@@ -1,0 +1,97 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Callable
+
+import can
+
+_logger = logging.getLogger(__name__)
+
+
+class CanBus:
+    """
+    Async wrapper around a python-can SocketCAN bus.
+
+    A single instance is shared between all Motor objects on the same physical
+    interface.  The background reader task dispatches every incoming frame to
+    registered listeners.
+
+    Use as an async context manager:
+
+        async with CanBus("can_alm_axol_l") as bus:
+            motor = Motor(bus, Joint.SHOULDER_1)
+            ...
+    """
+
+    def __init__(self, channel: str) -> None:
+        self._bus = can.Bus(channel=channel, bustype="socketcan")
+        self._listeners: list[Callable[[can.Message], None]] = []
+        self._reader_task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        """Start the background frame-dispatch loop."""
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(),
+            name=f"can_reader:{self._bus.channel_info}",
+        )
+
+    async def close(self) -> None:
+        """Stop the reader loop and shut down the socket."""
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+        self._bus.shutdown()
+
+    async def __aenter__(self) -> CanBus:
+        await self.start()
+        return self
+
+    async def __aexit__(self, *_) -> None:
+        await self.close()
+
+    def _add_listener(self, listener: Callable[[can.Message], None]) -> None:
+        self._listeners.append(listener)
+
+    async def _send(self, arbitration_id: int, data: bytes) -> None:
+        msg = can.Message(
+            arbitration_id=arbitration_id, data=data, is_extended_id=False
+        )
+        # Send synchronously — SocketCAN send is fast non-blocking at OS level.
+        # This prevents asyncio thread pool starvation at high telemetry rates.
+        self._bus.send(msg)
+
+    async def _reader_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        readable = asyncio.Event()
+        fd = self._bus.fileno()
+        loop.add_reader(fd, readable.set)
+        try:
+            while True:
+                try:
+                    msg: can.Message | None = self._bus.recv(timeout=0)
+                    if msg is not None:
+                        for listener in self._listeners:
+                            try:
+                                listener(msg)
+                            except Exception as e:
+                                _logger.error(
+                                    "CAN listener %s error: %s", listener.__name__, e
+                                )
+                    else:
+                        # No data — sleep until the socket is readable instead of
+                        # polling on a fixed 1ms timer.  This wakes up immediately
+                        # when the next CAN frame arrives, cutting response latency
+                        # by up to 1ms per round-trip.
+                        readable.clear()
+                        await readable.wait()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    _logger.warning("CAN reader loop warning: %s", e)
+                    await asyncio.sleep(0.01)
+        finally:
+            loop.remove_reader(fd)
