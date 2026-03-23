@@ -15,11 +15,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..constants import CAN_LEFT, CAN_RIGHT
+
 _VID = "1d50"
 _PID = "606f"
-_CAN_L = "can_alm_axol_l"
-_CAN_R = "can_alm_axol_r"
-_BITRATE = 1000000
+_CAN_L = CAN_LEFT
+_CAN_R = CAN_RIGHT
+_BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
 _UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
