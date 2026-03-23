@@ -15,16 +15,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-_VID      = "1d50"
-_PID      = "606f"
-_CAN_L    = "can_alm_axol_l"
-_CAN_R    = "can_alm_axol_r"
-_BITRATE  = 1000000
+_VID = "1d50"
+_PID = "606f"
+_CAN_L = "can_alm_axol_l"
+_CAN_R = "can_alm_axol_r"
+_BITRATE = 1000000
 _TXQUEUELEN = 512
 
 _UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
-_CAN_DIR         = Path.home() / ".almond" / "can"
-_CRON_SCRIPT     = _CAN_DIR / "startup.sh"
+_CAN_DIR = Path.home() / ".almond" / "can"
+_CRON_SCRIPT = _CAN_DIR / "startup.sh"
 
 
 def _die(msg: str) -> None:
@@ -44,21 +44,45 @@ def _find_serial() -> str:
     for iface_path in Path("/sys/class/net").glob("can*"):
         info = subprocess.run(
             ["udevadm", "info", "-a", "-p", str(iface_path)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         ).stdout
 
-        vid = next((l.split('"')[1] for l in info.splitlines() if "ATTRS{idVendor}" in l), "")
-        pid = next((l.split('"')[1] for l in info.splitlines() if "ATTRS{idProduct}" in l), "")
+        vid = next(
+            (
+                line.split('"')[1]
+                for line in info.splitlines()
+                if "ATTRS{idVendor}" in line
+            ),
+            "",
+        )
+        pid = next(
+            (
+                line.split('"')[1]
+                for line in info.splitlines()
+                if "ATTRS{idProduct}" in line
+            ),
+            "",
+        )
 
         if vid.lower() == _VID and pid.lower() == _PID:
-            serial = next((l.split('"')[1] for l in info.splitlines() if "ATTRS{serial}" in l), "")
+            serial = next(
+                (
+                    line.split('"')[1]
+                    for line in info.splitlines()
+                    if "ATTRS{serial}" in line
+                ),
+                "",
+            )
             if serial:
                 serials.append(serial)
 
     unique = list(dict.fromkeys(serials))
 
     if not unique:
-        print("\n  No adapter found. Enter the serial number manually (blank to abort):")
+        print(
+            "\n  No adapter found. Enter the serial number manually (blank to abort):"
+        )
         serial = input("  Serial: ").strip()
         if not serial:
             _die("No serial provided. Connect the device and re-run.")
@@ -104,10 +128,10 @@ def _write_cron_script() -> None:
         f"# Bring up Almond Axol CAN interfaces\n"
         f"set -euo pipefail\n\n"
         f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
-        f"    ip link set \"${{IFACE}}\" down 2>/dev/null || true\n"
-        f"    ip link set \"${{IFACE}}\" type can bitrate {_BITRATE}\n"
-        f"    ip link set \"${{IFACE}}\" txqueuelen {_TXQUEUELEN}\n"
-        f"    ip link set \"${{IFACE}}\" up\n"
+        f'    ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f'    ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
+        f'    ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f'    ip link set "${{IFACE}}" up\n'
         f"done\n"
     )
     _CRON_SCRIPT.chmod(0o755)

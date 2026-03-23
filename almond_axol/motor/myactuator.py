@@ -13,21 +13,21 @@ from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
 
-_MA_REQ     = 0x140  # standard command request  → 0x140 + motor_id
-_MA_RESP    = 0x240  # standard command response ← 0x240 + motor_id
-_MA_MC_REQ  = 0x400  # motion control request    → 0x400 + motor_id
+_MA_REQ = 0x140  # standard command request  → 0x140 + motor_id
+_MA_RESP = 0x240  # standard command response ← 0x240 + motor_id
+_MA_MC_REQ = 0x400  # motion control request    → 0x400 + motor_id
 _MA_MC_RESP = 0x500  # motion control response   ← 0x500 + motor_id
 
-_MA_SHUTDOWN         = 0x80
-_MA_STOP             = 0x81
-_MA_RELEASE_BRAKE    = 0x77
+_MA_SHUTDOWN = 0x80
+_MA_STOP = 0x81
+_MA_RELEASE_BRAKE = 0x77
 _MA_MULTI_TURN_ANGLE = 0x92
 
-_MA_P_MIN,  _MA_P_MAX  = -12.5, 12.5   # rad
-_MA_V_MIN,  _MA_V_MAX  = -45.0, 45.0   # rad/s
-_MA_T_MIN,  _MA_T_MAX  = -24.0, 24.0   # Nm
-_MA_KP_MIN, _MA_KP_MAX =   0.0, 500.0
-_MA_KD_MIN, _MA_KD_MAX =   0.0,   5.0
+_MA_P_MIN, _MA_P_MAX = -12.5, 12.5  # rad
+_MA_V_MIN, _MA_V_MAX = -45.0, 45.0  # rad/s
+_MA_T_MIN, _MA_T_MAX = -24.0, 24.0  # Nm
+_MA_KP_MIN, _MA_KP_MAX = 0.0, 500.0
+_MA_KD_MIN, _MA_KD_MAX = 0.0, 5.0
 
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
@@ -56,7 +56,9 @@ class MyActuatorMotor(MotorDriver):
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise MotorError(f"MyActuator motor {self._motor_id:#04x} did not respond within {timeout}s")
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x} did not respond within {timeout}s"
+            )
 
     @staticmethod
     def _cmd(byte: int) -> bytes:
@@ -96,22 +98,24 @@ class MyActuatorMotor(MotorDriver):
             kd:    Velocity damping          [0,   5]
             t_ff:  Feedforward torque (Nm,  [-24,  24])
         """
-        p_u  = _float_to_uint(p_des, _MA_P_MIN,  _MA_P_MAX,  16)
-        v_u  = _float_to_uint(v_des, _MA_V_MIN,  _MA_V_MAX,  12)
-        kp_u = _float_to_uint(kp,   _MA_KP_MIN, _MA_KP_MAX, 12)
-        kd_u = _float_to_uint(kd,   _MA_KD_MIN, _MA_KD_MAX, 12)
-        t_u  = _float_to_uint(t_ff, _MA_T_MIN,  _MA_T_MAX,  12)
+        p_u = _float_to_uint(p_des, _MA_P_MIN, _MA_P_MAX, 16)
+        v_u = _float_to_uint(v_des, _MA_V_MIN, _MA_V_MAX, 12)
+        kp_u = _float_to_uint(kp, _MA_KP_MIN, _MA_KP_MAX, 12)
+        kd_u = _float_to_uint(kd, _MA_KD_MIN, _MA_KD_MAX, 12)
+        t_u = _float_to_uint(t_ff, _MA_T_MIN, _MA_T_MAX, 12)
 
-        data = bytes([
-            (p_u >> 8) & 0xFF,
-            p_u & 0xFF,
-            (v_u >> 4) & 0xFF,
-            ((v_u & 0xF) << 4) | ((kp_u >> 8) & 0xF),
-            kp_u & 0xFF,
-            (kd_u >> 4) & 0xFF,
-            ((kd_u & 0xF) << 4) | ((t_u >> 8) & 0xF),
-            t_u & 0xFF,
-        ])
+        data = bytes(
+            [
+                (p_u >> 8) & 0xFF,
+                p_u & 0xFF,
+                (v_u >> 4) & 0xFF,
+                ((v_u & 0xF) << 4) | ((kp_u >> 8) & 0xF),
+                kp_u & 0xFF,
+                (kd_u >> 4) & 0xFF,
+                ((kd_u & 0xF) << 4) | ((t_u >> 8) & 0xF),
+                t_u & 0xFF,
+            ]
+        )
 
         resp_id = _MA_MC_RESP + self._motor_id
         loop = asyncio.get_running_loop()
@@ -121,4 +125,6 @@ class MyActuatorMotor(MotorDriver):
         try:
             await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise MotorError(f"MyActuator motor {self._motor_id:#04x} motion control timed out")
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x} motion control timed out"
+            )

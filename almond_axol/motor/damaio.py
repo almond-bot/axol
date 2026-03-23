@@ -16,38 +16,38 @@ from .errors import MotorError
 
 
 class _ControlMode(Enum):
-    MIT       = "mit"
-    POS_VEL   = "pos_vel"
-    VEL       = "vel"
+    MIT = "mit"
+    POS_VEL = "pos_vel"
+    VEL = "vel"
     FORCE_POS = "force_pos"
 
 
 class _DamaioStatus(Enum):
-    DISABLED        = 0x0
-    ENABLED         = 0x1
-    OVER_VOLTAGE    = 0x8
-    UNDER_VOLTAGE   = 0x9
-    OVER_CURRENT    = 0xA
-    MOS_OVER_TEMP   = 0xB
+    DISABLED = 0x0
+    ENABLED = 0x1
+    OVER_VOLTAGE = 0x8
+    UNDER_VOLTAGE = 0x9
+    OVER_CURRENT = 0xA
+    MOS_OVER_TEMP = 0xB
     ROTOR_OVER_TEMP = 0xC
-    LOST_COMM       = 0xD
-    OVERLOAD        = 0xE
+    LOST_COMM = 0xD
+    OVERLOAD = 0xE
 
 
 @dataclass
 class _MotorFeedback:
-    status:   _DamaioStatus
+    status: _DamaioStatus
     position: float  # rad (motor internal)
     velocity: float  # rad/s
-    torque:   float  # Nm
-    t_mos:    float  # °C
-    t_rotor:  float  # °C
+    torque: float  # Nm
+    t_mos: float  # °C
+    t_rotor: float  # °C
 
 
 _DM_UINT32_REGS = {7, 8, 9, 10, 13, 14, 15, 16, 35, 36}
-_DM_REG_PMAX    = 21
-_DM_REG_VMAX    = 22
-_DM_REG_TMAX    = 23
+_DM_REG_PMAX = 21
+_DM_REG_VMAX = 22
+_DM_REG_TMAX = 23
 
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
@@ -104,9 +104,9 @@ class DamaioMotor(MotorDriver):
 
     def _handle_feedback(self, data: bytes) -> None:
         status_code = data[0] >> 4
-        pos_int     = (data[1] << 8) | data[2]
-        vel_int     = (data[3] << 4) | (data[4] >> 4)
-        torq_int    = ((data[4] & 0xF) << 8) | data[5]
+        pos_int = (data[1] << 8) | data[2]
+        vel_int = (data[3] << 4) | (data[4] >> 4)
+        torq_int = ((data[4] & 0xF) << 8) | data[5]
 
         try:
             status = _DamaioStatus(status_code)
@@ -114,12 +114,12 @@ class DamaioMotor(MotorDriver):
             status = _DamaioStatus.DISABLED
 
         self._feedback = _MotorFeedback(
-            status=  status,
-            position=_uint_to_float(pos_int,  -self._p_max, self._p_max, 16),
-            velocity=_uint_to_float(vel_int,  -self._v_max, self._v_max, 12),
-            torque=  _uint_to_float(torq_int, -self._t_max, self._t_max, 12),
-            t_mos=   float(data[6]),
-            t_rotor= float(data[7]),
+            status=status,
+            position=_uint_to_float(pos_int, -self._p_max, self._p_max, 16),
+            velocity=_uint_to_float(vel_int, -self._v_max, self._v_max, 12),
+            torque=_uint_to_float(torq_int, -self._t_max, self._t_max, 12),
+            t_mos=float(data[6]),
+            t_rotor=float(data[7]),
         )
 
         for fut in self._feedback_waiters:
@@ -142,7 +142,9 @@ class DamaioMotor(MotorDriver):
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise MotorError(f"Damaio motor {self._motor_id:#04x} register {rid} read timed out")
+            raise MotorError(
+                f"Damaio motor {self._motor_id:#04x} register {rid} read timed out"
+            )
 
     async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
         loop = asyncio.get_running_loop()
@@ -193,21 +195,23 @@ class DamaioMotor(MotorDriver):
         current_limit: float = 0.0,
     ) -> None:
         if control_mode == _ControlMode.MIT:
-            pos_u  = _float_to_uint(target_position,    -self._p_max, self._p_max, 16)
-            vel_u  = _float_to_uint(target_velocity,    -self._v_max, self._v_max, 12)
-            kp_u   = _float_to_uint(stiffness,          0.0, 500.0, 12)
-            kd_u   = _float_to_uint(damping,            0.0,   5.0, 12)
+            pos_u = _float_to_uint(target_position, -self._p_max, self._p_max, 16)
+            vel_u = _float_to_uint(target_velocity, -self._v_max, self._v_max, 12)
+            kp_u = _float_to_uint(stiffness, 0.0, 500.0, 12)
+            kd_u = _float_to_uint(damping, 0.0, 5.0, 12)
             torq_u = _float_to_uint(feedforward_torque, -self._t_max, self._t_max, 12)
-            data = bytes([
-                (pos_u >> 8) & 0xFF,
-                pos_u & 0xFF,
-                (vel_u >> 4) & 0xFF,
-                ((vel_u & 0xF) << 4) | ((kp_u >> 8) & 0xF),
-                kp_u & 0xFF,
-                (kd_u >> 4) & 0xFF,
-                ((kd_u & 0xF) << 4) | ((torq_u >> 8) & 0xF),
-                torq_u & 0xFF,
-            ])
+            data = bytes(
+                [
+                    (pos_u >> 8) & 0xFF,
+                    pos_u & 0xFF,
+                    (vel_u >> 4) & 0xFF,
+                    ((vel_u & 0xF) << 4) | ((kp_u >> 8) & 0xF),
+                    kp_u & 0xFF,
+                    (kd_u >> 4) & 0xFF,
+                    ((kd_u & 0xF) << 4) | ((torq_u >> 8) & 0xF),
+                    torq_u & 0xFF,
+                ]
+            )
             await self._raw_send(data)
         elif control_mode == _ControlMode.POS_VEL:
             data = struct.pack("<ff", target_position, target_velocity)
@@ -217,6 +221,6 @@ class DamaioMotor(MotorDriver):
             await self._raw_send(data, arb_id=0x200 + self._motor_id)
         elif control_mode == _ControlMode.FORCE_POS:
             v_scaled = int(max(0.0, min(100.0, velocity_limit)) * 100)
-            i_scaled = int(max(0.0, min(1.0,   current_limit))  * 10000)
+            i_scaled = int(max(0.0, min(1.0, current_limit)) * 10000)
             data = struct.pack("<fHH", target_position, v_scaled, i_scaled)
             await self._raw_send(data, arb_id=0x300 + self._motor_id)

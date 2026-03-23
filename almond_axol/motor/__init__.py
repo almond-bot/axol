@@ -20,8 +20,8 @@ Usage
         pos = await shoulder.get_position()  # revolutions
 """
 
-from .errors import MotorError
 from .bus import CanBus
+from .errors import MotorError
 from .motor import Joint, Motor
 
 __all__ = ["CanBus", "Motor", "Joint", "MotorError"]

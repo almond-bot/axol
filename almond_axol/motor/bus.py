@@ -54,7 +54,9 @@ class CanBus:
         self._listeners.append(listener)
 
     async def _send(self, arbitration_id: int, data: bytes) -> None:
-        msg = can.Message(arbitration_id=arbitration_id, data=data, is_extended_id=False)
+        msg = can.Message(
+            arbitration_id=arbitration_id, data=data, is_extended_id=False
+        )
         await asyncio.to_thread(self._bus.send, msg)
 
     async def _reader_loop(self) -> None:
