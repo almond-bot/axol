@@ -22,6 +22,8 @@ _MA_SHUTDOWN = 0x80
 _MA_STOP = 0x81
 _MA_RELEASE_BRAKE = 0x77
 _MA_MULTI_TURN_ANGLE = 0x92
+_MA_MOTOR_STATUS_2 = 0x9C
+_MA_SET_ENCODER_ZERO = 0x64
 
 _MA_P_MIN, _MA_P_MAX = -12.5, 12.5  # rad
 _MA_V_MIN, _MA_V_MAX = -45.0, 45.0  # rad/s
@@ -73,11 +75,26 @@ class MyActuatorMotor(MotorDriver):
     async def clear_errors(self) -> None:
         await self._request(self._cmd(_MA_STOP))
 
+    async def set_zero_position(self) -> None:
+        await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
+
     async def get_position(self) -> float:
         resp = await self._request(self._cmd(_MA_MULTI_TURN_ANGLE))
         raw = struct.unpack_from("<i", resp, 4)[0]
         degrees = raw * 0.01  # raw is in 0.01 degree units
         return degrees / 360.0
+
+    async def _get_status2(self) -> bytes:
+        return await self._request(self._cmd(_MA_MOTOR_STATUS_2))
+
+    async def get_velocity(self) -> float:
+        resp = await self._get_status2()
+        speed_dps = struct.unpack_from("<h", resp, 4)[0]
+        return speed_dps / 360.0
+
+    async def get_torque(self) -> float:
+        resp = await self._get_status2()
+        return struct.unpack_from("<h", resp, 2)[0] * 0.01  # 0.01 A/LSB
 
     async def motion_control(
         self,
@@ -88,16 +105,6 @@ class MyActuatorMotor(MotorDriver):
         t_ff: float,
         timeout: float = 0.05,
     ) -> None:
-        """
-        MIT-style impedance control (CAN ID 0x400 + motor_id).
-
-        Args:
-            p_des: Desired position  (rad,  [-12.5, 12.5])
-            v_des: Desired velocity  (rad/s, [-45,  45])
-            kp:    Position stiffness        [0, 500]
-            kd:    Velocity damping          [0,   5]
-            t_ff:  Feedforward torque (Nm,  [-24,  24])
-        """
         p_u = _float_to_uint(p_des, _MA_P_MIN, _MA_P_MAX, 16)
         v_u = _float_to_uint(v_des, _MA_V_MIN, _MA_V_MAX, 12)
         kp_u = _float_to_uint(kp, _MA_KP_MIN, _MA_KP_MAX, 12)

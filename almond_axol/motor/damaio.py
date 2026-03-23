@@ -174,9 +174,37 @@ class DamaioMotor(MotorDriver):
     async def clear_errors(self) -> None:
         await self._raw_send(bytes([0xFF] * 7 + [0xFB]))
 
+    async def set_zero_position(self) -> None:
+        await self._raw_send(bytes([0xFF] * 7 + [0xFE]))
+
     async def get_position(self) -> float:
         feedback = await self._request_feedback()
         return feedback.position / (2 * math.pi)
+
+    async def get_velocity(self) -> float:
+        feedback = await self._request_feedback()
+        return feedback.velocity / (2 * math.pi)
+
+    async def get_torque(self) -> float:
+        feedback = await self._request_feedback()
+        return feedback.torque
+
+    async def motion_control(
+        self,
+        p_des: float,
+        v_des: float,
+        kp: float,
+        kd: float,
+        t_ff: float,
+    ) -> None:
+        await self.send_cmd(
+            target_position=p_des,
+            target_velocity=v_des,
+            stiffness=kp,
+            damping=kd,
+            feedforward_torque=t_ff,
+            control_mode=_ControlMode.MIT,
+        )
 
     async def set_control_mode(self, mode: _ControlMode) -> None:
         canid_l, canid_h = self._canid_bytes()
