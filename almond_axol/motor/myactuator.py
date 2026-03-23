@@ -232,16 +232,17 @@ class MyActuatorMotor(MotorDriver):
         speed_ki = int(max(0, min(255, gains.speed_ki)))
         pos_kp = int(max(0, min(255, gains.position_kp)))
         pos_ki = int(max(0, min(255, gains.position_ki)))
+        # SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
         data = bytes(
             [
                 _MA_WRITE_GAINS_ROM,
+                0,
                 current_kp,
                 current_ki,
                 speed_kp,
                 speed_ki,
                 pos_kp,
                 pos_ki,
-                0,
             ]
         )
         await self._request(data)

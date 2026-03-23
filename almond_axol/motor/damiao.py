@@ -186,12 +186,18 @@ class DamiaoMotor(MotorDriver):
                 f"Damiao motor {self._motor_id:#04x} register {rid} read timed out"
             )
 
-    async def _write_register(self, rid: int, value: float) -> None:
-        """Write a float register via the 0x55 command (RAM only; call _store_parameters to persist)."""
+    async def _write_register(self, rid: int, value: float | int) -> None:
+        """Write a register via the 0x55 command (RAM only; call _store_parameters to persist).
+
+        Packs as uint32 for registers in _DM_UINT32_REGS, float otherwise.
+        """
         canid_l, canid_h = self._canid_bytes()
-        await self._bus._send(
-            0x7FF, bytes([canid_l, canid_h, 0x55, rid]) + struct.pack("<f", value)
+        data = (
+            struct.pack("<I", int(value))
+            if rid in _DM_UINT32_REGS
+            else struct.pack("<f", float(value))
         )
+        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0x55, rid]) + data)
 
     async def _store_parameters(self) -> None:
         """Persist all RAM register values to flash (0xAA command)."""
@@ -356,8 +362,8 @@ class DamiaoMotor(MotorDriver):
 
     async def set_can_id(self, can_id: int) -> None:
         feedback_id = can_id + 0x10
-        await self._write_register(_DM_REG_CAN_ID, float(can_id))
-        await self._write_register(_DM_REG_FEEDBACK_ID, float(feedback_id))
+        await self._write_register(_DM_REG_CAN_ID, can_id)
+        await self._write_register(_DM_REG_FEEDBACK_ID, feedback_id)
         await self._store_parameters()
         self._motor_id = can_id
         self._feedback_id = feedback_id
@@ -368,7 +374,7 @@ class DamiaoMotor(MotorDriver):
             raise MotorError(
                 f"Unsupported baud rate {baud_rate}. Supported: {sorted(_DM_BAUD_MAP)}"
             )
-        await self._write_register(_DM_REG_CAN_BAUD, float(code))
+        await self._write_register(_DM_REG_CAN_BAUD, code)
         await self._store_parameters()
 
     async def motion_control(
