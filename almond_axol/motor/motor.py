@@ -7,6 +7,7 @@ from .bus import CanBus
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .myactuator import MyActuatorMotor
+from .types import MotorGains, MotorStatus
 
 
 class Joint(Enum):
@@ -98,6 +99,21 @@ class Motor:
         """
         return await self._driver.get_torque()
 
+    async def get_temperature(self) -> float:
+        """Return motor temperature in degrees Celsius.
+
+        Damiao: returns the higher of MOS and rotor temperatures.
+        """
+        return await self._driver.get_temperature()
+
+    async def get_voltage(self) -> float:
+        """Return bus voltage in Volts."""
+        return await self._driver.get_voltage()
+
+    async def get_error_code(self) -> MotorStatus:
+        """Return the current motor status / error code."""
+        return await self._driver.get_error_code()
+
     async def set_position(self, position: float, max_speed: float) -> None:
         """Move to an absolute position using the motor's built-in position controller.
 
@@ -106,6 +122,55 @@ class Motor:
             max_speed: Maximum speed during the move (rev/s)
         """
         await self._driver.set_position(position, max_speed)
+
+    async def set_velocity(self, velocity: float) -> None:
+        """Command a target velocity using the motor's built-in speed controller.
+
+        Args:
+            velocity: Target shaft velocity (rev/s)
+        """
+        await self._driver.set_velocity(velocity)
+
+    async def set_force_position(
+        self, position: float, max_speed: float, max_current: float
+    ) -> None:
+        """Move to a position with hard speed and current limits.
+
+        Only supported by Damiao motors. Raises MotorError on MyActuator.
+
+        Args:
+            position:    Target shaft position (rev)
+            max_speed:   Maximum speed during the move (rev/s)
+            max_current: Maximum phase current, normalized [0.0, 1.0]
+        """
+        await self._driver.set_force_position(position, max_speed, max_current)
+
+    async def set_acceleration(
+        self, acceleration: float, deceleration: float | None = None
+    ) -> None:
+        """Set the acceleration ramp for position and velocity control modes.
+
+        Args:
+            acceleration: Acceleration ramp (rev/s²)
+            deceleration: Deceleration ramp (rev/s²). If None, matches acceleration.
+                          Damiao stores acceleration and deceleration separately;
+                          MyActuator applies the same value to both ramps.
+        """
+        await self._driver.set_acceleration(acceleration, deceleration)
+
+    async def get_gains(self) -> MotorGains:
+        """Read the stored PID gains for the speed and position control loops."""
+        return await self._driver.get_gains()
+
+    async def set_gains(self, gains: MotorGains) -> None:
+        """Write PID gains for the speed and position control loops.
+
+        Changes are persisted to non-volatile memory so they survive power cycles.
+
+        Args:
+            gains: Gain values to write. Damiao ignores current_kp / current_ki.
+        """
+        await self._driver.set_gains(gains)
 
     async def motion_control(
         self,

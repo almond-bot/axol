@@ -13,6 +13,7 @@ import can
 from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
+from .types import MotorGains, MotorStatus
 
 
 class _ControlMode(Enum):
@@ -48,6 +49,25 @@ _DM_UINT32_REGS = {7, 8, 9, 10, 13, 14, 15, 16, 35, 36}
 _DM_REG_PMAX = 21
 _DM_REG_VMAX = 22
 _DM_REG_TMAX = 23
+_DM_REG_ACC = 4  # acceleration ramp (float, rad/s²)
+_DM_REG_DEC = 5  # deceleration ramp (float, rad/s²)
+_DM_REG_VBUS = 60  # bus voltage (float, V, read-only)
+_DM_REG_SPEED_KP = 25  # KP_ASR — speed loop proportional gain
+_DM_REG_SPEED_KI = 26  # KI_ASR — speed loop integral gain
+_DM_REG_POS_KP = 27  # KP_APR — position loop proportional gain
+_DM_REG_POS_KI = 28  # KI_APR — position loop integral gain
+
+_DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
+    _DamiaoStatus.DISABLED: MotorStatus.DISABLED,
+    _DamiaoStatus.ENABLED: MotorStatus.OK,
+    _DamiaoStatus.OVER_VOLTAGE: MotorStatus.OVER_VOLTAGE,
+    _DamiaoStatus.UNDER_VOLTAGE: MotorStatus.UNDER_VOLTAGE,
+    _DamiaoStatus.OVER_CURRENT: MotorStatus.OVER_CURRENT,
+    _DamiaoStatus.MOS_OVER_TEMP: MotorStatus.MOS_OVER_TEMP,
+    _DamiaoStatus.ROTOR_OVER_TEMP: MotorStatus.ROTOR_OVER_TEMP,
+    _DamiaoStatus.LOST_COMM: MotorStatus.LOST_COMM,
+    _DamiaoStatus.OVERLOAD: MotorStatus.OVERLOAD,
+}
 
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
@@ -75,6 +95,10 @@ class DamiaoMotor(MotorDriver):
         self._t_max = 18.0
 
         bus._add_listener(self._on_message)
+
+    # ------------------------------------------------------------------ #
+    # Private helpers                                                      #
+    # ------------------------------------------------------------------ #
 
     def _on_message(self, msg: can.Message) -> None:
         if len(msg.data) != 8:
@@ -146,6 +170,18 @@ class DamiaoMotor(MotorDriver):
                 f"Damiao motor {self._motor_id:#04x} register {rid} read timed out"
             )
 
+    async def _write_register(self, rid: int, value: float) -> None:
+        """Write a float register via the 0x55 command (RAM only; call _store_parameters to persist)."""
+        canid_l, canid_h = self._canid_bytes()
+        await self._bus._send(
+            0x7FF, bytes([canid_l, canid_h, 0x55, rid]) + struct.pack("<f", value)
+        )
+
+    async def _store_parameters(self) -> None:
+        """Persist all RAM register values to flash (0xAA command)."""
+        canid_l, canid_h = self._canid_bytes()
+        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xAA, 0x01, 0, 0, 0, 0]))
+
     async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[_MotorFeedback] = loop.create_future()
@@ -157,70 +193,7 @@ class DamiaoMotor(MotorDriver):
         except asyncio.TimeoutError:
             raise MotorError(f"Damiao motor {self._motor_id:#04x} feedback timed out")
 
-    async def enable(self) -> None:
-        pmax, vmax, tmax = await asyncio.gather(
-            self._read_register(_DM_REG_PMAX),
-            self._read_register(_DM_REG_VMAX),
-            self._read_register(_DM_REG_TMAX),
-        )
-        self._p_max = float(pmax)
-        self._v_max = float(vmax)
-        self._t_max = float(tmax)
-        await self._raw_send(bytes([0xFF] * 7 + [0xFC]))
-
-    async def disable(self) -> None:
-        await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
-
-    async def clear_errors(self) -> None:
-        await self._raw_send(bytes([0xFF] * 7 + [0xFB]))
-
-    async def set_zero_position(self) -> None:
-        await self._raw_send(bytes([0xFF] * 7 + [0xFE]))
-
-    async def get_position(self) -> float:
-        feedback = await self._request_feedback()
-        return feedback.position / (2 * math.pi)
-
-    async def get_velocity(self) -> float:
-        feedback = await self._request_feedback()
-        return feedback.velocity / (2 * math.pi)
-
-    async def get_torque(self) -> float:
-        feedback = await self._request_feedback()
-        return feedback.torque
-
-    async def set_position(self, position: float, max_speed: float) -> None:
-        # convert rev → rad for POS_VEL mode (arb_id 0x100 + motor_id)
-        await self.send_cmd(
-            target_position=position * 2 * math.pi,
-            target_velocity=max_speed * 2 * math.pi,
-            control_mode=_ControlMode.POS_VEL,
-        )
-
-    async def motion_control(
-        self,
-        p_des: float,
-        v_des: float,
-        kp: float,
-        kd: float,
-        t_ff: float,
-    ) -> None:
-        # convert rev → rad for MIT mode
-        await self.send_cmd(
-            target_position=p_des * 2 * math.pi,
-            target_velocity=v_des * 2 * math.pi,
-            stiffness=kp,
-            damping=kd,
-            feedforward_torque=t_ff,
-            control_mode=_ControlMode.MIT,
-        )
-
-    async def set_control_mode(self, mode: _ControlMode) -> None:
-        canid_l, canid_h = self._canid_bytes()
-        data = struct.pack("<I", list(_ControlMode).index(mode) + 1)
-        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0x55, 10]) + data)
-
-    async def send_cmd(
+    async def _send_cmd(
         self,
         target_position: float = 0.0,
         target_velocity: float = 0.0,
@@ -261,3 +234,124 @@ class DamiaoMotor(MotorDriver):
             i_scaled = int(max(0.0, min(1.0, current_limit)) * 10000)
             data = struct.pack("<fHH", target_position, v_scaled, i_scaled)
             await self._raw_send(data, arb_id=0x300 + self._motor_id)
+
+    # ------------------------------------------------------------------ #
+    # Public API (implements MotorDriver)                                  #
+    # ------------------------------------------------------------------ #
+
+    async def enable(self) -> None:
+        pmax, vmax, tmax = await asyncio.gather(
+            self._read_register(_DM_REG_PMAX),
+            self._read_register(_DM_REG_VMAX),
+            self._read_register(_DM_REG_TMAX),
+        )
+        self._p_max = float(pmax)
+        self._v_max = float(vmax)
+        self._t_max = float(tmax)
+        await self._raw_send(bytes([0xFF] * 7 + [0xFC]))
+
+    async def disable(self) -> None:
+        await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
+
+    async def clear_errors(self) -> None:
+        await self._raw_send(bytes([0xFF] * 7 + [0xFB]))
+
+    async def set_zero_position(self) -> None:
+        await self._raw_send(bytes([0xFF] * 7 + [0xFE]))
+
+    async def get_position(self) -> float:
+        feedback = await self._request_feedback()
+        return feedback.position / (2 * math.pi)
+
+    async def get_velocity(self) -> float:
+        feedback = await self._request_feedback()
+        return feedback.velocity / (2 * math.pi)
+
+    async def get_torque(self) -> float:
+        feedback = await self._request_feedback()
+        return feedback.torque
+
+    async def get_temperature(self) -> float:
+        feedback = await self._request_feedback()
+        return max(feedback.t_mos, feedback.t_rotor)
+
+    async def get_voltage(self) -> float:
+        return float(await self._read_register(_DM_REG_VBUS))
+
+    async def get_error_code(self) -> MotorStatus:
+        feedback = await self._request_feedback()
+        return _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
+
+    async def set_position(self, position: float, max_speed: float) -> None:
+        # convert rev → rad for POS_VEL mode (arb_id 0x100 + motor_id)
+        await self._send_cmd(
+            target_position=position * 2 * math.pi,
+            target_velocity=max_speed * 2 * math.pi,
+            control_mode=_ControlMode.POS_VEL,
+        )
+
+    async def set_velocity(self, velocity: float) -> None:
+        await self._send_cmd(
+            target_velocity=velocity * 2 * math.pi,
+            control_mode=_ControlMode.VEL,
+        )
+
+    async def set_force_position(
+        self, position: float, max_speed: float, max_current: float
+    ) -> None:
+        await self._send_cmd(
+            target_position=position * 2 * math.pi,
+            velocity_limit=max_speed * 2 * math.pi,
+            current_limit=max_current,
+            control_mode=_ControlMode.FORCE_POS,
+        )
+
+    async def set_acceleration(
+        self, acceleration: float, deceleration: float | None = None
+    ) -> None:
+        acc_rad_s2 = acceleration * 2 * math.pi
+        dec_rad_s2 = (
+            (deceleration if deceleration is not None else acceleration) * 2 * math.pi
+        )
+        await self._write_register(_DM_REG_ACC, acc_rad_s2)
+        await self._write_register(_DM_REG_DEC, dec_rad_s2)
+        await self._store_parameters()
+
+    async def get_gains(self) -> MotorGains:
+        speed_kp, speed_ki, pos_kp, pos_ki = await asyncio.gather(
+            self._read_register(_DM_REG_SPEED_KP),
+            self._read_register(_DM_REG_SPEED_KI),
+            self._read_register(_DM_REG_POS_KP),
+            self._read_register(_DM_REG_POS_KI),
+        )
+        return MotorGains(
+            speed_kp=float(speed_kp),
+            speed_ki=float(speed_ki),
+            position_kp=float(pos_kp),
+            position_ki=float(pos_ki),
+        )
+
+    async def set_gains(self, gains: MotorGains) -> None:
+        await self._write_register(_DM_REG_SPEED_KP, gains.speed_kp)
+        await self._write_register(_DM_REG_SPEED_KI, gains.speed_ki)
+        await self._write_register(_DM_REG_POS_KP, gains.position_kp)
+        await self._write_register(_DM_REG_POS_KI, gains.position_ki)
+        await self._store_parameters()
+
+    async def motion_control(
+        self,
+        p_des: float,
+        v_des: float,
+        kp: float,
+        kd: float,
+        t_ff: float,
+    ) -> None:
+        # convert rev → rad for MIT mode
+        await self._send_cmd(
+            target_position=p_des * 2 * math.pi,
+            target_velocity=v_des * 2 * math.pi,
+            stiffness=kp,
+            damping=kd,
+            feedforward_torque=t_ff,
+            control_mode=_ControlMode.MIT,
+        )
