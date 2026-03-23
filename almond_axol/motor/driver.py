@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Callable
 
 from .errors import MotorError
 from .types import MotorGains, MotorStatus
@@ -43,6 +44,19 @@ class MotorDriver(ABC):
 
         Damiao: estimated output torque in Nm.
         MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
+        """
+        ...
+
+    @abstractmethod
+    async def get_telemetry(
+        self,
+        on_position: Callable[[float], None],
+        on_torque: Callable[[float], None],
+    ) -> None:
+        """Fetch position and torque, calling each callback as soon as its value arrives.
+
+        Damiao: one feedback request — both callbacks called together.
+        MyActuator: two concurrent requests — each callback called independently.
         """
         ...
 

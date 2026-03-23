@@ -24,7 +24,15 @@ Usage
 
 from .bus import CanBus
 from .errors import MotorError
-from .motor import Joint, Motor
+from .motor import Joint, JointValues, Motor
 from .types import MotorGains, MotorStatus
 
-__all__ = ["CanBus", "Motor", "Joint", "MotorError", "MotorStatus", "MotorGains"]
+__all__ = [
+    "CanBus",
+    "Motor",
+    "Joint",
+    "JointValues",
+    "MotorError",
+    "MotorStatus",
+    "MotorGains",
+]

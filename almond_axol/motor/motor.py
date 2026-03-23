@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 
 from .bus import CanBus
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
+from .errors import MotorError
 from .myactuator import MyActuatorMotor
 from .types import MotorGains, MotorStatus
 
@@ -19,6 +21,9 @@ class Joint(Enum):
     WRIST_2 = "wrist_2"
     WRIST_3 = "wrist_3"
     GRIPPER = "gripper"
+
+
+JointValues = dict[Joint, float]
 
 
 class _MotorType(Enum):
@@ -65,6 +70,9 @@ class Motor:
             self._driver = MyActuatorMotor(bus, motor_id)
         else:
             self._driver = DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
+        self._position: float | None = None
+        self._torque: float | None = None
+        self._telemetry_task: asyncio.Task | None = None
 
     async def enable(self) -> None:
         """Enable the motor and release the brake."""
@@ -97,6 +105,58 @@ class Motor:
         MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
         """
         return await self._driver.get_torque()
+
+    async def start_telemetry(self, hz: float) -> None:
+        """Start the background polling loop at the given frequency.
+
+        Damiao: one CAN request per cycle (feedback frame gives position + torque).
+        MyActuator: two requests fired concurrently; cache is updated as each
+        response arrives independently — position does not wait for torque.
+
+        Args:
+            hz: Poll frequency in Hz.
+        """
+        await self.stop_telemetry()
+        self._telemetry_task = asyncio.create_task(self._telemetry_loop(hz))
+
+    async def stop_telemetry(self) -> None:
+        """Stop the background polling loop."""
+        if self._telemetry_task is not None:
+            self._telemetry_task.cancel()
+            try:
+                await self._telemetry_task
+            except asyncio.CancelledError:
+                pass
+            self._telemetry_task = None
+
+    async def _telemetry_loop(self, hz: float) -> None:
+        interval = 1.0 / hz
+        while True:
+            start = asyncio.get_event_loop().time()
+            await self._driver.get_telemetry(
+                on_position=lambda p: setattr(self, "_position", p),
+                on_torque=lambda t: setattr(self, "_torque", t),
+            )
+            elapsed = asyncio.get_event_loop().time() - start
+            await asyncio.sleep(max(0.0, interval - elapsed))
+
+    @property
+    def position(self) -> float:
+        """Latest cached shaft position (rev). Requires start_telemetry()."""
+        if self._position is None:
+            raise MotorError(
+                f"No position data for {self.joint} — call start_telemetry() first"
+            )
+        return self._position
+
+    @property
+    def torque(self) -> float:
+        """Latest cached torque estimate (Nm / A). Requires start_telemetry()."""
+        if self._torque is None:
+            raise MotorError(
+                f"No torque data for {self.joint} — call start_telemetry() first"
+            )
+        return self._torque
 
     async def get_temperature(self) -> float:
         """Return motor temperature in degrees Celsius.

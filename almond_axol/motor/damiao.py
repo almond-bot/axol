@@ -7,6 +7,7 @@ import math
 import struct
 from dataclasses import dataclass
 from enum import Enum
+from typing import Callable
 
 import can
 
@@ -292,6 +293,15 @@ class DamiaoMotor(MotorDriver):
     async def get_torque(self) -> float:
         feedback = await self._request_feedback()
         return feedback.torque
+
+    async def get_telemetry(
+        self,
+        on_position: Callable[[float], None],
+        on_torque: Callable[[float], None],
+    ) -> None:
+        feedback = await self._request_feedback()
+        on_position(feedback.position / (2 * math.pi))
+        on_torque(feedback.torque)
 
     async def get_temperature(self) -> float:
         feedback = await self._request_feedback()

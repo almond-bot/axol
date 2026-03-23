@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import math
 import struct
+from typing import Callable
 
 import can
 
@@ -91,7 +92,7 @@ class MyActuatorMotor(MotorDriver):
     def __init__(self, bus: CanBus, motor_id: int) -> None:
         self._bus = bus
         self._motor_id = motor_id
-        self._pending: dict[int, asyncio.Future[bytes]] = {}
+        self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
         bus._add_listener(self._on_message)
 
     # ------------------------------------------------------------------ #
@@ -99,15 +100,23 @@ class MyActuatorMotor(MotorDriver):
     # ------------------------------------------------------------------ #
 
     def _on_message(self, msg: can.Message) -> None:
-        fut = self._pending.pop(msg.arbitration_id, None)
+        # Motion control responses (0x500+id): data[0] is the echoed actuator CAN ID,
+        # not a command byte — key by (arb_id, motor_id) rather than (arb_id, data[0]).
+        mc_resp_id = _MA_MC_RESP + self._motor_id
+        if msg.arbitration_id == mc_resp_id:
+            key: tuple[int, int] = (mc_resp_id, self._motor_id)
+        else:
+            key = (msg.arbitration_id, msg.data[0])
+        fut = self._pending.pop(key, None)
         if fut is not None and not fut.done():
             fut.set_result(bytes(msg.data))
 
     async def _request(self, data: bytes, timeout: float = 0.1) -> bytes:
         resp_id = _MA_RESP + self._motor_id
+        key = (resp_id, data[0])
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[bytes] = loop.create_future()
-        self._pending[resp_id] = fut
+        self._pending[key] = fut
         await self._bus._send(_MA_REQ + self._motor_id, data)
         try:
             return await asyncio.wait_for(fut, timeout)
@@ -158,6 +167,25 @@ class MyActuatorMotor(MotorDriver):
     async def get_torque(self) -> float:
         resp = await self._get_status2()
         return struct.unpack_from("<h", resp, 2)[0] * 0.01  # 0.01 A/LSB
+
+    async def get_telemetry(
+        self,
+        on_position: Callable[[float], None],
+        on_torque: Callable[[float], None],
+    ) -> None:
+        def _on_pos(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is None:
+                on_position(task.result())
+
+        def _on_torq(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is None:
+                on_torque(task.result())
+
+        pos_task = asyncio.create_task(self.get_position())
+        torq_task = asyncio.create_task(self.get_torque())
+        pos_task.add_done_callback(_on_pos)
+        torq_task.add_done_callback(_on_torq)
+        await asyncio.gather(pos_task, torq_task, return_exceptions=True)
 
     async def get_temperature(self) -> float:
         resp = await self._get_status2()
@@ -293,7 +321,7 @@ class MyActuatorMotor(MotorDriver):
         resp_id = _MA_MC_RESP + self._motor_id
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[bytes] = loop.create_future()
-        self._pending[resp_id] = fut
+        self._pending[(resp_id, self._motor_id)] = fut
         await self._bus._send(_MA_MC_REQ + self._motor_id, data)
         try:
             await asyncio.wait_for(fut, timeout)

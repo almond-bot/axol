@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from ..constants import CAN_LEFT, CAN_RIGHT
-from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
+from ..motor import CanBus, Joint, JointValues, Motor, MotorGains, MotorStatus
 from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
 
 
@@ -16,6 +16,32 @@ class ArmController:
     def __init__(self, bus: CanBus, config: AxolConfig) -> None:
         self._config = config
         self._motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
+
+    # ------------------------------------------------------------------ #
+    # Polling                                                              #
+    # ------------------------------------------------------------------ #
+
+    async def start_telemetry(self, hz: float) -> None:
+        """Start background telemetry polling on all motors at the given frequency.
+
+        Args:
+            hz: Poll frequency in Hz.
+        """
+        await asyncio.gather(*[m.start_telemetry(hz) for m in self._motors.values()])
+
+    async def stop_telemetry(self) -> None:
+        """Stop the background telemetry polling loop on all motors."""
+        await asyncio.gather(*[m.stop_telemetry() for m in self._motors.values()])
+
+    @property
+    def positions(self) -> JointValues:
+        """Latest cached joint positions (rev). Requires start_telemetry()."""
+        return {j: m.position for j, m in self._motors.items()}
+
+    @property
+    def torques(self) -> JointValues:
+        """Latest cached joint torques (Nm / A). Requires start_telemetry()."""
+        return {j: m.torque for j, m in self._motors.items()}
 
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
@@ -57,19 +83,19 @@ class ArmController:
     # Getters                                                              #
     # ------------------------------------------------------------------ #
 
-    async def get_positions(self) -> dict[Joint, float]:
+    async def get_positions(self) -> JointValues:
         """Return shaft position (rev) for every joint, fetched concurrently."""
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_position() for j in joints])
         return dict(zip(joints, values))
 
-    async def get_velocities(self) -> dict[Joint, float]:
+    async def get_velocities(self) -> JointValues:
         """Return shaft velocity (rev/s) for every joint, fetched concurrently."""
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_velocity() for j in joints])
         return dict(zip(joints, values))
 
-    async def get_torques(self) -> dict[Joint, float]:
+    async def get_torques(self) -> JointValues:
         """Return torque estimate for every joint, fetched concurrently.
 
         Damiao: Nm. MyActuator: phase current in A.
@@ -78,7 +104,7 @@ class ArmController:
         values = await asyncio.gather(*[self._motors[j].get_torque() for j in joints])
         return dict(zip(joints, values))
 
-    async def get_temperatures(self) -> dict[Joint, float]:
+    async def get_temperatures(self) -> JointValues:
         """Return motor temperature (°C) for every joint, fetched concurrently."""
         joints = list(Joint)
         values = await asyncio.gather(
@@ -86,7 +112,7 @@ class ArmController:
         )
         return dict(zip(joints, values))
 
-    async def get_voltages(self) -> dict[Joint, float]:
+    async def get_voltages(self) -> JointValues:
         """Return bus voltage (V) for every joint, fetched concurrently."""
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_voltage() for j in joints])
@@ -110,9 +136,7 @@ class ArmController:
     # Setters                                                              #
     # ------------------------------------------------------------------ #
 
-    async def set_position(
-        self, positions: dict[Joint, float], max_speed: float
-    ) -> None:
+    async def set_position(self, positions: JointValues, max_speed: float) -> None:
         """Move joints to absolute positions using each motor's built-in controller.
 
         Args:
@@ -123,7 +147,7 @@ class ArmController:
             *[self._motors[j].set_position(p, max_speed) for j, p in positions.items()]
         )
 
-    async def set_velocity(self, velocities: dict[Joint, float]) -> None:
+    async def set_velocity(self, velocities: JointValues) -> None:
         """Command target velocities using each motor's built-in speed controller.
 
         Args:
@@ -140,7 +164,7 @@ class ArmController:
         """
         await asyncio.gather(*[self._motors[j].set_gains(g) for j, g in gains.items()])
 
-    async def motion_control(self, positions: dict[Joint, float]) -> None:
+    async def motion_control(self, positions: JointValues) -> None:
         """Send MIT impedance control to the specified joints concurrently.
 
         Gains (kp, kd, t_ff) are read from the AxolConfig supplied at construction.
@@ -170,9 +194,10 @@ class Axol:
 
         async with Axol() as axol:
             await axol.enable()
+            await axol.start_telemetry(500)  # 500 Hz
 
-            positions = await axol.get_positions()
-            print(positions.left[Joint.ELBOW])  # revolutions
+            # control loop — instant, no await
+            pos_l, pos_r = axol.left.positions, axol.right.positions
 
             await axol.motion_control(left={Joint.ELBOW: 0.5})
 
@@ -203,7 +228,26 @@ class Axol:
         return self
 
     async def __aexit__(self, *_) -> None:
-        await asyncio.gather(self._left_bus.close(), self._right_bus.close())
+        await asyncio.gather(
+            self.left.stop_telemetry(),
+            self.right.stop_telemetry(),
+            self._left_bus.close(),
+            self._right_bus.close(),
+        )
+
+    async def start_telemetry(self, hz: float) -> None:
+        """Start background telemetry polling on both arms at the given frequency.
+
+        Args:
+            hz: Poll frequency in Hz.
+        """
+        await asyncio.gather(
+            self.left.start_telemetry(hz), self.right.start_telemetry(hz)
+        )
+
+    async def stop_telemetry(self) -> None:
+        """Stop the background telemetry polling loop on both arms."""
+        await asyncio.gather(self.left.stop_telemetry(), self.right.stop_telemetry())
 
     async def enable(self) -> None:
         """Enable all motors on both arms."""
@@ -232,63 +276,50 @@ class Axol:
             self.right.set_acceleration(acceleration, deceleration),
         )
 
-    async def get_positions(self) -> tuple[dict[Joint, float], dict[Joint, float]]:
+    async def get_positions(self) -> tuple[JointValues, JointValues]:
         """Return joint positions (rev) for both arms as (left, right)."""
         return await asyncio.gather(
-            self.left.get_positions(),
-            self.right.get_positions(),
+            self.left.get_positions(), self.right.get_positions()
         )
 
-    async def get_velocities(self) -> tuple[dict[Joint, float], dict[Joint, float]]:
+    async def get_velocities(self) -> tuple[JointValues, JointValues]:
         """Return shaft velocity (rev/s) for both arms as (left, right)."""
         return await asyncio.gather(
-            self.left.get_velocities(),
-            self.right.get_velocities(),
+            self.left.get_velocities(), self.right.get_velocities()
         )
 
-    async def get_torques(self) -> tuple[dict[Joint, float], dict[Joint, float]]:
+    async def get_torques(self) -> tuple[JointValues, JointValues]:
         """Return torque estimates for both arms as (left, right)."""
-        return await asyncio.gather(
-            self.left.get_torques(),
-            self.right.get_torques(),
-        )
+        return await asyncio.gather(self.left.get_torques(), self.right.get_torques())
 
-    async def get_temperatures(self) -> tuple[dict[Joint, float], dict[Joint, float]]:
+    async def get_temperatures(self) -> tuple[JointValues, JointValues]:
         """Return motor temperatures (°C) for both arms as (left, right)."""
         return await asyncio.gather(
-            self.left.get_temperatures(),
-            self.right.get_temperatures(),
+            self.left.get_temperatures(), self.right.get_temperatures()
         )
 
-    async def get_voltages(self) -> tuple[dict[Joint, float], dict[Joint, float]]:
+    async def get_voltages(self) -> tuple[JointValues, JointValues]:
         """Return bus voltages (V) for both arms as (left, right)."""
-        return await asyncio.gather(
-            self.left.get_voltages(),
-            self.right.get_voltages(),
-        )
+        return await asyncio.gather(self.left.get_voltages(), self.right.get_voltages())
 
     async def get_error_codes(
         self,
     ) -> tuple[dict[Joint, MotorStatus], dict[Joint, MotorStatus]]:
         """Return MotorStatus for both arms as (left, right)."""
         return await asyncio.gather(
-            self.left.get_error_codes(),
-            self.right.get_error_codes(),
+            self.left.get_error_codes(), self.right.get_error_codes()
         )
 
     async def get_gains(
         self,
     ) -> tuple[dict[Joint, MotorGains], dict[Joint, MotorGains]]:
         """Return PID gains for both arms as (left, right)."""
-        return await asyncio.gather(
-            self.left.get_gains(),
-            self.right.get_gains(),
-        )
+        return await asyncio.gather(self.left.get_gains(), self.right.get_gains())
 
     async def set_position(
         self,
-        left: dict[Joint, float] = {},
-        right: dict[Joint, float] = {},
+        left: JointValues = {},
+        right: JointValues = {},
         max_speed: float = 0.0,
     ) -> None:
         """Move joints to absolute positions using each motor's built-in controller."""
@@ -302,8 +333,8 @@ class Axol:
 
     async def set_velocity(
         self,
-        left: dict[Joint, float] = {},
-        right: dict[Joint, float] = {},
+        left: JointValues = {},
+        right: JointValues = {},
     ) -> None:
         """Command target velocities (rev/s) on both arms concurrently."""
         tasks = []
@@ -330,8 +361,8 @@ class Axol:
 
     async def motion_control(
         self,
-        left: dict[Joint, float] = {},
-        right: dict[Joint, float] = {},
+        left: JointValues = {},
+        right: JointValues = {},
     ) -> None:
         """Send MIT impedance control to both arms concurrently.
 
