@@ -44,6 +44,16 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
+    async def set_position(self, position: float, max_speed: float) -> None:
+        """Move to an absolute position using the motor's built-in position controller.
+
+        Args:
+            position:  Target shaft position (rev)
+            max_speed: Maximum speed during the move (rev/s)
+        """
+        ...
+
+    @abstractmethod
     async def motion_control(
         self,
         p_des: float,
@@ -55,8 +65,8 @@ class MotorDriver(ABC):
         """Send an MIT-style impedance control command.
 
         Args:
-            p_des: Desired position (rad)
-            v_des: Desired velocity (rad/s)
+            p_des: Desired position (rev)
+            v_des: Desired velocity (rev/s)
             kp:    Position stiffness [0, 500]
             kd:    Velocity damping   [0, 5]
             t_ff:  Feedforward torque (Nm)

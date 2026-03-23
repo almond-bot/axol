@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import struct
 
 import can
@@ -24,6 +25,7 @@ _MA_RELEASE_BRAKE = 0x77
 _MA_MULTI_TURN_ANGLE = 0x92
 _MA_MOTOR_STATUS_2 = 0x9C
 _MA_SET_ENCODER_ZERO = 0x64
+_MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 
 _MA_P_MIN, _MA_P_MAX = -12.5, 12.5  # rad
 _MA_V_MIN, _MA_V_MAX = -45.0, 45.0  # rad/s
@@ -96,6 +98,17 @@ class MyActuatorMotor(MotorDriver):
         resp = await self._get_status2()
         return struct.unpack_from("<h", resp, 2)[0] * 0.01  # 0.01 A/LSB
 
+    async def set_position(self, position: float, max_speed: float) -> None:
+        # bytes 2-3: uint16 max speed in dps; bytes 4-7: int32 position in 0.01 degree units
+        speed_dps = int(max_speed * 360.0)
+        pos_centideg = int(position * 36000.0)  # rev * 360 deg/rev * 100 centideg/deg
+        data = (
+            bytes([_MA_POS_CONTROL, 0x00])
+            + struct.pack("<H", speed_dps)
+            + struct.pack("<i", pos_centideg)
+        )
+        await self._request(data)
+
     async def motion_control(
         self,
         p_des: float,
@@ -105,8 +118,8 @@ class MyActuatorMotor(MotorDriver):
         t_ff: float,
         timeout: float = 0.05,
     ) -> None:
-        p_u = _float_to_uint(p_des, _MA_P_MIN, _MA_P_MAX, 16)
-        v_u = _float_to_uint(v_des, _MA_V_MIN, _MA_V_MAX, 12)
+        p_u = _float_to_uint(p_des * 2 * math.pi, _MA_P_MIN, _MA_P_MAX, 16)
+        v_u = _float_to_uint(v_des * 2 * math.pi, _MA_V_MIN, _MA_V_MAX, 12)
         kp_u = _float_to_uint(kp, _MA_KP_MIN, _MA_KP_MAX, 12)
         kd_u = _float_to_uint(kd, _MA_KD_MIN, _MA_KD_MAX, 12)
         t_u = _float_to_uint(t_ff, _MA_T_MIN, _MA_T_MAX, 12)

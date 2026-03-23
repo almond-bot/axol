@@ -189,6 +189,14 @@ class DamaioMotor(MotorDriver):
         feedback = await self._request_feedback()
         return feedback.torque
 
+    async def set_position(self, position: float, max_speed: float) -> None:
+        # convert rev → rad for POS_VEL mode (arb_id 0x100 + motor_id)
+        await self.send_cmd(
+            target_position=position * 2 * math.pi,
+            target_velocity=max_speed * 2 * math.pi,
+            control_mode=_ControlMode.POS_VEL,
+        )
+
     async def motion_control(
         self,
         p_des: float,
@@ -197,9 +205,10 @@ class DamaioMotor(MotorDriver):
         kd: float,
         t_ff: float,
     ) -> None:
+        # convert rev → rad for MIT mode
         await self.send_cmd(
-            target_position=p_des,
-            target_velocity=v_des,
+            target_position=p_des * 2 * math.pi,
+            target_velocity=v_des * 2 * math.pi,
             stiffness=kp,
             damping=kd,
             feedforward_torque=t_ff,
