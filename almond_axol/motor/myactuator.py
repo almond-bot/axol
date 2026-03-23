@@ -139,7 +139,7 @@ class MyActuatorMotor(MotorDriver):
         await self._request(self._cmd(_MA_SHUTDOWN))
 
     async def clear_errors(self) -> None:
-        await self._request(self._cmd(_MA_STOP))
+        pass  # MyActuator has no clear-errors command
 
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
