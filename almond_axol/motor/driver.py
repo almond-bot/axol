@@ -148,3 +148,32 @@ class MotorDriver(ABC):
             t_ff:  Feedforward torque (Nm)
         """
         ...
+
+    @abstractmethod
+    async def set_can_id(self, can_id: int) -> None:
+        """Change the motor's CAN ID and persist it to flash.
+
+        The change takes effect immediately on the motor; subsequent commands
+        must use the new ID (the driver updates its internal state automatically).
+
+        Damiao: also sets the feedback ID to can_id + 0x10.
+
+        Args:
+            can_id: New CAN ID for the motor.
+        """
+        ...
+
+    @abstractmethod
+    async def set_can_baud_rate(self, baud_rate: int) -> None:
+        """Change the motor's CAN baud rate and persist it to flash.
+
+        The motor must be power-cycled for the new baud rate to take effect.
+
+        Args:
+            baud_rate: Baud rate in bps. Supported values:
+                       MyActuator — 500_000, 1_000_000
+                       Damiao     — 125_000, 200_000, 250_000, 500_000,
+                                    1_000_000, 2_000_000, 2_500_000,
+                                    3_200_000, 4_000_000, 5_000_000
+        """
+        ...

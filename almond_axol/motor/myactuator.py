@@ -31,6 +31,8 @@ _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
 _MA_SET_ENCODER_ZERO = 0x64
 _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
+_MA_SET_CAN_ID = 0x79  # change CAN ID
+_MA_SET_CAN_BAUD = 0xB4  # change CAN baud rate
 _MA_READ_GAINS = 0x30  # read all PID gains (uint8, bulk)
 _MA_WRITE_GAINS_ROM = (
     0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
@@ -48,6 +50,11 @@ _MA_V_MIN, _MA_V_MAX = -45.0, 45.0  # rad/s
 _MA_T_MIN, _MA_T_MAX = -24.0, 24.0  # Nm
 _MA_KP_MIN, _MA_KP_MAX = 0.0, 500.0
 _MA_KD_MIN, _MA_KD_MAX = 0.0, 5.0
+
+_MA_BAUD_MAP: dict[int, int] = {
+    500_000: 0,
+    1_000_000: 1,
+}
 
 # Acceleration range in dps/s²; [100, 60000] — 0 disables ramping.
 _MA_ACC_MIN_DPS_S2 = 100
@@ -237,6 +244,21 @@ class MyActuatorMotor(MotorDriver):
                 0,
             ]
         )
+        await self._request(data)
+
+    async def set_can_id(self, can_id: int) -> None:
+        # Byte 6 carries the new CAN ID; response arrives on the old resp ID.
+        data = bytes([_MA_SET_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, can_id, 0x00])
+        await self._request(data)
+        self._motor_id = can_id
+
+    async def set_can_baud_rate(self, baud_rate: int) -> None:
+        code = _MA_BAUD_MAP.get(baud_rate)
+        if code is None:
+            raise MotorError(
+                f"Unsupported baud rate {baud_rate}. Supported: {sorted(_MA_BAUD_MAP)}"
+            )
+        data = bytes([_MA_SET_CAN_BAUD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, code])
         await self._request(data)
 
     async def motion_control(

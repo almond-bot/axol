@@ -23,7 +23,7 @@ class Joint(Enum):
 
 class _MotorType(Enum):
     MYACTUATOR = "myactuator"
-    DAMAIO = "damiao"
+    DAMIAO = "damiao"
 
 
 @dataclass(frozen=True)
@@ -38,9 +38,9 @@ _JOINT_CONFIG: dict[Joint, _JointConfig] = {
     Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03),
     Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04),
     Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05),
-    Joint.WRIST_2: _JointConfig(_MotorType.DAMAIO, motor_id=0x06),
-    Joint.WRIST_3: _JointConfig(_MotorType.DAMAIO, motor_id=0x07),
-    Joint.GRIPPER: _JointConfig(_MotorType.DAMAIO, motor_id=0x08),
+    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06),
+    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
+    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
 }
 
 
@@ -56,16 +56,15 @@ class Motor:
         pos = await motor.get_position()  # revolutions
     """
 
-    def __init__(self, bus: CanBus, joint: Joint) -> None:
+    def __init__(self, bus: CanBus, joint: Joint, can_id: int | None = None) -> None:
         self.joint = joint
         cfg = _JOINT_CONFIG[joint]
+        motor_id = can_id if can_id is not None else cfg.motor_id
         self._driver: MotorDriver
         if cfg.kind == _MotorType.MYACTUATOR:
-            self._driver = MyActuatorMotor(bus, cfg.motor_id)
+            self._driver = MyActuatorMotor(bus, motor_id)
         else:
-            self._driver = DamiaoMotor(
-                bus, cfg.motor_id, feedback_id=0x10 + cfg.motor_id
-            )
+            self._driver = DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
 
     async def enable(self) -> None:
         """Enable the motor and release the brake."""
@@ -171,6 +170,33 @@ class Motor:
             gains: Gain values to write. Damiao ignores current_kp / current_ki.
         """
         await self._driver.set_gains(gains)
+
+    async def set_can_id(self, can_id: int) -> None:
+        """Change the motor's CAN ID and persist it to flash.
+
+        The driver updates its internal state immediately so subsequent commands
+        use the new ID without re-instantiation.
+
+        Damiao: also sets the feedback ID to can_id + 0x10.
+
+        Args:
+            can_id: New CAN ID for the motor.
+        """
+        await self._driver.set_can_id(can_id)
+
+    async def set_can_baud_rate(self, baud_rate: int) -> None:
+        """Change the motor's CAN baud rate and persist it to flash.
+
+        The motor must be power-cycled for the new baud rate to take effect.
+
+        Args:
+            baud_rate: Baud rate in bps. Supported values:
+                       MyActuator — 500_000, 1_000_000
+                       Damiao     — 125_000, 200_000, 250_000, 500_000,
+                                    1_000_000, 2_000_000, 2_500_000,
+                                    3_200_000, 4_000_000, 5_000_000
+        """
+        await self._driver.set_can_baud_rate(baud_rate)
 
     async def motion_control(
         self,

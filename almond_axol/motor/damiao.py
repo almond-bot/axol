@@ -51,11 +51,27 @@ _DM_REG_VMAX = 22
 _DM_REG_TMAX = 23
 _DM_REG_ACC = 4  # acceleration ramp (float, rad/s²)
 _DM_REG_DEC = 5  # deceleration ramp (float, rad/s²)
+_DM_REG_FEEDBACK_ID = 7  # MST_ID — CAN ID used for feedback frames (uint32)
+_DM_REG_CAN_ID = 8  # ESC_ID — CAN ID used for receiving commands (uint32)
+_DM_REG_CAN_BAUD = 35  # can_br — baud rate code (uint32)
 _DM_REG_VBUS = 60  # bus voltage (float, V, read-only)
 _DM_REG_SPEED_KP = 25  # KP_ASR — speed loop proportional gain
 _DM_REG_SPEED_KI = 26  # KI_ASR — speed loop integral gain
 _DM_REG_POS_KP = 27  # KP_APR — position loop proportional gain
 _DM_REG_POS_KI = 28  # KI_APR — position loop integral gain
+
+_DM_BAUD_MAP: dict[int, int] = {
+    125_000: 0,
+    200_000: 1,
+    250_000: 2,
+    500_000: 3,
+    1_000_000: 4,
+    2_000_000: 5,
+    2_500_000: 6,
+    3_200_000: 7,
+    4_000_000: 8,
+    5_000_000: 9,
+}
 
 _DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
     _DamiaoStatus.DISABLED: MotorStatus.DISABLED,
@@ -336,6 +352,23 @@ class DamiaoMotor(MotorDriver):
         await self._write_register(_DM_REG_SPEED_KI, gains.speed_ki)
         await self._write_register(_DM_REG_POS_KP, gains.position_kp)
         await self._write_register(_DM_REG_POS_KI, gains.position_ki)
+        await self._store_parameters()
+
+    async def set_can_id(self, can_id: int) -> None:
+        feedback_id = can_id + 0x10
+        await self._write_register(_DM_REG_CAN_ID, float(can_id))
+        await self._write_register(_DM_REG_FEEDBACK_ID, float(feedback_id))
+        await self._store_parameters()
+        self._motor_id = can_id
+        self._feedback_id = feedback_id
+
+    async def set_can_baud_rate(self, baud_rate: int) -> None:
+        code = _DM_BAUD_MAP.get(baud_rate)
+        if code is None:
+            raise MotorError(
+                f"Unsupported baud rate {baud_rate}. Supported: {sorted(_DM_BAUD_MAP)}"
+            )
+        await self._write_register(_DM_REG_CAN_BAUD, float(code))
         await self._store_parameters()
 
     async def motion_control(
