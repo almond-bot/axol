@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Almond Axol SDK"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "python-can>=4.0",
+]
 
 [project.scripts]
 almond-axol = "almond_axol.cli:main"
@@ -16,5 +18,3 @@ almond-axol = "almond_axol.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"almond_axol/script/setup_can.sh" = "almond_axol/script/setup_can.sh"
