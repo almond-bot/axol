@@ -10,7 +10,7 @@ import struct
 import can
 
 from .bus import CanBus
-from .driver import _MotorDriver
+from .driver import MotorDriver
 from .errors import MotorError
 
 _MA_REQ     = 0x140  # standard command request  → 0x140 + motor_id
@@ -35,7 +35,7 @@ def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 
 
-class _MyActuatorMotor(_MotorDriver):
+class MyActuatorMotor(MotorDriver):
     def __init__(self, bus: CanBus, motor_id: int) -> None:
         self._bus = bus
         self._motor_id = motor_id

@@ -11,7 +11,7 @@ from enum import Enum
 import can
 
 from .bus import CanBus
-from .driver import _MotorDriver
+from .driver import MotorDriver
 from .errors import MotorError
 
 
@@ -59,7 +59,7 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
     return float(x_int) * (x_max - x_min) / ((1 << bits) - 1) + x_min
 
 
-class _DamaioMotor(_MotorDriver):
+class DamaioMotor(MotorDriver):
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
         self._bus = bus
         self._motor_id = motor_id

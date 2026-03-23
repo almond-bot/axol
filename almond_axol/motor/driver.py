@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 
-class _MotorDriver(ABC):
+class MotorDriver(ABC):
     @abstractmethod
     async def enable(self) -> None: ...
 

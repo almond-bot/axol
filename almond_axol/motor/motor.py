@@ -4,9 +4,9 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .bus import CanBus
-from .damaio import _DamaioMotor
-from .driver import _MotorDriver
-from .myactuator import _MyActuatorMotor
+from .damaio import DamaioMotor
+from .driver import MotorDriver
+from .myactuator import MyActuatorMotor
 
 
 class Joint(Enum):
@@ -58,11 +58,11 @@ class Motor:
     def __init__(self, bus: CanBus, joint: Joint) -> None:
         self.joint = joint
         cfg = _JOINT_CONFIG[joint]
-        self._driver: _MotorDriver
+        self._driver: MotorDriver
         if cfg.kind == _MotorType.MYACTUATOR:
-            self._driver = _MyActuatorMotor(bus, cfg.motor_id)
+            self._driver = MyActuatorMotor(bus, cfg.motor_id)
         else:
-            self._driver = _DamaioMotor(bus, cfg.motor_id, feedback_id=0x10 + cfg.motor_id)
+            self._driver = DamaioMotor(bus, cfg.motor_id, feedback_id=0x10 + cfg.motor_id)
 
     async def enable(self) -> None:
         await self._driver.enable()
