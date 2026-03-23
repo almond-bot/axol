@@ -1,10 +1,6 @@
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass
-from pathlib import Path
-
-_DEFAULT_CONFIG = Path(__file__).parent / "config.json"
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -17,43 +13,29 @@ class JointGains:
         t_ff: Feedforward torque (Nm)
     """
 
-    kp: float
-    kd: float
-    t_ff: float
+    kp: float = 0.0
+    kd: float = 0.0
+    t_ff: float = 0.0
 
 
 @dataclass
 class AxolConfig:
-    """Per-joint impedance control gains for the full robot.
+    """Per-joint impedance control gains for the full arm.
 
-    Load from a JSON file with ``AxolConfig.load(path)`` or use the
-    bundled defaults with ``AxolConfig.load()``.
+    All joints default to zero gains. Override individual joints at construction
+    or use ``dataclasses.replace()`` for partial updates::
 
-    JSON schema — each key is a joint name, value has kp, kd, and t_ff:
+        from dataclasses import replace
 
-        {
-          "shoulder_1": {"kp": 100.0, "kd": 2.0, "t_ff": 0.0},
-          ...
-        }
+        config = replace(AxolConfig(), elbow=JointGains(kp=20.0, kd=2.0))
+        async with Axol(config=config) as axol: ...
     """
 
-    shoulder_1: JointGains
-    shoulder_2: JointGains
-    shoulder_3: JointGains
-    elbow: JointGains
-    wrist_1: JointGains
-    wrist_2: JointGains
-    wrist_3: JointGains
-    gripper: JointGains
-
-    @classmethod
-    def load(cls, path: str | Path | None = None) -> AxolConfig:
-        """Load gains from a JSON file.
-
-        Args:
-            path: Path to the JSON config file.
-                  Defaults to the bundled ``config.json``.
-        """
-        with open(path or _DEFAULT_CONFIG) as f:
-            data = json.load(f)
-        return cls(**{name: JointGains(**vals) for name, vals in data.items()})
+    shoulder_1: JointGains = field(default_factory=JointGains)
+    shoulder_2: JointGains = field(default_factory=JointGains)
+    shoulder_3: JointGains = field(default_factory=JointGains)
+    elbow: JointGains = field(default_factory=JointGains)
+    wrist_1: JointGains = field(default_factory=JointGains)
+    wrist_2: JointGains = field(default_factory=JointGains)
+    wrist_3: JointGains = field(default_factory=JointGains)
+    gripper: JointGains = field(default_factory=JointGains)

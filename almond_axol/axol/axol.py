@@ -213,15 +213,14 @@ class Axol:
 
     def __init__(
         self,
-        config: AxolConfig | None = None,
+        config: AxolConfig = AxolConfig(),
         left_channel: str = CAN_LEFT,
         right_channel: str = CAN_RIGHT,
     ) -> None:
-        cfg = config or AxolConfig.load()
         self._left_bus = CanBus(left_channel)
         self._right_bus = CanBus(right_channel)
-        self.left = ArmController(self._left_bus, cfg)
-        self.right = ArmController(self._right_bus, cfg)
+        self.left = ArmController(self._left_bus, config)
+        self.right = ArmController(self._right_bus, config)
 
     async def __aenter__(self) -> Axol:
         await asyncio.gather(self._left_bus.start(), self._right_bus.start())
