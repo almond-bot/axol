@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .bus import CanBus
-from .damaio import DamaioMotor
+from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .myactuator import MyActuatorMotor
 
@@ -22,7 +22,7 @@ class Joint(Enum):
 
 class _MotorType(Enum):
     MYACTUATOR = "myactuator"
-    DAMAIO = "damaio"
+    DAMAIO = "damiao"
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class Motor:
         if cfg.kind == _MotorType.MYACTUATOR:
             self._driver = MyActuatorMotor(bus, cfg.motor_id)
         else:
-            self._driver = DamaioMotor(
+            self._driver = DamiaoMotor(
                 bus, cfg.motor_id, feedback_id=0x10 + cfg.motor_id
             )
 
@@ -93,7 +93,7 @@ class Motor:
     async def get_torque(self) -> float:
         """Return current torque estimate.
 
-        Damaio: estimated output torque in Nm.
+        Damiao: estimated output torque in Nm.
         MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
         """
         return await self._driver.get_torque()

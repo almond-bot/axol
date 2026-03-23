@@ -22,7 +22,7 @@ class _ControlMode(Enum):
     FORCE_POS = "force_pos"
 
 
-class _DamaioStatus(Enum):
+class _DamiaoStatus(Enum):
     DISABLED = 0x0
     ENABLED = 0x1
     OVER_VOLTAGE = 0x8
@@ -36,7 +36,7 @@ class _DamaioStatus(Enum):
 
 @dataclass
 class _MotorFeedback:
-    status: _DamaioStatus
+    status: _DamiaoStatus
     position: float  # rad (motor internal)
     velocity: float  # rad/s
     torque: float  # Nm
@@ -59,7 +59,7 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
     return float(x_int) * (x_max - x_min) / ((1 << bits) - 1) + x_min
 
 
-class DamaioMotor(MotorDriver):
+class DamiaoMotor(MotorDriver):
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
         self._bus = bus
         self._motor_id = motor_id
@@ -109,9 +109,9 @@ class DamaioMotor(MotorDriver):
         torq_int = ((data[4] & 0xF) << 8) | data[5]
 
         try:
-            status = _DamaioStatus(status_code)
+            status = _DamiaoStatus(status_code)
         except ValueError:
-            status = _DamaioStatus.DISABLED
+            status = _DamiaoStatus.DISABLED
 
         self._feedback = _MotorFeedback(
             status=status,
@@ -143,7 +143,7 @@ class DamaioMotor(MotorDriver):
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             raise MotorError(
-                f"Damaio motor {self._motor_id:#04x} register {rid} read timed out"
+                f"Damiao motor {self._motor_id:#04x} register {rid} read timed out"
             )
 
     async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
@@ -155,7 +155,7 @@ class DamaioMotor(MotorDriver):
         try:
             return await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
-            raise MotorError(f"Damaio motor {self._motor_id:#04x} feedback timed out")
+            raise MotorError(f"Damiao motor {self._motor_id:#04x} feedback timed out")
 
     async def enable(self) -> None:
         pmax, vmax, tmax = await asyncio.gather(

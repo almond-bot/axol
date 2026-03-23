@@ -38,7 +38,7 @@ class MotorDriver(ABC):
     async def get_torque(self) -> float:
         """Return current torque estimate.
 
-        Damaio: estimated output torque in Nm.
+        Damiao: estimated output torque in Nm.
         MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
         """
         ...
