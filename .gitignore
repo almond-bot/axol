@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Auto-generated TLS certificates
+almond_axol/vr/certs

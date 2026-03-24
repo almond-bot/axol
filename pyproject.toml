@@ -9,7 +9,10 @@ description = "Almond Axol SDK"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "python-can>=4.0",
+    "python-can>=4.6.1",
+    "fastapi>=0.135.2",
+    "uvicorn[standard]>=0.42.0",
+    "pydantic>=2.12.5",
 ]
 
 [project.scripts]
