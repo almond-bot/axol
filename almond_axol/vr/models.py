@@ -60,6 +60,7 @@ class VRFrame(BaseModel):
         l_lock:  Left deadman switch; only track left arm movement while True.
         r_lock:  Right deadman switch; only track right arm movement while True.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
+        state:   Current teleoperation session state (idle / teleop / recording).
     """
 
     l_ee: VRPose
@@ -71,4 +72,4 @@ class VRFrame(BaseModel):
     l_lock: bool = False
     r_lock: bool = False
     reset: bool = False
-    state: VRState = VRState.IDLE
+    state: VRState = VRState.IDLE  # Current teleoperation session state.
