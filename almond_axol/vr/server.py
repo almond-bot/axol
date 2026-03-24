@@ -11,7 +11,7 @@ Typical usage::
         while True:
             frame = vr.get_frame()
             if frame is not None:
-                print(frame.left, frame.right, frame.l_grip, frame.r_grip)
+                print(frame.l_ee, frame.r_ee, frame.l_elbow, frame.r_elbow)
             await asyncio.sleep(0.01)
 
 Or with an on_frame callback::

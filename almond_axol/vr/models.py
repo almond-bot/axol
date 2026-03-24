@@ -9,6 +9,14 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 
+class VRPosition(BaseModel):
+    """3-DOF position in metres."""
+
+    x: float
+    y: float
+    z: float
+
+
 class VRPose(BaseModel):
     """6-DOF pose from a VR controller.
 
@@ -28,8 +36,10 @@ class VRFrame(BaseModel):
     """Single teleoperation frame sent by the VR headset.
 
     Attributes:
-        left:    Left controller pose (position + orientation).
-        right:   Right controller pose (position + orientation).
+        l_ee:    Left end-effector pose (position + orientation).
+        r_ee:    Right end-effector pose (position + orientation).
+        l_elbow: Left elbow position.
+        r_elbow: Right elbow position.
         l_grip:  Left gripper command — 0.0 = fully closed, 1.0 = fully open.
         r_grip:  Right gripper command — 0.0 = fully closed, 1.0 = fully open.
         l_lock:  Left deadman switch; only track left arm movement while True.
@@ -37,8 +47,10 @@ class VRFrame(BaseModel):
         reset:   Rising edge (False → True) triggers a reset to rest pose.
     """
 
-    left: VRPose
-    right: VRPose
+    l_ee: VRPose
+    r_ee: VRPose
+    l_elbow: VRPosition
+    r_elbow: VRPosition
     l_grip: float = 1.0
     r_grip: float = 1.0
     l_lock: bool = False

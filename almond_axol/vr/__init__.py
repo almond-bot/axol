@@ -17,7 +17,7 @@ Usage
         frame: VRFrame | None = vr.get_frame()
 """
 
-from .models import VRFrame, VRPose
+from .models import VRFrame, VRPose, VRPosition
 from .server import VRServer
 
-__all__ = ["VRServer", "VRFrame", "VRPose"]
+__all__ = ["VRServer", "VRFrame", "VRPose", "VRPosition"]
