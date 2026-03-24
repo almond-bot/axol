@@ -14,13 +14,13 @@ from pydantic import BaseModel
 class VRState(str, Enum):
     """Teleoperation session state for data collection.
 
-    IDLE:      No active teleoperation or recording.
+    DATA_COLLECTION: Teleoperating and collecting data without recording.
     TELEOP:    Actively teleoperating the arm.
     RECORDING: Teleoperating and recording a demonstration.
     """
 
-    IDLE = "idle"
     TELEOP = "teleop"
+    DATA_COLLECTION = "data_collection"
     RECORDING = "recording"
 
 
@@ -72,4 +72,4 @@ class VRFrame(BaseModel):
     l_lock: bool = False
     r_lock: bool = False
     reset: bool = False
-    state: VRState = VRState.IDLE  # Current teleoperation session state.
+    state: VRState = VRState.TELEOP  # Current teleoperation session state.
