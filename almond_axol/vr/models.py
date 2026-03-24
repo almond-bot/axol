@@ -32,19 +32,23 @@ class VRPosition(BaseModel):
     z: float
 
 
+class VRQuaternion(BaseModel):
+    """Unit quaternion orientation."""
+
+    x: float
+    y: float
+    z: float
+    w: float
+
+
 class VRPose(BaseModel):
     """6-DOF pose from a VR controller.
 
     Position is in metres; orientation is a unit quaternion.
     """
 
-    x: float
-    y: float
-    z: float
-    qx: float
-    qy: float
-    qz: float
-    qw: float
+    position: VRPosition
+    quaternion: VRQuaternion
 
 
 class VRFrame(BaseModel):
@@ -60,7 +64,7 @@ class VRFrame(BaseModel):
         l_lock:  Left deadman switch; only track left arm movement while True.
         r_lock:  Right deadman switch; only track right arm movement while True.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
-        state:   Current teleoperation session state (idle / teleop / recording).
+        state:   Current teleoperation session state (data_collection / teleop / recording).
     """
 
     l_ee: VRPose
@@ -72,4 +76,4 @@ class VRFrame(BaseModel):
     l_lock: bool = False
     r_lock: bool = False
     reset: bool = False
-    state: VRState = VRState.TELEOP  # Current teleoperation session state.
+    state: VRState = VRState.TELEOP
