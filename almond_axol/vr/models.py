@@ -6,7 +6,22 @@ The VR headset sends JSON matching VRFrame over the WebSocket connection.
 
 from __future__ import annotations
 
+from enum import Enum
+
 from pydantic import BaseModel
+
+
+class VRState(str, Enum):
+    """Teleoperation session state for data collection.
+
+    IDLE:      No active teleoperation or recording.
+    TELEOP:    Actively teleoperating the arm.
+    RECORDING: Teleoperating and recording a demonstration.
+    """
+
+    IDLE = "idle"
+    TELEOP = "teleop"
+    RECORDING = "recording"
 
 
 class VRPosition(BaseModel):
@@ -56,3 +71,4 @@ class VRFrame(BaseModel):
     l_lock: bool = False
     r_lock: bool = False
     reset: bool = False
+    state: VRState = VRState.IDLE
