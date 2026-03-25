@@ -152,7 +152,14 @@ def _register_cron() -> None:
         print(f"  Added: {cron_entry}")
 
 
-def run() -> None:
+def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    subparsers.add_parser(
+        "setup-can",
+        help="Configure CAN interfaces for the Axol arm.",
+    ).set_defaults(func=run)
+
+
+def run(_args: object = None) -> None:
     _require_root()
     serial = _find_serial()
     _write_udev_rules(serial)
