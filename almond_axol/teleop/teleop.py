@@ -254,9 +254,10 @@ class VRTeleop:
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
 
+        self._last_ik_duration: float | None = None
         self._reset_interp = ResetInterpolator()
-        self._smooth_left = AlphaSmoothFilter()
-        self._smooth_right = AlphaSmoothFilter()
+        self._smooth_left = AlphaSmoothFilter(alpha=config.smooth_alpha)
+        self._smooth_right = AlphaSmoothFilter(alpha=config.smooth_alpha)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -314,15 +315,25 @@ class VRTeleop:
         """
         interval = 1.0 / self._config.frequency
         loop_times: list[float] = []
+        ik_durations: list[float] = []
         last_log = time.perf_counter()
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         q_zeros = np.zeros(self._solver.num_joints, dtype=np.float32)
-        self._reset_interp.set(q_zeros, self._build_rest_q_full())
+        q_rest = self._build_rest_q_full()
+        trajectory = self.compute_reset_trajectory(q_zeros, q_rest)
+        if not trajectory:
+            raise RuntimeError(
+                "compute_reset_trajectory returned empty trajectory on startup"
+            )
+        self._reset_interp.set_trajectory(trajectory)
         try:
             while True:
                 t0 = time.perf_counter()
                 left, right = self.step()
+                if self._last_ik_duration is not None:
+                    ik_durations.append(self._last_ik_duration)
+                    self._last_ik_duration = None
                 if left is not None or right is not None:
                     await self._robot.set_positions(left=left, right=right)
 
@@ -331,7 +342,13 @@ class VRTeleop:
                 if now - last_log >= 1.0 and len(loop_times) > 1:
                     total = loop_times[-1] - loop_times[0]
                     rate = (len(loop_times) - 1) / total
-                    _logger.debug("loop rate: %.1f Hz", rate)
+                    if ik_durations:
+                        avg_ik_s = sum(ik_durations) / len(ik_durations)
+                        ik_hz = 1.0 / avg_ik_s if avg_ik_s > 0 else float("inf")
+                        _logger.info("loop: %.1f Hz  ik: %.1f Hz", rate, ik_hz)
+                        ik_durations.clear()
+                    else:
+                        _logger.info("loop: %.1f Hz", rate)
                     loop_times.clear()
                     last_log = now
 
@@ -383,10 +400,11 @@ class VRTeleop:
             q_full = self._build_q_full()
             q_target = self._build_rest_q_full()
             trajectory = self.compute_reset_trajectory(q_full, q_target)
-            if trajectory:
-                self._reset_interp.set_trajectory(trajectory)
-            else:
-                self._reset_interp.set(q_full, q_target)
+            if not trajectory:
+                raise RuntimeError(
+                    "compute_reset_trajectory returned empty trajectory on reset"
+                )
+            self._reset_interp.set_trajectory(trajectory)
             return None, None
 
         # 4. Deadman not engaged — hold current q
@@ -459,6 +477,7 @@ class VRTeleop:
             right_e - self._snap_elbow_ctrl["right"]
         )
 
+        _ik_t0 = time.perf_counter()
         left_jv, right_jv = self._solver.ik(
             left_pose=tl,
             right_pose=tr,
@@ -471,6 +490,7 @@ class VRTeleop:
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
+        self._last_ik_duration = time.perf_counter() - _ik_t0
         q_left_new = np.array(
             [rev_to_rad(left_jv[j]) for j in ARM_JOINTS], dtype=np.float32
         )

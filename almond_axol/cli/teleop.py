@@ -6,6 +6,7 @@ Run a VR teleoperation session with default parameters.
 
 import argparse
 import asyncio
+import logging
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -16,10 +17,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         required=True,
         help="Robot backend: 'axol' for hardware, 'sim' for visualizer.",
     )
+    p.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO).",
+    )
     p.set_defaults(func=run)
 
 
 def run(args: argparse.Namespace) -> None:
+    logging.basicConfig(level=getattr(logging, args.log_level))
     asyncio.run(_run(args.robot))
 
 

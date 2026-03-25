@@ -30,6 +30,8 @@ class TeleopConfig:
         reset_collision_weight: Cost weight on self-collision penalty during
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
+        smooth_alpha: Exponential smoothing factor for IK output in (0, 1].
+            ``1.0`` disables smoothing. Lower values = smoother but more lag.
     """
 
     rest_pose_left: JointValues = field(
@@ -42,10 +44,11 @@ class TeleopConfig:
             zip(ARM_JOINTS, [-0.05, 0.0, 0.0, 0.1, 0.0, 0.0, -0.05])
         )
     )
-    frequency: float = 100.0
+    frequency: float = 120.0
     reset_speed: float = 0.1
     reset_rest_weight: float = 20.0
     reset_limit_weight: float = 100.0
     reset_collision_margin: float = 0.01
     reset_collision_weight: float = 10.0
     reset_max_iterations: int = 10
+    smooth_alpha: float = 0.45
