@@ -1,4 +1,3 @@
-
 <?xml version="1.0"?>
 <robot name="axol">
   <link name="world"></link>

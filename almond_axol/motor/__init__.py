@@ -22,9 +22,10 @@ Usage
         pos = await shoulder.get_position()  # revolutions
 """
 
+from ..shared import Joint, JointValues
 from .bus import CanBus
 from .errors import MotorError
-from .motor import Joint, JointValues, Motor
+from .motor import Motor
 from .types import MotorGains, MotorStatus
 
 __all__ = [
