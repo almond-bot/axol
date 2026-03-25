@@ -7,12 +7,12 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import struct
 from typing import Callable
 
 import can
 
+from ..shared import deg_to_rev, rev_to_deg, rev_to_rad
 from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
@@ -157,12 +157,12 @@ class MyActuatorMotor(MotorDriver):
         resp = await self._request(self._cmd(_MA_MULTI_TURN_ANGLE))
         raw = struct.unpack_from("<i", resp, 4)[0]
         degrees = raw * 0.01  # raw is in 0.01 degree units
-        return degrees / 360.0
+        return deg_to_rev(degrees)
 
     async def get_velocity(self) -> float:
         resp = await self._get_status2()
         speed_dps = struct.unpack_from("<h", resp, 4)[0]
-        return speed_dps / 360.0
+        return deg_to_rev(speed_dps)
 
     async def get_torque(self) -> float:
         resp = await self._get_status2()
@@ -203,8 +203,8 @@ class MyActuatorMotor(MotorDriver):
 
     async def set_position(self, position: float, max_speed: float) -> None:
         # bytes 2-3: uint16 max speed in dps; bytes 4-7: int32 position in 0.01 degree units
-        speed_dps = int(max_speed * 360.0)
-        pos_centideg = int(position * 36000.0)  # rev * 360 deg/rev * 100 centideg/deg
+        speed_dps = int(rev_to_deg(max_speed))
+        pos_centideg = int(rev_to_deg(position) * 100.0)  # rev → deg → centideg
         data = (
             bytes([_MA_POS_CONTROL, 0x00])
             + struct.pack("<H", speed_dps)
@@ -213,8 +213,8 @@ class MyActuatorMotor(MotorDriver):
         await self._request(data)
 
     async def set_velocity(self, velocity: float) -> None:
-        # bytes 4-7: int32 in centidps (dps × 100); rev/s → dps × 360 → centidps × 100
-        centidps = int(velocity * 36000.0)
+        # bytes 4-7: int32 in centidps (dps × 100); rev/s → dps → centidps × 100
+        centidps = int(rev_to_deg(velocity) * 100.0)
         data = bytes([_MA_VELOCITY_CONTROL, 0, 0, 0]) + struct.pack("<i", centidps)
         await self._request(data)
 
@@ -227,7 +227,7 @@ class MyActuatorMotor(MotorDriver):
         async def _send(accel_type: int, value_rev_s2: float) -> None:
             dps_s2 = max(
                 _MA_ACC_MIN_DPS_S2,
-                min(_MA_ACC_MAX_DPS_S2, int(value_rev_s2 * 360.0)),
+                min(_MA_ACC_MAX_DPS_S2, int(rev_to_deg(value_rev_s2))),
             )
             data = bytes([_MA_SET_ACCELERATION, accel_type, 0, 0]) + struct.pack(
                 "<I", dps_s2
@@ -299,8 +299,8 @@ class MyActuatorMotor(MotorDriver):
         t_ff: float,
         timeout: float = 0.05,
     ) -> None:
-        p_u = _float_to_uint(p_des * 2 * math.pi, _MA_P_MIN, _MA_P_MAX, 16)
-        v_u = _float_to_uint(v_des * 2 * math.pi, _MA_V_MIN, _MA_V_MAX, 12)
+        p_u = _float_to_uint(rev_to_rad(p_des), _MA_P_MIN, _MA_P_MAX, 16)
+        v_u = _float_to_uint(rev_to_rad(v_des), _MA_V_MIN, _MA_V_MAX, 12)
         kp_u = _float_to_uint(kp, _MA_KP_MIN, _MA_KP_MAX, 12)
         kd_u = _float_to_uint(kd, _MA_KD_MIN, _MA_KD_MAX, 12)
         t_u = _float_to_uint(t_ff, _MA_T_MIN, _MA_T_MAX, 12)

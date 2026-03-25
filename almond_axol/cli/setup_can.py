@@ -15,7 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..constants import CAN_LEFT, CAN_RIGHT
+from ..shared import CAN_LEFT, CAN_RIGHT
 
 _VID = "1d50"
 _PID = "606f"
