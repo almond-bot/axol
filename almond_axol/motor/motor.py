@@ -4,26 +4,13 @@ import asyncio
 from dataclasses import dataclass
 from enum import Enum
 
+from ..shared import Joint
 from .bus import CanBus
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .errors import MotorError
 from .myactuator import MyActuatorMotor
 from .types import MotorGains, MotorStatus
-
-
-class Joint(Enum):
-    SHOULDER_1 = "shoulder_1"
-    SHOULDER_2 = "shoulder_2"
-    SHOULDER_3 = "shoulder_3"
-    ELBOW = "elbow"
-    WRIST_1 = "wrist_1"
-    WRIST_2 = "wrist_2"
-    WRIST_3 = "wrist_3"
-    GRIPPER = "gripper"
-
-
-JointValues = dict[Joint, float]
 
 
 class _MotorType(Enum):

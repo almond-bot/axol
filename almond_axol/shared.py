@@ -1,9 +1,22 @@
 """Shared constants for the Almond Axol robot."""
 
 import math
+from enum import Enum
 from pathlib import Path
 
-from .motor import Joint
+
+class Joint(Enum):
+    SHOULDER_1 = "shoulder_1"
+    SHOULDER_2 = "shoulder_2"
+    SHOULDER_3 = "shoulder_3"
+    ELBOW = "elbow"
+    WRIST_1 = "wrist_1"
+    WRIST_2 = "wrist_2"
+    WRIST_3 = "wrist_3"
+    GRIPPER = "gripper"
+
+
+JointValues = dict[Joint, float]
 
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
