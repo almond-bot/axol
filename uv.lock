@@ -23,6 +23,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pyroki" },
     { name = "python-can" },
+    { name = "scipy" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "yourdfpy" },
 ]
@@ -45,6 +46,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.12.5" },
     { name = "pyroki", git = "https://github.com/chungmin99/pyroki.git" },
     { name = "python-can", specifier = ">=4.6.1" },
+    { name = "scipy", specifier = ">=1.17.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.42.0" },
     { name = "viser", marker = "extra == 'sim'", specifier = ">=1.0.24" },
     { name = "yourdfpy", specifier = ">=0.0.60" },
