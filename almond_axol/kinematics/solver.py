@@ -7,6 +7,7 @@ end-effector poses in the robot's world frame (FLU).
 
 from __future__ import annotations
 
+import functools
 import logging
 
 import jax
@@ -37,7 +38,7 @@ _RIGHT_SHOULDER = "right_shoulder_1_link"
 # ---------------------------------------------------------------------------
 
 
-@jax.jit
+@functools.partial(jax.jit, static_argnames=("max_iterations",))
 def _solve_ik(
     robot: pk.Robot,
     robot_coll: pk.collision.RobotCollision,
@@ -423,8 +424,17 @@ class KinematicsSolver:
         dummy_pose = jaxlie.SE3.from_rotation_and_translation(
             jaxlie.SO3.identity(), jnp.array([0.0, 0.0, 0.3])
         )
+        dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
         try:
+            # Compile both the no-elbow path (pose-only) and the full path
+            # (pose + elbow hints) so neither recompiles during live teleop.
             self.ik(left_pose=dummy_pose, right_pose=dummy_pose)
+            self.ik(
+                left_pose=dummy_pose,
+                right_pose=dummy_pose,
+                left_elbow_pos=dummy_elbow,
+                right_elbow_pos=dummy_elbow,
+            )
             q = np.zeros(self.num_joints, dtype=np.float32)
             self.robot.forward_kinematics(jnp.asarray(q))
         except Exception:
