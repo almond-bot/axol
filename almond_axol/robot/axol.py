@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from ..motor import CanBus, Joint, JointValues, Motor, MotorGains, MotorStatus
+import numpy as np
+
+from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
-from .base import RobotBase
+from .base import MotionControl
 from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
 
 
@@ -35,14 +37,20 @@ class ArmController:
         await asyncio.gather(*[m.stop_telemetry() for m in self._motors.values()])
 
     @property
-    def positions(self) -> JointValues:
-        """Latest cached joint positions (rev). Requires start_telemetry()."""
-        return {j: m.position for j, m in self._motors.items()}
+    def positions(self) -> np.ndarray:
+        """Latest cached joint positions (rad). Requires start_telemetry().
+
+        Returns shape (8,) array in Joint enum order.
+        """
+        return np.array([m.position for m in self._motors.values()], dtype=np.float32)
 
     @property
-    def torques(self) -> JointValues:
-        """Latest cached joint torques (Nm / A). Requires start_telemetry()."""
-        return {j: m.torque for j, m in self._motors.items()}
+    def torques(self) -> np.ndarray:
+        """Latest cached joint torques (Nm / A). Requires start_telemetry().
+
+        Returns shape (8,) array in Joint enum order.
+        """
+        return np.array([m.torque for m in self._motors.values()], dtype=np.float32)
 
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
@@ -70,8 +78,8 @@ class ArmController:
         """Set the acceleration ramp on all motors.
 
         Args:
-            acceleration: Acceleration ramp (rev/s²)
-            deceleration: Deceleration ramp (rev/s²). Defaults to acceleration.
+            acceleration: Acceleration ramp (rad/s²)
+            deceleration: Deceleration ramp (rad/s²). Defaults to acceleration.
         """
         await asyncio.gather(
             *[
@@ -84,40 +92,50 @@ class ArmController:
     # Getters                                                              #
     # ------------------------------------------------------------------ #
 
-    async def get_positions(self) -> JointValues:
-        """Return shaft position (rev) for every joint, fetched concurrently."""
+    async def get_positions(self) -> np.ndarray:
+        """Return shaft position (rad) for every joint, fetched concurrently.
+
+        Returns shape (8,) array in Joint enum order.
+        """
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_position() for j in joints])
-        return dict(zip(joints, values))
+        return np.array(values, dtype=np.float32)
 
-    async def get_velocities(self) -> JointValues:
-        """Return shaft velocity (rev/s) for every joint, fetched concurrently."""
+    async def get_velocities(self) -> np.ndarray:
+        """Return shaft velocity (rad/s) for every joint, fetched concurrently.
+
+        Returns shape (8,) array in Joint enum order.
+        """
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_velocity() for j in joints])
-        return dict(zip(joints, values))
+        return np.array(values, dtype=np.float32)
 
-    async def get_torques(self) -> JointValues:
+    async def get_torques(self) -> np.ndarray:
         """Return torque estimate for every joint, fetched concurrently.
 
         Damiao: Nm. MyActuator: phase current in A.
+        Returns shape (8,) array in Joint enum order.
         """
-        joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_torque() for j in joints])
-        return dict(zip(joints, values))
+        values = await asyncio.gather(*[m.get_torque() for m in self._motors.values()])
+        return np.array(values, dtype=np.float32)
 
-    async def get_temperatures(self) -> JointValues:
-        """Return motor temperature (°C) for every joint, fetched concurrently."""
-        joints = list(Joint)
+    async def get_temperatures(self) -> np.ndarray:
+        """Return motor temperature (°C) for every joint, fetched concurrently.
+
+        Returns shape (8,) array in Joint enum order.
+        """
         values = await asyncio.gather(
-            *[self._motors[j].get_temperature() for j in joints]
+            *[m.get_temperature() for m in self._motors.values()]
         )
-        return dict(zip(joints, values))
+        return np.array(values, dtype=np.float32)
 
-    async def get_voltages(self) -> JointValues:
-        """Return bus voltage (V) for every joint, fetched concurrently."""
-        joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_voltage() for j in joints])
-        return dict(zip(joints, values))
+    async def get_voltages(self) -> np.ndarray:
+        """Return bus voltage (V) for every joint, fetched concurrently.
+
+        Returns shape (8,) array in Joint enum order.
+        """
+        values = await asyncio.gather(*[m.get_voltage() for m in self._motors.values()])
+        return np.array(values, dtype=np.float32)
 
     async def get_error_codes(self) -> dict[Joint, MotorStatus]:
         """Return MotorStatus for every joint, fetched concurrently."""
@@ -137,25 +155,31 @@ class ArmController:
     # Setters                                                              #
     # ------------------------------------------------------------------ #
 
-    async def set_position(self, positions: JointValues, max_speed: float) -> None:
+    async def set_position(self, positions: np.ndarray, max_speed: float) -> None:
         """Move joints to absolute positions using each motor's built-in controller.
 
         Args:
-            positions: Target positions (rev) keyed by joint.
-            max_speed: Maximum speed for all commanded joints (rev/s).
+            positions: Shape (8,) array of target positions (rad) in Joint enum order.
+            max_speed: Maximum speed for all joints (rad/s).
         """
         await asyncio.gather(
-            *[self._motors[j].set_position(p, max_speed) for j, p in positions.items()]
+            *[
+                self._motors[j].set_position(float(positions[i]), max_speed)
+                for i, j in enumerate(Joint)
+            ]
         )
 
-    async def set_velocity(self, velocities: JointValues) -> None:
+    async def set_velocity(self, velocities: np.ndarray) -> None:
         """Command target velocities using each motor's built-in speed controller.
 
         Args:
-            velocities: Target velocities (rev/s) keyed by joint.
+            velocities: Shape (8,) array of target velocities (rad/s) in Joint enum order.
         """
         await asyncio.gather(
-            *[self._motors[j].set_velocity(v) for j, v in velocities.items()]
+            *[
+                self._motors[j].set_velocity(float(velocities[i]))
+                for i, j in enumerate(Joint)
+            ]
         )
 
     async def set_gains(self, gains: dict[Joint, MotorGains]) -> None:
@@ -165,29 +189,29 @@ class ArmController:
         """
         await asyncio.gather(*[self._motors[j].set_gains(g) for j, g in gains.items()])
 
-    async def motion_control(self, positions: JointValues) -> None:
-        """Send MIT impedance control to the specified joints concurrently.
+    async def motion_control(self, q: np.ndarray) -> None:
+        """Send MIT impedance control to all joints concurrently.
 
         Gains (kp, kd, t_ff) are read from the AxolConfig supplied at construction.
 
         Args:
-            positions: Desired positions (rev) keyed by joint.
+            q: Shape (8,) array of desired positions (rad) in Joint enum order.
         """
         await asyncio.gather(
             *[
                 self._motors[j].motion_control(
-                    p,
+                    float(q[i]),
                     0.0,
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
                     getattr(self._config, j.value).t_ff,
                 )
-                for j, p in positions.items()
+                for i, j in enumerate(Joint)
             ]
         )
 
 
-class Axol(RobotBase):
+class Axol(MotionControl):
     """Dual-arm Axol robot interface.
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry.
@@ -200,7 +224,7 @@ class Axol(RobotBase):
             # control loop — instant, no await
             pos_l, pos_r = axol.left.positions, axol.right.positions
 
-            await axol.motion_control(left={Joint.ELBOW: 0.5})
+            await axol.motion_control(left=np.array([0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0]))
 
     Attributes:
         left:  ArmController for the left arm.
@@ -270,36 +294,51 @@ class Axol(RobotBase):
     async def set_acceleration(
         self, acceleration: float, deceleration: float | None = None
     ) -> None:
-        """Set the acceleration ramp on all motors on both arms."""
+        """Set the acceleration ramp (rad/s²) on all motors on both arms."""
         await asyncio.gather(
             self.left.set_acceleration(acceleration, deceleration),
             self.right.set_acceleration(acceleration, deceleration),
         )
 
-    async def get_positions(self) -> tuple[JointValues, JointValues]:
-        """Return joint positions (rev) for both arms as (left, right)."""
+    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return joint positions (rad) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order.
+        """
         return await asyncio.gather(
             self.left.get_positions(), self.right.get_positions()
         )
 
-    async def get_velocities(self) -> tuple[JointValues, JointValues]:
-        """Return shaft velocity (rev/s) for both arms as (left, right)."""
+    async def get_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return shaft velocity (rad/s) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order.
+        """
         return await asyncio.gather(
             self.left.get_velocities(), self.right.get_velocities()
         )
 
-    async def get_torques(self) -> tuple[JointValues, JointValues]:
-        """Return torque estimates for both arms as (left, right)."""
+    async def get_torques(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return torque estimates for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order.
+        """
         return await asyncio.gather(self.left.get_torques(), self.right.get_torques())
 
-    async def get_temperatures(self) -> tuple[JointValues, JointValues]:
-        """Return motor temperatures (°C) for both arms as (left, right)."""
+    async def get_temperatures(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return motor temperatures (°C) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order.
+        """
         return await asyncio.gather(
             self.left.get_temperatures(), self.right.get_temperatures()
         )
 
-    async def get_voltages(self) -> tuple[JointValues, JointValues]:
-        """Return bus voltages (V) for both arms as (left, right)."""
+    async def get_voltages(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return bus voltages (V) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order.
+        """
         return await asyncio.gather(self.left.get_voltages(), self.right.get_voltages())
 
     async def get_error_codes(
@@ -318,44 +357,41 @@ class Axol(RobotBase):
 
     async def set_positions(
         self,
-        left: JointValues | None = None,
-        right: JointValues | None = None,
-    ) -> None:
-        """Command joint positions via MIT impedance control on both arms.
-
-        Gains are taken from the ``AxolConfig`` provided at construction.
-
-        Args:
-            left:  Target positions (rev) for the left arm.  ``None`` skips the arm.
-            right: Target positions (rev) for the right arm. ``None`` skips the arm.
-        """
-        await self.motion_control(left=left or {}, right=right or {})
-
-    async def set_position(
-        self,
-        left: JointValues = {},
-        right: JointValues = {},
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
         max_speed: float = 0.0,
     ) -> None:
-        """Move joints to absolute positions using each motor's built-in controller."""
+        """Command joint positions (rad) via the motor's built-in position controller.
+
+        Args:
+            left:      Shape (8,) array of target positions (rad) in Joint enum order.
+                       ``None`` skips the arm.
+            right:     Same for the right arm.
+            max_speed: Maximum speed (rad/s). 0.0 uses the motor's default.
+        """
         tasks = []
-        if left:
+        if left is not None:
             tasks.append(self.left.set_position(left, max_speed))
-        if right:
+        if right is not None:
             tasks.append(self.right.set_position(right, max_speed))
         if tasks:
             await asyncio.gather(*tasks)
 
     async def set_velocity(
         self,
-        left: JointValues = {},
-        right: JointValues = {},
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
     ) -> None:
-        """Command target velocities (rev/s) on both arms concurrently."""
+        """Command target velocities (rad/s) on both arms concurrently.
+
+        Args:
+            left:  Shape (8,) array of target velocities (rad/s). ``None`` skips the arm.
+            right: Same for the right arm.
+        """
         tasks = []
-        if left:
+        if left is not None:
             tasks.append(self.left.set_velocity(left))
-        if right:
+        if right is not None:
             tasks.append(self.right.set_velocity(right))
         if tasks:
             await asyncio.gather(*tasks)
@@ -376,19 +412,20 @@ class Axol(RobotBase):
 
     async def motion_control(
         self,
-        left: JointValues = {},
-        right: JointValues = {},
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
     ) -> None:
         """Send MIT impedance control to both arms concurrently.
 
         Args:
-            left:  Target positions (rev) for the left arm.  Empty skips the arm.
-            right: Target positions (rev) for the right arm. Empty skips the arm.
+            left:  Shape (8,) array of target positions (rad) for the left arm.
+                   ``None`` skips the arm.
+            right: Same for the right arm.
         """
         tasks = []
-        if left:
+        if left is not None:
             tasks.append(self.left.motion_control(left))
-        if right:
+        if right is not None:
             tasks.append(self.right.motion_control(right))
         if tasks:
             await asyncio.gather(*tasks)

@@ -1,7 +1,7 @@
 """
 VR teleoperation for the Axol robot.
 
-VRTeleop connects a VRServer (headset input) and a RobotBase implementation
+VRTeleop connects a VRServer (headset input) and a MotionControl implementation
 (Axol hardware or Sim visualizer) into a single runnable teleop session. IK
 runs in a separate subprocess so JAX/CUDA never blocks the asyncio event loop.
 
@@ -37,9 +37,7 @@ import time
 import numpy as np
 
 from ..kinematics import KinematicsConfig, KinematicsSolver
-from ..motor import Joint, JointValues
-from ..robot.base import RobotBase
-from ..shared import ARM_JOINTS, rad_to_rev
+from ..robot.base import MotionControl
 from ..vr.server import VRServer
 from .config import TeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator
@@ -66,7 +64,7 @@ class VRTeleop:
     dispatch, smoothing, reset trajectory playback, and robot I/O.
 
     Args:
-        robot: Hardware or simulation target implementing :class:`RobotBase`.
+        robot: Hardware or simulation target implementing :class:`MotionControl`.
         vr_server: WebSocket server that receives VR frame data.
         config: Teleop session parameters (rest poses, loop frequency).
         solver: Optional :class:`KinematicsSolver` whose config is forwarded to
@@ -75,7 +73,7 @@ class VRTeleop:
 
     def __init__(
         self,
-        robot: RobotBase,
+        robot: MotionControl,
         *,
         vr_server: VRServer | None = None,
         config: TeleopConfig = TeleopConfig(),
@@ -194,7 +192,7 @@ class VRTeleop:
                 t0 = time.perf_counter()
                 left, right = self.step()
                 if left is not None or right is not None:
-                    await self._robot.set_positions(left=left, right=right)
+                    await self._robot.motion_control(left=left, right=right)
 
                 now = time.perf_counter()
                 loop_times.append(now)
@@ -223,12 +221,17 @@ class VRTeleop:
     # Step
     # ------------------------------------------------------------------
 
-    def step(self) -> tuple[JointValues | None, JointValues | None]:
+    def step(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return the latest smoothed joint positions.
 
         Returns ``(None, None)`` until the IK subprocess is ready.
         Once ready, always returns positions so the robot actively holds
         its commanded pose (matching the arm repo behaviour).
+
+        Returns:
+            Tuple ``(left, right)`` where each is a shape (8,) float32 array
+            of joint positions in radians (Joint enum order), or ``None``
+            if not yet ready.
         """
         if self._q is None:
             return None, None
@@ -242,7 +245,18 @@ class VRTeleop:
                 if done:
                     self._q = q.copy()
 
-        return self._q_to_joint_values(q)
+        smoothed_l = self._smooth_left.update(q[self._left_indices])
+        smoothed_r = self._smooth_right.update(q[self._right_indices])
+
+        left = np.empty(8, dtype=np.float32)
+        left[:7] = smoothed_l
+        left[7] = self._l_grip
+
+        right = np.empty(8, dtype=np.float32)
+        right[:7] = smoothed_r
+        right[7] = self._r_grip
+
+        return left, right
 
     # ------------------------------------------------------------------
     # IK loop (background task)
@@ -330,29 +344,3 @@ class VRTeleop:
                 ik_recv_timeout_count += 1
 
             await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _q_to_joint_values(self, q: np.ndarray) -> tuple[JointValues, JointValues]:
-        """Convert full (14,) radian array to smoothed JointValues dicts (revolutions)."""
-        q_left = q[self._left_indices]
-        q_right = q[self._right_indices]
-
-        smoothed_l = self._smooth_left.update(q_left)
-        smoothed_r = self._smooth_right.update(q_right)
-        if smoothed_l is not None:
-            q_left = smoothed_l
-        if smoothed_r is not None:
-            q_right = smoothed_r
-
-        left: JointValues = {
-            joint: rad_to_rev(float(q_left[i])) for i, joint in enumerate(ARM_JOINTS)
-        }
-        left[Joint.GRIPPER] = self._l_grip
-        right: JointValues = {
-            joint: rad_to_rev(float(q_right[i])) for i, joint in enumerate(ARM_JOINTS)
-        }
-        right[Joint.GRIPPER] = self._r_grip
-        return left, right

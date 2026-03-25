@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
@@ -21,7 +22,7 @@ class KinematicsConfig:
         self_collision_weight: Weight on the self-collision penalty.
         max_iterations: Maximum solver iterations per call.
         cost_tolerance: Solver convergence tolerance.
-        max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call, in revolutions.
+        max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call, in radians.
         max_reach: Maximum allowed distance (m) from shoulder to end-effector target.
     """
 
@@ -35,5 +36,5 @@ class KinematicsConfig:
     self_collision_weight: float = 10.0
     max_iterations: int = 25
     cost_tolerance: float = 1e-2
-    max_joint_delta: float = 0.0055
+    max_joint_delta: float = 0.0055 * 2 * math.pi
     max_reach: float = 0.6

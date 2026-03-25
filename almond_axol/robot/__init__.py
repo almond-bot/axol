@@ -1,10 +1,10 @@
 from .axol import ArmController, Axol
-from .base import RobotBase
+from .base import MotionControl
 from .config import AxolConfig, JointGains
 from .sim import Sim
 
 __all__ = [
-    "RobotBase",
+    "MotionControl",
     "Axol",
     "ArmController",
     "AxolConfig",

@@ -18,8 +18,7 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..motor import JointValues
-from ..shared import ARM_JOINTS, URDF_PATH, rad_to_rev, rev_to_rad
+from ..shared import URDF_PATH
 from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
@@ -248,7 +247,7 @@ class KinematicsSolver:
     Loads the bundled URDF, builds a pyroki + jaxls solver, and resolves
     absolute Cartesian end-effector poses (world frame, FLU) to joint angles.
     JIT compilation is triggered during ``__init__`` so the first call to
-    :meth:`solve` is fast.
+    :meth:`ik` is fast.
 
     Args:
         config: Solver cost weights and parameters.
@@ -256,10 +255,10 @@ class KinematicsSolver:
     Example::
 
         solver = KinematicsSolver()
-        target = jaxlie.SE3.from_rotation_and_translation(
-            jaxlie.SO3.identity(), jnp.array([0.3, 0.2, 0.4])
-        )
-        left_q, right_q = solver.ik(left_pose=target, right_pose=target)
+        q = np.zeros(solver.num_joints, dtype=np.float32)
+        pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
+        rot = np.eye(3, dtype=np.float32)
+        q = solver.ik(q, left_pose=(pos, rot))
     """
 
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
@@ -319,41 +318,27 @@ class KinematicsSolver:
 
     # -- Public interface ----------------------------------------------------
 
-    def fk(
-        self,
-        q_left: JointValues | None = None,
-        q_right: JointValues | None = None,
-    ) -> tuple[jaxlie.SE3, jaxlie.SE3]:
+    def fk(self, q: np.ndarray) -> tuple[jaxlie.SE3, jaxlie.SE3]:
         """Compute end-effector poses from joint positions.
 
         Args:
-            q_left: Left arm joint positions in revolutions. Defaults to zeros.
-            q_right: Right arm joint positions in revolutions. Defaults to zeros.
+            q: Full ``(N,)`` joint array in radians.
 
         Returns:
             Tuple ``(left_pose, right_pose)`` as :class:`jaxlie.SE3` transforms
             in the robot's world frame (FLU).
         """
-        q_full = np.zeros(self.num_joints, dtype=np.float32)
-        if q_left is not None:
-            for joint, gi in zip(ARM_JOINTS, self.left_indices):
-                q_full[gi] = rev_to_rad(q_left.get(joint, 0.0))
-        if q_right is not None:
-            for joint, gi in zip(ARM_JOINTS, self.right_indices):
-                q_full[gi] = rev_to_rad(q_right.get(joint, 0.0))
-
-        fk = self.robot.forward_kinematics(jnp.asarray(q_full))
+        fk = self.robot.forward_kinematics(jnp.asarray(q, dtype=jnp.float32))
         return jaxlie.SE3(fk[self.l_ee_idx]), jaxlie.SE3(fk[self.r_ee_idx])
 
     def ik(
         self,
+        q_current: np.ndarray,
         left_pose: tuple[np.ndarray, np.ndarray] | None = None,
         right_pose: tuple[np.ndarray, np.ndarray] | None = None,
-        q_current_left: JointValues | None = None,
-        q_current_right: JointValues | None = None,
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
-    ) -> tuple[JointValues, JointValues]:
+    ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
         All positions and orientations must be expressed in the robot's world
@@ -362,59 +347,22 @@ class KinematicsSolver:
         ``config.max_joint_delta`` per call.
 
         Args:
+            q_current: Full ``(N,)`` joint array in radians used as the solver
+                seed and rest-cost target.
             left_pose: ``(pos, rot_3x3)`` numpy tuple for the left end-effector,
-                or ``None`` to skip the left arm. ``pos`` is shape ``(3,)`` in
-                metres; ``rot_3x3`` is a ``(3, 3)`` float32 rotation matrix.
+                or ``None`` to skip the left arm.
             right_pose: Same as ``left_pose`` for the right end-effector.
-            q_current_left: Current left arm joint positions in revolutions.
-                Defaults to zeros. Used as the solver seed and rest-cost target.
-            q_current_right: Current right arm joint positions in revolutions.
-                Defaults to zeros. Used as the solver seed and rest-cost target.
-            left_elbow_pos: ``(3,)`` optional left elbow position hint in world
-                frame. Improves solutions in kinematically ambiguous configurations.
-            right_elbow_pos: ``(3,)`` optional right elbow position hint in world
-                frame. Improves solutions in kinematically ambiguous configurations.
+            left_elbow_pos: ``(3,)`` optional left elbow position hint in world frame.
+            right_elbow_pos: ``(3,)`` optional right elbow position hint in world frame.
 
         Returns:
-            Tuple ``(left_joints, right_joints)`` as :class:`JointValues` dicts
-            in revolutions. If an arm's pose is ``None``, that arm's output
-            equals its ``q_current`` input.
+            Updated full ``(N,)`` joint array in radians.
         """
-        n_left = len(self.left_indices)
-        n_right = len(self.right_indices)
-
-        q_left = (
-            np.zeros(n_left, dtype=np.float32)
-            if q_current_left is None
-            else np.array(
-                [rev_to_rad(q_current_left.get(j, 0.0)) for j in ARM_JOINTS],
-                dtype=np.float32,
-            )
-        )
-        q_right = (
-            np.zeros(n_right, dtype=np.float32)
-            if q_current_right is None
-            else np.array(
-                [rev_to_rad(q_current_right.get(j, 0.0)) for j in ARM_JOINTS],
-                dtype=np.float32,
-            )
-        )
-
-        def _to_jv(q_rad: np.ndarray) -> JointValues:
-            return {j: rad_to_rev(float(q_rad[i])) for i, j in enumerate(ARM_JOINTS)}
-
         if left_pose is None and right_pose is None:
-            return _to_jv(q_left), _to_jv(q_right)
-
-        q_full = np.zeros(self.num_joints, dtype=np.float32)
-        for i, gi in enumerate(self.left_indices):
-            q_full[gi] = q_left[i]
-        for i, gi in enumerate(self.right_indices):
-            q_full[gi] = q_right[i]
+            return q_current
 
         cfg = self.config
 
-        # All clamping/prep in NumPy; single JAX boundary at solve_ik
         target_L: jaxlie.SE3 | None = None
         if left_pose is not None:
             lp, lr = left_pose
@@ -455,7 +403,7 @@ class KinematicsSolver:
             elbow_R,
             self._l_elbow_idx_jax,
             self._r_elbow_idx_jax,
-            jnp.asarray(q_full, dtype=jnp.float32),
+            jnp.asarray(q_current, dtype=jnp.float32),
             cfg.pos_weight,
             cfg.ori_weight,
             cfg.rest_weight,
@@ -468,24 +416,23 @@ class KinematicsSolver:
             cfg.cost_tolerance,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
-
-        max_delta_rad = rev_to_rad(cfg.max_joint_delta)
-        delta = np.clip(q_result_np - q_full, -max_delta_rad, max_delta_rad)
-        q_result_np = q_full + delta
-
-        out_left = q_left if left_pose is None else q_result_np[self.left_indices]
-        out_right = q_right if right_pose is None else q_result_np[self.right_indices]
-        return _to_jv(out_left), _to_jv(out_right)
+        delta = np.clip(
+            q_result_np - q_current, -cfg.max_joint_delta, cfg.max_joint_delta
+        )
+        return (q_current + delta).astype(np.float32)
 
     # -- Internal ------------------------------------------------------------
 
     def _warmup(self) -> None:
         """Trigger JIT compilation with a dummy solve."""
         _logger.info("Warming up IK solver (JIT compile)...")
+        dummy_q = np.zeros(self.num_joints, dtype=np.float32)
         dummy_pos = np.array([0.0, 0.0, 0.3], dtype=np.float32)
         dummy_rot = np.eye(3, dtype=np.float32)
         dummy_pose = (dummy_pos, dummy_rot)
-        kwargs: dict = dict(left_pose=dummy_pose, right_pose=dummy_pose)
+        kwargs: dict = dict(
+            q_current=dummy_q, left_pose=dummy_pose, right_pose=dummy_pose
+        )
         if self.config.elbow_weight > 0:
             dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
             kwargs["left_elbow_pos"] = dummy_elbow

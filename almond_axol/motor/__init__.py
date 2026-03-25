@@ -19,10 +19,10 @@ Usage
         wrist2   = Motor(bus, Joint.WRIST_2)
 
         await shoulder.enable()
-        pos = await shoulder.get_position()  # revolutions
+        pos = await shoulder.get_position()  # radians
 """
 
-from ..shared import Joint, JointValues
+from ..shared import Joint
 from .bus import CanBus
 from .errors import MotorError
 from .motor import Motor
@@ -32,7 +32,6 @@ __all__ = [
     "CanBus",
     "Motor",
     "Joint",
-    "JointValues",
     "MotorError",
     "MotorStatus",
     "MotorGains",

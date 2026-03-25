@@ -22,7 +22,6 @@ import pyroki as pk
 
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
-from ..shared import ARM_JOINTS, rad_to_rev, rev_to_rad
 from ..vr.models import VRFrame
 from .config import TeleopConfig
 
@@ -156,14 +155,8 @@ class IKWorker:
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
 
-        self._rest_pose_left = np.array(
-            [rev_to_rad(config.rest_pose_left.get(j, 0.0)) for j in ARM_JOINTS],
-            dtype=np.float32,
-        )
-        self._rest_pose_right = np.array(
-            [rev_to_rad(config.rest_pose_right.get(j, 0.0)) for j in ARM_JOINTS],
-            dtype=np.float32,
-        )
+        self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
+        self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
 
         self._active: bool = False
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
@@ -252,40 +245,21 @@ class IKWorker:
             right_e - self._snap_elbow_ctrl["right"]
         )
 
-        # Per-arm current joint values for the solver seed
-        q_left_jv = {
-            j: rad_to_rev(float(q_current[gi]))
-            for j, gi in zip(ARM_JOINTS, self._solver.left_indices)
-        }
-        q_right_jv = {
-            j: rad_to_rev(float(q_current[gi]))
-            for j, gi in zip(ARM_JOINTS, self._solver.right_indices)
-        }
-
-        left_jv, right_jv = self._solver.ik(
+        return self._solver.ik(
+            q_current,
             left_pose=(tl_pos, tl_rot),
             right_pose=(tr_pos, tr_rot),
-            q_current_left=q_left_jv,
-            q_current_right=q_right_jv,
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
-
-        # Merge back into flat array
-        q_result = q_current.copy()
-        for j, gi in zip(ARM_JOINTS, self._solver.left_indices):
-            q_result[gi] = rev_to_rad(left_jv[j])
-        for j, gi in zip(ARM_JOINTS, self._solver.right_indices):
-            q_result[gi] = rev_to_rad(right_jv[j])
-        return q_result
 
     def compute_reset_trajectory(
         self, q_current: np.ndarray, q_target: np.ndarray
     ) -> list[np.ndarray]:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
-        max_dist_rev = rad_to_rev(float(np.max(np.abs(q_current - q_target))))
-        duration = max_dist_rev / cfg.reset_speed
+        max_dist_rad = float(np.max(np.abs(q_current - q_target)))
+        duration = max_dist_rad / cfg.reset_speed
         n_steps = max(1, round(duration * cfg.frequency))
         trajectory: list[np.ndarray] = []
         q = np.array(q_current, dtype=np.float32)

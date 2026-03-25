@@ -45,7 +45,7 @@ class Motor:
 
         motor = Motor(bus, Joint.WRIST_2)
         await motor.enable()
-        pos = await motor.get_position()  # revolutions
+        pos = await motor.get_position()  # radians
     """
 
     def __init__(self, bus: CanBus, joint: Joint, can_id: int | None = None) -> None:
@@ -78,11 +78,11 @@ class Motor:
         await self._driver.set_zero_position()
 
     async def get_position(self) -> float:
-        """Return current shaft position in revolutions."""
+        """Return current shaft position in radians."""
         return await self._driver.get_position()
 
     async def get_velocity(self) -> float:
-        """Return current shaft velocity in revolutions per second."""
+        """Return current shaft velocity in radians per second."""
         return await self._driver.get_velocity()
 
     async def get_torque(self) -> float:
@@ -129,7 +129,7 @@ class Motor:
 
     @property
     def position(self) -> float:
-        """Latest cached shaft position (rev). Requires start_telemetry()."""
+        """Latest cached shaft position (rad). Requires start_telemetry()."""
         if self._position is None:
             raise MotorError(
                 f"No position data for {self.joint} — call start_telemetry() first"
@@ -164,8 +164,8 @@ class Motor:
         """Move to an absolute position using the motor's built-in position controller.
 
         Args:
-            position:  Target shaft position (rev)
-            max_speed: Maximum speed during the move (rev/s)
+            position:  Target shaft position (rad)
+            max_speed: Maximum speed during the move (rad/s)
         """
         await self._driver.set_position(position, max_speed)
 
@@ -173,7 +173,7 @@ class Motor:
         """Command a target velocity using the motor's built-in speed controller.
 
         Args:
-            velocity: Target shaft velocity (rev/s)
+            velocity: Target shaft velocity (rad/s)
         """
         await self._driver.set_velocity(velocity)
 
@@ -185,8 +185,8 @@ class Motor:
         Only supported by Damiao motors. Raises MotorError on MyActuator.
 
         Args:
-            position:    Target shaft position (rev)
-            max_speed:   Maximum speed during the move (rev/s)
+            position:    Target shaft position (rad)
+            max_speed:   Maximum speed during the move (rad/s)
             max_current: Maximum phase current, normalized [0.0, 1.0]
         """
         await self._driver.set_force_position(position, max_speed, max_current)
@@ -197,8 +197,8 @@ class Motor:
         """Set the acceleration ramp for position and velocity control modes.
 
         Args:
-            acceleration: Acceleration ramp (rev/s²)
-            deceleration: Deceleration ramp (rev/s²). If None, matches acceleration.
+            acceleration: Acceleration ramp (rad/s²)
+            deceleration: Deceleration ramp (rad/s²). If None, matches acceleration.
                           Damiao stores acceleration and deceleration separately;
                           MyActuator applies the same value to both ramps.
         """
@@ -256,8 +256,8 @@ class Motor:
         """Send an MIT-style impedance control command.
 
         Args:
-            p_des: Desired position (rev)
-            v_des: Desired velocity (rev/s)
+            p_des: Desired position (rad)
+            v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
             kd:    Velocity damping   [0, 5]
             t_ff:  Feedforward torque (Nm)
