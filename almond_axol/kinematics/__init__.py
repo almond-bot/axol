@@ -1,3 +1,4 @@
-from almond_axol.kinematics.solver import KinematicsConfig, KinematicsSolver
+from .config import KinematicsConfig
+from .solver import KinematicsSolver
 
 __all__ = ["KinematicsConfig", "KinematicsSolver"]

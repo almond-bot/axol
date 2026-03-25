@@ -3,29 +3,16 @@
 from __future__ import annotations
 
 import logging
-import math
 import threading
-from pathlib import Path
 
 import numpy as np
 
-from ..motor import Joint, JointValues
+from ..motor import JointValues
+from ..shared import ARM_JOINTS, URDF_PATH, rev_to_rad
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
 
-_URDF_PATH = Path(__file__).resolve().parent.parent / "kinematics" / "axol.urdf"
-
-# IK joints per arm in URDF order (gripper excluded — not in kinematics model)
-_ARM_JOINTS = [
-    Joint.SHOULDER_1,
-    Joint.SHOULDER_2,
-    Joint.SHOULDER_3,
-    Joint.ELBOW,
-    Joint.WRIST_1,
-    Joint.WRIST_2,
-    Joint.WRIST_3,
-]
 
 try:
     import viser
@@ -69,8 +56,8 @@ class Sim(RobotBase):
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
-        self._last_left: JointValues = {j: 0.0 for j in _ARM_JOINTS}
-        self._last_right: JointValues = {j: 0.0 for j in _ARM_JOINTS}
+        self._last_left: JointValues = {j: 0.0 for j in ARM_JOINTS}
+        self._last_right: JointValues = {j: 0.0 for j in ARM_JOINTS}
 
     async def enable(self) -> None:
         """Start the viser server thread. No-op after the first call."""
@@ -111,16 +98,16 @@ class Sim(RobotBase):
 
     def _build_q(self) -> np.ndarray:
         """Build the full joint angle array (radians) for viser from cached positions."""
-        q = np.zeros(len(_ARM_JOINTS) * 2, dtype=float)
-        for i, joint in enumerate(_ARM_JOINTS):
-            q[i] = self._last_left.get(joint, 0.0) * 2.0 * math.pi
-            q[i + len(_ARM_JOINTS)] = self._last_right.get(joint, 0.0) * 2.0 * math.pi
+        q = np.zeros(len(ARM_JOINTS) * 2, dtype=float)
+        for i, joint in enumerate(ARM_JOINTS):
+            q[i] = rev_to_rad(self._last_left.get(joint, 0.0))
+            q[i + len(ARM_JOINTS)] = rev_to_rad(self._last_right.get(joint, 0.0))
         return q
 
     def _run(self) -> None:
         server = viser.ViserServer(port=self._port)
 
-        urdf = yourdfpy.URDF.load(str(_URDF_PATH), mesh_dir="")
+        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir="")
         viser_urdf = ViserUrdf(
             server,
             urdf_or_path=urdf,

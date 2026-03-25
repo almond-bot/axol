@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
-from ..constants import CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, JointValues, Motor, MotorGains, MotorStatus
+from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
 
