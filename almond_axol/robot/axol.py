@@ -4,6 +4,7 @@ import asyncio
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, JointValues, Motor, MotorGains, MotorStatus
+from .base import RobotBase
 from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
 
 
@@ -186,7 +187,7 @@ class ArmController:
         )
 
 
-class Axol:
+class Axol(RobotBase):
     """Dual-arm Axol robot interface.
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry.
@@ -314,6 +315,21 @@ class Axol:
     ) -> tuple[dict[Joint, MotorGains], dict[Joint, MotorGains]]:
         """Return PID gains for both arms as (left, right)."""
         return await asyncio.gather(self.left.get_gains(), self.right.get_gains())
+
+    async def set_positions(
+        self,
+        left: JointValues | None = None,
+        right: JointValues | None = None,
+    ) -> None:
+        """Command joint positions via MIT impedance control on both arms.
+
+        Gains are taken from the ``AxolConfig`` provided at construction.
+
+        Args:
+            left:  Target positions (rev) for the left arm.  ``None`` skips the arm.
+            right: Target positions (rev) for the right arm. ``None`` skips the arm.
+        """
+        await self.motion_control(left=left or {}, right=right or {})
 
     async def set_position(
         self,
