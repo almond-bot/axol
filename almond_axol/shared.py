@@ -23,7 +23,9 @@ CAN_RIGHT = "can_alm_axol_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
-URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "axol.urdf"
+URDF_PATH: Path = (
+    Path(__file__).resolve().parent / "kinematics" / "urdf" / "openarm.urdf"
+)
 
 
 def rev_to_rad(rev: float) -> float:

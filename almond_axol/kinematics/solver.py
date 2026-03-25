@@ -24,13 +24,13 @@ from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
 
-# Link names in axol.urdf
-_LEFT_EE = "left_ee_link"
-_RIGHT_EE = "right_ee_link"
-_LEFT_ELBOW = "left_elbow_link"
-_RIGHT_ELBOW = "right_elbow_link"
-_LEFT_SHOULDER = "left_shoulder_1_link"
-_RIGHT_SHOULDER = "right_shoulder_1_link"
+# Link names in openarm.urdf
+_LEFT_EE = "openarm_left_hand_tcp"
+_RIGHT_EE = "openarm_right_hand_tcp"
+_LEFT_ELBOW = "openarm_left_link4"
+_RIGHT_ELBOW = "openarm_right_link4"
+_LEFT_SHOULDER = "openarm_left_link1"
+_RIGHT_SHOULDER = "openarm_right_link1"
 
 
 # ---------------------------------------------------------------------------
@@ -202,8 +202,8 @@ class KinematicsSolver:
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
         self.config = config
 
-        _logger.info("Loading Axol URDF...")
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir="")
+        _logger.info("Loading OpenArm URDF...")
+        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
         self.robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
 
@@ -234,10 +234,10 @@ class KinematicsSolver:
         # Determine left/right joint split indices into the full actuated vector
         actuated = list(self.robot.joints.actuated_names)
         self._left_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("left_")
+            i for i, n in enumerate(actuated) if n.startswith("openarm_left_joint")
         ]
         self._right_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("right_")
+            i for i, n in enumerate(actuated) if n.startswith("openarm_right_joint")
         ]
 
         self._warmup()
@@ -424,17 +424,13 @@ class KinematicsSolver:
         dummy_pose = jaxlie.SE3.from_rotation_and_translation(
             jaxlie.SO3.identity(), jnp.array([0.0, 0.0, 0.3])
         )
-        dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
+        kwargs: dict = dict(left_pose=dummy_pose, right_pose=dummy_pose)
+        if self.config.elbow_weight > 0:
+            dummy_elbow = np.array([0.0, 0.2, 0.3], dtype=np.float32)
+            kwargs["left_elbow_pos"] = dummy_elbow
+            kwargs["right_elbow_pos"] = dummy_elbow
         try:
-            # Compile both the no-elbow path (pose-only) and the full path
-            # (pose + elbow hints) so neither recompiles during live teleop.
-            self.ik(left_pose=dummy_pose, right_pose=dummy_pose)
-            self.ik(
-                left_pose=dummy_pose,
-                right_pose=dummy_pose,
-                left_elbow_pos=dummy_elbow,
-                right_elbow_pos=dummy_elbow,
-            )
+            self.ik(**kwargs)
             q = np.zeros(self.num_joints, dtype=np.float32)
             self.robot.forward_kinematics(jnp.asarray(q))
         except Exception:

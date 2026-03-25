@@ -266,7 +266,27 @@ class VRTeleop:
         """Start the VR server and enable the robot."""
         await self._vr_server.enable()
         await self._robot.enable()
+        self._warmup_reset_step()
         _logger.info("VRTeleop enabled")
+
+    def _warmup_reset_step(self) -> None:
+        """JIT-compile _solve_reset_step so the first reset is instant."""
+        cfg = self._config
+        q = jnp.zeros(self._solver.num_joints, dtype=jnp.float32)
+        try:
+            _solve_reset_step(
+                self._solver.robot,
+                self._solver.robot_coll,
+                q,
+                q,
+                cfg.reset_rest_weight,
+                cfg.reset_limit_weight,
+                cfg.reset_collision_margin,
+                cfg.reset_collision_weight,
+                cfg.reset_max_iterations,
+            )
+        except Exception:
+            pass
 
     async def disable(self) -> None:
         """Disable the robot and stop the VR server."""
@@ -297,6 +317,8 @@ class VRTeleop:
         last_log = time.perf_counter()
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
+        q_zeros = np.zeros(self._solver.num_joints, dtype=np.float32)
+        self._reset_interp.set(q_zeros, self._build_rest_q_full())
         try:
             while True:
                 t0 = time.perf_counter()

@@ -97,7 +97,7 @@ class Sim(RobotBase):
             self._condition.notify()
 
     def _build_q(self) -> np.ndarray:
-        """Build the full joint angle array (radians) for viser from cached positions."""
+        """Build the arm joint angle array (radians), left then right, in ARM_JOINTS order."""
         q = np.zeros(len(ARM_JOINTS) * 2, dtype=float)
         for i, joint in enumerate(ARM_JOINTS):
             q[i] = rev_to_rad(self._last_left.get(joint, 0.0))
@@ -107,7 +107,7 @@ class Sim(RobotBase):
     def _run(self) -> None:
         server = viser.ViserServer(port=self._port)
 
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir="")
+        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         viser_urdf = ViserUrdf(
             server,
             urdf_or_path=urdf,
@@ -116,28 +116,36 @@ class Sim(RobotBase):
             load_collision_meshes=False,
         )
 
+        # Build the robot-side joint ordering to match _build_q's output:
+        # left arm joint1-N, then right arm joint1-N.
+        n_arm = len(ARM_JOINTS)
+        left_names = [f"openarm_left_joint{i + 1}" for i in range(n_arm)]
+        right_names = [f"openarm_right_joint{i + 1}" for i in range(n_arm)]
+        robot_order = (self._joint_names or left_names) + right_names
+
+        # Map each viser joint to its index in robot_order (-1 for joints not
+        # in robot_order, e.g. finger joints, which stay at 0).
         viser_order = viser_urdf.get_actuated_joint_names()
-        robot_order = self._joint_names or viser_order
-        if viser_order == robot_order:
-            reorder = None
-        else:
+        viser_to_robot: list[int] = []
+        for name in viser_order:
             try:
-                reorder = np.array([robot_order.index(name) for name in viser_order])
+                viser_to_robot.append(robot_order.index(name))
             except ValueError:
-                reorder = None
-                _logger.warning(
-                    "Joint name mismatch between robot and viser URDF — "
-                    "display may be incorrect."
-                )
+                viser_to_robot.append(-1)
+
+        def _to_viser(q_robot: np.ndarray) -> np.ndarray:
+            q_out = np.zeros(len(viser_order), dtype=float)
+            for vi, ri in enumerate(viser_to_robot):
+                if ri >= 0:
+                    q_out[vi] = q_robot[ri]
+            return q_out
 
         q0 = (
             np.asarray(self._default_q, dtype=float)
             if self._default_q is not None
             else np.zeros(len(robot_order))
         )
-        if reorder is not None:
-            q0 = q0[reorder]
-        viser_urdf.update_cfg(q0)
+        viser_urdf.update_cfg(_to_viser(q0))
 
         server.scene.add_grid("/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0))
 
@@ -146,6 +154,4 @@ class Sim(RobotBase):
                 self._condition.wait()
                 q = self._latest_q
             if q is not None and q.size > 0:
-                if reorder is not None:
-                    q = np.asarray(q)[reorder]
-                viser_urdf.update_cfg(np.asarray(q, dtype=float))
+                viser_urdf.update_cfg(_to_viser(np.asarray(q, dtype=float)))
