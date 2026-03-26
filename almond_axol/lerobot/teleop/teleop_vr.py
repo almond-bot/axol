@@ -117,6 +117,7 @@ class AxolVRTeleop(Teleoperator):
         self._prev_state: VRState = VRState.TELEOP
         self._rerecord_latch: bool = False
         self._terminate_latch: bool = False
+        self._start_recording_latch: bool = False
 
         self._ik_loop_times: list[float] = []
 
@@ -263,20 +264,23 @@ class AxolVRTeleop(Teleoperator):
             action[key] = float(q[8 + i])
         return action
 
-    def get_teleop_events(self) -> dict[TeleopEvents, bool]:
+    def get_teleop_events(self) -> dict[TeleopEvents | str, Any]:
         """Return episode control events derived from VRState transitions.
 
         Consumes and clears any latched events. Call once per control step.
         """
         rerecord = self._rerecord_latch
         terminate = self._terminate_latch
+        start_recording = self._start_recording_latch
         self._rerecord_latch = False
         self._terminate_latch = False
+        self._start_recording_latch = False
         return {
             TeleopEvents.IS_INTERVENTION: False,
             TeleopEvents.TERMINATE_EPISODE: terminate,
             TeleopEvents.SUCCESS: terminate,
             TeleopEvents.RERECORD_EPISODE: rerecord,
+            "start_recording": start_recording,
         }
 
     # ------------------------------------------------------------------
@@ -296,6 +300,9 @@ class AxolVRTeleop(Teleoperator):
         # Episode state transitions
         prev = self._prev_state
         curr = frame.state
+        if prev == VRState.DATA_COLLECTION and curr == VRState.RECORDING:
+            self._start_recording_latch = True
+
         if prev == VRState.RECORDING and curr == VRState.DATA_COLLECTION:
             if frame.reset:
                 # Discard episode — consume the reset so it doesn't trigger rest-pose move
