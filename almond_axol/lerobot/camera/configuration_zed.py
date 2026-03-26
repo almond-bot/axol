@@ -11,17 +11,21 @@ class ZedCameraConfig(CameraConfig):
     Connects to a single ZED stream produced by ZedStreamer on the sender machine.
     One instance per camera (overhead, left_arm, right_arm each get their own config).
 
-    Resolution and FPS are auto-detected from the stream on connect.
-
     Args:
         host:       IP address of the ZedStreamer host (default localhost).
         port:       Streaming port matching the sender (default 30000).
+        fps:        Expected stream FPS; must match the sender (default 60).
+        width:      Expected frame width in pixels; must match the sender (default 1280).
+        height:     Expected frame height in pixels; must match the sender (default 720).
         color_mode: Output color channel order (default RGB).
         warmup_s:   Seconds to read frames during connect() before returning.
     """
 
     host: str = "127.0.0.1"
     port: int = 30000
+    fps: int | None = 60
+    width: int | None = 1280
+    height: int | None = 720
     color_mode: ColorMode = ColorMode.RGB
     warmup_s: int = 1
 
