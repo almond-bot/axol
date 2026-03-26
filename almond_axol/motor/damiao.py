@@ -13,7 +13,7 @@ import can
 from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
-from .types import MotorGains, MotorStatus
+from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _ControlMode(Enum):
@@ -46,6 +46,7 @@ class _MotorFeedback:
 
 
 _DM_UINT32_REGS = {7, 8, 9, 10, 13, 14, 15, 16, 35, 36}
+_DM_REG_CTRL_MODE = 10  # control mode: 1=MIT, 2=POS_VEL, 3=VEL, 4=FORCE_POS
 _DM_REG_PMAX = 21
 _DM_REG_VMAX = 22
 _DM_REG_TMAX = 23
@@ -71,6 +72,13 @@ _DM_BAUD_MAP: dict[int, int] = {
     3_200_000: 7,
     4_000_000: 8,
     5_000_000: 9,
+}
+
+_DM_CTRL_MODE_MAP: dict[ControlMode, int] = {
+    ControlMode.MIT: 1,
+    ControlMode.POS_VEL: 2,
+    ControlMode.VEL: 3,
+    ControlMode.FORCE_POS: 4,
 }
 
 _DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
@@ -273,7 +281,19 @@ class DamiaoMotor(MotorDriver):
         await self._raw_send(bytes([0xFF] * 7 + [0xFC]))
 
     async def disable(self) -> None:
-        await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
+        max_attempts = 10
+        for _ in range(max_attempts):
+            await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
+            await asyncio.sleep(0.01)
+            try:
+                feedback = await self._request_feedback()
+                if feedback.status == _DamiaoStatus.DISABLED:
+                    return
+            except MotorError:
+                pass
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        await self._write_register(_DM_REG_CTRL_MODE, _DM_CTRL_MODE_MAP[mode])
 
     async def clear_errors(self) -> None:
         await self._raw_send(bytes([0xFF] * 7 + [0xFB]))

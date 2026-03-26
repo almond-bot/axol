@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Callable
 
 from .errors import MotorError
-from .types import MotorGains, MotorStatus
+from .types import ControlMode, MotorGains, MotorStatus
 
 
 class MotorDriver(ABC):
@@ -160,6 +160,19 @@ class MotorDriver(ABC):
             kp:    Position stiffness [0, 500]
             kd:    Velocity damping   [0, 5]
             t_ff:  Feedforward torque (Nm)
+        """
+        ...
+
+    @abstractmethod
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        """Set the active control mode.
+
+        Damiao: writes register 10 to match the requested mode.
+        MyActuator: has no persistent mode register — resets the motor instead
+        so it comes back in a clean state; the next command determines the mode.
+
+        Args:
+            mode: Desired control mode.
         """
         ...
 

@@ -16,7 +16,7 @@ import can
 from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
-from .types import MotorGains, MotorStatus
+from .types import ControlMode, MotorGains, MotorStatus
 
 _MA_REQ = 0x140  # standard command request  → 0x140 + motor_id
 _MA_RESP = 0x240  # standard command response ← 0x240 + motor_id
@@ -25,6 +25,7 @@ _MA_MC_RESP = 0x500  # motion control response   ← 0x500 + motor_id
 
 _MA_SHUTDOWN = 0x80
 _MA_RELEASE_BRAKE = 0x77
+_MA_RESET = 0x76  # system reset; no response — motor restarts immediately
 _MA_READ_STATUS1 = 0x9A  # temperature, voltage, error flags
 _MA_MULTI_TURN_ANGLE = 0x92
 _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
@@ -145,6 +146,13 @@ class MyActuatorMotor(MotorDriver):
 
     async def disable(self) -> None:
         await self._request(self._cmd(_MA_SHUTDOWN))
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        # MyActuator has no persistent control mode register; the active mode is
+        # determined by which command is sent. Reset the motor to clear internal
+        # state so it comes back ready for the next command type.
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(0.5)
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command

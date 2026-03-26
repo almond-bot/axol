@@ -26,13 +26,14 @@ from ..shared import Joint
 from .bus import CanBus
 from .errors import MotorError
 from .motor import Motor
-from .types import MotorGains, MotorStatus
+from .types import ControlMode, MotorGains, MotorStatus
 
 __all__ = [
     "CanBus",
     "Motor",
     "Joint",
     "MotorError",
+    "ControlMode",
     "MotorStatus",
     "MotorGains",
 ]

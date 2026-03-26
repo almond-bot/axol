@@ -5,7 +5,7 @@ import math
 
 import numpy as np
 
-from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
+from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
 from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
@@ -99,6 +99,14 @@ class ArmController:
     async def clear_errors(self) -> None:
         """Clear latched error flags on all motors."""
         await asyncio.gather(*[m.clear_errors() for m in self._motors.values()])
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        """Set the control mode on all motors.
+
+        Args:
+            mode: Desired control mode.
+        """
+        await asyncio.gather(*[m.set_control_mode(mode) for m in self._motors.values()])
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -350,6 +358,16 @@ class Axol(RobotBase):
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""
         await asyncio.gather(self.left.clear_errors(), self.right.clear_errors())
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        """Set the control mode on all motors on both arms.
+
+        Args:
+            mode: Desired control mode.
+        """
+        await asyncio.gather(
+            self.left.set_control_mode(mode), self.right.set_control_mode(mode)
+        )
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #

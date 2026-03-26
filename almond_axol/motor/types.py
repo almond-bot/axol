@@ -4,6 +4,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+class ControlMode(Enum):
+    """Active control mode for a motor."""
+
+    MIT = "MIT"
+    POS_VEL = "POS_VEL"
+    VEL = "VEL"
+    FORCE_POS = "FORCE_POS"
+
+
 class MotorStatus(Enum):
     """Unified motor status / error code returned by both driver types."""
 

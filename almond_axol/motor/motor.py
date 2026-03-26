@@ -10,7 +10,7 @@ from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .errors import MotorError
 from .myactuator import MyActuatorMotor
-from .types import MotorGains, MotorStatus
+from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _MotorType(Enum):
@@ -76,6 +76,18 @@ class Motor:
     async def set_zero_position(self) -> None:
         """Save the current shaft position as the encoder zero reference."""
         await self._driver.set_zero_position()
+
+    async def set_control_mode(self, mode: ControlMode) -> None:
+        """Set the active control mode.
+
+        Damiao: writes register 10 to match the requested mode.
+        MyActuator: resets the motor (no persistent mode register; mode is
+        determined per-command).
+
+        Args:
+            mode: Desired control mode.
+        """
+        await self._driver.set_control_mode(mode)
 
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
