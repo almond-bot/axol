@@ -36,7 +36,7 @@ import time
 
 import numpy as np
 
-from ..kinematics import KinematicsConfig, KinematicsSolver
+from ..kinematics import KinematicsConfig
 from ..robot.base import MotionControl
 from ..vr.server import VRServer
 from .config import TeleopConfig
@@ -75,16 +75,15 @@ class VRTeleop:
         self,
         robot: MotionControl,
         *,
-        vr_server: VRServer | None = None,
         config: TeleopConfig = TeleopConfig(),
-        solver: KinematicsSolver | None = None,
+        kinematics_config: KinematicsConfig = KinematicsConfig(),
+        vr_server: VRServer = VRServer(),
     ) -> None:
         self._robot = robot
-        self._vr_server = vr_server or VRServer()
         self._config = config
-        self._kinematics_config = (
-            solver.config if solver is not None else KinematicsConfig()
-        )
+        self._kinematics_config = kinematics_config
+        self._vr_server = vr_server
+        self._vr_server.set_on_frame(self._on_vr_frame)
 
         # Full joint vector (radians), updated by _ik_loop
         self._q: np.ndarray | None = None
@@ -94,6 +93,9 @@ class VRTeleop:
         self._l_grip: float = 1.0
         self._r_grip: float = 1.0
         self._prev_reset: bool = False
+        # Latched by _on_vr_frame on every rising edge so the IK loop can't
+        # miss a short reset press that arrives while blocked on conn.recv.
+        self._reset_latched: bool = False
 
         self._reset_interp = ResetInterpolator()
         self._smooth_left = AlphaSmoothFilter(alpha=config.smooth_alpha)
@@ -259,6 +261,21 @@ class VRTeleop:
         return left, right
 
     # ------------------------------------------------------------------
+    # VR frame callback (runs on every incoming frame)
+    # ------------------------------------------------------------------
+
+    def _on_vr_frame(self, frame) -> None:
+        """Latch the reset rising edge as soon as the frame arrives.
+
+        This runs on the event-loop thread for every WebSocket frame, so it
+        captures reset=True even if the IK loop is blocked in run_in_executor
+        and the button is released before the loop next checks get_frame().
+        """
+        if frame.reset and not self._prev_reset:
+            self._reset_latched = True
+        self._prev_reset = frame.reset
+
+    # ------------------------------------------------------------------
     # IK loop (background task)
     # ------------------------------------------------------------------
 
@@ -283,29 +300,27 @@ class VRTeleop:
             self._l_grip = frame.l_grip
             self._r_grip = frame.r_grip
 
-            # Reset rising edge
-            reset_rising = frame.reset and not self._prev_reset
-            self._prev_reset = frame.reset
-
-            if (
-                reset_rising
-                and self._q is not None
-                and not self._reset_interp.is_active()
-            ):
-                try:
-                    conn.send(("reset", self._q.copy()))
-                    result = await loop.run_in_executor(None, conn.recv)
-                    if isinstance(result, tuple) and result[0] == "reset_traj":
-                        _, q_default, trajectory = result
-                        if trajectory:
-                            self._reset_interp.set_trajectory(trajectory)
-                            self._smooth_left.reset()
-                            self._smooth_right.reset()
-                        self._q = np.asarray(q_default, dtype=np.float32)
-                except Exception as e:
-                    _logger.error("Reset error: %s", e)
-                await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
-                continue
+            if self._reset_latched:
+                if self._reset_interp.is_active() or self._q is None:
+                    self._reset_latched = False
+                else:
+                    self._reset_latched = False
+                    try:
+                        conn.send(("reset", self._q.copy()))
+                        result = await loop.run_in_executor(None, conn.recv)
+                        if isinstance(result, tuple) and result[0] == "reset_traj":
+                            _, q_default, trajectory = result
+                            if trajectory:
+                                self._reset_interp.set_trajectory(trajectory)
+                                self._smooth_left.reset()
+                                self._smooth_right.reset()
+                            self._q = np.asarray(q_default, dtype=np.float32)
+                    except Exception as e:
+                        _logger.error("Reset error: %s", e)
+                    await asyncio.sleep(
+                        max(0.0, ik_interval - (time.perf_counter() - t0))
+                    )
+                    continue
 
             if self._reset_interp.is_active():
                 await asyncio.sleep(0.001)

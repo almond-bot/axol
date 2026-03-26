@@ -77,6 +77,10 @@ class VRServer:
         """Return the most recent frame received, or None if none yet."""
         return self._latest_frame
 
+    def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
+        """Replace the on_frame callback. Safe to call after construction."""
+        self._on_frame = callback
+
     @property
     def connected(self) -> bool:
         """True if at least one VR client is currently connected."""
