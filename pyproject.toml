@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "pyroki",
     "python-can>=4.6.1",
+    "scipy>=1.17.1",
     "uvicorn[standard]>=0.42.0",
     "yourdfpy>=0.0.60",
 ]

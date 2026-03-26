@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 import numpy as np
 
@@ -9,6 +10,28 @@ from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 
+_TAU = 2 * math.pi
+
+# Per-joint position limits (rad).  shoulder_2 is asymmetric across arms.
+SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0.03 * _TAU)
+SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
+
+_LIMITS: dict[Joint, tuple[float, float]] = {
+    Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.SHOULDER_3: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.ELBOW: (0.0, 0.41 * _TAU),
+    Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
+}
+
+
+def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
+    """Return (min, max) position limits in radians for a joint on the given arm."""
+    if joint == Joint.SHOULDER_2:
+        return SHOULDER_2_LEFT_LIMITS if is_left else SHOULDER_2_RIGHT_LIMITS
+    return _LIMITS.get(joint, (-math.inf, math.inf))
+
 
 class ArmController:
     """Controls one 7-DOF + gripper arm over a single CAN bus.
@@ -16,9 +39,15 @@ class ArmController:
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
     """
 
-    def __init__(self, bus: CanBus, config: AxolConfig) -> None:
+    def __init__(self, bus: CanBus, config: AxolConfig, is_left: bool = True) -> None:
         self._config = config
         self._motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
+        self._limits_lo = np.array(
+            [arm_limits(j, is_left)[0] for j in Joint], dtype=float
+        )
+        self._limits_hi = np.array(
+            [arm_limits(j, is_left)[1] for j in Joint], dtype=float
+        )
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -170,13 +199,16 @@ class ArmController:
     async def set_position(self, positions: np.ndarray, max_speed: float) -> None:
         """Move joints to absolute positions using each motor's built-in controller.
 
+        Positions are clipped to the arm's joint limits before being sent.
+
         Args:
             positions: Shape (8,) array of target positions (rad) in Joint enum order.
             max_speed: Maximum speed for all joints (rad/s).
         """
+        clipped = np.clip(positions, self._limits_lo, self._limits_hi)
         await asyncio.gather(
             *[
-                self._motors[j].set_position(float(positions[i]), max_speed)
+                self._motors[j].set_position(float(clipped[i]), max_speed)
                 for i, j in enumerate(Joint)
             ]
         )
@@ -197,15 +229,17 @@ class ArmController:
     async def motion_control(self, q: np.ndarray) -> None:
         """Send MIT impedance control to all joints concurrently.
 
+        Desired positions are clipped to the arm's joint limits before being sent.
         Gains (kp, kd, t_ff) are read from the AxolConfig supplied at construction.
 
         Args:
             q: Shape (8,) array of desired positions (rad) in Joint enum order.
         """
+        clipped = np.clip(q, self._limits_lo, self._limits_hi)
         await asyncio.gather(
             *[
                 self._motors[j].motion_control(
-                    float(q[i]),
+                    float(clipped[i]),
                     0.0,
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
@@ -249,8 +283,8 @@ class Axol(RobotBase):
     ) -> None:
         self._left_bus = CanBus(left_channel)
         self._right_bus = CanBus(right_channel)
-        self.left = ArmController(self._left_bus, config)
-        self.right = ArmController(self._right_bus, config)
+        self.left = ArmController(self._left_bus, config, is_left=True)
+        self.right = ArmController(self._right_bus, config, is_left=False)
 
     async def __aenter__(self) -> Axol:
         await asyncio.gather(self._left_bus.start(), self._right_bus.start())
