@@ -6,9 +6,10 @@ import math
 import numpy as np
 
 from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
-from ..shared import CAN_LEFT, CAN_RIGHT
+from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
+from .control import Differentiator, GravityCompensator, compute_friction
 
 _TAU = 2 * math.pi
 
@@ -48,6 +49,8 @@ class ArmController:
         self._limits_hi = np.array(
             [arm_limits(j, is_left)[1] for j in Joint], dtype=float
         )
+        self._differentiator = Differentiator(n=len(list(Joint)))
+        self._gravity_comp = GravityCompensator(is_left=is_left)
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -230,20 +233,36 @@ class ArmController:
         """Send MIT impedance control to all joints concurrently.
 
         Desired positions are clipped to the arm's joint limits before being sent.
-        Gains (kp, kd, t_ff) are read from the AxolConfig supplied at construction.
+        Gains (kp, kd) and friction params are read from the AxolConfig. The
+        feedforward torque is computed as gravity + friction; it is not specified
+        directly in the config.
 
         Args:
             q: Shape (8,) array of desired positions (rad) in Joint enum order.
         """
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
+
+        # Velocity feedforward via differentiation of commanded positions (rad/s).
+        velocities = self._differentiator.differentiate(list(clipped))
+
+        # Gravity torques for the 7 arm joints (shoulder_1 → wrist_3, not gripper).
+        gravity = self._gravity_comp.get_gravity(list(clipped[: len(ARM_JOINTS)]))
+
         await asyncio.gather(
             *[
                 self._motors[j].motion_control(
                     float(clipped[i]),
-                    0.0,
+                    velocities[i],
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
-                    getattr(self._config, j.value).t_ff,
+                    (gravity[i] if i < len(ARM_JOINTS) else 0.0)
+                    + compute_friction(
+                        velocities[i],
+                        getattr(self._config, j.value).fc,
+                        getattr(self._config, j.value).k,
+                        getattr(self._config, j.value).fv,
+                        getattr(self._config, j.value).fo,
+                    ),
                 )
                 for i, j in enumerate(Joint)
             ]
@@ -270,7 +289,7 @@ class Axol(RobotBase):
         right: ArmController for the right arm.
 
     Args:
-        config:        Per-joint gains. Defaults to the bundled config.json.
+        config:        Per-joint gains and friction parameters. Defaults to zero.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
     """
