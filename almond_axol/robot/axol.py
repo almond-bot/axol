@@ -7,7 +7,7 @@ import numpy as np
 from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
-from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
+from .config import AxolConfig
 
 
 class ArmController:
@@ -68,26 +68,6 @@ class ArmController:
         """Clear latched error flags on all motors."""
         await asyncio.gather(*[m.clear_errors() for m in self._motors.values()])
 
-    async def set_zero_position(self) -> None:
-        """Save the current shaft position as the encoder zero on all motors."""
-        await asyncio.gather(*[m.set_zero_position() for m in self._motors.values()])
-
-    async def set_acceleration(
-        self, acceleration: float, deceleration: float | None = None
-    ) -> None:
-        """Set the acceleration ramp on all motors.
-
-        Args:
-            acceleration: Acceleration ramp (rad/s²)
-            deceleration: Deceleration ramp (rad/s²). Defaults to acceleration.
-        """
-        await asyncio.gather(
-            *[
-                m.set_acceleration(acceleration, deceleration)
-                for m in self._motors.values()
-            ]
-        )
-
     # ------------------------------------------------------------------ #
     # Getters                                                              #
     # ------------------------------------------------------------------ #
@@ -137,23 +117,55 @@ class ArmController:
         values = await asyncio.gather(*[m.get_voltage() for m in self._motors.values()])
         return np.array(values, dtype=np.float32)
 
-    async def get_error_codes(self) -> dict[Joint, MotorStatus]:
-        """Return MotorStatus for every joint, fetched concurrently."""
+    async def get_error_codes(self) -> list[MotorStatus]:
+        """Return MotorStatus for every joint, fetched concurrently.
+
+        Returns a list in Joint enum order.
+        """
         joints = list(Joint)
         values = await asyncio.gather(
             *[self._motors[j].get_error_code() for j in joints]
         )
-        return dict(zip(joints, values))
+        return list(values)
 
-    async def get_gains(self) -> dict[Joint, MotorGains]:
-        """Return PID gains for every joint, fetched concurrently."""
+    async def get_gains(self) -> list[MotorGains]:
+        """Return PID gains for every joint, fetched concurrently.
+
+        Returns a list in Joint enum order.
+        """
         joints = list(Joint)
         values = await asyncio.gather(*[self._motors[j].get_gains() for j in joints])
-        return dict(zip(joints, values))
+        return list(values)
 
     # ------------------------------------------------------------------ #
     # Setters                                                              #
     # ------------------------------------------------------------------ #
+
+    async def set_gains(self, gains: dict[Joint, MotorGains]) -> None:
+        """Write PID gains to the specified motors.
+
+        Changes are persisted to non-volatile memory.
+        """
+        await asyncio.gather(*[self._motors[j].set_gains(g) for j, g in gains.items()])
+
+    async def set_zero_position(self, joints: list[Joint]) -> None:
+        """Save the current shaft position as the encoder zero for the specified joints.
+
+        Args:
+            joints: List of joints to zero.
+        """
+        await asyncio.gather(*[self._motors[j].set_zero_position() for j in joints])
+
+    async def set_acceleration(self, accelerations: dict[Joint, float]) -> None:
+        """Set the acceleration ramp per joint. Deceleration matches acceleration.
+
+        Args:
+            accelerations: Mapping of joint → acceleration ramp (rad/s²).
+                           Joints not in the dict are unchanged.
+        """
+        await asyncio.gather(
+            *[self._motors[j].set_acceleration(a) for j, a in accelerations.items()]
+        )
 
     async def set_position(self, positions: np.ndarray, max_speed: float) -> None:
         """Move joints to absolute positions using each motor's built-in controller.
@@ -181,13 +193,6 @@ class ArmController:
                 for i, j in enumerate(Joint)
             ]
         )
-
-    async def set_gains(self, gains: dict[Joint, MotorGains]) -> None:
-        """Write PID gains to the specified motors.
-
-        Changes are persisted to non-volatile memory.
-        """
-        await asyncio.gather(*[self._motors[j].set_gains(g) for j, g in gains.items()])
 
     async def motion_control(self, q: np.ndarray) -> None:
         """Send MIT impedance control to all joints concurrently.
@@ -259,6 +264,10 @@ class Axol(RobotBase):
             self._right_bus.close(),
         )
 
+    # ------------------------------------------------------------------ #
+    # Polling                                                              #
+    # ------------------------------------------------------------------ #
+
     async def start_telemetry(self, hz: float) -> None:
         """Start background telemetry polling on both arms at the given frequency.
 
@@ -273,6 +282,10 @@ class Axol(RobotBase):
         """Stop the background telemetry polling loop on both arms."""
         await asyncio.gather(self.left.stop_telemetry(), self.right.stop_telemetry())
 
+    # ------------------------------------------------------------------ #
+    # Arm-wide commands                                                    #
+    # ------------------------------------------------------------------ #
+
     async def enable(self) -> None:
         """Enable all motors on both arms."""
         await asyncio.gather(self.left.enable(), self.right.enable())
@@ -285,20 +298,9 @@ class Axol(RobotBase):
         """Clear latched error flags on both arms."""
         await asyncio.gather(self.left.clear_errors(), self.right.clear_errors())
 
-    async def set_zero_position(self) -> None:
-        """Save the current shaft position as the encoder zero on both arms."""
-        await asyncio.gather(
-            self.left.set_zero_position(), self.right.set_zero_position()
-        )
-
-    async def set_acceleration(
-        self, acceleration: float, deceleration: float | None = None
-    ) -> None:
-        """Set the acceleration ramp (rad/s²) on all motors on both arms."""
-        await asyncio.gather(
-            self.left.set_acceleration(acceleration, deceleration),
-            self.right.set_acceleration(acceleration, deceleration),
-        )
+    # ------------------------------------------------------------------ #
+    # Getters                                                              #
+    # ------------------------------------------------------------------ #
 
     async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
         """Return joint positions (rad) for both arms as (left, right).
@@ -343,17 +345,79 @@ class Axol(RobotBase):
 
     async def get_error_codes(
         self,
-    ) -> tuple[dict[Joint, MotorStatus], dict[Joint, MotorStatus]]:
-        """Return MotorStatus for both arms as (left, right)."""
+    ) -> tuple[list[MotorStatus], list[MotorStatus]]:
+        """Return MotorStatus for both arms as (left, right).
+
+        Each list is in Joint enum order.
+        """
         return await asyncio.gather(
             self.left.get_error_codes(), self.right.get_error_codes()
         )
 
     async def get_gains(
         self,
-    ) -> tuple[dict[Joint, MotorGains], dict[Joint, MotorGains]]:
-        """Return PID gains for both arms as (left, right)."""
+    ) -> tuple[list[MotorGains], list[MotorGains]]:
+        """Return PID gains for both arms as (left, right).
+
+        Each list is in Joint enum order.
+        """
         return await asyncio.gather(self.left.get_gains(), self.right.get_gains())
+
+    # ------------------------------------------------------------------ #
+    # Setters                                                              #
+    # ------------------------------------------------------------------ #
+
+    async def set_gains(
+        self,
+        left: dict[Joint, MotorGains] = {},
+        right: dict[Joint, MotorGains] = {},
+    ) -> None:
+        """Write PID gains to the specified joints on both arms."""
+        tasks = []
+        if left:
+            tasks.append(self.left.set_gains(left))
+        if right:
+            tasks.append(self.right.set_gains(right))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def set_zero_position(
+        self,
+        left: list[Joint] | None = None,
+        right: list[Joint] | None = None,
+    ) -> None:
+        """Save the current shaft position as the encoder zero for the specified joints.
+
+        Args:
+            left:  Joints on the left arm to zero. ``None`` skips the arm.
+            right: Joints on the right arm to zero. ``None`` skips the arm.
+        """
+        tasks = []
+        if left is not None:
+            tasks.append(self.left.set_zero_position(left))
+        if right is not None:
+            tasks.append(self.right.set_zero_position(right))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def set_acceleration(
+        self,
+        left: dict[Joint, float] = {},
+        right: dict[Joint, float] = {},
+    ) -> None:
+        """Set per-joint acceleration ramps (rad/s²) on both arms.
+
+        Args:
+            left:  Joint → acceleration (rad/s²) for the left arm. ``None`` skips.
+            right: Same for the right arm.
+        """
+        tasks = []
+        if left:
+            tasks.append(self.left.set_acceleration(left))
+        if right:
+            tasks.append(self.right.set_acceleration(right))
+        if tasks:
+            await asyncio.gather(*tasks)
 
     async def set_positions(
         self,
@@ -393,20 +457,6 @@ class Axol(RobotBase):
             tasks.append(self.left.set_velocity(left))
         if right is not None:
             tasks.append(self.right.set_velocity(right))
-        if tasks:
-            await asyncio.gather(*tasks)
-
-    async def set_gains(
-        self,
-        left: dict[Joint, MotorGains] = {},
-        right: dict[Joint, MotorGains] = {},
-    ) -> None:
-        """Write PID gains to the specified joints on both arms."""
-        tasks = []
-        if left:
-            tasks.append(self.left.set_gains(left))
-        if right:
-            tasks.append(self.right.set_gains(right))
         if tasks:
             await asyncio.gather(*tasks)
 
