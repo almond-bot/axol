@@ -7,7 +7,7 @@ import numpy as np
 
 
 @dataclass
-class TeleopConfig:
+class VRTeleopConfig:
     """Configuration for a :class:`VRTeleop` session.
 
     Attributes:

@@ -34,6 +34,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from .certs import create_self_signed_cert
+from .config import VRServerConfig
 from .models import VRFrame
 
 _logger = logging.getLogger(__name__)
@@ -45,24 +46,14 @@ class VRServer:
     """Secure WebSocket server that receives VRFrame data from a VR headset.
 
     Args:
-        port:      Port to listen on (default 8000).
-        on_frame:  Optional callback invoked synchronously on each new frame.
-                   Runs on the event-loop thread — keep it fast.
-        certfile:  Path to TLS certificate PEM. Auto-generated if absent.
-        keyfile:   Path to TLS private key PEM. Auto-generated if absent.
+        config:  Server configuration (port, TLS paths). Defaults to VRServerConfig().
     """
 
-    def __init__(
-        self,
-        port: int = 8000,
-        on_frame: Callable[[VRFrame], None] | None = None,
-        certfile: str | None = None,
-        keyfile: str | None = None,
-    ) -> None:
-        self._port = port
-        self._on_frame = on_frame
-        self._certfile = certfile or os.path.join(_CERTS_DIR, "cert.pem")
-        self._keyfile = keyfile or os.path.join(_CERTS_DIR, "key.pem")
+    def __init__(self, config: VRServerConfig = VRServerConfig()) -> None:
+        self._port = config.port
+        self._on_frame: Callable[[VRFrame], None] | None = None
+        self._certfile = config.certfile or os.path.join(_CERTS_DIR, "cert.pem")
+        self._keyfile = config.keyfile or os.path.join(_CERTS_DIR, "key.pem")
 
         self._latest_frame: VRFrame | None = None
         self._client_count: int = 0

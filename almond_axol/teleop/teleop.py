@@ -19,8 +19,8 @@ Or with custom components::
 
     async with VRTeleop(
         Axol(),
-        vr_server=VRServer(port=9000),
-        config=TeleopConfig(smooth_alpha=0.3),
+        config=VRTeleopConfig(smooth_alpha=0.3),
+        vr_server_config=VRServerConfig(port=9000),
     ) as teleop:
         await teleop.run()
 """
@@ -38,8 +38,9 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
+from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
-from .config import TeleopConfig
+from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator
 from .worker import run_ik_worker
 
@@ -64,25 +65,24 @@ class VRTeleop:
     dispatch, smoothing, reset trajectory playback, and robot I/O.
 
     Args:
-        robot: Hardware or simulation target implementing :class:`MotionControl`.
-        vr_server: WebSocket server that receives VR frame data.
-        config: Teleop session parameters (rest poses, loop frequency).
-        solver: Optional :class:`KinematicsSolver` whose config is forwarded to
-            the IK subprocess. Pass a custom instance to tune IK weights.
+        robot:             Hardware or simulation target implementing :class:`MotionControl`.
+        config:            Teleop session parameters (rest poses, loop frequency).
+        kinematics_config: IK solver parameters forwarded to the subprocess.
+        vr_server_config:  VR WebSocket server parameters (port, TLS certs).
     """
 
     def __init__(
         self,
         robot: RobotBase,
         *,
-        config: TeleopConfig = TeleopConfig(),
+        config: VRTeleopConfig = VRTeleopConfig(),
         kinematics_config: KinematicsConfig = KinematicsConfig(),
-        vr_server: VRServer = VRServer(),
+        vr_server_config: VRServerConfig = VRServerConfig(),
     ) -> None:
         self._robot = robot
         self._config = config
         self._kinematics_config = kinematics_config
-        self._vr_server = vr_server
+        self._vr_server = VRServer(vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
 
         # Full joint vector (radians), updated by _ik_loop

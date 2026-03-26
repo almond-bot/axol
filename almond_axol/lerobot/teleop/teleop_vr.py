@@ -104,7 +104,7 @@ class AxolVRTeleop(Teleoperator):
         self._q_lock = threading.Lock()
 
         # Signal processing (accessed only from IK loop thread)
-        cfg = config.teleop_config
+        cfg = config.vr_teleop_config
         self._smooth_left = AlphaSmoothFilter(cfg.smooth_alpha)
         self._smooth_right = AlphaSmoothFilter(cfg.smooth_alpha)
         self._reset_interp = ResetInterpolator()
@@ -157,7 +157,7 @@ class AxolVRTeleop(Teleoperator):
         _logger.info("AxolVRTeleop connected.")
 
     async def _connect_async(self) -> None:
-        self._vr_server = VRServer()
+        self._vr_server = VRServer(self.config.vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
         await self._vr_server.enable()
 
@@ -167,7 +167,11 @@ class AxolVRTeleop(Teleoperator):
 
         process = ctx.Process(
             target=run_ik_worker,
-            args=(child_conn, self.config.teleop_config, self.config.kinematics_config),
+            args=(
+                child_conn,
+                self.config.vr_teleop_config,
+                self.config.kinematics_config,
+            ),
             daemon=True,
         )
         process.start()
@@ -333,7 +337,7 @@ class AxolVRTeleop(Teleoperator):
         loop = asyncio.get_running_loop()
         assert self._parent_conn is not None
         conn = self._parent_conn
-        ik_interval = 1.0 / self.config.teleop_config.frequency
+        ik_interval = 1.0 / self.config.vr_teleop_config.frequency
         last_frame = None
         ik_recv_timeout_count = 0
 
