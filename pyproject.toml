@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = ["jax[cuda13]>=0.9.2"]
+lerobot = ["lerobot"]
 sim = ["viser>=1.0.24"]
 zed = ["pyzed"]
 
@@ -30,6 +31,7 @@ find-links = ["vendor/"]
 
 [tool.uv.sources]
 pyroki = { git = "https://github.com/chungmin99/pyroki.git" }
+lerobot = { git = "https://github.com/huggingface/lerobot.git" }
 
 [project.scripts]
 almond-axol = "almond_axol.cli:main"

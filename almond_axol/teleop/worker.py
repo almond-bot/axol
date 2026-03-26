@@ -23,7 +23,7 @@ import pyroki as pk
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
-from .config import TeleopConfig
+from .config import VRTeleopConfig
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -150,7 +150,7 @@ class IKWorker:
     """
 
     def __init__(
-        self, config: TeleopConfig, kinematics_config: KinematicsConfig
+        self, config: VRTeleopConfig, kinematics_config: KinematicsConfig
     ) -> None:
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
@@ -335,7 +335,7 @@ class IKWorker:
 
 def run_ik_worker(
     conn: multiprocessing.connection.Connection,
-    config: TeleopConfig,
+    config: VRTeleopConfig,
     kinematics_config: KinematicsConfig,
 ) -> None:
     """IK subprocess entry point."""

@@ -1,4 +1,4 @@
-from .config import TeleopConfig
+from .config import VRTeleopConfig
 from .teleop import VRTeleop
 
-__all__ = ["TeleopConfig", "VRTeleop"]
+__all__ = ["VRTeleopConfig", "VRTeleop"]
