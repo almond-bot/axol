@@ -37,7 +37,7 @@ import time
 import numpy as np
 
 from ..kinematics import KinematicsConfig
-from ..robot.base import MotionControl
+from ..robot.base import RobotBase
 from ..vr.server import VRServer
 from .config import TeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator
@@ -73,7 +73,7 @@ class VRTeleop:
 
     def __init__(
         self,
-        robot: MotionControl,
+        robot: RobotBase,
         *,
         config: TeleopConfig = TeleopConfig(),
         kinematics_config: KinematicsConfig = KinematicsConfig(),

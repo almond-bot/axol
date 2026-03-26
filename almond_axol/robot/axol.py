@@ -6,7 +6,7 @@ import numpy as np
 
 from ..motor import CanBus, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
-from .base import MotionControl
+from .base import RobotBase
 from .config import AxolConfig, JointGains  # noqa: F401 (re-exported)
 
 
@@ -211,7 +211,7 @@ class ArmController:
         )
 
 
-class Axol(MotionControl):
+class Axol(RobotBase):
     """Dual-arm Axol robot interface.
 
     Opens one CAN bus per arm and constructs all 16 motor drivers on entry.

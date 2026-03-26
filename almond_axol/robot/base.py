@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 
 
-class MotionControl(ABC):
+class RobotBase(ABC):
     """Common interface for the Axol hardware robot and the viser simulation.
 
     All position values are in radians. Gripper is normalised

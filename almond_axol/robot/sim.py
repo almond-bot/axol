@@ -8,7 +8,7 @@ import threading
 import numpy as np
 
 from ..shared import ARM_JOINTS, URDF_PATH
-from .base import MotionControl
+from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ except ImportError as e:
     ) from e
 
 
-class Sim(MotionControl):
+class Sim(RobotBase):
     """Viser-based robot simulation.
 
     Implements the same :class:`MotionControl` interface as :class:`Axol` so it
