@@ -7,8 +7,7 @@ import threading
 
 import numpy as np
 
-from ..motor import JointValues
-from ..shared import ARM_JOINTS, URDF_PATH, rev_to_rad
+from ..shared import ARM_JOINTS, URDF_PATH
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
@@ -27,7 +26,7 @@ except ImportError as e:
 class Sim(RobotBase):
     """Viser-based robot simulation.
 
-    Implements the same :class:`RobotBase` interface as :class:`Axol` so it
+    Implements the same :class:`MotionControl` interface as :class:`Axol` so it
     can be used as a drop-in replacement for visualising motion without hardware.
 
     Args:
@@ -40,7 +39,7 @@ class Sim(RobotBase):
 
         async with Sim() as sim:
             left_q, right_q = await sim.get_positions()
-            await sim.set_positions(left={Joint.ELBOW: 0.5})
+            await sim.motion_control(left=np.zeros(8, dtype=np.float32))
     """
 
     def __init__(
@@ -56,8 +55,9 @@ class Sim(RobotBase):
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
-        self._last_left: JointValues = {j: 0.0 for j in ARM_JOINTS}
-        self._last_right: JointValues = {j: 0.0 for j in ARM_JOINTS}
+        # Shape (8,): 7 arm joints then gripper, in Joint enum order
+        self._last_left: np.ndarray = np.zeros(len(ARM_JOINTS) + 1, dtype=np.float32)
+        self._last_right: np.ndarray = np.zeros(len(ARM_JOINTS) + 1, dtype=np.float32)
 
     async def enable(self) -> None:
         """Start the viser server thread. No-op after the first call."""
@@ -71,25 +71,28 @@ class Sim(RobotBase):
         """No-op — the daemon thread exits when the process ends."""
         pass
 
-    async def get_positions(self) -> tuple[JointValues, JointValues]:
-        """Return the last commanded joint positions (rev) for both arms."""
-        return dict(self._last_left), dict(self._last_right)
+    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the last commanded joint positions (rad) for both arms.
 
-    async def set_positions(
+        Each array is shape (8,) in Joint enum order: 7 arm joints then gripper.
+        """
+        return self._last_left.copy(), self._last_right.copy()
+
+    async def motion_control(
         self,
-        left: JointValues | None = None,
-        right: JointValues | None = None,
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
     ) -> None:
-        """Update the simulation to the given joint positions (rev).
+        """Update the simulation to the given joint positions (rad).
 
         Args:
-            left:  Target positions (rev) for the left arm.  ``None`` skips the arm.
-            right: Target positions (rev) for the right arm. ``None`` skips the arm.
+            left:  Shape (8,) array of target positions (rad). ``None`` skips the arm.
+            right: Same for the right arm.
         """
         if left is not None:
-            self._last_left.update(left)
+            self._last_left = np.asarray(left, dtype=np.float32)
         if right is not None:
-            self._last_right.update(right)
+            self._last_right = np.asarray(right, dtype=np.float32)
 
         q = self._build_q()
         with self._condition:
@@ -97,17 +100,19 @@ class Sim(RobotBase):
             self._condition.notify()
 
     def _build_q(self) -> np.ndarray:
-        """Build the full joint angle array (radians) for viser from cached positions."""
-        q = np.zeros(len(ARM_JOINTS) * 2, dtype=float)
-        for i, joint in enumerate(ARM_JOINTS):
-            q[i] = rev_to_rad(self._last_left.get(joint, 0.0))
-            q[i + len(ARM_JOINTS)] = rev_to_rad(self._last_right.get(joint, 0.0))
-        return q
+        """Build the arm joint angle array (radians), left then right, no gripper."""
+        n_arm = len(ARM_JOINTS)  # 7, no gripper
+        return np.concatenate(
+            [
+                self._last_left[:n_arm].astype(float),
+                self._last_right[:n_arm].astype(float),
+            ]
+        )
 
     def _run(self) -> None:
         server = viser.ViserServer(port=self._port)
 
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir="")
+        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         viser_urdf = ViserUrdf(
             server,
             urdf_or_path=urdf,
@@ -116,28 +121,36 @@ class Sim(RobotBase):
             load_collision_meshes=False,
         )
 
+        # Build the robot-side joint ordering to match _build_q's output:
+        # left arm joint1-N, then right arm joint1-N.
+        n_arm = len(ARM_JOINTS)
+        left_names = [f"openarm_left_joint{i + 1}" for i in range(n_arm)]
+        right_names = [f"openarm_right_joint{i + 1}" for i in range(n_arm)]
+        robot_order = (self._joint_names or left_names) + right_names
+
+        # Map each viser joint to its index in robot_order (-1 for joints not
+        # in robot_order, e.g. finger joints, which stay at 0).
         viser_order = viser_urdf.get_actuated_joint_names()
-        robot_order = self._joint_names or viser_order
-        if viser_order == robot_order:
-            reorder = None
-        else:
+        viser_to_robot: list[int] = []
+        for name in viser_order:
             try:
-                reorder = np.array([robot_order.index(name) for name in viser_order])
+                viser_to_robot.append(robot_order.index(name))
             except ValueError:
-                reorder = None
-                _logger.warning(
-                    "Joint name mismatch between robot and viser URDF — "
-                    "display may be incorrect."
-                )
+                viser_to_robot.append(-1)
+
+        def _to_viser(q_robot: np.ndarray) -> np.ndarray:
+            q_out = np.zeros(len(viser_order), dtype=float)
+            for vi, ri in enumerate(viser_to_robot):
+                if ri >= 0:
+                    q_out[vi] = q_robot[ri]
+            return q_out
 
         q0 = (
             np.asarray(self._default_q, dtype=float)
             if self._default_q is not None
             else np.zeros(len(robot_order))
         )
-        if reorder is not None:
-            q0 = q0[reorder]
-        viser_urdf.update_cfg(q0)
+        viser_urdf.update_cfg(_to_viser(q0))
 
         server.scene.add_grid("/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0))
 
@@ -146,6 +159,4 @@ class Sim(RobotBase):
                 self._condition.wait()
                 q = self._latest_q
             if q is not None and q.size > 0:
-                if reorder is not None:
-                    q = np.asarray(q)[reorder]
-                viser_urdf.update_cfg(np.asarray(q, dtype=float))
+                viser_urdf.update_cfg(_to_viser(np.asarray(q, dtype=float)))

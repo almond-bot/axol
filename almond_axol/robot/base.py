@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from ..motor import JointValues
+import numpy as np
 
 
 class RobotBase(ABC):
     """Common interface for the Axol hardware robot and the viser simulation.
 
-    All position values are in revolutions. Gripper is normalised
+    All position values are in radians. Gripper is normalised
     [0.0 closed, 1.0 open].
     """
 
@@ -25,22 +25,24 @@ class RobotBase(ABC):
         ...
 
     @abstractmethod
-    async def get_positions(self) -> tuple[JointValues, JointValues]:
-        """Return current joint positions (rev) for both arms as (left, right)."""
+    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return current joint positions (rad) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order: 7 arm joints then gripper.
+        """
         ...
 
     @abstractmethod
-    async def set_positions(
+    async def motion_control(
         self,
-        left: JointValues | None = None,
-        right: JointValues | None = None,
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
     ) -> None:
-        """Command joint positions (rev) on one or both arms.
+        """Send MIT impedance control commands to one or both arms.
 
         Args:
-            left:  Target positions keyed by joint. Omit or pass ``None`` to
-                skip the left arm.
-            right: Target positions keyed by joint. Omit or pass ``None`` to
-                skip the right arm.
+            left:  Shape (8,) array of target positions (rad) in Joint enum order.
+                   Pass ``None`` to skip the left arm.
+            right: Same for the right arm.
         """
         ...

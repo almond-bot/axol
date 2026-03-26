@@ -30,12 +30,12 @@ class MotorDriver(ABC):
 
     @abstractmethod
     async def get_position(self) -> float:
-        """Return current shaft position in revolutions."""
+        """Return current shaft position in radians."""
         ...
 
     @abstractmethod
     async def get_velocity(self) -> float:
-        """Return current shaft velocity in revolutions per second."""
+        """Return current shaft velocity in radians per second."""
         ...
 
     @abstractmethod
@@ -83,8 +83,8 @@ class MotorDriver(ABC):
         """Move to an absolute position using the motor's built-in position controller.
 
         Args:
-            position:  Target shaft position (rev)
-            max_speed: Maximum speed during the move (rev/s)
+            position:  Target shaft position (rad)
+            max_speed: Maximum speed during the move (rad/s)
         """
         ...
 
@@ -93,7 +93,7 @@ class MotorDriver(ABC):
         """Command a target velocity using the motor's built-in speed controller.
 
         Args:
-            velocity: Target shaft velocity (rev/s)
+            velocity: Target shaft velocity (rad/s)
         """
         ...
 
@@ -105,8 +105,8 @@ class MotorDriver(ABC):
         Only supported by Damiao motors. Raises MotorError on MyActuator.
 
         Args:
-            position:    Target shaft position (rev)
-            max_speed:   Maximum speed during the move (rev/s)
+            position:    Target shaft position (rad)
+            max_speed:   Maximum speed during the move (rad/s)
             max_current: Maximum phase current, normalized [0.0, 1.0]
         """
         raise MotorError(
@@ -120,8 +120,8 @@ class MotorDriver(ABC):
         """Set the acceleration ramp for position and velocity control modes.
 
         Args:
-            acceleration: Acceleration ramp (rev/s²)
-            deceleration: Deceleration ramp (rev/s²). If None, matches acceleration.
+            acceleration: Acceleration ramp (rad/s²)
+            deceleration: Deceleration ramp (rad/s²). If None, matches acceleration.
                           Damiao stores acceleration and deceleration separately;
                           MyActuator applies the same value to both ramps.
         """
@@ -155,8 +155,8 @@ class MotorDriver(ABC):
         """Send an MIT-style impedance control command.
 
         Args:
-            p_des: Desired position (rev)
-            v_des: Desired velocity (rev/s)
+            p_des: Desired position (rad)
+            v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
             kd:    Velocity damping   [0, 5]
             t_ff:  Feedforward torque (Nm)

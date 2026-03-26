@@ -10,7 +10,6 @@ from typing import Callable
 
 import can
 
-from ..shared import rad_to_rev, rev_to_rad
 from .bus import CanBus
 from .driver import MotorDriver
 from .errors import MotorError
@@ -284,11 +283,11 @@ class DamiaoMotor(MotorDriver):
 
     async def get_position(self) -> float:
         feedback = await self._request_feedback()
-        return rad_to_rev(feedback.position)
+        return feedback.position
 
     async def get_velocity(self) -> float:
         feedback = await self._request_feedback()
-        return rad_to_rev(feedback.velocity)
+        return feedback.velocity
 
     async def get_torque(self) -> float:
         feedback = await self._request_feedback()
@@ -300,7 +299,7 @@ class DamiaoMotor(MotorDriver):
         on_torque: Callable[[float], None],
     ) -> None:
         feedback = await self._request_feedback()
-        on_position(rad_to_rev(feedback.position))
+        on_position(feedback.position)
         on_torque(feedback.torque)
 
     async def get_temperature(self) -> float:
@@ -315,16 +314,15 @@ class DamiaoMotor(MotorDriver):
         return _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
 
     async def set_position(self, position: float, max_speed: float) -> None:
-        # convert rev → rad for POS_VEL mode (arb_id 0x100 + motor_id)
         await self._send_cmd(
-            target_position=rev_to_rad(position),
-            target_velocity=rev_to_rad(max_speed),
+            target_position=position,
+            target_velocity=max_speed,
             control_mode=_ControlMode.POS_VEL,
         )
 
     async def set_velocity(self, velocity: float) -> None:
         await self._send_cmd(
-            target_velocity=rev_to_rad(velocity),
+            target_velocity=velocity,
             control_mode=_ControlMode.VEL,
         )
 
@@ -332,8 +330,8 @@ class DamiaoMotor(MotorDriver):
         self, position: float, max_speed: float, max_current: float
     ) -> None:
         await self._send_cmd(
-            target_position=rev_to_rad(position),
-            velocity_limit=rev_to_rad(max_speed),
+            target_position=position,
+            velocity_limit=max_speed,
             current_limit=max_current,
             control_mode=_ControlMode.FORCE_POS,
         )
@@ -341,12 +339,9 @@ class DamiaoMotor(MotorDriver):
     async def set_acceleration(
         self, acceleration: float, deceleration: float | None = None
     ) -> None:
-        acc_rad_s2 = rev_to_rad(acceleration)
-        dec_rad_s2 = rev_to_rad(
-            deceleration if deceleration is not None else acceleration
-        )
-        await self._write_register(_DM_REG_ACC, acc_rad_s2)
-        await self._write_register(_DM_REG_DEC, dec_rad_s2)
+        dec = deceleration if deceleration is not None else acceleration
+        await self._write_register(_DM_REG_ACC, acceleration)
+        await self._write_register(_DM_REG_DEC, dec)
         await self._store_parameters()
 
     async def get_gains(self) -> MotorGains:
@@ -395,10 +390,9 @@ class DamiaoMotor(MotorDriver):
         kd: float,
         t_ff: float,
     ) -> None:
-        # convert rev → rad for MIT mode
         await self._send_cmd(
-            target_position=rev_to_rad(p_des),
-            target_velocity=rev_to_rad(v_des),
+            target_position=p_des,
+            target_velocity=v_des,
             stiffness=kp,
             damping=kd,
             feedforward_torque=t_ff,
