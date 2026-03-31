@@ -4,7 +4,9 @@ from . import (
     collect_data,
     identify_friction,
     install_zed,
+    motor_info,
     run_policy,
+    set_can_id,
     setup_can,
     stream_zed,
     teleop,
@@ -17,6 +19,8 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup_can.add_parser(subparsers)
+    set_can_id.add_parser(subparsers)
+    motor_info.add_parser(subparsers)
     collect_data.add_parser(subparsers)
     run_policy.add_parser(subparsers)
     teleop.add_parser(subparsers)
