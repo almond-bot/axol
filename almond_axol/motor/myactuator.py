@@ -32,8 +32,9 @@ _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
 _MA_SET_ENCODER_ZERO = 0x64
 _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
-_MA_SET_CAN_ID = 0x79  # change CAN ID
-_MA_SET_CAN_BAUD = 0xB4  # change CAN baud rate
+_MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
+_MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
+_MA_SET_CAN_BAUD = 0xB4  # change CAN baud rate; no response — motor restarts
 _MA_READ_GAINS = 0x30  # read all PID gains (uint8, bulk)
 _MA_WRITE_GAINS_ROM = (
     0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
@@ -282,9 +283,23 @@ class MyActuatorMotor(MotorDriver):
         await self._request(data)
 
     async def set_can_id(self, can_id: int) -> None:
-        # Byte 6 carries the new CAN ID; response arrives on the old resp ID.
-        data = bytes([_MA_SET_CAN_ID, 0x00, 0x00, 0x00, 0x00, 0x00, can_id, 0x00])
-        await self._request(data)
+        # no response; motor must be reset for the new ID to take effect
+        data = bytes(
+            [
+                _MA_FUNCTION_CONTROL,
+                _MA_FC_SET_CANID,
+                0x00,
+                0x00,
+                can_id & 0xFF,
+                (can_id >> 8) & 0xFF,
+                0x00,
+                0x00,
+            ]
+        )
+        await self._bus._send(_MA_REQ + self._motor_id, data)
+        await asyncio.sleep(0.1)
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(0.5)
         self._motor_id = can_id
 
     async def set_can_baud_rate(self, baud_rate: int) -> None:
@@ -294,7 +309,7 @@ class MyActuatorMotor(MotorDriver):
                 f"Unsupported baud rate {baud_rate}. Supported: {sorted(_MA_BAUD_MAP)}"
             )
         data = bytes([_MA_SET_CAN_BAUD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, code])
-        await self._request(data)
+        await self._bus._send(_MA_REQ + self._motor_id, data)
 
     async def motion_control(
         self,

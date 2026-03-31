@@ -4,7 +4,6 @@ almond-axol set-can-id
 Change the CAN ID of a single motor and persist it to flash.
 
 The motor must be the only device on the bus, or you must know its current CAN ID.
-After running this command, power-cycle the motor to confirm the new ID is active.
 
 Examples:
     almond-axol set-can-id --type myactuator --current-id 0x01 --new-id 0x03
@@ -77,4 +76,11 @@ async def _run(args: argparse.Namespace) -> None:
         print("  sending set-can-id command ...")
         await motor.set_can_id(args.new_id)
         print(f"  done — new CAN ID is {args.new_id:#04x}")
-        print("  power-cycle the motor to confirm the change.")
+
+        print("  verifying ...")
+        voltage = await motor.get_voltage()
+        temperature = await motor.get_temperature()
+        position = await motor.get_position()
+        print(f"  voltage:     {voltage:.1f} V")
+        print(f"  temperature: {temperature:.0f} °C")
+        print(f"  position:    {position:.4f} rad")
