@@ -160,6 +160,8 @@ class MyActuatorMotor(MotorDriver):
 
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(0.5)
 
     async def get_position(self) -> float:
         resp = await self._request(self._cmd(_MA_MULTI_TURN_ANGLE))
