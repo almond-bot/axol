@@ -1,14 +1,18 @@
 """Live terminal display of all motor positions at 100 Hz.
 
 Run directly:
-    python -m almond_axol.test.can
+    python -m almond_axol.test.can --left
+    python -m almond_axol.test.can --right
 """
 
+import argparse
 import asyncio
 import math
 
-from ..robot.axol import Axol, arm_limits
-from ..shared import Joint
+from ..motor import CanBus
+from ..robot.axol import ArmController, arm_limits
+from ..robot.config import AxolConfig
+from ..shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -24,32 +28,32 @@ def _bar(value: float, lo: float, hi: float) -> str:
     return "".join(bar)
 
 
-async def _run() -> None:
+async def _run(is_left: bool) -> None:
     joints = list(Joint)
+    side = "left" if is_left else "right"
+    channel = CAN_LEFT if is_left else CAN_RIGHT
 
-    async with Axol() as axol:
-        await axol.start_telemetry(100)
+    async with CanBus(channel) as bus:
+        arm = ArmController(bus, AxolConfig(), is_left=is_left)
+        await arm.start_telemetry(100)
         await asyncio.sleep(0.1)
 
         print("\033[?25l", end="")  # hide cursor
         try:
             while True:
-                pos_l = axol.left.positions
-                pos_r = axol.right.positions
+                positions = arm.positions
 
                 lines = []
                 lines.append("\033[H\033[J")  # home + clear
-                lines.append(
-                    f"  {'Joint':<12}  {'Left':>8}  {'rev':<{_BAR_WIDTH}}  {'Right':>8}  {'rev':<{_BAR_WIDTH}}"
-                )
-                lines.append("  " + "─" * (12 + 8 + _BAR_WIDTH + 8 + _BAR_WIDTH + 6))
+                lines.append(f"  {side.upper()} ARM")
+                lines.append(f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}")
+                lines.append("  " + "─" * (12 + 8 + _BAR_WIDTH + 4))
 
                 for i, joint in enumerate(joints):
-                    lo_l, hi_l = arm_limits(joint, is_left=True)
-                    lo_r, hi_r = arm_limits(joint, is_left=False)
-                    pl, pr = float(pos_l[i]), float(pos_r[i])
+                    lo, hi = arm_limits(joint, is_left=is_left)
+                    p = float(positions[i])
                     lines.append(
-                        f"  {joint.value:<12}  {pl / _TAU:>+8.4f}  {_bar(pl, lo_l, hi_l)}  {pr / _TAU:>+8.4f}  {_bar(pr, lo_r, hi_r)}"
+                        f"  {joint.value:<12}  {p / _TAU:>+8.4f}  {_bar(p, lo, hi)}"
                     )
 
                 lines.append("")
@@ -65,7 +69,13 @@ async def _run() -> None:
 
 
 def main() -> None:
-    asyncio.run(_run())
+    parser = argparse.ArgumentParser(description="Live motor position display")
+    side = parser.add_mutually_exclusive_group(required=True)
+    side.add_argument("--l", action="store_true", help="Monitor left arm")
+    side.add_argument("--r", action="store_true", help="Monitor right arm")
+    args = parser.parse_args()
+
+    asyncio.run(_run(is_left=args.l))
 
 
 if __name__ == "__main__":
