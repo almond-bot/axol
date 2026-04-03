@@ -77,7 +77,9 @@ async def _run(args: argparse.Namespace) -> None:
         torque_unit = "Nm" if is_damiao else "A"
 
         print(f"  status      {status.value}")
-        print(f"  position    {position:.4f} rad  ({math.degrees(position):.2f}°)")
+        print(
+            f"  position    {position:.4f} rad  ({math.degrees(position):.2f}°)  ({position / (2 * math.pi):.4f} rev)"
+        )
         print(f"  velocity    {velocity:.4f} rad/s  ({math.degrees(velocity):.2f}°/s)")
         print(f"  {torque_label:<10}  {torque:.4f} {torque_unit}")
         print(f"  temperature {temperature:.1f} °C")
