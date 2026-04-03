@@ -6,7 +6,7 @@ import math
 import numpy as np
 
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
-from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, GravityCompensator, compute_friction
@@ -266,7 +266,7 @@ class ArmController:
         velocities = self._differentiator.differentiate(list(clipped))
 
         # Gravity torques for the 7 arm joints (shoulder_1 → wrist_3, not gripper).
-        gravity = self._gravity_comp.get_gravity(list(clipped[: len(ARM_JOINTS)]))
+        # gravity = self._gravity_comp.get_gravity(list(clipped[: len(ARM_JOINTS)]))
 
         await asyncio.gather(
             *[
@@ -275,7 +275,7 @@ class ArmController:
                     velocities[i],
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
-                    (gravity[i] if i < len(ARM_JOINTS) else 0.0)
+                    0.0  # (gravity[i] if i < len(ARM_JOINTS) else 0.0)
                     + compute_friction(
                         velocities[i],
                         getattr(self._config, j.value).fc,
