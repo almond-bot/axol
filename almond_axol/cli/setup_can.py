@@ -119,8 +119,57 @@ def _reload_udev() -> None:
     print("Reloading udev rules (requires sudo)...")
     subprocess.run(["sudo", "udevadm", "control", "--reload-rules"], check=True)
     subprocess.run(["sudo", "systemctl", "restart", "systemd-udevd"], check=True)
-    subprocess.run(["sudo", "udevadm", "trigger"], check=True)
-    print("  Done. Unplug and replug the adapter to apply the new names.")
+    print("  Done.")
+
+
+def _rename_interfaces(serial: str) -> None:
+    """Rename existing canX interfaces to their target names without replug."""
+    print("Renaming CAN interfaces (requires sudo)...")
+    target = {0: _CAN_L, 1: _CAN_R}
+
+    for iface_path in Path("/sys/class/net").glob("can*"):
+        iface = iface_path.name
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+
+        iface_serial = next(
+            (
+                line.split('"')[1]
+                for line in info.splitlines()
+                if "ATTRS{serial}" in line
+            ),
+            "",
+        )
+        if iface_serial != serial:
+            continue
+
+        dev_id_str = next(
+            (
+                line.split('"')[1]
+                for line in info.splitlines()
+                if "ATTR{dev_id}" in line
+            ),
+            "",
+        )
+        try:
+            dev_id = int(dev_id_str, 16)
+        except ValueError:
+            continue
+
+        new_name = target.get(dev_id)
+        if new_name is None or iface == new_name:
+            continue
+
+        print(f"  {iface} -> {new_name}")
+        subprocess.run(["sudo", "ip", "link", "set", iface, "down"], check=True)
+        subprocess.run(
+            ["sudo", "ip", "link", "set", iface, "name", new_name], check=True
+        )
+
+    print("  Done.")
 
 
 def _write_cron_script() -> None:
@@ -174,6 +223,7 @@ def run(_args: object = None) -> None:
     serial = _find_serial()
     _write_udev_rules(serial)
     _reload_udev()
+    _rename_interfaces(serial)
     _write_cron_script()
     _register_cron()
     _bring_up_can()
