@@ -25,12 +25,13 @@ Usage
 from ..shared import Joint
 from .bus import CanBus
 from .errors import MotorError
-from .motor import Motor
+from .motor import Motor, make_driver
 from .types import ControlMode, MotorGains, MotorStatus
 
 __all__ = [
     "CanBus",
     "Motor",
+    "make_driver",
     "Joint",
     "MotorError",
     "ControlMode",

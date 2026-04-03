@@ -24,6 +24,8 @@ class _JointConfig:
     motor_id: int
 
 
+_ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
+
 _JOINT_CONFIG: dict[Joint, _JointConfig] = {
     Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01),
     Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02),
@@ -34,6 +36,32 @@ _JOINT_CONFIG: dict[Joint, _JointConfig] = {
     Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
     Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
 }
+
+
+_ID_TO_TYPE = {cfg.motor_id: cfg.kind for cfg in _JOINT_CONFIG.values()}
+
+
+def make_driver(
+    bus: CanBus, motor_id: int, motor_type: str | None = None
+) -> MotorDriver:
+    """Return the correct MotorDriver for *motor_id*.
+
+    Args:
+        motor_type: ``"myactuator"`` or ``"damiao"`` to override inference.
+                    If ``None``, the type is inferred from *motor_id*.
+    """
+    if motor_type is not None:
+        kind = _MotorType(motor_type)
+    else:
+        kind = _ID_TO_TYPE.get(motor_id)
+        if kind is None:
+            raise ValueError(
+                f"Unknown motor ID {motor_id:#04x}. Known IDs: "
+                + ", ".join(f"{i:#04x}" for i in sorted(_ID_TO_TYPE))
+            )
+    if kind == _MotorType.MYACTUATOR:
+        return MyActuatorMotor(bus, motor_id)
+    return DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
 
 
 class Motor:
