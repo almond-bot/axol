@@ -10,7 +10,6 @@ on a single USB device:
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
 """
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -32,11 +31,6 @@ _CRON_SCRIPT = _CAN_DIR / "startup.sh"
 def _die(msg: str) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(1)
-
-
-def _require_root() -> None:
-    if os.geteuid() != 0:
-        _die("This command must be run as root (sudo).")
 
 
 def _find_serial() -> str:
@@ -102,8 +96,8 @@ def _find_serial() -> str:
 
 
 def _write_udev_rules(serial: str) -> None:
-    print(f"Writing udev rules to {_UDEV_RULES_FILE}...")
-    _UDEV_RULES_FILE.write_text(
+    print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
+    content = (
         f"# Almond Axol dual-channel CAN adapter\n"
         f"# Adapter serial: {serial}\n"
         f"# Channel 0 -> left arm\n"
@@ -111,14 +105,21 @@ def _write_udev_rules(serial: str) -> None:
         f"# Channel 1 -> right arm\n"
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
     )
+    subprocess.run(
+        ["sudo", "tee", str(_UDEV_RULES_FILE)],
+        input=content,
+        text=True,
+        check=True,
+        stdout=subprocess.DEVNULL,
+    )
     print("  Done.")
 
 
 def _reload_udev() -> None:
-    print("Reloading udev rules...")
-    subprocess.run(["udevadm", "control", "--reload-rules"], check=True)
-    subprocess.run(["systemctl", "restart", "systemd-udevd"], check=True)
-    subprocess.run(["udevadm", "trigger"], check=True)
+    print("Reloading udev rules (requires sudo)...")
+    subprocess.run(["sudo", "udevadm", "control", "--reload-rules"], check=True)
+    subprocess.run(["sudo", "systemctl", "restart", "systemd-udevd"], check=True)
+    subprocess.run(["sudo", "udevadm", "trigger"], check=True)
     print("  Done. Unplug and replug the adapter to apply the new names.")
 
 
@@ -141,14 +142,18 @@ def _write_cron_script() -> None:
 
 
 def _register_cron() -> None:
-    print("Registering @reboot cron entry in root crontab...")
+    print("Registering @reboot cron entry in root crontab (requires sudo)...")
     cron_entry = f"@reboot {_CRON_SCRIPT}"
-    existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    existing = subprocess.run(
+        ["sudo", "crontab", "-l"], capture_output=True, text=True
+    ).stdout
     if str(_CRON_SCRIPT) in existing:
         print("  Entry already present — skipping.")
     else:
         new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
-        subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
+        subprocess.run(
+            ["sudo", "crontab", "-"], input=new_crontab, text=True, check=True
+        )
         print(f"  Added: {cron_entry}")
 
 
@@ -159,13 +164,19 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
+def _bring_up_can() -> None:
+    print("Bringing up CAN interfaces (requires sudo)...")
+    subprocess.run(["sudo", "bash", str(_CRON_SCRIPT)], check=True)
+    print("  Done.")
+
+
 def run(_args: object = None) -> None:
-    _require_root()
     serial = _find_serial()
     _write_udev_rules(serial)
     _reload_udev()
     _write_cron_script()
     _register_cron()
+    _bring_up_can()
 
     print()
     print("Setup complete.")
