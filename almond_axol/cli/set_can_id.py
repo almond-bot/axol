@@ -2,13 +2,12 @@
 almond-axol set-can-id
 
 Change the CAN ID of a single motor and persist it to flash.
-The motor type is inferred automatically from the current CAN ID.
 
 The motor must be the only device on the bus, or you must know its current CAN ID.
 
 Examples:
-    almond-axol set-can-id --channel l --current-id 0x01 --new-id 0x03
-    almond-axol set-can-id --channel r --current-id 0x06 --new-id 0x07
+    almond-axol set-can-id --channel l --current-id 0x01 --new-id 0x03 --type myactuator
+    almond-axol set-can-id --channel r --current-id 0x06 --new-id 0x07 --type damiao
 """
 
 import argparse
@@ -47,9 +46,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument(
         "--type",
+        required=True,
         choices=["myactuator", "damiao"],
-        default=None,
-        help="Motor driver type (inferred from current ID if omitted)",
+        help="Motor driver type",
     )
     p.set_defaults(func=run)
 
