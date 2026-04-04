@@ -61,7 +61,11 @@ class CanBus:
 
     async def _reader_loop(self) -> None:
         while True:
-            msg: can.Message | None = await asyncio.to_thread(self._bus.recv, 0.02)
-            if msg is not None:
+            # Block up to 1ms for the first message, then yield to the event loop.
+            msg: can.Message | None = await asyncio.to_thread(self._bus.recv, 0.001)
+            while msg is not None:
                 for listener in self._listeners:
                     listener(msg)
+                # Drain any additional messages that arrived in the meantime.
+                # recv(timeout=0) is a non-blocking select() — safe to call here.
+                msg = self._bus.recv(timeout=0)
