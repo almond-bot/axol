@@ -17,9 +17,9 @@ will include any residual gravity at the measurement positions.
 Run tune-pid first to find good Kp/Kd values before using this command.
 
 Examples:
-    almond-axol identify-friction --left  --joint shoulder_1 --kp 30 --kd 0.8
-    almond-axol identify-friction --right --joint elbow      --kp 20 --kd 0.6
-    almond-axol identify-friction --left  --joint wrist_2    --kp 10 --kd 0.4 --velocities 0.1 0.3 0.6 1.2
+    almond-axol identify-friction --l --joint shoulder_1 --kp 30 --kd 0.8
+    almond-axol identify-friction --r --joint elbow      --kp 20 --kd 0.6
+    almond-axol identify-friction --l --joint wrist_2    --kp 10 --kd 0.4 --velocities 0.1 0.3 0.6 1.2
 """
 
 import argparse
@@ -250,8 +250,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         description=__doc__,
     )
     side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--left", action="store_true")
-    side.add_argument("--right", action="store_true")
+    side.add_argument("--l", action="store_true")
+    side.add_argument("--r", action="store_true")
     p.add_argument(
         "--joint",
         required=True,
@@ -282,7 +282,7 @@ def run(args: argparse.Namespace) -> None:
 
 async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
-    is_left = args.left
+    is_left = args.l
     side_str = "left" if is_left else "right"
     kp, kd = args.kp, args.kd
 

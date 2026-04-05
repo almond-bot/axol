@@ -6,8 +6,8 @@ Change the CAN ID of a single motor and persist it to flash.
 The motor must be the only device on the bus, or you must know its current CAN ID.
 
 Examples:
-    almond-axol set-can-id --channel l --current-id 0x01 --new-id 0x03 --type myactuator
-    almond-axol set-can-id --channel r --current-id 0x06 --new-id 0x07 --type damiao
+    almond-axol set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+    almond-axol set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
 """
 
 import argparse
@@ -24,12 +24,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    p.add_argument(
-        "--channel",
-        required=True,
-        choices=["l", "r"],
-        help="CAN channel: l = can_alm_axol_l, r = can_alm_axol_r",
-    )
+    side = p.add_mutually_exclusive_group(required=True)
+    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
+    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
     p.add_argument(
         "--current-id",
         required=True,
@@ -58,7 +55,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    channel = f"can_alm_axol_{args.channel}"
+    channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
     print(f"\nset-can-id — {channel}  {args.current_id:#04x} → {args.new_id:#04x}")
 
     async with CanBus(channel) as bus:

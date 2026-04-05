@@ -47,5 +47,5 @@ class AxolConfig:
     elbow: JointGains = field(default_factory=JointGains)
     wrist_1: JointGains = field(default_factory=JointGains)
     wrist_2: JointGains = field(default_factory=JointGains)
-    wrist_3: JointGains = field(default_factory=JointGains)
+    wrist_3: JointGains = field(default_factory=lambda: JointGains(kp=100.0, kd=0.8))
     gripper: JointGains = field(default_factory=JointGains)

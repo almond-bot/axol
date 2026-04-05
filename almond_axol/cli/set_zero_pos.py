@@ -8,8 +8,8 @@ The motor must be powered and on the CAN bus. The command sets the current
 mechanical position as the new zero reference (persisted to flash).
 
 Examples:
-    almond-axol set-zero-pos --channel l --id 0x01
-    almond-axol set-zero-pos --channel r --id 0x06
+    almond-axol set-zero-pos --l --id 0x01
+    almond-axol set-zero-pos --r --id 0x06
 """
 
 import argparse
@@ -26,12 +26,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    p.add_argument(
-        "--channel",
-        required=True,
-        choices=["l", "r"],
-        help="CAN channel: l = can_alm_axol_l, r = can_alm_axol_r",
-    )
+    side = p.add_mutually_exclusive_group(required=True)
+    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
+    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
     p.add_argument(
         "--id",
         required=True,
@@ -53,7 +50,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    channel = f"can_alm_axol_{args.channel}"
+    channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
     print(f"\nset-zero-pos — {channel}  id={args.id:#04x}")
 
     async with CanBus(channel) as bus:
