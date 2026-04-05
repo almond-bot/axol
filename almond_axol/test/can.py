@@ -1,8 +1,9 @@
-"""Live terminal display of all motor positions at 100 Hz.
+"""Live terminal display of all motor positions.
 
 Run directly:
-    python -m almond_axol.test.can --left
-    python -m almond_axol.test.can --right
+    python -m almond_axol.test.can --l
+    python -m almond_axol.test.can --r
+    python -m almond_axol.test.can --l --hz 50
 """
 
 import argparse
@@ -28,14 +29,14 @@ def _bar(value: float, lo: float, hi: float) -> str:
     return "".join(bar)
 
 
-async def _run(is_left: bool) -> None:
+async def _run(is_left: bool, hz: int) -> None:
     joints = list(Joint)
     side = "left" if is_left else "right"
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
     async with CanBus(channel) as bus:
         arm = ArmController(bus, AxolConfig(), is_left=is_left)
-        await arm.start_telemetry(100)
+        await arm.start_telemetry(hz)
         await asyncio.sleep(0.1)
 
         print("\033[?25l", end="")  # hide cursor
@@ -60,9 +61,9 @@ async def _run(is_left: bool) -> None:
                 lines.append("  ctrl+c to quit")
                 print("\n".join(lines), end="", flush=True)
 
-                await asyncio.sleep(1 / 100)
+                await asyncio.sleep(1 / hz)
 
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, asyncio.CancelledError):
             pass
         finally:
             print("\033[?25h")  # restore cursor
@@ -73,9 +74,12 @@ def main() -> None:
     side = parser.add_mutually_exclusive_group(required=True)
     side.add_argument("--l", action="store_true", help="Monitor left arm")
     side.add_argument("--r", action="store_true", help="Monitor right arm")
+    parser.add_argument(
+        "--hz", type=int, default=100, help="Telemetry rate in Hz (default: 100)"
+    )
     args = parser.parse_args()
 
-    asyncio.run(_run(is_left=args.l))
+    asyncio.run(_run(is_left=args.l, hz=args.hz))
 
 
 if __name__ == "__main__":
