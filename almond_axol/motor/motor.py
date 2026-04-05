@@ -160,10 +160,13 @@ class Motor:
         interval = 1.0 / hz
         while True:
             start = asyncio.get_event_loop().time()
-            await self._driver.get_telemetry(
-                on_position=lambda p: setattr(self, "_position", p),
-                on_torque=lambda t: setattr(self, "_torque", t),
-            )
+            try:
+                await self._driver.get_telemetry(
+                    on_position=lambda p: setattr(self, "_position", p),
+                    on_torque=lambda t: setattr(self, "_torque", t),
+                )
+            except MotorError:
+                pass  # Dropped CAN frames are normal on physical buses; skip cycle
             elapsed = asyncio.get_event_loop().time() - start
             await asyncio.sleep(max(0.0, interval - elapsed))
 
