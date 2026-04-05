@@ -150,10 +150,8 @@ class MyActuatorMotor(MotorDriver):
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         # MyActuator has no persistent control mode register; the active mode is
-        # determined by which command is sent. Reset the motor to clear internal
-        # state so it comes back ready for the next command type.
-        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(0.5)
+        # determined by which command is sent.
+        pass
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command

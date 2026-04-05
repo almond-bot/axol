@@ -7,10 +7,10 @@ Tests gains via sinusoidal or step-response tracking and measures error (RMS, ma
 overshoot). Results are printed to stdout.
 
 Examples:
-    almond-axol tune-pid --left  --joint elbow      --kp 25 --kd 0.6
-    almond-axol tune-pid --right --joint shoulder_1 --kp 35 --kd 1.2 --mode step
-    almond-axol tune-pid --left  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
-    almond-axol tune-pid --left  --joint wrist_2    --kp 10 --kd 0.3 --mode step
+    almond-axol tune-pid --l  --joint elbow      --kp 25 --kd 0.6
+    almond-axol tune-pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
+    almond-axol tune-pid --l  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
+    almond-axol tune-pid --l  --joint wrist_2    --kp 10 --kd 0.3 --mode step
 """
 
 import argparse
@@ -18,22 +18,22 @@ import asyncio
 import math
 import time
 
-import numpy as np
-
-from ..motor import CanBus, Joint, Motor
+from ..motor import CanBus, ControlMode, Joint, Motor
 from ..robot.axol import arm_limits
 from ..robot.config import AxolConfig
 from ..robot.control import compute_friction
 from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _DEFAULT_AMP_FRACTION = 0.3
-_RAMP_MAX_SPEED = (
-    4 * math.pi
-)  # rad/s — generous cap; actual speed is interpolation-limited
+_RAMP_SPEED = 0.25  # rad/s
 
 
 def _sine_center(joint: Joint, is_left: bool) -> float:
     lo, hi = arm_limits(joint, is_left)
+    if joint == Joint.WRIST_2:
+        # wrist_2 midpoint is 0; going negative hits the robot base, so center
+        # at the midpoint of the positive half instead.
+        return hi / 2.0
     return (lo + hi) / 2.0
 
 
@@ -64,28 +64,22 @@ def _safe_amplitude(
     return amp
 
 
-async def _ramp_all(
+async def _ramp_others_to_zero(
     motors: dict[Joint, Motor],
-    from_pos: np.ndarray,
-    to_pos: np.ndarray,
-    duration: float,
-    rate_hz: float,
+    exclude: Joint,
 ) -> None:
-    dt = 1.0 / rate_hz
+    """Send non-test joints to 0 at _RAMP_SPEED and poll until arrival."""
+    joints = [j for j in ARM_JOINTS if j != exclude]
+    pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    max_dist = max((abs(p) for p in pos_vals), default=0.0)
+    await asyncio.gather(*[motors[j].set_position(0.0, _RAMP_SPEED) for j in joints])
+    timeout = max_dist / _RAMP_SPEED + 2.0
     t0 = time.monotonic()
-    while True:
-        t = time.monotonic() - t0
-        alpha = min(t / duration, 1.0)
-        targets = from_pos + alpha * (to_pos - from_pos)
-        await asyncio.gather(
-            *[
-                motors[j].set_position(float(targets[i]), _RAMP_MAX_SPEED)
-                for i, j in enumerate(ARM_JOINTS)
-            ]
-        )
-        if alpha >= 1.0:
+    while time.monotonic() - t0 < timeout:
+        await asyncio.sleep(0.1)
+        positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
+        if all(abs(p) < 0.05 for p in positions):
             break
-        await asyncio.sleep(dt)
 
 
 async def run_sine(
@@ -294,8 +288,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         description=__doc__,
     )
     side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--left", action="store_true", help="Left arm")
-    side.add_argument("--right", action="store_true", help="Right arm")
+    side.add_argument("--l", action="store_true", help="Left arm")
+    side.add_argument("--r", action="store_true", help="Right arm")
     p.add_argument(
         "--joint",
         required=True,
@@ -349,7 +343,7 @@ def run(args: argparse.Namespace) -> None:
 
 async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
-    is_left = args.left
+    is_left = args.l
     side_str = "left" if is_left else "right"
     lo, hi = arm_limits(joint, is_left)
 
@@ -372,22 +366,17 @@ async def _run(args: argparse.Namespace) -> None:
     async with CanBus(channel) as bus:
         motors = {j: Motor(bus, j) for j in ARM_JOINTS}
         await asyncio.gather(*[m.enable() for m in motors.values()])
+        await asyncio.gather(
+            *[
+                motors[j].set_control_mode(ControlMode.POS_VEL)
+                for j in ARM_JOINTS
+                if j != joint
+            ]
+        )
 
         try:
-            print("  ramping all joints to 0 ...")
-            pos_vals = await asyncio.gather(
-                *[motors[j].get_position() for j in ARM_JOINTS]
-            )
-            start_positions = np.array(pos_vals, dtype=float)
-            await _ramp_all(
-                motors,
-                start_positions,
-                np.zeros_like(start_positions),
-                duration=2.0,
-                rate_hz=args.rate,
-            )
-            await asyncio.sleep(1.0)
-
+            print("  ramping other joints to 0 ...")
+            await _ramp_others_to_zero(motors, joint)
             if args.mode == "sine":
                 log, amp = await run_sine(
                     motors,
@@ -426,24 +415,10 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  interrupted")
         finally:
             print("  returning to 0 ...")
-            test_motor = motors[joint]
             try:
-                start_rad = await test_motor.get_position()
-                dt = 1.0 / 100.0
-                t0 = time.monotonic()
-                while True:
-                    t = time.monotonic() - t0
-                    alpha = min(t / 2.0, 1.0)
-                    loop_start = time.monotonic()
-                    await test_motor.motion_control(
-                        start_rad * (1.0 - alpha), 0.0, args.kp, args.kd, 0.0
-                    )
-                    if alpha >= 1.0:
-                        break
-                    spent = time.monotonic() - loop_start
-                    if spent < dt:
-                        await asyncio.sleep(dt - spent)
-                await asyncio.sleep(1.0)
+                start_rad = await motors[joint].get_position()
+                await motors[joint].set_position(0.0, _RAMP_SPEED)
+                await asyncio.sleep(abs(start_rad) / _RAMP_SPEED + 1.0)
             except Exception:
                 pass
             await asyncio.gather(*[m.disable() for m in motors.values()])
