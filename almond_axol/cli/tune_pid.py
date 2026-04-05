@@ -177,7 +177,10 @@ async def run_step(
         raise ValueError(
             f"{joint.value} at {center:.4f} rad has no headroom within [{lo:.4f}, {hi:.4f}]."
         )
-    if headroom_up >= headroom_down:
+    if joint == Joint.WRIST_2:
+        # going negative hits the robot base
+        direction, headroom = 1, headroom_up
+    elif headroom_up >= headroom_down:
         direction, headroom = 1, headroom_up
     else:
         direction, headroom = -1, headroom_down
@@ -420,7 +423,12 @@ async def _run(args: argparse.Namespace) -> None:
                 await motors[joint].set_control_mode(ControlMode.POS_VEL)
                 start_rad = await motors[joint].get_position()
                 await motors[joint].set_position(0.0, _RAMP_SPEED)
-                await asyncio.sleep(abs(start_rad) / _RAMP_SPEED + 1.0)
+                timeout = abs(start_rad) / _RAMP_SPEED + 2.0
+                t0 = time.monotonic()
+                while time.monotonic() - t0 < timeout:
+                    await asyncio.sleep(0.1)
+                    if abs(await motors[joint].get_position()) < 0.05:
+                        break
             except Exception:
                 pass
             await asyncio.gather(*[m.disable() for m in motors.values()])
