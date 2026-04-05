@@ -368,9 +368,10 @@ async def _run(args: argparse.Namespace) -> None:
         await asyncio.gather(*[m.enable() for m in motors.values()])
         await asyncio.gather(
             *[
-                motors[j].set_control_mode(ControlMode.POS_VEL)
+                motors[j].set_control_mode(
+                    ControlMode.MIT if j == joint else ControlMode.POS_VEL
+                )
                 for j in ARM_JOINTS
-                if j != joint
             ]
         )
 
@@ -416,6 +417,7 @@ async def _run(args: argparse.Namespace) -> None:
         finally:
             print("  returning to 0 ...")
             try:
+                await motors[joint].set_control_mode(ControlMode.POS_VEL)
                 start_rad = await motors[joint].get_position()
                 await motors[joint].set_position(0.0, _RAMP_SPEED)
                 await asyncio.sleep(abs(start_rad) / _RAMP_SPEED + 1.0)
