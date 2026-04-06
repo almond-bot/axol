@@ -23,13 +23,13 @@ from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
 
-# Link names in openarm.urdf
-_LEFT_EE = "openarm_left_hand_tcp"
-_RIGHT_EE = "openarm_right_hand_tcp"
-_LEFT_ELBOW = "openarm_left_link4"
-_RIGHT_ELBOW = "openarm_right_link4"
-_LEFT_SHOULDER = "openarm_left_link1"
-_RIGHT_SHOULDER = "openarm_right_link1"
+# Link names in axol.urdf
+_LEFT_EE = "left_gripper"
+_RIGHT_EE = "right_gripper"
+_LEFT_ELBOW = "left_e1"
+_RIGHT_ELBOW = "right_e1"
+_LEFT_SHOULDER = "left_s2"
+_RIGHT_SHOULDER = "right_s2"
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,7 @@ class KinematicsSolver:
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
         self.config = config
 
-        _logger.info("Loading OpenArm URDF...")
+        _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
         self.robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
@@ -295,11 +295,9 @@ class KinematicsSolver:
 
         # Determine left/right joint split indices into the full actuated vector
         actuated = list(self.robot.joints.actuated_names)
-        self.left_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("openarm_left_joint")
-        ]
+        self.left_indices = [i for i, n in enumerate(actuated) if n.startswith("left_")]
         self.right_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("openarm_right_joint")
+            i for i, n in enumerate(actuated) if n.startswith("right_")
         ]
 
         self._warmup()

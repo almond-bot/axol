@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import time
 
-# Matches CUTOFF_FREQUENCY in openarm_constants.hpp
+# Cutoff frequency for the velocity differentiator low-pass filter (Hz)
 CUTOFF_FREQ = 90.0
 
 
