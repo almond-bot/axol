@@ -14,8 +14,8 @@ from .control import Differentiator, compute_feedforward
 _TAU = 2 * math.pi
 
 # Per-joint position limits (rad).  shoulder_2 is asymmetric across arms.
-SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0 * _TAU)
-SHOULDER_2_RIGHT_LIMITS = (0 * _TAU, 0.25 * _TAU)
+SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0.03 * _TAU)
+SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
 
 _LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),

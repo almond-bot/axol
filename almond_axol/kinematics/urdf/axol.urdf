@@ -296,17 +296,19 @@
         <parent link="root" />
         <child link="s1" />
     </joint>
-    <joint name="left_e1_0" type="continuous">
+    <joint name="left_e1_0" type="revolute">
         <origin xyz="0.04229 2.32031e-17 -0.289385" rpy="-8.89879e-17 3.99879e-31 1.22465e-16" />
         <axis xyz="-1 0 2.98117e-16" />
         <parent link="left_e1" />
         <child link="left_e2" />
+        <limit lower="0.0" upper="2.6389" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_e2_0" type="continuous">
+    <joint name="left_e2_0" type="revolute">
         <origin xyz="-0.03229 -1.20261e-17 -0.12429" rpy="1.6148e-14 2.26208e-15 6.65562e-15" />
         <axis xyz="0 0 1" />
         <parent link="left_e2" />
         <child link="left_w0" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_gripper_0" type="fixed">
         <origin xyz="0.0285 -1.86926e-17 -0.0335" rpy="0 -0 0" />
@@ -314,47 +316,54 @@
         <parent link="left_w2" />
         <child link="left_gripper" />
     </joint>
-    <joint name="left_s1_0" type="continuous">
+    <joint name="left_s1_0" type="revolute">
         <origin xyz="0.13 -1.00596e-18 0" rpy="-4.76619e-36 -1.02798e-15 1.03524e-20" />
         <axis xyz="-1 0 0" />
         <parent link="s1" />
         <child link="left_s2" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_s2_0" type="continuous">
+    <joint name="left_s2_0" type="revolute">
         <origin xyz="0.06958 -0.04475 7.14706e-16" rpy="-1.11022e-16 -1.72409e-15 -2.28994e-16" />
         <axis xyz="0 1 0" />
         <parent link="left_s2" />
         <child link="left_s3" />
+        <limit lower="-1.5708" upper="0.1885" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_s3_0" type="continuous">
+    <joint name="left_s3_0" type="revolute">
         <origin xyz="-3.05311e-16 0.04475 -0.07335" rpy="6.12323e-17 -8.04912e-16 -3.52374e-15" />
         <axis xyz="0 0 1" />
         <parent link="left_s3" />
         <child link="left_e1" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_w1_0" type="continuous">
+    <joint name="left_w1_0" type="revolute">
         <origin xyz="0 -0.0285 -0.13567" rpy="1.57652e-14 -1.23165e-16 1.11994e-14" />
         <axis xyz="0 -1 0" />
         <parent link="left_w0" />
         <child link="left_w1" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_w2_0" type="continuous">
+    <joint name="left_w2_0" type="revolute">
         <origin xyz="-0.0285 0.0285 -0.057" rpy="-3.36618e-14 -2.11528e-30 -6.12323e-17" />
         <axis xyz="1 0 0" />
         <parent link="left_w1" />
         <child link="left_w2" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_e1_0" type="continuous">
+    <joint name="right_e1_0" type="revolute">
         <origin xyz="-0.04229 5.0307e-17 -0.289385" rpy="-1.09476e-47 7.39557e-32 1.2326e-32" />
         <axis xyz="1 0 2.98117e-16" />
         <parent link="right_e1" />
         <child link="right_e2" />
+        <limit lower="0.0" upper="2.6389" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_e2_0" type="continuous">
+    <joint name="right_e2_0" type="revolute">
         <origin xyz="0.03229 -1.04083e-17 -0.12429" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
         <axis xyz="0 0 1" />
         <parent link="right_e2" />
         <child link="right_w0" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_gripper_0" type="fixed">
         <origin xyz="-0.0285 1.38778e-17 -0.0335" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
@@ -362,34 +371,39 @@
         <parent link="right_w2" />
         <child link="right_gripper" />
     </joint>
-    <joint name="right_s1_0" type="continuous">
+    <joint name="right_s1_0" type="revolute">
         <origin xyz="-0.13 7.27427e-19 -1.38778e-17" rpy="-4.76873e-49 -2.31296e-16 7.65788e-33" />
         <axis xyz="1 0 0" />
         <parent link="s1" />
         <child link="right_s2" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_s2_0" type="continuous">
+    <joint name="right_s2_0" type="revolute">
         <origin xyz="-0.06958 -0.04475 3.81639e-16" rpy="-1.28654e-32 -9.17877e-18 -7.824e-17" />
         <axis xyz="0 1 0" />
         <parent link="right_s2" />
         <child link="right_s3" />
+        <limit lower="-0.1885" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_s3_0" type="continuous">
+    <joint name="right_s3_0" type="revolute">
         <origin xyz="3.88578e-16 0.0323582 -0.07335" rpy="-2.73691e-48 4.93038e-32 4.71657e-48" />
         <axis xyz="0 0 1" />
         <parent link="right_s3" />
         <child link="right_e1" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_w1_0" type="continuous">
+    <joint name="right_w1_0" type="revolute">
         <origin xyz="5.55112e-17 -0.0285 -0.13301" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
         <axis xyz="0 -1 0" />
         <parent link="right_w0" />
         <child link="right_w1" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_w2_0" type="continuous">
+    <joint name="right_w2_0" type="revolute">
         <origin xyz="0.0285 0.0285 -0.057" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
         <axis xyz="-1 0 0" />
         <parent link="right_w1" />
         <child link="right_w2" />
+        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
 </robot>
