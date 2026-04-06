@@ -6,24 +6,25 @@ import math
 import numpy as np
 
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
-from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
-from .control import Differentiator, GravityCompensator, compute_friction
+from .control import Differentiator, compute_feedforward
 
 _TAU = 2 * math.pi
 
 # Per-joint position limits (rad).  shoulder_2 is asymmetric across arms.
-SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0.03 * _TAU)
-SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
+SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0 * _TAU)
+SHOULDER_2_RIGHT_LIMITS = (0 * _TAU, 0.25 * _TAU)
 
 _LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.SHOULDER_3: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.ELBOW: (0.0, 0.41 * _TAU),
+    Joint.ELBOW: (0.0, 0.42 * _TAU),
     Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.GRIPPER: (-0.8037 * _TAU, 0.0),
 }
 
 
@@ -50,7 +51,6 @@ class ArmController:
             [arm_limits(j, is_left)[1] for j in Joint], dtype=float
         )
         self._differentiator = Differentiator(n=len(list(Joint)))
-        self._gravity_comp = GravityCompensator(is_left=is_left)
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -211,11 +211,17 @@ class ArmController:
         """Move joints to absolute positions using each motor's built-in controller.
 
         Positions are clipped to the arm's joint limits before being sent.
+        The gripper value is normalized: 0.0 = closed, 1.0 = fully open.
 
         Args:
-            positions: Shape (8,) array of target positions (rad) in Joint enum order.
+            positions: Shape (8,) array of target positions (rad) in Joint enum order,
+                       except gripper which is [0, 1].
             max_speed: Maximum speed for all joints (rad/s).
         """
+        positions = positions.copy()
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        i = list(Joint).index(Joint.GRIPPER)
+        positions[i] = _hi + positions[i] * (_lo - _hi)
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
         await asyncio.gather(
             *[
@@ -246,15 +252,17 @@ class ArmController:
         directly in the config.
 
         Args:
-            q: Shape (8,) array of desired positions (rad) in Joint enum order.
+            q: Shape (8,) array of desired positions (rad) in Joint enum order,
+               except gripper which is [0, 1].
         """
+        q = q.copy()
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        i = list(Joint).index(Joint.GRIPPER)
+        q[i] = _hi + q[i] * (_lo - _hi)
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s).
         velocities = self._differentiator.differentiate(list(clipped))
-
-        # Gravity torques for the 7 arm joints (shoulder_1 → wrist_3, not gripper).
-        gravity = self._gravity_comp.get_gravity(list(clipped[: len(ARM_JOINTS)]))
 
         await asyncio.gather(
             *[
@@ -263,9 +271,11 @@ class ArmController:
                     velocities[i],
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
-                    (gravity[i] if i < len(ARM_JOINTS) else 0.0)
-                    + compute_friction(
+                    compute_feedforward(
+                        float(clipped[i]),
                         velocities[i],
+                        getattr(self._config, j.value).ga,
+                        getattr(self._config, j.value).gb,
                         getattr(self._config, j.value).fc,
                         getattr(self._config, j.value).k,
                         getattr(self._config, j.value).fv,

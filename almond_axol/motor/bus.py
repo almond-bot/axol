@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Callable
 
 import can
+
+_logger = logging.getLogger(__name__)
 
 
 class CanBus:
@@ -57,11 +60,29 @@ class CanBus:
         msg = can.Message(
             arbitration_id=arbitration_id, data=data, is_extended_id=False
         )
-        await asyncio.to_thread(self._bus.send, msg)
+        # Send synchronously — SocketCAN send is fast non-blocking at OS level.
+        # This prevents asyncio thread pool starvation at high telemetry rates.
+        self._bus.send(msg)
 
     async def _reader_loop(self) -> None:
         while True:
-            msg: can.Message | None = await asyncio.to_thread(self._bus.recv, 0.02)
-            if msg is not None:
-                for listener in self._listeners:
-                    listener(msg)
+            try:
+                # Non-blocking read directly in the async loop saves overhead
+                # and avoids threadpool contention with 'send' calls.
+                msg: can.Message | None = self._bus.recv(timeout=0)
+                if msg is not None:
+                    for listener in self._listeners:
+                        try:
+                            listener(msg)
+                        except Exception as e:
+                            _logger.error(
+                                "CAN listener %s error: %s", listener.__name__, e
+                            )
+                else:
+                    # Give control back to event loop if no data
+                    await asyncio.sleep(0.001)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                _logger.warning("CAN reader loop warning: %s", e)
+                await asyncio.sleep(0.01)

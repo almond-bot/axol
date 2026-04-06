@@ -6,17 +6,15 @@ Change the CAN ID of a single motor and persist it to flash.
 The motor must be the only device on the bus, or you must know its current CAN ID.
 
 Examples:
-    almond-axol set-can-id --type myactuator --current-id 0x01 --new-id 0x03
-    almond-axol set-can-id --type damiao     --current-id 0x06 --new-id 0x07
-    almond-axol set-can-id --channel can_alm_axol_l --type myactuator --current-id 0x01 --new-id 0x03
+    almond-axol set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+    almond-axol set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
 """
 
 import argparse
 import asyncio
 
 from ..motor.bus import CanBus
-from ..motor.damiao import DamiaoMotor
-from ..motor.myactuator import MyActuatorMotor
+from ..motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -26,18 +24,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    p.add_argument(
-        "--channel",
-        default="can0",
-        metavar="CHANNEL",
-        help="CAN interface name (default: can0)",
-    )
-    p.add_argument(
-        "--type",
-        required=True,
-        choices=["myactuator", "damiao"],
-        help="Motor driver type",
-    )
+    side = p.add_mutually_exclusive_group(required=True)
+    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
+    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
     p.add_argument(
         "--current-id",
         required=True,
@@ -52,6 +41,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="ID",
         help="New CAN ID to assign (hex or decimal, e.g. 0x03 or 3)",
     )
+    p.add_argument(
+        "--type",
+        required=True,
+        choices=["myactuator", "damiao"],
+        help="Motor driver type",
+    )
     p.set_defaults(func=run)
 
 
@@ -60,18 +55,11 @@ def run(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    print(
-        f"\nset-can-id — {args.channel}  type={args.type}"
-        f"  {args.current_id:#04x} → {args.new_id:#04x}"
-    )
+    channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
+    print(f"\nset-can-id — {channel}  {args.current_id:#04x} → {args.new_id:#04x}")
 
-    async with CanBus(args.channel) as bus:
-        if args.type == "myactuator":
-            motor = MyActuatorMotor(bus, args.current_id)
-        else:
-            motor = DamiaoMotor(
-                bus, args.current_id, feedback_id=0x10 + args.current_id
-            )
+    async with CanBus(channel) as bus:
+        motor = make_driver(bus, args.current_id, args.type)
 
         print("  sending set-can-id command ...")
         await motor.set_can_id(args.new_id)

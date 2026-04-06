@@ -153,13 +153,15 @@ class MyActuatorMotor(MotorDriver):
         # determined by which command is sent. Reset the motor to clear internal
         # state so it comes back ready for the next command type.
         await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1)
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command
 
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
+        await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
+        await asyncio.sleep(0.5)
 
     async def get_position(self) -> float:
         resp = await self._request(self._cmd(_MA_MULTI_TURN_ANGLE))

@@ -388,10 +388,12 @@ class DamiaoMotor(MotorDriver):
     async def set_can_id(self, can_id: int) -> None:
         feedback_id = can_id + 0x10
         await self._write_register(_DM_REG_CAN_ID, can_id)
-        await self._write_register(_DM_REG_FEEDBACK_ID, feedback_id)
-        await self._store_parameters()
+        # Motor firmware immediately uses the new ESC_ID to filter 0x7FF commands,
+        # so subsequent writes must use the new ID in the data bytes.
         self._motor_id = can_id
         self._feedback_id = feedback_id
+        await self._write_register(_DM_REG_FEEDBACK_ID, feedback_id)
+        await self._store_parameters()
 
     async def set_can_baud_rate(self, baud_rate: int) -> None:
         code = _DM_BAUD_MAP.get(baud_rate)
