@@ -68,7 +68,7 @@ async def _ramp_others_to_zero(
     motors: dict[Joint, Motor],
     exclude: Joint,
 ) -> None:
-    """Send non-test joints to 0 at _RAMP_SPEED and poll until arrival."""
+    """Send non-test joints to 0 via set_position and poll until arrival."""
     joints = [j for j in ARM_JOINTS if j != exclude]
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max((abs(p) for p in pos_vals), default=0.0)
@@ -398,6 +398,7 @@ async def _run(args: argparse.Namespace) -> None:
                     fo=fo,
                 )
                 _print_stats_sine(log, args.kp, args.kd)
+                await asyncio.sleep(1.0)
             else:
                 log, amp = await run_step(
                     motors,
@@ -420,15 +421,22 @@ async def _run(args: argparse.Namespace) -> None:
         finally:
             print("  returning to 0 ...")
             try:
-                await motors[joint].set_control_mode(ControlMode.POS_VEL)
                 start_rad = await motors[joint].get_position()
-                await motors[joint].set_position(0.0, _RAMP_SPEED)
-                timeout = abs(start_rad) / _RAMP_SPEED + 2.0
+                duration = max(abs(start_rad) / _RAMP_SPEED, 0.5)
+                dt = 1.0 / 100.0
                 t0 = time.monotonic()
-                while time.monotonic() - t0 < timeout:
-                    await asyncio.sleep(0.1)
-                    if abs(await motors[joint].get_position()) < 0.05:
+                while True:
+                    t = time.monotonic() - t0
+                    alpha = min(t / duration, 1.0)
+                    loop_start = time.monotonic()
+                    await motors[joint].motion_control(
+                        start_rad * (1.0 - alpha), 0.0, args.kp, args.kd, 0.0
+                    )
+                    if alpha >= 1.0:
                         break
+                    spent = time.monotonic() - loop_start
+                    if spent < dt:
+                        await asyncio.sleep(dt - spent)
             except Exception:
                 pass
             await asyncio.gather(*[m.disable() for m in motors.values()])
