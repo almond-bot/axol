@@ -41,9 +41,9 @@ class AxolConfig:
     specified directly.
     """
 
-    shoulder_1: JointGains = field(default_factory=JointGains)
-    shoulder_2: JointGains = field(default_factory=JointGains)
-    shoulder_3: JointGains = field(default_factory=JointGains)
+    shoulder_1: JointGains = field(default_factory=lambda: JointGains(kp=600.0, kd=5.0))
+    shoulder_2: JointGains = field(default_factory=lambda: JointGains(kp=600.0, kd=5.0))
+    shoulder_3: JointGains = field(default_factory=lambda: JointGains(kp=250.0, kd=2.0))
     elbow: JointGains = field(default_factory=lambda: JointGains(kp=100.0, kd=2.0))
     wrist_1: JointGains = field(default_factory=lambda: JointGains(kp=150.0, kd=1.0))
     wrist_2: JointGains = field(default_factory=lambda: JointGains(kp=100.0, kd=2.5))
