@@ -9,7 +9,7 @@ from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
-from .control import Differentiator, GravityCompensator, compute_friction
+from .control import Differentiator, compute_feedforward
 
 _TAU = 2 * math.pi
 
@@ -51,7 +51,6 @@ class ArmController:
             [arm_limits(j, is_left)[1] for j in Joint], dtype=float
         )
         self._differentiator = Differentiator(n=len(list(Joint)))
-        self._gravity_comp = GravityCompensator(is_left=is_left)
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -265,9 +264,6 @@ class ArmController:
         # Velocity feedforward via differentiation of commanded positions (rad/s).
         velocities = self._differentiator.differentiate(list(clipped))
 
-        # Gravity torques for the 7 arm joints (shoulder_1 → wrist_3, not gripper).
-        # gravity = self._gravity_comp.get_gravity(list(clipped[: len(ARM_JOINTS)]))
-
         await asyncio.gather(
             *[
                 self._motors[j].motion_control(
@@ -275,9 +271,11 @@ class ArmController:
                     velocities[i],
                     getattr(self._config, j.value).kp,
                     getattr(self._config, j.value).kd,
-                    0.0  # (gravity[i] if i < len(ARM_JOINTS) else 0.0)
-                    + compute_friction(
+                    compute_feedforward(
+                        float(clipped[i]),
                         velocities[i],
+                        getattr(self._config, j.value).ga,
+                        getattr(self._config, j.value).gb,
                         getattr(self._config, j.value).fc,
                         getattr(self._config, j.value).k,
                         getattr(self._config, j.value).fv,

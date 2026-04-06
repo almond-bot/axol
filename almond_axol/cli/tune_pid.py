@@ -21,7 +21,7 @@ import time
 from ..motor import CanBus, ControlMode, Joint, Motor
 from ..robot.axol import arm_limits
 from ..robot.config import AxolConfig
-from ..robot.control import compute_friction
+from ..robot.control import compute_feedforward
 from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _DEFAULT_AMP_FRACTION = 0.3
@@ -96,6 +96,8 @@ async def run_sine(
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
+    ga: float = 0.0,
+    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
     lo, hi = arm_limits(joint, is_left)
@@ -134,7 +136,7 @@ async def run_sine(
 
         v_des = amp * 2 * math.pi * freq * math.cos(2 * math.pi * freq * t)
         target = center + amp * math.sin(2 * math.pi * freq * t)
-        tff = compute_friction(v_des, fc, k, fv, fo)
+        tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
         await test_motor.motion_control(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
         log.append(
@@ -166,6 +168,8 @@ async def run_step(
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
+    ga: float = 0.0,
+    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
     center = await test_motor.get_position()
@@ -210,7 +214,7 @@ async def run_step(
         while time.monotonic() - phase_start < hold:
             loop_start = time.monotonic()
             t = time.monotonic() - start
-            tff = compute_friction(0.0, fc, k, fv, fo)
+            tff = compute_feedforward(phase_target, 0.0, ga, gb, fc, k, fv, fo)
             await test_motor.motion_control(phase_target, 0.0, kp, kd, tff)
             actual = await test_motor.get_position()
             log.append(
@@ -303,9 +307,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument("--kp", type=float, required=True, help="Proportional gain to test")
     p.add_argument("--kd", type=float, required=True, help="Derivative gain to test")
     p.add_argument(
-        "--friction",
+        "--tff",
         action="store_true",
-        help="Apply friction feedforward from AxolConfig",
+        help="Apply full feedforward (gravity + friction) from AxolConfig",
     )
     p.add_argument(
         "--mode",
@@ -351,18 +355,18 @@ async def _run(args: argparse.Namespace) -> None:
     lo, hi = arm_limits(joint, is_left)
 
     joint_gains = getattr(AxolConfig(), joint.value)
-    fc, k, fv, fo = (
-        (joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo)
-        if args.friction
-        else (0.0, 0.0, 0.0, 0.0)
-    )
+    if args.tff:
+        fc, k, fv, fo = joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo
+        ga, gb = joint_gains.ga, joint_gains.gb
+    else:
+        fc = k = fv = fo = ga = gb = 0.0
 
     print(
         f"\nAxol PID tuner — {side_str} {joint.value}  limits=[{lo:.4f}, {hi:.4f}] rad"
     )
     print(f"  testing  Kp={args.kp}  Kd={args.kd}  mode={args.mode}")
-    if args.friction:
-        print(f"  friction  Fc={fc}  k={k}  Fv={fv}  Fo={fo}")
+    if args.tff:
+        print(f"  tff  Fc={fc}  k={k}  Fv={fv}  Fo={fo}  ga={ga}  gb={gb}")
 
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
@@ -396,6 +400,8 @@ async def _run(args: argparse.Namespace) -> None:
                     k=k,
                     fv=fv,
                     fo=fo,
+                    ga=ga,
+                    gb=gb,
                 )
                 _print_stats_sine(log, args.kp, args.kd)
                 await asyncio.sleep(1.0)
@@ -413,6 +419,8 @@ async def _run(args: argparse.Namespace) -> None:
                     k=k,
                     fv=fv,
                     fo=fo,
+                    ga=ga,
+                    gb=gb,
                 )
                 _print_stats_step(log, amp, args.kp, args.kd)
 

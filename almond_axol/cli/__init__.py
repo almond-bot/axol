@@ -2,7 +2,7 @@ import argparse
 
 from . import (
     collect_data,
-    identify_friction,
+    identify_feedforward,
     install_zed,
     motor_info,
     run_policy,
@@ -29,7 +29,7 @@ def main() -> None:
     stream_zed.add_parser(subparsers)
     install_zed.add_parser(subparsers)
     tune_pid.add_parser(subparsers)
-    identify_friction.add_parser(subparsers)
+    identify_feedforward.add_parser(subparsers)
 
     args = parser.parse_args()
     args.func(args)

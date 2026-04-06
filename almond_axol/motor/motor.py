@@ -22,16 +22,17 @@ class _MotorType(Enum):
 class _JointConfig:
     kind: _MotorType
     motor_id: int
+    kt: float | None = None  # Nm/A — MyActuator phase current → torque; None for Damiao
 
 
 _ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
 
 _JOINT_CONFIG: dict[Joint, _JointConfig] = {
-    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01),
-    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02),
-    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03),
-    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04),
-    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05),
+    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01, kt=2.4),
+    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02, kt=2.4),
+    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=2.1),
+    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=2.1),
+    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=2.1),
     Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06),
     Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
     Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
@@ -80,6 +81,7 @@ class Motor:
         self.joint = joint
         cfg = _JOINT_CONFIG[joint]
         motor_id = can_id if can_id is not None else cfg.motor_id
+        self._kt = cfg.kt  # Nm/A for MyActuator; None for Damiao (already Nm)
         self._driver: MotorDriver
         if cfg.kind == _MotorType.MYACTUATOR:
             self._driver = MyActuatorMotor(bus, motor_id)
@@ -126,12 +128,13 @@ class Motor:
         return await self._driver.get_velocity()
 
     async def get_torque(self) -> float:
-        """Return current torque estimate.
+        """Return current torque estimate in Nm.
 
-        Damiao: estimated output torque in Nm.
-        MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
+        Damiao: estimated output torque in Nm directly.
+        MyActuator: phase current (A) multiplied by the joint's Kt (Nm/A).
         """
-        return await self._driver.get_torque()
+        raw = await self._driver.get_torque()
+        return raw * self._kt if self._kt is not None else raw
 
     async def start_telemetry(self, hz: float) -> None:
         """Start the background polling loop at the given frequency.
