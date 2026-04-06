@@ -365,14 +365,14 @@ async def _run(args: argparse.Namespace) -> None:
         )
 
         try:
-            # wrist_2: elbow at half its positive limit so wrist_2 can sweep
+            # wrist_2: elbow at midpoint of its range so wrist_2 can sweep
             # its full ±range without the forearm hitting the robot base.
             other_targets: dict[Joint, float] = {}
             if joint == Joint.WRIST_2:
-                elbow_hi = arm_limits(Joint.ELBOW, is_left)[1]
-                other_targets[Joint.ELBOW] = elbow_hi / 2.0
+                elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
+                other_targets[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
                 print(
-                    f"  Moving elbow to {other_targets[Joint.ELBOW]:.3f} rad (half positive limit) for wrist_2 clearance."
+                    f"  Moving elbow to {other_targets[Joint.ELBOW]:.3f} rad (midpoint of range) for wrist_2 clearance."
                 )
             print("  Ramping other joints to start position ...")
             await _ramp_others(motors, joint, other_targets)

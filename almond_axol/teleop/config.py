@@ -49,7 +49,7 @@ class VRTeleopConfig:
     rest_pose_right: np.ndarray = field(
         default_factory=lambda: np.array(
             [
-                -0.05 * 2 * math.pi,
+                0.05 * 2 * math.pi,
                 0.0,
                 0.0,
                 -0.1 * 2 * math.pi,

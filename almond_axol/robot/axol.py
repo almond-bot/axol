@@ -16,11 +16,12 @@ _TAU = 2 * math.pi
 # Per-joint position limits (rad).  shoulder_2 is asymmetric across arms.
 SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0.03 * _TAU)
 SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
+ELBOW_LEFT_LIMITS = (0.0, 0.42 * _TAU)
+ELBOW_RIGHT_LIMITS = (-0.42 * _TAU, 0.0)
 
 _LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.SHOULDER_3: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.ELBOW: (0.0, 0.42 * _TAU),
     Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
@@ -32,6 +33,8 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     """Return (min, max) position limits in radians for a joint on the given arm."""
     if joint == Joint.SHOULDER_2:
         return SHOULDER_2_LEFT_LIMITS if is_left else SHOULDER_2_RIGHT_LIMITS
+    if joint == Joint.ELBOW:
+        return ELBOW_LEFT_LIMITS if is_left else ELBOW_RIGHT_LIMITS
     return _LIMITS.get(joint, (-math.inf, math.inf))
 
 

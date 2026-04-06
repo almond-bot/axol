@@ -31,6 +31,27 @@ _RIGHT_ELBOW = "right_e1"
 _LEFT_SHOULDER = "left_s2"
 _RIGHT_SHOULDER = "right_s2"
 
+# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3).
+# Must match the ordering assumed by rest_pose / motion_control.
+_LEFT_JOINT_NAMES = [
+    "left_s1_0",  # SHOULDER_1
+    "left_s2_0",  # SHOULDER_2
+    "left_s3_0",  # SHOULDER_3
+    "left_e1_0",  # ELBOW
+    "left_e2_0",  # WRIST_1
+    "left_w1_0",  # WRIST_2
+    "left_w2_0",  # WRIST_3
+]
+_RIGHT_JOINT_NAMES = [
+    "right_s1_0",  # SHOULDER_1
+    "right_s2_0",  # SHOULDER_2
+    "right_s3_0",  # SHOULDER_3
+    "right_e1_0",  # ELBOW
+    "right_e2_0",  # WRIST_1
+    "right_w1_0",  # WRIST_2
+    "right_w2_0",  # WRIST_3
+]
+
 
 # ---------------------------------------------------------------------------
 # JIT-compiled core solve
@@ -293,12 +314,12 @@ class KinematicsSolver:
             jaxlie.SE3(fk0[R_sh_idx]).translation(), dtype=np.float32
         )
 
-        # Determine left/right joint split indices into the full actuated vector
+        # Determine left/right joint indices in ARM_JOINTS order so that
+        # q[left_indices] / q[right_indices] align with rest_pose and motion_control.
         actuated = list(self.robot.joints.actuated_names)
-        self.left_indices = [i for i, n in enumerate(actuated) if n.startswith("left_")]
-        self.right_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("right_")
-        ]
+        name_to_idx = {n: i for i, n in enumerate(actuated)}
+        self.left_indices = [name_to_idx[n] for n in _LEFT_JOINT_NAMES]
+        self.right_indices = [name_to_idx[n] for n in _RIGHT_JOINT_NAMES]
 
         self._warmup()
 

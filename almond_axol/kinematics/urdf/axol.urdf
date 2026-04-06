@@ -356,7 +356,7 @@
         <axis xyz="1 0 2.98117e-16" />
         <parent link="right_e1" />
         <child link="right_e2" />
-        <limit lower="0.0" upper="2.6389" velocity="30.0" effort="87.0" />
+        <limit lower="-2.6389" upper="0.0" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_e2_0" type="revolute">
         <origin xyz="0.03229 -1.04083e-17 -0.12429" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
