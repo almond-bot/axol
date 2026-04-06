@@ -1,5 +1,5 @@
 """
-almond-axol teleop [axol|sim]
+almond-axol teleop --robot [axol|sim]
 
 Run a VR teleoperation session with default parameters.
 """
