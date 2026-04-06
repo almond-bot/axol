@@ -46,17 +46,64 @@ class AxolConfig:
     """
 
     shoulder_1: JointGains = field(default_factory=lambda: JointGains(kp=600.0, kd=5.0))
-    shoulder_2: JointGains = field(default_factory=lambda: JointGains(kp=600.0, kd=5.0))
-    shoulder_3: JointGains = field(default_factory=lambda: JointGains(kp=250.0, kd=2.0))
-    elbow: JointGains = field(default_factory=lambda: JointGains(kp=100.0, kd=2.0))
+    shoulder_2: JointGains = field(
+        default_factory=lambda: JointGains(
+            kp=600.0,
+            kd=5.0,
+            fc=1.0453,
+            k=735.28,
+            fv=4.4808,
+            fo=-4.5180,
+            ga=4.8035,
+            gb=21.7120,
+        )
+    )
+    shoulder_3: JointGains = field(
+        default_factory=lambda: JointGains(
+            kp=250.0,
+            kd=2.0,
+            fc=0.4545,
+            k=102.73,
+            fv=1.5295,
+            fo=0.0917,
+            ga=-0.0256,
+            gb=0.0225,
+        )
+    )
+    elbow: JointGains = field(
+        default_factory=lambda: JointGains(
+            kp=100.0,
+            kd=2.0,
+            fc=0.8210,
+            k=918.07,
+            fv=0.6716,
+            fo=-0.0428,
+            ga=-0.2960,
+            gb=5.2126,
+        )
+    )
     wrist_1: JointGains = field(
         default_factory=lambda: JointGains(
-            kp=150.0, kd=1.0, fc=0.4052, k=1000.0, fv=1.0126, fo=0.0670
+            kp=150.0,
+            kd=1.0,
+            fc=0.4129,
+            k=83.02,
+            fv=0.9732,
+            fo=0.0916,
+            ga=-0.0497,
+            gb=0.0149,
         )
     )
     wrist_2: JointGains = field(
         default_factory=lambda: JointGains(
-            kp=150.0, kd=2.5, fc=0.9011, k=1000.0, fv=0.5591, fo=0.0
+            kp=150.0,
+            kd=2.5,
+            fc=0.1862,
+            k=94.51,
+            fv=0.7391,
+            fo=0.0835,
+            ga=0.0315,
+            gb=0.3816,
         )
     )
     wrist_3: JointGains = field(

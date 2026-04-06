@@ -273,6 +273,9 @@ async def _identify_joint(
         cur = await motor.get_position()
         print(f"    fwd: {len(fwd)} samples")
 
+        # Hold at turnaround to damp velocity before reversing
+        await _ramp_to(motor, kp, kd, cur, duration=2.0)
+
         # Backward sweep: sweep_hi → sweep_lo
         bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
         print(f"    bwd: {len(bwd)} samples")
@@ -373,6 +376,7 @@ async def _run(args: argparse.Namespace) -> None:
                 )
             print("  Ramping other joints to start position ...")
             await _ramp_others(motors, joint, other_targets)
+            await asyncio.sleep(1.0)
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint], joint, kp, kd, is_left, args.velocities
@@ -423,6 +427,10 @@ async def _run(args: argparse.Namespace) -> None:
             print("  Returning to 0 and disabling ...")
             try:
                 await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
+            except Exception:
+                pass
+            try:
+                await _ramp_others(motors, joint)
             except Exception:
                 pass
             await asyncio.gather(*[m.disable() for m in motors.values()])
