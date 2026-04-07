@@ -37,4 +37,4 @@ class KinematicsConfig:
     max_iterations: int = 25
     cost_tolerance: float = 1e-2
     max_joint_delta: float = 0.0055 * 2 * math.pi
-    max_reach: float = 0.6
+    max_reach: float = 0.75
