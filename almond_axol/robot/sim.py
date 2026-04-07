@@ -123,9 +123,24 @@ class Sim(RobotBase):
 
         # Build the robot-side joint ordering to match _build_q's output:
         # left arm joint1-N, then right arm joint1-N.
-        n_arm = len(ARM_JOINTS)
-        left_names = [f"openarm_left_joint{i + 1}" for i in range(n_arm)]
-        right_names = [f"openarm_right_joint{i + 1}" for i in range(n_arm)]
+        left_names = [
+            "left_s1_0",
+            "left_s2_0",
+            "left_s3_0",
+            "left_e1_0",
+            "left_e2_0",
+            "left_w1_0",
+            "left_w2_0",
+        ]
+        right_names = [
+            "right_s1_0",
+            "right_s2_0",
+            "right_s3_0",
+            "right_e1_0",
+            "right_e2_0",
+            "right_w1_0",
+            "right_w2_0",
+        ]
         robot_order = (self._joint_names or left_names) + right_names
 
         # Map each viser joint to its index in robot_order (-1 for joints not

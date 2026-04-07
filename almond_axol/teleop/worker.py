@@ -45,7 +45,7 @@ def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarr
     )
 
 
-def _rub_to_flu_np(
+def _vr_to_flu_np(
     px: float,
     py: float,
     pz: float,
@@ -54,13 +54,13 @@ def _rub_to_flu_np(
     qz: float,
     qw: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Convert VR RUB pose → robot FLU. Returns (pos_3, rot_3x3), float32."""
-    pos = np.array((-pz, -px, py), dtype=np.float32)
+    """Convert VR pose (X=Down, Y=Left, Z=Forward) → robot FLU. Returns (pos_3, rot_3x3), float32."""
+    pos = np.array((pz, py, -px), dtype=np.float32)
     m = _quat_xyzw_to_matrix(qx, qy, qz, qw)
     rot = np.empty((3, 3), dtype=np.float32)
-    rot[0, :] = (m[2, 2], m[2, 0], -m[2, 1])
-    rot[1, :] = (m[0, 2], m[0, 0], -m[0, 1])
-    rot[2, :] = (-m[1, 2], -m[1, 0], m[1, 1])
+    rot[0, :] = (m[2, 2], m[2, 1], -m[2, 0])
+    rot[1, :] = (m[1, 2], m[1, 1], -m[1, 0])
+    rot[2, :] = (-m[0, 2], -m[0, 1], m[0, 0])
     return pos, rot
 
 
@@ -194,7 +194,7 @@ class IKWorker:
             return q_current
 
         # Convert poses to FLU — pure numpy
-        left_pos, left_rot = _rub_to_flu_np(
+        left_pos, left_rot = _vr_to_flu_np(
             frame.l_ee.position.x,
             frame.l_ee.position.y,
             frame.l_ee.position.z,
@@ -203,7 +203,7 @@ class IKWorker:
             frame.l_ee.quaternion.z,
             frame.l_ee.quaternion.w,
         )
-        right_pos, right_rot = _rub_to_flu_np(
+        right_pos, right_rot = _vr_to_flu_np(
             frame.r_ee.position.x,
             frame.r_ee.position.y,
             frame.r_ee.position.z,
@@ -213,10 +213,10 @@ class IKWorker:
             frame.r_ee.quaternion.w,
         )
         left_e = np.array(
-            (-frame.l_elbow.z, -frame.l_elbow.x, frame.l_elbow.y), dtype=np.float32
+            (frame.l_elbow.z, frame.l_elbow.y, -frame.l_elbow.x), dtype=np.float32
         )
         right_e = np.array(
-            (-frame.r_elbow.z, -frame.r_elbow.x, frame.r_elbow.y), dtype=np.float32
+            (frame.r_elbow.z, frame.r_elbow.y, -frame.r_elbow.x), dtype=np.float32
         )
 
         if not self._active:

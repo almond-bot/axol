@@ -35,13 +35,13 @@ class VRTeleopConfig:
     rest_pose_left: np.ndarray = field(
         default_factory=lambda: np.array(
             [
-                0.05 * 2 * math.pi,
-                0.0,
-                0.0,
-                0.1 * 2 * math.pi,
+                -0.025 * 2 * math.pi,
                 0.0,
                 0.0,
                 0.05 * 2 * math.pi,
+                0.0,
+                0.0,
+                0.025 * 2 * math.pi,
             ],
             dtype=np.float32,
         )
@@ -49,13 +49,13 @@ class VRTeleopConfig:
     rest_pose_right: np.ndarray = field(
         default_factory=lambda: np.array(
             [
-                -0.05 * 2 * math.pi,
-                0.0,
-                0.0,
-                0.1 * 2 * math.pi,
+                0.025 * 2 * math.pi,
                 0.0,
                 0.0,
                 -0.05 * 2 * math.pi,
+                0.0,
+                0.0,
+                -0.025 * 2 * math.pi,
             ],
             dtype=np.float32,
         )
@@ -65,6 +65,6 @@ class VRTeleopConfig:
     reset_rest_weight: float = 20.0
     reset_limit_weight: float = 100.0
     reset_collision_margin: float = 0.01
-    reset_collision_weight: float = 10.0
+    reset_collision_weight: float = 25.0
     reset_max_iterations: int = 10
     smooth_alpha: float = 0.45

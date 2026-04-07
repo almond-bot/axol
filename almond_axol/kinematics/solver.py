@@ -23,13 +23,34 @@ from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
 
-# Link names in openarm.urdf
-_LEFT_EE = "openarm_left_hand_tcp"
-_RIGHT_EE = "openarm_right_hand_tcp"
-_LEFT_ELBOW = "openarm_left_link4"
-_RIGHT_ELBOW = "openarm_right_link4"
-_LEFT_SHOULDER = "openarm_left_link1"
-_RIGHT_SHOULDER = "openarm_right_link1"
+# Link names in axol.urdf
+_LEFT_EE = "left_gripper"
+_RIGHT_EE = "right_gripper"
+_LEFT_ELBOW = "left_e1"
+_RIGHT_ELBOW = "right_e1"
+_LEFT_SHOULDER = "left_s2"
+_RIGHT_SHOULDER = "right_s2"
+
+# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3).
+# Must match the ordering assumed by rest_pose / motion_control.
+_LEFT_JOINT_NAMES = [
+    "left_s1_0",  # SHOULDER_1
+    "left_s2_0",  # SHOULDER_2
+    "left_s3_0",  # SHOULDER_3
+    "left_e1_0",  # ELBOW
+    "left_e2_0",  # WRIST_1
+    "left_w1_0",  # WRIST_2
+    "left_w2_0",  # WRIST_3
+]
+_RIGHT_JOINT_NAMES = [
+    "right_s1_0",  # SHOULDER_1
+    "right_s2_0",  # SHOULDER_2
+    "right_s3_0",  # SHOULDER_3
+    "right_e1_0",  # ELBOW
+    "right_e2_0",  # WRIST_1
+    "right_w1_0",  # WRIST_2
+    "right_w2_0",  # WRIST_3
+]
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +285,7 @@ class KinematicsSolver:
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
         self.config = config
 
-        _logger.info("Loading OpenArm URDF...")
+        _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
         self.robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
@@ -293,14 +314,12 @@ class KinematicsSolver:
             jaxlie.SE3(fk0[R_sh_idx]).translation(), dtype=np.float32
         )
 
-        # Determine left/right joint split indices into the full actuated vector
+        # Determine left/right joint indices in ARM_JOINTS order so that
+        # q[left_indices] / q[right_indices] align with rest_pose and motion_control.
         actuated = list(self.robot.joints.actuated_names)
-        self.left_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("openarm_left_joint")
-        ]
-        self.right_indices = [
-            i for i, n in enumerate(actuated) if n.startswith("openarm_right_joint")
-        ]
+        name_to_idx = {n: i for i, n in enumerate(actuated)}
+        self.left_indices = [name_to_idx[n] for n in _LEFT_JOINT_NAMES]
+        self.right_indices = [name_to_idx[n] for n in _RIGHT_JOINT_NAMES]
 
         self._warmup()
 

@@ -33,8 +33,8 @@ class KinematicsConfig:
     manipulability_weight: float = 0.05
     limit_weight: float = 100.0
     self_collision_margin: float = 0.01
-    self_collision_weight: float = 10.0
+    self_collision_weight: float = 25.0
     max_iterations: int = 25
     cost_tolerance: float = 1e-2
     max_joint_delta: float = 0.0055 * 2 * math.pi
-    max_reach: float = 0.6
+    max_reach: float = 0.75
