@@ -438,7 +438,10 @@ class KinematicsSolver:
         delta = np.clip(
             q_result_np - q_current, -cfg.max_joint_delta, cfg.max_joint_delta
         )
-        return (q_current + delta).astype(np.float32)
+        q_out = (q_current + delta).astype(np.float32)
+        # TODO: remove when left arm URDF wrist_3 axis is corrected
+        q_out[self.left_indices[6]] *= -1.0  # flip left WRIST_3 sign
+        return q_out
 
     # -- Internal ------------------------------------------------------------
 
