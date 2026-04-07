@@ -316,11 +316,12 @@ class DamiaoMotor(MotorDriver):
     async def get_telemetry(
         self,
         on_position: Callable[[float], None],
-        on_torque: Callable[[float], None],
+        on_torque: Callable[[float], None] | None = None,
     ) -> None:
         feedback = await self._request_feedback()
         on_position(feedback.position)
-        on_torque(feedback.torque)
+        if on_torque is not None:
+            on_torque(feedback.torque)
 
     async def get_temperature(self) -> float:
         feedback = await self._request_feedback()

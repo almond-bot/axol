@@ -38,7 +38,7 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     return _LIMITS.get(joint, (-math.inf, math.inf))
 
 
-class ArmController:
+class AxolArm:
     """Controls one 7-DOF + gripper arm over a single CAN bus.
 
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
@@ -59,13 +59,16 @@ class ArmController:
     # Polling                                                              #
     # ------------------------------------------------------------------ #
 
-    async def start_telemetry(self, hz: float) -> None:
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start background telemetry polling on all motors at the given frequency.
 
         Args:
-            hz: Poll frequency in Hz.
+            hz:     Poll frequency in Hz.
+            torque: If True, also fetch and cache torque each cycle.
         """
-        await asyncio.gather(*[m.start_telemetry(hz) for m in self._motors.values()])
+        await asyncio.gather(
+            *[m.start_telemetry(hz, torque=torque) for m in self._motors.values()]
+        )
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on all motors."""
@@ -324,8 +327,8 @@ class Axol(RobotBase):
             await axol.motion_control(left=np.array([0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0]))
 
     Attributes:
-        left:  ArmController for the left arm.
-        right: ArmController for the right arm.
+        left:  AxolArm for the left arm.
+        right: AxolArm for the right arm.
 
     Args:
         config:        Per-joint gains and friction parameters. Defaults to zero.
@@ -346,13 +349,13 @@ class Axol(RobotBase):
 
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
-            self.left = ArmController(self._left_bus, config, is_left=True)
+            self.left = AxolArm(self._left_bus, config, is_left=True)
         else:
             self.left = None
 
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = ArmController(self._right_bus, config, is_left=False)
+            self.right = AxolArm(self._right_bus, config, is_left=False)
         else:
             self.right = None
 
@@ -367,17 +370,18 @@ class Axol(RobotBase):
     # Polling                                                              #
     # ------------------------------------------------------------------ #
 
-    async def start_telemetry(self, hz: float) -> None:
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start background telemetry polling on both arms at the given frequency.
 
         Args:
-            hz: Poll frequency in Hz.
+            hz:     Poll frequency in Hz.
+            torque: If True, also fetch and cache torque each cycle.
         """
         tasks = []
         if self.left is not None:
-            tasks.append(self.left.start_telemetry(hz))
+            tasks.append(self.left.start_telemetry(hz, torque=torque))
         if self.right is not None:
-            tasks.append(self.right.start_telemetry(hz))
+            tasks.append(self.right.start_telemetry(hz, torque=torque))
         await asyncio.gather(*tasks)
 
     async def stop_telemetry(self) -> None:

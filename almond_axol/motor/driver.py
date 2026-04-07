@@ -51,12 +51,12 @@ class MotorDriver(ABC):
     async def get_telemetry(
         self,
         on_position: Callable[[float], None],
-        on_torque: Callable[[float], None],
+        on_torque: Callable[[float], None] | None = None,
     ) -> None:
-        """Fetch position and torque, calling each callback as soon as its value arrives.
+        """Fetch position and optionally torque, calling each callback as soon as its value arrives.
 
-        Damiao: one feedback request — both callbacks called together.
-        MyActuator: two concurrent requests — each callback called independently.
+        Damiao: one feedback request — position always fetched, torque skipped if on_torque is None.
+        MyActuator: position always fetched; torque request skipped if on_torque is None.
         """
         ...
 

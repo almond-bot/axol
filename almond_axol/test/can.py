@@ -11,7 +11,7 @@ import asyncio
 import math
 
 from ..motor import CanBus
-from ..robot.axol import ArmController, arm_limits
+from ..robot.axol import AxolArm, arm_limits
 from ..robot.config import AxolConfig
 from ..shared import CAN_LEFT, CAN_RIGHT, Joint
 
@@ -35,7 +35,7 @@ async def _run(is_left: bool, hz: int) -> None:
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
     async with CanBus(channel) as bus:
-        arm = ArmController(bus, AxolConfig(), is_left=is_left)
+        arm = AxolArm(bus, AxolConfig(), is_left=is_left)
         await arm.start_telemetry(hz)
         await asyncio.sleep(0.1)
 

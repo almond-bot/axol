@@ -136,7 +136,7 @@ class Motor:
         raw = await self._driver.get_torque()
         return raw * self._kt if self._kt is not None else raw
 
-    async def start_telemetry(self, hz: float) -> None:
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start the background polling loop at the given frequency.
 
         Damiao: one CAN request per cycle (feedback frame gives position + torque).
@@ -144,10 +144,13 @@ class Motor:
         response arrives independently — position does not wait for torque.
 
         Args:
-            hz: Poll frequency in Hz.
+            hz:     Poll frequency in Hz.
+            torque: If True, also fetch and cache torque each cycle.
         """
         await self.stop_telemetry()
-        self._telemetry_task = asyncio.create_task(self._telemetry_loop(hz))
+        self._telemetry_task = asyncio.create_task(
+            self._telemetry_loop(hz, torque=torque)
+        )
 
     async def stop_telemetry(self) -> None:
         """Stop the background polling loop."""
@@ -159,14 +162,15 @@ class Motor:
                 pass
             self._telemetry_task = None
 
-    async def _telemetry_loop(self, hz: float) -> None:
+    async def _telemetry_loop(self, hz: float, *, torque: bool = False) -> None:
         interval = 1.0 / hz
+        on_torque = (lambda t: setattr(self, "_torque", t)) if torque else None
         while True:
             start = asyncio.get_event_loop().time()
             try:
                 await self._driver.get_telemetry(
                     on_position=lambda p: setattr(self, "_position", p),
-                    on_torque=lambda t: setattr(self, "_torque", t),
+                    on_torque=on_torque,
                 )
             except MotorError:
                 pass  # Dropped CAN frames are normal on physical buses; skip cycle

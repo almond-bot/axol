@@ -180,21 +180,27 @@ class MyActuatorMotor(MotorDriver):
     async def get_telemetry(
         self,
         on_position: Callable[[float], None],
-        on_torque: Callable[[float], None],
+        on_torque: Callable[[float], None] | None = None,
     ) -> None:
         def _on_pos(task: asyncio.Task) -> None:
             if not task.cancelled() and task.exception() is None:
                 on_position(task.result())
 
-        def _on_torq(task: asyncio.Task) -> None:
-            if not task.cancelled() and task.exception() is None:
-                on_torque(task.result())
-
         pos_task = asyncio.create_task(self.get_position())
-        torq_task = asyncio.create_task(self.get_torque())
         pos_task.add_done_callback(_on_pos)
-        torq_task.add_done_callback(_on_torq)
-        await asyncio.gather(pos_task, torq_task, return_exceptions=True)
+        tasks: list[asyncio.Task] = [pos_task]
+
+        if on_torque is not None:
+
+            def _on_torq(task: asyncio.Task) -> None:
+                if not task.cancelled() and task.exception() is None:
+                    on_torque(task.result())
+
+            torq_task = asyncio.create_task(self.get_torque())
+            torq_task.add_done_callback(_on_torq)
+            tasks.append(torq_task)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_temperature(self) -> float:
         resp = await self._get_status2()
