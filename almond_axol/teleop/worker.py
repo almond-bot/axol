@@ -337,6 +337,8 @@ def run_ik_worker(
     conn: multiprocessing.connection.Connection,
     config: VRTeleopConfig,
     kinematics_config: KinematicsConfig,
+    q_current_left: np.ndarray | None = None,
+    q_current_right: np.ndarray | None = None,
 ) -> None:
     """IK subprocess entry point."""
     try:
@@ -347,7 +349,15 @@ def run_ik_worker(
     worker = IKWorker(config, kinematics_config)
     q_rest = worker.get_rest_q()
 
-    startup_traj = worker.compute_reset_trajectory(np.zeros_like(q_rest), q_rest)
+    q_start = np.zeros_like(q_rest)
+    if q_current_left is not None:
+        for i, gi in enumerate(worker.left_indices):
+            q_start[gi] = q_current_left[i]
+    if q_current_right is not None:
+        for i, gi in enumerate(worker.right_indices):
+            q_start[gi] = q_current_right[i]
+
+    startup_traj = worker.compute_reset_trajectory(q_start, q_rest)
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(

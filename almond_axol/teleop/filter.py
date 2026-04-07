@@ -41,29 +41,51 @@ class AlphaSmoothFilter:
 
 
 class ResetInterpolator:
-    """Steps through a pre-computed collision-aware trajectory one waypoint per call."""
+    """Steps through a pre-computed collision-aware trajectory one waypoint per call.
+
+    Optionally ramps gripper values (normalized [0, 1]) from a start value to
+    1.0 (open) over the same number of steps as the arm trajectory.
+    """
 
     def __init__(self) -> None:
         self._trajectory: list[np.ndarray] | None = None
         self._traj_index: int = 0
+        self._l_grip_start: float = 0.0
+        self._r_grip_start: float = 0.0
 
-    def set_trajectory(self, trajectory: list[np.ndarray]) -> None:
-        """Load a pre-computed trajectory."""
+    def set_trajectory(
+        self,
+        trajectory: list[np.ndarray],
+        l_grip: float = 0.0,
+        r_grip: float = 0.0,
+    ) -> None:
+        """Load a pre-computed trajectory and gripper start values."""
         self._trajectory = [np.array(q, dtype=np.float64) for q in trajectory]
         self._traj_index = 0
+        self._l_grip_start = l_grip
+        self._r_grip_start = r_grip
 
-    def step(self) -> tuple[np.ndarray | None, bool]:
-        """Advance one step. Returns ``(new_q_rad, done)``."""
+    def step(self) -> tuple[np.ndarray | None, float, float, bool]:
+        """Advance one step.
+
+        Returns ``(new_q_rad, l_grip, r_grip, done)`` where gripper values are
+        smoothstepped from their start values to 1.0 over the trajectory length.
+        """
         if self._trajectory is None or self._traj_index >= len(self._trajectory):
             self.clear()
-            return None, True
+            return None, 1.0, 1.0, True
+        n = len(self._trajectory)
+        alpha = (self._traj_index + 1) / n
+        smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+        l_grip = self._l_grip_start + smooth * (1.0 - self._l_grip_start)
+        r_grip = self._r_grip_start + smooth * (1.0 - self._r_grip_start)
         q = self._trajectory[self._traj_index]
         self._traj_index += 1
-        done = self._traj_index >= len(self._trajectory)
+        done = self._traj_index >= n
         if done:
             self._trajectory = None
             self._traj_index = 0
-        return q, done
+        return q, l_grip, r_grip, done
 
     def is_active(self) -> bool:
         """True if trajectory playback is in progress."""

@@ -98,8 +98,8 @@ class AxolVRTeleop(Teleoperator):
         self._q: np.ndarray | None = None  # full URDF vector from IK subprocess
         self._left_indices: list[int] = []
         self._right_indices: list[int] = []
-        self._l_grip: float = 1.0
-        self._r_grip: float = 1.0
+        self._l_grip: float = 0.0
+        self._r_grip: float = 0.0
         self._q_out = np.zeros(16, dtype=np.float32)
         self._q_lock = threading.Lock()
 
@@ -146,18 +146,36 @@ class AxolVRTeleop(Teleoperator):
     # ------------------------------------------------------------------
 
     @check_if_already_connected
-    def connect(self, calibrate: bool = True) -> None:
-        """Start the VR server and IK subprocess."""
+    def connect(
+        self,
+        calibrate: bool = True,
+        q_start_left: np.ndarray | None = None,
+        q_start_right: np.ndarray | None = None,
+    ) -> None:
+        """Start the VR server and IK subprocess.
+
+        Args:
+            q_start_left:  Shape (7,) current left arm positions (rad) in ARM_JOINTS
+                           order. Used as the startup trajectory start so the arm ramps
+                           from its actual position rather than zeros. Optional.
+            q_start_right: Same for the right arm.
+        """
         loop = asyncio.new_event_loop()
         self._loop = loop
         self._loop_thread = threading.Thread(
             target=loop.run_forever, name="vr-axol-event-loop", daemon=True
         )
         self._loop_thread.start()
-        asyncio.run_coroutine_threadsafe(self._connect_async(), loop).result(timeout=60)
+        asyncio.run_coroutine_threadsafe(
+            self._connect_async(q_start_left, q_start_right), loop
+        ).result(timeout=60)
         _logger.info("AxolVRTeleop connected.")
 
-    async def _connect_async(self) -> None:
+    async def _connect_async(
+        self,
+        q_start_left: np.ndarray | None = None,
+        q_start_right: np.ndarray | None = None,
+    ) -> None:
         self._vr_server = VRServer(self.config.vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
         await self._vr_server.enable()
@@ -172,6 +190,8 @@ class AxolVRTeleop(Teleoperator):
                 child_conn,
                 self.config.vr_teleop_config,
                 self.config.kinematics_config,
+                q_start_left,
+                q_start_right,
             ),
             daemon=True,
         )
@@ -187,8 +207,12 @@ class AxolVRTeleop(Teleoperator):
         self._q = np.asarray(q_init, dtype=np.float32)
         self._left_indices = left_indices
         self._right_indices = right_indices
+        if q_start_left is not None and len(q_start_left) > 7:
+            self._l_grip = float(q_start_left[7])
+        if q_start_right is not None and len(q_start_right) > 7:
+            self._r_grip = float(q_start_right[7])
         if startup_traj:
-            self._reset_interp.set_trajectory(startup_traj)
+            self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
         self._ik_task = asyncio.create_task(self._ik_loop())
 
@@ -322,21 +346,24 @@ class AxolVRTeleop(Teleoperator):
         if q is None:
             return self._q_out
 
+        l_grip = self._l_grip
+        r_grip = self._r_grip
+
         if self._reset_interp.is_active():
-            new_q, done = self._reset_interp.step()
+            new_q, l_grip, r_grip, done = self._reset_interp.step()
             if new_q is not None:
                 q = np.asarray(new_q, dtype=np.float32)
                 if done:
                     self._q = q.copy()
 
-        smoothed_l = self._smooth_left.update(q[self._left_indices])
-        smoothed_r = self._smooth_right.update(q[self._right_indices])
+        smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
+        smoothed_r = self._smooth_right.update(
+            np.append(q[self._right_indices], r_grip)
+        )
 
         out = np.empty(16, dtype=np.float32)
-        out[:7] = smoothed_l
-        out[7] = self._l_grip
-        out[8:15] = smoothed_r
-        out[15] = self._r_grip
+        out[:8] = smoothed_l
+        out[8:] = smoothed_r
         return out
 
     async def _ik_loop(self) -> None:
@@ -371,7 +398,9 @@ class AxolVRTeleop(Teleoperator):
                         if isinstance(result, tuple) and result[0] == "reset_traj":
                             _, q_default, trajectory = result
                             if trajectory:
-                                self._reset_interp.set_trajectory(trajectory)
+                                self._reset_interp.set_trajectory(
+                                    trajectory, self._l_grip, self._r_grip
+                                )
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
                             self._q = np.asarray(q_default, dtype=np.float32)
