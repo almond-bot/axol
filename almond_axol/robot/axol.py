@@ -100,8 +100,11 @@ class ArmController:
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
-        """Enable all motors and release brakes."""
+        """Enable all motors in MIT mode."""
         await asyncio.gather(*[m.enable() for m in self._motors.values()])
+        await asyncio.gather(
+            *[m.set_control_mode(ControlMode.MIT) for m in self._motors.values()]
+        )
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""

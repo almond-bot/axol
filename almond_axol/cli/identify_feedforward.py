@@ -435,4 +435,7 @@ async def _run(args: argparse.Namespace) -> None:
                 await _ramp_others(motors, joint)
             except Exception:
                 pass
+            await asyncio.gather(
+                *[m.set_control_mode(ControlMode.MIT) for m in motors.values()]
+            )
             await asyncio.gather(*[m.disable() for m in motors.values()])
