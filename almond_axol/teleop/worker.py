@@ -53,9 +53,13 @@ def _vr_to_flu_np(
     qy: float,
     qz: float,
     qw: float,
+    *,
+    is_right: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert VR pose (X=Down, Y=Left, Z=Forward) → robot FLU. Returns (pos_3, rot_3x3), float32."""
-    pos = np.array((pz, py, -px), dtype=np.float32)
+    pos = np.array(
+        (-pz if is_right else pz, py, px if is_right else -px), dtype=np.float32
+    )
     m = _quat_xyzw_to_matrix(qx, qy, qz, qw)
     rot = np.empty((3, 3), dtype=np.float32)
     rot[0, :] = (m[2, 2], m[2, 1], -m[2, 0])
@@ -211,6 +215,7 @@ class IKWorker:
             frame.r_ee.quaternion.y,
             frame.r_ee.quaternion.z,
             frame.r_ee.quaternion.w,
+            is_right=True,
         )
         left_e = np.array(
             (frame.l_elbow.z, frame.l_elbow.y, -frame.l_elbow.x), dtype=np.float32

@@ -28,7 +28,7 @@ class KinematicsConfig:
 
     pos_weight: float = 50.0
     ori_weight: float = 10.0
-    elbow_weight: float = 25.0
+    elbow_weight: float = 35.0
     rest_weight: float = 4.5
     manipulability_weight: float = 0.05
     limit_weight: float = 100.0
