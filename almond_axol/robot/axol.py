@@ -339,21 +339,11 @@ class Axol(RobotBase):
             self.right = None
 
     async def __aenter__(self) -> Axol:
-        tasks = []
-        if self.left is not None:
-            tasks.append(self._left_bus.start())
-        if self.right is not None:
-            tasks.append(self._right_bus.start())
-        await asyncio.gather(*tasks)
+        await self.enable()
         return self
 
     async def __aexit__(self, *_) -> None:
-        tasks = []
-        if self.left is not None:
-            tasks.extend([self.left.stop_telemetry(), self._left_bus.close()])
-        if self.right is not None:
-            tasks.extend([self.right.stop_telemetry(), self._right_bus.close()])
-        await asyncio.gather(*tasks)
+        await self.disable()
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -386,22 +376,36 @@ class Axol(RobotBase):
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
-        """Enable all motors on both arms."""
-        tasks = []
+        """Start CAN buses and enable all motors on both arms."""
+        bus_tasks = []
         if self.left is not None:
-            tasks.append(self.left.enable())
+            bus_tasks.append(self._left_bus.start())
         if self.right is not None:
-            tasks.append(self.right.enable())
-        await asyncio.gather(*tasks)
+            bus_tasks.append(self._right_bus.start())
+        await asyncio.gather(*bus_tasks)
+
+        motor_tasks = []
+        if self.left is not None:
+            motor_tasks.append(self.left.enable())
+        if self.right is not None:
+            motor_tasks.append(self.right.enable())
+        await asyncio.gather(*motor_tasks)
 
     async def disable(self) -> None:
-        """Disable all motors on both arms."""
+        """Disable all motors and close CAN buses."""
         tasks = []
         if self.left is not None:
-            tasks.append(self.left.disable())
+            tasks.extend([self.left.stop_telemetry(), self.left.disable()])
         if self.right is not None:
-            tasks.append(self.right.disable())
+            tasks.extend([self.right.stop_telemetry(), self.right.disable()])
         await asyncio.gather(*tasks)
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        await asyncio.gather(*close_tasks)
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""

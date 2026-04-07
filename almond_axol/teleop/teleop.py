@@ -144,7 +144,7 @@ class VRTeleop:
         _logger.info("VRTeleop enabled")
 
     async def disable(self) -> None:
-        """Stop IK subprocess, robot, and VR server."""
+        """Stop IK subprocess and VR server. Does not disable motors."""
         if self._ik_task is not None:
             self._ik_task.cancel()
             try:
@@ -167,7 +167,6 @@ class VRTeleop:
                 self._ik_process.terminate()
             self._ik_process = None
 
-        await self._robot.disable()
         await self._vr_server.disable()
         _logger.info("VRTeleop disabled")
 
@@ -194,7 +193,10 @@ class VRTeleop:
                 t0 = time.perf_counter()
                 left, right = self.step()
                 if left is not None or right is not None:
-                    await self._robot.motion_control(left=left, right=right)
+                    try:
+                        await self._robot.motion_control(left=left, right=right)
+                    except Exception:
+                        pass
 
                 now = time.perf_counter()
                 loop_times.append(now)
@@ -217,7 +219,7 @@ class VRTeleop:
                 elapsed = time.perf_counter() - t0
                 await asyncio.sleep(max(0.0, interval - elapsed))
         except asyncio.CancelledError:
-            pass
+            await self._robot.disable()
 
     # ------------------------------------------------------------------
     # Step
