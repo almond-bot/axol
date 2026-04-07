@@ -65,6 +65,6 @@ class VRTeleopConfig:
     reset_rest_weight: float = 20.0
     reset_limit_weight: float = 100.0
     reset_collision_margin: float = 0.01
-    reset_collision_weight: float = 10.0
+    reset_collision_weight: float = 25.0
     reset_max_iterations: int = 10
     smooth_alpha: float = 0.45

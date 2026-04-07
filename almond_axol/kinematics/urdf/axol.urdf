@@ -16,6 +16,12 @@
                 <color rgba="0.647059 0.647059 0.647059 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Base.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_e1">
         <inertial>
@@ -33,6 +39,12 @@
                 <color rgba="0.917647 0.917647 0.917647 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.19958 2.34488e-17 0.07335" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_E1.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_e2">
         <inertial>
@@ -50,6 +62,12 @@
                 <color rgba="0.768627 0.886275 0.952941 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.24187 0 0.362735" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_E2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_gripper">
         <inertial>
@@ -67,6 +85,12 @@
                 <color rgba="0.615686 0.811765 0.929412 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.19958 0 0.713195" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left Gripper.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_s2">
         <inertial>
@@ -84,6 +108,12 @@
                 <color rgba="0.647059 0.647059 0.647059 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.13 1.83545e-17 -4.58863e-18" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_S2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_s3">
         <inertial>
@@ -101,6 +131,12 @@
                 <color rgba="0.231373 0.380392 0.705882 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.19958 0.04475 -3.81639e-16" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_S3.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_w0">
         <inertial>
@@ -118,6 +154,12 @@
                 <color rgba="0.972549 0.529412 0.00392157 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.19958 0 0.487025" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_W0.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_w1">
         <inertial>
@@ -135,6 +177,12 @@
                 <color rgba="0.498039 0.498039 0.498039 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.19958 0.0285 0.622695" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_W1.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="left_w2">
         <inertial>
@@ -152,6 +200,12 @@
                 <color rgba="0.980392 0.713726 0.00392157 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="-0.17108 0 0.679695" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Left_W2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_e1">
         <inertial>
@@ -169,6 +223,12 @@
                 <color rgba="0.917647 0.917647 0.917647 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.19958 2.34488e-17 0.07335" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_E1.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_e2">
         <inertial>
@@ -186,6 +246,12 @@
                 <color rgba="0.768627 0.886275 0.952941 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.24187 0 0.362735" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_E2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_gripper">
         <inertial>
@@ -203,6 +269,12 @@
                 <color rgba="0.615686 0.811765 0.929412 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.19958 0 0.713195" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right Gripper.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_s2">
         <inertial>
@@ -220,6 +292,12 @@
                 <color rgba="0.647059 0.647059 0.647059 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.13 1.83545e-17 -4.58863e-18" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_S2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_s3">
         <inertial>
@@ -237,6 +315,12 @@
                 <color rgba="0.231373 0.380392 0.705882 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.19958 0.04475 -3.81639e-16" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_S3.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_w0">
         <inertial>
@@ -254,6 +338,12 @@
                 <color rgba="0.972549 0.529412 0.00392157 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.19958 0 0.487025" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_W0.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_w1">
         <inertial>
@@ -271,6 +361,12 @@
                 <color rgba="0.498039 0.498039 0.498039 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.19958 0.0285 0.622695" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_W1.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="right_w2">
         <inertial>
@@ -288,6 +384,12 @@
                 <color rgba="0.980392 0.713726 0.00392157 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="0.17108 0 0.679695" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Right_W2.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <link name="root" />
     <link name="s1">
@@ -306,6 +408,12 @@
                 <color rgba="0.615686 0.811765 0.929412 1" />
             </material>
         </visual>
+        <collision>
+            <origin xyz="2.78001e-17 0 0.06" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/S1.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
     </link>
     <joint name="base_0" type="fixed">
         <origin xyz="-2.79001e-17 6.93889e-18 -0.06" rpy="0 -1.06752e-16 0" />
