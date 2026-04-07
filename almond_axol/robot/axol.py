@@ -73,11 +73,19 @@ class ArmController:
 
     @property
     def positions(self) -> np.ndarray:
-        """Latest cached joint positions (rad). Requires start_telemetry().
+        """Latest cached joint positions. Requires start_telemetry().
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
+        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
+        consistent with set_position and motion_control.
         """
-        return np.array([m.position for m in self._motors.values()], dtype=np.float32)
+        joints = list(Joint)
+        values = [self._motors[j].position for j in joints]
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        values[joints.index(Joint.GRIPPER)] = (
+            values[joints.index(Joint.GRIPPER)] - _hi
+        ) / (_lo - _hi)
+        return np.array(values, dtype=np.float32)
 
     @property
     def torques(self) -> np.ndarray:
@@ -116,12 +124,19 @@ class ArmController:
     # ------------------------------------------------------------------ #
 
     async def get_positions(self) -> np.ndarray:
-        """Return shaft position (rad) for every joint, fetched concurrently.
+        """Return joint positions for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
+        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
+        consistent with set_position and motion_control.
         """
         joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_position() for j in joints])
+        values = list(
+            await asyncio.gather(*[self._motors[j].get_position() for j in joints])
+        )
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        i = joints.index(Joint.GRIPPER)
+        values[i] = (values[i] - _hi) / (_lo - _hi)
         return np.array(values, dtype=np.float32)
 
     async def get_velocities(self) -> np.ndarray:

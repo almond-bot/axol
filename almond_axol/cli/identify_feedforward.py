@@ -310,9 +310,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--joint",
         required=True,
-        choices=[j.value for j in ARM_JOINTS],
+        choices=[j.value for j in [*ARM_JOINTS, Joint.GRIPPER]],
         metavar="JOINT",
-        help=f"Joint to identify: {', '.join(j.value for j in ARM_JOINTS)}",
+        help=f"Joint to identify: {', '.join(j.value for j in [*ARM_JOINTS, Joint.GRIPPER])}",
     )
     p.add_argument(
         "--kp",
@@ -354,13 +354,15 @@ async def _run(args: argparse.Namespace) -> None:
 
     async with CanBus(channel) as bus:
         motors = {j: Motor(bus, j) for j in ARM_JOINTS}
+        if joint == Joint.GRIPPER:
+            motors[Joint.GRIPPER] = Motor(bus, Joint.GRIPPER)
         await asyncio.gather(*[m.enable() for m in motors.values()])
         await asyncio.gather(
             *[
                 motors[j].set_control_mode(
                     ControlMode.MIT if j == joint else ControlMode.POS_VEL
                 )
-                for j in ARM_JOINTS
+                for j in motors
             ]
         )
 

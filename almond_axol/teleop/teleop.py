@@ -195,7 +195,8 @@ class VRTeleop:
                 if left is not None or right is not None:
                     try:
                         await self._robot.motion_control(left=left, right=right)
-                    except Exception:
+                    except Exception as e:
+                        _logger.error("Motion control error: %s", e)
                         pass
 
                 now = time.perf_counter()
