@@ -51,9 +51,6 @@ async def _run(no_left: bool, no_right: bool) -> None:
         kwargs["right_channel"] = None
 
     async with Axol(**kwargs) as axol:
-        print("Enabling motors ...")
-        await axol.enable()
-
         arms = []
         if axol.left is not None and not no_left:
             pos = await axol.left.get_positions()
@@ -63,7 +60,7 @@ async def _run(no_left: bool, no_right: bool) -> None:
             arms.append(("right", axol.right, pos))
 
         for side, arm, start_pos in arms:
-            # get_positions() already returns gripper as [0, 1] normalized.
+            # get_positions() returns gripper as [0, 1] normalized.
             q_hold = start_pos.copy()
             start_norm = float(np.clip(q_hold[_GRIPPER_IDX], 0.0, 1.0))
             q_hold[_GRIPPER_IDX] = start_norm
@@ -76,8 +73,7 @@ async def _run(no_left: bool, no_right: bool) -> None:
 
             print(f"  {side} gripper closed.")
 
-        print("Done. Disabling motors ...")
-        await axol.disable()
+    print("Done.")
 
 
 def main() -> None:
