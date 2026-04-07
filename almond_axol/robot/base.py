@@ -25,10 +25,11 @@ class RobotBase(ABC):
         ...
 
     @abstractmethod
-    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return current joint positions (rad) for both arms as (left, right).
 
-        Each array is shape (8,) in Joint enum order: 7 arm joints then gripper.
+        Each array is shape (8,) in Joint enum order: 7 arm joints then gripper,
+        or ``None`` if that arm is absent.
         """
         ...
 

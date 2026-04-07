@@ -71,7 +71,7 @@ class Sim(RobotBase):
         """No-op — the daemon thread exits when the process ends."""
         pass
 
-    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return the last commanded joint positions (rad) for both arms.
 
         Each array is shape (8,) in Joint enum order: 7 arm joints then gripper.
