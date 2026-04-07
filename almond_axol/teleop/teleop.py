@@ -264,6 +264,8 @@ class VRTeleop:
                 q = np.asarray(new_q, dtype=np.float32)
                 if done:
                     self._q = q.copy()
+                    self._l_grip = l_grip
+                    self._r_grip = r_grip
 
         smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
         smoothed_r = self._smooth_right.update(
