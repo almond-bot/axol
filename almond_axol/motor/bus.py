@@ -60,9 +60,21 @@ class CanBus:
         msg = can.Message(
             arbitration_id=arbitration_id, data=data, is_extended_id=False
         )
-        # Send synchronously — SocketCAN send is fast non-blocking at OS level.
-        # This prevents asyncio thread pool starvation at high telemetry rates.
-        self._bus.send(msg)
+        # Retry on ENOBUFS: the gs_usb kernel driver has only 10 tx_context slots.
+        # A burst of 8 motor frames can transiently exhaust them if USB echo latency
+        # drifts slightly beyond the cycle period.  Waiting 2ms lets pending echoes
+        # drain before the next attempt; 5 retries covers any realistic jitter.
+        for attempt in range(5):
+            try:
+                self._bus.send(msg)
+                return
+            except can.CanOperationError:
+                if attempt == 4:
+                    raise
+                _logger.debug(
+                    "CAN TX buffer full (attempt %d/5), retrying", attempt + 1
+                )
+                await asyncio.sleep(0.002)
 
     async def _reader_loop(self) -> None:
         while True:
