@@ -118,6 +118,8 @@ class DamiaoMotor(MotorDriver):
         self._v_max = 45.0
         self._t_max = 18.0
 
+        self._on_feedback: Callable[[float, float], None] | None = None
+
         bus._add_listener(self._on_message)
 
     # ------------------------------------------------------------------ #
@@ -174,6 +176,9 @@ class DamiaoMotor(MotorDriver):
             if not fut.done():
                 fut.set_result(self._feedback)
         self._feedback_waiters.clear()
+
+        if self._on_feedback is not None:
+            self._on_feedback(self._feedback.position, self._feedback.torque)
 
     def _canid_bytes(self) -> tuple[int, int]:
         return self._motor_id & 0xFF, (self._motor_id >> 8) & 0xFF

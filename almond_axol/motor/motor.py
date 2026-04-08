@@ -90,6 +90,9 @@ class Motor:
         self._position: float | None = None
         self._torque: float | None = None
         self._telemetry_task: asyncio.Task | None = None
+        self._driver._on_feedback = lambda pos, torq: (
+            setattr(self, "_position", pos) or setattr(self, "_torque", torq)
+        )
 
     async def enable(self) -> None:
         """Enable the motor and release the brake."""
@@ -164,7 +167,15 @@ class Motor:
 
     async def _telemetry_loop(self, hz: float, *, torque: bool = False) -> None:
         interval = 1.0 / hz
-        on_torque = (lambda t: setattr(self, "_torque", t)) if torque else None
+        kt = self._kt
+        if torque:
+            on_torque = (
+                (lambda t: setattr(self, "_torque", t * kt))
+                if kt is not None
+                else (lambda t: setattr(self, "_torque", t))
+            )
+        else:
+            on_torque = None
         while True:
             start = asyncio.get_event_loop().time()
             try:
