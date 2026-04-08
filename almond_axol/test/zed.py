@@ -2,8 +2,9 @@
 Test script: connect to a ZED stream and save one frame as a PNG.
 
 Usage:
-    python -m almond_axol.test.zed --host 192.168.1.10 --port 30000
-    python -m almond_axol.test.zed --host 192.168.1.10 --port 30000 --output frame.png
+    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000
+    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000 --output frame.png
+    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000 --setup-ip eth0
 """
 
 from __future__ import annotations
@@ -16,13 +17,25 @@ import cv2
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
 
+_RECEIVER_IP = "192.168.10.2/24"
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Capture one frame from a ZED stream and save as PNG.")
-    parser.add_argument("--host", default="127.0.0.1", help="IP address of the ZedStreamer host.")
+    parser.add_argument("--host", default="192.168.10.1", help="IP address of the ZedStreamer host (default: 192.168.10.1).")
     parser.add_argument("--port", type=int, default=30000, help="Streaming port (default: 30000).")
     parser.add_argument("--output", default="zed_frame.png", help="Output PNG file path (default: zed_frame.png).")
+    parser.add_argument(
+        "--setup-ip",
+        metavar="IFACE",
+        default=None,
+        help=f"Assign the receiver IP ({_RECEIVER_IP}) to IFACE before connecting (e.g. eth0). Requires sudo.",
+    )
     args = parser.parse_args()
+
+    if args.setup_ip:
+        from ..shared import setup_link_ip
+        setup_link_ip(args.setup_ip, _RECEIVER_IP)
 
     import pyzed.sl as sl
 
