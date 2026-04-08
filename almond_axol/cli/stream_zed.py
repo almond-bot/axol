@@ -18,21 +18,21 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     p.add_argument(
         "--overhead",
         type=int,
-        required=True,
+        default=None,
         metavar="SERIAL",
         help="Serial number of the overhead camera.",
     )
     p.add_argument(
         "--left-arm",
         type=int,
-        required=True,
+        default=None,
         metavar="SERIAL",
         help="Serial number of the left-arm camera.",
     )
     p.add_argument(
         "--right-arm",
         type=int,
-        required=True,
+        default=None,
         metavar="SERIAL",
         help="Serial number of the right-arm camera.",
     )
@@ -46,6 +46,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.overhead is None and args.left_arm is None and args.right_arm is None:
+        raise SystemExit("error: at least one of --overhead, --left-arm, --right-arm must be provided")
     logging.basicConfig(level=getattr(logging, args.log_level))
     asyncio.run(_run(args.overhead, args.left_arm, args.right_arm))
 
