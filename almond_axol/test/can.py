@@ -34,7 +34,7 @@ _logger = logging.getLogger(__name__)
 def _setup_logging(log_file: str) -> None:
     fmt = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s"
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format=fmt,
         datefmt="%H:%M:%S",
         handlers=[
