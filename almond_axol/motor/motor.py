@@ -172,8 +172,6 @@ class Motor:
             except asyncio.CancelledError:
                 pass
             self._telemetry_task = None
-        self._position = None
-        self._torque = None
 
     async def _telemetry_loop(self, hz: float, *, torque: bool = False) -> None:
         interval = 1.0 / hz
