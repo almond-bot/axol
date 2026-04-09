@@ -124,7 +124,7 @@ class Motor:
 
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
-        if self._position is not None:
+        if self._telemetry_task is not None:
             raise MotorError(
                 f"Telemetry is active on {self.joint} — use motor.position or stop_telemetry() first"
             )
@@ -140,9 +140,9 @@ class Motor:
         Damiao: estimated output torque in Nm directly.
         MyActuator: phase current (A) multiplied by the joint's Kt (Nm/A).
         """
-        if self._torque is not None:
+        if self._telemetry_task is not None:
             raise MotorError(
-                f"Torque telemetry is active on {self.joint} — use motor.torque or stop_telemetry() first"
+                f"Telemetry is active on {self.joint} — use motor.torque or stop_telemetry() first"
             )
         raw = await self._driver.get_torque()
         return raw * self._kt if self._kt is not None else raw
