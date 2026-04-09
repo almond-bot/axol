@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import subprocess
 import time
 import traceback
@@ -36,6 +37,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _setup_logging(log_file: str) -> None:
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     fmt = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s"
     logging.basicConfig(
         level=logging.INFO,
@@ -160,6 +162,15 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
             stats_task = asyncio.create_task(
                 _stats_monitor(channel, arm), name="can_stats_monitor"
             )
+
+            try:
+                await arm.enable()
+                _logger.info("Motors enabled")
+            except Exception as exc:
+                _logger.error(
+                    "enable failed: %s\n%s", exc, traceback.format_exc()
+                )
+                raise
 
             try:
                 await arm.start_telemetry(hz)
@@ -297,6 +308,7 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
             finally:
                 print("\033[?25h")
                 await arm.stop_telemetry()
+                await arm.disable()
 
     except Exception as exc:
         _logger.error("Fatal error in _run: %s\n%s", exc, traceback.format_exc())
@@ -343,7 +355,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--log-file",
-        default=f"can_send_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        default=f"logs/can_send_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
     args = parser.parse_args()

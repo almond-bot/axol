@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import logging
 import math
+import os
 import subprocess
 import time
 import traceback
@@ -32,6 +33,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _setup_logging(log_file: str) -> None:
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     fmt = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s"
     logging.basicConfig(
         level=logging.INFO,
@@ -254,7 +256,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--log-file",
-        default=f"can_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        default=f"logs/can_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
     args = parser.parse_args()
