@@ -183,8 +183,9 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
 
             await asyncio.sleep(0.1)
 
-            # Read initial positions; all joints hold here except the cycling one.
-            hold_q = await arm.get_positions()
+            # Read initial positions from telemetry cache (avoids conflicting with
+            # the background polling loop which uses the same CAN request type).
+            hold_q = arm.positions
             cycle_start = float(hold_q[joint_idx])
             _logger.info(
                 "Initial positions read. cycle_joint=%s  start=%.4f",
