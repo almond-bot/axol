@@ -200,19 +200,25 @@ class Motor:
 
     @property
     def position(self) -> float:
-        """Latest cached shaft position (rad). Requires start_telemetry()."""
+        """Latest cached shaft position (rad).
+
+        Populated by start_telemetry() or motion_control() responses.
+        """
         if self._position is None:
             raise MotorError(
-                f"No position data for {self.joint} — call start_telemetry() first"
+                f"No position data for {self.joint} — call start_telemetry() or send a motion_control() command first"
             )
         return self._position
 
     @property
     def torque(self) -> float:
-        """Latest cached torque estimate (Nm / A). Requires start_telemetry()."""
+        """Latest cached torque estimate (Nm / A).
+
+        Populated by start_telemetry(torque=True) or motion_control() responses.
+        """
         if self._torque is None:
             raise MotorError(
-                f"No torque data for {self.joint} — call start_telemetry() first"
+                f"No torque data for {self.joint} — call start_telemetry(torque=True) or send a motion_control() command first"
             )
         return self._torque
 

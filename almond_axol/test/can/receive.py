@@ -124,7 +124,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
     side = "left" if is_left else "right"
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
-    _logger.info("Starting telemetry  side=%s  channel=%s  hz=%d", side, channel, hz)
+    _logger.info("Starting  side=%s  channel=%s  hz=%d", side, channel, hz)
     _logger.info("Initial CAN stats:\n%s", _read_can_stats(channel))
 
     t_start = time.perf_counter()
@@ -158,10 +158,14 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
 
             print("\033[?25l", end="")
             last_stat_log = time.perf_counter()
+            last_display = 0.0
+            interval = 1.0 / hz
+            _DISPLAY_HZ = 30
 
             try:
                 while True:
                     cycle_count += 1
+                    t_iter = time.perf_counter()
 
                     try:
                         positions = arm.positions
@@ -175,30 +179,31 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                         )
                         positions = np.zeros(len(joints), dtype=np.float32)
 
-                    lines = []
-                    lines.append("\033[H\033[J")
-                    lines.append(f"  {side.upper()} ARM  [{hz} Hz]  log→{log_file}")
-                    lines.append(
-                        f"  cycles={cycle_count}  send_err={send_error_count}"
-                        f"  timeout_err={timeout_error_count}"
-                        f"  other_err={other_error_count}"
-                    )
-                    lines.append(f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}")
-                    lines.append("  " + "─" * (12 + 8 + _BAR_WIDTH + 4))
-
-                    for i, joint in enumerate(joints):
-                        lo, hi = arm_limits(joint, is_left=is_left)
-                        p = float(positions[i])
+                    now = t_iter
+                    if now - last_display >= 1.0 / _DISPLAY_HZ:
+                        lines = []
+                        lines.append("\033[H\033[J")
+                        lines.append(f"  {side.upper()} ARM  [{hz} Hz]  log→{log_file}")
                         lines.append(
-                            f"  {joint.value:<12}  {p / _TAU:>+8.4f}  {_bar(p, lo, hi)}"
+                            f"  cycles={cycle_count}  send_err={send_error_count}"
+                            f"  timeout_err={timeout_error_count}"
+                            f"  other_err={other_error_count}"
                         )
+                        lines.append(f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}")
+                        lines.append("  " + "─" * (12 + 8 + _BAR_WIDTH + 4))
 
-                    lines.append("")
-                    lines.append("  ctrl+c to quit")
-                    print("\n".join(lines), end="", flush=True)
+                        for i, joint in enumerate(joints):
+                            lo, hi = arm_limits(joint, is_left=is_left)
+                            p = float(positions[i])
+                            lines.append(
+                                f"  {joint.value:<12}  {p / _TAU:>+8.4f}  {_bar(p, lo, hi)}"
+                            )
 
-                    # Log per-cycle timing to file every 10 seconds
-                    now = time.perf_counter()
+                        lines.append("")
+                        lines.append("  ctrl+c to quit")
+                        print("\n".join(lines), end="", flush=True)
+                        last_display = now
+
                     if now - last_stat_log >= 10.0:
                         elapsed_total = now - t_start
                         _logger.info(
@@ -213,7 +218,8 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                         )
                         last_stat_log = now
 
-                    await asyncio.sleep(1 / hz)
+                    elapsed = time.perf_counter() - t_iter
+                    await asyncio.sleep(max(0.0, interval - elapsed))
 
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
@@ -256,7 +262,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--log-file",
-        default=f"logs/can_diag_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+        default=f"logs/can_receive_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
     args = parser.parse_args()
