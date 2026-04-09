@@ -53,9 +53,13 @@ def _vr_to_flu_np(
     qy: float,
     qz: float,
     qw: float,
+    *,
+    is_right: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert VR pose (X=Down, Y=Left, Z=Forward) → robot FLU. Returns (pos_3, rot_3x3), float32."""
-    pos = np.array((pz, py, -px), dtype=np.float32)
+    pos = np.array(
+        (-pz if is_right else pz, py, px if is_right else -px), dtype=np.float32
+    )
     m = _quat_xyzw_to_matrix(qx, qy, qz, qw)
     rot = np.empty((3, 3), dtype=np.float32)
     rot[0, :] = (m[2, 2], m[2, 1], -m[2, 0])
@@ -211,6 +215,7 @@ class IKWorker:
             frame.r_ee.quaternion.y,
             frame.r_ee.quaternion.z,
             frame.r_ee.quaternion.w,
+            is_right=True,
         )
         left_e = np.array(
             (frame.l_elbow.z, frame.l_elbow.y, -frame.l_elbow.x), dtype=np.float32
@@ -337,6 +342,8 @@ def run_ik_worker(
     conn: multiprocessing.connection.Connection,
     config: VRTeleopConfig,
     kinematics_config: KinematicsConfig,
+    q_current_left: np.ndarray | None = None,
+    q_current_right: np.ndarray | None = None,
 ) -> None:
     """IK subprocess entry point."""
     try:
@@ -347,7 +354,15 @@ def run_ik_worker(
     worker = IKWorker(config, kinematics_config)
     q_rest = worker.get_rest_q()
 
-    startup_traj = worker.compute_reset_trajectory(np.zeros_like(q_rest), q_rest)
+    q_start = np.zeros_like(q_rest)
+    if q_current_left is not None:
+        for i, gi in enumerate(worker.left_indices):
+            q_start[gi] = q_current_left[i]
+    if q_current_right is not None:
+        for i, gi in enumerate(worker.right_indices):
+            q_start[gi] = q_current_right[i]
+
+    startup_traj = worker.compute_reset_trajectory(q_start, q_rest)
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(

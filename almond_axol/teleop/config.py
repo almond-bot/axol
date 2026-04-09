@@ -41,7 +41,7 @@ class VRTeleopConfig:
                 0.05 * 2 * math.pi,
                 0.0,
                 0.0,
-                0.025 * 2 * math.pi,
+                -0.025 * 2 * math.pi,
             ],
             dtype=np.float32,
         )
@@ -55,7 +55,7 @@ class VRTeleopConfig:
                 -0.05 * 2 * math.pi,
                 0.0,
                 0.0,
-                -0.025 * 2 * math.pi,
+                0.025 * 2 * math.pi,
             ],
             dtype=np.float32,
         )

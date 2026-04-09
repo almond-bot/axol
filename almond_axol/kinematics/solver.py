@@ -438,7 +438,8 @@ class KinematicsSolver:
         delta = np.clip(
             q_result_np - q_current, -cfg.max_joint_delta, cfg.max_joint_delta
         )
-        return (q_current + delta).astype(np.float32)
+        q_out = (q_current + delta).astype(np.float32)
+        return q_out
 
     # -- Internal ------------------------------------------------------------
 

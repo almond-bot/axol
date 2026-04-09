@@ -38,7 +38,7 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     return _LIMITS.get(joint, (-math.inf, math.inf))
 
 
-class ArmController:
+class AxolArm:
     """Controls one 7-DOF + gripper arm over a single CAN bus.
 
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
@@ -59,13 +59,16 @@ class ArmController:
     # Polling                                                              #
     # ------------------------------------------------------------------ #
 
-    async def start_telemetry(self, hz: float) -> None:
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start background telemetry polling on all motors at the given frequency.
 
         Args:
-            hz: Poll frequency in Hz.
+            hz:     Poll frequency in Hz.
+            torque: If True, also fetch and cache torque each cycle.
         """
-        await asyncio.gather(*[m.start_telemetry(hz) for m in self._motors.values()])
+        await asyncio.gather(
+            *[m.start_telemetry(hz, torque=torque) for m in self._motors.values()]
+        )
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on all motors."""
@@ -73,11 +76,19 @@ class ArmController:
 
     @property
     def positions(self) -> np.ndarray:
-        """Latest cached joint positions (rad). Requires start_telemetry().
+        """Latest cached joint positions. Requires start_telemetry().
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
+        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
+        consistent with set_position and motion_control.
         """
-        return np.array([m.position for m in self._motors.values()], dtype=np.float32)
+        joints = list(Joint)
+        values = [self._motors[j].position for j in joints]
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        values[joints.index(Joint.GRIPPER)] = (
+            values[joints.index(Joint.GRIPPER)] - _hi
+        ) / (_lo - _hi)
+        return np.array(values, dtype=np.float32)
 
     @property
     def torques(self) -> np.ndarray:
@@ -92,8 +103,11 @@ class ArmController:
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
-        """Enable all motors and release brakes."""
+        """Enable all motors in MIT mode."""
         await asyncio.gather(*[m.enable() for m in self._motors.values()])
+        await asyncio.gather(
+            *[m.set_control_mode(ControlMode.MIT) for m in self._motors.values()]
+        )
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -116,12 +130,19 @@ class ArmController:
     # ------------------------------------------------------------------ #
 
     async def get_positions(self) -> np.ndarray:
-        """Return shaft position (rad) for every joint, fetched concurrently.
+        """Return joint positions for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
+        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
+        consistent with set_position and motion_control.
         """
         joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_position() for j in joints])
+        values = list(
+            await asyncio.gather(*[self._motors[j].get_position() for j in joints])
+        )
+        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        i = joints.index(Joint.GRIPPER)
+        values[i] = (values[i] - _hi) / (_lo - _hi)
         return np.array(values, dtype=np.float32)
 
     async def get_velocities(self) -> np.ndarray:
@@ -306,8 +327,8 @@ class Axol(RobotBase):
             await axol.motion_control(left=np.array([0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0]))
 
     Attributes:
-        left:  ArmController for the left arm.
-        right: ArmController for the right arm.
+        left:  AxolArm for the left arm.
+        right: AxolArm for the right arm.
 
     Args:
         config:        Per-joint gains and friction parameters. Defaults to zero.
@@ -318,59 +339,104 @@ class Axol(RobotBase):
     def __init__(
         self,
         config: AxolConfig = AxolConfig(),
-        left_channel: str = CAN_LEFT,
-        right_channel: str = CAN_RIGHT,
+        left_channel: str | None = CAN_LEFT,
+        right_channel: str | None = CAN_RIGHT,
     ) -> None:
-        self._left_bus = CanBus(left_channel)
-        self._right_bus = CanBus(right_channel)
-        self.left = ArmController(self._left_bus, config, is_left=True)
-        self.right = ArmController(self._right_bus, config, is_left=False)
+        if left_channel is None and right_channel is None:
+            raise ValueError(
+                "At least one of left_channel or right_channel must be specified."
+            )
+
+        if left_channel is not None:
+            self._left_bus = CanBus(left_channel)
+            self.left = AxolArm(self._left_bus, config, is_left=True)
+        else:
+            self.left = None
+
+        if right_channel is not None:
+            self._right_bus = CanBus(right_channel)
+            self.right = AxolArm(self._right_bus, config, is_left=False)
+        else:
+            self.right = None
 
     async def __aenter__(self) -> Axol:
-        await asyncio.gather(self._left_bus.start(), self._right_bus.start())
+        await self.enable()
         return self
 
     async def __aexit__(self, *_) -> None:
-        await asyncio.gather(
-            self.left.stop_telemetry(),
-            self.right.stop_telemetry(),
-            self._left_bus.close(),
-            self._right_bus.close(),
-        )
+        await self.disable()
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
     # ------------------------------------------------------------------ #
 
-    async def start_telemetry(self, hz: float) -> None:
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start background telemetry polling on both arms at the given frequency.
 
         Args:
-            hz: Poll frequency in Hz.
+            hz:     Poll frequency in Hz.
+            torque: If True, also fetch and cache torque each cycle.
         """
-        await asyncio.gather(
-            self.left.start_telemetry(hz), self.right.start_telemetry(hz)
-        )
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.start_telemetry(hz, torque=torque))
+        if self.right is not None:
+            tasks.append(self.right.start_telemetry(hz, torque=torque))
+        await asyncio.gather(*tasks)
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on both arms."""
-        await asyncio.gather(self.left.stop_telemetry(), self.right.stop_telemetry())
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.stop_telemetry())
+        if self.right is not None:
+            tasks.append(self.right.stop_telemetry())
+        await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
-        """Enable all motors on both arms."""
-        await asyncio.gather(self.left.enable(), self.right.enable())
+        """Start CAN buses and enable all motors on both arms."""
+        bus_tasks = []
+        if self.left is not None:
+            bus_tasks.append(self._left_bus.start())
+        if self.right is not None:
+            bus_tasks.append(self._right_bus.start())
+        await asyncio.gather(*bus_tasks)
+
+        motor_tasks = []
+        if self.left is not None:
+            motor_tasks.append(self.left.enable())
+        if self.right is not None:
+            motor_tasks.append(self.right.enable())
+        await asyncio.gather(*motor_tasks)
 
     async def disable(self) -> None:
-        """Disable all motors on both arms."""
-        await asyncio.gather(self.left.disable(), self.right.disable())
+        """Disable all motors and close CAN buses."""
+        tasks = []
+        if self.left is not None:
+            tasks.extend([self.left.stop_telemetry(), self.left.disable()])
+        if self.right is not None:
+            tasks.extend([self.right.stop_telemetry(), self.right.disable()])
+        await asyncio.gather(*tasks)
+
+        close_tasks = []
+        if self.left is not None:
+            close_tasks.append(self._left_bus.close())
+        if self.right is not None:
+            close_tasks.append(self._right_bus.close())
+        await asyncio.gather(*close_tasks)
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""
-        await asyncio.gather(self.left.clear_errors(), self.right.clear_errors())
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.clear_errors())
+        if self.right is not None:
+            tasks.append(self.right.clear_errors())
+        await asyncio.gather(*tasks)
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         """Set the control mode on all motors on both arms.
@@ -378,74 +444,103 @@ class Axol(RobotBase):
         Args:
             mode: Desired control mode.
         """
-        await asyncio.gather(
-            self.left.set_control_mode(mode), self.right.set_control_mode(mode)
-        )
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.set_control_mode(mode))
+        if self.right is not None:
+            tasks.append(self.right.set_control_mode(mode))
+        await asyncio.gather(*tasks)
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers                                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    async def _gather_pair(left_coro, right_coro) -> tuple:
+        """Run up to two coroutines concurrently; pass ``None`` to skip an arm."""
+        coros = [c for c in (left_coro, right_coro) if c is not None]
+        results = list(await asyncio.gather(*coros))
+        left = results.pop(0) if left_coro is not None else None
+        right = results.pop(0) if right_coro is not None else None
+        return left, right
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
     # ------------------------------------------------------------------ #
 
-    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return joint positions (rad) for both arms as (left, right).
 
-        Each array is shape (8,) in Joint enum order.
+        Each array is shape (8,) in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(
-            self.left.get_positions(), self.right.get_positions()
+        return await self._gather_pair(
+            self.left.get_positions() if self.left is not None else None,
+            self.right.get_positions() if self.right is not None else None,
         )
 
-    async def get_velocities(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_velocities(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return shaft velocity (rad/s) for both arms as (left, right).
 
-        Each array is shape (8,) in Joint enum order.
+        Each array is shape (8,) in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(
-            self.left.get_velocities(), self.right.get_velocities()
+        return await self._gather_pair(
+            self.left.get_velocities() if self.left is not None else None,
+            self.right.get_velocities() if self.right is not None else None,
         )
 
-    async def get_torques(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_torques(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return torque estimates for both arms as (left, right).
 
-        Each array is shape (8,) in Joint enum order.
+        Each array is shape (8,) in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(self.left.get_torques(), self.right.get_torques())
-
-    async def get_temperatures(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return motor temperatures (°C) for both arms as (left, right).
-
-        Each array is shape (8,) in Joint enum order.
-        """
-        return await asyncio.gather(
-            self.left.get_temperatures(), self.right.get_temperatures()
+        return await self._gather_pair(
+            self.left.get_torques() if self.left is not None else None,
+            self.right.get_torques() if self.right is not None else None,
         )
 
-    async def get_voltages(self) -> tuple[np.ndarray, np.ndarray]:
+    async def get_temperatures(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return motor temperatures (°C) for both arms as (left, right).
+
+        Each array is shape (8,) in Joint enum order, or ``None`` if that arm is absent.
+        """
+        return await self._gather_pair(
+            self.left.get_temperatures() if self.left is not None else None,
+            self.right.get_temperatures() if self.right is not None else None,
+        )
+
+    async def get_voltages(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return bus voltages (V) for both arms as (left, right).
 
-        Each array is shape (8,) in Joint enum order.
+        Each array is shape (8,) in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(self.left.get_voltages(), self.right.get_voltages())
+        return await self._gather_pair(
+            self.left.get_voltages() if self.left is not None else None,
+            self.right.get_voltages() if self.right is not None else None,
+        )
 
     async def get_error_codes(
         self,
-    ) -> tuple[list[MotorStatus], list[MotorStatus]]:
+    ) -> tuple[list[MotorStatus] | None, list[MotorStatus] | None]:
         """Return MotorStatus for both arms as (left, right).
 
-        Each list is in Joint enum order.
+        Each list is in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(
-            self.left.get_error_codes(), self.right.get_error_codes()
+        return await self._gather_pair(
+            self.left.get_error_codes() if self.left is not None else None,
+            self.right.get_error_codes() if self.right is not None else None,
         )
 
     async def get_gains(
         self,
-    ) -> tuple[list[MotorGains], list[MotorGains]]:
+    ) -> tuple[list[MotorGains] | None, list[MotorGains] | None]:
         """Return PID gains for both arms as (left, right).
 
-        Each list is in Joint enum order.
+        Each list is in Joint enum order, or ``None`` if that arm is absent.
         """
-        return await asyncio.gather(self.left.get_gains(), self.right.get_gains())
+        return await self._gather_pair(
+            self.left.get_gains() if self.left is not None else None,
+            self.right.get_gains() if self.right is not None else None,
+        )
 
     # ------------------------------------------------------------------ #
     # Setters                                                              #
@@ -458,9 +553,9 @@ class Axol(RobotBase):
     ) -> None:
         """Write PID gains to the specified joints on both arms."""
         tasks = []
-        if left:
+        if left and self.left is not None:
             tasks.append(self.left.set_gains(left))
-        if right:
+        if right and self.right is not None:
             tasks.append(self.right.set_gains(right))
         if tasks:
             await asyncio.gather(*tasks)
@@ -477,9 +572,9 @@ class Axol(RobotBase):
             right: Joints on the right arm to zero. ``None`` skips the arm.
         """
         tasks = []
-        if left is not None:
+        if left is not None and self.left is not None:
             tasks.append(self.left.set_zero_position(left))
-        if right is not None:
+        if right is not None and self.right is not None:
             tasks.append(self.right.set_zero_position(right))
         if tasks:
             await asyncio.gather(*tasks)
@@ -496,9 +591,9 @@ class Axol(RobotBase):
             right: Same for the right arm.
         """
         tasks = []
-        if left:
+        if left and self.left is not None:
             tasks.append(self.left.set_acceleration(left))
-        if right:
+        if right and self.right is not None:
             tasks.append(self.right.set_acceleration(right))
         if tasks:
             await asyncio.gather(*tasks)
@@ -518,9 +613,9 @@ class Axol(RobotBase):
             max_speed: Maximum speed (rad/s). 0.0 uses the motor's default.
         """
         tasks = []
-        if left is not None:
+        if left is not None and self.left is not None:
             tasks.append(self.left.set_position(left, max_speed))
-        if right is not None:
+        if right is not None and self.right is not None:
             tasks.append(self.right.set_position(right, max_speed))
         if tasks:
             await asyncio.gather(*tasks)
@@ -537,9 +632,9 @@ class Axol(RobotBase):
             right: Same for the right arm.
         """
         tasks = []
-        if left is not None:
+        if left is not None and self.left is not None:
             tasks.append(self.left.set_velocity(left))
-        if right is not None:
+        if right is not None and self.right is not None:
             tasks.append(self.right.set_velocity(right))
         if tasks:
             await asyncio.gather(*tasks)
@@ -557,9 +652,9 @@ class Axol(RobotBase):
             right: Same for the right arm.
         """
         tasks = []
-        if left is not None:
+        if left is not None and self.left is not None:
             tasks.append(self.left.motion_control(left))
-        if right is not None:
+        if right is not None and self.right is not None:
             tasks.append(self.right.motion_control(right))
         if tasks:
             await asyncio.gather(*tasks)

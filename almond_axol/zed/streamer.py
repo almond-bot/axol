@@ -70,11 +70,12 @@ class ZedStreamer:
             return
 
         cfg = self._config
-        specs = [
+        all_specs = [
             ("overhead", cfg.overhead_serial, cfg.overhead_port),
             ("left_arm", cfg.left_arm_serial, cfg.left_arm_port),
             ("right_arm", cfg.right_arm_serial, cfg.right_arm_port),
         ]
+        specs = [(name, serial, port) for name, serial, port in all_specs if serial is not None]
 
         loop = asyncio.get_running_loop()
         states = await asyncio.gather(

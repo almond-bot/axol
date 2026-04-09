@@ -129,4 +129,15 @@ class AxolConfig:
             gb=0.5935,
         )
     )
-    gripper: JointGains = field(default_factory=JointGains)
+    gripper: JointGains = field(
+        default_factory=lambda: JointGains(
+            kp=50.0,
+            kd=1.0,
+            fc=0.1194,
+            k=129.10,
+            fv=0.2604,
+            fo=0.0298,
+            ga=0.0002,
+            gb=0.0008,
+        )
+    )

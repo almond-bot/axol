@@ -65,24 +65,33 @@ class CanBus:
         self._bus.send(msg)
 
     async def _reader_loop(self) -> None:
-        while True:
-            try:
-                # Non-blocking read directly in the async loop saves overhead
-                # and avoids threadpool contention with 'send' calls.
-                msg: can.Message | None = self._bus.recv(timeout=0)
-                if msg is not None:
-                    for listener in self._listeners:
-                        try:
-                            listener(msg)
-                        except Exception as e:
-                            _logger.error(
-                                "CAN listener %s error: %s", listener.__name__, e
-                            )
-                else:
-                    # Give control back to event loop if no data
-                    await asyncio.sleep(0.001)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                _logger.warning("CAN reader loop warning: %s", e)
-                await asyncio.sleep(0.01)
+        loop = asyncio.get_running_loop()
+        readable = asyncio.Event()
+        fd = self._bus.fileno()
+        loop.add_reader(fd, readable.set)
+        try:
+            while True:
+                try:
+                    msg: can.Message | None = self._bus.recv(timeout=0)
+                    if msg is not None:
+                        for listener in self._listeners:
+                            try:
+                                listener(msg)
+                            except Exception as e:
+                                _logger.error(
+                                    "CAN listener %s error: %s", listener.__name__, e
+                                )
+                    else:
+                        # No data — sleep until the socket is readable instead of
+                        # polling on a fixed 1ms timer.  This wakes up immediately
+                        # when the next CAN frame arrives, cutting response latency
+                        # by up to 1ms per round-trip.
+                        readable.clear()
+                        await readable.wait()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    _logger.warning("CAN reader loop warning: %s", e)
+                    await asyncio.sleep(0.01)
+        finally:
+            loop.remove_reader(fd)

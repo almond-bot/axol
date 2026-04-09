@@ -113,7 +113,8 @@ def _run(
 
     init_rerun(session_name="axol_record")
     robot.connect()
-    teleop.connect()
+    pos_l, pos_r = robot.positions
+    teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
     episodes_recorded = 0

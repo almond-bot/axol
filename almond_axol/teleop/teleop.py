@@ -90,8 +90,8 @@ class VRTeleop:
         self._left_indices: list[int] = []
         self._right_indices: list[int] = []
 
-        self._l_grip: float = 1.0
-        self._r_grip: float = 1.0
+        self._l_grip: float = 0.0
+        self._r_grip: float = 0.0
         self._prev_reset: bool = False
         # Latched by _on_vr_frame on every rising edge so the IK loop can't
         # miss a short reset press that arrives while blocked on conn.recv.
@@ -116,13 +116,25 @@ class VRTeleop:
         await self._vr_server.enable()
         await self._robot.enable()
 
+        pos_l, pos_r = await self._robot.get_positions()
+        if pos_l is not None:
+            self._l_grip = float(pos_l[7])
+        if pos_r is not None:
+            self._r_grip = float(pos_r[7])
+
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
         self._parent_conn = parent_conn
 
         process = ctx.Process(
             target=run_ik_worker,
-            args=(child_conn, self._config, self._kinematics_config),
+            args=(
+                child_conn,
+                self._config,
+                self._kinematics_config,
+                pos_l[:7] if pos_l is not None else None,
+                pos_r[:7] if pos_r is not None else None,
+            ),
             daemon=True,
         )
         process.start()
@@ -138,13 +150,13 @@ class VRTeleop:
         self._left_indices = left_indices
         self._right_indices = right_indices
         if startup_traj:
-            self._reset_interp.set_trajectory(startup_traj)
+            self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
         self._ik_task = asyncio.create_task(self._ik_loop())
         _logger.info("VRTeleop enabled")
 
     async def disable(self) -> None:
-        """Stop IK subprocess, robot, and VR server."""
+        """Stop IK subprocess and VR server. Does not disable motors."""
         if self._ik_task is not None:
             self._ik_task.cancel()
             try:
@@ -167,7 +179,6 @@ class VRTeleop:
                 self._ik_process.terminate()
             self._ik_process = None
 
-        await self._robot.disable()
         await self._vr_server.disable()
         _logger.info("VRTeleop disabled")
 
@@ -194,7 +205,11 @@ class VRTeleop:
                 t0 = time.perf_counter()
                 left, right = self.step()
                 if left is not None or right is not None:
-                    await self._robot.motion_control(left=left, right=right)
+                    try:
+                        await self._robot.motion_control(left=left, right=right)
+                    except Exception as e:
+                        _logger.error("Motion control error: %s", e)
+                        pass
 
                 now = time.perf_counter()
                 loop_times.append(now)
@@ -217,7 +232,7 @@ class VRTeleop:
                 elapsed = time.perf_counter() - t0
                 await asyncio.sleep(max(0.0, interval - elapsed))
         except asyncio.CancelledError:
-            pass
+            await self._robot.disable()
 
     # ------------------------------------------------------------------
     # Step
@@ -240,23 +255,28 @@ class VRTeleop:
 
         q = self._q
 
+        l_grip = self._l_grip
+        r_grip = self._r_grip
+
         if self._reset_interp.is_active():
-            new_q, done = self._reset_interp.step()
+            new_q, l_grip, r_grip, done = self._reset_interp.step()
             if new_q is not None:
                 q = np.asarray(new_q, dtype=np.float32)
                 if done:
                     self._q = q.copy()
+                    self._l_grip = l_grip
+                    self._r_grip = r_grip
 
-        smoothed_l = self._smooth_left.update(q[self._left_indices])
-        smoothed_r = self._smooth_right.update(q[self._right_indices])
+        smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
+        smoothed_r = self._smooth_right.update(
+            np.append(q[self._right_indices], r_grip)
+        )
 
         left = np.empty(8, dtype=np.float32)
-        left[:7] = smoothed_l
-        left[7] = self._l_grip
+        left[:] = smoothed_l
 
         right = np.empty(8, dtype=np.float32)
-        right[:7] = smoothed_r
-        right[7] = self._r_grip
+        right[:] = smoothed_r
 
         return left, right
 
@@ -311,7 +331,9 @@ class VRTeleop:
                         if isinstance(result, tuple) and result[0] == "reset_traj":
                             _, q_default, trajectory = result
                             if trajectory:
-                                self._reset_interp.set_trajectory(trajectory)
+                                self._reset_interp.set_trajectory(
+                                    trajectory, self._l_grip, self._r_grip
+                                )
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
                             self._q = np.asarray(q_default, dtype=np.float32)

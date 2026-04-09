@@ -133,7 +133,6 @@ class AxolRobot(Robot):
             left_channel=self.config.left_channel,
             right_channel=self.config.right_channel,
         )
-        await self._axol.__aenter__()
         await self._axol.enable()
         await self._axol.start_telemetry(self.config.telemetry_hz)
 
@@ -174,6 +173,18 @@ class AxolRobot(Robot):
     def configure(self) -> None:
         pass
 
+    @property
+    def positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Cached arm positions from telemetry. Call after connect().
+
+        Returns ``(left, right)`` each shape (8,) in Joint enum order,
+        with gripper normalized to [0, 1].
+        """
+        assert self._axol is not None
+        assert self._axol.left is not None
+        assert self._axol.right is not None
+        return self._axol.left.positions, self._axol.right.positions
+
     # ------------------------------------------------------------------
     # Observation / action
     # ------------------------------------------------------------------
@@ -182,6 +193,8 @@ class AxolRobot(Robot):
     def get_observation(self) -> RobotObservation:
         """Return cached joint positions and latest camera frames."""
         assert self._axol is not None
+        assert self._axol.left is not None
+        assert self._axol.right is not None
 
         left_pos = self._axol.left.positions  # np.ndarray (8,), from telemetry cache
         right_pos = self._axol.right.positions

@@ -80,6 +80,10 @@ def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 
 
+def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
+    return float(x_int) * (x_max - x_min) / ((1 << bits) - 1) + x_min
+
+
 def _ma_error_to_status(error_code: int) -> MotorStatus:
     if error_code == 0:
         return MotorStatus.OK
@@ -94,6 +98,7 @@ class MyActuatorMotor(MotorDriver):
         self._bus = bus
         self._motor_id = motor_id
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
+        self._on_feedback: Callable[[float, float], None] | None = None
         bus._add_listener(self._on_message)
 
     # ------------------------------------------------------------------ #
@@ -180,21 +185,27 @@ class MyActuatorMotor(MotorDriver):
     async def get_telemetry(
         self,
         on_position: Callable[[float], None],
-        on_torque: Callable[[float], None],
+        on_torque: Callable[[float], None] | None = None,
     ) -> None:
         def _on_pos(task: asyncio.Task) -> None:
             if not task.cancelled() and task.exception() is None:
                 on_position(task.result())
 
-        def _on_torq(task: asyncio.Task) -> None:
-            if not task.cancelled() and task.exception() is None:
-                on_torque(task.result())
-
         pos_task = asyncio.create_task(self.get_position())
-        torq_task = asyncio.create_task(self.get_torque())
         pos_task.add_done_callback(_on_pos)
-        torq_task.add_done_callback(_on_torq)
-        await asyncio.gather(pos_task, torq_task, return_exceptions=True)
+        tasks: list[asyncio.Task] = [pos_task]
+
+        if on_torque is not None:
+
+            def _on_torq(task: asyncio.Task) -> None:
+                if not task.cancelled() and task.exception() is None:
+                    on_torque(task.result())
+
+            torq_task = asyncio.create_task(self.get_torque())
+            torq_task.add_done_callback(_on_torq)
+            tasks.append(torq_task)
+
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def get_temperature(self) -> float:
         resp = await self._get_status2()
@@ -347,8 +358,15 @@ class MyActuatorMotor(MotorDriver):
         self._pending[(resp_id, self._motor_id)] = fut
         await self._bus._send(_MA_MC_REQ + self._motor_id, data)
         try:
-            await asyncio.wait_for(fut, timeout)
+            resp = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             raise MotorError(
                 f"MyActuator motor {self._motor_id:#04x} motion control timed out"
             )
+
+        if self._on_feedback is not None:
+            pos_int = (resp[1] << 8) | resp[2]
+            torq_int = ((resp[4] & 0x0F) << 8) | resp[5]
+            position = _uint_to_float(pos_int, _MA_P_MIN, _MA_P_MAX, 16)
+            torque = _uint_to_float(torq_int, _MA_T_MIN, _MA_T_MAX, 12)
+            self._on_feedback(position, torque)

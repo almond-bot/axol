@@ -118,6 +118,8 @@ class DamiaoMotor(MotorDriver):
         self._v_max = 45.0
         self._t_max = 18.0
 
+        self._on_feedback: Callable[[float, float], None] | None = None
+
         bus._add_listener(self._on_message)
 
     # ------------------------------------------------------------------ #
@@ -174,6 +176,9 @@ class DamiaoMotor(MotorDriver):
             if not fut.done():
                 fut.set_result(self._feedback)
         self._feedback_waiters.clear()
+
+        if self._on_feedback is not None:
+            self._on_feedback(self._feedback.position, self._feedback.torque)
 
     def _canid_bytes(self) -> tuple[int, int]:
         return self._motor_id & 0xFF, (self._motor_id >> 8) & 0xFF
@@ -316,11 +321,12 @@ class DamiaoMotor(MotorDriver):
     async def get_telemetry(
         self,
         on_position: Callable[[float], None],
-        on_torque: Callable[[float], None],
+        on_torque: Callable[[float], None] | None = None,
     ) -> None:
         feedback = await self._request_feedback()
         on_position(feedback.position)
-        on_torque(feedback.torque)
+        if on_torque is not None:
+            on_torque(feedback.torque)
 
     async def get_temperature(self) -> float:
         feedback = await self._request_feedback()

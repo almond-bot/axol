@@ -71,10 +71,11 @@ class Sim(RobotBase):
         """No-op — the daemon thread exits when the process ends."""
         pass
 
-    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
-        """Return the last commanded joint positions (rad) for both arms.
+    async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Return the last commanded joint positions for both arms.
 
-        Each array is shape (8,) in Joint enum order: 7 arm joints then gripper.
+        Each array is shape (8,) in Joint enum order: 7 arm joints in radians,
+        then gripper normalized to [0, 1] (0.0 = closed, 1.0 = fully open).
         """
         return self._last_left.copy(), self._last_right.copy()
 
@@ -83,10 +84,11 @@ class Sim(RobotBase):
         left: np.ndarray | None = None,
         right: np.ndarray | None = None,
     ) -> None:
-        """Update the simulation to the given joint positions (rad).
+        """Update the simulation to the given joint positions.
 
         Args:
-            left:  Shape (8,) array of target positions (rad). ``None`` skips the arm.
+            left:  Shape (8,) array — 7 arm joints in radians then gripper in [0, 1].
+                   ``None`` skips the arm.
             right: Same for the right arm.
         """
         if left is not None:
