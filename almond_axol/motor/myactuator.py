@@ -106,13 +106,17 @@ class MyActuatorMotor(MotorDriver):
     # ------------------------------------------------------------------ #
 
     def _on_message(self, msg: can.Message) -> None:
-        # Motion control responses (0x500+id): data[0] is the echoed actuator CAN ID,
-        # not a command byte — key by (arb_id, motor_id) rather than (arb_id, data[0]).
         mc_resp_id = _MA_MC_RESP + self._motor_id
         if msg.arbitration_id == mc_resp_id:
-            key: tuple[int, int] = (mc_resp_id, self._motor_id)
-        else:
-            key = (msg.arbitration_id, msg.data[0])
+            if self._on_feedback is not None:
+                data = bytes(msg.data)
+                pos_int = (data[1] << 8) | data[2]
+                torq_int = ((data[4] & 0x0F) << 8) | data[5]
+                position = _uint_to_float(pos_int, _MA_P_MIN, _MA_P_MAX, 16)
+                torque = _uint_to_float(torq_int, _MA_T_MIN, _MA_T_MAX, 12)
+                self._on_feedback(position, torque)
+            return
+        key = (msg.arbitration_id, msg.data[0])
         fut = self._pending.pop(key, None)
         if fut is not None and not fut.done():
             fut.set_result(bytes(msg.data))
@@ -331,7 +335,6 @@ class MyActuatorMotor(MotorDriver):
         kp: float,
         kd: float,
         t_ff: float,
-        timeout: float = 0.05,
     ) -> None:
         p_u = _float_to_uint(p_des, _MA_P_MIN, _MA_P_MAX, 16)
         v_u = _float_to_uint(v_des, _MA_V_MIN, _MA_V_MAX, 12)
@@ -352,21 +355,4 @@ class MyActuatorMotor(MotorDriver):
             ]
         )
 
-        resp_id = _MA_MC_RESP + self._motor_id
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[bytes] = loop.create_future()
-        self._pending[(resp_id, self._motor_id)] = fut
         await self._bus._send(_MA_MC_REQ + self._motor_id, data)
-        try:
-            resp = await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            raise MotorError(
-                f"MyActuator motor {self._motor_id:#04x} motion control timed out"
-            )
-
-        if self._on_feedback is not None:
-            pos_int = (resp[1] << 8) | resp[2]
-            torq_int = ((resp[4] & 0x0F) << 8) | resp[5]
-            position = _uint_to_float(pos_int, _MA_P_MIN, _MA_P_MAX, 16)
-            torque = _uint_to_float(torq_int, _MA_T_MIN, _MA_T_MAX, 12)
-            self._on_feedback(position, torque)

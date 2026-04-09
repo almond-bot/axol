@@ -124,6 +124,10 @@ class Motor:
 
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
+        if self._telemetry_task is not None:
+            raise MotorError(
+                f"Telemetry is active on {self.joint} — use motor.position or stop_telemetry() first"
+            )
         return await self._driver.get_position()
 
     async def get_velocity(self) -> float:
@@ -136,6 +140,10 @@ class Motor:
         Damiao: estimated output torque in Nm directly.
         MyActuator: phase current (A) multiplied by the joint's Kt (Nm/A).
         """
+        if self._telemetry_task is not None:
+            raise MotorError(
+                f"Telemetry is active on {self.joint} — use motor.torque or stop_telemetry() first"
+            )
         raw = await self._driver.get_torque()
         return raw * self._kt if self._kt is not None else raw
 
@@ -190,19 +198,25 @@ class Motor:
 
     @property
     def position(self) -> float:
-        """Latest cached shaft position (rad). Requires start_telemetry()."""
+        """Latest cached shaft position (rad).
+
+        Populated by start_telemetry() or motion_control() responses.
+        """
         if self._position is None:
             raise MotorError(
-                f"No position data for {self.joint} — call start_telemetry() first"
+                f"No position data for {self.joint} — call start_telemetry() or send a motion_control() command first"
             )
         return self._position
 
     @property
     def torque(self) -> float:
-        """Latest cached torque estimate (Nm / A). Requires start_telemetry()."""
+        """Latest cached torque estimate (Nm / A).
+
+        Populated by start_telemetry(torque=True) or motion_control() responses.
+        """
         if self._torque is None:
             raise MotorError(
-                f"No torque data for {self.joint} — call start_telemetry() first"
+                f"No torque data for {self.joint} — call start_telemetry(torque=True) or send a motion_control() command first"
             )
         return self._torque
 
