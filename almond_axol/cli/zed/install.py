@@ -1,20 +1,21 @@
 """
 almond-axol zed.install
 
-Downloads the pyzed wheel matching the installed ZED SDK version into vendor/,
-so that 'uv sync --extra zed' can find and install it.
+Downloads and installs the pyzed wheel matching the installed ZED SDK version.
+pyzed is not on PyPI, so this command handles the install directly.
 """
 
 from __future__ import annotations
 
 import platform
 import re
+import subprocess
 import sys
 import urllib.request
 from pathlib import Path
 
 _ZED_INCLUDE = Path("/usr/local/zed/include")
-_VENDOR_DIR = Path(__file__).parent.parent.parent.parent / "vendor"
+_CACHE_DIR = Path.home() / ".almond" / "wheels"
 _BASE_URL = "https://download.stereolabs.com/zedsdk"
 
 
@@ -61,7 +62,7 @@ def run(_args: object = None) -> None:
 
     whl_name = f"pyzed-{sdk_ver}-cp{py}-cp{py}-linux_{arch}.whl"
     url = f"{_BASE_URL}/{sdk_ver}/whl/linux_{arch}/{whl_name}"
-    dest = _VENDOR_DIR / whl_name
+    dest = _CACHE_DIR / whl_name
 
     if dest.exists():
         print(f"Already downloaded: {dest}")
@@ -70,8 +71,10 @@ def run(_args: object = None) -> None:
             f"ZED SDK {sdk_ver}  Python {sys.version_info.major}.{sys.version_info.minor}  {arch}"
         )
         print(f"Downloading {url}")
-        _VENDOR_DIR.mkdir(exist_ok=True)
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         urllib.request.urlretrieve(url, dest)
         print(f"Saved to {dest}")
 
-    print("\nRun 'uv sync --extra zed' to install.")
+    print(f"Installing {whl_name}...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", str(dest)])
+    print("Done. pyzed is installed.")
