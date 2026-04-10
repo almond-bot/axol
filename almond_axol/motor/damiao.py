@@ -275,6 +275,7 @@ class DamiaoMotor(MotorDriver):
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
+        await self.clear_errors()
         pmax, vmax, tmax = await asyncio.gather(
             self._read_register(_DM_REG_PMAX),
             self._read_register(_DM_REG_VMAX),
