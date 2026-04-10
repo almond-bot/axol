@@ -52,7 +52,7 @@ class ZedCamera(Camera):
         super().__init__(config)
         self.config = config
 
-        self.zed: sl.Camera | None = None
+        self.zed: sl.CameraOne | None = None
 
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
@@ -84,8 +84,8 @@ class ZedCamera(Camera):
         Raises:
             ConnectionError: If the stream cannot be opened.
         """
-        zed = sl.Camera()
-        init_params = sl.InitParameters()
+        zed = sl.CameraOne()
+        init_params = sl.InitParametersOne()
         init_params.set_from_stream(self.config.host, self.config.port)
 
         err = zed.open(init_params)
@@ -159,7 +159,7 @@ class ZedCamera(Camera):
                     _logger.debug(f"{self} grab returned {err}, skipping frame.")
                     continue
 
-                self.zed.retrieve_image(image, sl.VIEW.LEFT)
+                self.zed.retrieve_image(image)
                 raw = image.get_data()  # BGRA uint8 (height, width, 4)
 
                 if self.config.color_mode == ColorMode.RGB:
