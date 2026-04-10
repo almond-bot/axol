@@ -76,5 +76,5 @@ def run(_args: object = None) -> None:
         print(f"Saved to {dest}")
 
     print(f"Installing {whl_name}...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", str(dest)])
+    subprocess.check_call(["uv", "pip", "install", str(dest)])
     print("Done. pyzed is installed.")
