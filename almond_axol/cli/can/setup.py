@@ -1,5 +1,5 @@
 """
-almond-axol setup-can
+almond-axol can.setup
 
 Sets persistent CAN interface names for the Almond Axol arm CAN bus adapter
 and registers a root crontab @reboot entry to bring up the interfaces.
@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ..shared import CAN_LEFT, CAN_RIGHT
+from ...shared import CAN_LEFT, CAN_RIGHT
 
 _VID = "1d50"
 _PID = "606f"
@@ -208,7 +208,7 @@ def _register_cron() -> None:
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     subparsers.add_parser(
-        "setup-can",
+        "can.setup",
         help="Configure CAN interfaces for the Axol arm.",
     ).set_defaults(func=run)
 

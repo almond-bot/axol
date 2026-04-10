@@ -1,27 +1,27 @@
 """
-almond-axol motor-info
+almond-axol motor.info
 
 Read and print status information from a single motor.
 Useful for verifying that a motor is reachable at a given CAN ID.
 The motor type is inferred automatically from the CAN ID.
 
 Examples:
-    almond-axol motor-info --l --id 0x01
-    almond-axol motor-info --r --id 0x06
+    almond-axol motor.info --l --id 0x01
+    almond-axol motor.info --r --id 0x06
 """
 
 import argparse
 import asyncio
 import math
 
-from ..motor.bus import CanBus
-from ..motor.damiao import DamiaoMotor
-from ..motor.motor import make_driver
+from ...motor.bus import CanBus
+from ...motor.damiao import DamiaoMotor
+from ...motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "motor-info",
+        "motor.info",
         help="Read status from a motor to verify it is reachable.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,

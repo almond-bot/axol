@@ -1,5 +1,5 @@
 """
-almond-axol set-zero-pos
+almond-axol motor.set-zero-pos
 
 Set the zero position of a single motor to its current position.
 The motor type is inferred automatically from the CAN ID.
@@ -8,20 +8,20 @@ The motor must be powered and on the CAN bus. The command sets the current
 mechanical position as the new zero reference (persisted to flash).
 
 Examples:
-    almond-axol set-zero-pos --l --id 0x01
-    almond-axol set-zero-pos --r --id 0x06
+    almond-axol motor.set-zero-pos --l --id 0x01
+    almond-axol motor.set-zero-pos --r --id 0x06
 """
 
 import argparse
 import asyncio
 
-from ..motor.bus import CanBus
-from ..motor.motor import make_driver
+from ...motor.bus import CanBus
+from ...motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "set-zero-pos",
+        "motor.set-zero-pos",
         help="Set the zero position of a motor to its current position.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,

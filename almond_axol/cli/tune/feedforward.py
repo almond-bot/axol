@@ -1,5 +1,5 @@
 """
-almond-axol identify-feedforward
+almond-axol tune.feedforward
 
 Identify all six feedforward parameters (gravity + friction) for an Axol joint
 in a single bidirectional sweep.
@@ -20,9 +20,9 @@ At runtime:
     tff(q, v) = ga·cos(q) + gb·sin(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
 Examples:
-    almond-axol identify-feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-    almond-axol identify-feedforward --r --joint elbow --kp 20 --kd 0.6
-    almond-axol identify-feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    almond-axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
+    almond-axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
+    almond-axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
 import argparse
@@ -33,10 +33,10 @@ import time
 import numpy as np
 from scipy.optimize import curve_fit
 
-from ..motor import CanBus, ControlMode, Joint, Motor
-from ..robot.axol import arm_limits
-from ..robot.config import AxolConfig
-from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ...motor import CanBus, ControlMode, Joint, Motor
+from ...robot.axol import arm_limits
+from ...robot.config import AxolConfig
+from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
@@ -299,7 +299,7 @@ async def _identify_joint(
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "identify-feedforward",
+        "tune.feedforward",
         help="Identify all feedforward parameters (gravity + friction) in one pass.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,

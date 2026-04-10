@@ -1,5 +1,5 @@
 """
-almond-axol stream-zed
+almond-axol zed.stream
 
 Start HEVC HD720 streaming for all three ZED cameras.
 """
@@ -15,7 +15,7 @@ _SENDER_IP = "192.168.10.1/24"
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "stream-zed", help="Stream all three ZED cameras over the local network."
+        "zed.stream", help="Stream all three ZED cameras over the local network."
     )
     p.add_argument(
         "--overhead",
@@ -55,16 +55,19 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 def run(args: argparse.Namespace) -> None:
     if args.overhead is None and args.left_arm is None and args.right_arm is None:
-        raise SystemExit("error: at least one of --overhead, --left-arm, --right-arm must be provided")
+        raise SystemExit(
+            "error: at least one of --overhead, --left-arm, --right-arm must be provided"
+        )
     logging.basicConfig(level=getattr(logging, args.log_level))
     if args.setup_ip:
-        from ..shared import setup_link_ip
+        from ...shared import setup_link_ip
+
         setup_link_ip(args.setup_ip, _SENDER_IP)
     asyncio.run(_run(args.overhead, args.left_arm, args.right_arm))
 
 
 async def _run(overhead: int, left_arm: int, right_arm: int) -> None:
-    from ..zed import ZedConfig, ZedStreamer
+    from ...zed import ZedConfig, ZedStreamer
 
     config = ZedConfig(
         overhead_serial=overhead,

@@ -1,25 +1,25 @@
 """
-almond-axol set-can-id
+almond-axol motor.set-can-id
 
 Change the CAN ID of a single motor and persist it to flash.
 
 The motor must be the only device on the bus, or you must know its current CAN ID.
 
 Examples:
-    almond-axol set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
-    almond-axol set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
+    almond-axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+    almond-axol motor.set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
 """
 
 import argparse
 import asyncio
 
-from ..motor.bus import CanBus
-from ..motor.motor import make_driver
+from ...motor.bus import CanBus
+from ...motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "set-can-id",
+        "motor.set-can-id",
         help="Change the CAN ID of a motor and persist it to flash.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,

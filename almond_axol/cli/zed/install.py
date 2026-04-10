@@ -1,5 +1,5 @@
 """
-almond-axol install-zed
+almond-axol zed.install
 
 Downloads the pyzed wheel matching the installed ZED SDK version into vendor/,
 so that 'uv sync --extra zed' can find and install it.
@@ -14,7 +14,7 @@ import urllib.request
 from pathlib import Path
 
 _ZED_INCLUDE = Path("/usr/local/zed/include")
-_VENDOR_DIR = Path(__file__).parent.parent.parent / "vendor"
+_VENDOR_DIR = Path(__file__).parent.parent.parent.parent / "vendor"
 _BASE_URL = "https://download.stereolabs.com/zedsdk"
 
 
@@ -40,7 +40,7 @@ def _sdk_version() -> tuple[str, str]:
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     subparsers.add_parser(
-        "install-zed",
+        "zed.install",
         help="Download the pyzed wheel for the installed ZED SDK version.",
     ).set_defaults(func=run)
 
