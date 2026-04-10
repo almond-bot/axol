@@ -14,7 +14,7 @@ Typical usage::
     right_arm = ZedCamera(ZedCameraConfig(host="192.168.1.10", port=30004))
 
     with overhead, left_arm, right_arm:
-        frame = overhead.read()  # uint8 numpy array (720, 1280, 3) RGB
+        frame = overhead.read()  # uint8 numpy array (1080, 1920, 3) RGB
 """
 
 from __future__ import annotations

@@ -1,9 +1,9 @@
 """
-ZED camera streamer for the Axol robot.
+ZED-X One camera streamer for the Axol robot.
 
-ZedStreamer opens three ZED cameras (overhead, left_arm, right_arm) by serial
-number and streams each over HEVC HD720 on the local network using the ZED SDK's
-built-in streaming API.
+ZedStreamer opens up to three ZED-X One cameras (overhead, left_arm, right_arm)
+by serial number and streams each over HEVC on the local network using the ZED
+SDK's built-in streaming API.
 
 Typical usage::
 
@@ -41,19 +41,19 @@ class _CameraState:
     name: str
     serial: int
     port: int
-    zed: sl.Camera
+    zed: sl.CameraOne
     stop_event: threading.Event
     thread: threading.Thread | None = None
 
 
 class ZedStreamer:
-    """Streams three ZED cameras over the local network using HEVC HD720.
+    """Streams ZED-X One cameras over the local network using HEVC.
 
-    Each camera runs a background grab thread that drives the encoder.
-    Use as an async context manager or call enable()/disable() directly.
+    Each camera runs in a background grab thread that drives the encoder.
+    Use as an async context manager or call ``enable()`` / ``disable()`` directly.
 
     Args:
-        config: Serial numbers, ports, and bitrate for all three cameras.
+        config: Serial numbers, ports, resolution, fps, and bitrate for all cameras.
     """
 
     def __init__(self, config: ZedConfig) -> None:
@@ -75,7 +75,11 @@ class ZedStreamer:
             ("left_arm", cfg.left_arm_serial, cfg.left_arm_port),
             ("right_arm", cfg.right_arm_serial, cfg.right_arm_port),
         ]
-        specs = [(name, serial, port) for name, serial, port in all_specs if serial is not None]
+        specs = [
+            (name, serial, port)
+            for name, serial, port in all_specs
+            if serial is not None
+        ]
 
         loop = asyncio.get_running_loop()
         states = await asyncio.gather(
@@ -118,11 +122,11 @@ class ZedStreamer:
     # ------------------------------------------------------------------
 
     def _open_camera(self, name: str, serial: int, port: int) -> _CameraState | None:
-        zed = sl.Camera()
+        zed = sl.CameraOne()
 
-        init_params = sl.InitParameters()
-        init_params.camera_resolution = sl.RESOLUTION.HD720
-        init_params.camera_fps = 60
+        init_params = sl.InitParametersOne()
+        init_params.camera_resolution = self._config.resolution
+        init_params.camera_fps = self._config.fps
         init_params.input.set_from_serial_number(serial)
 
         err = zed.open(init_params)
@@ -157,7 +161,15 @@ class ZedStreamer:
         thread.start()
         state.thread = thread
 
-        _logger.info("Streaming %s (serial %d) on port %d", name, serial, port)
+        _logger.info(
+            "Streaming %s (serial %d) on port %d at %s %dfps %dkbps",
+            name,
+            serial,
+            port,
+            self._config.resolution,
+            self._config.fps,
+            self._config.bitrate,
+        )
         return state
 
     def _close_camera(self, state: _CameraState) -> None:
