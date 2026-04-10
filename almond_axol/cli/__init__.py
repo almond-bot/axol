@@ -2,6 +2,7 @@ import argparse
 
 from . import (
     collect_data,
+    enable_can,
     identify_feedforward,
     install_zed,
     motor_info,
@@ -20,6 +21,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     setup_can.add_parser(subparsers)
+    enable_can.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
