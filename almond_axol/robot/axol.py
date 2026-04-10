@@ -19,7 +19,7 @@ SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
 ELBOW_LEFT_LIMITS = (0.0, 0.42 * _TAU)
 ELBOW_RIGHT_LIMITS = (-0.42 * _TAU, 0.0)
 
-_LIMITS: dict[Joint, tuple[float, float]] = {
+LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.SHOULDER_3: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
@@ -35,7 +35,7 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
         return SHOULDER_2_LEFT_LIMITS if is_left else SHOULDER_2_RIGHT_LIMITS
     if joint == Joint.ELBOW:
         return ELBOW_LEFT_LIMITS if is_left else ELBOW_RIGHT_LIMITS
-    return _LIMITS.get(joint, (-math.inf, math.inf))
+    return LIMITS.get(joint, (-math.inf, math.inf))
 
 
 class AxolArm:
@@ -84,7 +84,7 @@ class AxolArm:
         """
         joints = list(Joint)
         values = [self._motors[j].position for j in joints]
-        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        _lo, _hi = LIMITS[Joint.GRIPPER]
         values[joints.index(Joint.GRIPPER)] = (
             values[joints.index(Joint.GRIPPER)] - _hi
         ) / (_lo - _hi)
@@ -140,7 +140,7 @@ class AxolArm:
         values = list(
             await asyncio.gather(*[self._motors[j].get_position() for j in joints])
         )
-        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        _lo, _hi = LIMITS[Joint.GRIPPER]
         i = joints.index(Joint.GRIPPER)
         values[i] = (values[i] - _hi) / (_lo - _hi)
         return np.array(values, dtype=np.float32)
@@ -243,7 +243,7 @@ class AxolArm:
             max_speed: Maximum speed for all joints (rad/s).
         """
         positions = positions.copy()
-        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        _lo, _hi = LIMITS[Joint.GRIPPER]
         i = list(Joint).index(Joint.GRIPPER)
         positions[i] = _hi + positions[i] * (_lo - _hi)
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
@@ -280,7 +280,7 @@ class AxolArm:
                except gripper which is [0, 1].
         """
         q = q.copy()
-        _lo, _hi = _LIMITS[Joint.GRIPPER]
+        _lo, _hi = LIMITS[Joint.GRIPPER]
         i = list(Joint).index(Joint.GRIPPER)
         q[i] = _hi + q[i] * (_lo - _hi)
         clipped = np.clip(q, self._limits_lo, self._limits_hi)

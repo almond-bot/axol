@@ -22,7 +22,7 @@ from datetime import datetime
 import numpy as np
 
 from ...motor import CanBus
-from ...robot.axol import AxolArm, arm_limits
+from ...robot.axol import LIMITS, AxolArm, arm_limits
 from ...robot.config import AxolConfig
 from ...shared import CAN_LEFT, CAN_RIGHT, Joint
 
@@ -30,8 +30,8 @@ _BAR_WIDTH = 24
 _TAU = 2 * math.pi
 
 # Consistent with home.py and gripper.py.
-_SPEED = 0.2 * _TAU          # rad/s for arm joints
-_GRIPPER_RANGE = 0.8037 * _TAU  # rad, full open-to-close travel
+_SPEED = 0.2 * _TAU  # rad/s for arm joints
+_GRIPPER_RANGE = abs(LIMITS[Joint.GRIPPER][0] - LIMITS[Joint.GRIPPER][1])
 
 _logger = logging.getLogger(__name__)
 
@@ -143,7 +143,12 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
 
     _logger.info(
         "Starting  side=%s  channel=%s  joint=%s  hz=%d  limits=[%.4f, %.4f]",
-        side, channel, cycle_joint.value, hz, lo_api, hi_api,
+        side,
+        channel,
+        cycle_joint.value,
+        hz,
+        lo_api,
+        hi_api,
     )
     _logger.info("Initial CAN stats:\n%s", _read_can_stats(channel))
 
@@ -167,16 +172,15 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
                 await arm.enable()
                 _logger.info("Motors enabled")
             except Exception as exc:
-                _logger.error(
-                    "enable failed: %s\n%s", exc, traceback.format_exc()
-                )
+                _logger.error("enable failed: %s\n%s", exc, traceback.format_exc())
                 raise
 
             hold_q = await arm.get_positions()
             cycle_start = float(hold_q[joint_idx])
             _logger.info(
                 "Initial positions read. cycle_joint=%s  start=%.4f",
-                cycle_joint.value, cycle_start,
+                cycle_joint.value,
+                cycle_start,
             )
 
             # Cycle: start → hi → lo → hi → lo → ...
@@ -207,7 +211,9 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
                     now = t_iter
                     alpha = min((now - t_seg) / duration, 1.0)
                     smooth = alpha * alpha * (3.0 - 2.0 * alpha)
-                    cycle_pos = segment_start + smooth * (segment_target - segment_start)
+                    cycle_pos = segment_start + smooth * (
+                        segment_target - segment_start
+                    )
 
                     q = hold_q.copy()
                     q[joint_idx] = cycle_pos
@@ -218,7 +224,9 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
                         send_error_count += 1
                         _logger.error(
                             "motion_control failed (cycle=%d): %s\n%s",
-                            cycle_count, exc, traceback.format_exc(),
+                            cycle_count,
+                            exc,
+                            traceback.format_exc(),
                         )
 
                     # Read back positions for display; fall back to hold_q until
@@ -288,7 +296,9 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
                         t_seg = time.perf_counter()
                         _logger.info(
                             "New segment: %.4f → %.4f  duration=%.2fs",
-                            segment_start, segment_target, duration,
+                            segment_start,
+                            segment_target,
+                            duration,
                         )
 
                     elapsed = time.perf_counter() - t_iter
@@ -351,7 +361,11 @@ def main() -> None:
     args = parser.parse_args()
 
     cycle_joint = Joint(args.joint)
-    asyncio.run(_run(is_left=args.l, cycle_joint=cycle_joint, hz=args.hz, log_file=args.log_file))
+    asyncio.run(
+        _run(
+            is_left=args.l, cycle_joint=cycle_joint, hz=args.hz, log_file=args.log_file
+        )
+    )
 
 
 if __name__ == "__main__":
