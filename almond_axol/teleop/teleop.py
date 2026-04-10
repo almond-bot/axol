@@ -200,16 +200,18 @@ class VRTeleop:
         last_log = time.perf_counter()
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
+        # Track an absolute deadline so late wakeups are corrected in the next
+        # cycle rather than accumulating as permanent drift.
+        deadline = time.perf_counter()
         try:
             while True:
-                t0 = time.perf_counter()
+                deadline += interval
                 left, right = self.step()
                 if left is not None or right is not None:
                     try:
                         await self._robot.motion_control(left=left, right=right)
                     except Exception as e:
                         _logger.error("Motion control error: %s", e)
-                        pass
 
                 now = time.perf_counter()
                 loop_times.append(now)
@@ -229,8 +231,7 @@ class VRTeleop:
                     loop_times.clear()
                     last_log = now
 
-                elapsed = time.perf_counter() - t0
-                await asyncio.sleep(max(0.0, interval - elapsed))
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         except asyncio.CancelledError:
             await self._robot.disable()
 

@@ -53,7 +53,10 @@ class AxolArm:
         self._limits_hi = np.array(
             [arm_limits(j, is_left)[1] for j in Joint], dtype=float
         )
-        self._differentiator = Differentiator(n=len(list(Joint)))
+        fixed_dt = (
+            1.0 / config.motion_control_hz if config.motion_control_hz > 0 else None
+        )
+        self._differentiator = Differentiator(n=len(list(Joint)), fixed_dt=fixed_dt)
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
