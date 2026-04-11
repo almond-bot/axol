@@ -3,6 +3,7 @@
 Run directly:
     python -m almond_axol.test.can.send --l --joint shoulder_1
     python -m almond_axol.test.can.send --r --joint elbow
+    python -m almond_axol.test.can.send --joint elbow        # both arms, log only
     python -m almond_axol.test.can.send --l --joint wrist_2 --hz 50
     python -m almond_axol.test.can.send --l --joint gripper --hz 100 --log-file can_send.log
 """
@@ -116,7 +117,9 @@ def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
     return abs(dist_api)
 
 
-async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> None:
+async def _run(
+    is_left: bool, cycle_joint: Joint, hz: int, log_file: str, display: bool = True
+) -> None:
     _setup_logging(log_file)
 
     def _asyncio_exc_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
@@ -197,7 +200,8 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
             duration = max(dist_rad / _SPEED, 0.05)
             t_seg = time.perf_counter()
 
-            print("\033[?25l", end="")
+            if display:
+                print("\033[?25l", end="")
             last_stat_log = time.perf_counter()
             last_display = 0.0
             interval = 1.0 / hz
@@ -236,7 +240,7 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
                     except Exception:
                         positions = hold_q
 
-                    if now - last_display >= 1.0 / _DISPLAY_HZ:
+                    if display and now - last_display >= 1.0 / _DISPLAY_HZ:
                         lines = []
                         lines.append("\033[H\033[J")
                         lines.append(
@@ -307,7 +311,8 @@ async def _run(is_left: bool, cycle_joint: Joint, hz: int, log_file: str) -> Non
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
             finally:
-                print("\033[?25h")
+                if display:
+                    print("\033[?25h")
                 await arm.disable()
 
     except Exception as exc:
@@ -340,7 +345,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cycle one joint through its limits via motion control."
     )
-    side = parser.add_mutually_exclusive_group(required=True)
+    side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Use left arm")
     side.add_argument("--r", action="store_true", help="Use right arm")
     parser.add_argument(
@@ -361,11 +366,41 @@ def main() -> None:
     args = parser.parse_args()
 
     cycle_joint = Joint(args.joint)
-    asyncio.run(
-        _run(
-            is_left=args.l, cycle_joint=cycle_joint, hz=args.hz, log_file=args.log_file
+
+    if not args.l and not args.r:
+        stem, _, ext = args.log_file.rpartition(".")
+        left_log = f"{stem}_left.{ext}"
+        right_log = f"{stem}_right.{ext}"
+        print("No side specified — running both arms (log only).")
+        print(f"  left  → {left_log}")
+        print(f"  right → {right_log}")
+        asyncio.run(
+            asyncio.gather(
+                _run(
+                    is_left=True,
+                    cycle_joint=cycle_joint,
+                    hz=args.hz,
+                    log_file=left_log,
+                    display=False,
+                ),
+                _run(
+                    is_left=False,
+                    cycle_joint=cycle_joint,
+                    hz=args.hz,
+                    log_file=right_log,
+                    display=False,
+                ),
+            )
         )
-    )
+    else:
+        asyncio.run(
+            _run(
+                is_left=args.l,
+                cycle_joint=cycle_joint,
+                hz=args.hz,
+                log_file=args.log_file,
+            )
+        )
 
 
 if __name__ == "__main__":

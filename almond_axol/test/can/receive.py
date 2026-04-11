@@ -3,6 +3,7 @@
 Run directly:
     python -m almond_axol.test.can.receive --l
     python -m almond_axol.test.can.receive --r
+    python -m almond_axol.test.can.receive            # both arms, log only
     python -m almond_axol.test.can.receive --l --hz 50
     python -m almond_axol.test.can.receive --l --hz 250 --log-file can_diag.log
 """
@@ -105,7 +106,7 @@ async def _stats_monitor(channel: str, arm: AxolArm) -> None:
         stale_count = 0
 
 
-async def _run(is_left: bool, hz: int, log_file: str) -> None:
+async def _run(is_left: bool, hz: int, log_file: str, display: bool = True) -> None:
     _setup_logging(log_file)
 
     # Catch unhandled exceptions from background asyncio tasks.
@@ -156,7 +157,8 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
 
             await asyncio.sleep(0.1)
 
-            print("\033[?25l", end="")
+            if display:
+                print("\033[?25l", end="")
             last_stat_log = time.perf_counter()
             last_display = 0.0
             interval = 1.0 / hz
@@ -180,7 +182,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                         positions = np.zeros(len(joints), dtype=np.float32)
 
                     now = t_iter
-                    if now - last_display >= 1.0 / _DISPLAY_HZ:
+                    if display and now - last_display >= 1.0 / _DISPLAY_HZ:
                         lines = []
                         lines.append("\033[H\033[J")
                         lines.append(f"  {side.upper()} ARM  [{hz} Hz]  log→{log_file}")
@@ -224,7 +226,8 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
             finally:
-                print("\033[?25h")
+                if display:
+                    print("\033[?25h")
                 await arm.stop_telemetry()
 
     except Exception as exc:
@@ -254,7 +257,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live motor position display")
-    side = parser.add_mutually_exclusive_group(required=True)
+    side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Monitor left arm")
     side.add_argument("--r", action="store_true", help="Monitor right arm")
     parser.add_argument(
@@ -267,7 +270,21 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
+    if not args.l and not args.r:
+        stem, _, ext = args.log_file.rpartition(".")
+        left_log = f"{stem}_left.{ext}"
+        right_log = f"{stem}_right.{ext}"
+        print("No side specified — monitoring both arms (log only).")
+        print(f"  left  → {left_log}")
+        print(f"  right → {right_log}")
+        asyncio.run(
+            asyncio.gather(
+                _run(is_left=True, hz=args.hz, log_file=left_log, display=False),
+                _run(is_left=False, hz=args.hz, log_file=right_log, display=False),
+            )
+        )
+    else:
+        asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
 
 
 if __name__ == "__main__":
