@@ -160,6 +160,8 @@ class IKWorker:
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
         self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
 
+        self._solver.set_posture_pose(self.get_rest_q())
+
         self._active: bool = False
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
         self._snap_ctrl: dict[str, tuple[np.ndarray, np.ndarray]] = {}
