@@ -28,13 +28,13 @@ class KinematicsConfig:
 
     pos_weight: float = 50.0
     ori_weight: float = 10.0
-    elbow_weight: float = 20.0
+    elbow_weight: float = 30.0
     rest_weight: float = 4.5
     manipulability_weight: float = 0.05
-    limit_weight: float = 100.0
-    self_collision_margin: float = 0.1
-    self_collision_weight: float = 35.0
+    limit_weight: float = 75.0
+    self_collision_margin: float = 0.025
+    self_collision_weight: float = 75.0
     max_iterations: int = 25
     cost_tolerance: float = 1e-2
     max_joint_delta: float = 0.0055 * 2 * math.pi
-    max_reach: float = 0.75
+    max_reach: float = 0.8

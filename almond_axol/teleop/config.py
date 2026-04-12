@@ -68,10 +68,10 @@ class VRTeleopConfig:
     )
     frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
-    reset_rest_weight: float = 20.0
+    reset_rest_weight: float = 50.0
     reset_limit_weight: float = 100.0
-    reset_collision_margin: float = 0.01
-    reset_collision_weight: float = 25.0
+    reset_collision_margin: float = 0.025
+    reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
     teleop_max_vel: float = 0.5 * 2 * math.pi
     teleop_max_accel: float = 1.5 * 2 * math.pi
