@@ -57,19 +57,12 @@ def _vr_to_flu_np(
     is_right: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert VR pose (X=Down, Y=Left, Z=Forward) → robot FLU. Returns (pos_3, rot_3x3), float32."""
-    pos = np.array(
-        (pz, -py if is_right else py, px if is_right else -px), dtype=np.float32
-    )
+    pos = np.array((pz, py, -px), dtype=np.float32)
     m = _quat_xyzw_to_matrix(qx, qy, qz, qw)
     rot = np.empty((3, 3), dtype=np.float32)
-    if is_right:
-        rot[0, :] = (m[2, 2], -m[2, 1], -m[2, 0])
-        rot[1, :] = (-m[1, 2], m[1, 1], m[1, 0])
-        rot[2, :] = (-m[0, 2], m[0, 1], m[0, 0])
-    else:
-        rot[0, :] = (m[2, 2], m[2, 1], -m[2, 0])
-        rot[1, :] = (m[1, 2], m[1, 1], -m[1, 0])
-        rot[2, :] = (-m[0, 2], -m[0, 1], m[0, 0])
+    rot[0, :] = (m[2, 2], m[2, 1], -m[2, 0])
+    rot[1, :] = (m[1, 2], m[1, 1], -m[1, 0])
+    rot[2, :] = (-m[0, 2], -m[0, 1], m[0, 0])
     return pos, rot
 
 
