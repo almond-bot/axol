@@ -277,12 +277,14 @@ def main() -> None:
         print("No side specified — monitoring both arms (log only).")
         print(f"  left  → {left_log}")
         print(f"  right → {right_log}")
-        asyncio.run(
-            asyncio.gather(
+
+        async def _run_both() -> None:
+            await asyncio.gather(
                 _run(is_left=True, hz=args.hz, log_file=left_log, display=False),
                 _run(is_left=False, hz=args.hz, log_file=right_log, display=False),
             )
-        )
+
+        asyncio.run(_run_both())
     else:
         asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
 
