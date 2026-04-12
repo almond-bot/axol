@@ -28,8 +28,14 @@ class VRTeleopConfig:
         reset_collision_weight: Cost weight on self-collision penalty during
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
-        smooth_alpha: Exponential smoothing factor for IK output in (0, 1].
-            ``1.0`` disables smoothing. Lower values = smoother but more lag.
+        teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
+            trapezoidal filter during normal teleoperation.  Limits how fast
+            any single joint can move toward a new IK target.  Defaults to
+            0.5 rev/s (~180 °/s).
+        teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
+            trapezoidal filter.  Controls how quickly the commanded velocity
+            ramps up or down.  Defaults to 1.5 rev/s² (~540 °/s²), giving a
+            ~0.2 s ramp from rest to full speed.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -67,4 +73,5 @@ class VRTeleopConfig:
     reset_collision_margin: float = 0.01
     reset_collision_weight: float = 25.0
     reset_max_iterations: int = 10
-    smooth_alpha: float = 0.45
+    teleop_max_vel: float = 0.5 * 2 * math.pi
+    teleop_max_accel: float = 1.5 * 2 * math.pi

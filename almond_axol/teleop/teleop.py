@@ -19,7 +19,7 @@ Or with custom components::
 
     async with VRTeleop(
         Axol(),
-        config=VRTeleopConfig(smooth_alpha=0.3),
+        config=VRTeleopConfig(teleop_max_vel=2.0),
         vr_server_config=VRServerConfig(port=9000),
     ) as teleop:
         await teleop.run()
@@ -41,7 +41,7 @@ from ..robot.base import RobotBase
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
-from .filter import AlphaSmoothFilter, ResetInterpolator
+from .filter import ResetInterpolator, TrapezoidalFilter
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -98,8 +98,13 @@ class VRTeleop:
         self._reset_latched: bool = False
 
         self._reset_interp = ResetInterpolator()
-        self._smooth_left = AlphaSmoothFilter(alpha=config.smooth_alpha)
-        self._smooth_right = AlphaSmoothFilter(alpha=config.smooth_alpha)
+        dt = 1.0 / config.frequency
+        self._smooth_left = TrapezoidalFilter(
+            config.teleop_max_vel, config.teleop_max_accel, dt
+        )
+        self._smooth_right = TrapezoidalFilter(
+            config.teleop_max_vel, config.teleop_max_accel, dt
+        )
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None

@@ -43,7 +43,7 @@ from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...shared import Joint
-from ...teleop.filter import AlphaSmoothFilter, ResetInterpolator
+from ...teleop.filter import ResetInterpolator, TrapezoidalFilter
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
@@ -105,8 +105,13 @@ class AxolVRTeleop(Teleoperator):
 
         # Signal processing (accessed only from IK loop thread)
         cfg = config.vr_teleop_config
-        self._smooth_left = AlphaSmoothFilter(cfg.smooth_alpha)
-        self._smooth_right = AlphaSmoothFilter(cfg.smooth_alpha)
+        dt = 1.0 / cfg.frequency
+        self._smooth_left = TrapezoidalFilter(
+            cfg.teleop_max_vel, cfg.teleop_max_accel, dt
+        )
+        self._smooth_right = TrapezoidalFilter(
+            cfg.teleop_max_vel, cfg.teleop_max_accel, dt
+        )
         self._reset_interp = ResetInterpolator()
 
         # Reset latch
