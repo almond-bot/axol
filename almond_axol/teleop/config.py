@@ -36,6 +36,14 @@ class VRTeleopConfig:
             trapezoidal filter.  Controls how quickly the commanded velocity
             ramps up or down.  Defaults to 1.5 rev/s² (~540 °/s²), giving a
             ~0.2 s ramp from rest to full speed.
+        rest_engage_max_vel: Maximum joint velocity (rad/s) used by the
+            trapezoidal filter when the deadman switch is first pressed after a
+            rest-pose trajectory (startup or reset).  Slows the transition from
+            rest pose to the first IK target.  Restored to ``teleop_max_vel``
+            after ``rest_engage_duration`` seconds.  Defaults to
+            ``reset_speed`` for a consistent feel.
+        rest_engage_duration: Seconds to hold ``rest_engage_max_vel`` after the
+            post-rest deadman rising edge before restoring ``teleop_max_vel``.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -75,3 +83,5 @@ class VRTeleopConfig:
     reset_max_iterations: int = 10
     teleop_max_vel: float = 0.5 * 2 * math.pi
     teleop_max_accel: float = 1.5 * 2 * math.pi
+    rest_engage_max_vel: float = 0.1 * 2 * math.pi
+    rest_engage_duration: float = 2.0
