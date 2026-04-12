@@ -16,6 +16,7 @@ import argparse
 import asyncio
 
 from ...motor.bus import CanBus
+from ...motor.damiao import DamiaoMotor
 from ...motor.motor import make_driver
 
 
@@ -65,3 +66,9 @@ async def _run(args: argparse.Namespace) -> None:
         position_after = await motor.get_position()
         print(f"  position after:  {position_after:.4f} rad")
         print("  done")
+
+        if isinstance(motor, DamiaoMotor):
+            print(
+                "\n  ⚠  WARNING: Damiao motors require a power cycle to apply the new"
+                " zero position. Please restart the motor now."
+            )
