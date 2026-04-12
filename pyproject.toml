@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.9.2"]
+cuda = ["jax[cuda13]>=0.9.2"] # CPU is usually faster for the JAX IK solver
 dev = ["opencv-python-headless>=4.13.0.92"]
 lerobot = ["lerobot"]
 sim = ["viser>=1.0.24"]
