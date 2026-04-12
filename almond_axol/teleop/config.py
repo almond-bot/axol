@@ -84,4 +84,4 @@ class VRTeleopConfig:
     teleop_max_vel: float = 0.5 * 2 * math.pi
     teleop_max_accel: float = 1.5 * 2 * math.pi
     rest_engage_max_vel: float = 0.1 * 2 * math.pi
-    rest_engage_duration: float = 2.0
+    rest_engage_duration: float = 1.0
