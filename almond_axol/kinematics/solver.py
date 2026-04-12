@@ -26,8 +26,8 @@ _logger = logging.getLogger(__name__)
 # Link names in axol.urdf
 _LEFT_EE = "left_gripper"
 _RIGHT_EE = "right_gripper"
-_LEFT_ELBOW = "left_e1"
-_RIGHT_ELBOW = "right_e1"
+_LEFT_ELBOW = "left_e2"
+_RIGHT_ELBOW = "right_e2"
 _LEFT_SHOULDER = "left_s2"
 _RIGHT_SHOULDER = "right_s2"
 
