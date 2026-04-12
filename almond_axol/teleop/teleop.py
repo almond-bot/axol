@@ -115,6 +115,7 @@ class VRTeleop:
         self._ik_task: asyncio.Task | None = None
 
         self._ik_loop_times: list[float] = []
+        self._vr_frame_times: list[float] = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -243,7 +244,23 @@ class VRTeleop:
                             if ik_total > 0
                             else 0.0
                         )
-                        _logger.info("loop: %.1f Hz  ik: %.1f Hz", rate, ik_hz)
+                        if len(self._vr_frame_times) >= 2:
+                            vr_total = (
+                                self._vr_frame_times[-1] - self._vr_frame_times[0]
+                            )
+                            vr_hz = (
+                                (len(self._vr_frame_times) - 1) / vr_total
+                                if vr_total > 0
+                                else 0.0
+                            )
+                            _logger.info(
+                                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+                                rate,
+                                vr_hz,
+                                ik_hz,
+                            )
+                        else:
+                            _logger.info("loop: %.1f Hz  ik: %.1f Hz", rate, ik_hz)
                     else:
                         _logger.info("loop: %.1f Hz", rate)
                     loop_times.clear()
@@ -311,6 +328,13 @@ class VRTeleop:
         captures reset=True even if the IK loop is blocked in run_in_executor
         and the button is released before the loop next checks get_frame().
         """
+        now = time.perf_counter()
+        self._vr_frame_times.append(now)
+        while (
+            len(self._vr_frame_times) > 1
+            and self._vr_frame_times[-1] - self._vr_frame_times[0] > 2.0
+        ):
+            self._vr_frame_times.pop(0)
         if frame.reset and not self._prev_reset:
             self._reset_latched = True
         self._prev_reset = frame.reset
