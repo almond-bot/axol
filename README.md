@@ -58,7 +58,7 @@ axol can.setup
 
 ### `can.setup`
 
-One-time setup for the Almond Axol dual-channel USB CAN adapter. Writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, and brings up the interfaces immediately.
+One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, and brings up the interfaces immediately.
 
 - Left arm → `can_alm_axol_l`
 - Right arm → `can_alm_axol_r`
@@ -71,7 +71,7 @@ axol can.setup
 
 ### `can.enable`
 
-Re-runs the CAN startup script to bring interfaces up after plugging in the Axol without a system restart. (`can.setup` registers a `@reboot` cron hook, so this is only needed when the adapter is re-plugged mid-session.) Requires `can.setup` to have been run first.
+Re-runs the CAN startup script to bring interfaces up after plugging in the Axol without a system restart. (`can.setup` registers a `@reboot` cron hook, so this is only needed when the Axol Hub is re-plugged mid-session.) Requires `can.setup` to have been run first.
 
 ```bash
 axol can.enable
