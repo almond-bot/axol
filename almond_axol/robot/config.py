@@ -43,15 +43,8 @@ class AxolConfig:
     The feedforward torque sent to each motor is computed automatically from the
     friction parameters (fc, k, fv, fo) and gravity compensation; t_ff is not
     specified directly.
-
-    Attributes:
-        motion_control_hz: Expected call rate of :meth:`AxolArm.motion_control`.
-            Used to give the velocity differentiator a fixed time step so that
-            asyncio timing jitter does not produce noisy feedforward torques.
-            Set to ``0.0`` to fall back to wall-clock measurement.
     """
 
-    motion_control_hz: float = 120.0
     shoulder_1: JointGains = field(
         default_factory=lambda: JointGains(
             kp=600.0,
