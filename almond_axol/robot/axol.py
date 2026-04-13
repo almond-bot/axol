@@ -25,7 +25,7 @@ LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.GRIPPER: (-0.4558 * _TAU, 0.0),  # -0.8037
+    Joint.GRIPPER: (-0.8037 * _TAU, 0.0),
 }
 
 
