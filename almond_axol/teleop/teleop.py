@@ -137,10 +137,6 @@ class VRTeleop:
         self._vr_stop: threading.Event = threading.Event()
         self._vr_ready: threading.Event = threading.Event()
 
-        # Burst detection — only touched from the VR thread, no lock needed.
-        self._vr_prev_frame_time: float | None = None
-        self._vr_burst_count: int = 0
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -215,7 +211,6 @@ class VRTeleop:
             target=self._ik_loop, daemon=True, name="ik-loop"
         )
         self._ik_thread.start()
-        _logger.info("VRTeleop enabled")
 
     async def disable(self) -> None:
         """Stop IK subprocess and VR server. Does not disable motors."""
@@ -242,7 +237,6 @@ class VRTeleop:
             self._vr_stop.set()
             self._vr_thread.join(timeout=5.0)
             self._vr_thread = None
-        _logger.info("VRTeleop disabled")
 
     async def __aenter__(self) -> VRTeleop:
         await self.enable()
@@ -280,11 +274,7 @@ class VRTeleop:
                 left, right = self.step()
                 if left is not None or right is not None:
                     try:
-                        t_mc = time.perf_counter()
                         await self._robot.motion_control(left=left, right=right)
-                        mc_ms = (time.perf_counter() - t_mc) * 1000
-                        if mc_ms > 5.0:
-                            _logger.warning("slow motion_control: %.1f ms", mc_ms)
                     except Exception as e:
                         _logger.error("Motion control error: %s", e)
 
@@ -383,22 +373,6 @@ class VRTeleop:
         Called from the VR server thread; uses a lock for the frame-time list.
         """
         now = time.perf_counter()
-
-        if self._vr_prev_frame_time is not None:
-            gap_ms = (now - self._vr_prev_frame_time) * 1000
-            if gap_ms > 20.0:
-                _logger.warning(
-                    "VR burst gap: %.1f ms (prev burst: %d frames)",
-                    gap_ms,
-                    self._vr_burst_count,
-                )
-                self._vr_burst_count = 1
-            else:
-                self._vr_burst_count += 1
-        else:
-            self._vr_burst_count = 1
-        self._vr_prev_frame_time = now
-
         with self._vr_frame_times_lock:
             self._vr_frame_times.append(now)
             while (
@@ -423,8 +397,6 @@ class VRTeleop:
         assert self._parent_conn is not None
         conn = self._parent_conn
         ik_interval = 1.0 / self._config.frequency
-        ik_recv_timeout_count = 0
-        _t_last_recv: float | None = None
         last_frame = None
 
         while not self._ik_stop.is_set():
@@ -483,44 +455,20 @@ class VRTeleop:
                 continue
 
             try:
-                t_send = time.perf_counter()
-                if _t_last_recv is not None:
-                    inter_ms = (t_send - _t_last_recv) * 1000
-                    if inter_ms > 15.0:
-                        sleep_ms = (t0 - _t_last_recv) * 1000
-                        spin_ms = (t_send - t0) * 1000
-                        _logger.warning(
-                            "slow IK inter-iteration: %.1f ms (sleep=%.1f ms spin=%.1f ms)",
-                            inter_ms,
-                            sleep_ms,
-                            spin_ms,
-                        )
                 conn.send(frame)
                 result = _recv_with_timeout(conn, _IK_RECV_TIMEOUT, self._ik_stop)
                 if result is not None:
-                    _t_last_recv = time.perf_counter()
-                    rtt_ms = (_t_last_recv - t_send) * 1000
-                    if rtt_ms > 15.0:
-                        _logger.warning("slow IK round-trip: %.1f ms", rtt_ms)
                     self._q = np.asarray(result, dtype=np.float32)
-                    ik_recv_timeout_count = 0
+                    now = time.perf_counter()
                     with self._ik_loop_times_lock:
-                        self._ik_loop_times.append(_t_last_recv)
+                        self._ik_loop_times.append(now)
                         while (
                             len(self._ik_loop_times) > 1
                             and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
                         ):
                             self._ik_loop_times.pop(0)
-                else:
-                    ik_recv_timeout_count += 1
-                    if ik_recv_timeout_count <= 3 or ik_recv_timeout_count % 100 == 0:
-                        _logger.warning(
-                            "IK recv timeout (no response in %.1fs)", _IK_RECV_TIMEOUT
-                        )
-            except Exception as e:
-                if not self._ik_stop.is_set():
-                    _logger.error("IK process error: %s", e)
-                ik_recv_timeout_count += 1
+            except Exception:
+                pass
 
             _rem = ik_interval - (time.perf_counter() - t0)
             if _rem > 0.0:
