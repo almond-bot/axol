@@ -32,6 +32,7 @@ import logging
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.context
+import threading
 import time
 
 import numpy as np
@@ -50,12 +51,24 @@ _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
 
 def _recv_with_timeout(
-    conn: multiprocessing.connection.Connection, timeout: float
+    conn: multiprocessing.connection.Connection,
+    timeout: float,
+    stop_event: threading.Event | None = None,
 ) -> object | None:
-    """Return ``conn.recv()`` if data arrives within ``timeout``, else ``None``."""
-    if not conn.poll(timeout):
-        return None
-    return conn.recv()
+    """Return ``conn.recv()`` if data arrives within ``timeout``, else ``None``.
+
+    Polls in short intervals so ``stop_event`` can interrupt a long wait.
+    """
+    poll_interval = 0.05
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        if stop_event is not None and stop_event.is_set():
+            return None
+        if conn.poll(min(poll_interval, remaining)):
+            return conn.recv()
 
 
 class VRTeleop:
@@ -112,18 +125,53 @@ class VRTeleop:
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
-        self._ik_task: asyncio.Task | None = None
+        self._ik_thread: threading.Thread | None = None
+        self._ik_stop: threading.Event = threading.Event()
 
         self._ik_loop_times: list[float] = []
+        self._ik_loop_times_lock: threading.Lock = threading.Lock()
         self._vr_frame_times: list[float] = []
+        self._vr_frame_times_lock: threading.Lock = threading.Lock()
+
+        self._vr_thread: threading.Thread | None = None
+        self._vr_stop: threading.Event = threading.Event()
+        self._vr_ready: threading.Event = threading.Event()
+
+        # Burst detection — only touched from the VR thread, no lock needed.
+        self._vr_prev_frame_time: float | None = None
+        self._vr_burst_count: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def _run_vr_thread(self) -> None:
+        """Run the VR WebSocket server in its own asyncio event loop.
+
+        Keeping VR in a dedicated thread prevents burst WebSocket callbacks
+        from contending with the IK thread for the GIL or CPU time.
+        """
+
+        async def _serve() -> None:
+            await self._vr_server.enable()
+            self._vr_ready.set()
+            while not self._vr_stop.is_set():
+                await asyncio.sleep(0.05)
+            await self._vr_server.disable()
+
+        asyncio.run(_serve())
+
     async def enable(self) -> None:
         """Start the VR server, robot, and IK subprocess."""
-        await self._vr_server.enable()
+        self._vr_stop.clear()
+        self._vr_ready.clear()
+        self._vr_thread = threading.Thread(
+            target=self._run_vr_thread, daemon=True, name="vr-server"
+        )
+        self._vr_thread.start()
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._vr_ready.wait)
+
         await self._robot.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
@@ -162,18 +210,19 @@ class VRTeleop:
         if startup_traj:
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
-        self._ik_task = asyncio.create_task(self._ik_loop())
+        self._ik_stop.clear()
+        self._ik_thread = threading.Thread(
+            target=self._ik_loop, daemon=True, name="ik-loop"
+        )
+        self._ik_thread.start()
         _logger.info("VRTeleop enabled")
 
     async def disable(self) -> None:
         """Stop IK subprocess and VR server. Does not disable motors."""
-        if self._ik_task is not None:
-            self._ik_task.cancel()
-            try:
-                await self._ik_task
-            except asyncio.CancelledError:
-                pass
-            self._ik_task = None
+        if self._ik_thread is not None:
+            self._ik_stop.set()
+            self._ik_thread.join(timeout=3.0)
+            self._ik_thread = None
 
         if self._parent_conn is not None:
             try:
@@ -189,7 +238,10 @@ class VRTeleop:
                 self._ik_process.terminate()
             self._ik_process = None
 
-        await self._vr_server.disable()
+        if self._vr_thread is not None:
+            self._vr_stop.set()
+            self._vr_thread.join(timeout=5.0)
+            self._vr_thread = None
         _logger.info("VRTeleop disabled")
 
     async def __aenter__(self) -> VRTeleop:
@@ -228,7 +280,11 @@ class VRTeleop:
                 left, right = self.step()
                 if left is not None or right is not None:
                     try:
+                        t_mc = time.perf_counter()
                         await self._robot.motion_control(left=left, right=right)
+                        mc_ms = (time.perf_counter() - t_mc) * 1000
+                        if mc_ms > 5.0:
+                            _logger.warning("slow motion_control: %.1f ms", mc_ms)
                     except Exception as e:
                         _logger.error("Motion control error: %s", e)
 
@@ -237,19 +293,19 @@ class VRTeleop:
                 if now - last_log >= 1.0 and len(loop_times) > 1:
                     total = loop_times[-1] - loop_times[0]
                     rate = (len(loop_times) - 1) / total
-                    if len(self._ik_loop_times) >= 2:
-                        ik_total = self._ik_loop_times[-1] - self._ik_loop_times[0]
+                    with self._ik_loop_times_lock:
+                        ik_times_snap = list(self._ik_loop_times)
+                    if len(ik_times_snap) >= 2:
+                        ik_total = ik_times_snap[-1] - ik_times_snap[0]
                         ik_hz = (
-                            (len(self._ik_loop_times) - 1) / ik_total
-                            if ik_total > 0
-                            else 0.0
+                            (len(ik_times_snap) - 1) / ik_total if ik_total > 0 else 0.0
                         )
-                        if len(self._vr_frame_times) >= 2:
-                            vr_total = (
-                                self._vr_frame_times[-1] - self._vr_frame_times[0]
-                            )
+                        with self._vr_frame_times_lock:
+                            vr_times_snap = list(self._vr_frame_times)
+                        if len(vr_times_snap) >= 2:
+                            vr_total = vr_times_snap[-1] - vr_times_snap[0]
                             vr_hz = (
-                                (len(self._vr_frame_times) - 1) / vr_total
+                                (len(vr_times_snap) - 1) / vr_total
                                 if vr_total > 0
                                 else 0.0
                             )
@@ -324,42 +380,60 @@ class VRTeleop:
     def _on_vr_frame(self, frame) -> None:
         """Latch the reset rising edge as soon as the frame arrives.
 
-        This runs on the event-loop thread for every WebSocket frame, so it
-        captures reset=True even if the IK loop is blocked in run_in_executor
-        and the button is released before the loop next checks get_frame().
+        Called from the VR server thread; uses a lock for the frame-time list.
         """
         now = time.perf_counter()
-        self._vr_frame_times.append(now)
-        while (
-            len(self._vr_frame_times) > 1
-            and self._vr_frame_times[-1] - self._vr_frame_times[0] > 2.0
-        ):
-            self._vr_frame_times.pop(0)
+
+        if self._vr_prev_frame_time is not None:
+            gap_ms = (now - self._vr_prev_frame_time) * 1000
+            if gap_ms > 20.0:
+                _logger.warning(
+                    "VR burst gap: %.1f ms (prev burst: %d frames)",
+                    gap_ms,
+                    self._vr_burst_count,
+                )
+                self._vr_burst_count = 1
+            else:
+                self._vr_burst_count += 1
+        else:
+            self._vr_burst_count = 1
+        self._vr_prev_frame_time = now
+
+        with self._vr_frame_times_lock:
+            self._vr_frame_times.append(now)
+            while (
+                len(self._vr_frame_times) > 1
+                and self._vr_frame_times[-1] - self._vr_frame_times[0] > 2.0
+            ):
+                self._vr_frame_times.pop(0)
         if frame.reset and not self._prev_reset:
             self._reset_latched = True
         self._prev_reset = frame.reset
 
     # ------------------------------------------------------------------
-    # IK loop (background task)
+    # IK loop (daemon thread)
     # ------------------------------------------------------------------
 
-    async def _ik_loop(self) -> None:
-        """Dispatch VR frames to the IK subprocess and receive results."""
-        loop = asyncio.get_running_loop()
+    def _ik_loop(self) -> None:
+        """Dispatch VR frames to the IK subprocess and receive results.
+
+        Runs in a dedicated daemon thread so that asyncio event-loop activity
+        (e.g. VR WebSocket burst callbacks) cannot delay IK scheduling.
+        """
         assert self._parent_conn is not None
         conn = self._parent_conn
         ik_interval = 1.0 / self._config.frequency
-        last_frame = None
         ik_recv_timeout_count = 0
+        _t_last_recv: float | None = None
+        last_frame = None
 
-        while True:
+        while not self._ik_stop.is_set():
             t0 = time.perf_counter()
             frame = self._vr_server.get_frame()
 
             if frame is None or frame is last_frame:
-                await asyncio.sleep(0.001)
+                time.sleep(0.001)
                 continue
-
             last_frame = frame
             self._l_grip = frame.l_grip
             self._r_grip = frame.r_grip
@@ -379,7 +453,7 @@ class VRTeleop:
                     self._reset_latched = False
                     try:
                         conn.send(("reset", self._q.copy()))
-                        result = await loop.run_in_executor(None, conn.recv)
+                        result = conn.recv()
                         if isinstance(result, tuple) and result[0] == "reset_traj":
                             _, q_default, trajectory = result
                             if trajectory:
@@ -392,37 +466,51 @@ class VRTeleop:
                             self._q = np.asarray(q_default, dtype=np.float32)
                     except Exception as e:
                         _logger.error("Reset error: %s", e)
-                    await asyncio.sleep(
-                        max(0.0, ik_interval - (time.perf_counter() - t0))
-                    )
+                    _rem = ik_interval - (time.perf_counter() - t0)
+                    if _rem > 0.0:
+                        time.sleep(_rem)
                     continue
 
             if self._reset_interp.is_active():
-                await asyncio.sleep(0.001)
+                time.sleep(0.001)
                 continue
 
             if self._ik_process is not None and not self._ik_process.is_alive():
                 _logger.warning("IK process is not alive")
-                await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
+                _rem = ik_interval - (time.perf_counter() - t0)
+                if _rem > 0.0:
+                    time.sleep(_rem)
                 continue
 
             try:
+                t_send = time.perf_counter()
+                if _t_last_recv is not None:
+                    inter_ms = (t_send - _t_last_recv) * 1000
+                    if inter_ms > 15.0:
+                        sleep_ms = (t0 - _t_last_recv) * 1000
+                        spin_ms = (t_send - t0) * 1000
+                        _logger.warning(
+                            "slow IK inter-iteration: %.1f ms (sleep=%.1f ms spin=%.1f ms)",
+                            inter_ms,
+                            sleep_ms,
+                            spin_ms,
+                        )
                 conn.send(frame)
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: _recv_with_timeout(conn, _IK_RECV_TIMEOUT),
-                )
+                result = _recv_with_timeout(conn, _IK_RECV_TIMEOUT, self._ik_stop)
                 if result is not None:
+                    _t_last_recv = time.perf_counter()
+                    rtt_ms = (_t_last_recv - t_send) * 1000
+                    if rtt_ms > 15.0:
+                        _logger.warning("slow IK round-trip: %.1f ms", rtt_ms)
                     self._q = np.asarray(result, dtype=np.float32)
                     ik_recv_timeout_count = 0
-                    now = time.perf_counter()
-                    self._ik_loop_times.append(now)
-                    # Keep a 2-second rolling window
-                    while (
-                        len(self._ik_loop_times) > 1
-                        and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
-                    ):
-                        self._ik_loop_times.pop(0)
+                    with self._ik_loop_times_lock:
+                        self._ik_loop_times.append(_t_last_recv)
+                        while (
+                            len(self._ik_loop_times) > 1
+                            and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
+                        ):
+                            self._ik_loop_times.pop(0)
                 else:
                     ik_recv_timeout_count += 1
                     if ik_recv_timeout_count <= 3 or ik_recv_timeout_count % 100 == 0:
@@ -430,7 +518,10 @@ class VRTeleop:
                             "IK recv timeout (no response in %.1fs)", _IK_RECV_TIMEOUT
                         )
             except Exception as e:
-                _logger.error("IK process error: %s", e)
+                if not self._ik_stop.is_set():
+                    _logger.error("IK process error: %s", e)
                 ik_recv_timeout_count += 1
 
-            await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
+            _rem = ik_interval - (time.perf_counter() - t0)
+            if _rem > 0.0:
+                time.sleep(_rem)
