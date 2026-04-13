@@ -131,7 +131,7 @@ class DamiaoMotor(MotorDriver):
             return
         data = bytes(msg.data)
 
-        if data[2] == 0x33 and data[3] <= 81:
+        if data[1] <= 0x0F and data[2] == 0x33 and data[3] <= 81:
             if (data[0] | (data[1] << 8)) == self._motor_id:
                 self._handle_register_reply(data)
             return
