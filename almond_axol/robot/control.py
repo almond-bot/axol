@@ -45,16 +45,11 @@ class Differentiator:
         vel[i] = vel_prev[i] * a + b * (pos[i] - pos_prev[i])
 
     Args:
-        n:        Number of channels to differentiate.
-        fixed_dt: If provided, use this fixed time step (seconds) instead of
-                  measuring wall-clock time between calls.  Pass
-                  ``1.0 / loop_hz`` when the caller runs at a known fixed rate
-                  to avoid velocity noise from asyncio timing jitter.
+        n: Number of channels to differentiate.
     """
 
-    def __init__(self, n: int, fixed_dt: float | None = None) -> None:
+    def __init__(self, n: int) -> None:
         self._n = n
-        self._fixed_dt = fixed_dt
         self._vel_prev = [0.0] * n
         self._pos_prev: list[float | None] = [None] * n
         self._last_time: float | None = None
@@ -67,10 +62,7 @@ class Differentiator:
             self._pos_prev = list(positions)
             return [0.0] * self._n
 
-        if self._fixed_dt is not None:
-            Ts = self._fixed_dt
-        else:
-            Ts = now - self._last_time
+        Ts = now - self._last_time
         self._last_time = now
 
         if Ts <= 0:
