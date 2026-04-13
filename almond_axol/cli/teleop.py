@@ -7,6 +7,7 @@ Run a VR teleoperation session with default parameters.
 import argparse
 import asyncio
 import logging
+import socket
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -36,8 +37,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.set_defaults(func=run)
 
 
+def _get_local_ip() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+
+
 def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level))
+
+    hostname = socket.gethostname()
+    local_ip = _get_local_ip()
+    print("Connect the VR app (https://axol.almond.bot) to this machine:")
+    print(f"  Hostname : {hostname}.local")
+    print(f"  IP       : {local_ip}")
+
     asyncio.run(_run(args.robot, no_left=args.no_left, no_right=args.no_right))
 
 
