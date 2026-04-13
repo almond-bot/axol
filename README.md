@@ -31,7 +31,7 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --robot sim` |
-| `cuda` | JAX with CUDA 13 support | GPU inference with `run-policy` |
+| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
