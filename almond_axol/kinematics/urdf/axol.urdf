@@ -348,11 +348,11 @@
     <link name="right_w1">
         <inertial>
             <mass value="0.000330643" />
-            <origin xyz="-1.38778e-16 0.0285 -0.0285" rpy="0 -0 0" />
+            <origin xyz="-1.38778e-16 -0.0285 -0.0285" rpy="0 -0 0" />
             <inertia ixx="3.827e-07" ixy="0" ixz="0" iyy="3.827e-07" iyz="0" izz="1.69198e-07" />
         </inertial>
         <visual>
-            <origin xyz="0.19958 0.0285 0.622695" rpy="0 -0 0" />
+            <origin xyz="0.19958 -0.0285 0.622695" rpy="0 -0 0" />
             <geometry>
                 <mesh filename="package://assembly/meshes/Right_W1.stl" scale="1 1 1" />
             </geometry>
@@ -362,7 +362,7 @@
             </material>
         </visual>
         <collision>
-            <origin xyz="0.19958 0.0285 0.622695" rpy="0 -0 0" />
+            <origin xyz="0.19958 -0.0285 0.622695" rpy="0 -0 0" />
             <geometry>
                 <mesh filename="package://assembly/meshes/Right_W1.stl" scale="1 1 1" />
             </geometry>
@@ -371,11 +371,11 @@
     <link name="right_w2">
         <inertial>
             <mass value="4.33287e-05" />
-            <origin xyz="0.0285 1.20012e-18 -0.0118233" rpy="0 -0 0" />
+            <origin xyz="-0.0285 1.20012e-18 -0.0118233" rpy="0 -0 0" />
             <inertia ixx="2.50338e-08" ixy="0" ixz="0" iyy="4.74579e-08" iyz="0" izz="4.41594e-08" />
         </inertial>
         <visual>
-            <origin xyz="0.22808 0 0.679695" rpy="0 -0 0" />
+            <origin xyz="0.17108 0 0.679695" rpy="0 -0 0" />
             <geometry>
                 <mesh filename="package://assembly/meshes/Right_W2.stl" scale="1 1 1" />
             </geometry>
@@ -385,7 +385,7 @@
             </material>
         </visual>
         <collision>
-            <origin xyz="0.22808 0 0.679695" rpy="0 -0 0" />
+            <origin xyz="0.17108 0 0.679695" rpy="0 -0 0" />
             <geometry>
                 <mesh filename="package://assembly/meshes/Right_W2.stl" scale="1 1 1" />
             </geometry>
@@ -490,14 +490,14 @@
         <limit lower="-2.6389" upper="0.0" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_e2_0" type="revolute">
-        <origin xyz="0.04229 -1.56125e-17 -0.12429" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
+        <origin xyz="0.04229 -5.37817e-17 -0.12429" rpy="7.66335e-47 -2.46519e-32 3.14159" />
         <axis xyz="0 0 1" />
         <parent link="right_e2" />
         <child link="right_w0" />
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_gripper_0" type="fixed">
-        <origin xyz="0.0285 -6.93889e-18 -0.032251" rpy="-2.71671e-32 1.87354e-29 1.2326e-32" />
+        <origin xyz="-0.0285 -7.09742e-18 -0.032251" rpy="2.46519e-32 1.4083e-43 -3.14159" />
         <axis xyz="0 0 1" />
         <parent link="right_w2" />
         <child link="right_gripper" />
@@ -524,14 +524,14 @@
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_w1_0" type="revolute">
-        <origin xyz="5.55112e-17 -0.0285 -0.13301" rpy="3.03858e-64 4.93038e-32 1.2326e-32" />
-        <axis xyz="0 -1 0" />
+        <origin xyz="1.11022e-16 0.0285 -0.13567" rpy="1.09476e-47 2.55312e-94 -4.66423e-47" />
+        <axis xyz="0 1 0" />
         <parent link="right_w0" />
         <child link="right_w1" />
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_w2_0" type="revolute">
-        <origin xyz="0.0285 0.0285 -0.057" rpy="7.5053e-62 -4.93038e-32 -3.14159" />
+        <origin xyz="0.0285 -0.0285 -0.057" rpy="3.9443e-31 2.46519e-31 -1.30277e-45" />
         <axis xyz="-1 0 0" />
         <parent link="right_w1" />
         <child link="right_w2" />

@@ -7,6 +7,81 @@ from __future__ import annotations
 import numpy as np
 
 
+class TrapezoidalFilter:
+    """Per-joint trapezoidal velocity profile tracker.
+
+    Tracks a moving IK target by accelerating up to ``max_vel``, cruising,
+    then decelerating to arrive at the target with zero velocity.  This
+    prevents the abrupt position jumps and velocity spikes that occur when
+    an EMA filter receives a large IK update.
+
+    The deceleration distance is computed from kinematics:
+    ``v_stop = sqrt(2 * max_accel * distance)``
+    so the filter always arrives at the target without overshoot.
+
+    Args:
+        max_vel:   Maximum joint velocity in rad/s.
+        max_accel: Maximum joint acceleration in rad/s².
+        dt:        Control step duration in seconds (``1 / frequency``).
+    """
+
+    def __init__(self, max_vel: float, max_accel: float, dt: float) -> None:
+        self.max_vel = max_vel
+        self.max_accel = max_accel
+        self.dt = dt
+        self._pos: np.ndarray | None = None
+        self._vel: np.ndarray | None = None
+
+    def update(self, target: np.ndarray | None) -> np.ndarray | None:
+        """Advance one step toward ``target``.
+
+        Returns ``target`` unchanged on first call.  Subsequent calls move the
+        internal position toward ``target`` subject to velocity and acceleration
+        limits.
+        """
+        if target is None:
+            return None
+        target = np.asarray(target, dtype=np.float32)
+        if self._pos is None:
+            self._pos = target.copy()
+            self._vel = np.zeros_like(target)
+            return target.copy()
+
+        err = target - self._pos
+        dist = np.abs(err)
+        direction = np.sign(err)
+
+        # Maximum speed from which we can decelerate to rest exactly at target.
+        v_stop = np.sqrt(2.0 * self.max_accel * dist)
+
+        desired_vel = direction * np.minimum(self.max_vel, v_stop)
+
+        # Clamp velocity change by the acceleration limit.
+        dv = np.clip(
+            desired_vel - self._vel,
+            -self.max_accel * self.dt,
+            self.max_accel * self.dt,
+        )
+        self._vel = self._vel + dv
+
+        # Advance position; snap to target if we would overshoot this step.
+        step = self._vel * self.dt
+        overshoot = np.abs(step) > dist
+        self._pos = np.where(overshoot, target, self._pos + step)
+        self._vel = np.where(overshoot, 0.0, self._vel)
+
+        return self._pos.copy()
+
+    def reset(self, seed: np.ndarray | None = None) -> None:
+        """Reset filter state, optionally seeding position with a known value."""
+        if seed is not None:
+            self._pos = np.asarray(seed, dtype=np.float32).copy()
+            self._vel = np.zeros_like(self._pos)
+        else:
+            self._pos = None
+            self._vel = None
+
+
 class AlphaSmoothFilter:
     """Exponential smoothing filter for joint angle arrays (radians).
 

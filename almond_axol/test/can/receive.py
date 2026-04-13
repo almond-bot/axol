@@ -3,6 +3,7 @@
 Run directly:
     python -m almond_axol.test.can.receive --l
     python -m almond_axol.test.can.receive --r
+    python -m almond_axol.test.can.receive            # both arms, log only
     python -m almond_axol.test.can.receive --l --hz 50
     python -m almond_axol.test.can.receive --l --hz 250 --log-file can_diag.log
 """
@@ -17,6 +18,7 @@ import os
 import subprocess
 import time
 import traceback
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
@@ -28,23 +30,39 @@ from ...shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
+_DISPLAY_HZ = 30
+# Width reserved for the left arm column in the side-by-side display.
+# Joint lines are 50 chars; 56 leaves a clear margin before the right column.
+_COL_WIDTH = 56
+_COL_GAP = 2
 
 _logger = logging.getLogger(__name__)
 
 
-def _setup_logging(log_file: str) -> None:
+@dataclass
+class _ArmSnapshot:
+    side: str
+    hz: int
+    log_file: str
+    is_left: bool
+    positions: np.ndarray = field(default_factory=lambda: np.zeros(len(list(Joint))))
+    cycle_count: int = 0
+    send_error_count: int = 0
+    timeout_error_count: int = 0
+    other_error_count: int = 0
+
+
+def _make_logger(log_file: str, name: str) -> logging.Logger:
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     fmt = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        datefmt="%H:%M:%S",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-        force=True,
-    )
-    _logger.info("Logging started → %s", log_file)
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.FileHandler(log_file, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+    logger.addHandler(handler)
+    logger.info("Logging started → %s", log_file)
+    return logger
 
 
 def _bar(value: float, lo: float, hi: float) -> str:
@@ -71,7 +89,7 @@ def _read_can_stats(channel: str) -> str:
         return f"(failed to read stats: {exc})"
 
 
-async def _stats_monitor(channel: str, arm: AxolArm) -> None:
+async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> None:
     """Background task: log CAN interface stats and position staleness every second."""
     prev_positions: np.ndarray | None = None
     stale_count = 0
@@ -94,7 +112,7 @@ async def _stats_monitor(channel: str, arm: AxolArm) -> None:
         prev_positions = positions.copy()
 
         can_stats = _read_can_stats(channel)
-        _logger.info(
+        log.info(
             "--- 1s interval (%.2fs) | pos_updates=%d stale_checks=%d ---\n%s",
             elapsed,
             update_count,
@@ -105,8 +123,60 @@ async def _stats_monitor(channel: str, arm: AxolArm) -> None:
         stale_count = 0
 
 
-async def _run(is_left: bool, hz: int, log_file: str) -> None:
-    _setup_logging(log_file)
+def _arm_lines(snap: _ArmSnapshot) -> list[str]:
+    joints = list(Joint)
+    lines = [
+        f"  {snap.side.upper()} ARM  [{snap.hz} Hz]  log→{snap.log_file}",
+        (
+            f"  cycles={snap.cycle_count}  send_err={snap.send_error_count}"
+            f"  timeout_err={snap.timeout_error_count}"
+            f"  other_err={snap.other_error_count}"
+        ),
+        f"  {'Joint':<12}  {'rev':>8}  {'':^{_BAR_WIDTH}}",
+        "  " + "─" * (12 + 8 + _BAR_WIDTH + 4),
+    ]
+    for i, joint in enumerate(joints):
+        lo, hi = arm_limits(joint, is_left=snap.is_left)
+        p = float(snap.positions[i])
+        lines.append(f"  {joint.value:<12}  {p / _TAU:>+8.4f}  {_bar(p, lo, hi)}")
+    return lines
+
+
+async def _display_both(left: _ArmSnapshot, right: _ArmSnapshot) -> None:
+    right_col = _COL_WIDTH + _COL_GAP + 1  # 1-based terminal column for right arm
+    print("\033[?25l\033[2J", end="", flush=True)
+    try:
+        while True:
+            left_lines = _arm_lines(left)
+            right_lines = _arm_lines(right)
+            n_rows = max(len(left_lines), len(right_lines))
+
+            buf: list[str] = []
+            for row in range(n_rows):
+                if row < len(left_lines):
+                    cell = left_lines[row][:_COL_WIDTH].ljust(_COL_WIDTH)
+                    buf.append(f"\033[{row + 1};1H{cell}")
+                if row < len(right_lines):
+                    buf.append(f"\033[{row + 1};{right_col}H{right_lines[row]}\033[K")
+
+            buf.append(f"\033[{n_rows + 2};1H  ctrl+c to quit\033[K")
+            print("".join(buf), end="", flush=True)
+            await asyncio.sleep(1.0 / _DISPLAY_HZ)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        print("\033[?25h", end="", flush=True)
+
+
+async def _run(
+    is_left: bool,
+    hz: int,
+    log_file: str,
+    display: bool = True,
+    snapshot: _ArmSnapshot | None = None,
+) -> None:
+    side = "left" if is_left else "right"
+    log = _make_logger(log_file, f"{__name__}.{side}")
 
     # Catch unhandled exceptions from background asyncio tasks.
     def _asyncio_exc_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
@@ -114,18 +184,17 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
         msg = context.get("message", "(no message)")
         if exc is not None:
             tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            _logger.error("Unhandled asyncio exception: %s\n%s", msg, tb)
+            log.error("Unhandled asyncio exception: %s\n%s", msg, tb)
         else:
-            _logger.error("Unhandled asyncio error: %s | context=%s", msg, context)
+            log.error("Unhandled asyncio error: %s | context=%s", msg, context)
 
     asyncio.get_running_loop().set_exception_handler(_asyncio_exc_handler)
 
     joints = list(Joint)
-    side = "left" if is_left else "right"
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
-    _logger.info("Starting  side=%s  channel=%s  hz=%d", side, channel, hz)
-    _logger.info("Initial CAN stats:\n%s", _read_can_stats(channel))
+    log.info("Starting  side=%s  channel=%s  hz=%d", side, channel, hz)
+    log.info("Initial CAN stats:\n%s", _read_can_stats(channel))
 
     t_start = time.perf_counter()
     cycle_count = 0
@@ -140,14 +209,14 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
             arm = AxolArm(bus, AxolConfig(), is_left=is_left)
 
             stats_task = asyncio.create_task(
-                _stats_monitor(channel, arm), name="can_stats_monitor"
+                _stats_monitor(channel, arm, log), name="can_stats_monitor"
             )
 
             try:
                 await arm.start_telemetry(hz)
-                _logger.info("Telemetry started at %d Hz", hz)
+                log.info("Telemetry started at %d Hz", hz)
             except Exception as exc:
-                _logger.error(
+                log.error(
                     "start_telemetry failed: %s\n%s",
                     exc,
                     traceback.format_exc(),
@@ -156,11 +225,11 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
 
             await asyncio.sleep(0.1)
 
-            print("\033[?25l", end="")
+            if display:
+                print("\033[?25l", end="")
             last_stat_log = time.perf_counter()
             last_display = 0.0
             interval = 1.0 / hz
-            _DISPLAY_HZ = 30
 
             try:
                 while True:
@@ -171,7 +240,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                         positions = arm.positions
                     except Exception as exc:
                         other_error_count += 1
-                        _logger.error(
+                        log.error(
                             "arm.positions failed (cycle=%d): %s\n%s",
                             cycle_count,
                             exc,
@@ -180,7 +249,15 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                         positions = np.zeros(len(joints), dtype=np.float32)
 
                     now = t_iter
-                    if now - last_display >= 1.0 / _DISPLAY_HZ:
+
+                    if snapshot is not None:
+                        snapshot.positions = positions.copy()
+                        snapshot.cycle_count = cycle_count
+                        snapshot.send_error_count = send_error_count
+                        snapshot.timeout_error_count = timeout_error_count
+                        snapshot.other_error_count = other_error_count
+
+                    if display and now - last_display >= 1.0 / _DISPLAY_HZ:
                         lines = []
                         lines.append("\033[H\033[J")
                         lines.append(f"  {side.upper()} ARM  [{hz} Hz]  log→{log_file}")
@@ -206,7 +283,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
 
                     if now - last_stat_log >= 10.0:
                         elapsed_total = now - t_start
-                        _logger.info(
+                        log.info(
                             "CYCLE STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f"
                             "  send_err=%d  timeout_err=%d  other_err=%d",
                             elapsed_total,
@@ -224,11 +301,12 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
             except (KeyboardInterrupt, asyncio.CancelledError):
                 pass
             finally:
-                print("\033[?25h")
+                if display:
+                    print("\033[?25h")
                 await arm.stop_telemetry()
 
     except Exception as exc:
-        _logger.error("Fatal error in _run: %s\n%s", exc, traceback.format_exc())
+        log.error("Fatal error in _run: %s\n%s", exc, traceback.format_exc())
         raise
     finally:
         if stats_task is not None and not stats_task.done():
@@ -239,7 +317,7 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
                 pass
 
         elapsed_total = time.perf_counter() - t_start
-        _logger.info(
+        log.info(
             "FINAL STATS  elapsed=%.1fs  cycles=%d  actual_hz=%.1f"
             "  send_err=%d  timeout_err=%d  other_err=%d",
             elapsed_total,
@@ -249,12 +327,12 @@ async def _run(is_left: bool, hz: int, log_file: str) -> None:
             timeout_error_count,
             other_error_count,
         )
-        _logger.info("Final CAN stats:\n%s", _read_can_stats(channel))
+        log.info("Final CAN stats:\n%s", _read_can_stats(channel))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Live motor position display")
-    side = parser.add_mutually_exclusive_group(required=True)
+    side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Monitor left arm")
     side.add_argument("--r", action="store_true", help="Monitor right arm")
     parser.add_argument(
@@ -267,7 +345,62 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
+    try:
+        if not args.l and not args.r:
+            stem, _, ext = args.log_file.rpartition(".")
+            left_log = f"{stem}_left.{ext}"
+            right_log = f"{stem}_right.{ext}"
+            print("No side specified — monitoring both arms.")
+            print(f"  left  → {left_log}")
+            print(f"  right → {right_log}")
+
+            joints = list(Joint)
+            left_snap = _ArmSnapshot(
+                side="left",
+                hz=args.hz,
+                log_file=left_log,
+                is_left=True,
+                positions=np.zeros(len(joints)),
+            )
+            right_snap = _ArmSnapshot(
+                side="right",
+                hz=args.hz,
+                log_file=right_log,
+                is_left=False,
+                positions=np.zeros(len(joints)),
+            )
+
+            async def _run_both() -> None:
+                display_task = asyncio.create_task(_display_both(left_snap, right_snap))
+                try:
+                    await asyncio.gather(
+                        _run(
+                            is_left=True,
+                            hz=args.hz,
+                            log_file=left_log,
+                            display=False,
+                            snapshot=left_snap,
+                        ),
+                        _run(
+                            is_left=False,
+                            hz=args.hz,
+                            log_file=right_log,
+                            display=False,
+                            snapshot=right_snap,
+                        ),
+                    )
+                finally:
+                    display_task.cancel()
+                    try:
+                        await display_task
+                    except asyncio.CancelledError:
+                        pass
+
+            asyncio.run(_run_both())
+        else:
+            asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

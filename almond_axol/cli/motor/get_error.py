@@ -1,29 +1,26 @@
 """
-almond-axol motor.set-zero-pos
+almond-axol motor.get-error
 
-Set the zero position of a single motor to its current position.
+Read and print the error / status code from a single motor.
 The motor type is inferred automatically from the CAN ID.
 
-The motor must be powered and on the CAN bus. The command sets the current
-mechanical position as the new zero reference (persisted to flash).
-
 Examples:
-    almond-axol motor.set-zero-pos --l --id 0x01
-    almond-axol motor.set-zero-pos --r --id 0x06
+    almond-axol motor.get-error --l --id 0x01
+    almond-axol motor.get-error --r --id 0x06
 """
 
 import argparse
 import asyncio
 
 from ...motor.bus import CanBus
-from ...motor.damiao import DamiaoMotor
 from ...motor.motor import make_driver
+from ...motor.types import MotorStatus
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "motor.set-zero-pos",
-        help="Set the zero position of a motor to its current position.",
+        "motor.get-error",
+        help="Read the error / status code from a motor.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -35,7 +32,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         required=True,
         type=lambda x: int(x, 0),
         metavar="ID",
-        help="CAN ID of the motor (hex or decimal, e.g. 0x01 or 1)",
+        help="Motor CAN ID (hex or decimal, e.g. 0x01 or 1)",
     )
     p.add_argument(
         "--type",
@@ -52,23 +49,18 @@ def run(args: argparse.Namespace) -> None:
 
 async def _run(args: argparse.Namespace) -> None:
     channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
-    print(f"\nset-zero-pos — {channel}  id={args.id:#04x}")
+    print(f"\nget-error — {channel}  id={args.id:#04x}\n")
 
     async with CanBus(channel) as bus:
         motor = make_driver(bus, args.id, args.type)
 
-        position_before = await motor.get_position()
-        print(f"  position before: {position_before:.4f} rad")
+        try:
+            status = await motor.get_error_code()
+        except Exception as e:
+            print(f"  ERROR: could not read motor — {e}")
+            print("  Check that the motor is powered and the CAN ID is correct.")
+            return
 
-        print("  setting zero position ...")
-        await motor.set_zero_position()
-
-        position_after = await motor.get_position()
-        print(f"  position after:  {position_after:.4f} rad")
-        print("  done")
-
-        if isinstance(motor, DamiaoMotor):
-            print(
-                "\n  ⚠  WARNING: Damiao motors require a power cycle to apply the new"
-                " zero position. Please restart the motor now."
-            )
+        ok = status == MotorStatus.OK
+        label = "OK" if ok else "FAULT"
+        print(f"  status  {label}  ({status.value})")

@@ -13,14 +13,14 @@ import time
 
 import numpy as np
 
-from ..robot.axol import Axol
+from ..robot.axol import LIMITS, Axol
 from ..shared import Joint
 
 _SPEED = 0.2 * 2 * math.pi  # rad/s
 _RATE_HZ = 100.0
 
 _GRIPPER_IDX = list(Joint).index(Joint.GRIPPER)
-_GRIPPER_RANGE = 0.8037 * 2 * math.pi  # rad, full open-to-close travel
+_GRIPPER_RANGE = abs(LIMITS[Joint.GRIPPER][0] - LIMITS[Joint.GRIPPER][1])
 
 
 async def _move_gripper(

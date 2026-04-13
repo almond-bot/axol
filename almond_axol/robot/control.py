@@ -43,6 +43,9 @@ class Differentiator:
         a = 1 / (1 + Ts * CUTOFF_FREQ)
         b = a * CUTOFF_FREQ
         vel[i] = vel_prev[i] * a + b * (pos[i] - pos_prev[i])
+
+    Args:
+        n: Number of channels to differentiate.
     """
 
     def __init__(self, n: int) -> None:

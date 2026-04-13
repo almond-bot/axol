@@ -26,8 +26,8 @@ _logger = logging.getLogger(__name__)
 # Link names in axol.urdf
 _LEFT_EE = "left_gripper"
 _RIGHT_EE = "right_gripper"
-_LEFT_ELBOW = "left_e1"
-_RIGHT_ELBOW = "right_e1"
+_LEFT_ELBOW = "left_e2"
+_RIGHT_ELBOW = "right_e2"
 _LEFT_SHOULDER = "left_s2"
 _RIGHT_SHOULDER = "right_s2"
 
@@ -71,9 +71,11 @@ def _solve_ik(
     L_elbow_idx: jax.Array,
     R_elbow_idx: jax.Array,
     q_current: jax.Array,
+    posture_pose: jax.Array,
     pos_weight: float,
     ori_weight: float,
     rest_weight: float,
+    posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
     self_collision_margin: float,
@@ -86,6 +88,7 @@ def _solve_ik(
 
     costs = [
         pk.costs.rest_cost(JointVar(0), rest_pose=q_current, weight=rest_weight),
+        pk.costs.rest_cost(JointVar(0), rest_pose=posture_pose, weight=posture_weight),
         pk.costs.manipulability_cost(
             robot,
             JointVar(0),
@@ -321,7 +324,19 @@ class KinematicsSolver:
         self.left_indices = [name_to_idx[n] for n in _LEFT_JOINT_NAMES]
         self.right_indices = [name_to_idx[n] for n in _RIGHT_JOINT_NAMES]
 
+        self._posture_pose = jnp.zeros(
+            self.robot.joints.num_actuated_joints, dtype=jnp.float32
+        )
+
         self._warmup()
+
+    def set_posture_pose(self, q: np.ndarray) -> None:
+        """Set the global preferred posture used as a persistent attractor.
+
+        Args:
+            q: Full ``(N,)`` joint array in radians (same ordering as :meth:`ik`).
+        """
+        self._posture_pose = jnp.asarray(q, dtype=jnp.float32)
 
     # -- Properties ----------------------------------------------------------
 
@@ -423,9 +438,11 @@ class KinematicsSolver:
             self._l_elbow_idx_jax,
             self._r_elbow_idx_jax,
             jnp.asarray(q_current, dtype=jnp.float32),
+            self._posture_pose,
             cfg.pos_weight,
             cfg.ori_weight,
             cfg.rest_weight,
+            cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
             cfg.self_collision_margin,

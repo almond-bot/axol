@@ -16,6 +16,10 @@ class KinematicsConfig:
         ori_weight: Weight on end-effector orientation error.
         elbow_weight: Weight on elbow position hints (position only, no orientation).
         rest_weight: Weight penalising deviation from the current joint configuration.
+            Acts as a per-step damping term; uses q_current as the target.
+        posture_weight: Weight penalising deviation from the global preferred posture.
+            Acts as a persistent attractor toward the home/rest configuration,
+            preventing slow null-space drift (e.g. unnecessary shoulder twist).
         manipulability_weight: Weight rewarding configurations with high manipulability.
         limit_weight: Weight penalising joint-limit violations.
         self_collision_margin: Minimum clearance (m) enforced between collision bodies.
@@ -28,13 +32,14 @@ class KinematicsConfig:
 
     pos_weight: float = 50.0
     ori_weight: float = 10.0
-    elbow_weight: float = 35.0
-    rest_weight: float = 4.5
+    elbow_weight: float = 5.0
+    rest_weight: float = 7.5
+    posture_weight: float = 5.0
     manipulability_weight: float = 0.05
-    limit_weight: float = 100.0
-    self_collision_margin: float = 0.01
-    self_collision_weight: float = 25.0
-    max_iterations: int = 25
+    limit_weight: float = 75.0
+    self_collision_margin: float = 0.1
+    self_collision_weight: float = 75.0
+    max_iterations: int = 8
     cost_tolerance: float = 1e-2
     max_joint_delta: float = 0.0055 * 2 * math.pi
-    max_reach: float = 0.75
+    max_reach: float = 0.8
