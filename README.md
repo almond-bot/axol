@@ -132,6 +132,13 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 
 > **Before opening the VR app**, accept the self-signed HTTPS certificate in the VR browser by navigating to `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceeding past the security warning.
 
+> **Network tip:** If VR tracking feels jittery or packets arrive in bursts, configure the following on your router/access point:
+> - **DTIM interval** → `1`
+> - **Beacon interval** → `100` ms
+> - **WMM APSD (U-APSD)** → disabled
+>
+> These settings prevent the AP from buffering packets between beacon intervals, which causes intermittent delivery delays that are especially noticeable for latency-sensitive VR traffic.
+
 | Flag | Description |
 |---|---|
 | `--robot {axol,sim}` | `axol` uses real hardware; `sim` uses the software visualizer (required) |
