@@ -24,7 +24,7 @@ from datetime import datetime
 import numpy as np
 
 from ...motor import CanBus
-from ...robot.axol import LIMITS, AxolArm, arm_limits
+from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
 from ...robot.config import AxolConfig
 from ...shared import CAN_LEFT, CAN_RIGHT, Joint
 
@@ -35,8 +35,7 @@ _COL_WIDTH = 60
 _COL_GAP = 2
 
 # Consistent with home.py and gripper.py.
-_SPEED = 0.2 * _TAU  # rad/s for arm joints
-_GRIPPER_RANGE = abs(LIMITS[Joint.GRIPPER][0] - LIMITS[Joint.GRIPPER][1])
+_SPEED = 0.2 * _TAU  # rad/s
 
 
 def _make_logger(log_file: str, name: str) -> logging.Logger:
@@ -181,7 +180,7 @@ async def _display_both(left: _SendSnapshot, right: _SendSnapshot) -> None:
 def _cycle_dist_rad(dist_api: float, joint: Joint) -> float:
     """Convert an API-unit distance to radians for speed/duration calculations."""
     if joint == Joint.GRIPPER:
-        return abs(dist_api) * _GRIPPER_RANGE
+        return abs(dist_api) * GRIPPER_TRAVEL
     return abs(dist_api)
 
 
