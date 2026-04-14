@@ -32,7 +32,7 @@ LIMITS: dict[Joint, tuple[float, float]] = {
 GRIPPER_TRAVEL = 0.8037 * _TAU
 
 # Gripper open-position calibration parameters.
-_GRIPPER_TORQUE_THRESHOLD = 0.35  # Nm
+_GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
 _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
 _GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
