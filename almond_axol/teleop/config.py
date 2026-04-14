@@ -28,6 +28,19 @@ class VRTeleopConfig:
         reset_collision_weight: Cost weight on self-collision penalty during
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
+        startup_max_accel: Maximum joint acceleration (rad/s²) used only during
+            the initial startup trajectory (current pose → rest pose).  Motors
+            are cold at this point and respond sharply; a gentler ramp avoids
+            the initial jerk.  Restored to ``teleop_max_accel`` once the
+            startup trajectory completes.  Defaults to 0.3 rev/s².
+        engage_max_vel: Maximum joint velocity (rad/s) used by the
+            trapezoidal filter when the deadman switch is first pressed after a
+            rest-pose trajectory (startup or reset).  Slows the transition from
+            rest pose to the first IK target.  Restored to ``teleop_max_vel``
+            after ``engage_duration`` seconds.  Defaults to
+            ``reset_speed`` for a consistent feel.
+        engage_duration: Seconds to hold ``engage_max_vel`` after the
+            post-rest deadman rising edge before restoring ``teleop_max_vel``.
         teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
             trapezoidal filter during normal teleoperation.  Limits how fast
             any single joint can move toward a new IK target.  Defaults to
@@ -36,14 +49,6 @@ class VRTeleopConfig:
             trapezoidal filter.  Controls how quickly the commanded velocity
             ramps up or down.  Defaults to 1.5 rev/s² (~540 °/s²), giving a
             ~0.2 s ramp from rest to full speed.
-        rest_engage_max_vel: Maximum joint velocity (rad/s) used by the
-            trapezoidal filter when the deadman switch is first pressed after a
-            rest-pose trajectory (startup or reset).  Slows the transition from
-            rest pose to the first IK target.  Restored to ``teleop_max_vel``
-            after ``rest_engage_duration`` seconds.  Defaults to
-            ``reset_speed`` for a consistent feel.
-        rest_engage_duration: Seconds to hold ``rest_engage_max_vel`` after the
-            post-rest deadman rising edge before restoring ``teleop_max_vel``.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -81,7 +86,8 @@ class VRTeleopConfig:
     reset_collision_margin: float = 0.025
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
+    startup_max_accel: float = 0.3 * 2 * math.pi
+    engage_max_vel: float = 0.1 * 2 * math.pi
+    engage_duration: float = 1.0
     teleop_max_vel: float = 0.5 * 2 * math.pi
     teleop_max_accel: float = 1.5 * 2 * math.pi
-    rest_engage_max_vel: float = 0.1 * 2 * math.pi
-    rest_engage_duration: float = 1.0

@@ -122,6 +122,7 @@ class VRTeleop:
         self._prev_deadman: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
+        self._startup_complete: bool = False
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -211,6 +212,8 @@ class VRTeleop:
             self._smooth_right.reset(seed=np.append(cur_r[:7], self._r_grip))
 
         if startup_traj:
+            self._smooth_left.max_accel = self._config.startup_max_accel
+            self._smooth_right.max_accel = self._config.startup_max_accel
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
         self._ik_stop.clear()
@@ -272,7 +275,7 @@ class VRTeleop:
                 if self._engage_time is not None:
                     if (
                         time.perf_counter() - self._engage_time
-                        >= self._config.rest_engage_duration
+                        >= self._config.engage_duration
                     ):
                         self._smooth_left.max_vel = self._config.teleop_max_vel
                         self._smooth_right.max_vel = self._config.teleop_max_vel
@@ -356,6 +359,10 @@ class VRTeleop:
                     self._l_grip = l_grip
                     self._r_grip = r_grip
                     self._at_rest = True
+                    if not self._startup_complete:
+                        self._startup_complete = True
+                        self._smooth_left.max_accel = self._config.teleop_max_accel
+                        self._smooth_right.max_accel = self._config.teleop_max_accel
 
         smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
         smoothed_r = self._smooth_right.update(
@@ -419,8 +426,8 @@ class VRTeleop:
 
             deadman = frame.l_lock and frame.r_lock
             if deadman and not self._prev_deadman and self._at_rest:
-                self._smooth_left.max_vel = self._config.rest_engage_max_vel
-                self._smooth_right.max_vel = self._config.rest_engage_max_vel
+                self._smooth_left.max_vel = self._config.engage_max_vel
+                self._smooth_right.max_vel = self._config.engage_max_vel
                 self._engage_time = time.perf_counter()
                 self._at_rest = False
             self._prev_deadman = deadman
