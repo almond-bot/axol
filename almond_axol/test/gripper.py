@@ -13,22 +13,20 @@ import time
 
 import numpy as np
 
-from ..robot.axol import LIMITS, Axol
+from ..robot.axol import GRIPPER_TRAVEL, Axol
 from ..shared import Joint
 
 _SPEED = 0.2 * 2 * math.pi  # rad/s
 _RATE_HZ = 100.0
 
 _GRIPPER_IDX = list(Joint).index(Joint.GRIPPER)
-_GRIPPER_RANGE = abs(LIMITS[Joint.GRIPPER][0] - LIMITS[Joint.GRIPPER][1])
 
 
 async def _move_gripper(
     arm, q_hold: np.ndarray, start_norm: float, end_norm: float
 ) -> None:
     """Interpolate gripper from start_norm to end_norm at _SPEED."""
-    dist_rad = abs(end_norm - start_norm) * _GRIPPER_RANGE
-    duration = max(dist_rad / _SPEED, 0.1)
+    duration = max(abs(end_norm - start_norm) * GRIPPER_TRAVEL / _SPEED, 0.1)
     dt = 1.0 / _RATE_HZ
     t0 = time.monotonic()
     q = q_hold.copy()

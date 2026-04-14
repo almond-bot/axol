@@ -25,16 +25,33 @@ LIMITS: dict[Joint, tuple[float, float]] = {
     Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
     Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.GRIPPER: (-0.8037 * _TAU, 0.0),
+    # Gripper absent: open position varies per unit, found at runtime by _calibrate_gripper().
 }
+
+# Fixed open-to-close travel of the gripper (rad).
+GRIPPER_TRAVEL = 0.8037 * _TAU
+
+# Gripper open-position calibration parameters.
+_GRIPPER_TORQUE_THRESHOLD = 0.35  # Nm
+_GRIPPER_CALIB_STEP = 0.005  # rad per step
+_GRIPPER_CALIB_SETTLE = 0.001  # s per step
+_GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
-    """Return (min, max) position limits in radians for a joint on the given arm."""
+    """Return (min, max) position limits for a joint on the given arm.
+
+    Arm joints are in radians.  The gripper returns the normalised API range
+    (0.0, 1.0) since gripper positions are always exposed as [0 = closed,
+    1 = open] — the raw motor limits vary per unit and are calibrated at
+    runtime by AxolArm._calibrate_gripper().
+    """
     if joint == Joint.SHOULDER_2:
         return SHOULDER_2_LEFT_LIMITS if is_left else SHOULDER_2_RIGHT_LIMITS
     if joint == Joint.ELBOW:
         return ELBOW_LEFT_LIMITS if is_left else ELBOW_RIGHT_LIMITS
+    if joint == Joint.GRIPPER:
+        return (0.0, 1.0)
     return LIMITS.get(joint, (-math.inf, math.inf))
 
 
@@ -47,13 +64,25 @@ class AxolArm:
     def __init__(self, bus: CanBus, config: AxolConfig, is_left: bool = True) -> None:
         self._config = config
         self._motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
+        self._differentiator = Differentiator(n=len(list(Joint)))
+
+        # Clipping arrays in raw motor radians.  arm_limits() returns normalised [0, 1]
+        # for the gripper, so the gripper entries are seeded with raw defaults here;
+        # _calibrate_gripper() overwrites them on enable.
+        # Pre-calibration defaults assume zero is closed — do not rely on for actual motion.
+        joints = list(Joint)
+        self._gripper_i: int = joints.index(Joint.GRIPPER)
         self._limits_lo = np.array(
-            [arm_limits(j, is_left)[0] for j in Joint], dtype=float
+            [
+                -GRIPPER_TRAVEL if j == Joint.GRIPPER else arm_limits(j, is_left)[0]
+                for j in joints
+            ],
+            dtype=float,
         )
         self._limits_hi = np.array(
-            [arm_limits(j, is_left)[1] for j in Joint], dtype=float
+            [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[1] for j in joints],
+            dtype=float,
         )
-        self._differentiator = Differentiator(n=len(list(Joint)))
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -84,10 +113,10 @@ class AxolArm:
         """
         joints = list(Joint)
         values = [self._motors[j].position for j in joints]
-        _lo, _hi = LIMITS[Joint.GRIPPER]
-        values[joints.index(Joint.GRIPPER)] = (
-            values[joints.index(Joint.GRIPPER)] - _hi
-        ) / (_lo - _hi)
+        gripper_i = self._gripper_i
+        values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
+            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+        )
         return np.array(values, dtype=np.float32)
 
     @property
@@ -102,12 +131,44 @@ class AxolArm:
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #
 
+    async def _calibrate_gripper(self) -> None:
+        """Find the gripper open position by stepping in the negative direction.
+
+        Steps the gripper motor incrementally toward open until the torque
+        magnitude drops to ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop).
+        Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
+        (close) which are used for normalization and clipping.
+
+        Must be called with the gripper motor already enabled and in MIT mode.
+        """
+        motor = self._motors[Joint.GRIPPER]
+        gcfg = self._config.gripper
+        gripper_i = self._gripper_i
+
+        target = await motor.get_position()
+
+        for _ in range(_GRIPPER_CALIB_MAX_STEPS):
+            target -= _GRIPPER_CALIB_STEP
+            await motor.motion_control(target, 0.0, gcfg.kp, gcfg.kd, 0.0)
+            await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
+            torque = await motor.get_torque()
+            if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
+                open_pos = await motor.get_position()
+                self._limits_lo[gripper_i] = open_pos
+                self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
+                return
+
+        raise RuntimeError(
+            "Gripper calibration failed: torque threshold not reached within travel range"
+        )
+
     async def enable(self) -> None:
-        """Enable all motors in MIT mode."""
+        """Enable all motors in MIT mode, then calibrate the gripper open position."""
         await asyncio.gather(*[m.enable() for m in self._motors.values()])
         await asyncio.gather(
             *[m.set_control_mode(ControlMode.MIT) for m in self._motors.values()]
         )
+        await self._calibrate_gripper()
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -140,9 +201,10 @@ class AxolArm:
         values = list(
             await asyncio.gather(*[self._motors[j].get_position() for j in joints])
         )
-        _lo, _hi = LIMITS[Joint.GRIPPER]
-        i = joints.index(Joint.GRIPPER)
-        values[i] = (values[i] - _hi) / (_lo - _hi)
+        gripper_i = self._gripper_i
+        values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
+            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+        )
         return np.array(values, dtype=np.float32)
 
     async def get_velocities(self) -> np.ndarray:
@@ -243,9 +305,10 @@ class AxolArm:
             max_speed: Maximum speed for all joints (rad/s).
         """
         positions = positions.copy()
-        _lo, _hi = LIMITS[Joint.GRIPPER]
-        i = list(Joint).index(Joint.GRIPPER)
-        positions[i] = _hi + positions[i] * (_lo - _hi)
+        gripper_i = self._gripper_i
+        positions[gripper_i] = self._limits_hi[gripper_i] + positions[gripper_i] * (
+            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+        )
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
         await asyncio.gather(
             *[
@@ -280,9 +343,10 @@ class AxolArm:
                except gripper which is [0, 1].
         """
         q = q.copy()
-        _lo, _hi = LIMITS[Joint.GRIPPER]
-        i = list(Joint).index(Joint.GRIPPER)
-        q[i] = _hi + q[i] * (_lo - _hi)
+        gripper_i = self._gripper_i
+        q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
+            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+        )
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s).
