@@ -203,6 +203,13 @@ class VRTeleop:
         self._q = np.asarray(q_init, dtype=np.float32)
         self._left_indices = left_indices
         self._right_indices = right_indices
+
+        cur_l, cur_r = await self._robot.get_positions()
+        if cur_l is not None:
+            self._smooth_left.reset(seed=np.append(cur_l[:7], self._l_grip))
+        if cur_r is not None:
+            self._smooth_right.reset(seed=np.append(cur_r[:7], self._r_grip))
+
         if startup_traj:
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
