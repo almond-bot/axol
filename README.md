@@ -2,7 +2,11 @@
 
 Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <command> [flags]`.
 
-**Requires Python 3.13+.**
+## Requirements
+
+- **Linux**
+- **Python 3.13+**
+- **(Optional) NVIDIA Jetson** If Zed cameras are used.
 
 ## Table of Contents
 
