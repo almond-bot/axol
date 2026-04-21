@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 
 @dataclass
@@ -141,3 +141,18 @@ class AxolConfig:
             gb=0.0008,
         )
     )
+
+    def mirror_gravity(self) -> AxolConfig:
+        """Return a copy with gb negated for shoulder_2 and elbow.
+
+        shoulder_2 and elbow have mirrored angle ranges on the right arm
+        (e.g. elbow: [0, 0.42τ] left vs [-0.42τ, 0] right).  Because
+        sin(−q) = −sin(q), the gb coefficient must flip sign while ga
+        (cosine term) stays the same.  All other joints have symmetric
+        limits so their gravity fits are valid for both arms unchanged.
+        """
+        return replace(
+            self,
+            shoulder_2=replace(self.shoulder_2, gb=-self.shoulder_2.gb),
+            elbow=replace(self.elbow, gb=-self.elbow.gb),
+        )

@@ -158,9 +158,9 @@ class AxolArm:
                 self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
                 return
 
-        raise RuntimeError(
-            "Gripper calibration failed: torque threshold not reached within travel range"
-        )
+        open_pos = await motor.get_position()
+        self._limits_lo[gripper_i] = open_pos
+        self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
 
     async def enable(self) -> None:
         """Enable all motors in MIT mode, then calibrate the gripper open position."""
@@ -419,7 +419,9 @@ class Axol(RobotBase):
 
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = AxolArm(self._right_bus, config, is_left=False)
+            self.right = AxolArm(
+                self._right_bus, config.mirror_gravity(), is_left=False
+            )
         else:
             self.right = None
 
