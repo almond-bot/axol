@@ -101,10 +101,10 @@ async def _run_sweep_raw(
     start_pos: float,
     velocity_rad_s: float,
     end_pos: float,
-) -> list[tuple[float, float, float]]:
+) -> list[tuple[float, float]]:
     """Sweep from start_pos to end_pos at constant velocity.
 
-    Returns list of (q_actual, v_actual, tau_est). No friction subtraction.
+    Returns list of (q_actual, tau_est). No friction subtraction.
     The first WARMUP_FRACTION of travel is discarded for motor settling.
     """
     travel = abs(end_pos - start_pos)
@@ -114,7 +114,7 @@ async def _run_sweep_raw(
     warmup_time = total_time * _WARMUP_FRACTION
     dt = 1.0 / _RATE_HZ
 
-    samples: list[tuple[float, float, float]] = []
+    samples: list[tuple[float, float]] = []
     pos_prev: float | None = None
     t_prev: float | None = None
 
@@ -136,7 +136,7 @@ async def _run_sweep_raw(
             v_actual = (q_actual - pos_prev) / dt_actual if dt_actual > 0 else 0.0
             vel_err = velocity_rad_s - v_actual
             tau_est = kp * pos_err + kd * vel_err
-            samples.append((q_actual, v_actual, tau_est))
+            samples.append((q_actual, tau_est))
 
         pos_prev = q_actual
         t_prev = now
@@ -149,18 +149,18 @@ async def _run_sweep_raw(
 
 
 def _bin_by_position(
-    samples: list[tuple[float, float, float]],
+    samples: list[tuple[float, float]],
     sweep_lo: float,
     sweep_hi: float,
     n_bins: int = _N_BINS,
 ) -> dict[float, float]:
-    """Return {bin_center: mean_tau} from (q, v, tau) samples."""
+    """Return {bin_center: mean_tau} from (q, tau) samples."""
     span = sweep_hi - sweep_lo
     if span <= 0:
         return {}
     bin_width = span / n_bins
     buckets: dict[int, list[float]] = {}
-    for q, _v, tau in samples:
+    for q, tau in samples:
         idx = int((q - sweep_lo) / bin_width)
         idx = max(0, min(n_bins - 1, idx))
         buckets.setdefault(idx, []).append(tau)

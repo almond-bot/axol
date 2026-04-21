@@ -21,7 +21,7 @@ import time
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import AxolConfig
-from ...robot.control import compute_feedforward
+from ...robot.control import Differentiator, compute_feedforward
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _DEFAULT_AMP_FRACTION = 0.3
@@ -127,6 +127,7 @@ async def run_sine(
     dt = 1.0 / rate_hz
     log: list[dict] = []
     start = time.monotonic()
+    diff = Differentiator(1)
 
     while True:
         t = time.monotonic() - start
@@ -134,17 +135,19 @@ async def run_sine(
             break
         loop_start = time.monotonic()
 
-        v_des = amp * 2 * math.pi * freq * math.cos(2 * math.pi * freq * t)
         target = center + amp * math.sin(2 * math.pi * freq * t)
+        v_des = diff.differentiate([target])[0]
         tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
         await test_motor.motion_control(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
+        t_read = time.monotonic() - start
+        target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
         log.append(
             {
-                "t": round(t, 5),
-                "target": target,
+                "t": round(t_read, 5),
+                "target": target_at_read,
                 "actual": actual,
-                "error": actual - target,
+                "error": actual - target_at_read,
             }
         )
 
