@@ -1,13 +1,13 @@
 """
-almond-axol motor.set-can-id
+axol motor.set-can-id
 
 Change the CAN ID of a single motor and persist it to flash.
 
 The motor must be the only device on the bus, or you must know its current CAN ID.
 
 Examples:
-    almond-axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
-    almond-axol motor.set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
+    axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+    axol motor.set-can-id --r --current-id 0x06 --new-id 0x07 --type damiao
 """
 
 import argparse

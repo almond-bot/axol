@@ -1,5 +1,5 @@
 """
-almond-axol zed.stream
+axol zed.stream
 
 Stream ZED-X One cameras over the local network using HEVC.
 """

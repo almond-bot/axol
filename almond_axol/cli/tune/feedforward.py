@@ -1,5 +1,5 @@
 """
-almond-axol tune.feedforward
+axol tune.feedforward
 
 Identify all six feedforward parameters (gravity + friction) for an Axol joint
 in a single bidirectional sweep.
@@ -20,9 +20,9 @@ At runtime:
     tff(q, v) = ga·cos(q) + gb·sin(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
 Examples:
-    almond-axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-    almond-axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
-    almond-axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
+    axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
+    axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
 import argparse
@@ -35,7 +35,7 @@ from scipy.optimize import curve_fit
 
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
-from ...robot.config import AxolConfig
+from ...robot.config import ArmConfig, AxolConfig
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _TAU = 2 * math.pi
@@ -101,10 +101,10 @@ async def _run_sweep_raw(
     start_pos: float,
     velocity_rad_s: float,
     end_pos: float,
-) -> list[tuple[float, float, float]]:
+) -> list[tuple[float, float]]:
     """Sweep from start_pos to end_pos at constant velocity.
 
-    Returns list of (q_actual, v_actual, tau_est). No friction subtraction.
+    Returns list of (q_actual, tau_est). No friction subtraction.
     The first WARMUP_FRACTION of travel is discarded for motor settling.
     """
     travel = abs(end_pos - start_pos)
@@ -114,7 +114,7 @@ async def _run_sweep_raw(
     warmup_time = total_time * _WARMUP_FRACTION
     dt = 1.0 / _RATE_HZ
 
-    samples: list[tuple[float, float, float]] = []
+    samples: list[tuple[float, float]] = []
     pos_prev: float | None = None
     t_prev: float | None = None
 
@@ -136,7 +136,7 @@ async def _run_sweep_raw(
             v_actual = (q_actual - pos_prev) / dt_actual if dt_actual > 0 else 0.0
             vel_err = velocity_rad_s - v_actual
             tau_est = kp * pos_err + kd * vel_err
-            samples.append((q_actual, v_actual, tau_est))
+            samples.append((q_actual, tau_est))
 
         pos_prev = q_actual
         t_prev = now
@@ -149,18 +149,18 @@ async def _run_sweep_raw(
 
 
 def _bin_by_position(
-    samples: list[tuple[float, float, float]],
+    samples: list[tuple[float, float]],
     sweep_lo: float,
     sweep_hi: float,
     n_bins: int = _N_BINS,
 ) -> dict[float, float]:
-    """Return {bin_center: mean_tau} from (q, v, tau) samples."""
+    """Return {bin_center: mean_tau} from (q, tau) samples."""
     span = sweep_hi - sweep_lo
     if span <= 0:
         return {}
     bin_width = span / n_bins
     buckets: dict[int, list[float]] = {}
-    for q, _v, tau in samples:
+    for q, tau in samples:
         idx = int((q - sweep_lo) / bin_width)
         idx = max(0, min(n_bins - 1, idx))
         buckets.setdefault(idx, []).append(tau)
@@ -237,6 +237,8 @@ async def _identify_joint(
     kd: float,
     is_left: bool,
     velocities: list[float],
+    lo_override: float | None = None,
+    hi_override: float | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run bidirectional multi-velocity sweep over the full joint range.
 
@@ -245,6 +247,10 @@ async def _identify_joint(
         halfdiff_samples: (v, tau_half) — for Fc/k/Fv fitting
     """
     lo, hi = arm_limits(joint, is_left)
+    if lo_override is not None:
+        lo = lo_override
+    if hi_override is not None:
+        hi = hi_override
     sweep_lo = lo + _SWEEP_MARGIN
     sweep_hi = hi - _SWEEP_MARGIN
 
@@ -331,6 +337,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="V",
         help="Velocity setpoints in rad/s (default: ~0.1 0.3 0.6 0.9 1.3 rad/s)",
     )
+    p.add_argument(
+        "--lo",
+        type=float,
+        default=None,
+        metavar="RAD",
+        help="Override lower joint limit for the sweep (rad)",
+    )
+    p.add_argument(
+        "--hi",
+        type=float,
+        default=None,
+        metavar="RAD",
+        help="Override upper joint limit for the sweep (rad)",
+    )
     p.set_defaults(func=run)
 
 
@@ -342,7 +362,8 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
-    config_gains = getattr(AxolConfig(), joint.value)
+    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    config_gains = getattr(arm_cfg, joint.value)
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd
 
@@ -381,7 +402,14 @@ async def _run(args: argparse.Namespace) -> None:
             await asyncio.sleep(1.0)
 
             avg_samples, halfdiff_samples = await _identify_joint(
-                motors[joint], joint, kp, kd, is_left, args.velocities
+                motors[joint],
+                joint,
+                kp,
+                kd,
+                is_left,
+                args.velocities,
+                lo_override=args.lo,
+                hi_override=args.hi,
             )
 
             if not avg_samples and not halfdiff_samples:

@@ -1,12 +1,12 @@
 """
-almond-axol motor.get-error
+axol motor.get-error
 
 Read and print the error / status code from a single motor.
 The motor type is inferred automatically from the CAN ID.
 
 Examples:
-    almond-axol motor.get-error --l --id 0x01
-    almond-axol motor.get-error --r --id 0x06
+    axol motor.get-error --l --id 0x01
+    axol motor.get-error --r --id 0x06
 """
 
 import argparse

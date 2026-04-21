@@ -1,5 +1,5 @@
 """
-almond-axol collect-data
+axol collect-data
 
 Record teleoperation episodes with the Axol robot and three ZED cameras.
 Episode boundaries are driven by VR controller commands:

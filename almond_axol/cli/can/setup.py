@@ -1,5 +1,5 @@
 """
-almond-axol can.setup
+axol can.setup
 
 Sets persistent CAN interface names for the Almond Axol arm CAN bus adapter
 and registers a root crontab @reboot entry to bring up the interfaces.

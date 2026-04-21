@@ -1,5 +1,5 @@
 """
-almond-axol motor.set-zero-pos
+axol motor.set-zero-pos
 
 Set the zero position of a single motor to its current position.
 The motor type is inferred automatically from the CAN ID.
@@ -8,8 +8,8 @@ The motor must be powered and on the CAN bus. The command sets the current
 mechanical position as the new zero reference (persisted to flash).
 
 Examples:
-    almond-axol motor.set-zero-pos --l --id 0x01
-    almond-axol motor.set-zero-pos --r --id 0x06
+    axol motor.set-zero-pos --l --id 0x01
+    axol motor.set-zero-pos --r --id 0x06
 """
 
 import argparse

@@ -1,5 +1,5 @@
 """
-almond-axol tune.pid
+axol tune.pid
 
 Tune Kp/Kd for a single Axol joint at ~100 Hz.
 
@@ -7,10 +7,10 @@ Tests gains via sinusoidal or step-response tracking and measures error (RMS, ma
 overshoot). Results are printed to stdout.
 
 Examples:
-    almond-axol tune.pid --l  --joint elbow      --kp 25 --kd 0.6
-    almond-axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
-    almond-axol tune.pid --l  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
-    almond-axol tune.pid --l  --joint wrist_2    --kp 10 --kd 0.3 --mode step
+    axol tune.pid --l  --joint elbow      --kp 25 --kd 0.6
+    axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
+    axol tune.pid --l  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
+    axol tune.pid --l  --joint wrist_2    --kp 10 --kd 0.3 --mode step
 """
 
 import argparse
@@ -20,8 +20,8 @@ import time
 
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
-from ...robot.config import AxolConfig
-from ...robot.control import compute_feedforward
+from ...robot.config import ArmConfig, AxolConfig
+from ...robot.control import Differentiator, compute_feedforward
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _DEFAULT_AMP_FRACTION = 0.3
@@ -127,6 +127,7 @@ async def run_sine(
     dt = 1.0 / rate_hz
     log: list[dict] = []
     start = time.monotonic()
+    diff = Differentiator(1)
 
     while True:
         t = time.monotonic() - start
@@ -134,17 +135,19 @@ async def run_sine(
             break
         loop_start = time.monotonic()
 
-        v_des = amp * 2 * math.pi * freq * math.cos(2 * math.pi * freq * t)
         target = center + amp * math.sin(2 * math.pi * freq * t)
+        v_des = diff.differentiate([target])[0]
         tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
         await test_motor.motion_control(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
+        t_read = time.monotonic() - start
+        target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
         log.append(
             {
-                "t": round(t, 5),
-                "target": target,
+                "t": round(t_read, 5),
+                "target": target_at_read,
                 "actual": actual,
-                "error": actual - target,
+                "error": actual - target_at_read,
             }
         )
 
@@ -354,7 +357,8 @@ async def _run(args: argparse.Namespace) -> None:
     side_str = "left" if is_left else "right"
     lo, hi = arm_limits(joint, is_left)
 
-    joint_gains = getattr(AxolConfig(), joint.value)
+    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    joint_gains = getattr(arm_cfg, joint.value)
     if args.tff:
         fc, k, fv, fo = joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo
         ga, gb = joint_gains.ga, joint_gains.gb

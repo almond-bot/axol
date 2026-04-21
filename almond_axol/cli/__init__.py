@@ -12,7 +12,7 @@ from .zed import stream as zed_stream
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="almond-axol")
+    parser = argparse.ArgumentParser(prog="axol")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     can_setup.add_parser(subparsers)
