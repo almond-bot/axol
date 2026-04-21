@@ -1,5 +1,5 @@
 """
-almond-axol run-policy
+axol run-policy
 
 Run a trained policy on the Axol robot with three ZED cameras.
 The policy drives actions autonomously for a fixed duration per episode.

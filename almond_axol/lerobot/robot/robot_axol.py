@@ -82,7 +82,7 @@ class AxolRobot(Robot):
 
     @property
     def is_calibrated(self) -> bool:
-        return True  # Encoder zeros set via almond-axol CLI, not managed here
+        return True  # Encoder zeros set via axol CLI, not managed here
 
     @property
     def observation_features(self) -> dict:

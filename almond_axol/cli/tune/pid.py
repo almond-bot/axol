@@ -1,5 +1,5 @@
 """
-almond-axol tune.pid
+axol tune.pid
 
 Tune Kp/Kd for a single Axol joint at ~100 Hz.
 
@@ -7,10 +7,10 @@ Tests gains via sinusoidal or step-response tracking and measures error (RMS, ma
 overshoot). Results are printed to stdout.
 
 Examples:
-    almond-axol tune.pid --l  --joint elbow      --kp 25 --kd 0.6
-    almond-axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
-    almond-axol tune.pid --l  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
-    almond-axol tune.pid --l  --joint wrist_2    --kp 10 --kd 0.3 --mode step
+    axol tune.pid --l  --joint elbow      --kp 25 --kd 0.6
+    axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
+    axol tune.pid --l  --joint wrist_1    --kp 12 --kd 0.4 --freq 2
+    axol tune.pid --l  --joint wrist_2    --kp 10 --kd 0.3 --mode step
 """
 
 import argparse

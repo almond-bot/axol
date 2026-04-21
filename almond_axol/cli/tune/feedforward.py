@@ -1,5 +1,5 @@
 """
-almond-axol tune.feedforward
+axol tune.feedforward
 
 Identify all six feedforward parameters (gravity + friction) for an Axol joint
 in a single bidirectional sweep.
@@ -20,9 +20,9 @@ At runtime:
     tff(q, v) = ga·cos(q) + gb·sin(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
 Examples:
-    almond-axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-    almond-axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
-    almond-axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
+    axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
+    axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
 import argparse

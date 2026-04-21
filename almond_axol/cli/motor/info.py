@@ -1,13 +1,13 @@
 """
-almond-axol motor.info
+axol motor.info
 
 Read and print status information from a single motor.
 Useful for verifying that a motor is reachable at a given CAN ID.
 The motor type is inferred automatically from the CAN ID.
 
 Examples:
-    almond-axol motor.info --l --id 0x01
-    almond-axol motor.info --r --id 0x06
+    axol motor.info --l --id 0x01
+    axol motor.info --r --id 0x06
 """
 
 import argparse

@@ -1,5 +1,5 @@
 """
-almond-axol zed.install
+axol zed.install
 
 Downloads and installs the pyzed wheel matching the installed ZED SDK version.
 pyzed is not on PyPI, so this command handles the install directly.
