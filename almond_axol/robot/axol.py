@@ -8,7 +8,7 @@ import numpy as np
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
-from .config import AxolConfig
+from .config import ArmConfig, AxolConfig
 from .control import Differentiator, compute_feedforward
 
 _TAU = 2 * math.pi
@@ -61,7 +61,7 @@ class AxolArm:
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
     """
 
-    def __init__(self, bus: CanBus, config: AxolConfig, is_left: bool = True) -> None:
+    def __init__(self, bus: CanBus, config: ArmConfig, is_left: bool = True) -> None:
         self._config = config
         self._motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
         self._differentiator = Differentiator(n=len(list(Joint)))
@@ -395,7 +395,9 @@ class Axol(RobotBase):
         right: AxolArm for the right arm.
 
     Args:
-        config:        Per-joint gains and friction parameters. Defaults to zero.
+        config:        Dual-arm gains config. Left and right arm gains are specified
+                       independently; the right arm defaults to the left with gravity
+                       mirrored for shoulder_2 and elbow.
         left_channel:  SocketCAN interface name for the left arm.
         right_channel: SocketCAN interface name for the right arm.
     """
@@ -413,15 +415,13 @@ class Axol(RobotBase):
 
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
-            self.left = AxolArm(self._left_bus, config, is_left=True)
+            self.left = AxolArm(self._left_bus, config.left, is_left=True)
         else:
             self.left = None
 
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = AxolArm(
-                self._right_bus, config.mirror_gravity(), is_left=False
-            )
+            self.right = AxolArm(self._right_bus, config.right, is_left=False)
         else:
             self.right = None
 

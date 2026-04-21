@@ -29,15 +29,16 @@ class JointGains:
 
 
 @dataclass
-class AxolConfig:
-    """Per-joint impedance control gains and friction parameters for the full arm.
+class ArmConfig:
+    """Per-joint impedance control gains and friction parameters for one arm.
 
     All joints default to zero gains. Override individual joints at construction
     or use ``dataclasses.replace()`` for partial updates::
 
         from dataclasses import replace
 
-        config = replace(AxolConfig(), elbow=JointGains(kp=20.0, kd=2.0))
+        left = replace(ArmConfig(), elbow=JointGains(kp=20.0, kd=2.0))
+        config = AxolConfig(left=left)
         async with Axol(config=config) as axol: ...
 
     The feedforward torque sent to each motor is computed automatically from the
@@ -83,8 +84,8 @@ class AxolConfig:
     )
     elbow: JointGains = field(
         default_factory=lambda: JointGains(
-            kp=200.0,
-            kd=5.0,
+            kp=100.0,
+            kd=2.0,
             fc=0.9459,
             k=760.52,
             fv=1.0965,
@@ -142,7 +143,7 @@ class AxolConfig:
         )
     )
 
-    def mirror_gravity(self) -> AxolConfig:
+    def mirror_gravity(self) -> ArmConfig:
         """Return a copy with gb negated for shoulder_2 and elbow.
 
         shoulder_2 and elbow have mirrored angle ranges on the right arm
@@ -156,3 +157,22 @@ class AxolConfig:
             shoulder_2=replace(self.shoulder_2, gb=-self.shoulder_2.gb),
             elbow=replace(self.elbow, gb=-self.elbow.gb),
         )
+
+
+@dataclass
+class AxolConfig:
+    """Dual-arm configuration: explicit left and right ArmConfig instances.
+
+    The right arm defaults to the left arm's gains with gravity terms mirrored
+    for shoulder_2 and elbow, whose joint ranges are reflected between arms.
+    Override either arm independently::
+
+        from dataclasses import replace
+
+        left = replace(ArmConfig(), elbow=JointGains(kp=20.0, kd=2.0))
+        config = AxolConfig(left=left)
+        async with Axol(config=config) as axol: ...
+    """
+
+    left: ArmConfig = field(default_factory=ArmConfig)
+    right: ArmConfig = field(default_factory=lambda: ArmConfig().mirror_gravity())

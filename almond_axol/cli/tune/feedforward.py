@@ -35,7 +35,7 @@ from scipy.optimize import curve_fit
 
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
-from ...robot.config import AxolConfig
+from ...robot.config import ArmConfig, AxolConfig
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _TAU = 2 * math.pi
@@ -362,7 +362,8 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
-    config_gains = getattr(AxolConfig(), joint.value)
+    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    config_gains = getattr(arm_cfg, joint.value)
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd
 

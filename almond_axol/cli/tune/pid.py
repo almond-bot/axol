@@ -20,7 +20,7 @@ import time
 
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
-from ...robot.config import AxolConfig
+from ...robot.config import ArmConfig, AxolConfig
 from ...robot.control import Differentiator, compute_feedforward
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
@@ -357,7 +357,8 @@ async def _run(args: argparse.Namespace) -> None:
     side_str = "left" if is_left else "right"
     lo, hi = arm_limits(joint, is_left)
 
-    joint_gains = getattr(AxolConfig(), joint.value)
+    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    joint_gains = getattr(arm_cfg, joint.value)
     if args.tff:
         fc, k, fv, fo = joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo
         ga, gb = joint_gains.ga, joint_gains.gb

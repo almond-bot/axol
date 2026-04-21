@@ -206,7 +206,8 @@ async def _run(
 
     try:
         async with CanBus(channel) as bus:
-            arm = AxolArm(bus, AxolConfig(), is_left=is_left)
+            cfg = AxolConfig()
+            arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
 
             stats_task = asyncio.create_task(
                 _stats_monitor(channel, arm, log), name="can_stats_monitor"
