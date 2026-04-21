@@ -237,6 +237,8 @@ async def _identify_joint(
     kd: float,
     is_left: bool,
     velocities: list[float],
+    lo_override: float | None = None,
+    hi_override: float | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run bidirectional multi-velocity sweep over the full joint range.
 
@@ -245,6 +247,10 @@ async def _identify_joint(
         halfdiff_samples: (v, tau_half) — for Fc/k/Fv fitting
     """
     lo, hi = arm_limits(joint, is_left)
+    if lo_override is not None:
+        lo = lo_override
+    if hi_override is not None:
+        hi = hi_override
     sweep_lo = lo + _SWEEP_MARGIN
     sweep_hi = hi - _SWEEP_MARGIN
 
@@ -331,6 +337,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="V",
         help="Velocity setpoints in rad/s (default: ~0.1 0.3 0.6 0.9 1.3 rad/s)",
     )
+    p.add_argument(
+        "--lo",
+        type=float,
+        default=None,
+        metavar="RAD",
+        help="Override lower joint limit for the sweep (rad)",
+    )
+    p.add_argument(
+        "--hi",
+        type=float,
+        default=None,
+        metavar="RAD",
+        help="Override upper joint limit for the sweep (rad)",
+    )
     p.set_defaults(func=run)
 
 
@@ -381,7 +401,14 @@ async def _run(args: argparse.Namespace) -> None:
             await asyncio.sleep(1.0)
 
             avg_samples, halfdiff_samples = await _identify_joint(
-                motors[joint], joint, kp, kd, is_left, args.velocities
+                motors[joint],
+                joint,
+                kp,
+                kd,
+                is_left,
+                args.velocities,
+                lo_override=args.lo,
+                hi_override=args.hi,
             )
 
             if not avg_samples and not halfdiff_samples:
