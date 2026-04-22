@@ -55,7 +55,7 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"\nset-zero-pos — {channel}  id={args.id:#04x}")
 
     async with CanBus(channel) as bus:
-        motor = make_driver(bus, args.id, args.type)
+        motor = make_driver(bus, args.id, kt=1.0, motor_type=args.type)
 
         position_before = await motor.get_position()
         print(f"  position before: {position_before:.4f} rad")

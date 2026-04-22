@@ -89,19 +89,11 @@ All motor commands accept a mutually exclusive `--l` / `--r` flag to select the 
 
 ### `motor.info`
 
-Reads and prints a full status snapshot from a motor: position, velocity, torque, temperature, and voltage.
+Reads and prints a full status snapshot from a motor: status/error code, control mode (Damiao only), position, velocity, torque, temperature, and voltage.
 
 ```bash
 axol motor.info --l --id 0x01
 axol motor.info --r --id 6 --type damiao
-```
-
-### `motor.get-error`
-
-Reads the error/status code and prints `OK` or `FAULT`.
-
-```bash
-axol motor.get-error --r --id 0x06
 ```
 
 ### `motor.set-can-id`
@@ -148,6 +140,7 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 | `--robot {axol,sim}` | `axol` uses real hardware; `sim` uses the software visualizer (required) |
 | `--no-left` | Disable the left arm |
 | `--no-right` | Disable the right arm |
+| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
@@ -170,6 +163,7 @@ Records teleoperation episodes using VR controller inputs and three ZED cameras.
 | `--fps INT` | Frame rate (default: 30) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push-to-hub` | Push to HuggingFace Hub when done |
+| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
@@ -203,6 +197,7 @@ Runs a trained policy autonomously on the robot using three ZED cameras. Between
 | `--repo-id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push-to-hub` | Push rollout dataset to HuggingFace Hub when done |
+| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
 | `--device STR` | PyTorch device for inference (default: `cuda`) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
@@ -254,7 +249,7 @@ Tunes `Kp`/`Kd` gains for a single joint at ~100 Hz using sinusoidal tracking or
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
-| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `elbow`, `wrist_1`, `wrist_2`, `gripper` (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
 | `--kp FLOAT` | Proportional gain (required) |
 | `--kd FLOAT` | Derivative gain (required) |
 | `--tff` | Apply full feedforward (gravity + friction) |

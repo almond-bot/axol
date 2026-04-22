@@ -16,13 +16,6 @@ from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
 
 
-class _ControlMode(Enum):
-    MIT = "mit"
-    POS_VEL = "pos_vel"
-    VEL = "vel"
-    FORCE_POS = "force_pos"
-
-
 class _DamiaoStatus(Enum):
     DISABLED = 0x0
     ENABLED = 0x1
@@ -74,12 +67,6 @@ _DM_BAUD_MAP: dict[int, int] = {
     5_000_000: 9,
 }
 
-_DM_CTRL_MODE_MAP: dict[ControlMode, int] = {
-    ControlMode.MIT: 1,
-    ControlMode.POS_VEL: 2,
-    ControlMode.VEL: 3,
-    ControlMode.FORCE_POS: 4,
-}
 
 _DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
     _DamiaoStatus.DISABLED: MotorStatus.DISABLED,
@@ -104,10 +91,11 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
 
 
 class DamiaoMotor(MotorDriver):
-    def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
+    def __init__(self, bus: CanBus, motor_id: int, feedback_id: int, kt: float) -> None:
         self._bus = bus
         self._motor_id = motor_id
         self._feedback_id = feedback_id
+        self._kt = kt
 
         self._feedback: _MotorFeedback | None = None
         self._registers: dict[int, float | int] = {}
@@ -235,11 +223,11 @@ class DamiaoMotor(MotorDriver):
         stiffness: float = 0.0,
         damping: float = 0.0,
         feedforward_torque: float = 0.0,
-        control_mode: _ControlMode = _ControlMode.MIT,
+        control_mode: ControlMode = ControlMode.IMPEDANCE,
         velocity_limit: float = 0.0,
         current_limit: float = 0.0,
     ) -> None:
-        if control_mode == _ControlMode.MIT:
+        if control_mode == ControlMode.IMPEDANCE:
             pos_u = _float_to_uint(target_position, -self._p_max, self._p_max, 16)
             vel_u = _float_to_uint(target_velocity, -self._v_max, self._v_max, 12)
             kp_u = _float_to_uint(stiffness, 0.0, 500.0, 12)
@@ -258,13 +246,13 @@ class DamiaoMotor(MotorDriver):
                 ]
             )
             await self._raw_send(data)
-        elif control_mode == _ControlMode.POS_VEL:
+        elif control_mode == ControlMode.POSITION_VELOCITY:
             data = struct.pack("<ff", target_position, target_velocity)
             await self._raw_send(data, arb_id=0x100 + self._motor_id)
-        elif control_mode == _ControlMode.VEL:
+        elif control_mode == ControlMode.VELOCITY:
             data = struct.pack("<f", target_velocity) + b"\x00" * 4
             await self._raw_send(data, arb_id=0x200 + self._motor_id)
-        elif control_mode == _ControlMode.FORCE_POS:
+        elif control_mode == ControlMode.POSITION_FORCE:
             v_scaled = int(max(0.0, min(100.0, velocity_limit)) * 100)
             i_scaled = int(max(0.0, min(1.0, current_limit)) * 10000)
             data = struct.pack("<fHH", target_position, v_scaled, i_scaled)
@@ -298,8 +286,13 @@ class DamiaoMotor(MotorDriver):
             except MotorError:
                 pass
 
+    async def get_control_mode(self) -> ControlMode:
+        """Read the active control mode from the motor's register."""
+        value = await self._read_register(_DM_REG_CTRL_MODE)
+        return ControlMode(int(value))
+
     async def set_control_mode(self, mode: ControlMode) -> None:
-        await self._write_register(_DM_REG_CTRL_MODE, _DM_CTRL_MODE_MAP[mode])
+        await self._write_register(_DM_REG_CTRL_MODE, int(mode))
 
     async def clear_errors(self) -> None:
         await self._raw_send(bytes([0xFF] * 7 + [0xFB]))
@@ -340,27 +333,32 @@ class DamiaoMotor(MotorDriver):
         feedback = await self._request_feedback()
         return _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
 
-    async def set_position(self, position: float, max_speed: float) -> None:
+    async def set_position_velocity(self, position: float, max_speed: float) -> None:
         await self._send_cmd(
             target_position=position,
             target_velocity=max_speed,
-            control_mode=_ControlMode.POS_VEL,
+            control_mode=ControlMode.POSITION_VELOCITY,
         )
 
     async def set_velocity(self, velocity: float) -> None:
         await self._send_cmd(
             target_velocity=velocity,
-            control_mode=_ControlMode.VEL,
+            control_mode=ControlMode.VELOCITY,
         )
 
-    async def set_force_position(
-        self, position: float, max_speed: float, max_current: float
+    async def set_position_force(
+        self, position: float, max_speed: float, max_torque: float
     ) -> None:
+        # Convert Nm → A via kt, then normalise to [0, 1] fraction of rated current
+        # (i_rated = t_max / kt, so the kt terms cancel: current_A / i_rated = max_torque / t_max).
+        current_limit = min(
+            1.0, max(0.0, (max_torque / self._kt) / (self._t_max / self._kt))
+        )
         await self._send_cmd(
             target_position=position,
             velocity_limit=max_speed,
-            current_limit=max_current,
-            control_mode=_ControlMode.FORCE_POS,
+            current_limit=current_limit,
+            control_mode=ControlMode.POSITION_FORCE,
         )
 
     async def set_acceleration(
@@ -411,7 +409,7 @@ class DamiaoMotor(MotorDriver):
         await self._write_register(_DM_REG_CAN_BAUD, code)
         await self._store_parameters()
 
-    async def motion_control(
+    async def set_impedance(
         self,
         p_des: float,
         v_des: float,
@@ -425,5 +423,5 @@ class DamiaoMotor(MotorDriver):
             stiffness=kp,
             damping=kd,
             feedforward_torque=t_ff,
-            control_mode=_ControlMode.MIT,
+            control_mode=ControlMode.IMPEDANCE,
         )

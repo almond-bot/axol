@@ -8,7 +8,7 @@ import numpy as np
 from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
 from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
-from .config import ArmConfig, AxolConfig
+from .config import AxolConfig
 from .control import Differentiator, compute_feedforward
 
 _TAU = 2 * math.pi
@@ -37,6 +37,10 @@ _GRIPPER_CALIB_STEP = 0.005  # rad per step
 _GRIPPER_CALIB_SETTLE = 0.001  # s per step
 _GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
 
+# Impedance gains used only during gripper open-stop calibration.
+_GRIPPER_CALIB_KP = 50.0
+_GRIPPER_CALIB_KD = 1.0
+
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     """Return (min, max) position limits for a joint on the given arm.
@@ -61,9 +65,15 @@ class AxolArm:
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
     """
 
-    def __init__(self, bus: CanBus, config: ArmConfig, is_left: bool = True) -> None:
+    def __init__(
+        self,
+        bus: CanBus,
+        config: AxolConfig,
+        is_left: bool = True,
+    ) -> None:
         self._config = config
-        self._motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
+        self._arm_config = config.left if is_left else config.right
+        self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
         self._differentiator = Differentiator(n=len(list(Joint)))
 
         # Clipping arrays in raw motor radians.  arm_limits() returns normalised [0, 1]
@@ -96,12 +106,12 @@ class AxolArm:
             torque: If True, also fetch and cache torque each cycle.
         """
         await asyncio.gather(
-            *[m.start_telemetry(hz, torque=torque) for m in self._motors.values()]
+            *[m.start_telemetry(hz, torque=torque) for m in self.motors.values()]
         )
 
     async def stop_telemetry(self) -> None:
         """Stop the background telemetry polling loop on all motors."""
-        await asyncio.gather(*[m.stop_telemetry() for m in self._motors.values()])
+        await asyncio.gather(*[m.stop_telemetry() for m in self.motors.values()])
 
     @property
     def positions(self) -> np.ndarray:
@@ -109,10 +119,10 @@ class AxolArm:
 
         Returns shape (8,) array in Joint enum order. Arm joints are in radians;
         the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
-        consistent with set_position and motion_control.
+        consistent with set_position_velocity and motion_control.
         """
         joints = list(Joint)
-        values = [self._motors[j].position for j in joints]
+        values = [self.motors[j].position for j in joints]
         gripper_i = self._gripper_i
         values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
@@ -125,7 +135,7 @@ class AxolArm:
 
         Returns shape (8,) array in Joint enum order.
         """
-        return np.array([m.torque for m in self._motors.values()], dtype=np.float32)
+        return np.array([m.torque for m in self.motors.values()], dtype=np.float32)
 
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
@@ -139,17 +149,18 @@ class AxolArm:
         Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
         (close) which are used for normalization and clipping.
 
-        Must be called with the gripper motor already enabled and in MIT mode.
+        Must be called with the gripper motor already enabled and in IMPEDANCE mode.
         """
-        motor = self._motors[Joint.GRIPPER]
-        gcfg = self._config.gripper
+        motor = self.motors[Joint.GRIPPER]
         gripper_i = self._gripper_i
 
         target = await motor.get_position()
 
         for _ in range(_GRIPPER_CALIB_MAX_STEPS):
             target -= _GRIPPER_CALIB_STEP
-            await motor.motion_control(target, 0.0, gcfg.kp, gcfg.kd, 0.0)
+            await motor.set_impedance(
+                target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+            )
             await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
             torque = await motor.get_torque()
             if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
@@ -163,20 +174,21 @@ class AxolArm:
         self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
 
     async def enable(self) -> None:
-        """Enable all motors in MIT mode, then calibrate the gripper open position."""
-        await asyncio.gather(*[m.enable() for m in self._motors.values()])
+        """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode."""
+        await asyncio.gather(*[m.enable() for m in self.motors.values()])
         await asyncio.gather(
-            *[m.set_control_mode(ControlMode.MIT) for m in self._motors.values()]
+            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in self.motors.values()]
         )
         await self._calibrate_gripper()
+        await self.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
-        await asyncio.gather(*[m.disable() for m in self._motors.values()])
+        await asyncio.gather(*[m.disable() for m in self.motors.values()])
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on all motors."""
-        await asyncio.gather(*[m.clear_errors() for m in self._motors.values()])
+        await asyncio.gather(*[m.clear_errors() for m in self.motors.values()])
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         """Set the control mode on all motors.
@@ -184,7 +196,7 @@ class AxolArm:
         Args:
             mode: Desired control mode.
         """
-        await asyncio.gather(*[m.set_control_mode(mode) for m in self._motors.values()])
+        await asyncio.gather(*[m.set_control_mode(mode) for m in self.motors.values()])
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -195,11 +207,11 @@ class AxolArm:
 
         Returns shape (8,) array in Joint enum order. Arm joints are in radians;
         the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
-        consistent with set_position and motion_control.
+        consistent with set_position_velocity and motion_control.
         """
         joints = list(Joint)
         values = list(
-            await asyncio.gather(*[self._motors[j].get_position() for j in joints])
+            await asyncio.gather(*[self.motors[j].get_position() for j in joints])
         )
         gripper_i = self._gripper_i
         values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
@@ -213,7 +225,7 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order.
         """
         joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_velocity() for j in joints])
+        values = await asyncio.gather(*[self.motors[j].get_velocity() for j in joints])
         return np.array(values, dtype=np.float32)
 
     async def get_torques(self) -> np.ndarray:
@@ -222,7 +234,7 @@ class AxolArm:
         Damiao: Nm. MyActuator: phase current in A.
         Returns shape (8,) array in Joint enum order.
         """
-        values = await asyncio.gather(*[m.get_torque() for m in self._motors.values()])
+        values = await asyncio.gather(*[m.get_torque() for m in self.motors.values()])
         return np.array(values, dtype=np.float32)
 
     async def get_temperatures(self) -> np.ndarray:
@@ -231,7 +243,7 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order.
         """
         values = await asyncio.gather(
-            *[m.get_temperature() for m in self._motors.values()]
+            *[m.get_temperature() for m in self.motors.values()]
         )
         return np.array(values, dtype=np.float32)
 
@@ -240,7 +252,7 @@ class AxolArm:
 
         Returns shape (8,) array in Joint enum order.
         """
-        values = await asyncio.gather(*[m.get_voltage() for m in self._motors.values()])
+        values = await asyncio.gather(*[m.get_voltage() for m in self.motors.values()])
         return np.array(values, dtype=np.float32)
 
     async def get_error_codes(self) -> list[MotorStatus]:
@@ -250,7 +262,7 @@ class AxolArm:
         """
         joints = list(Joint)
         values = await asyncio.gather(
-            *[self._motors[j].get_error_code() for j in joints]
+            *[self.motors[j].get_error_code() for j in joints]
         )
         return list(values)
 
@@ -260,7 +272,7 @@ class AxolArm:
         Returns a list in Joint enum order.
         """
         joints = list(Joint)
-        values = await asyncio.gather(*[self._motors[j].get_gains() for j in joints])
+        values = await asyncio.gather(*[self.motors[j].get_gains() for j in joints])
         return list(values)
 
     # ------------------------------------------------------------------ #
@@ -272,7 +284,7 @@ class AxolArm:
 
         Changes are persisted to non-volatile memory.
         """
-        await asyncio.gather(*[self._motors[j].set_gains(g) for j, g in gains.items()])
+        await asyncio.gather(*[self.motors[j].set_gains(g) for j, g in gains.items()])
 
     async def set_zero_position(self, joints: list[Joint]) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
@@ -280,7 +292,7 @@ class AxolArm:
         Args:
             joints: List of joints to zero.
         """
-        await asyncio.gather(*[self._motors[j].set_zero_position() for j in joints])
+        await asyncio.gather(*[self.motors[j].set_zero_position() for j in joints])
 
     async def set_acceleration(self, accelerations: dict[Joint, float]) -> None:
         """Set the acceleration ramp per joint. Deceleration matches acceleration.
@@ -290,10 +302,12 @@ class AxolArm:
                            Joints not in the dict are unchanged.
         """
         await asyncio.gather(
-            *[self._motors[j].set_acceleration(a) for j, a in accelerations.items()]
+            *[self.motors[j].set_acceleration(a) for j, a in accelerations.items()]
         )
 
-    async def set_position(self, positions: np.ndarray, max_speed: float) -> None:
+    async def set_position_velocity(
+        self, positions: np.ndarray, max_speed: float
+    ) -> None:
         """Move joints to absolute positions using each motor's built-in controller.
 
         Positions are clipped to the arm's joint limits before being sent.
@@ -312,7 +326,7 @@ class AxolArm:
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
         await asyncio.gather(
             *[
-                self._motors[j].set_position(float(clipped[i]), max_speed)
+                self.motors[j].set_position_velocity(float(clipped[i]), max_speed)
                 for i, j in enumerate(Joint)
             ]
         )
@@ -325,22 +339,28 @@ class AxolArm:
         """
         await asyncio.gather(
             *[
-                self._motors[j].set_velocity(float(velocities[i]))
+                self.motors[j].set_velocity(float(velocities[i]))
                 for i, j in enumerate(Joint)
             ]
         )
 
     async def motion_control(self, q: np.ndarray) -> None:
-        """Send MIT impedance control to all joints concurrently.
+        """Send control commands to all joints concurrently.
 
-        Desired positions are clipped to the arm's joint limits before being sent.
-        Gains (kp, kd) and friction params are read from the AxolConfig. The
-        feedforward torque is computed as gravity + friction; it is not specified
-        directly in the config.
+        The 7 arm joints use IMPEDANCE control: gains (kp, kd) and friction
+        parameters come from ArmConfig; feedforward torque is computed as
+        gravity + friction compensation.
+
+        The gripper uses POSITION_FORCE control: it tracks the target position
+        at up to ``ArmConfig.gripper.max_speed`` (rad/s) with torque capped
+        at ``ArmConfig.gripper.torque_limit`` (Nm).
+
+        All positions are clipped to joint limits before being sent.
 
         Args:
-            q: Shape (8,) array of desired positions (rad) in Joint enum order,
-               except gripper which is [0, 1].
+            q: Shape (8,) array of desired positions in Joint enum order.
+               Arm joints are in radians; gripper is normalized to [0, 1]
+               (0.0 = closed, 1.0 = fully open).
         """
         q = q.copy()
         gripper_i = self._gripper_i
@@ -352,26 +372,38 @@ class AxolArm:
         # Velocity feedforward via differentiation of commanded positions (rad/s).
         velocities = self._differentiator.differentiate(list(clipped))
 
+        gripper_i = self._gripper_i
+        gripper_pos = float(clipped[gripper_i])
+        gripper_max_speed = self._arm_config.gripper.max_speed
+        gripper_torque_limit = self._arm_config.gripper.torque_limit
+
+        def _mit_cmd(i: int, j: Joint):
+            gains = getattr(self._arm_config, j.value)
+            t_ff = compute_feedforward(
+                float(clipped[i]),
+                velocities[i],
+                gains.ga,
+                gains.gb,
+                gains.fc,
+                gains.k,
+                gains.fv,
+                gains.fo,
+            )
+            return self.motors[j].set_impedance(
+                float(clipped[i]),
+                velocities[i],
+                gains.kp,
+                gains.kd,
+                t_ff,
+            )
+
         await asyncio.gather(
-            *[
-                self._motors[j].motion_control(
-                    float(clipped[i]),
-                    velocities[i],
-                    getattr(self._config, j.value).kp,
-                    getattr(self._config, j.value).kd,
-                    compute_feedforward(
-                        float(clipped[i]),
-                        velocities[i],
-                        getattr(self._config, j.value).ga,
-                        getattr(self._config, j.value).gb,
-                        getattr(self._config, j.value).fc,
-                        getattr(self._config, j.value).k,
-                        getattr(self._config, j.value).fv,
-                        getattr(self._config, j.value).fo,
-                    ),
-                )
-                for i, j in enumerate(Joint)
-            ]
+            *[_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER],
+            self.motors[Joint.GRIPPER].set_position_force(
+                gripper_pos,
+                gripper_max_speed,
+                gripper_torque_limit,
+            ),
         )
 
 
@@ -415,13 +447,13 @@ class Axol(RobotBase):
 
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
-            self.left = AxolArm(self._left_bus, config.left, is_left=True)
+            self.left = AxolArm(self._left_bus, config, is_left=True)
         else:
             self.left = None
 
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = AxolArm(self._right_bus, config.right, is_left=False)
+            self.right = AxolArm(self._right_bus, config, is_left=False)
         else:
             self.right = None
 
@@ -664,7 +696,7 @@ class Axol(RobotBase):
         if tasks:
             await asyncio.gather(*tasks)
 
-    async def set_positions(
+    async def set_positions_velocity(
         self,
         left: np.ndarray | None = None,
         right: np.ndarray | None = None,
@@ -680,9 +712,9 @@ class Axol(RobotBase):
         """
         tasks = []
         if left is not None and self.left is not None:
-            tasks.append(self.left.set_position(left, max_speed))
+            tasks.append(self.left.set_position_velocity(left, max_speed))
         if right is not None and self.right is not None:
-            tasks.append(self.right.set_position(right, max_speed))
+            tasks.append(self.right.set_position_velocity(right, max_speed))
         if tasks:
             await asyncio.gather(*tasks)
 
@@ -710,11 +742,14 @@ class Axol(RobotBase):
         left: np.ndarray | None = None,
         right: np.ndarray | None = None,
     ) -> None:
-        """Send MIT impedance control to both arms concurrently.
+        """Send control commands to both arms concurrently.
+
+        Arm joints use IMPEDANCE control; the gripper uses POSITION_FORCE control.
+        See ``AxolArm.motion_control`` for full details.
 
         Args:
-            left:  Shape (8,) array of target positions (rad) for the left arm.
-                   ``None`` skips the arm.
+            left:  Shape (8,) array of target positions for the left arm
+                   (arm joints in rad, gripper in [0, 1]).  ``None`` skips.
             right: Same for the right arm.
         """
         tasks = []

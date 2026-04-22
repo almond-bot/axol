@@ -40,11 +40,7 @@ class MotorDriver(ABC):
 
     @abstractmethod
     async def get_torque(self) -> float:
-        """Return current torque estimate.
-
-        Damiao: estimated output torque in Nm.
-        MyActuator: phase current in Amperes (multiply by motor Kt for Nm).
-        """
+        """Return current torque estimate in Nm."""
         ...
 
     @abstractmethod
@@ -79,7 +75,7 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
-    async def set_position(self, position: float, max_speed: float) -> None:
+    async def set_position_velocity(self, position: float, max_speed: float) -> None:
         """Move to an absolute position using the motor's built-in position controller.
 
         Args:
@@ -97,20 +93,28 @@ class MotorDriver(ABC):
         """
         ...
 
-    async def set_force_position(
-        self, position: float, max_speed: float, max_current: float
+    async def get_control_mode(self) -> ControlMode | None:
+        """Return the active control mode read from hardware, or None if unsupported.
+
+        Damiao: reads register 10 and returns the matching ControlMode.
+        MyActuator: returns None — the mode is implicit in each command sent.
+        """
+        return None
+
+    async def set_position_force(
+        self, position: float, max_speed: float, max_torque: float
     ) -> None:
-        """Move to a position with hard speed and current limits.
+        """Move to a position with hard speed and torque limits.
 
         Only supported by Damiao motors. Raises MotorError on MyActuator.
 
         Args:
-            position:    Target shaft position (rad)
-            max_speed:   Maximum speed during the move (rad/s)
-            max_current: Maximum phase current, normalized [0.0, 1.0]
+            position:   Target shaft position (rad)
+            max_speed:  Maximum speed during the move (rad/s)
+            max_torque: Maximum output torque (Nm)
         """
         raise MotorError(
-            f"set_force_position is not supported by {type(self).__name__}"
+            f"set_position_force is not supported by {type(self).__name__}"
         )
 
     @abstractmethod
@@ -144,7 +148,7 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
-    async def motion_control(
+    async def set_impedance(
         self,
         p_des: float,
         v_des: float,
@@ -152,7 +156,7 @@ class MotorDriver(ABC):
         kd: float,
         t_ff: float,
     ) -> None:
-        """Send an MIT-style impedance control command.
+        """Send an impedance control command.
 
         Args:
             p_des: Desired position (rad)

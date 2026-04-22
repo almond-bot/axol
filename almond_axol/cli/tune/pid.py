@@ -68,11 +68,13 @@ async def _ramp_others_to_zero(
     motors: dict[Joint, Motor],
     exclude: Joint,
 ) -> None:
-    """Send non-test joints to 0 via set_position and poll until arrival."""
+    """Send non-test joints to 0 via set_position_velocity and poll until arrival."""
     joints = [j for j in ARM_JOINTS if j != exclude]
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max((abs(p) for p in pos_vals), default=0.0)
-    await asyncio.gather(*[motors[j].set_position(0.0, _RAMP_SPEED) for j in joints])
+    await asyncio.gather(
+        *[motors[j].set_position_velocity(0.0, _RAMP_SPEED) for j in joints]
+    )
     timeout = max_dist / _RAMP_SPEED + 2.0
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -115,7 +117,7 @@ async def run_sine(
     while True:
         t = time.monotonic() - t0
         alpha = min(t / 2.0, 1.0)
-        await test_motor.motion_control(
+        await test_motor.set_impedance(
             start_rad + alpha * (center - start_rad), 0.0, kp, kd, 0.0
         )
         if alpha >= 1.0:
@@ -138,7 +140,7 @@ async def run_sine(
         target = center + amp * math.sin(2 * math.pi * freq * t)
         v_des = diff.differentiate([target])[0]
         tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
-        await test_motor.motion_control(target, v_des, kp, kd, tff)
+        await test_motor.set_impedance(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
         t_read = time.monotonic() - start
         target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
@@ -218,7 +220,7 @@ async def run_step(
             loop_start = time.monotonic()
             t = time.monotonic() - start
             tff = compute_feedforward(phase_target, 0.0, ga, gb, fc, k, fv, fo)
-            await test_motor.motion_control(phase_target, 0.0, kp, kd, tff)
+            await test_motor.set_impedance(phase_target, 0.0, kp, kd, tff)
             actual = await test_motor.get_position()
             log.append(
                 {
@@ -380,7 +382,9 @@ async def _run(args: argparse.Namespace) -> None:
         await asyncio.gather(
             *[
                 motors[j].set_control_mode(
-                    ControlMode.MIT if j == joint else ControlMode.POS_VEL
+                    ControlMode.IMPEDANCE
+                    if j == joint
+                    else ControlMode.POSITION_VELOCITY
                 )
                 for j in motors
             ]
@@ -441,7 +445,7 @@ async def _run(args: argparse.Namespace) -> None:
                     t = time.monotonic() - t0
                     alpha = min(t / duration, 1.0)
                     loop_start = time.monotonic()
-                    await motors[joint].motion_control(
+                    await motors[joint].set_impedance(
                         start_rad * (1.0 - alpha), 0.0, args.kp, args.kd, 0.0
                     )
                     if alpha >= 1.0:
@@ -452,6 +456,6 @@ async def _run(args: argparse.Namespace) -> None:
             except Exception:
                 pass
             await asyncio.gather(
-                *[m.set_control_mode(ControlMode.MIT) for m in motors.values()]
+                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
             )
             await asyncio.gather(*[m.disable() for m in motors.values()])

@@ -39,7 +39,7 @@ class RobotBase(ABC):
         left: np.ndarray | None = None,
         right: np.ndarray | None = None,
     ) -> None:
-        """Send MIT impedance control commands to one or both arms.
+        """Send control commands to one or both arms (impedance for arm joints, position-force for gripper).
 
         Args:
             left:  Shape (8,) array of target positions (rad) in Joint enum order.

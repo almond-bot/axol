@@ -22,7 +22,7 @@ class _MotorType(Enum):
 class _JointConfig:
     kind: _MotorType
     motor_id: int
-    kt: float | None = None  # Nm/A — MyActuator phase current → torque; None for Damiao
+    kt: float
 
 
 _ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
@@ -33,9 +33,9 @@ _JOINT_CONFIG: dict[Joint, _JointConfig] = {
     Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=2.1),
     Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=2.1),
     Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=2.1),
-    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06),
-    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
-    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
+    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06, kt=0.945),
+    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07, kt=0.945),
+    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08, kt=0.945),
 }
 
 
@@ -43,11 +43,13 @@ _ID_TO_TYPE = {cfg.motor_id: cfg.kind for cfg in _JOINT_CONFIG.values()}
 
 
 def make_driver(
-    bus: CanBus, motor_id: int, motor_type: str | None = None
+    bus: CanBus, motor_id: int, kt: float, motor_type: str | None = None
 ) -> MotorDriver:
     """Return the correct MotorDriver for *motor_id*.
 
     Args:
+        kt:         Torque constant (Nm/A). Used by ``get_torque()`` to convert
+                    raw current readings to Nm.
         motor_type: ``"myactuator"`` or ``"damiao"`` to override inference.
                     If ``None``, the type is inferred from *motor_id*.
     """
@@ -61,8 +63,11 @@ def make_driver(
                 + ", ".join(f"{i:#04x}" for i in sorted(_ID_TO_TYPE))
             )
     if kind == _MotorType.MYACTUATOR:
-        return MyActuatorMotor(bus, motor_id)
-    return DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
+        return MyActuatorMotor(bus, motor_id, kt=kt)
+    elif kind == _MotorType.DAMIAO:
+        return DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id, kt=kt)
+    else:
+        raise ValueError(f"Unknown motor type {kind}")
 
 
 class Motor:
@@ -79,14 +84,10 @@ class Motor:
 
     def __init__(self, bus: CanBus, joint: Joint, can_id: int | None = None) -> None:
         self.joint = joint
+        self.mode: ControlMode | None = None
         cfg = _JOINT_CONFIG[joint]
         motor_id = can_id if can_id is not None else cfg.motor_id
-        self._kt = cfg.kt  # Nm/A for MyActuator; None for Damiao (already Nm)
-        self._driver: MotorDriver
-        if cfg.kind == _MotorType.MYACTUATOR:
-            self._driver = MyActuatorMotor(bus, motor_id)
-        else:
-            self._driver = DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
+        self._driver = make_driver(bus, motor_id, kt=cfg.kt)
         self._position: float | None = None
         self._torque: float | None = None
         self._telemetry_task: asyncio.Task | None = None
@@ -121,6 +122,15 @@ class Motor:
             mode: Desired control mode.
         """
         await self._driver.set_control_mode(mode)
+        self.mode = mode
+
+    async def get_control_mode(self) -> ControlMode | None:
+        """Return the active control mode read from hardware, or None if unsupported.
+
+        Damiao: reads register 10 and returns the matching ControlMode.
+        MyActuator: returns None — the mode is implicit in each command sent.
+        """
+        return await self._driver.get_control_mode()
 
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
@@ -135,28 +145,19 @@ class Motor:
         return await self._driver.get_velocity()
 
     async def get_torque(self) -> float:
-        """Return current torque estimate in Nm.
-
-        Damiao: estimated output torque in Nm directly.
-        MyActuator: phase current (A) multiplied by the joint's Kt (Nm/A).
-        """
+        """Return current torque estimate in Nm."""
         if self._telemetry_task is not None:
             raise MotorError(
                 f"Telemetry is active on {self.joint} — use motor.torque or stop_telemetry() first"
             )
-        raw = await self._driver.get_torque()
-        return raw * self._kt if self._kt is not None else raw
+        return await self._driver.get_torque()
 
     async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         """Start the background polling loop at the given frequency.
 
-        Damiao: one CAN request per cycle (feedback frame gives position + torque).
-        MyActuator: two requests fired concurrently; cache is updated as each
-        response arrives independently — position does not wait for torque.
-
         Args:
             hz:     Poll frequency in Hz.
-            torque: If True, also fetch and cache torque each cycle.
+            torque: If True, also fetch and cache torque (Nm) each cycle.
         """
         await self.stop_telemetry()
         self._telemetry_task = asyncio.create_task(
@@ -175,15 +176,7 @@ class Motor:
 
     async def _telemetry_loop(self, hz: float, *, torque: bool = False) -> None:
         interval = 1.0 / hz
-        kt = self._kt
-        if torque:
-            on_torque = (
-                (lambda t: setattr(self, "_torque", t * kt))
-                if kt is not None
-                else (lambda t: setattr(self, "_torque", t))
-            )
-        else:
-            on_torque = None
+        on_torque = (lambda t: setattr(self, "_torque", t)) if torque else None
         while True:
             start = asyncio.get_event_loop().time()
             try:
@@ -200,23 +193,23 @@ class Motor:
     def position(self) -> float:
         """Latest cached shaft position (rad).
 
-        Populated by start_telemetry() or motion_control() responses.
+        Populated by start_telemetry() or set_impedance() responses.
         """
         if self._position is None:
             raise MotorError(
-                f"No position data for {self.joint} — call start_telemetry() or send a motion_control() command first"
+                f"No position data for {self.joint} — call start_telemetry() or send a set_impedance() command first"
             )
         return self._position
 
     @property
     def torque(self) -> float:
-        """Latest cached torque estimate (Nm / A).
+        """Latest cached torque estimate (Nm).
 
-        Populated by start_telemetry(torque=True) or motion_control() responses.
+        Populated by start_telemetry(torque=True) or set_impedance() responses.
         """
         if self._torque is None:
             raise MotorError(
-                f"No torque data for {self.joint} — call start_telemetry(torque=True) or send a motion_control() command first"
+                f"No torque data for {self.joint} — call start_telemetry(torque=True) or send a set_impedance() command first"
             )
         return self._torque
 
@@ -235,36 +228,56 @@ class Motor:
         """Return the current motor status / error code."""
         return await self._driver.get_error_code()
 
-    async def set_position(self, position: float, max_speed: float) -> None:
+    async def set_position_velocity(self, position: float, max_speed: float) -> None:
         """Move to an absolute position using the motor's built-in position controller.
+
+        Requires the motor to be in POSITION_VELOCITY mode (set via set_control_mode).
 
         Args:
             position:  Target shaft position (rad)
             max_speed: Maximum speed during the move (rad/s)
         """
-        await self._driver.set_position(position, max_speed)
+        if self.mode != ControlMode.POSITION_VELOCITY:
+            raise RuntimeError(
+                f"{self.joint} is in mode {self.mode}, expected POSITION_VELOCITY. "
+                f"Call set_control_mode(ControlMode.POSITION_VELOCITY) first."
+            )
+        await self._driver.set_position_velocity(position, max_speed)
 
     async def set_velocity(self, velocity: float) -> None:
         """Command a target velocity using the motor's built-in speed controller.
 
+        Requires the motor to be in VELOCITY mode (set via set_control_mode).
+
         Args:
             velocity: Target shaft velocity (rad/s)
         """
+        if self.mode != ControlMode.VELOCITY:
+            raise RuntimeError(
+                f"{self.joint} is in mode {self.mode}, expected VELOCITY. "
+                f"Call set_control_mode(ControlMode.VELOCITY) first."
+            )
         await self._driver.set_velocity(velocity)
 
-    async def set_force_position(
-        self, position: float, max_speed: float, max_current: float
+    async def set_position_force(
+        self, position: float, max_speed: float, max_torque: float
     ) -> None:
-        """Move to a position with hard speed and current limits.
+        """Move to a position with hard speed and torque limits.
 
         Only supported by Damiao motors. Raises MotorError on MyActuator.
+        Requires the motor to be in POSITION_FORCE mode (set via set_control_mode).
 
         Args:
-            position:    Target shaft position (rad)
-            max_speed:   Maximum speed during the move (rad/s)
-            max_current: Maximum phase current, normalized [0.0, 1.0]
+            position:   Target shaft position (rad)
+            max_speed:  Maximum speed during the move (rad/s)
+            max_torque: Maximum output torque (Nm)
         """
-        await self._driver.set_force_position(position, max_speed, max_current)
+        if self.mode != ControlMode.POSITION_FORCE:
+            raise RuntimeError(
+                f"{self.joint} is in mode {self.mode}, expected POSITION_FORCE. "
+                f"Call set_control_mode(ControlMode.POSITION_FORCE) first."
+            )
+        await self._driver.set_position_force(position, max_speed, max_torque)
 
     async def set_acceleration(
         self, acceleration: float, deceleration: float | None = None
@@ -320,7 +333,7 @@ class Motor:
         """
         await self._driver.set_can_baud_rate(baud_rate)
 
-    async def motion_control(
+    async def set_impedance(
         self,
         p_des: float,
         v_des: float,
@@ -328,7 +341,9 @@ class Motor:
         kd: float,
         t_ff: float,
     ) -> None:
-        """Send an MIT-style impedance control command.
+        """Send an impedance control command.
+
+        Requires the motor to be in IMPEDANCE mode (set via set_control_mode).
 
         Args:
             p_des: Desired position (rad)
@@ -337,4 +352,9 @@ class Motor:
             kd:    Velocity damping   [0, 5]
             t_ff:  Feedforward torque (Nm)
         """
-        await self._driver.motion_control(p_des, v_des, kp, kd, t_ff)
+        if self.mode != ControlMode.IMPEDANCE:
+            raise RuntimeError(
+                f"{self.joint} is in mode {self.mode}, expected IMPEDANCE. "
+                f"Call set_control_mode(ControlMode.IMPEDANCE) first."
+            )
+        await self._driver.set_impedance(p_des, v_des, kp, kd, t_ff)

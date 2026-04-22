@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 
 @dataclass
 class JointGains:
-    """MIT impedance control gains and friction parameters for one joint.
+    """Impedance control gains and friction parameters for one joint.
 
     Attributes:
         kp:   Position stiffness [0, 500]
@@ -18,14 +18,27 @@ class JointGains:
         gb:   Gravity feedforward sine coefficient
     """
 
-    kp: float = 0.0
-    kd: float = 0.0
-    fc: float = 0.0
-    k: float = 0.0
-    fv: float = 0.0
-    fo: float = 0.0
-    ga: float = 0.0
-    gb: float = 0.0
+    kp: float
+    kd: float
+    fc: float
+    k: float
+    fv: float
+    fo: float
+    ga: float
+    gb: float
+
+
+@dataclass
+class PositionForceConfig:
+    """Position-force control parameters.
+
+    Attributes:
+        torque_limit: Peak output torque (Nm).
+        max_speed:    Maximum joint speed (rad/s).
+    """
+
+    torque_limit: float
+    max_speed: float
 
 
 @dataclass
@@ -130,17 +143,8 @@ class ArmConfig:
             gb=0.6200,
         )
     )
-    gripper: JointGains = field(
-        default_factory=lambda: JointGains(
-            kp=50.0,
-            kd=1.0,
-            fc=0.1194,
-            k=129.10,
-            fv=0.2604,
-            fo=0.0298,
-            ga=0.0002,
-            gb=0.0008,
-        )
+    gripper: PositionForceConfig = field(
+        default_factory=lambda: PositionForceConfig(torque_limit=1.0, max_speed=10.0)
     )
 
     def mirror_gravity(self) -> ArmConfig:
@@ -148,7 +152,7 @@ class ArmConfig:
 
         shoulder_2 and elbow have mirrored angle ranges on the right arm
         (e.g. elbow: [0, 0.42τ] left vs [-0.42τ, 0] right).  Because
-        sin(−q) = −sin(q), the gb coefficient must flip sign while ga
+        sin(-q) = -sin(q), the gb coefficient must flip sign while ga
         (cosine term) stays the same.  All other joints have symmetric
         limits so their gravity fits are valid for both arms unchanged.
         """
@@ -161,17 +165,19 @@ class ArmConfig:
 
 @dataclass
 class AxolConfig:
-    """Dual-arm configuration: explicit left and right ArmConfig instances.
+    """Top-level configuration for both arms and grippers.
 
-    The right arm defaults to the left arm's gains with gravity terms mirrored
-    for shoulder_2 and elbow, whose joint ranges are reflected between arms.
-    Override either arm independently::
+    ``right`` defaults to ``left`` with gravity terms mirrored for
+    shoulder_2 and elbow; override either arm independently::
 
         from dataclasses import replace
 
-        left = replace(ArmConfig(), elbow=JointGains(kp=20.0, kd=2.0))
-        config = AxolConfig(left=left)
+        config = AxolConfig(left=replace(ArmConfig(), elbow=JointGains(kp=20.0, kd=2.0)))
         async with Axol(config=config) as axol: ...
+
+    Attributes:
+        left: Per-joint gains, friction parameters, and gripper config for the left arm.
+        right: Same as ``left`` but with mirrored gravity terms.
     """
 
     left: ArmConfig = field(default_factory=ArmConfig)

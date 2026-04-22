@@ -1,4 +1,4 @@
-"""Open then close the gripper on each arm using MIT impedance control.
+"""Open then close the gripper on each arm using impedance control for the arm joints and position-force control for the gripper.
 
 Run directly:
     python -m almond_axol.test.gripper
