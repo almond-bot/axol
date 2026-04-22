@@ -59,7 +59,7 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"\nset-can-id — {channel}  {args.current_id:#04x} → {args.new_id:#04x}")
 
     async with CanBus(channel) as bus:
-        motor = make_driver(bus, args.current_id, args.type)
+        motor = make_driver(bus, args.current_id, kt=1.0, motor_type=args.type)
 
         print("  sending set-can-id command ...")
         await motor.set_can_id(args.new_id)

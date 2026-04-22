@@ -62,7 +62,7 @@ async def _ramp_to(
     while True:
         t = time.monotonic() - t0
         alpha = min(t / duration, 1.0)
-        await motor.motion_control(
+        await motor.set_impedance(
             start_pos + alpha * (target - start_pos), 0.0, kp, kd, 0.0
         )
         if alpha >= 1.0:
@@ -83,7 +83,7 @@ async def _ramp_others(
         (abs(pos - t.get(j, 0.0)) for j, pos in zip(joints, pos_vals)), default=0.0
     )
     await asyncio.gather(
-        *[motors[j].set_position(t.get(j, 0.0), _RAMP_SPEED) for j in joints]
+        *[motors[j].set_position_velocity(t.get(j, 0.0), _RAMP_SPEED) for j in joints]
     )
     timeout = max_dist / _RAMP_SPEED + 2.0
     t0 = time.monotonic()
@@ -127,7 +127,7 @@ async def _run_sweep_raw(
         loop_start = now
 
         target = start_pos + velocity_rad_s * t
-        await motor.motion_control(target, velocity_rad_s, kp, kd, 0.0)
+        await motor.set_impedance(target, velocity_rad_s, kp, kd, 0.0)
         q_actual = await motor.get_position()
 
         if t >= warmup_time and pos_prev is not None and t_prev is not None:
@@ -381,7 +381,9 @@ async def _run(args: argparse.Namespace) -> None:
         await asyncio.gather(
             *[
                 motors[j].set_control_mode(
-                    ControlMode.MIT if j == joint else ControlMode.POS_VEL
+                    ControlMode.IMPEDANCE
+                    if j == joint
+                    else ControlMode.POSITION_VELOCITY
                 )
                 for j in motors
             ]
@@ -464,6 +466,6 @@ async def _run(args: argparse.Namespace) -> None:
             except Exception:
                 pass
             await asyncio.gather(
-                *[m.set_control_mode(ControlMode.MIT) for m in motors.values()]
+                *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors.values()]
             )
             await asyncio.gather(*[m.disable() for m in motors.values()])

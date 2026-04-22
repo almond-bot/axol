@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 
 
-class ControlMode(Enum):
-    """Active control mode for a motor."""
+class ControlMode(IntEnum):
+    """Active control mode for a motor.
 
-    MIT = "MIT"
-    POS_VEL = "POS_VEL"
-    VEL = "VEL"
-    FORCE_POS = "FORCE_POS"
+    Integer values match the Damiao register encoding (register 10).
+    """
+
+    IMPEDANCE = 1
+    POSITION_VELOCITY = 2
+    VELOCITY = 3
+    POSITION_FORCE = 4
 
 
 class MotorStatus(Enum):
@@ -39,7 +42,7 @@ class MotorGains:
     PID gains for the motor's internal speed and position control loops.
 
     Used with Motor.get_gains() and Motor.set_gains(). Only relevant when
-    using set_position() or set_velocity(); motion_control() accepts gains
+    using set_position_velocity() or set_velocity(); set_impedance() accepts gains
     directly per command and does not use these stored values.
 
     Attributes:

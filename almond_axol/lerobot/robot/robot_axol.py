@@ -53,7 +53,7 @@ class AxolRobot(Robot):
     """LeRobot Robot wrapping the Axol dual-arm hardware.
 
     Observations include joint positions for all 16 joints (8 per arm) plus any
-    configured cameras. Actions are joint positions sent via MIT impedance control.
+    configured cameras. Actions are joint positions sent via impedance control (arm joints) and position-force control (gripper).
 
     Args:
         config: Hardware channels, camera configs, and gain config.
@@ -220,7 +220,7 @@ class AxolRobot(Robot):
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Send joint position targets via MIT impedance control.
+        """Send joint position targets via impedance control (arm joints) and position-force control (gripper).
 
         Args:
             action: Dict with keys matching action_features, values in radians.

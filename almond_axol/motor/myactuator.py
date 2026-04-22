@@ -94,9 +94,10 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
 
 
 class MyActuatorMotor(MotorDriver):
-    def __init__(self, bus: CanBus, motor_id: int) -> None:
+    def __init__(self, bus: CanBus, motor_id: int, kt: float) -> None:
         self._bus = bus
         self._motor_id = motor_id
+        self._kt = kt
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
         self._on_feedback: Callable[[float, float], None] | None = None
         bus._add_listener(self._on_message)
@@ -184,7 +185,7 @@ class MyActuatorMotor(MotorDriver):
 
     async def get_torque(self) -> float:
         resp = await self._get_status2()
-        return struct.unpack_from("<h", resp, 2)[0] * 0.01  # 0.01 A/LSB
+        return struct.unpack_from("<h", resp, 2)[0] * 0.01 * self._kt  # 0.01 A/LSB → Nm
 
     async def get_telemetry(
         self,
@@ -225,7 +226,7 @@ class MyActuatorMotor(MotorDriver):
         error_bits = struct.unpack_from("<H", resp, 6)[0]
         return _ma_error_to_status(error_bits)
 
-    async def set_position(self, position: float, max_speed: float) -> None:
+    async def set_position_velocity(self, position: float, max_speed: float) -> None:
         # bytes 2-3: uint16 max speed in dps; bytes 4-7: int32 position in 0.01 degree units
         speed_dps = int(max_speed * (180.0 / math.pi))
         pos_centideg = int(position * (18000.0 / math.pi))  # rad → 0.01 deg units
@@ -328,7 +329,7 @@ class MyActuatorMotor(MotorDriver):
         data = bytes([_MA_SET_CAN_BAUD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, code])
         await self._bus._send(_MA_REQ + self._motor_id, data)
 
-    async def motion_control(
+    async def set_impedance(
         self,
         p_des: float,
         v_des: float,

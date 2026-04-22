@@ -49,6 +49,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Torch device for policy inference (default: cuda).",
     )
     p.add_argument(
+        "--gripper-torque-limit",
+        type=float,
+        default=1.0,
+        help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -68,6 +74,7 @@ def run(args: argparse.Namespace) -> None:
         root=args.root,
         push_to_hub=args.push_to_hub,
         device=args.device,
+        gripper_torque_limit=args.gripper_torque_limit,
     )
 
 
@@ -80,7 +87,10 @@ def _run(
     root: str | None,
     push_to_hub: bool,
     device: str,
+    gripper_torque_limit: float = 1.0,
 ) -> None:
+    from dataclasses import replace
+
     from lerobot.datasets.feature_utils import hw_to_dataset_features
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.factory import make_pre_post_processors
@@ -94,6 +104,7 @@ def _run(
     from ..lerobot.camera.configuration_zed import ZedCameraConfig
     from ..lerobot.robot.config_axol import AxolRobotConfig
     from ..lerobot.robot.robot_axol import AxolRobot
+    from ..robot.config import ArmConfig, AxolConfig
 
     # Load policy
     policy = PreTrainedPolicy.from_pretrained(policy_path)
@@ -101,13 +112,20 @@ def _run(
     policy.to(device)
     policy.eval()
 
+    left = ArmConfig()
+    right = ArmConfig().mirror_gravity()
+    gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
+    left = replace(left, gripper=gripper)
+    right = replace(right, gripper=gripper)
+
     # Build robot with 3 ZED cameras
     robot_config = AxolRobotConfig(
         cameras={
             "overhead": ZedCameraConfig(port=30000, fps=fps, width=1280, height=720),
             "left_arm": ZedCameraConfig(port=30002, fps=fps, width=1280, height=720),
             "right_arm": ZedCameraConfig(port=30004, fps=fps, width=1280, height=720),
-        }
+        },
+        axol_config=AxolConfig(left=left, right=right),
     )
     robot = AxolRobot(robot_config)
 
