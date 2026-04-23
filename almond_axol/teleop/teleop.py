@@ -121,7 +121,9 @@ class VRTeleop:
             config.teleop_max_vel, config.teleop_max_accel, dt
         )
 
-        self._prev_deadman: bool = False
+        self._teleop_enabled: bool = False
+        self._prev_both: bool = False
+        self._prev_either: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
         self._startup_complete: bool = False
@@ -436,13 +438,25 @@ class VRTeleop:
             self._l_grip = frame.l_grip
             self._r_grip = frame.r_grip
 
-            deadman = frame.l_lock and frame.r_lock
-            if deadman and not self._prev_deadman and self._at_rest:
-                self._smooth_left.max_vel = self._config.engage_max_vel
-                self._smooth_right.max_vel = self._config.engage_max_vel
-                self._engage_time = time.perf_counter()
-                self._at_rest = False
-            self._prev_deadman = deadman
+            both = frame.l_lock and frame.r_lock
+            either = frame.l_lock or frame.r_lock
+
+            if not self._teleop_enabled:
+                if both and not self._prev_both:
+                    self._teleop_enabled = True
+                    _logger.info("Teleop enabled")
+                    if self._at_rest:
+                        self._smooth_left.max_vel = self._config.engage_max_vel
+                        self._smooth_right.max_vel = self._config.engage_max_vel
+                        self._engage_time = time.perf_counter()
+                        self._at_rest = False
+            else:
+                if either and not self._prev_either:
+                    self._teleop_enabled = False
+                    _logger.info("Teleop disabled")
+
+            self._prev_both = both
+            self._prev_either = either
 
             if self._reset_latched:
                 if self._reset_interp.is_active() or self._q is None:
@@ -462,7 +476,9 @@ class VRTeleop:
                                 self._ema_right.reset()
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
-                                self._prev_deadman = False
+                                self._teleop_enabled = False
+                                self._prev_both = False
+                                self._prev_either = False
                             self._q = np.asarray(q_default, dtype=np.float32)
                     except Exception as e:
                         _logger.error("Reset error: %s", e)
@@ -483,7 +499,15 @@ class VRTeleop:
                 continue
 
             try:
-                conn.send(frame)
+                # Synthesize lock state: worker sees both locks = enabled state,
+                # so its _active flag tracks our toggle rather than the physical buttons.
+                frame_to_send = frame.model_copy(
+                    update={
+                        "l_lock": self._teleop_enabled,
+                        "r_lock": self._teleop_enabled,
+                    }
+                )
+                conn.send(frame_to_send)
                 result = _recv_with_timeout(conn, _IK_RECV_TIMEOUT, self._ik_stop)
                 if result is not None:
                     self._q = np.asarray(result, dtype=np.float32)
