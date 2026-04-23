@@ -211,11 +211,11 @@ class VRTeleop:
         if cur_l is not None:
             seed_l = np.append(cur_l[:7], self._l_grip)
             self._ema_left.reset(seed=seed_l)
-            self._smooth_left.reset(seed=seed_l)
+            self._smooth_left.reset(seed=seed_l[:7])
         if cur_r is not None:
             seed_r = np.append(cur_r[:7], self._r_grip)
             self._ema_right.reset(seed=seed_r)
-            self._smooth_right.reset(seed=seed_r)
+            self._smooth_right.reset(seed=seed_r[:7])
 
         if startup_traj:
             self._smooth_left.max_accel = self._config.startup_max_accel
@@ -370,18 +370,22 @@ class VRTeleop:
                         self._smooth_left.max_accel = self._config.teleop_max_accel
                         self._smooth_right.max_accel = self._config.teleop_max_accel
 
-        smoothed_l = self._smooth_left.update(
-            self._ema_left.update(np.append(q[self._left_indices], l_grip))
-        )
-        smoothed_r = self._smooth_right.update(
-            self._ema_right.update(np.append(q[self._right_indices], r_grip))
-        )
+        ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
+        ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
+
+        # Arm joints go through the trapezoidal filter; the gripper bypasses it
+        # so it responds immediately (limited only by the EMA smoother) rather
+        # than being throttled by the rad/s velocity limit designed for arm joints.
+        smoothed_l_arm = self._smooth_left.update(ema_l[:7])
+        smoothed_r_arm = self._smooth_right.update(ema_r[:7])
 
         left = np.empty(8, dtype=np.float32)
-        left[:] = smoothed_l
+        left[:7] = smoothed_l_arm
+        left[7] = ema_l[7]
 
         right = np.empty(8, dtype=np.float32)
-        right[:] = smoothed_r
+        right[:7] = smoothed_r_arm
+        right[7] = ema_r[7]
 
         return left, right
 
