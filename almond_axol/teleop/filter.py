@@ -115,6 +115,84 @@ class AlphaSmoothFilter:
         )
 
 
+class OneEuroFilter:
+    """Adaptive low-pass filter for vector signals.
+
+    Applies heavier smoothing when the signal is slow (killing tremor / VR
+    tracking noise) and lighter smoothing when the signal is moving fast
+    (preserving responsiveness for intentional motion).
+
+    The cutoff frequency adapts per-component: ``f_c = min_cutoff + beta * |dx̂|``
+    where ``dx̂`` is the filtered derivative of the signal.  High beta means
+    the filter opens up quickly during fast motion.
+
+    Designed for VR/gesture tracking.  Apply to controller positions and
+    quaternions before they enter the IK solver so the solver never sees
+    high-frequency noise.
+
+    Args:
+        freq:        Sampling frequency in Hz.
+        min_cutoff:  Cutoff frequency (Hz) applied when the signal is still.
+                     Lower values kill more tremor but increase lag at rest.
+                     Typical range: 0.5–3 Hz.
+        beta:        Speed coefficient.  Higher values raise the cutoff during
+                     fast motion, reducing lag.  For meter-space positions at
+                     120 Hz, a value of ~20 works well; tune upward if fast
+                     moves feel sticky.
+        d_cutoff:    Fixed cutoff for the internal derivative estimate.
+                     Rarely needs changing; defaults to 1 Hz.
+    """
+
+    def __init__(
+        self,
+        freq: float,
+        min_cutoff: float = 1.0,
+        beta: float = 0.0,
+        d_cutoff: float = 1.0,
+    ) -> None:
+        self._freq = freq
+        self._min_cutoff = min_cutoff
+        self._beta = beta
+        self._d_cutoff = d_cutoff
+        self._x_prev: np.ndarray | None = None
+        self._dx_prev: np.ndarray | None = None
+
+    @staticmethod
+    def _alpha(cutoff: float | np.ndarray, freq: float) -> float | np.ndarray:
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        te = 1.0 / freq
+        return 1.0 / (1.0 + tau / te)
+
+    def update(self, x: np.ndarray) -> np.ndarray:
+        """Apply one filter step. Returns ``x`` unchanged on the first call."""
+        x = np.asarray(x, dtype=np.float32)
+        if self._x_prev is None:
+            self._x_prev = x.copy()
+            self._dx_prev = np.zeros_like(x)
+            return x.copy()
+
+        dx = (x - self._x_prev) * self._freq
+        a_d = self._alpha(self._d_cutoff, self._freq)
+        dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev
+
+        cutoff = self._min_cutoff + self._beta * np.abs(dx_hat)
+        a = self._alpha(cutoff, self._freq)
+
+        x_hat = a * x + (1.0 - a) * self._x_prev
+        self._x_prev = x_hat.copy()
+        self._dx_prev = dx_hat.copy()
+        return x_hat
+
+    def reset(self, seed: np.ndarray | None = None) -> None:
+        """Reset filter state, optionally seeding with a known starting value."""
+        if seed is not None:
+            self._x_prev = np.asarray(seed, dtype=np.float32).copy()
+            self._dx_prev = np.zeros_like(self._x_prev)
+        else:
+            self._x_prev = None
+            self._dx_prev = None
+
+
 class ResetInterpolator:
     """Steps through a pre-computed collision-aware trajectory one waypoint per call.
 

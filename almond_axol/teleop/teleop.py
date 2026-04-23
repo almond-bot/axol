@@ -42,7 +42,7 @@ from ..robot.base import RobotBase
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
-from .filter import ResetInterpolator, TrapezoidalFilter
+from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -112,6 +112,8 @@ class VRTeleop:
 
         self._reset_interp = ResetInterpolator()
         dt = 1.0 / config.frequency
+        self._ema_left = AlphaSmoothFilter(config.ik_alpha)
+        self._ema_right = AlphaSmoothFilter(config.ik_alpha)
         self._smooth_left = TrapezoidalFilter(
             config.teleop_max_vel, config.teleop_max_accel, dt
         )
@@ -207,9 +209,13 @@ class VRTeleop:
 
         cur_l, cur_r = await self._robot.get_positions()
         if cur_l is not None:
-            self._smooth_left.reset(seed=np.append(cur_l[:7], self._l_grip))
+            seed_l = np.append(cur_l[:7], self._l_grip)
+            self._ema_left.reset(seed=seed_l)
+            self._smooth_left.reset(seed=seed_l)
         if cur_r is not None:
-            self._smooth_right.reset(seed=np.append(cur_r[:7], self._r_grip))
+            seed_r = np.append(cur_r[:7], self._r_grip)
+            self._ema_right.reset(seed=seed_r)
+            self._smooth_right.reset(seed=seed_r)
 
         if startup_traj:
             self._smooth_left.max_accel = self._config.startup_max_accel
@@ -364,9 +370,11 @@ class VRTeleop:
                         self._smooth_left.max_accel = self._config.teleop_max_accel
                         self._smooth_right.max_accel = self._config.teleop_max_accel
 
-        smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
+        smoothed_l = self._smooth_left.update(
+            self._ema_left.update(np.append(q[self._left_indices], l_grip))
+        )
         smoothed_r = self._smooth_right.update(
-            np.append(q[self._right_indices], r_grip)
+            self._ema_right.update(np.append(q[self._right_indices], r_grip))
         )
 
         left = np.empty(8, dtype=np.float32)
@@ -446,6 +454,8 @@ class VRTeleop:
                                 self._reset_interp.set_trajectory(
                                     trajectory, self._l_grip, self._r_grip
                                 )
+                                self._ema_left.reset()
+                                self._ema_right.reset()
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
                                 self._prev_deadman = False
