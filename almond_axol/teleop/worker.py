@@ -24,6 +24,7 @@ from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
+from .filter import OneEuroFilter
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -169,6 +170,16 @@ class IKWorker:
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
 
+        freq = config.frequency
+        mc = config.pose_min_cutoff
+        beta = config.pose_beta
+        self._f_l_pos = OneEuroFilter(freq, mc, beta)
+        self._f_l_quat = OneEuroFilter(freq, mc, beta)
+        self._f_r_pos = OneEuroFilter(freq, mc, beta)
+        self._f_r_quat = OneEuroFilter(freq, mc, beta)
+        self._f_l_elbow = OneEuroFilter(freq, mc, beta)
+        self._f_r_elbow = OneEuroFilter(freq, mc, beta)
+
     # -- Properties the main process needs ----------------------------------
 
     @property
@@ -197,32 +208,53 @@ class IKWorker:
             self._active = False
             return q_current
 
-        # Convert poses to FLU — pure numpy
-        left_pos, left_rot = _vr_to_flu_np(
-            frame.l_ee.position.x,
-            frame.l_ee.position.y,
-            frame.l_ee.position.z,
-            frame.l_ee.quaternion.x,
-            frame.l_ee.quaternion.y,
-            frame.l_ee.quaternion.z,
-            frame.l_ee.quaternion.w,
+        # Filter raw VR poses before IK to remove tracking noise / tremor.
+        lp = self._f_l_pos.update(
+            np.array(
+                [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
+            )
         )
-        right_pos, right_rot = _vr_to_flu_np(
-            frame.r_ee.position.x,
-            frame.r_ee.position.y,
-            frame.r_ee.position.z,
-            frame.r_ee.quaternion.x,
-            frame.r_ee.quaternion.y,
-            frame.r_ee.quaternion.z,
-            frame.r_ee.quaternion.w,
-            is_right=True,
+        lq = self._f_l_quat.update(
+            np.array(
+                [
+                    frame.l_ee.quaternion.x,
+                    frame.l_ee.quaternion.y,
+                    frame.l_ee.quaternion.z,
+                    frame.l_ee.quaternion.w,
+                ]
+            )
         )
-        left_e = np.array(
-            (frame.l_elbow.z, frame.l_elbow.y, -frame.l_elbow.x), dtype=np.float32
+        lq = lq / np.linalg.norm(lq)
+
+        rp = self._f_r_pos.update(
+            np.array(
+                [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
+            )
         )
-        right_e = np.array(
-            (frame.r_elbow.z, frame.r_elbow.y, -frame.r_elbow.x), dtype=np.float32
+        rq = self._f_r_quat.update(
+            np.array(
+                [
+                    frame.r_ee.quaternion.x,
+                    frame.r_ee.quaternion.y,
+                    frame.r_ee.quaternion.z,
+                    frame.r_ee.quaternion.w,
+                ]
+            )
         )
+        rq = rq / np.linalg.norm(rq)
+
+        # Convert filtered poses to FLU — pure numpy
+        left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
+        right_pos, right_rot = _vr_to_flu_np(*rp, *rq, is_right=True)
+
+        le = self._f_l_elbow.update(
+            np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
+        )
+        re = self._f_r_elbow.update(
+            np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z])
+        )
+        left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
+        right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
         if not self._active:
             self._active = True
@@ -293,6 +325,12 @@ class IKWorker:
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
         self._snap_elbow_fk = {}
+        self._f_l_pos.reset()
+        self._f_l_quat.reset()
+        self._f_r_pos.reset()
+        self._f_r_quat.reset()
+        self._f_l_elbow.reset()
+        self._f_r_elbow.reset()
 
     # -- Internal -----------------------------------------------------------
 

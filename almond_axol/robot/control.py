@@ -6,7 +6,7 @@ import math
 import time
 
 # Cutoff frequency for the velocity differentiator low-pass filter (Hz)
-CUTOFF_FREQ = 90.0
+CUTOFF_FREQ = 20.0
 
 
 def compute_gravity(q: float, ga: float, gb: float) -> float:

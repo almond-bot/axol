@@ -49,6 +49,25 @@ class VRTeleopConfig:
             trapezoidal filter.  Controls how quickly the commanded velocity
             ramps up or down.  Defaults to 1.5 rev/s² (~540 °/s²), giving a
             ~0.2 s ramp from rest to full speed.
+        ik_alpha: Blend factor for the exponential moving average applied to
+            the IK output before the trapezoidal filter.  Range ``(0, 1]``
+            where ``1.0`` disables smoothing.  Lower values kill more
+            high-frequency jitter at the cost of a small fixed lag
+            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.7`` (~3 ms lag
+            at 120 Hz), which removes most IK noise without a perceptible
+            feel difference.
+        pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
+            applied to raw VR controller positions, quaternions, and elbow
+            positions **before** they enter the IK solver.  This is the
+            primary tremor / tracking-noise kill knob.  Lower values give
+            heavier smoothing at rest (more tremor rejection) at the cost of
+            slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
+            to ``1.5`` Hz.
+        pose_beta: Speed coefficient for the One Euro Filter.  Raises the
+            filter cutoff proportionally to the signal's instantaneous speed,
+            keeping the filter transparent during fast intentional moves.  For
+            meter-space positions at 120 Hz a value of ~20 works well; increase
+            if fast moves feel sticky.  Defaults to ``20.0``.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -89,5 +108,8 @@ class VRTeleopConfig:
     startup_max_accel: float = 0.3 * 2 * math.pi
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
-    teleop_max_vel: float = 0.5 * 2 * math.pi
-    teleop_max_accel: float = 1.5 * 2 * math.pi
+    teleop_max_vel: float = 1.0 * 2 * math.pi
+    teleop_max_accel: float = 3.5 * 2 * math.pi
+    ik_alpha: float = 0.5
+    pose_min_cutoff: float = 1.5
+    pose_beta: float = 5.0
