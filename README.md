@@ -14,6 +14,8 @@ Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <com
 - [CAN Bus Setup](#can-bus-setup)
 - [Motor Commands](#motor-commands)
 - [Teleoperation](#teleoperation)
+- [Data Collection](#data-collection)
+- [Policy Execution](#policy-execution)
 - [ZED Camera](#zed-camera)
 - [Tuning](#tuning)
 
@@ -21,7 +23,7 @@ Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <com
 
 ## Installation
 
-Install the package using `uv`. `pyroki` is sourced from Git and is resolved automatically:
+Install the package using `uv`. `pyroki` and `lerobot` are sourced from Git and are resolved automatically:
 
 ```bash
 uv sync
@@ -31,14 +33,15 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
+| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --robot sim` |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
-uv sync --extra sim        # teleoperation with sim visualizer
-uv sync --extra cuda       # JAX on GPU
-uv sync --extra sim --extra cuda   # both
+uv sync --extra lerobot --extra sim        # teleoperation + data collection
+uv sync --extra lerobot --extra cuda       # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra cuda   # everything
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
@@ -143,6 +146,64 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 ```bash
 axol teleop --robot axol
 axol teleop --robot sim --no-right
+```
+
+---
+
+## Data Collection
+
+### `collect-data`
+
+Records teleoperation episodes using VR controller inputs and three ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
+
+| Flag | Description |
+|---|---|
+| `--repo-id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
+| `--task TEXT` | Natural language task description (required) |
+| `--fps INT` | Frame rate (default: 30) |
+| `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
+| `--push-to-hub` | Push to HuggingFace Hub when done |
+| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube and place it in the bin"
+```
+
+**VR controller events:**
+
+| Event | Action |
+|---|---|
+| `START_RECORDING` | Begin capturing frames |
+| `TERMINATE_EPISODE` | Save the episode |
+| `RERECORD_EPISODE` | Discard and retry |
+
+If an existing dataset is found at `--root`, collection resumes from where it left off.
+
+---
+
+## Policy Execution
+
+### `run-policy`
+
+Runs a trained policy autonomously on the robot using three ZED cameras. Between episodes, prompts the operator via stdin to save (`Enter`), re-record (`r`), or quit (`q`).
+
+| Flag | Description |
+|---|---|
+| `--policy PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
+| `--task TEXT` | Natural language task description (required) |
+| `--episode-time-s INT` | Max duration per episode in seconds (default: 30) |
+| `--fps INT` | Control loop frame rate (default: 30) |
+| `--repo-id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
+| `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
+| `--push-to-hub` | Push rollout dataset to HuggingFace Hub when done |
+| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--device STR` | PyTorch device for inference (default: `cuda`) |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol run-policy --policy myorg/pick-place-policy --task "Pick the red cube"
+axol run-policy --policy ./checkpoints/epoch_100 --task "Stack blocks" --episode-time-s 20 --device cpu
 ```
 
 ---
