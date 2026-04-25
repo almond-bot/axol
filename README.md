@@ -6,7 +6,7 @@ Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <com
 
 - **Linux**
 - **Python 3.13+**
-- **(Optional) NVIDIA Jetson** If Zed cameras are used.
+- **(Optional) NVIDIA Jetson** If ZED cameras are used.
 
 ## Table of Contents
 
@@ -215,10 +215,12 @@ Identifies all six feedforward parameters for one joint via a bidirectional velo
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
-| `--joint JOINT` | Joint to identify (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`, `gripper` (required) |
 | `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
 | `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
 | `--velocities V [V ...]` | Velocity setpoints in rad/s (default: ~0.1, 0.3, 0.6, 0.9, 1.3) |
+| `--lo RAD` | Override lower joint limit for the sweep |
+| `--hi RAD` | Override upper joint limit for the sweep |
 
 ```bash
 axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
