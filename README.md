@@ -289,7 +289,7 @@ VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → mot
 
 ---
 
-### almond\_axol.robot
+### almond_axol.robot
 
 Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
 
@@ -423,7 +423,7 @@ async with Axol(config=config) as axol: ...
 
 ---
 
-### almond\_axol.kinematics
+### almond_axol.kinematics
 
 Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first call takes a few seconds; subsequent calls are fast.
 
@@ -478,7 +478,7 @@ q = solver.ik(q, left_pose=(pos, rot))
 
 ---
 
-### almond\_axol.teleop
+### almond_axol.teleop
 
 Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → One Euro filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
 
@@ -530,7 +530,7 @@ See `teleop --robot axol` in [Teleoperation](#teleoperation) for the equivalent 
 
 ---
 
-### almond\_axol.vr
+### almond_axol.vr
 
 Secure WebSocket server (WSS) that receives `VRFrame` JSON messages from the VR app. A self-signed TLS certificate is auto-generated in `~/.almond/vr/certs/` on first use. This module can be used standalone to read raw VR data without full teleoperation — useful for custom control loops or data collection.
 
@@ -587,7 +587,7 @@ async with VRServer() as vr:
 
 ---
 
-### almond\_axol.zed
+### almond_axol.zed
 
 Streams up to three ZED-X One cameras over the local network using HEVC (H.265) encoding via the ZED SDK. Requires `pyzed` — install it with `axol zed.install` (see [ZED Camera](#zed-camera)).
 
@@ -629,7 +629,7 @@ At least one serial number must be provided. The sender IP is `192.168.10.1/24`;
 
 ---
 
-### almond\_axol.motor
+### almond_axol.motor
 
 Low-level async SocketCAN interface for individual motors. Most users work through `Axol` — this layer is exposed for diagnostics, custom control modes, and bench testing individual motors.
 

@@ -88,6 +88,8 @@ The terminal will print the hostname and IP address. Open the VR app at [axol.al
 |---|---|---|
 | 1 | Left grip | Press both 1 + 2 to **enable** arm movement; press either alone to **disable** |
 | 2 | Right grip | Same as above |
+| 3 | Left trigger | Actuate left gripper |
+| 4 | Right trigger | Actuate right gripper |
 | 5 | X | **Reset** — returns both arms to the rest pose |
 | 7 | Y | **Exit AR** — closes the VR session |
 
