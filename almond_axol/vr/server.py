@@ -50,6 +50,15 @@ class VRServer:
     """
 
     def __init__(self, config: VRServerConfig = VRServerConfig()) -> None:
+        """Configure the VR WebSocket server.
+
+        The server is not started until :meth:`enable` (or ``async with``) is
+        called.  A self-signed TLS certificate is auto-generated in
+        ``~/.almond/vr/certs/`` on first use if no cert paths are provided.
+
+        Args:
+            config: Port, TLS certificate, and private-key paths.
+        """
         self._port = config.port
         self._on_frame: Callable[[VRFrame], None] | None = None
         self._certfile = config.certfile or os.path.join(_CERTS_DIR, "cert.pem")

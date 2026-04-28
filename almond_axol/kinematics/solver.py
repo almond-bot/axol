@@ -286,6 +286,15 @@ class KinematicsSolver:
     """
 
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
+        """Load the bundled Axol URDF, build the pyroki robot and collision model, and warm up JIT.
+
+        Resolves link and joint indices, computes fixed shoulder positions, and
+        triggers JAX JIT compilation via a dummy solve so the first real call to
+        :meth:`ik` is fast.
+
+        Args:
+            config: Cost weights and solver parameters.
+        """
         self.config = config
 
         _logger.info("Loading Axol URDF...")

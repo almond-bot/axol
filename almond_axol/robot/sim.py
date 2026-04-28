@@ -49,6 +49,16 @@ class Sim(RobotBase):
         default_q: np.ndarray | None = None,
         port: int = 8080,
     ) -> None:
+        """Construct the simulation.
+
+        The viser server is not started until :meth:`enable` is called.
+
+        Args:
+            joint_names: Ordered list of actuated joint names to look up in the URDF.
+                Defaults to the hard-coded left-then-right arm order.
+            default_q:   Initial joint configuration in radians; defaults to zeros.
+            port:        Port for the viser web server.
+        """
         self._joint_names = joint_names
         self._default_q = default_q
         self._port = port

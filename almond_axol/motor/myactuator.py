@@ -1,3 +1,5 @@
+"""MyActuator RMD motor driver implementing the 0x140-series CAN protocol."""
+
 # Protocol source: myactuator_rmd/include/myactuator_rmd/driver/can_address_offset.hpp
 #                  myactuator_rmd/include/myactuator_rmd/protocol/command_type.hpp
 #                  myactuator_rmd/include/myactuator_rmd/protocol/motion_control_request.hpp
@@ -94,6 +96,8 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
 
 
 class MyActuatorMotor(MotorDriver):
+    """MotorDriver implementation for MyActuator RMD motors using the 0x140-series protocol."""
+
     def __init__(self, bus: CanBus, motor_id: int, kt: float) -> None:
         self._bus = bus
         self._motor_id = motor_id

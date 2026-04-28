@@ -1,3 +1,5 @@
+"""VRTeleopConfig dataclass with all tunable parameters for a VRTeleop session."""
+
 from __future__ import annotations
 
 import math

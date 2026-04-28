@@ -1,3 +1,5 @@
+"""Dataclasses for per-joint impedance gains, friction parameters, and robot configuration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace

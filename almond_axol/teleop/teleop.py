@@ -92,6 +92,17 @@ class VRTeleop:
         kinematics_config: KinematicsConfig = KinematicsConfig(),
         vr_server_config: VRServerConfig = VRServerConfig(),
     ) -> None:
+        """Construct the teleoperation session.
+
+        No network connections or subprocesses are started until :meth:`enable`
+        (or ``async with``) is called.
+
+        Args:
+            robot:             Hardware or simulation target implementing :class:`RobotBase`.
+            config:            Teleop loop parameters (rest poses, frequency, velocity limits).
+            kinematics_config: IK solver cost weights forwarded to the IK subprocess.
+            vr_server_config:  VR WebSocket server parameters (port, TLS certs).
+        """
         self._robot = robot
         self._config = config
         self._kinematics_config = kinematics_config
