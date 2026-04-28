@@ -285,7 +285,7 @@ VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → mot
 
 **Joint arrays.** Every method that reads or writes joint state uses `np.ndarray` of shape `(8,)` in `Joint` enum order: `SHOULDER_1`, `SHOULDER_2`, `SHOULDER_3`, `ELBOW`, `WRIST_1`, `WRIST_2`, `WRIST_3`, `GRIPPER`. Arm joints are in radians; the gripper is normalized to `[0.0 = closed, 1.0 = fully open]`.
 
-**Telemetry vs. one-shot reads.** `start_telemetry(hz)` launches a background polling loop and populates `.positions` and `.torques` as non-blocking cached properties — read them in a tight control loop without `await`. Direct calls like `await get_positions()` issue individual CAN reads and are suitable for diagnostics but too slow for real-time control.
+**Telemetry vs. one-shot reads.** `start_telemetry(hz)` launches a background polling loop and populates `.positions` and `.torques` as non-blocking cached properties — read them in a tight control loop without `await`. Direct calls like `await get_positions()` issue individual CAN reads and are suitable for diagnostics but too slow for real-time control. `start_telemetry` is not required if you are already running a `motion_control` loop — every impedance command sent to the arm motors returns a position and torque reading, which is used to populate the same cache automatically.
 
 ---
 
