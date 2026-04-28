@@ -6,6 +6,7 @@ build-backend = "hatchling.build"
 name = "almond-axol"
 version = "0.1.0"
 description = "Almond Axol SDK"
+license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
