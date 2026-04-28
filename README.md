@@ -1,6 +1,6 @@
 # Axol
 
-![Axol dual-arm robot](assets/axol.png)
+<img src="assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
 
