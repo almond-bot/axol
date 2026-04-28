@@ -26,6 +26,13 @@ class TrapezoidalFilter:
     """
 
     def __init__(self, max_vel: float, max_accel: float, dt: float) -> None:
+        """Initialize the filter.
+
+        Args:
+            max_vel:   Maximum joint velocity in rad/s.
+            max_accel: Maximum joint acceleration in rad/s².
+            dt:        Control step duration in seconds (``1 / frequency``).
+        """
         self.max_vel = max_vel
         self.max_accel = max_accel
         self.dt = dt
@@ -93,6 +100,11 @@ class AlphaSmoothFilter:
     """
 
     def __init__(self, alpha: float) -> None:
+        """Initialize the filter.
+
+        Args:
+            alpha: Smoothing blend factor in ``(0, 1]``. ``1.0`` disables smoothing.
+        """
         self.alpha = alpha
         self._prev: np.ndarray | None = None
 
@@ -150,6 +162,17 @@ class OneEuroFilter:
         beta: float = 0.0,
         d_cutoff: float = 1.0,
     ) -> None:
+        """Initialize the filter.
+
+        Args:
+            freq:       Sampling frequency in Hz.
+            min_cutoff: Cutoff frequency (Hz) when the signal is stationary; lower
+                values kill more tremor at the cost of increased lag at rest.
+            beta:       Speed coefficient; higher values open the filter during fast
+                motion to preserve responsiveness.
+            d_cutoff:   Fixed cutoff frequency for the internal derivative estimate
+                (default 1 Hz; rarely needs changing).
+        """
         self._freq = freq
         self._min_cutoff = min_cutoff
         self._beta = beta
@@ -201,6 +224,10 @@ class ResetInterpolator:
     """
 
     def __init__(self) -> None:
+        """Construct the interpolator with no active trajectory.
+
+        Call :meth:`set_trajectory` before calling :meth:`step`.
+        """
         self._trajectory: list[np.ndarray] | None = None
         self._traj_index: int = 0
         self._l_grip_start: float = 0.0

@@ -31,6 +31,13 @@ def setup_link_ip(iface: str, address: str) -> None:
 
 
 class Joint(Enum):
+    """All motor joints on one arm, in control order.
+
+    The seven arm joints (``SHOULDER_1`` through ``WRIST_3``) are collected in
+    ``ARM_JOINTS``. ``GRIPPER`` is the eighth entry and is handled separately
+    from the arm joints throughout the control stack.
+    """
+
     SHOULDER_1 = "shoulder_1"
     SHOULDER_2 = "shoulder_2"
     SHOULDER_3 = "shoulder_3"

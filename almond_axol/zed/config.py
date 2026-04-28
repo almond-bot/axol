@@ -1,3 +1,5 @@
+"""ZedConfig dataclass for the ZED-X One camera streamer."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,7 +18,7 @@ class ZedConfig:
         - ``sl.RESOLUTION.HD1080`` (1920×1080)
         - ``sl.RESOLUTION.SVGA``   (960×600)  — ZED-X One GS only
 
-    Args:
+    Attributes:
         overhead_serial:  Serial number of the overhead camera (optional).
         left_arm_serial:  Serial number of the left-arm camera (optional).
         right_arm_serial: Serial number of the right-arm camera (optional).
@@ -39,6 +41,11 @@ class ZedConfig:
     bitrate: int = 8000
 
     def __post_init__(self) -> None:
+        """Validate that at least one camera serial number has been provided.
+
+        Raises:
+            ValueError: If all three serial fields are ``None``.
+        """
         if (
             self.overhead_serial is None
             and self.left_arm_serial is None

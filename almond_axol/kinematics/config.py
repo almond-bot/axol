@@ -1,3 +1,5 @@
+"""KinematicsConfig dataclass with cost weights and solver parameters for KinematicsSolver."""
+
 from __future__ import annotations
 
 import math

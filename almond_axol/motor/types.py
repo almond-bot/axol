@@ -1,3 +1,5 @@
+"""Shared enums and dataclasses for the motor layer: ControlMode, MotorStatus, MotorGains."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -38,8 +40,7 @@ class MotorStatus(Enum):
 
 @dataclass
 class MotorGains:
-    """
-    PID gains for the motor's internal speed and position control loops.
+    """PID gains for the motor's internal speed and position control loops.
 
     Used with Motor.get_gains() and Motor.set_gains(). Only relevant when
     using set_position_velocity() or set_velocity(); set_impedance() accepts gains
