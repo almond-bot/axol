@@ -452,6 +452,9 @@ class VRTeleop:
             both = frame.l_lock and frame.r_lock
             either = frame.l_lock or frame.r_lock
 
+            # Toggle logic via rising-edge detection:
+            #   rising edge of BOTH grips pressed together → enable tracking
+            #   rising edge of EITHER grip pressed alone   → disable tracking
             if not self._teleop_enabled:
                 if both and not self._prev_both:
                     self._teleop_enabled = True

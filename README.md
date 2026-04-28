@@ -1,5 +1,7 @@
 # Axol
 
+![Axol dual-arm robot](assets/axol.png)
+
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
 
 **New here?** See the [Quickstart](QUICKSTART.md) to go from installation to a live teleoperation session.
