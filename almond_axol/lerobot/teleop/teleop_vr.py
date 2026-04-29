@@ -230,6 +230,11 @@ class AxolVRTeleop(Teleoperator):
             self._ema_right.reset(seed=seed_r)
             self._smooth_right.reset(seed=seed_r[:7])
 
+        # Prime _q_out from the seeded filters so get_action() returns correct
+        # starting positions immediately rather than the all-zeros default.
+        with self._q_lock:
+            self._q_out = self._compute_output()
+
         if startup_traj:
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
@@ -423,6 +428,16 @@ class AxolVRTeleop(Teleoperator):
 
         while True:
             t0 = time.perf_counter()
+
+            # Service startup/reset trajectory before any VR frame check so
+            # the arm moves to rest pose even when no headset is connected yet.
+            if self._reset_interp.is_active():
+                out = self._compute_output()
+                with self._q_lock:
+                    self._q_out = out
+                await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
+                continue
+
             frame = self._vr_server.get_frame()  # type: ignore[union-attr]
 
             if frame is None or frame is last_frame:
@@ -461,13 +476,6 @@ class AxolVRTeleop(Teleoperator):
                         max(0.0, ik_interval - (time.perf_counter() - t0))
                     )
                     continue
-
-            if self._reset_interp.is_active():
-                out = self._compute_output()
-                with self._q_lock:
-                    self._q_out = out
-                await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
-                continue
 
             if self._ik_process is not None and not self._ik_process.is_alive():
                 _logger.warning("IK process is not alive")

@@ -12,6 +12,7 @@ Recording continues until Ctrl+C.
 
 import argparse
 import logging
+import socket
 import time
 
 
@@ -188,6 +189,14 @@ def _run(
             use_videos=True,
             image_writer_threads=4,
         )
+
+    hostname = socket.gethostname()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
+        _s.connect(("8.8.8.8", 80))
+        local_ip = _s.getsockname()[0]
+    print("Connect the VR app (https://axol.almond.bot) to this machine:")
+    print(f"  Hostname : {hostname}.local")
+    print(f"  IP       : {local_ip}")
 
     if rerun_ip:
         init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
