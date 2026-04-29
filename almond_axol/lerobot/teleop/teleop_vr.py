@@ -440,8 +440,46 @@ class AxolVRTeleop(Teleoperator):
         while True:
             t0 = time.perf_counter()
 
-            # Service startup/reset trajectory before any VR frame check so
-            # the arm moves to rest pose even when no headset is connected yet.
+            # Process a pending reset before checking for VR frames so it fires
+            # even without a live headset.  _reset_latched is cleared only in the
+            # finally block — after the IK subprocess responds and the trajectory is
+            # armed — so is_resetting() stays True throughout the async IK call and
+            # the collect_data reset loop cannot exit prematurely.
+            if (
+                self._reset_latched
+                and not self._reset_interp.is_active()
+                and self._q is not None
+            ):
+                try:
+                    conn.send(("reset", self._q.copy()))
+                    result = await loop.run_in_executor(None, conn.recv)
+                    if isinstance(result, tuple) and result[0] == "reset_traj":
+                        _, q_default, trajectory = result
+                        if trajectory:
+                            self._reset_interp.set_trajectory(
+                                trajectory, self._l_grip, self._r_grip
+                            )
+                            self._ema_left.reset()
+                            self._ema_right.reset()
+                            self._smooth_left.reset()
+                            self._smooth_right.reset()
+                            self._teleop_enabled = False
+                            self._prev_both = False
+                            self._prev_either = False
+                            self._at_rest = True
+                        self._q = np.asarray(q_default, dtype=np.float32)
+                except Exception as e:
+                    _logger.error("Reset error: %s", e)
+                finally:
+                    self._reset_latched = False
+                out = self._compute_output()
+                with self._q_lock:
+                    self._q_out = out
+                await asyncio.sleep(max(0.0, ik_interval - (time.perf_counter() - t0)))
+                continue
+
+            # Service an active reset/startup trajectory (runs at IK frequency,
+            # no VR frame needed).
             if self._reset_interp.is_active():
                 out = self._compute_output()
                 with self._q_lock:
@@ -488,39 +526,6 @@ class AxolVRTeleop(Teleoperator):
                     self._smooth_left.max_vel = cfg.teleop_max_vel
                     self._smooth_right.max_vel = cfg.teleop_max_vel
                     self._engage_time = None
-
-            if self._reset_latched:
-                if self._reset_interp.is_active() or self._q is None:
-                    self._reset_latched = False
-                else:
-                    self._reset_latched = False
-                    try:
-                        conn.send(("reset", self._q.copy()))
-                        result = await loop.run_in_executor(None, conn.recv)
-                        if isinstance(result, tuple) and result[0] == "reset_traj":
-                            _, q_default, trajectory = result
-                            if trajectory:
-                                self._reset_interp.set_trajectory(
-                                    trajectory, self._l_grip, self._r_grip
-                                )
-                                self._ema_left.reset()
-                                self._ema_right.reset()
-                                self._smooth_left.reset()
-                                self._smooth_right.reset()
-                                self._teleop_enabled = False
-                                self._prev_both = False
-                                self._prev_either = False
-                                self._at_rest = True
-                            self._q = np.asarray(q_default, dtype=np.float32)
-                    except Exception as e:
-                        _logger.error("Reset error: %s", e)
-                    out = self._compute_output()
-                    with self._q_lock:
-                        self._q_out = out
-                    await asyncio.sleep(
-                        max(0.0, ik_interval - (time.perf_counter() - t0))
-                    )
-                    continue
 
             if self._ik_process is not None and not self._ik_process.is_alive():
                 _logger.warning("IK process is not alive")
