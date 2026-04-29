@@ -78,6 +78,35 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
+def _move_to_rest(robot, fps: int, duration_s: float = 5.0) -> None:
+    """Send the robot to the default rest pose for ``duration_s`` seconds.
+
+    Uses the rest poses defined in VRTeleopConfig (arm joints) with gripper
+    fully open. The robot's impedance controller smoothly tracks the target.
+    """
+    import time
+
+    from ..shared import ARM_JOINTS, Joint
+    from ..teleop.config import VRTeleopConfig
+
+    cfg = VRTeleopConfig()
+    rest: dict[str, float] = {}
+    for j in Joint:
+        if j in ARM_JOINTS:
+            arm_i = ARM_JOINTS.index(j)
+            rest[f"left_{j.value}.pos"] = float(cfg.rest_pose_left[arm_i])
+            rest[f"right_{j.value}.pos"] = float(cfg.rest_pose_right[arm_i])
+        else:
+            rest[f"left_{j.value}.pos"] = 1.0
+            rest[f"right_{j.value}.pos"] = 1.0
+
+    steps = max(1, int(duration_s * fps))
+    for _ in range(steps):
+        t0 = time.perf_counter()
+        robot.send_action(rest)
+        time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - t0)))
+
+
 def _run(
     policy_path: str,
     task: str,
@@ -194,12 +223,16 @@ def _run(
                 log_say("Re-recording episode.")
                 if dataset:
                     dataset.clear_episode_buffer()
+                log_say("Returning to rest pose.")
+                _move_to_rest(robot, fps)
                 input("Reset the scene, then press Enter to start.")
                 continue
 
             if dataset:
                 dataset.save_episode()
             episodes_recorded += 1
+            log_say("Returning to rest pose.")
+            _move_to_rest(robot, fps)
             input("Reset the scene, then press Enter to start the next episode.")
 
     except KeyboardInterrupt:

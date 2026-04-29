@@ -287,6 +287,25 @@ class AxolVRTeleop(Teleoperator):
         pass
 
     # ------------------------------------------------------------------
+    # Reset control
+    # ------------------------------------------------------------------
+
+    def request_reset(self) -> None:
+        """Programmatically trigger a rest-pose return move.
+
+        Safe to call from any thread. The IK loop will pick up the latch on
+        its next iteration and send a reset request to the IK subprocess,
+        which plans a collision-aware trajectory back to the rest pose.
+        Poll :attr:`is_resetting` to know when the move completes.
+        """
+        self._reset_latched = True
+
+    @property
+    def is_resetting(self) -> bool:
+        """True while a reset is pending or a reset trajectory is playing back."""
+        return self._reset_latched or self._reset_interp.is_active()
+
+    # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------
 

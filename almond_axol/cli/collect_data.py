@@ -179,6 +179,20 @@ def _run(
 
                 time.sleep(max(0.0, 1 / fps - (time.perf_counter() - t0)))
 
+            # Return to rest pose before the next episode so the operator
+            # starts each take from a consistent configuration.
+            log_say("Returning to rest pose.")
+            teleop.request_reset()
+            reset_deadline = time.perf_counter() + 30.0
+            while teleop.is_resetting and time.perf_counter() < reset_deadline:
+                t0 = time.perf_counter()
+                obs = robot.get_observation()
+                act = teleop.get_action()
+                robot.send_action(robot_action_proc((act, obs)))
+                time.sleep(max(0.0, 1 / fps - (time.perf_counter() - t0)))
+            # Drain any VR events that fired during the reset move.
+            teleop.get_teleop_events()
+
             if rerecord:
                 log_say("Re-recording episode.")
                 continue
