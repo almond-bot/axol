@@ -37,10 +37,40 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Push dataset to HuggingFace Hub when done.",
     )
     p.add_argument(
+        "--zed-host",
+        default="192.168.10.1",
+        help="IP address of the ZED streamer (default: 192.168.10.1).",
+    )
+    p.add_argument(
+        "--zed-iface",
+        default=None,
+        metavar="IFACE",
+        help=(
+            "Network interface to configure for the ZED link before connecting "
+            "(e.g. eth0). Assigns 192.168.10.2/24 and requires sudo. "
+            "Skip if the interface is already configured."
+        ),
+    )
+    p.add_argument(
         "--gripper-torque-limit",
         type=float,
         default=1.0,
         help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
+        "--rerun-ip",
+        default=None,
+        help=(
+            "IP of a Rerun viewer running on your local machine. "
+            "When set, streams live visualization to that viewer. "
+            "On the local machine run: rerun --connect rerun+http://<robot-ip>:<port>/proxy"
+        ),
+    )
+    p.add_argument(
+        "--rerun-port",
+        type=int,
+        default=9876,
+        help="Port of the Rerun viewer (default: 9876). Only used when --rerun-ip is set.",
     )
     p.add_argument(
         "--log-level",
@@ -59,7 +89,11 @@ def run(args: argparse.Namespace) -> None:
         fps=args.fps,
         root=args.root,
         push_to_hub=args.push_to_hub,
+        zed_host=args.zed_host,
+        zed_iface=args.zed_iface,
         gripper_torque_limit=args.gripper_torque_limit,
+        rerun_ip=args.rerun_ip,
+        rerun_port=args.rerun_port,
     )
 
 
@@ -69,7 +103,11 @@ def _run(
     fps: int,
     root: str | None,
     push_to_hub: bool,
+    zed_host: str = "192.168.10.1",
+    zed_iface: str | None = None,
     gripper_torque_limit: float = 1.0,
+    rerun_ip: str | None = None,
+    rerun_port: int = 9876,
 ) -> None:
     from dataclasses import replace
     from pathlib import Path
@@ -91,6 +129,10 @@ def _run(
     from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
     from ..robot.config import ArmConfig, AxolConfig
+    from ..shared import setup_link_ip
+
+    if zed_iface:
+        setup_link_ip(zed_iface, "192.168.10.2/24")
 
     left = ArmConfig()
     right = ArmConfig().mirror_gravity()
@@ -99,9 +141,15 @@ def _run(
     right = replace(right, gripper=gripper)
     robot_config = AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(port=30000, fps=fps, width=1280, height=720),
-            "left_arm": ZedCameraConfig(port=30002, fps=fps, width=1280, height=720),
-            "right_arm": ZedCameraConfig(port=30004, fps=fps, width=1280, height=720),
+            "overhead": ZedCameraConfig(
+                host=zed_host, port=30000, fps=fps, width=1280, height=720
+            ),
+            "left_arm": ZedCameraConfig(
+                host=zed_host, port=30002, fps=fps, width=1280, height=720
+            ),
+            "right_arm": ZedCameraConfig(
+                host=zed_host, port=30004, fps=fps, width=1280, height=720
+            ),
         },
         axol_config=AxolConfig(left=left, right=right),
     )
@@ -112,7 +160,20 @@ def _run(
     obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
 
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-    if (dataset_root / "meta" / "info.json").exists():
+    meta = dataset_root / "meta"
+    has_info = (meta / "info.json").exists()
+    is_complete = (
+        has_info
+        and (meta / "tasks.parquet").exists()
+        and (meta / "episodes.parquet").exists()
+    )
+    if has_info and not is_complete:
+        raise RuntimeError(
+            f"Incomplete dataset found at {dataset_root} (missing tasks.parquet or episodes.parquet). "
+            f"Delete the directory and rerun to start fresh:\n"
+            f"  rm -rf {dataset_root}"
+        )
+    if is_complete:
         log_say(f"Resuming existing dataset at {dataset_root}.")
         dataset = LeRobotDataset(repo_id=repo_id, root=root)
         dataset.start_image_writer(num_threads=4)
@@ -127,7 +188,8 @@ def _run(
             image_writer_threads=4,
         )
 
-    init_rerun(session_name="axol_record")
+    if rerun_ip:
+        init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
     robot.connect()
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
@@ -169,7 +231,8 @@ def _run(
                         dataset.features, act_processed, prefix=ACTION
                     )
                     dataset.add_frame({**obs_frame, **act_frame, "task": task})
-                    log_rerun_data(observation=obs_processed, action=act_processed)
+                    if rerun_ip:
+                        log_rerun_data(observation=obs_processed, action=act_processed)
 
                 if events[TeleopEvents.TERMINATE_EPISODE]:
                     break

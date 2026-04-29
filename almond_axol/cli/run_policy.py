@@ -49,10 +49,40 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Torch device for policy inference (default: cuda).",
     )
     p.add_argument(
+        "--zed-host",
+        default="192.168.10.1",
+        help="IP address of the ZED streamer (default: 192.168.10.1).",
+    )
+    p.add_argument(
+        "--zed-iface",
+        default=None,
+        metavar="IFACE",
+        help=(
+            "Network interface to configure for the ZED link before connecting "
+            "(e.g. eth0). Assigns 192.168.10.2/24 and requires sudo. "
+            "Skip if the interface is already configured."
+        ),
+    )
+    p.add_argument(
         "--gripper-torque-limit",
         type=float,
         default=1.0,
         help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
+        "--rerun-ip",
+        default=None,
+        help=(
+            "IP of a Rerun viewer running on your local machine. "
+            "When set, streams live visualization to that viewer. "
+            "On the local machine run: rerun --connect rerun+http://<robot-ip>:<port>/proxy"
+        ),
+    )
+    p.add_argument(
+        "--rerun-port",
+        type=int,
+        default=9876,
+        help="Port of the Rerun viewer (default: 9876). Only used when --rerun-ip is set.",
     )
     p.add_argument(
         "--log-level",
@@ -74,7 +104,11 @@ def run(args: argparse.Namespace) -> None:
         root=args.root,
         push_to_hub=args.push_to_hub,
         device=args.device,
+        zed_host=args.zed_host,
+        zed_iface=args.zed_iface,
         gripper_torque_limit=args.gripper_torque_limit,
+        rerun_ip=args.rerun_ip,
+        rerun_port=args.rerun_port,
     )
 
 
@@ -116,7 +150,11 @@ def _run(
     root: str | None,
     push_to_hub: bool,
     device: str,
+    zed_host: str = "192.168.10.1",
+    zed_iface: str | None = None,
     gripper_torque_limit: float = 1.0,
+    rerun_ip: str | None = None,
+    rerun_port: int = 9876,
 ) -> None:
     from dataclasses import replace
 
@@ -134,6 +172,10 @@ def _run(
     from ..lerobot.robot.config_axol import AxolRobotConfig
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..robot.config import ArmConfig, AxolConfig
+    from ..shared import setup_link_ip
+
+    if zed_iface:
+        setup_link_ip(zed_iface, "192.168.10.2/24")
 
     # Load policy
     policy = PreTrainedPolicy.from_pretrained(policy_path)
@@ -150,9 +192,15 @@ def _run(
     # Build robot with 3 ZED cameras
     robot_config = AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(port=30000, fps=fps, width=1280, height=720),
-            "left_arm": ZedCameraConfig(port=30002, fps=fps, width=1280, height=720),
-            "right_arm": ZedCameraConfig(port=30004, fps=fps, width=1280, height=720),
+            "overhead": ZedCameraConfig(
+                host=zed_host, port=30000, fps=fps, width=1280, height=720
+            ),
+            "left_arm": ZedCameraConfig(
+                host=zed_host, port=30002, fps=fps, width=1280, height=720
+            ),
+            "right_arm": ZedCameraConfig(
+                host=zed_host, port=30004, fps=fps, width=1280, height=720
+            ),
         },
         axol_config=AxolConfig(left=left, right=right),
     )
@@ -187,7 +235,8 @@ def _run(
     # Episode control is handled via stdin prompts between episodes.
     events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
 
-    init_rerun(session_name="axol_run_policy")
+    if rerun_ip:
+        init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
 
     episodes_recorded = 0
     try:
@@ -204,7 +253,7 @@ def _run(
                 dataset=dataset,
                 control_time_s=episode_time_s,
                 single_task=task,
-                display_data=True,
+                display_data=rerun_ip is not None,
                 teleop_action_processor=teleop_action_proc,
                 robot_action_processor=robot_action_proc,
                 robot_observation_processor=robot_obs_proc,
