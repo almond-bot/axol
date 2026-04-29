@@ -156,17 +156,17 @@ def _run(
     rerun_ip: str | None = None,
     rerun_port: int = 9876,
 ) -> None:
+    import time
     from dataclasses import replace
 
-    from lerobot.datasets.feature_utils import hw_to_dataset_features
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.pretrained import PreTrainedPolicy
     from lerobot.processor import make_default_processors
-    from lerobot.scripts.lerobot_record import record_loop
     from lerobot.utils.constants import ACTION, OBS_STR
+    from lerobot.utils.feature_utils import build_dataset_frame, hw_to_dataset_features
     from lerobot.utils.utils import log_say
-    from lerobot.utils.visualization_utils import init_rerun
+    from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
     from ..lerobot.camera.configuration_zed import ZedCameraConfig
     from ..lerobot.robot.config_axol import AxolRobotConfig
@@ -231,10 +231,6 @@ def _run(
 
     robot.connect()
 
-    # No keyboard listener — this command must work over SSH.
-    # Episode control is handled via stdin prompts between episodes.
-    events = {"exit_early": False, "rerecord_episode": False, "stop_recording": False}
-
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
 
@@ -243,21 +239,34 @@ def _run(
         while True:
             log_say(f"Running episode {episodes_recorded + 1}.")
 
-            record_loop(
-                robot=robot,
-                events=events,
-                fps=fps,
-                policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                dataset=dataset,
-                control_time_s=episode_time_s,
-                single_task=task,
-                display_data=rerun_ip is not None,
-                teleop_action_processor=teleop_action_proc,
-                robot_action_processor=robot_action_proc,
-                robot_observation_processor=robot_obs_proc,
-            )
+            if dataset:
+                dataset.clear_episode_buffer()
+
+            deadline = time.perf_counter() + episode_time_s
+            while time.perf_counter() < deadline:
+                t0 = time.perf_counter()
+
+                obs = robot.get_observation()
+                obs_processed = robot_obs_proc(obs)
+
+                policy_input = preprocessor(obs_processed)
+                policy_action = policy.select_action(policy_input)
+                act_processed = postprocessor(policy_action)
+                robot.send_action(robot_action_proc((act_processed, obs)))
+
+                if dataset:
+                    obs_frame = build_dataset_frame(
+                        dataset.features, obs_processed, prefix=OBS_STR
+                    )
+                    act_frame = build_dataset_frame(
+                        dataset.features, act_processed, prefix=ACTION
+                    )
+                    dataset.add_frame({**obs_frame, **act_frame, "task": task})
+
+                if rerun_ip:
+                    log_rerun_data(observation=obs_processed, action=act_processed)
+
+                time.sleep(max(0.0, 1 / fps - (time.perf_counter() - t0)))
 
             choice = (
                 input("Episode done. [Enter]=save, r=rerecord, q=quit: ")

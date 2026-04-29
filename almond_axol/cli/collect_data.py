@@ -112,14 +112,14 @@ def _run(
     from dataclasses import replace
     from pathlib import Path
 
-    from lerobot.datasets.feature_utils import (
-        build_dataset_frame,
-        hw_to_dataset_features,
-    )
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
+    from lerobot.utils.feature_utils import (
+        build_dataset_frame,
+        hw_to_dataset_features,
+    )
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
@@ -163,20 +163,21 @@ def _run(
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
     is_complete = (
-        has_info
-        and (meta / "tasks.parquet").exists()
-        and (meta / "episodes.parquet").exists()
+        has_info and (meta / "tasks.parquet").exists() and (meta / "episodes").is_dir()
     )
     if has_info and not is_complete:
         raise RuntimeError(
-            f"Incomplete dataset found at {dataset_root} (missing tasks.parquet or episodes.parquet). "
+            f"Incomplete dataset found at {dataset_root} (missing tasks.parquet or episodes/). "
             f"Delete the directory and rerun to start fresh:\n"
             f"  rm -rf {dataset_root}"
         )
     if is_complete:
         log_say(f"Resuming existing dataset at {dataset_root}.")
-        dataset = LeRobotDataset(repo_id=repo_id, root=root)
-        dataset.start_image_writer(num_threads=4)
+        dataset = LeRobotDataset.resume(
+            repo_id=repo_id,
+            root=str(dataset_root),
+            image_writer_threads=4,
+        )
     else:
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
