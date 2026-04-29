@@ -28,8 +28,8 @@ lerobot = ["lerobot"]
 sim = ["viser>=1.0.24"]
 
 [tool.uv.sources]
-pyroki = { git = "https://github.com/chungmin99/pyroki.git" }
-lerobot = { git = "https://github.com/huggingface/lerobot.git" }
+pyroki = { git = "https://github.com/chungmin99/pyroki.git", rev = "388e43e1fc0d0ee382968d3dd72970fd62a0450c" }
+lerobot = { git = "https://github.com/huggingface/lerobot.git", rev = "b5f65e533270015f33dc2f5f570b27dada96fbb1" }
 [project.scripts]
 axol = "almond_axol.cli:main"
 
