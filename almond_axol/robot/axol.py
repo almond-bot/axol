@@ -541,14 +541,17 @@ class Axol(RobotBase):
             tasks.extend([self.left.stop_telemetry(), self.left.disable()])
         if self.right is not None:
             tasks.extend([self.right.stop_telemetry(), self.right.disable()])
-        await asyncio.gather(*tasks)
-
-        close_tasks = []
-        if self.left is not None:
-            close_tasks.append(self._left_bus.close())
-        if self.right is not None:
-            close_tasks.append(self._right_bus.close())
-        await asyncio.gather(*close_tasks)
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            pass
+        finally:
+            close_tasks = []
+            if self.left is not None:
+                close_tasks.append(self._left_bus.close())
+            if self.right is not None:
+                close_tasks.append(self._right_bus.close())
+            await asyncio.gather(*close_tasks)
 
     async def clear_errors(self) -> None:
         """Clear latched error flags on both arms."""
