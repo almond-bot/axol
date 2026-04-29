@@ -96,12 +96,35 @@ class ZedCamera(Camera):
 
         self.zed = zed
 
-        # Always read resolution and FPS from the stream — do not use config values
+        # Read actual resolution and FPS from the stream and validate against config
         info = zed.get_camera_information()
         params = info.camera_configuration.resolution
-        self.fps = int(info.camera_configuration.fps)
-        self.width = int(params.width)
-        self.height = int(params.height)
+        stream_fps = int(info.camera_configuration.fps)
+        stream_width = int(params.width)
+        stream_height = int(params.height)
+
+        mismatches = []
+        if self.config.fps is not None and stream_fps != self.config.fps:
+            mismatches.append(f"fps: expected {self.config.fps}, got {stream_fps}")
+        if self.config.width is not None and stream_width != self.config.width:
+            mismatches.append(
+                f"width: expected {self.config.width}, got {stream_width}"
+            )
+        if self.config.height is not None and stream_height != self.config.height:
+            mismatches.append(
+                f"height: expected {self.config.height}, got {stream_height}"
+            )
+        if mismatches:
+            zed.close()
+            raise RuntimeError(
+                f"{self} stream parameters do not match config — "
+                + ", ".join(mismatches)
+                + ". Update ZedCameraConfig or the sender settings."
+            )
+
+        self.fps = stream_fps
+        self.width = stream_width
+        self.height = stream_height
 
         self._start_read_thread()
 
