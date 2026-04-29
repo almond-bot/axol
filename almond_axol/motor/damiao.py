@@ -1,3 +1,5 @@
+"""Damiao motor driver implementing the MIT/position-force CAN protocol."""
+
 # Protocol source: python-damiao-driver/damiao_motor/motor.py
 
 from __future__ import annotations
@@ -91,6 +93,8 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
 
 
 class DamiaoMotor(MotorDriver):
+    """MotorDriver implementation for Damiao motors using the MIT/position-force protocol."""
+
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int, kt: float) -> None:
         self._bus = bus
         self._motor_id = motor_id

@@ -1,12 +1,16 @@
-# Axol CLI
+# Axol
 
-Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <command> [flags]`.
+<img src="assets/axol.png" width="400" alt="Axol dual-arm robot" />
+
+Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
+
+**New here?** See the [Quickstart](QUICKSTART.md) to go from installation to a live teleoperation session.
 
 ## Requirements
 
 - **Linux**
 - **Python 3.13+**
-- **(Optional) NVIDIA Jetson** If Zed cameras are used.
+- **(Optional) NVIDIA Jetson** If ZED cameras are used.
 
 ## Table of Contents
 
@@ -18,6 +22,15 @@ Command-line interface for the Almond Axol dual-arm robot. Invoked as `axol <com
 - [Policy Execution](#policy-execution)
 - [ZED Camera](#zed-camera)
 - [Tuning](#tuning)
+- [Python SDK](#python-sdk)
+  - [Modules](#modules)
+  - [Core Concepts](#core-concepts)
+  - [almond_axol.robot](#almond_axolrobot)
+  - [almond_axol.kinematics](#almond_axolkinematics)
+  - [almond_axol.teleop](#almond_axolteleop)
+  - [almond_axol.vr](#almond_axolvr)
+  - [almond_axol.zed](#almond_axolzed)
+  - [almond_axol.motor](#almond_axolmotor)
 
 ---
 
@@ -276,13 +289,478 @@ Identifies all six feedforward parameters for one joint via a bidirectional velo
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
-| `--joint JOINT` | Joint to identify (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`, `gripper` (required) |
 | `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
 | `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
 | `--velocities V [V ...]` | Velocity setpoints in rad/s (default: ~0.1, 0.3, 0.6, 0.9, 1.3) |
+| `--lo RAD` | Override lower joint limit for the sweep |
+| `--hi RAD` | Override upper joint limit for the sweep |
 
 ```bash
 axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
 axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
 axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+axol tune.feedforward --r --joint gripper --kp 10 --kd 0.3
 ```
+
+---
+
+## Python SDK
+
+Install the package with `uv sync` (see [Installation](#installation)), then import directly from `almond_axol`.
+
+- [Modules](#modules)
+- [Core Concepts](#core-concepts)
+- [almond_axol.robot](#almond_axolrobot)
+- [almond_axol.kinematics](#almond_axolkinematics)
+- [almond_axol.teleop](#almond_axolteleop)
+- [almond_axol.vr](#almond_axolvr)
+- [almond_axol.zed](#almond_axolzed)
+- [almond_axol.motor](#almond_axolmotor)
+
+---
+
+### Modules
+
+```
+almond_axol/
+├── robot/        Axol (hardware) and Sim (visualizer) — start here
+├── kinematics/   Bimanual IK solver (JAX + pyroki)
+├── teleop/       VR headset → IK → robot control loop
+├── vr/           WebSocket server that receives VR frames
+├── zed/          ZED-X One camera streaming
+└── motor/        Low-level async CAN motor interface
+```
+
+End-to-end data flow for teleoperation:
+
+```
+VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → motors
+```
+
+---
+
+### Core Concepts
+
+**Async context managers.** `Axol`, `Sim`, `VRTeleop`, `VRServer`, and `ZedStreamer` all open and close hardware resources in `__aenter__` / `__aexit__`. Always use them with `async with`.
+
+**Joint arrays.** Every method that reads or writes joint state uses `np.ndarray` of shape `(8,)` in `Joint` enum order: `SHOULDER_1`, `SHOULDER_2`, `SHOULDER_3`, `ELBOW`, `WRIST_1`, `WRIST_2`, `WRIST_3`, `GRIPPER`. Arm joints are in radians; the gripper is normalized to `[0.0 = closed, 1.0 = fully open]`.
+
+**Telemetry vs. one-shot reads.** `start_telemetry(hz)` launches a background polling loop and populates `.positions` and `.torques` as non-blocking cached properties — read them in a tight control loop without `await`. Direct calls like `await get_positions()` issue individual CAN reads and are suitable for diagnostics but too slow for real-time control. `start_telemetry` is not required if you are already running a `motion_control` loop — every impedance command sent to the arm motors returns a position and torque reading, which is used to populate the same cache automatically.
+
+---
+
+### almond_axol.robot
+
+Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
+
+```python
+from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointGains, Sim
+```
+
+#### `Axol`
+
+```python
+Axol(
+    config: AxolConfig = AxolConfig(),
+    left_channel: str | None = "can_alm_axol_l",
+    right_channel: str | None = "can_alm_axol_r",
+)
+```
+
+Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`.
+
+```python
+import asyncio
+import numpy as np
+from almond_axol.robot import Axol
+
+async def main():
+    async with Axol() as axol:
+        await axol.start_telemetry(500)   # 500 Hz background polling
+
+        # non-blocking cached reads (after telemetry warms up)
+        print("left positions (rad):", axol.left.positions)
+        print("left torques (Nm):", axol.left.torques)
+
+        # primary control: impedance for arm joints, position-force for gripper
+        q = np.zeros(8, dtype=np.float32)
+        q[7] = 1.0  # open gripper
+        await axol.motion_control(left=q, right=q)
+
+asyncio.run(main())
+```
+
+**Lifecycle methods**
+
+| Method | Description |
+|---|---|
+| `enable()` | Start CAN buses, enable all motors, calibrate grippers |
+| `disable()` | Disable all motors and close CAN buses |
+| `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
+| `stop_telemetry()` | Stop background polling |
+| `clear_errors()` | Clear latched error flags on all motors |
+| `set_control_mode(mode)` | Set `ControlMode` on all motors |
+
+**State reads** — each returns `(left_array, right_array)` where the absent arm is `None`
+
+| Method | Units |
+|---|---|
+| `get_positions()` | rad (gripper: `[0, 1]`) |
+| `get_velocities()` | rad/s |
+| `get_torques()` | Nm (Damiao) / A (MyActuator) |
+| `get_temperatures()` | °C |
+| `get_voltages()` | V |
+| `get_error_codes()` | `list[MotorStatus]` |
+| `get_gains()` | `list[MotorGains]` |
+
+**State writes**
+
+| Method | Description |
+|---|---|
+| `motion_control(left, right)` | Impedance (arm) + position-force (gripper); primary control method |
+| `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
+| `set_velocity(left, right)` | Motor built-in speed controller |
+| `set_gains(left, right)` | Write PID gains; persisted to flash |
+| `set_zero_position(left, right)` | Save current shaft position as encoder zero |
+| `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
+
+Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.
+
+#### `Sim`
+
+`Sim` implements the same interface as `Axol`. Use it to visualise motion without hardware. Requires the `sim` extra.
+
+```python
+import asyncio
+import numpy as np
+from almond_axol.robot import Sim
+
+async def main():
+    async with Sim(port=8080) as sim:
+        q = np.zeros(8, dtype=np.float32)
+        await sim.motion_control(left=q)
+        await asyncio.sleep(float("inf"))  # keep the viser server alive
+
+asyncio.run(main())
+```
+
+Open `http://localhost:8080` in a browser to view the robot.
+
+#### Configuration — `AxolConfig`, `ArmConfig`, `JointGains`
+
+`ArmConfig` holds per-joint gains and friction parameters. All joints ship with pre-tuned defaults; override individual joints with `dataclasses.replace()`:
+
+```python
+from dataclasses import replace
+from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointGains
+
+left = replace(
+    ArmConfig(),
+    shoulder_1=JointGains(kp=35.0, kd=1.2, ga=2.1, gb=0.3, fc=0.0, k=0.0, fv=0.0, fo=0.0),
+    elbow=JointGains(kp=25.0, kd=0.6, fc=0.4, k=10.0, fv=0.05, fo=0.0, ga=-0.18, gb=5.66),
+)
+config = AxolConfig(left=left)
+# right defaults to left with gb negated for shoulder_2 and elbow
+async with Axol(config=config) as axol: ...
+```
+
+**`JointGains` fields**
+
+| Field | Range | Description |
+|---|---|---|
+| `kp` | `[0, 500]` | Impedance position stiffness |
+| `kd` | `[0, 5]` | Impedance velocity damping |
+| `ga` | — | Gravity feedforward cosine coefficient: `τ = ga·cos(q) + gb·sin(q)` |
+| `gb` | — | Gravity feedforward sine coefficient |
+| `fc` | — | Coulomb friction magnitude (Nm) |
+| `k` | — | Tanh sharpness factor for the friction model |
+| `fv` | — | Viscous friction coefficient (Nm·s/rad) |
+| `fo` | — | Constant friction offset (Nm) |
+
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s).
+
+`AxolConfig.right` automatically mirrors `gb` for `shoulder_2` and `elbow`, because those joints have inverted angle ranges on the right arm. Override either arm independently by passing both `left=` and `right=` to `AxolConfig`.
+
+---
+
+### almond_axol.kinematics
+
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first call takes a few seconds; subsequent calls are fast.
+
+```python
+from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
+```
+
+```python
+import numpy as np
+from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
+
+solver = KinematicsSolver(KinematicsConfig(pos_weight=100.0))
+q = np.zeros(solver.num_joints, dtype=np.float32)
+
+# Forward kinematics → (left_SE3, right_SE3) as jaxlie.SE3
+left_se3, right_se3 = solver.fk(q)
+
+# Inverse kinematics → new joint array
+pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
+rot = np.eye(3, dtype=np.float32)
+q = solver.ik(q, left_pose=(pos, rot))
+```
+
+**`KinematicsSolver` interface**
+
+| Member | Description |
+|---|---|
+| `num_joints` | Total actuated joints across both arms |
+| `joint_names` | Joint name strings (left arm then right) |
+| `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
+| `fk(q)` | Forward kinematics → `(left_SE3, right_SE3)` |
+| `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
+| `set_posture_pose(q)` | Set the null-space attractor (home pose for joint drift prevention) |
+
+**`KinematicsConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `pos_weight` | `50.0` | End-effector position tracking weight |
+| `ori_weight` | `10.0` | End-effector orientation tracking weight |
+| `elbow_weight` | `5.0` | Elbow hint tracking weight |
+| `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
+| `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
+| `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
+| `limit_weight` | `75.0` | Joint limit penalty weight |
+| `self_collision_margin` | `0.1` m | Minimum clearance between collision bodies |
+| `self_collision_weight` | `75.0` | Self-collision penalty weight |
+| `max_iterations` | `8` | Solver iterations per `ik()` call |
+| `cost_tolerance` | `1e-2` | Convergence tolerance |
+| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call |
+| `max_reach` | `0.8` m | EE target clamped to this distance from shoulder |
+
+---
+
+### almond_axol.teleop
+
+Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → One Euro filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
+
+```python
+from almond_axol.teleop import VRTeleop, VRTeleopConfig
+```
+
+```python
+import asyncio
+from almond_axol.robot import Axol
+from almond_axol.teleop import VRTeleop
+
+async def main():
+    async with VRTeleop(Axol()) as teleop:
+        await teleop.run()  # blocking; Ctrl+C to exit
+
+asyncio.run(main())
+```
+
+Use `step()` instead of `run()` to integrate teleoperation into your own control loop:
+
+```python
+async with VRTeleop(axol) as teleop:
+    while True:
+        left_q, right_q = teleop.step()  # returns latest smoothed (8,) arrays
+        # ... custom logic ...
+        await asyncio.sleep(1 / 120)
+```
+
+See `teleop --robot axol` in [Teleoperation](#teleoperation) for the equivalent CLI command.
+
+**`VRTeleopConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `frequency` | `120` Hz | Control loop rate used by `run()` and reset trajectory density |
+| `teleop_max_vel` | `1.0 rev/s` | Trapezoidal filter velocity cap during normal teleoperation |
+| `teleop_max_accel` | `3.5 rev/s²` | Trapezoidal filter acceleration cap |
+| `engage_max_vel` | `0.1 rev/s` | Slower velocity limit when the deadman switch is first pressed after a reset |
+| `engage_duration` | `1.0` s | How long `engage_max_vel` is held before restoring `teleop_max_vel` |
+| `startup_max_accel` | `0.3 rev/s²` | Gentler accel during the initial startup move to rest pose |
+| `ik_alpha` | `0.5` | EMA blend factor on IK output; `1.0` disables smoothing |
+| `pose_min_cutoff` | `1.5` Hz | One Euro Filter tremor cutoff for raw VR poses |
+| `pose_beta` | `5.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
+| `reset_speed` | `0.1 rev/s` | Speed of the collision-aware return-to-rest trajectory |
+| `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
+
+**Deadman switch behaviour.** Grip is a toggle, not a hold. Press both grip buttons together to enable arm movement; press either grip alone to freeze the arms. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.
+
+---
+
+### almond_axol.vr
+
+Secure WebSocket server (WSS) that receives `VRFrame` JSON messages from the VR app. A self-signed TLS certificate is auto-generated in `~/.almond/vr/certs/` on first use. This module can be used standalone to read raw VR data without full teleoperation — useful for custom control loops or data collection.
+
+```python
+from almond_axol.vr import VRServer, VRServerConfig
+```
+
+```python
+import asyncio
+from almond_axol.vr import VRServer, VRServerConfig
+
+async def main():
+    async with VRServer(VRServerConfig(port=8000)) as vr:
+        while True:
+            frame = vr.get_frame()
+            if frame is not None:
+                print(frame.l_ee, frame.r_ee)
+            await asyncio.sleep(0.01)
+
+asyncio.run(main())
+```
+
+Or use a callback instead of polling:
+
+```python
+def on_frame(frame):
+    print(frame.l_grip, frame.r_grip)
+
+async with VRServer() as vr:
+    vr.set_on_frame(on_frame)
+    await asyncio.sleep(float("inf"))
+```
+
+**`VRFrame` fields**
+
+| Field | Type | Description |
+|---|---|---|
+| `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position + quaternion) |
+| `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions |
+| `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
+| `l_lock` / `r_lock` | `bool` | Deadman switches |
+| `reset` | `bool` | Rising edge triggers a reset move |
+| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` |
+
+**`VRServerConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `port` | `8000` | WSS listen port |
+| `certfile` | auto | Path to TLS certificate; `None` uses the auto-generated cert |
+| `keyfile` | auto | Path to TLS private key |
+
+> Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.
+
+---
+
+### almond_axol.zed
+
+Streams up to three ZED-X One cameras over the local network using HEVC (H.265) encoding via the ZED SDK. Requires `pyzed` — install it with `axol zed.install` (see [ZED Camera](#zed-camera)).
+
+```python
+from almond_axol.zed import ZedStreamer, ZedConfig
+```
+
+```python
+import asyncio
+from almond_axol.zed import ZedStreamer, ZedConfig
+
+async def main():
+    config = ZedConfig(
+        overhead_serial=12345678,
+        left_arm_serial=23456789,
+        right_arm_serial=34567890,
+    )
+    async with ZedStreamer(config):
+        await asyncio.sleep(float("inf"))
+
+asyncio.run(main())
+```
+
+**`ZedConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `overhead_serial` | `None` | Serial number of the overhead camera |
+| `left_arm_serial` | `None` | Serial number of the left-arm camera |
+| `right_arm_serial` | `None` | Serial number of the right-arm camera |
+| `overhead_port` | `30000` | Streaming port for the overhead camera |
+| `left_arm_port` | `30002` | Streaming port for the left-arm camera |
+| `right_arm_port` | `30004` | Streaming port for the right-arm camera |
+| `resolution` | `HD1080` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
+| `fps` | `60` | Capture frame rate for all cameras |
+| `bitrate` | `8000` kbps | HEVC encoding bitrate |
+
+At least one serial number must be provided. The sender IP is `192.168.10.1/24`; set it automatically with `--setup-ip` via the CLI or by calling `setup_link_ip(iface, "192.168.10.1/24")` from `almond_axol.shared` before streaming.
+
+---
+
+### almond_axol.motor
+
+Low-level async SocketCAN interface for individual motors. Most users work through `Axol` — this layer is exposed for diagnostics, custom control modes, and bench testing individual motors.
+
+```python
+from almond_axol.motor import CanBus, Motor, ControlMode, MotorStatus, MotorGains, Joint
+```
+
+```python
+import asyncio
+from almond_axol.motor import CanBus, Motor, ControlMode, Joint
+
+async def main():
+    async with CanBus("can_alm_axol_l") as bus:
+        elbow = Motor(bus, Joint.ELBOW)
+        await elbow.enable()
+        await elbow.set_control_mode(ControlMode.IMPEDANCE)
+
+        pos = await elbow.get_position()  # rad
+        print("elbow position:", pos)
+
+        await elbow.set_impedance(p_des=pos, v_des=0.0, kp=100.0, kd=2.0, t_ff=0.0)
+        await elbow.disable()
+
+asyncio.run(main())
+```
+
+**`Motor` methods**
+
+| Method | Description |
+|---|---|
+| `enable()` / `disable()` | Enable motor / engage brake |
+| `clear_errors()` | Clear latched error flags |
+| `set_zero_position()` | Save current position as encoder zero (persisted to flash) |
+| `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |
+| `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
+| `get_position()` | Shaft position (rad); raises if telemetry is active |
+| `get_velocity()` | Shaft velocity (rad/s) |
+| `get_torque()` | Torque estimate (Nm); raises if telemetry is active |
+| `get_temperature()` | Motor temperature (°C) |
+| `get_voltage()` | Bus voltage (V) |
+| `get_error_code()` | `MotorStatus` |
+| `get_gains()` / `set_gains(gains)` | Read/write PID gains (persisted to flash) |
+| `set_impedance(p_des, v_des, kp, kd, t_ff)` | MIT impedance command; requires `IMPEDANCE` mode |
+| `set_position_velocity(position, max_speed)` | Built-in position controller; requires `POSITION_VELOCITY` mode |
+| `set_velocity(velocity)` | Built-in speed controller; requires `VELOCITY` mode |
+| `set_position_force(position, max_speed, max_torque)` | Damiao only; requires `POSITION_FORCE` mode |
+| `set_acceleration(acceleration, deceleration)` | Acceleration ramp (rad/s²) |
+| `set_can_id(can_id)` | Change CAN ID (persisted to flash) |
+| `start_telemetry(hz, torque=False)` / `stop_telemetry()` | Background polling loop |
+| `motor.position` | Cached position (rad); populated by telemetry or `set_impedance` responses |
+| `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
+
+**`ControlMode` values**
+
+| Value | Description |
+|---|---|
+| `IMPEDANCE` | MIT impedance control (arm joints) |
+| `POSITION_VELOCITY` | Motor built-in position controller |
+| `VELOCITY` | Motor built-in speed controller |
+| `POSITION_FORCE` | Position with hard torque cap; Damiao only (gripper) |
+
+**`MotorStatus` values**
+
+`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `UNKNOWN`
+
+\* MyActuator only
+
+**Joint → driver mapping**
+
+| Joint | Driver | CAN ID |
+|---|---|---|
+| `SHOULDER_1` – `WRIST_1` | MyActuator | `0x01` – `0x05` |
+| `WRIST_2`, `WRIST_3`, `GRIPPER` | Damiao | `0x06` – `0x08` |

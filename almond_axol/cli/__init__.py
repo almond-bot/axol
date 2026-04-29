@@ -1,3 +1,5 @@
+"""CLI entry point for the axol command registered via pyproject.toml."""
+
 import argparse
 
 from . import collect_data, run_policy, teleop

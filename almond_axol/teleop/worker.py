@@ -155,6 +155,15 @@ class IKWorker:
     def __init__(
         self, config: VRTeleopConfig, kinematics_config: KinematicsConfig
     ) -> None:
+        """Construct the IK worker.
+
+        Instantiates the :class:`KinematicsSolver` (which triggers JAX JIT
+        compilation) and initialises One Euro Filters for all VR pose streams.
+
+        Args:
+            config:            Teleop session parameters (rest poses, frequency, filter settings).
+            kinematics_config: IK solver cost weights forwarded to :class:`KinematicsSolver`.
+        """
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
 
@@ -184,10 +193,12 @@ class IKWorker:
 
     @property
     def left_indices(self) -> list[int]:
+        """Indices of the left arm joints within the full ``(N,)`` joint array, in ARM_JOINTS order."""
         return self._solver.left_indices
 
     @property
     def right_indices(self) -> list[int]:
+        """Indices of the right arm joints within the full ``(N,)`` joint array, in ARM_JOINTS order."""
         return self._solver.right_indices
 
     def get_rest_q(self) -> np.ndarray:
@@ -320,6 +331,11 @@ class IKWorker:
         return trajectory
 
     def reset(self) -> None:
+        """Deactivate the deadman-switch state and clear snap poses and filter state.
+
+        Call this before replaying a reset trajectory so the next deadman press
+        performs a fresh engage-snap from the current IK pose.
+        """
         self._active = False
         self._snap_ctrl = {}
         self._snap_fk = {}

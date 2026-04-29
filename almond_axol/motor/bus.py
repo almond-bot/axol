@@ -1,3 +1,5 @@
+"""Async SocketCAN bus shared across all Motor instances on one physical interface."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,8 +12,7 @@ _logger = logging.getLogger(__name__)
 
 
 class CanBus:
-    """
-    Async wrapper around a python-can SocketCAN bus.
+    """Async wrapper around a python-can SocketCAN bus.
 
     A single instance is shared between all Motor objects on the same physical
     interface.  The background reader task dispatches every incoming frame to
@@ -25,6 +26,14 @@ class CanBus:
     """
 
     def __init__(self, channel: str) -> None:
+        """Open a SocketCAN socket on the given interface.
+
+        The background reader loop is not started until :meth:`start` (or
+        ``async with``) is called.
+
+        Args:
+            channel: SocketCAN interface name, e.g. ``"can_alm_axol_l"``.
+        """
         self._bus = can.Bus(channel=channel, bustype="socketcan")
         self._listeners: list[Callable[[can.Message], None]] = []
         self._reader_task: asyncio.Task | None = None

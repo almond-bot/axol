@@ -1,3 +1,11 @@
+"""Unified async motor interface and driver factory.
+
+Provides :class:`Motor` (the public facade used throughout the codebase) and
+:func:`make_driver` (selects the correct low-level :class:`MotorDriver` subclass
+— :class:`DamiaoMotor` or :class:`MyActuatorMotor` — based on CAN ID or an
+explicit type override).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -71,8 +79,7 @@ def make_driver(
 
 
 class Motor:
-    """
-    Unified async motor interface.
+    """Unified async motor interface.
 
     Instantiate with a CanBus and a Joint; the correct underlying driver
     is selected automatically based on the joint.
@@ -83,6 +90,14 @@ class Motor:
     """
 
     def __init__(self, bus: CanBus, joint: Joint, can_id: int | None = None) -> None:
+        """Construct a Motor and select the correct underlying driver for the joint.
+
+        Args:
+            bus:    Shared CAN bus for this arm.
+            joint:  The joint this motor drives; determines driver type and default CAN ID.
+            can_id: Override the default CAN ID from the joint config table; useful for
+                bench testing a motor before it is mounted to the arm.
+        """
         self.joint = joint
         self.mode: ControlMode | None = None
         cfg = _JOINT_CONFIG[joint]

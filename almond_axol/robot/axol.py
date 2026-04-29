@@ -1,3 +1,9 @@
+"""Hardware control classes for the Almond Axol dual-arm robot.
+
+Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
+(dual-arm context manager that opens both buses and constructs all 16 motor drivers).
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -71,6 +77,13 @@ class AxolArm:
         config: AxolConfig,
         is_left: bool = True,
     ) -> None:
+        """Construct an AxolArm.
+
+        Args:
+            bus:     Shared CAN bus for this arm (one per physical interface).
+            config:  Full dual-arm gains config; the correct side is selected via ``is_left``.
+            is_left: ``True`` for the left arm, ``False`` for the right.
+        """
         self._config = config
         self._arm_config = config.left if is_left else config.right
         self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
@@ -440,6 +453,16 @@ class Axol(RobotBase):
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
     ) -> None:
+        """Construct the dual-arm interface.
+
+        CAN buses and motors are created but not started; call ``enable()``
+        or use the class as an async context manager to bring up hardware.
+
+        Args:
+            config:        Per-joint gains, friction parameters, and gripper config.
+            left_channel:  SocketCAN interface name for the left arm, or ``None`` to omit it.
+            right_channel: SocketCAN interface name for the right arm, or ``None`` to omit it.
+        """
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."

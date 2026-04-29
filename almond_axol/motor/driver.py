@@ -1,3 +1,5 @@
+"""Abstract base class defining the motor driver interface."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -8,6 +10,14 @@ from .types import ControlMode, MotorGains, MotorStatus
 
 
 class MotorDriver(ABC):
+    """Abstract base class for a single CAN motor driver.
+
+    Concrete subclasses :class:`DamiaoMotor` and :class:`MyActuatorMotor`
+    implement the protocol-specific CAN framing. All position values are in
+    radians; all velocity values are in rad/s. Public methods defined here
+    carry the authoritative docstrings inherited by both implementations.
+    """
+
     @abstractmethod
     async def enable(self) -> None:
         """Enable the motor and release the brake."""

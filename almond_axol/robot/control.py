@@ -36,8 +36,7 @@ def compute_feedforward(
 
 
 class Differentiator:
-    """
-    First-order low-pass differentiator, matching C++ Differentiator::Differentiate.
+    """First-order low-pass differentiator, matching C++ Differentiator::Differentiate.
 
     For each channel:
         a = 1 / (1 + Ts * CUTOFF_FREQ)
@@ -49,12 +48,26 @@ class Differentiator:
     """
 
     def __init__(self, n: int) -> None:
+        """Initialize the differentiator.
+
+        Args:
+            n: Number of independent channels to differentiate simultaneously.
+        """
         self._n = n
         self._vel_prev = [0.0] * n
         self._pos_prev: list[float | None] = [None] * n
         self._last_time: float | None = None
 
     def differentiate(self, positions: list[float]) -> list[float]:
+        """Compute low-pass-filtered velocities from a new position sample.
+
+        Returns a list of length ``n`` in rad/s.  Returns all zeros on the
+        first call.  If called with no elapsed time (``Ts <= 0``), returns
+        the previous velocity estimate unchanged.
+
+        Args:
+            positions: Current joint positions in radians, length ``n``.
+        """
         now = time.perf_counter()
 
         if self._last_time is None or any(p is None for p in self._pos_prev):

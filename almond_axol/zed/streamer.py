@@ -57,6 +57,13 @@ class ZedStreamer:
     """
 
     def __init__(self, config: ZedConfig) -> None:
+        """Construct the streamer.
+
+        Cameras are not opened until :meth:`enable` (or ``async with``) is called.
+
+        Args:
+            config: Serial numbers, ports, resolution, fps, and bitrate for all cameras.
+        """
         self._config = config
         self._cameras: list[_CameraState] = []
 

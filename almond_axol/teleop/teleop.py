@@ -92,6 +92,17 @@ class VRTeleop:
         kinematics_config: KinematicsConfig = KinematicsConfig(),
         vr_server_config: VRServerConfig = VRServerConfig(),
     ) -> None:
+        """Construct the teleoperation session.
+
+        No network connections or subprocesses are started until :meth:`enable`
+        (or ``async with``) is called.
+
+        Args:
+            robot:             Hardware or simulation target implementing :class:`RobotBase`.
+            config:            Teleop loop parameters (rest poses, frequency, velocity limits).
+            kinematics_config: IK solver cost weights forwarded to the IK subprocess.
+            vr_server_config:  VR WebSocket server parameters (port, TLS certs).
+        """
         self._robot = robot
         self._config = config
         self._kinematics_config = kinematics_config
@@ -295,6 +306,7 @@ class VRTeleop:
                         await self._robot.motion_control(left=left, right=right)
                     except Exception as e:
                         _logger.error("Motion control error: %s", e)
+                        raise
 
                 now = time.perf_counter()
                 loop_times.append(now)
@@ -441,6 +453,9 @@ class VRTeleop:
             both = frame.l_lock and frame.r_lock
             either = frame.l_lock or frame.r_lock
 
+            # Toggle logic via rising-edge detection:
+            #   rising edge of BOTH grips pressed together → enable tracking
+            #   rising edge of EITHER grip pressed alone   → disable tracking
             if not self._teleop_enabled:
                 if both and not self._prev_both:
                     self._teleop_enabled = True
@@ -519,8 +534,8 @@ class VRTeleop:
                             and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
                         ):
                             self._ik_loop_times.pop(0)
-            except Exception:
-                pass
+            except Exception as e:
+                _logger.error("IK dispatch error: %s", e)
 
             _rem = ik_interval - (time.perf_counter() - t0)
             if _rem > 0.0:
