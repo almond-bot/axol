@@ -25,7 +25,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument("--task", required=True, help="Natural language task description.")
     p.add_argument(
-        "--fps", type=int, default=30, help="Recording frame rate (default: 30)."
+        "--fps", type=int, default=60, help="Recording frame rate (default: 60)."
     )
     p.add_argument(
         "--root",

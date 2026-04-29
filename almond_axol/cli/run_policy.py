@@ -26,7 +26,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Max duration of each episode in seconds (default: 30).",
     )
     p.add_argument(
-        "--fps", type=int, default=30, help="Control loop frame rate (default: 30)."
+        "--fps", type=int, default=60, help="Control loop frame rate (default: 60)."
     )
     p.add_argument(
         "--repo-id",

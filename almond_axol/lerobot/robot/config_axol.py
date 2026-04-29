@@ -25,7 +25,7 @@ class AxolRobotConfig(RobotConfig):
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     axol_config: AxolConfig = field(default_factory=AxolConfig)
-    telemetry_hz: float = 200.0
+    telemetry_hz: float = 120.0
     observe_torques: bool = False
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
