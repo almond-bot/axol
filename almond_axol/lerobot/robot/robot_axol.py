@@ -134,7 +134,9 @@ class AxolRobot(Robot):
             right_channel=self.config.right_channel,
         )
         await self._axol.enable()
-        await self._axol.start_telemetry(self.config.telemetry_hz)
+        await self._axol.start_telemetry(
+            self.config.telemetry_hz, torque=self.config.observe_torques
+        )
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
@@ -159,8 +161,7 @@ class AxolRobot(Robot):
     async def _disconnect_async(self) -> None:
         if self._axol is None:
             return
-        await self._axol.stop_telemetry()
-        await self._axol.__aexit__(None, None, None)
+        await self._axol.disable()
         self._axol = None
 
     # ------------------------------------------------------------------

@@ -43,7 +43,7 @@ from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...shared import Joint
-from ...teleop.filter import ResetInterpolator, TrapezoidalFilter
+from ...teleop.filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
@@ -106,6 +106,8 @@ class AxolVRTeleop(Teleoperator):
         # Signal processing (accessed only from IK loop thread)
         cfg = config.vr_teleop_config
         dt = 1.0 / cfg.frequency
+        self._ema_left = AlphaSmoothFilter(cfg.ik_alpha)
+        self._ema_right = AlphaSmoothFilter(cfg.ik_alpha)
         self._smooth_left = TrapezoidalFilter(
             cfg.teleop_max_vel, cfg.teleop_max_accel, dt
         )
@@ -216,6 +218,18 @@ class AxolVRTeleop(Teleoperator):
             self._l_grip = float(q_start_left[7])
         if q_start_right is not None and len(q_start_right) > 7:
             self._r_grip = float(q_start_right[7])
+
+        # Seed signal-processing filters from current arm positions so there
+        # is no transient on the first step (mirrors native VRTeleop.enable).
+        if q_start_left is not None:
+            seed_l = np.append(q_start_left[:7], self._l_grip)
+            self._ema_left.reset(seed=seed_l)
+            self._smooth_left.reset(seed=seed_l[:7])
+        if q_start_right is not None:
+            seed_r = np.append(q_start_right[:7], self._r_grip)
+            self._ema_right.reset(seed=seed_r)
+            self._smooth_right.reset(seed=seed_r[:7])
+
         if startup_traj:
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
@@ -363,14 +377,20 @@ class AxolVRTeleop(Teleoperator):
                     self._l_grip = l_grip
                     self._r_grip = r_grip
 
-        smoothed_l = self._smooth_left.update(np.append(q[self._left_indices], l_grip))
-        smoothed_r = self._smooth_right.update(
-            np.append(q[self._right_indices], r_grip)
-        )
+        ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
+        ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
+
+        # Arm joints go through the trapezoidal filter; the gripper bypasses it
+        # so it responds immediately (limited only by the EMA) rather than being
+        # throttled by the rad/s velocity limit designed for arm joints.
+        smoothed_l_arm = self._smooth_left.update(ema_l[:7])
+        smoothed_r_arm = self._smooth_right.update(ema_r[:7])
 
         out = np.empty(16, dtype=np.float32)
-        out[:8] = smoothed_l
-        out[8:] = smoothed_r
+        out[:7] = smoothed_l_arm
+        out[7] = ema_l[7]
+        out[8:15] = smoothed_r_arm
+        out[15] = ema_r[7]
         return out
 
     async def _ik_loop(self) -> None:
@@ -408,6 +428,8 @@ class AxolVRTeleop(Teleoperator):
                                 self._reset_interp.set_trajectory(
                                     trajectory, self._l_grip, self._r_grip
                                 )
+                                self._ema_left.reset()
+                                self._ema_right.reset()
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
                             self._q = np.asarray(q_default, dtype=np.float32)
