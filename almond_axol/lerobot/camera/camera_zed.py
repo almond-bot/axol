@@ -96,21 +96,12 @@ class ZedCamera(Camera):
 
         self.zed = zed
 
-        # Auto-detect resolution and FPS from the stream
+        # Always read resolution and FPS from the stream — do not use config values
         info = zed.get_camera_information()
         params = info.camera_configuration.resolution
-        stream_fps = int(info.camera_configuration.fps)
-        if self.fps is None:
-            self.fps = stream_fps
-        elif stream_fps < self.fps:
-            zed.close()
-            raise RuntimeError(
-                f"{self} stream FPS ({stream_fps}) is less than the requested FPS ({self.fps}). "
-                f"Start the ZED sender at {self.fps}fps or higher, or lower the camera fps config."
-            )
-        if self.width is None or self.height is None:
-            self.width = int(params.width)
-            self.height = int(params.height)
+        self.fps = int(info.camera_configuration.fps)
+        self.width = int(params.width)
+        self.height = int(params.height)
 
         self._start_read_thread()
 

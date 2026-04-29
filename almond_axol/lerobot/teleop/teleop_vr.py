@@ -120,6 +120,16 @@ class AxolVRTeleop(Teleoperator):
         self._prev_reset: bool = False
         self._reset_latched: bool = False
 
+        # Deadman toggle (mirrors native VRTeleop behaviour):
+        #   both grips rising edge → enable, either grip rising edge → disable
+        self._teleop_enabled: bool = False
+        self._prev_both: bool = False
+        self._prev_either: bool = False
+        # After a startup/reset trajectory completes, engage at reduced velocity
+        # so the first move toward the IK target is gentle.
+        self._at_rest: bool = True
+        self._engage_time: float | None = None
+
         # Episode state
         self._prev_state: VRState = VRState.TELEOP
         self._rerecord_latch: bool = False
@@ -400,6 +410,7 @@ class AxolVRTeleop(Teleoperator):
                     self._q = q.copy()
                     self._l_grip = l_grip
                     self._r_grip = r_grip
+                    self._at_rest = True
 
         ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
         ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
@@ -448,6 +459,36 @@ class AxolVRTeleop(Teleoperator):
             self._l_grip = frame.l_grip
             self._r_grip = frame.r_grip
 
+            # Deadman toggle — mirrors native VRTeleop._ik_loop logic:
+            #   rising edge of BOTH grips pressed together → enable tracking
+            #   rising edge of EITHER grip pressed alone   → disable tracking
+            both = frame.l_lock and frame.r_lock
+            either = frame.l_lock or frame.r_lock
+            if not self._teleop_enabled:
+                if both and not self._prev_both:
+                    self._teleop_enabled = True
+                    _logger.info("Teleop enabled")
+                    if self._at_rest:
+                        cfg = self.config.vr_teleop_config
+                        self._smooth_left.max_vel = cfg.engage_max_vel
+                        self._smooth_right.max_vel = cfg.engage_max_vel
+                        self._engage_time = time.perf_counter()
+                        self._at_rest = False
+            else:
+                if either and not self._prev_either:
+                    self._teleop_enabled = False
+                    _logger.info("Teleop disabled")
+            self._prev_both = both
+            self._prev_either = either
+
+            # Restore full velocity after engage window expires
+            if self._engage_time is not None:
+                cfg = self.config.vr_teleop_config
+                if time.perf_counter() - self._engage_time >= cfg.engage_duration:
+                    self._smooth_left.max_vel = cfg.teleop_max_vel
+                    self._smooth_right.max_vel = cfg.teleop_max_vel
+                    self._engage_time = None
+
             if self._reset_latched:
                 if self._reset_interp.is_active() or self._q is None:
                     self._reset_latched = False
@@ -466,6 +507,10 @@ class AxolVRTeleop(Teleoperator):
                                 self._ema_right.reset()
                                 self._smooth_left.reset()
                                 self._smooth_right.reset()
+                                self._teleop_enabled = False
+                                self._prev_both = False
+                                self._prev_either = False
+                                self._at_rest = True
                             self._q = np.asarray(q_default, dtype=np.float32)
                     except Exception as e:
                         _logger.error("Reset error: %s", e)
@@ -483,7 +528,15 @@ class AxolVRTeleop(Teleoperator):
                 continue
 
             try:
-                conn.send(frame)
+                # Synthesize lock state so the IK worker tracks our toggle
+                # rather than the raw button state (matches native VRTeleop).
+                frame_to_send = frame.model_copy(
+                    update={
+                        "l_lock": self._teleop_enabled,
+                        "r_lock": self._teleop_enabled,
+                    }
+                )
+                conn.send(frame_to_send)
                 result = await loop.run_in_executor(
                     None,
                     lambda: _recv_with_timeout(conn, _IK_RECV_TIMEOUT),

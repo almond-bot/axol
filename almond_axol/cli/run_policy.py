@@ -189,22 +189,27 @@ def _run(
     left = replace(left, gripper=gripper)
     right = replace(right, gripper=gripper)
 
-    # Build robot with 3 ZED cameras
+    # Build robot with 3 ZED cameras — resolution/FPS auto-detected from stream
     robot_config = AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(
-                host=zed_host, port=30000, fps=fps, width=1280, height=720
-            ),
-            "left_arm": ZedCameraConfig(
-                host=zed_host, port=30002, fps=fps, width=1280, height=720
-            ),
-            "right_arm": ZedCameraConfig(
-                host=zed_host, port=30004, fps=fps, width=1280, height=720
-            ),
+            "overhead": ZedCameraConfig(host=zed_host, port=30000),
+            "left_arm": ZedCameraConfig(host=zed_host, port=30002),
+            "right_arm": ZedCameraConfig(host=zed_host, port=30004),
         },
         axol_config=AxolConfig(left=left, right=right),
     )
     robot = AxolRobot(robot_config)
+
+    # Policy pre/post processors — normalization stats loaded from checkpoint
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=policy.config,
+        pretrained_path=policy_path,
+        preprocessor_overrides={"device_processor": {"device": device}},
+    )
+    _, robot_action_proc, robot_obs_proc = make_default_processors()
+
+    # Connect first so cameras auto-detect resolution, then build dataset features
+    robot.connect()
 
     # Dataset (optional — only created if --repo-id is specified)
     dataset = None
@@ -220,16 +225,6 @@ def _run(
             use_videos=True,
             image_writer_threads=4,
         )
-
-    # Policy pre/post processors — normalization stats loaded from checkpoint
-    preprocessor, postprocessor = make_pre_post_processors(
-        policy_cfg=policy.config,
-        pretrained_path=policy_path,
-        preprocessor_overrides={"device_processor": {"device": device}},
-    )
-    teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
-
-    robot.connect()
 
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)

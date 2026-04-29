@@ -142,24 +142,16 @@ def _run(
     right = replace(right, gripper=gripper)
     robot_config = AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(
-                host=zed_host, port=30000, fps=fps, width=1280, height=720
-            ),
-            "left_arm": ZedCameraConfig(
-                host=zed_host, port=30002, fps=fps, width=1280, height=720
-            ),
-            "right_arm": ZedCameraConfig(
-                host=zed_host, port=30004, fps=fps, width=1280, height=720
-            ),
+            "overhead": ZedCameraConfig(host=zed_host, port=30000),
+            "left_arm": ZedCameraConfig(host=zed_host, port=30002),
+            "right_arm": ZedCameraConfig(host=zed_host, port=30004),
         },
         axol_config=AxolConfig(left=left, right=right),
     )
     robot = AxolRobot(robot_config)
     teleop = AxolVRTeleop(AxolVRTeleopConfig())
 
-    action_features = hw_to_dataset_features(robot.action_features, ACTION)
-    obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
-
+    # Check resume eligibility before connecting (file check only)
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
     meta = dataset_root / "meta"
     has_info = (meta / "info.json").exists()
@@ -172,23 +164,6 @@ def _run(
             f"Delete the directory and rerun to start fresh:\n"
             f"  rm -rf {dataset_root}"
         )
-    if is_complete:
-        log_say(f"Resuming existing dataset at {dataset_root}.")
-        dataset = LeRobotDataset.resume(
-            repo_id=repo_id,
-            root=str(dataset_root),
-            image_writer_threads=4,
-        )
-    else:
-        dataset = LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=fps,
-            root=root,
-            features={**action_features, **obs_features},
-            robot_type=robot.name,
-            use_videos=True,
-            image_writer_threads=4,
-        )
 
     hostname = socket.gethostname()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
@@ -200,7 +175,30 @@ def _run(
 
     if rerun_ip:
         init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
+
+    # Connect first — cameras auto-detect resolution and FPS from the stream,
+    # which is then used to define the dataset observation features.
     robot.connect()
+
+    if is_complete:
+        log_say(f"Resuming existing dataset at {dataset_root}.")
+        dataset = LeRobotDataset.resume(
+            repo_id=repo_id,
+            root=str(dataset_root),
+            image_writer_threads=4,
+        )
+    else:
+        action_features = hw_to_dataset_features(robot.action_features, ACTION)
+        obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+        dataset = LeRobotDataset.create(
+            repo_id=repo_id,
+            fps=fps,
+            root=root,
+            features={**action_features, **obs_features},
+            robot_type=robot.name,
+            use_videos=True,
+            image_writer_threads=4,
+        )
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
