@@ -2,7 +2,7 @@
 
 import argparse
 
-from . import teleop
+from . import collect_data, run_policy, teleop
 from .can import enable as can_enable
 from .can import setup as can_setup
 from .motor import info as motor_info
@@ -21,6 +21,8 @@ def main() -> None:
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
+    collect_data.add_parser(subparsers)
+    run_policy.add_parser(subparsers)
     teleop.add_parser(subparsers)
     zed_stream.add_parser(subparsers)
     zed_install.add_parser(subparsers)

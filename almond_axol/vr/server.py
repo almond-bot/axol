@@ -5,6 +5,10 @@ VRServer accepts secure WebSocket (WSS) connections from a VR headset and
 surfaces the latest VRFrame to the caller. IK and motor control are handled
 separately — this class is purely the network layer.
 
+Communication is bidirectional:
+  - headset → server: VRFrame JSON every XR frame
+  - server → headset: arbitrary JSON (e.g. state feedback via broadcast_text)
+
 Typical usage::
 
     async with VRServer() as vr:
@@ -66,6 +70,7 @@ class VRServer:
 
         self._latest_frame: VRFrame | None = None
         self._client_count: int = 0
+        self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
 
@@ -85,6 +90,14 @@ class VRServer:
     def connected(self) -> bool:
         """True if at least one VR client is currently connected."""
         return self._client_count > 0
+
+    async def broadcast_text(self, text: str) -> None:
+        """Send a text message to all currently connected VR clients."""
+        for ws in list(self._active_clients):
+            try:
+                await ws.send_text(text)
+            except Exception as exc:
+                _logger.warning("Failed to send feedback to client: %s", exc)
 
     async def enable(self) -> None:
         """Start the WSS server in the background."""
@@ -129,6 +142,7 @@ class VRServer:
             self._server_task = None
 
         self._client_count = 0
+        self._active_clients.clear()
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -154,6 +168,7 @@ class VRServer:
             await websocket.accept()
             _logger.info("client connected %s", websocket.client)
             server._client_count += 1
+            server._active_clients.add(websocket)
             try:
                 while True:
                     data = await websocket.receive_text()
@@ -173,6 +188,7 @@ class VRServer:
                 except Exception:
                     pass
             finally:
+                server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
 
         return app

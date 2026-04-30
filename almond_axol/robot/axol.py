@@ -7,6 +7,7 @@ Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 
 import numpy as np
@@ -16,6 +17,8 @@ from ..shared import CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_feedforward
+
+_logger = logging.getLogger(__name__)
 
 _TAU = 2 * math.pi
 
@@ -88,6 +91,7 @@ class AxolArm:
         self._arm_config = config.left if is_left else config.right
         self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
         self._differentiator = Differentiator(n=len(list(Joint)))
+        self._last_q_commanded: np.ndarray | None = None
 
         # Clipping arrays in raw motor radians.  arm_limits() returns normalised [0, 1]
         # for the gripper, so the gripper entries are seeded with raw defaults here;
@@ -376,6 +380,32 @@ class AxolArm:
                (0.0 = closed, 1.0 = fully open).
         """
         q = q.copy()
+
+        # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
+        max_step = self._config.max_step_rad
+        if self._last_q_commanded is not None and max_step < float("inf"):
+            gripper_i = self._gripper_i
+            arm_mask = np.ones(len(q), dtype=bool)
+            arm_mask[gripper_i] = False
+            deltas = np.abs(q[arm_mask] - self._last_q_commanded[arm_mask])
+            worst_i = int(np.argmax(deltas))
+            worst_delta = float(deltas[worst_i])
+            if worst_delta > max_step:
+                arm_joints = [j for j in Joint if j != Joint.GRIPPER]
+                joint_name = (
+                    arm_joints[worst_i].name
+                    if worst_i < len(arm_joints)
+                    else str(worst_i)
+                )
+                _logger.warning(
+                    "motion_control: command dropped — joint %s delta %.3f rad exceeds "
+                    "max_step_rad %.3f rad",
+                    joint_name,
+                    worst_delta,
+                    max_step,
+                )
+                return
+
         gripper_i = self._gripper_i
         q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
@@ -418,6 +448,7 @@ class AxolArm:
                 gripper_torque_limit,
             ),
         )
+        self._last_q_commanded = clipped
 
 
 class Axol(RobotBase):
