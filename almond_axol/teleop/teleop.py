@@ -444,8 +444,6 @@ class VRTeleop:
                 time.sleep(0.001)
                 continue
             last_frame = frame
-            self._l_grip = frame.l_grip
-            self._r_grip = frame.r_grip
 
             both = frame.l_lock and frame.r_lock
             either = frame.l_lock or frame.r_lock
@@ -469,6 +467,12 @@ class VRTeleop:
 
             self._prev_both = both
             self._prev_either = either
+
+            # Only track gripper position when arm movement is also enabled so
+            # that the gripper cannot be actuated independently of the deadman.
+            if self._teleop_enabled:
+                self._l_grip = frame.l_grip
+                self._r_grip = frame.r_grip
 
             if self._reset_latched:
                 if self._reset_interp.is_active() or self._q is None:
