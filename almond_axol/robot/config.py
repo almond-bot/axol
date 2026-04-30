@@ -180,7 +180,13 @@ class AxolConfig:
     Attributes:
         left: Per-joint gains, friction parameters, and gripper config for the left arm.
         right: Same as ``left`` but with mirrored gravity terms.
+        max_step_rad: Maximum allowed change in any arm joint (rad) between consecutive
+            ``motion_control`` calls.  Commands that exceed this are dropped and a warning
+            is logged.  Set to ``float('inf')`` to disable.  At 30 Hz, 0.5 rad/step ≈
+            15 rad/s — roughly 2.5× the teleop ceiling — so normal motion is never blocked
+            while multi-radian jumps from a misbehaving policy are caught.
     """
 
     left: ArmConfig = field(default_factory=ArmConfig)
     right: ArmConfig = field(default_factory=lambda: ArmConfig().mirror_gravity())
+    max_step_rad: float = 0.5

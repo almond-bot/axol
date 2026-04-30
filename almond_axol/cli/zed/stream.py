@@ -42,9 +42,9 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     )
     p.add_argument(
         "--resolution",
-        default="HD1080",
+        default="SVGA",
         choices=_VALID_RESOLUTIONS,
-        help="Capture resolution for all cameras (default: HD1080).",
+        help="Capture resolution for all cameras (default: SVGA).",
     )
     p.add_argument(
         "--fps",
