@@ -3,9 +3,12 @@ axol collect-data
 
 Record teleoperation episodes with the Axol robot and three ZED cameras.
 Episode boundaries are driven by VR controller commands:
-  - DATA_COLLECTION → RECORDING:  start collecting frames
-  - RECORDING → DATA_COLLECTION:  save episode (success)
-  - RECORDING → DATA_COLLECTION + reset button: discard episode (rerecord)
+  - DATA_COLLECTION → RECORDING:              start collecting frames
+  - RECORDING → DATA_COLLECTION:              stop; save episode (success)
+  - RECORDING → DATA_COLLECTION + reset btn:  stop; discard episode (rerecord)
+
+While saving, the VR headset is pushed into the SAVING state so recording
+controls are blocked until save_episode() completes.
 
 Recording continues until Ctrl+C.
 """
@@ -131,6 +134,7 @@ def _run(
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
     from ..robot.config import ArmConfig, AxolConfig
     from ..shared import setup_link_ip
+    from ..vr.models import VRState
 
     if zed_iface:
         setup_link_ip(zed_iface, "192.168.10.2/24")
@@ -243,6 +247,7 @@ def _run(
                         log_rerun_data(observation=obs_processed, action=act_processed)
 
                 if events[TeleopEvents.TERMINATE_EPISODE]:
+                    teleop.send_feedback_state(VRState.SAVING)
                     break
                 if events[TeleopEvents.RERECORD_EPISODE]:
                     rerecord = True
@@ -269,6 +274,7 @@ def _run(
                 continue
 
             if recording:
+                log_say("Saving episode…")
                 dataset.save_episode()
                 episode_idx += 1
                 episodes_recorded += 1
@@ -277,6 +283,7 @@ def _run(
                 )
             else:
                 log_say("Episode ended before recording started, skipping.")
+            teleop.send_feedback_state(VRState.DATA_COLLECTION)
 
     except KeyboardInterrupt:
         pass

@@ -17,11 +17,13 @@ class VRState(str, Enum):
     DATA_COLLECTION: Teleoperating and collecting data without recording.
     TELEOP:    Actively teleoperating the arm.
     RECORDING: Teleoperating and recording a demonstration.
+    SAVING:    Episode saved — server is writing frames. Controls blocked.
     """
 
     TELEOP = "teleop"
     DATA_COLLECTION = "data_collection"
     RECORDING = "recording"
+    SAVING = "saving"
 
 
 class VRPosition(BaseModel):

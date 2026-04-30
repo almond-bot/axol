@@ -12,6 +12,10 @@ transitions:
   - RECORDING → DATA_COLLECTION + reset: RERECORD_EPISODE (discard)
   - RECORDING → DATA_COLLECTION:         TERMINATE_EPISODE + SUCCESS
 
+After a TERMINATE_EPISODE the caller should push SAVING to the headset via
+send_feedback_state(VRState.SAVING) to block controls while writing the
+episode, then send_feedback_state(VRState.DATA_COLLECTION) when done.
+
 Typical usage::
 
     from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
@@ -28,6 +32,7 @@ Typical usage::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import multiprocessing.connection
@@ -328,6 +333,20 @@ class AxolVRTeleop(Teleoperator):
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         """Accept robot observation. Currently a no-op — IK worker maintains its own state."""
         pass
+
+    def send_feedback_state(self, state: VRState) -> None:
+        """Broadcast a state override to all connected VR clients.
+
+        Used to push server-driven states (e.g. ``VRState.SAVING``,
+        ``VRState.DATA_COLLECTION``) back to the headset so the UI can block
+        controls appropriately. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        text = json.dumps({"type": "state", "value": state.value})
+        asyncio.run_coroutine_threadsafe(
+            self._vr_server.broadcast_text(text), self._loop
+        )
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
