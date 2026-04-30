@@ -348,6 +348,27 @@ class AxolVRTeleop(Teleoperator):
             self._vr_server.broadcast_text(text), self._loop
         )
 
+    def send_feedback_error(self, timeout: float = 2.0) -> None:
+        """Broadcast the error state to all connected VR clients.
+
+        Blocks until the broadcast completes (or ``timeout`` seconds elapse) so
+        the state update is delivered before ``disconnect()`` shuts down the
+        event loop. Safe to call from any thread.
+
+        Args:
+            timeout: Maximum seconds to wait for delivery (default: 2.0).
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        text = json.dumps({"type": "state", "value": "error"})
+        future = asyncio.run_coroutine_threadsafe(
+            self._vr_server.broadcast_text(text), self._loop
+        )
+        try:
+            future.result(timeout=timeout)
+        except Exception:
+            pass
+
     @check_if_not_connected
     def get_action(self) -> RobotAction:
         """Return the latest solved and smoothed joint positions."""

@@ -28,7 +28,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     p.add_argument("--task", required=True, help="Natural language task description.")
     p.add_argument(
-        "--fps", type=int, default=60, help="Recording frame rate (default: 60)."
+        "--fps",
+        type=int,
+        default=60,
+        help="Dataset recording frame rate (default: 60).",
+    )
+    p.add_argument(
+        "--teleop-hz",
+        type=int,
+        default=120,
+        help=(
+            "Motor command rate in Hz (default: 120, matching the IK loop). "
+            "Teleop runs at this rate while dataset frames are captured at --fps."
+        ),
     )
     p.add_argument(
         "--root",
@@ -91,6 +103,7 @@ def run(args: argparse.Namespace) -> None:
         repo_id=args.repo_id,
         task=args.task,
         fps=args.fps,
+        teleop_hz=args.teleop_hz,
         root=args.root,
         push_to_hub=args.push_to_hub,
         zed_host=args.zed_host,
@@ -105,8 +118,9 @@ def _run(
     repo_id: str,
     task: str,
     fps: int,
-    root: str | None,
-    push_to_hub: bool,
+    teleop_hz: int = 120,
+    root: str | None = None,
+    push_to_hub: bool = False,
     zed_host: str = "192.168.10.1",
     zed_iface: str | None = None,
     gripper_torque_limit: float = 1.0,
@@ -209,6 +223,8 @@ def _run(
 
     episodes_recorded = 0
     episode_idx = dataset.num_episodes  # global index; increments as episodes are saved
+    teleop_interval = 1.0 / teleop_hz
+    frame_interval = 1.0 / fps
     try:
         while True:
             log_say(
@@ -217,25 +233,32 @@ def _run(
             dataset.clear_episode_buffer()
             recording = False
             rerecord = False
+            last_frame_t = 0.0  # timestamp of the last dataset frame written
 
             while True:
                 t0 = time.perf_counter()
 
-                obs = robot.get_observation()
-                obs_processed = robot_obs_proc(obs)
-
-                teleop.send_feedback(obs)
+                # Joints-only observation — no camera copies at teleop rate.
+                joint_obs = robot.get_joint_observation()
+                teleop.send_feedback(joint_obs)
                 act = teleop.get_action()
-                act_processed = teleop_action_proc((act, obs))
-                robot.send_action(robot_action_proc((act_processed, obs)))
+                act_processed = teleop_action_proc((act, joint_obs))
+                robot.send_action(robot_action_proc((act_processed, joint_obs)))
 
                 events = teleop.get_teleop_events()
 
                 if events.get("start_recording") and not recording:
                     recording = True
+                    last_frame_t = (
+                        t0 - frame_interval
+                    )  # capture first frame immediately
                     log_say("Recording started.")
 
-                if recording:
+                # Dataset frame at --fps rate: read cameras + process images here only.
+                if recording and (t0 - last_frame_t) >= frame_interval:
+                    last_frame_t += frame_interval
+                    obs = robot.get_observation()  # joints + camera frames
+                    obs_processed = robot_obs_proc(obs)
                     obs_frame = build_dataset_frame(
                         dataset.features, obs_processed, prefix=OBS_STR
                     )
@@ -253,7 +276,7 @@ def _run(
                     rerecord = True
                     break
 
-                time.sleep(max(0.0, 1 / fps - (time.perf_counter() - t0)))
+                time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
 
             # Return to rest pose before the next episode so the operator
             # starts each take from a consistent configuration.
@@ -262,10 +285,10 @@ def _run(
             reset_deadline = time.perf_counter() + 30.0
             while teleop.is_resetting and time.perf_counter() < reset_deadline:
                 t0 = time.perf_counter()
-                obs = robot.get_observation()
+                joint_obs = robot.get_joint_observation()
                 act = teleop.get_action()
-                robot.send_action(robot_action_proc((act, obs)))
-                time.sleep(max(0.0, 1 / fps - (time.perf_counter() - t0)))
+                robot.send_action(robot_action_proc((act, joint_obs)))
+                time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
             # Drain any VR events that fired during the reset move.
             teleop.get_teleop_events()
 
@@ -287,6 +310,9 @@ def _run(
 
     except KeyboardInterrupt:
         pass
+    except Exception:
+        teleop.send_feedback_error()
+        raise
     finally:
         log_say("Stopping.")
         robot.disconnect()

@@ -191,6 +191,37 @@ class AxolRobot(Robot):
     # ------------------------------------------------------------------
 
     @check_if_not_connected
+    def get_joint_observation(self) -> RobotObservation:
+        """Return cached joint positions only — no camera reads.
+
+        Use this in the high-frequency teleop path to avoid copying large
+        camera frames on every step.  Call :meth:`get_observation` only when
+        a full observation (joints + cameras) is actually needed.
+        """
+        assert self._axol is not None
+        assert self._axol.left is not None
+        assert self._axol.right is not None
+
+        left_pos = self._axol.left.positions
+        right_pos = self._axol.right.positions
+
+        obs: RobotObservation = {}
+        for i, key in enumerate(_LEFT_POS_KEYS):
+            obs[key] = float(left_pos[i])
+        for i, key in enumerate(_RIGHT_POS_KEYS):
+            obs[key] = float(right_pos[i])
+
+        if self.config.observe_torques:
+            left_trq = self._axol.left.torques
+            right_trq = self._axol.right.torques
+            for i, key in enumerate(_LEFT_TRQ_KEYS):
+                obs[key] = float(left_trq[i])
+            for i, key in enumerate(_RIGHT_TRQ_KEYS):
+                obs[key] = float(right_trq[i])
+
+        return obs
+
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         """Return cached joint positions and latest camera frames."""
         assert self._axol is not None
