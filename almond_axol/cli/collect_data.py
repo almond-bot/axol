@@ -251,13 +251,13 @@ def _run(
                     recording = True
                     last_frame_t = (
                         t0 - frame_interval
-                    )  # capture first frame immediately
+                    )  # align first frame to recording start
                     log_say("Recording started.")
 
                 # Dataset frame at --fps rate: read cameras + process images here only.
                 if recording and (t0 - last_frame_t) >= frame_interval:
                     last_frame_t += frame_interval
-                    obs = robot.get_observation()  # joints + camera frames
+                    obs = robot.get_observation()
                     obs_processed = robot_obs_proc(obs)
                     obs_frame = build_dataset_frame(
                         dataset.features, obs_processed, prefix=OBS_STR

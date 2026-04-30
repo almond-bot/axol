@@ -448,7 +448,7 @@ class AxolArm:
                 gripper_torque_limit,
             ),
         )
-        self._last_q_commanded = q
+        self._last_q_commanded = clipped
 
 
 class Axol(RobotBase):

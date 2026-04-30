@@ -31,6 +31,7 @@ Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI in
   - [almond_axol.vr](#almond_axolvr)
   - [almond_axol.zed](#almond_axolzed)
   - [almond_axol.motor](#almond_axolmotor)
+  - [almond_axol.lerobot](#almond_axollerobot)
 
 ---
 
@@ -173,14 +174,20 @@ Records teleoperation episodes using VR controller inputs and three ZED cameras.
 |---|---|
 | `--repo-id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
 | `--task TEXT` | Natural language task description (required) |
-| `--fps INT` | Frame rate (default: 30) |
+| `--fps INT` | Dataset recording frame rate — camera frames captured at this rate (default: 60) |
+| `--teleop-hz INT` | Motor command rate in Hz; decoupled from `--fps` for smooth control (default: 120) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push-to-hub` | Push to HuggingFace Hub when done |
+| `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
+| `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
 | `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
+| `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
 axol collect-data --repo-id myorg/pick-place --task "Pick the red cube and place it in the bin"
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --fps 30 --zed-iface eth0
 ```
 
 **VR controller events:**
@@ -188,10 +195,10 @@ axol collect-data --repo-id myorg/pick-place --task "Pick the red cube and place
 | Event | Action |
 |---|---|
 | `START_RECORDING` | Begin capturing frames |
-| `TERMINATE_EPISODE` | Save the episode |
+| `TERMINATE_EPISODE` | Save the episode; headset enters `Saving` state until write completes |
 | `RERECORD_EPISODE` | Discard and retry |
 
-If an existing dataset is found at `--root`, collection resumes from where it left off.
+After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off.
 
 ---
 
@@ -206,11 +213,15 @@ Runs a trained policy autonomously on the robot using three ZED cameras. Between
 | `--policy PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
 | `--task TEXT` | Natural language task description (required) |
 | `--episode-time-s INT` | Max duration per episode in seconds (default: 30) |
-| `--fps INT` | Control loop frame rate (default: 30) |
+| `--fps INT` | Control loop frame rate (default: 60) |
 | `--repo-id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push-to-hub` | Push rollout dataset to HuggingFace Hub when done |
+| `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
+| `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
 | `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
+| `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
 | `--device STR` | PyTorch device for inference (default: `cuda`) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
@@ -317,6 +328,7 @@ Install the package with `uv sync` (see [Installation](#installation)), then imp
 - [almond_axol.vr](#almond_axolvr)
 - [almond_axol.zed](#almond_axolzed)
 - [almond_axol.motor](#almond_axolmotor)
+- [almond_axol.lerobot](#almond_axollerobot)
 
 ---
 
@@ -329,13 +341,26 @@ almond_axol/
 ├── teleop/       VR headset → IK → robot control loop
 ├── vr/           WebSocket server that receives VR frames
 ├── zed/          ZED-X One camera streaming
-└── motor/        Low-level async CAN motor interface
+├── motor/        Low-level async CAN motor interface
+└── lerobot/      LeRobot Robot / Teleoperator / Camera wrappers (requires lerobot extra)
+    ├── robot/    AxolRobot — LeRobot Robot wrapping the async hardware driver
+    ├── teleop/   AxolVRTeleop — LeRobot Teleoperator wrapping VRTeleop
+    └── camera/   ZedCamera — LeRobot Camera wrapping a ZED stream receiver
 ```
 
 End-to-end data flow for teleoperation:
 
 ```
 VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → motors
+```
+
+End-to-end data flow for LeRobot data collection:
+
+```
+VR headset → AxolVRTeleop.get_action() → AxolRobot.send_action() → motors
+                                                 ↑
+                                  AxolRobot.get_observation() → dataset
+                                  (joints from telemetry, cameras from ZedCamera)
 ```
 
 ---
@@ -479,6 +504,12 @@ async with Axol(config=config) as axol: ...
 | `fo` | — | Constant friction offset (Nm) |
 
 `ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s).
+
+`AxolConfig` also exposes a top-level safety parameter:
+
+| Field | Default | Description |
+|---|---|---|
+| `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
 
 `AxolConfig.right` automatically mirrors `gb` for `shoulder_2` and `elbow`, because those joints have inverted angle ranges on the right arm. Override either arm independently by passing both `left=` and `right=` to `AxolConfig`.
 
@@ -634,7 +665,11 @@ async with VRServer() as vr:
 | `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
 | `l_lock` / `r_lock` | `bool` | Deadman switches |
 | `reset` | `bool` | Rising edge triggers a reset move |
-| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` |
+| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` is server-pushed only |
+
+**Server → headset feedback**
+
+The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. When `save_episode()` completes, send `{"type": "state", "value": "data_collection"}` to re-enable them. The `AxolVRTeleop.send_feedback_state(VRState.SAVING)` helper wraps this.
 
 **`VRServerConfig` fields**
 
@@ -764,3 +799,120 @@ asyncio.run(main())
 |---|---|---|
 | `SHOULDER_1` – `WRIST_1` | MyActuator | `0x01` – `0x05` |
 | `WRIST_2`, `WRIST_3`, `GRIPPER` | Damiao | `0x06` – `0x08` |
+
+---
+
+### almond_axol.lerobot
+
+LeRobot-compatible wrappers for the Axol hardware. Requires the `lerobot` extra. These classes implement the LeRobot `Robot`, `Teleoperator`, and `Camera` interfaces so the Axol works with any LeRobot training or data-collection pipeline without modification. The `collect-data` and `run-policy` CLI commands are built on top of this layer.
+
+```python
+from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
+from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
+from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
+```
+
+#### `AxolRobot`
+
+LeRobot `Robot` wrapping the async `Axol` hardware driver. A background thread runs a dedicated asyncio event loop so motor telemetry keeps streaming while the synchronous `get_observation()` and `send_action()` calls block on the calling thread.
+
+```python
+from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
+from almond_axol.lerobot.camera import ZedCameraConfig
+
+config = AxolRobotConfig(
+    cameras={
+        "overhead":  ZedCameraConfig(host="192.168.10.1", port=30000),
+        "left_arm":  ZedCameraConfig(host="192.168.10.1", port=30002),
+        "right_arm": ZedCameraConfig(host="192.168.10.1", port=30004),
+    },
+)
+with AxolRobot(config) as robot:
+    obs = robot.get_observation()           # joints + camera frames
+    joint_obs = robot.get_joint_observation()  # joints only — use in tight control loops
+    robot.send_action(obs)                  # hold current position
+```
+
+**`AxolRobotConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `cameras` | `{}` | `ZedCameraConfig` instances keyed by name |
+| `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
+| `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
+| `observe_torques` | `False` | Include joint torques in `observation.state` |
+| `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |
+| `right_channel` | `"can_alm_axol_r"` | SocketCAN interface for the right arm |
+
+**Key methods**
+
+| Method | Description |
+|---|---|
+| `get_observation()` | Returns joint positions (+ torques if enabled) and latest camera frames |
+| `get_joint_observation()` | Returns joint positions only — no camera reads; use in the high-frequency teleop path |
+| `send_action(action)` | Sends joint position targets via impedance control (arm) and position-force control (gripper) |
+| `positions` | `(left, right)` cached arm positions from telemetry, each shape `(8,)` |
+
+---
+
+#### `AxolVRTeleop`
+
+LeRobot `Teleoperator` wrapping `VRTeleop`. Runs the VR WebSocket server and IK subprocess on a background thread so `get_action()` is non-blocking and safe to call from any thread.
+
+```python
+from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
+
+teleop = AxolVRTeleop(AxolVRTeleopConfig())
+pos_l, pos_r = robot.positions
+teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+
+while True:
+    action = teleop.get_action()
+    events = teleop.get_teleop_events()
+```
+
+**`AxolVRTeleopConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `vr_teleop_config` | `VRTeleopConfig()` | Rest poses, IK frequency, filter parameters — see [`almond_axol.teleop`](#almond_axolteleop) |
+| `kinematics_config` | `KinematicsConfig()` | IK solver weights — see [`almond_axol.kinematics`](#almond_axolkinematics) |
+| `vr_server_config` | `VRServerConfig()` | WSS port and TLS certificate paths — see [`almond_axol.vr`](#almond_axolvr) |
+
+**Key methods**
+
+| Method | Description |
+|---|---|
+| `get_action()` | Returns the latest smoothed joint positions as a LeRobot `RobotAction` dict |
+| `get_teleop_events()` | Returns and clears latched episode-control events (`start_recording`, `TERMINATE_EPISODE`, `RERECORD_EPISODE`) |
+| `request_reset()` | Triggers a collision-aware trajectory back to the rest pose |
+| `is_resetting` | `True` while the reset move is pending or in progress |
+| `send_feedback_state(state)` | Broadcasts a `VRState` override (e.g. `SAVING`) to all connected VR headsets |
+
+---
+
+#### `ZedCamera`
+
+LeRobot `Camera` wrapping a ZED stream receiver. Connects to a single port on the ZED streamer and decodes HEVC frames in a background thread. Resolution and FPS are **always overridden from the live stream** on `connect()` — the config defaults just need to match the sender so `RobotConfig` validation passes before the robot connects.
+
+```python
+from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
+
+cam = ZedCamera(ZedCameraConfig(host="192.168.10.1", port=30000))
+cam.connect()
+frame = cam.read_latest()   # shape (H, W, 3), non-blocking, returns most recent frame
+cam.disconnect()
+```
+
+**`ZedCameraConfig` fields**
+
+| Field | Default | Description |
+|---|---|---|
+| `host` | `"192.168.10.1"` | IP address of the `zed.stream` sender |
+| `port` | `30000` | Streaming port; overhead=30000, left_arm=30002, right_arm=30004 |
+| `fps` | `60` | Expected stream FPS; validated against the live stream on connect |
+| `width` | `960` | Expected frame width (SVGA); validated on connect |
+| `height` | `600` | Expected frame height (SVGA); validated on connect |
+| `warmup_s` | `1` | Seconds to read frames during `connect()` before returning |
+
+If the live stream parameters differ from the config, `connect()` raises a `RuntimeError` with the mismatch details. Update the config to match the `--resolution` and `--fps` passed to `zed.stream`.
