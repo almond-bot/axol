@@ -208,7 +208,7 @@ def _run(
     try:
         while True:
             log_say(
-                f"Episode {episode_idx + 1}: move to start position, then press record on the VR controller."
+                f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
             dataset.clear_episode_buffer()
             recording = False
