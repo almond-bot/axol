@@ -665,11 +665,11 @@ async with VRServer() as vr:
 | `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
 | `l_lock` / `r_lock` | `bool` | Deadman switches |
 | `reset` | `bool` | Rising edge triggers a reset move |
-| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` is server-pushed only |
+| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
 
 **Server → headset feedback**
 
-The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. When `save_episode()` completes, send `{"type": "state", "value": "data_collection"}` to re-enable them. The `AxolVRTeleop.send_feedback_state(VRState.SAVING)` helper wraps this.
+The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. `{"type": "state", "value": "error"}` shows an error indicator in the headset UI. `{"type": "state", "value": "data_collection"}` re-enables controls after saving. The `AxolVRTeleop.send_feedback_state(state)` helper wraps this for all `VRState` values.
 
 **`VRServerConfig` fields**
 
