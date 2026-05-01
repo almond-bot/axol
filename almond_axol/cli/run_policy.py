@@ -157,7 +157,6 @@ def _run(
     rerun_port: int = 9876,
 ) -> None:
     import time
-    from dataclasses import replace
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.factory import make_pre_post_processors
@@ -184,12 +183,8 @@ def _run(
     policy.eval()
 
     axol_config = AxolConfig()
-    gripper = replace(axol_config.left.gripper, torque_limit=gripper_torque_limit)
-    axol_config = replace(
-        axol_config,
-        left=replace(axol_config.left, gripper=gripper),
-        right=replace(axol_config.right, gripper=gripper),
-    )
+    axol_config.left.gripper.torque_limit = gripper_torque_limit
+    axol_config.right.gripper.torque_limit = gripper_torque_limit
 
     # Build robot with 3 ZED cameras — resolution/FPS auto-detected from stream
     robot_config = AxolRobotConfig(

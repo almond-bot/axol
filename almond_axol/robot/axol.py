@@ -12,7 +12,15 @@ import math
 
 import numpy as np
 
-from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
+from ..motor import (
+    CanBus,
+    ControlMode,
+    Joint,
+    Motor,
+    MotorError,
+    MotorGains,
+    MotorStatus,
+)
 from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
@@ -95,7 +103,13 @@ class AxolArm:
         self._gravity_comp = gravity_comp
         self._is_left = is_left
         self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
-        self._differentiator = Differentiator(n=len(list(Joint)))
+        # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
+        # the impedance-control velocity FF and the friction model; a_des
+        # feeds inertia FF (``j_eff``); v_meas feeds software damping
+        # (``kd_soft``) — all in :class:`JointConfig`.
+        self._vel_diff = Differentiator(n=len(list(Joint)))
+        self._accel_diff = Differentiator(n=len(list(Joint)))
+        self._meas_vel_diff = Differentiator(n=len(list(Joint)))
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -419,8 +433,17 @@ class AxolArm:
         )
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
-        # Velocity feedforward via differentiation of commanded positions (rad/s).
-        velocities = self._differentiator.differentiate(list(clipped))
+        # Velocity feedforward via differentiation of commanded positions (rad/s),
+        # and acceleration feedforward via a second pass for inertia FF (rad/s²).
+        velocities = self._vel_diff.differentiate(list(clipped))
+        accelerations = self._accel_diff.differentiate(velocities)
+        # v_meas drives software velocity damping. The position cache is
+        # empty until the first set_impedance reply lands; fall back to v_des
+        # so the ``kd_soft`` term collapses to 0 for those first cycles.
+        try:
+            v_meas = self._meas_vel_diff.differentiate(list(self.positions))
+        except MotorError:
+            v_meas = list(velocities)
 
         gripper_i = self._gripper_i
         gripper_pos = float(clipped[gripper_i])
@@ -435,12 +458,11 @@ class AxolArm:
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
-            t_ff = float(gravity[i]) + compute_friction(
-                velocities[i],
-                f.fc,
-                f.k,
-                f.fv,
-                f.fo,
+            t_ff = (
+                float(gravity[i])
+                + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + gains.j_eff * accelerations[i]
+                + gains.kd_soft * (velocities[i] - v_meas[i])
             )
             return self.motors[j].set_impedance(
                 float(clipped[i]),

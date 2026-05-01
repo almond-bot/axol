@@ -127,7 +127,6 @@ def _run(
     rerun_ip: str | None = None,
     rerun_port: int = 9876,
 ) -> None:
-    from dataclasses import replace
     from pathlib import Path
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -154,12 +153,8 @@ def _run(
         setup_link_ip(zed_iface, "192.168.10.2/24")
 
     axol_config = AxolConfig()
-    gripper = replace(axol_config.left.gripper, torque_limit=gripper_torque_limit)
-    axol_config = replace(
-        axol_config,
-        left=replace(axol_config.left, gripper=gripper),
-        right=replace(axol_config.right, gripper=gripper),
-    )
+    axol_config.left.gripper.torque_limit = gripper_torque_limit
+    axol_config.right.gripper.torque_limit = gripper_torque_limit
     robot_config = AxolRobotConfig(
         cameras={
             "overhead": ZedCameraConfig(host=zed_host, port=30000),

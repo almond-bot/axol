@@ -9,9 +9,9 @@ gravity feedforward).
 
 :class:`ArmConfig` bundles the seven per-joint configs and a
 :class:`PositionForceConfig` for the gripper. :class:`AxolConfig` holds the
-left and right :class:`ArmConfig` plus a few global safety knobs. Defaults
-encode the production-tuned values; override individual fields at
-construction or via :func:`dataclasses.replace`::
+left and right :class:`ArmConfig` plus a few global knobs. Defaults encode
+the production-tuned values; override individual fields at construction or
+via :func:`dataclasses.replace`::
 
     from almond_axol.robot.config import AxolConfig, FrictionParams
 
@@ -61,13 +61,21 @@ class JointConfig:
 
     Attributes:
         kp:       Position stiffness for impedance control [0, 500].
-        kd:       Velocity damping for impedance control [0, 5].
+        kd:       Velocity damping for impedance control [0, 5]. Hardware-
+                  capped by the motor firmware at 5; use ``kd_soft`` to
+                  augment.
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
                   ``*_w2``).
         com:      Centre of mass of the same body, in the body's URDF link
                   frame (m).
+        j_eff:    Effective scalar inertia (kg·m²) for acceleration
+                  feedforward: ``τ = j_eff · q̈_des`` is added to ``t_ff``
+                  so inertia is not driven through tracking error.
+        kd_soft:  Extra software velocity damping (Nm·s/rad) applied as
+                  ``τ = kd_soft · (v_des − v_meas)``; mathematically
+                  equivalent to raising ``kd`` past the firmware's 5 cap.
     """
 
     kp: float
@@ -75,6 +83,8 @@ class JointConfig:
     friction: FrictionParams
     mass: float
     com: tuple[float, float, float]
+    j_eff: float = 0.0
+    kd_soft: float = 0.0
 
 
 @dataclass
@@ -118,26 +128,33 @@ class ArmConfig:
 
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=500.0,
+            kp=40.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
             mass=2.00,
             com=(0.0652231, 0.0, 0.0),
+            # Identified from step response (ζ ≈ 0.35 at kp=40, kd=5 → J ≈ 1.27).
+            j_eff=1.27,
+            # Doubles effective kd past the firmware's 5 cap (ζ ≈ 0.35 → 0.70).
+            kd_soft=5.0,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=500.0,
+            kp=50.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.50,
             com=(0.0, 0.0115864, -0.0302711),
+            # Identified from step response (ζ ≈ 0.36 at kp=50, kd=5 → J ≈ 0.91).
+            j_eff=0.91,
+            kd_soft=5.0,
         )
     )
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=2.0,
+            kp=45.0,
+            kd=1.0,
             friction=_ZERO_FRICTION,
             mass=2.75,
             com=(0.0, 0.00286547, -0.164964),
@@ -145,8 +162,8 @@ class ArmConfig:
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=100.0,
-            kd=2.0,
+            kp=40.0,
+            kd=3.0,
             friction=_ZERO_FRICTION,
             mass=0.80,
             com=(-0.0256064, 0.0, -0.072044),
@@ -154,7 +171,7 @@ class ArmConfig:
     )
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=150.0,
+            kp=30.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
             mass=0.50,
@@ -163,8 +180,8 @@ class ArmConfig:
     )
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=150.0,
-            kd=2.5,
+            kp=25.0,
+            kd=1.0,
             friction=_ZERO_FRICTION,
             mass=0.60,
             # left_w1 CoM (right side has y sign-flipped — done by mirror_to_right).
@@ -173,8 +190,8 @@ class ArmConfig:
     )
     wrist_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=100.0,
-            kd=0.8,
+            kp=25.0,
+            kd=0.5,
             friction=_ZERO_FRICTION,
             mass=0.65,
             # left_w2 lumps wrist-3 segment with the gripper assembly (fixed
@@ -274,6 +291,70 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     )
 
 
+@dataclass(frozen=True)
+class _ArmGains:
+    """Per-joint ``(kp, kd)`` tuples for one arm. Field names mirror
+    :class:`ArmConfig` so values are looked up by attribute (not string key).
+    """
+
+    shoulder_1: tuple[float, float]
+    shoulder_2: tuple[float, float]
+    shoulder_3: tuple[float, float]
+    elbow: tuple[float, float]
+    wrist_1: tuple[float, float]
+    wrist_2: tuple[float, float]
+    wrist_3: tuple[float, float]
+
+
+# Pre-compliance-tuning gains — the high-``kp`` "industrial robot" defaults
+# used as the ``stiffness=1.0`` endpoint of :attr:`AxolConfig.stiffness`.
+_STIFF_GAINS = _ArmGains(
+    shoulder_1=(500.0, 5.0),
+    shoulder_2=(500.0, 5.0),
+    shoulder_3=(250.0, 2.0),
+    elbow=(100.0, 2.0),
+    wrist_1=(150.0, 1.0),
+    wrist_2=(150.0, 2.5),
+    wrist_3=(100.0, 0.8),
+)
+
+
+def _blend_joint(
+    jc: JointConfig, kp_stiff: float, kd_stiff: float, s: float
+) -> JointConfig:
+    """Blend one joint's gains toward the stiff endpoint by factor ``s``.
+
+    ``kp`` and ``kd`` interpolate geometrically (log-space — matches how
+    stiffness is perceived); ``j_eff`` and ``kd_soft`` scale linearly to 0
+    since they only compensate for the low-``kp`` regime.
+    """
+    return replace(
+        jc,
+        kp=jc.kp * (kp_stiff / jc.kp) ** s,
+        kd=jc.kd * (kd_stiff / jc.kd) ** s,
+        j_eff=jc.j_eff * (1.0 - s),
+        kd_soft=jc.kd_soft * (1.0 - s),
+    )
+
+
+def _apply_stiffness(arm: ArmConfig, s: float) -> ArmConfig:
+    """Return ``arm`` with all 7 joints blended toward :data:`_STIFF_GAINS`
+    by factor ``s`` ∈ ``[0, 1]``. ``s=0`` returns ``arm`` unchanged.
+    """
+    if s == 0.0:
+        return arm
+    return replace(
+        arm,
+        shoulder_1=_blend_joint(arm.shoulder_1, *_STIFF_GAINS.shoulder_1, s),
+        shoulder_2=_blend_joint(arm.shoulder_2, *_STIFF_GAINS.shoulder_2, s),
+        shoulder_3=_blend_joint(arm.shoulder_3, *_STIFF_GAINS.shoulder_3, s),
+        elbow=_blend_joint(arm.elbow, *_STIFF_GAINS.elbow, s),
+        wrist_1=_blend_joint(arm.wrist_1, *_STIFF_GAINS.wrist_1, s),
+        wrist_2=_blend_joint(arm.wrist_2, *_STIFF_GAINS.wrist_2, s),
+        wrist_3=_blend_joint(arm.wrist_3, *_STIFF_GAINS.wrist_3, s),
+    )
+
+
 @dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
@@ -292,6 +373,15 @@ class AxolConfig:
                       consecutive ``motion_control`` calls. Commands that
                       exceed this are dropped and a warning is logged. Set
                       to ``float('inf')`` to disable.
+        stiffness:    Compliance ↔ stiffness blend in ``[0, 1]``. ``0``
+                      (default) keeps the per-joint compliant gains; ``1``
+                      restores the pre-tuning industrial gains in
+                      :data:`_STIFF_GAINS`. ``kp`` / ``kd`` interpolate
+                      geometrically (log-space); ``j_eff`` / ``kd_soft``
+                      scale linearly to 0 at ``s=1``. The blend is baked
+                      into ``left`` / ``right`` at construction time —
+                      mutate ``stiffness`` after the fact has no effect,
+                      and ``replace()`` would re-apply it (don't).
     """
 
     left: ArmConfig = field(
@@ -301,3 +391,11 @@ class AxolConfig:
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
     max_step_rad: float = 0.5
+    stiffness: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.stiffness <= 1.0:
+            raise ValueError(f"stiffness must be in [0, 1], got {self.stiffness}")
+        if self.stiffness > 0.0:
+            self.left = _apply_stiffness(self.left, self.stiffness)
+            self.right = _apply_stiffness(self.right, self.stiffness)
