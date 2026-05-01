@@ -7,7 +7,7 @@ from .can import enable as can_enable
 from .can import setup as can_setup
 from .motor import info as motor_info
 from .motor import set_can_id, set_zero_pos
-from .tune import friction, pid
+from .tune import friction, pid, repeatability
 from .zed import install as zed_install
 from .zed import stream as zed_stream
 
@@ -29,6 +29,7 @@ def main() -> None:
     zed_install.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
+    repeatability.add_parser(subparsers)
 
     args = parser.parse_args()
     args.func(args)
