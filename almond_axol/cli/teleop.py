@@ -90,7 +90,7 @@ async def _run(
         if no_right:
             kwargs["right_channel"] = None
         left = ArmConfig()
-        right = ArmConfig().mirror_gravity()
+        right = ArmConfig().mirror_to_right()
         gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
         left = replace(left, gripper=gripper)
         right = replace(right, gripper=gripper)

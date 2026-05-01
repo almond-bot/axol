@@ -18,10 +18,13 @@ import asyncio
 import math
 import time
 
+import numpy as np
+
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import ArmConfig, AxolConfig
-from ...robot.control import Differentiator, compute_feedforward
+from ...robot.control import Differentiator, compute_friction
+from ...robot.gravity import GravityCompensator
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _DEFAULT_AMP_FRACTION = 0.3
@@ -94,12 +97,11 @@ async def run_sine(
     duration: float,
     rate_hz: float,
     is_left: bool,
+    gravity_fn=lambda q: 0.0,
     fc: float = 0.0,
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
-    ga: float = 0.0,
-    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
     lo, hi = arm_limits(joint, is_left)
@@ -139,7 +141,7 @@ async def run_sine(
 
         target = center + amp * math.sin(2 * math.pi * freq * t)
         v_des = diff.differentiate([target])[0]
-        tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
+        tff = gravity_fn(target) + compute_friction(v_des, fc, k, fv, fo)
         await test_motor.set_impedance(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
         t_read = time.monotonic() - start
@@ -169,12 +171,11 @@ async def run_step(
     hold: float,
     rate_hz: float,
     is_left: bool,
+    gravity_fn=lambda q: 0.0,
     fc: float = 0.0,
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
-    ga: float = 0.0,
-    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
     center = await test_motor.get_position()
@@ -219,7 +220,7 @@ async def run_step(
         while time.monotonic() - phase_start < hold:
             loop_start = time.monotonic()
             t = time.monotonic() - start
-            tff = compute_feedforward(phase_target, 0.0, ga, gb, fc, k, fv, fo)
+            tff = gravity_fn(phase_target) + compute_friction(0.0, fc, k, fv, fo)
             await test_motor.set_impedance(phase_target, 0.0, kp, kd, tff)
             actual = await test_motor.get_position()
             log.append(
@@ -362,17 +363,31 @@ async def _run(args: argparse.Namespace) -> None:
     arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
     joint_gains = getattr(arm_cfg, joint.value)
     if args.tff:
-        fc, k, fv, fo = joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo
-        ga, gb = joint_gains.ga, joint_gains.gb
+        f = joint_gains.friction
+        fc, k, fv, fo = f.fc, f.k, f.fv, f.fo
     else:
-        fc = k = fv = fo = ga = gb = 0.0
+        fc = k = fv = fo = 0.0
+
+    # Gravity feedforward is computed from the URDF for the *full* arm pose;
+    # other joints sit at 0 during tuning so we just substitute the test joint
+    # angle into a single-joint MuJoCo lookup.
+    gravity_comp = GravityCompensator() if args.tff else None
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q_buf = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+
+    def gravity_fn(q: float) -> float:
+        if gravity_comp is None:
+            return 0.0
+        arm_q_buf[test_idx] = q
+        return float(gravity_comp.gravity_arm(arm_q_buf, is_left=is_left)[test_idx])
 
     print(
         f"\nAxol PID tuner — {side_str} {joint.value}  limits=[{lo:.4f}, {hi:.4f}] rad"
     )
     print(f"  testing  Kp={args.kp}  Kd={args.kd}  mode={args.mode}")
     if args.tff:
-        print(f"  tff  Fc={fc}  k={k}  Fv={fv}  Fo={fo}  ga={ga}  gb={gb}")
+        g0 = gravity_fn(0.0)
+        print(f"  tff  Fc={fc}  k={k}  Fv={fv}  Fo={fo}  gravity@0={g0:.4f} Nm (model)")
 
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
@@ -404,12 +419,11 @@ async def _run(args: argparse.Namespace) -> None:
                     args.duration,
                     args.rate,
                     is_left,
+                    gravity_fn=gravity_fn,
                     fc=fc,
                     k=k,
                     fv=fv,
                     fo=fo,
-                    ga=ga,
-                    gb=gb,
                 )
                 _print_stats_sine(log, args.kp, args.kd)
                 await asyncio.sleep(1.0)
@@ -423,12 +437,11 @@ async def _run(args: argparse.Namespace) -> None:
                     args.hold,
                     args.rate,
                     is_left,
+                    gravity_fn=gravity_fn,
                     fc=fc,
                     k=k,
                     fv=fv,
                     fo=fo,
-                    ga=ga,
-                    gb=gb,
                 )
                 _print_stats_step(log, amp, args.kp, args.kd)
 

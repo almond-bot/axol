@@ -154,7 +154,7 @@ def _run(
         setup_link_ip(zed_iface, "192.168.10.2/24")
 
     left = ArmConfig()
-    right = ArmConfig().mirror_gravity()
+    right = ArmConfig().mirror_to_right()
     gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
     left = replace(left, gripper=gripper)
     right = replace(right, gripper=gripper)

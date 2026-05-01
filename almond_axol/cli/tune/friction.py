@@ -1,28 +1,28 @@
 """
-axol tune.feedforward
+axol tune.friction
 
-Identify all six feedforward parameters (gravity + friction) for an Axol joint
+Identify the four friction-model parameters (Fc, k, Fv, Fo) for an Axol joint
 in a single bidirectional sweep.
 
 Sweeps the full joint range at multiple velocities, both forward and backward.
 Bidirectional averaging at the same position separates gravity from friction:
 
-    avg(τ_fwd, τ_bwd) at same q     →  ga·cos(q) + gb·sin(q) + Fo
+    avg(τ_fwd, τ_bwd) at same q     →  gravity(q) + Fo
     half(τ_fwd - τ_bwd) at same q   →  Fc·tanh(0.1·k·v) + Fv·v
 
-Fits six parameters at once:
-    ga, gb  — gravity model (τ_grav = ga·cos(q) + gb·sin(q))
-    Fc, k   — Coulomb friction magnitude and tanh sharpness
-    Fv      — viscous friction coefficient
-    Fo      — constant torque offset (from gravity fit)
+Gravity compensation is computed centrally from the URDF (see
+:class:`almond_axol.robot.gravity.GravityCompensator`); the gravity-shape fit
+is reported only as a diagnostic and is *not* added to ``JointConfig``. The
+half-difference (the part that flips sign with velocity) is fit to the friction
+model and yields the four config values.
 
 At runtime:
-    tff(q, v) = ga·cos(q) + gb·sin(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
+    tff(q, v) = gravity_model(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
 Examples:
-    axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-    axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
-    axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
+    axol tune.friction --r --joint elbow --kp 20 --kd 0.6
+    axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
 import argparse
@@ -305,8 +305,8 @@ async def _identify_joint(
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "tune.feedforward",
-        help="Identify all feedforward parameters (gravity + friction) in one pass.",
+        "tune.friction",
+        help="Identify the friction-model parameters (Fc, k, Fv, Fo) for one joint.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -367,7 +367,7 @@ async def _run(args: argparse.Namespace) -> None:
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd
 
-    print(f"\nAxol feedforward identification — {side_str} {joint.value}")
+    print(f"\nAxol friction identification — {side_str} {joint.value}")
     print(f"  Velocity sweep: {[round(v, 3) for v in args.velocities]} rad/s")
     print(f"  Kp={kp}  Kd={kd}")
 
@@ -425,17 +425,20 @@ async def _run(args: argparse.Namespace) -> None:
             gravity_result = _fit_gravity_with_offset(avg_samples)
             friction_result = _fit_friction_halfdiff(halfdiff_samples)
 
-            ga_out = gb_out = Fo_out = Fc_out = k_out = Fv_out = 0.0
+            Fo_out = Fc_out = k_out = Fv_out = 0.0
 
             if gravity_result is not None:
                 ga_out, gb_out, Fo_out = gravity_result
                 amplitude = math.sqrt(ga_out**2 + gb_out**2)
                 phase_deg = math.degrees(math.atan2(gb_out, ga_out))
-                print("\n  Fitted gravity model: τ = ga·cos(q) + gb·sin(q)")
-                print(f"    ga = {ga_out:.4f} Nm")
-                print(f"    gb = {gb_out:.4f} Nm")
+                print(
+                    "\n  Diagnostic gravity fit (informational only — runtime"
+                    " gravity comes from the URDF model):"
+                )
+                print(f"    ga = {ga_out:.4f} Nm  (cos coefficient)")
+                print(f"    gb = {gb_out:.4f} Nm  (sin coefficient)")
                 print(f"    amplitude = {amplitude:.4f} Nm  phase = {phase_deg:.1f}°")
-                print(f"    Fo = {Fo_out:.4f} Nm  (offset, from avg fit)")
+                print(f"    Fo = {Fo_out:.4f} Nm  (offset, retained for tff)")
 
             if friction_result is not None:
                 Fc_out, k_out, Fv_out = friction_result
@@ -444,12 +447,12 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"    k  = {k_out:.2f}      (tanh steepness)")
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
 
-            if gravity_result is not None or friction_result is not None:
-                print(f"\n  Add to config.py JointGains for {joint.value}:")
+            if friction_result is not None or gravity_result is not None:
+                print(f"\n  Add to config.py JointConfig.{joint.value}.friction:")
                 print(
-                    f"    fc={Fc_out:.4f}, k={k_out:.2f}, fv={Fv_out:.4f}, fo={Fo_out:.4f},"
+                    f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
+                    f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
                 )
-                print(f"    ga={ga_out:.4f}, gb={gb_out:.4f}")
 
             print(f"{'─' * 50}")
 

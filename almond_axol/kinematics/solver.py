@@ -18,7 +18,12 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..shared import URDF_PATH
+from ..shared import (
+    URDF_PATH,
+    Joint,
+    urdf_arm_joint_names,
+    urdf_body_name,
+)
 from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
@@ -82,34 +87,21 @@ def _build_robot_collision(
     return rc
 
 
-# Link names in axol.urdf
-_LEFT_EE = "left_gripper"
-_RIGHT_EE = "right_gripper"
-_LEFT_ELBOW = "left_e2"
-_RIGHT_ELBOW = "right_e2"
-_LEFT_SHOULDER = "left_s2"
-_RIGHT_SHOULDER = "right_s2"
+# Convenience aliases for URDF link / joint names. The single source of
+# truth for these strings lives in :mod:`almond_axol.shared`; the helpers
+# below just compose ``"left_*"`` / ``"right_*"`` from a side-agnostic
+# suffix table so renaming the URDF only requires editing one place.
+_LEFT_EE = urdf_body_name(Joint.GRIPPER, is_left=True)
+_RIGHT_EE = urdf_body_name(Joint.GRIPPER, is_left=False)
+_LEFT_ELBOW = urdf_body_name(Joint.ELBOW, is_left=True)
+_RIGHT_ELBOW = urdf_body_name(Joint.ELBOW, is_left=False)
+_LEFT_SHOULDER = urdf_body_name(Joint.SHOULDER_1, is_left=True)
+_RIGHT_SHOULDER = urdf_body_name(Joint.SHOULDER_1, is_left=False)
 
-# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3).
-# Must match the ordering assumed by rest_pose / motion_control.
-_LEFT_JOINT_NAMES = [
-    "left_s1_0",  # SHOULDER_1
-    "left_s2_0",  # SHOULDER_2
-    "left_s3_0",  # SHOULDER_3
-    "left_e1_0",  # ELBOW
-    "left_e2_0",  # WRIST_1
-    "left_w1_0",  # WRIST_2
-    "left_w2_0",  # WRIST_3
-]
-_RIGHT_JOINT_NAMES = [
-    "right_s1_0",  # SHOULDER_1
-    "right_s2_0",  # SHOULDER_2
-    "right_s3_0",  # SHOULDER_3
-    "right_e1_0",  # ELBOW
-    "right_e2_0",  # WRIST_1
-    "right_w1_0",  # WRIST_2
-    "right_w2_0",  # WRIST_3
-]
+# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3). Must
+# match the ordering assumed by rest_pose / motion_control.
+_LEFT_JOINT_NAMES = urdf_arm_joint_names(is_left=True)
+_RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 
 
 # ---------------------------------------------------------------------------

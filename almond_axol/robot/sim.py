@@ -7,7 +7,7 @@ import threading
 
 import numpy as np
 
-from ..shared import ARM_JOINTS, URDF_PATH
+from ..shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
@@ -135,25 +135,9 @@ class Sim(RobotBase):
 
         # Build the robot-side joint ordering to match _build_q's output:
         # left arm joint1-N, then right arm joint1-N.
-        left_names = [
-            "left_s1_0",
-            "left_s2_0",
-            "left_s3_0",
-            "left_e1_0",
-            "left_e2_0",
-            "left_w1_0",
-            "left_w2_0",
-        ]
-        right_names = [
-            "right_s1_0",
-            "right_s2_0",
-            "right_s3_0",
-            "right_e1_0",
-            "right_e2_0",
-            "right_w1_0",
-            "right_w2_0",
-        ]
-        robot_order = (self._joint_names or left_names) + right_names
+        robot_order = (
+            self._joint_names or urdf_arm_joint_names(is_left=True)
+        ) + urdf_arm_joint_names(is_left=False)
 
         # Map each viser joint to its index in robot_order (-1 for joints not
         # in robot_order, e.g. finger joints, which stay at 0).
