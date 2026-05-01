@@ -90,6 +90,12 @@ class PositionForceConfig:
     max_speed: float
 
 
+# Placeholder used in :class:`ArmConfig` defaults. Real per-arm friction
+# values are injected by :class:`AxolConfig` via the ``_LEFT_FRICTION`` /
+# ``_RIGHT_FRICTION`` maps below.
+_ZERO_FRICTION = FrictionParams(fc=0.0, k=1.0, fv=0.0, fo=0.0)
+
+
 @dataclass
 class ArmConfig:
     """Per-joint configuration for a single arm.
@@ -100,19 +106,21 @@ class ArmConfig:
     :class:`PositionForceConfig` (gripper mass is already lumped into
     ``wrist_3.mass``).
 
-    The defaults below encode the **left** arm's tuned values. Use
-    :class:`AxolConfig` to get a paired left/right configuration with
-    mirrored CoMs on the right side. Per-link masses come from the Onshape
-    CAD geometry but are tuned in place against measured joint torques —
-    typically lower than the CAD values because Onshape often over-assigns
-    aluminum-class densities to parts that are hollow / 3D-printed.
+    Defaults encode the gains, masses, and CoMs that are common to both
+    arms. **Friction defaults to zero** — the real per-arm friction values
+    are supplied by :class:`AxolConfig` at construction (left and right
+    motors differ enough that there is no meaningful "shared" default).
+    Per-link masses come from the Onshape CAD geometry but are tuned in
+    place against measured joint torques — typically lower than the CAD
+    values because Onshape often over-assigns aluminum-class densities to
+    parts that are hollow / 3D-printed.
     """
 
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=500.0,
             kd=5.0,
-            friction=FrictionParams(fc=1.2588, k=892.72, fv=4.0400, fo=-0.2332),
+            friction=_ZERO_FRICTION,
             mass=2.00,
             com=(0.0652231, 0.0, 0.0),
         )
@@ -121,7 +129,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=500.0,
             kd=5.0,
-            friction=FrictionParams(fc=1.8254, k=142.20, fv=3.6122, fo=-2.5386),
+            friction=_ZERO_FRICTION,
             mass=1.50,
             com=(0.0, 0.0115864, -0.0302711),
         )
@@ -130,7 +138,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=250.0,
             kd=2.0,
-            friction=FrictionParams(fc=0.7140, k=89.62, fv=2.1274, fo=-0.0028),
+            friction=_ZERO_FRICTION,
             mass=2.75,
             com=(0.0, 0.00286547, -0.164964),
         )
@@ -139,7 +147,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=100.0,
             kd=2.0,
-            friction=FrictionParams(fc=0.9459, k=760.52, fv=1.0965, fo=-0.1867),
+            friction=_ZERO_FRICTION,
             mass=0.80,
             com=(-0.0256064, 0.0, -0.072044),
         )
@@ -148,7 +156,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=150.0,
             kd=1.0,
-            friction=FrictionParams(fc=0.5977, k=72.71, fv=1.2183, fo=0.1210),
+            friction=_ZERO_FRICTION,
             mass=0.50,
             com=(0.0, 0.0, -0.0614121),
         )
@@ -157,7 +165,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=150.0,
             kd=2.5,
-            friction=FrictionParams(fc=0.1171, k=796.16, fv=1.0274, fo=0.0833),
+            friction=_ZERO_FRICTION,
             mass=0.60,
             # left_w1 CoM (right side has y sign-flipped — done by mirror_to_right).
             com=(0.0, 0.0285, -0.0285),
@@ -167,7 +175,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             kp=100.0,
             kd=0.8,
-            friction=FrictionParams(fc=0.1311, k=175.50, fv=0.5887, fo=0.0486),
+            friction=_ZERO_FRICTION,
             mass=0.65,
             # left_w2 lumps wrist-3 segment with the gripper assembly (fixed
             # joint): merged CAD inertial is 1.267 kg @ (-0.0285, 0, -0.08945);
@@ -208,25 +216,88 @@ def _flip_x_y(com: tuple[float, float, float]) -> tuple[float, float, float]:
     return (-com[0], -com[1], com[2])
 
 
+@dataclass(frozen=True)
+class _ArmFriction:
+    """Per-joint friction values for one physical arm. Field names mirror
+    :class:`ArmConfig` so values are injected by attribute (not string key).
+    """
+
+    shoulder_1: FrictionParams
+    shoulder_2: FrictionParams
+    shoulder_3: FrictionParams
+    elbow: FrictionParams
+    wrist_1: FrictionParams
+    wrist_2: FrictionParams
+    wrist_3: FrictionParams
+
+
+# Per-joint friction values measured with ``axol tune.friction``. Each
+# instance is the source of truth for one physical arm — the two arms share
+# gains, masses, and (after mirroring) CoMs, but motor-by-motor friction
+# differs enough to be worth identifying per side. Re-run the tuner on a
+# fresh Axol to refresh these.
+_LEFT_FRICTION = _ArmFriction(
+    shoulder_1=FrictionParams(fc=1.0191, k=723.53, fv=3.3848, fo=0.2853),
+    shoulder_2=FrictionParams(fc=1.6873, k=115.41, fv=2.7202, fo=-0.1701),
+    shoulder_3=FrictionParams(fc=0.5979, k=106.56, fv=2.1515, fo=0.0242),
+    elbow=FrictionParams(fc=0.6806, k=801.34, fv=0.8665, fo=-0.2496),
+    wrist_1=FrictionParams(fc=0.5601, k=66.02, fv=1.2435, fo=0.0504),
+    wrist_2=FrictionParams(fc=0.2658, k=180.00, fv=0.9962, fo=0.0691),
+    wrist_3=FrictionParams(fc=0.1048, k=829.09, fv=0.5857, fo=0.0638),
+)
+
+_RIGHT_FRICTION = _ArmFriction(
+    shoulder_1=FrictionParams(fc=1.0390, k=781.53, fv=3.5425, fo=0.2861),
+    shoulder_2=FrictionParams(fc=1.6873, k=115.41, fv=2.7202, fo=0.1701),
+    shoulder_3=FrictionParams(fc=0.4773, k=91.37, fv=1.8673, fo=0.0631),
+    elbow=FrictionParams(fc=0.5255, k=159.25, fv=0.8480, fo=0.3607),
+    wrist_1=FrictionParams(fc=0.4415, k=80.96, fv=1.3184, fo=0.0497),
+    wrist_2=FrictionParams(fc=0.1880, k=813.44, fv=1.1331, fo=0.0252),
+    wrist_3=FrictionParams(fc=0.1137, k=852.61, fv=0.5843, fo=0.0345),
+)
+
+
+def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
+    """Build an :class:`ArmConfig` for one side: shared gains + masses, with
+    per-side CoMs (mirrored on the right) and per-motor friction injected.
+    """
+    arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
+    return replace(
+        arm,
+        shoulder_1=replace(arm.shoulder_1, friction=friction.shoulder_1),
+        shoulder_2=replace(arm.shoulder_2, friction=friction.shoulder_2),
+        shoulder_3=replace(arm.shoulder_3, friction=friction.shoulder_3),
+        elbow=replace(arm.elbow, friction=friction.elbow),
+        wrist_1=replace(arm.wrist_1, friction=friction.wrist_1),
+        wrist_2=replace(arm.wrist_2, friction=friction.wrist_2),
+        wrist_3=replace(arm.wrist_3, friction=friction.wrist_3),
+    )
+
+
 @dataclass
 class AxolConfig:
     """Top-level configuration for both arms and grippers.
 
-    The ``left`` and ``right`` :class:`ArmConfig` instances have identical
-    gains, friction, and masses by default, but mirrored CoMs — the right
-    arm is generated by :meth:`ArmConfig.mirror_to_right`. Pass an explicit
-    ``right=`` argument if you want asymmetric tuning.
+    Each arm is built from the shared :class:`ArmConfig` defaults (gains,
+    masses, link CoMs) with side-specific friction values
+    (:data:`_LEFT_FRICTION` / :data:`_RIGHT_FRICTION`, both
+    :class:`_ArmFriction` instances) injected, and CoMs mirrored across X
+    for the right arm. Pass an explicit ``left=`` / ``right=`` argument to
+    bypass either default.
 
     Attributes:
         left:         Per-joint config for the left arm.
-        right:        Per-joint config for the right arm. Defaults to the
-                      left arm with CoMs mirrored across X.
+        right:        Per-joint config for the right arm.
         max_step_rad: Maximum allowed change in any arm joint (rad) between
                       consecutive ``motion_control`` calls. Commands that
                       exceed this are dropped and a warning is logged. Set
                       to ``float('inf')`` to disable.
     """
 
-    left: ArmConfig = field(default_factory=ArmConfig)
-    right: ArmConfig = field(default_factory=lambda: ArmConfig().mirror_to_right())
+    left: ArmConfig = field(
+        default_factory=lambda: _build_arm(_LEFT_FRICTION, is_left=True)
+    )
+    right: ArmConfig = field(
+        default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
+    )
     max_step_rad: float = 0.5

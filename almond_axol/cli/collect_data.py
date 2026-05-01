@@ -146,25 +146,27 @@ def _run(
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
-    from ..robot.config import ArmConfig, AxolConfig
+    from ..robot.config import AxolConfig
     from ..shared import setup_link_ip
     from ..vr.models import VRState
 
     if zed_iface:
         setup_link_ip(zed_iface, "192.168.10.2/24")
 
-    left = ArmConfig()
-    right = ArmConfig().mirror_to_right()
-    gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
-    left = replace(left, gripper=gripper)
-    right = replace(right, gripper=gripper)
+    axol_config = AxolConfig()
+    gripper = replace(axol_config.left.gripper, torque_limit=gripper_torque_limit)
+    axol_config = replace(
+        axol_config,
+        left=replace(axol_config.left, gripper=gripper),
+        right=replace(axol_config.right, gripper=gripper),
+    )
     robot_config = AxolRobotConfig(
         cameras={
             "overhead": ZedCameraConfig(host=zed_host, port=30000),
             "left_arm": ZedCameraConfig(host=zed_host, port=30002),
             "right_arm": ZedCameraConfig(host=zed_host, port=30004),
         },
-        axol_config=AxolConfig(left=left, right=right),
+        axol_config=axol_config,
     )
     robot = AxolRobot(robot_config)
     teleop = AxolVRTeleop(AxolVRTeleopConfig())

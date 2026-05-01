@@ -298,18 +298,19 @@ Identifies the four friction-model parameters for one joint via a bidirectional 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
-| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`, `gripper` (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
 | `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
 | `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
 | `--velocities V [V ...]` | Velocity setpoints in rad/s (default: ~0.1, 0.3, 0.6, 0.9, 1.3) |
 | `--lo RAD` | Override lower joint limit for the sweep |
 | `--hi RAD` | Override upper joint limit for the sweep |
+| `--dump-csv [PATH]` | Write per-bin `(v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff)` rows to a CSV for offline plotting / arm-vs-arm comparison. Pass without a value to auto-name as `logs/friction_<side>_<joint>_<timestamp>.csv` |
 
 ```bash
 axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
 axol tune.friction --r --joint elbow --kp 20 --kd 0.6
 axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
-axol tune.friction --r --joint gripper --kp 10 --kd 0.3
+axol tune.friction --l --joint shoulder_2 --dump-csv
 ```
 
 ### `gravity_comp`
@@ -509,14 +510,16 @@ config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
 async with Axol(config=config) as axol: ...
 ```
 
-Or build a fully custom arm with `dataclasses.replace`:
+Or build a fully custom arm with `dataclasses.replace` (start from the
+`AxolConfig` defaults so you keep the per-side friction values that get
+injected at construction):
 
 ```python
 from dataclasses import replace
-from almond_axol.robot import ArmConfig, JointConfig, FrictionParams
+from almond_axol.robot import AxolConfig, JointConfig, FrictionParams
 
 left = replace(
-    ArmConfig(),
+    AxolConfig().left,
     shoulder_1=JointConfig(
         kp=35.0, kd=1.2,
         friction=FrictionParams(fc=0.0, k=0.0, fv=0.0, fo=0.0),
@@ -545,7 +548,7 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 |---|---|---|
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
 
-By default `AxolConfig.right` is `ArmConfig().mirror_to_right()` (same gains, friction, and masses as left, but CoMs mirrored across X). Pass an explicit `right=` to override.
+Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
 
 ### Gravity compensation
 

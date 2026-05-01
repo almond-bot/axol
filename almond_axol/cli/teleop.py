@@ -78,7 +78,7 @@ async def _run(
     from dataclasses import replace
 
     from ..robot import Axol, Sim
-    from ..robot.config import ArmConfig, AxolConfig
+    from ..robot.config import AxolConfig
     from ..teleop import VRTeleop
 
     if robot_type == "sim":
@@ -89,11 +89,13 @@ async def _run(
             kwargs["left_channel"] = None
         if no_right:
             kwargs["right_channel"] = None
-        left = ArmConfig()
-        right = ArmConfig().mirror_to_right()
-        gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
-        left = replace(left, gripper=gripper)
-        right = replace(right, gripper=gripper)
-        robot = Axol(config=AxolConfig(left=left, right=right), **kwargs)
+        axol_config = AxolConfig()
+        gripper = replace(axol_config.left.gripper, torque_limit=gripper_torque_limit)
+        axol_config = replace(
+            axol_config,
+            left=replace(axol_config.left, gripper=gripper),
+            right=replace(axol_config.right, gripper=gripper),
+        )
+        robot = Axol(config=axol_config, **kwargs)
     async with VRTeleop(robot) as teleop:
         await teleop.run()
