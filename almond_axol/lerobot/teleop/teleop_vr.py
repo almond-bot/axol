@@ -534,8 +534,6 @@ class AxolVRTeleop(Teleoperator):
                 continue
 
             last_frame = frame
-            self._l_grip = frame.l_grip
-            self._r_grip = frame.r_grip
 
             # Deadman toggle — mirrors native VRTeleop._ik_loop logic:
             #   rising edge of BOTH grips pressed together → enable tracking
@@ -558,6 +556,12 @@ class AxolVRTeleop(Teleoperator):
                     _logger.info("Teleop disabled")
             self._prev_both = both
             self._prev_either = either
+
+            # Only track gripper position when arm movement is also enabled so
+            # that the gripper cannot be actuated independently of the deadman.
+            if self._teleop_enabled:
+                self._l_grip = frame.l_grip
+                self._r_grip = frame.r_grip
 
             # Restore full velocity after engage window expires
             if self._engage_time is not None:
