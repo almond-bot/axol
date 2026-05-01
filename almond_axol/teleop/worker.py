@@ -54,8 +54,6 @@ def _vr_to_flu_np(
     qy: float,
     qz: float,
     qw: float,
-    *,
-    is_right: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert VR pose (X=Down, Y=Left, Z=Forward) → robot FLU. Returns (pos_3, rot_3x3), float32."""
     pos = np.array((pz, py, -px), dtype=np.float32)
@@ -256,7 +254,7 @@ class IKWorker:
 
         # Convert filtered poses to FLU — pure numpy
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
-        right_pos, right_rot = _vr_to_flu_np(*rp, *rq, is_right=True)
+        right_pos, right_rot = _vr_to_flu_np(*rp, *rq)
 
         le = self._f_l_elbow.update(
             np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
