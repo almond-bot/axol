@@ -1,30 +1,3 @@
-"""Range of motion test — simulation only.
-
-Moves each joint sequentially through its full range of motion while all
-other joints stay at home.  Both arms are driven simultaneously for
-symmetric joints; asymmetric joints (SHOULDER_2, ELBOW) are exercised one
-arm at a time.
-
-Each waypoint is checked for self-collision via pyroki before execution.
-If a waypoint would cause a collision it is skipped with a warning.
-
-Joint sequence:
-  1. SHOULDER_1  — both arms, max → min → home
-  2. SHOULDER_2  — right (0=min, sweep to max), then left (0=max, sweep to min)
-  3. SHOULDER_3  — both arms, max → min → home
-  4. ELBOW       — both arms together, 120° bend → home
-  5. WRIST_1     — both arms, max → min → home
-  6. WRIST_2     — arms forward −45° first, then max → min → home, then arms return
-  7. WRIST_3     — both arms, max → min → home
-  8. GRIPPER     — both arms, open → closed → home
-
-Run:
-    python -m almond_axol.test.rom_test
-
-Open http://localhost:8080 in a browser to view the 3-D simulation.
-Press Enter in the terminal when you are ready to start motion.
-"""
-
 import asyncio
 import math
 import time
@@ -37,6 +10,8 @@ import yourdfpy
 
 from ..kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
 from ..robot.axol import (
+    ELBOW_LEFT_LIMITS,
+    ELBOW_RIGHT_LIMITS,
     LIMITS,
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
@@ -44,30 +19,19 @@ from ..robot.axol import (
 from ..robot.sim import Sim
 from ..shared import URDF_PATH, Joint
 
-_SPEED = 3.0  # rad/s — fast for simulation
+_SPEED = 3.0
+_PRE_POSE_SPEED = 0.8
 _RATE_HZ = 100.0
-_PAUSE = 0.5  # seconds to hold at each waypoint
+_PAUSE = 0.5
 
-_90_DEG = math.pi * 2 / 3  # elbow bend limit (~120°)
-_FWD_45 = -math.pi / 4  # shoulder_1 forward pre-pose for wrist_2
+_WRIST_ELBOW = math.pi / 2
+_FWD_25 = -25 * math.pi / 180
 
 _IDX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
-_N = len(list(Joint))  # 8
-
-
-# ---------------------------------------------------------------------------
-# Collision checker
-# ---------------------------------------------------------------------------
+_N = len(list(Joint))
 
 
 class CollisionChecker:
-    """Checks robot configurations for self-collision using pyroki.
-
-    Args:
-        margin: Safety margin in metres. A waypoint is rejected if any
-                collision pair distance falls below ``-margin``.
-    """
-
     def __init__(self, margin: float = 0.01) -> None:
         print("Loading collision model (pyroki) ...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
@@ -85,33 +49,18 @@ class CollisionChecker:
         def _check(q: jax.Array) -> jax.Array:
             return robot_coll.compute_self_collision_distance(robot, q)
 
-        # Trigger JIT compilation and record home-position baseline.
-        # Connected links always overlap in the URDF mesh, so we compare
-        # relative to home rather than against an absolute threshold.
         home_dists = np.asarray(_check(jnp.zeros(self._n, dtype=jnp.float32)))
         self._baseline = float(home_dists.min())
         self._check = _check
         print(f"Collision model ready. Home baseline: {self._baseline:.4f} m\n")
 
     def is_safe(self, q_l: np.ndarray, q_r: np.ndarray) -> tuple[bool, float]:
-        """Return ``(safe, min_distance)``.
-
-        Positive distance means shapes are separated; negative means
-        penetration.  A configuration is considered safe when
-        ``min_distance > -margin``.
-        """
         q_full = np.zeros(self._n, dtype=np.float32)
-        q_full[self._left_idx] = q_l[:7]  # ARM_JOINTS only, no gripper
+        q_full[self._left_idx] = q_l[:7]
         q_full[self._right_idx] = q_r[:7]
         distances = np.asarray(self._check(jnp.asarray(q_full)))
         min_dist = float(distances.min())
-        # Safe if not significantly worse than the home-position baseline
         return min_dist > self._baseline - self._margin, min_dist
-
-
-# ---------------------------------------------------------------------------
-# Motion helpers
-# ---------------------------------------------------------------------------
 
 
 def _home() -> np.ndarray:
@@ -125,8 +74,8 @@ async def _sweep(
     q_r: np.ndarray,
     tgt_l: np.ndarray,
     tgt_r: np.ndarray,
+    speed: float = _SPEED,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Check target for collision, then S-curve interpolate to it."""
     safe, min_dist = checker.is_safe(tgt_l, tgt_r)
     if not safe:
         print(
@@ -138,7 +87,7 @@ async def _sweep(
         float(np.max(np.abs(tgt_l - q_l))),
         float(np.max(np.abs(tgt_r - q_r))),
     )
-    dur = max(dist / _SPEED, 0.1)
+    dur = max(dist / speed, 0.1)
     dt = 1.0 / _RATE_HZ
     t0 = time.monotonic()
     while True:
@@ -168,12 +117,11 @@ async def _joint_rom(
     q_l: np.ndarray,
     q_r: np.ndarray,
     joint: Joint,
-    arm: str,  # "both" | "left" | "right"
+    arm: str,
     waypoints: list[float],
     label: str,
     home_val: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Sweep one joint through waypoints then return to home_val."""
     print(f"  {label}  {[round(w, 3) for w in waypoints]} → {round(home_val, 3)}")
     for val in waypoints:
         tgt_l = _with_joint(q_l, joint, val) if arm in ("both", "left") else q_l.copy()
@@ -185,11 +133,6 @@ async def _joint_rom(
     )
     q_l, q_r = await _sweep(sim, checker, q_l, q_r, tgt_l, tgt_r)
     return q_l, q_r
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 
 async def _run() -> None:
@@ -210,7 +153,6 @@ async def _run() -> None:
         await asyncio.sleep(0.5)
         print("\nStarting ROM sweep ...\n")
 
-        # 1. SHOULDER_1 — symmetric — max then min
         lo, hi = LIMITS[Joint.SHOULDER_1]
         q_l, q_r = await _joint_rom(
             sim,
@@ -223,50 +165,61 @@ async def _run() -> None:
             "SHOULDER_1  (both)",
         )
 
-        # 2. SHOULDER_2 — 0 is home; right sweeps to max, left sweeps to min
         _, r_hi = SHOULDER_2_RIGHT_LIMITS
-        q_l, q_r = await _joint_rom(
-            sim,
-            checker,
-            q_l,
-            q_r,
-            Joint.SHOULDER_2,
-            "right",
-            [r_hi],
-            "SHOULDER_2  (right)",
-        )
         l_lo, _ = SHOULDER_2_LEFT_LIMITS
-        q_l, q_r = await _joint_rom(
-            sim,
-            checker,
-            q_l,
-            q_r,
-            Joint.SHOULDER_2,
-            "left",
-            [l_lo],
-            "SHOULDER_2  (left) ",
-        )
-
-        # 3. SHOULDER_3 — arms come forward −45° first, then sweep, then return
-        print(f"  SHOULDER_3 pre-pose: arms forward {round(math.degrees(_FWD_45), 1)}°")
+        print(f"  SHOULDER_2  (both)  → [{round(l_lo, 3)}, {round(r_hi, 3)}] → 0")
         q_l, q_r = await _sweep(
             sim,
             checker,
             q_l,
             q_r,
-            _with_joint(q_l, Joint.SHOULDER_1, _FWD_45),
-            _with_joint(q_r, Joint.SHOULDER_1, _FWD_45),
+            _with_joint(q_l, Joint.SHOULDER_2, l_lo),
+            _with_joint(q_r, Joint.SHOULDER_2, r_hi),
         )
-        lo, hi = LIMITS[Joint.SHOULDER_3]
-        q_l, q_r = await _joint_rom(
+        q_l, q_r = await _sweep(
             sim,
             checker,
             q_l,
             q_r,
-            Joint.SHOULDER_3,
-            "both",
-            [hi, lo],
-            "SHOULDER_3  (both)",
+            _with_joint(q_l, Joint.SHOULDER_2, 0.0),
+            _with_joint(q_r, Joint.SHOULDER_2, 0.0),
+        )
+
+        print(f"  SHOULDER_3 pre-pose: arms forward {round(math.degrees(_FWD_25), 1)}°")
+        q_l, q_r = await _sweep(
+            sim,
+            checker,
+            q_l,
+            q_r,
+            _with_joint(q_l, Joint.SHOULDER_1, -_FWD_25),
+            _with_joint(q_r, Joint.SHOULDER_1, _FWD_25),
+            speed=_PRE_POSE_SPEED,
+        )
+        lo, hi = LIMITS[Joint.SHOULDER_3]
+        print(f"  SHOULDER_3  (both fwd)  [{round(lo, 3)}, {round(hi, 3)}] → 0")
+        q_l, q_r = await _sweep(
+            sim,
+            checker,
+            q_l,
+            q_r,
+            _with_joint(q_l, Joint.SHOULDER_3, lo),
+            _with_joint(q_r, Joint.SHOULDER_3, -lo),
+        )
+        q_l, q_r = await _sweep(
+            sim,
+            checker,
+            q_l,
+            q_r,
+            _with_joint(q_l, Joint.SHOULDER_3, hi),
+            _with_joint(q_r, Joint.SHOULDER_3, -hi),
+        )
+        q_l, q_r = await _sweep(
+            sim,
+            checker,
+            q_l,
+            q_r,
+            _with_joint(q_l, Joint.SHOULDER_3, 0.0),
+            _with_joint(q_r, Joint.SHOULDER_3, 0.0),
         )
         q_l, q_r = await _sweep(
             sim,
@@ -275,17 +228,21 @@ async def _run() -> None:
             q_r,
             _with_joint(q_l, Joint.SHOULDER_1, 0.0),
             _with_joint(q_r, Joint.SHOULDER_1, 0.0),
+            speed=_PRE_POSE_SPEED,
         )
 
-        # 4. ELBOW — both arms together
-        print(f"  ELBOW       (both)  [{round(-_90_DEG, 3)}, {round(_90_DEG, 3)}] → 0")
+        _, elbow_l_hi = ELBOW_LEFT_LIMITS
+        elbow_r_lo, _ = ELBOW_RIGHT_LIMITS
+        print(
+            f"  ELBOW       (both)  [{round(elbow_r_lo, 3)}, {round(elbow_l_hi, 3)}] → 0"
+        )
         q_l, q_r = await _sweep(
             sim,
             checker,
             q_l,
             q_r,
-            _with_joint(q_l, Joint.ELBOW, +_90_DEG),
-            _with_joint(q_r, Joint.ELBOW, -_90_DEG),
+            _with_joint(q_l, Joint.ELBOW, elbow_l_hi),
+            _with_joint(q_r, Joint.ELBOW, elbow_r_lo),
         )
         q_l, q_r = await _sweep(
             sim,
@@ -296,18 +253,16 @@ async def _run() -> None:
             _with_joint(q_r, Joint.ELBOW, 0.0),
         )
 
-        # 5-8. WRIST_1/2/3 + GRIPPER — elbows stay at 90° throughout
         print("  Pre-pose: elbows at 90°")
         q_l, q_r = await _sweep(
             sim,
             checker,
             q_l,
             q_r,
-            _with_joint(q_l, Joint.ELBOW, +_90_DEG),
-            _with_joint(q_r, Joint.ELBOW, -_90_DEG),
+            _with_joint(q_l, Joint.ELBOW, +_WRIST_ELBOW),
+            _with_joint(q_r, Joint.ELBOW, -_WRIST_ELBOW),
         )
 
-        # 5. WRIST_1
         lo, hi = LIMITS[Joint.WRIST_1]
         q_l, q_r = await _joint_rom(
             sim,
@@ -320,7 +275,6 @@ async def _run() -> None:
             "WRIST 1     (both)",
         )
 
-        # 6. WRIST_2
         lo, hi = LIMITS[Joint.WRIST_2]
         q_l, q_r = await _joint_rom(
             sim,
@@ -333,7 +287,6 @@ async def _run() -> None:
             "WRIST 2     (both)",
         )
 
-        # 7. WRIST_3
         lo, hi = LIMITS[Joint.WRIST_3]
         q_l, q_r = await _joint_rom(
             sim,
@@ -346,19 +299,6 @@ async def _run() -> None:
             "WRIST 3     (both)",
         )
 
-        # 8. GRIPPER — both arms — open (1.0) → closed (0.0)
-        q_l, q_r = await _joint_rom(
-            sim,
-            checker,
-            q_l,
-            q_r,
-            Joint.GRIPPER,
-            "both",
-            [1.0, 0.0],
-            "GRIPPER     (both)",
-        )
-
-        # Return elbows to home
         q_l, q_r = await _sweep(
             sim,
             checker,
