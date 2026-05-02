@@ -53,32 +53,23 @@ _PLAN_SPEED = 0.1 * np.pi  # rad/s — joint-space speed for the planned traject
 # wrist_3) — read off ``axol motor.info`` while the operator held the arms
 # in the desired contact pose. Edit these in place to re-calibrate.
 _TOUCH_LEFT: dict[Joint, float] = {
-    Joint.SHOULDER_1: 0.1033,
-    Joint.SHOULDER_2: 0.0054,
-    Joint.SHOULDER_3: -0.2850,
-    Joint.ELBOW: 1.3830,
-    Joint.WRIST_1: -0.2794,
-    Joint.WRIST_2: -0.1764,
-    Joint.WRIST_3: 0.3393,
+    Joint.SHOULDER_1: 0.1194,
+    Joint.SHOULDER_2: -0.0515,
+    Joint.SHOULDER_3: -0.3430,
+    Joint.ELBOW: 1.3842,
+    Joint.WRIST_1: -0.2252,
+    Joint.WRIST_2: -0.1582,
+    Joint.WRIST_3: 0.3352,
 }
 _TOUCH_RIGHT: dict[Joint, float] = {
-    Joint.SHOULDER_1: -0.1529,
-    Joint.SHOULDER_2: -0.0873,
-    Joint.SHOULDER_3: 0.1031,
-    Joint.ELBOW: -1.3491,
-    Joint.WRIST_1: 0.3421,
-    Joint.WRIST_2: 0.5831,
-    Joint.WRIST_3: -0.3626,
+    Joint.SHOULDER_1: -0.1827,
+    Joint.SHOULDER_2: -0.0716,
+    Joint.SHOULDER_3: 0.1444,
+    Joint.ELBOW: -1.3580,
+    Joint.WRIST_1: 0.3029,
+    Joint.WRIST_2: 0.5780,
+    Joint.WRIST_3: -0.3291,
 }
-
-# Cartesian fine-tune nudges applied on top of the measured touch pose.
-# IK fixes each gripper's seed orientation and only solves for the
-# requested ``(dx, dy, dz)`` position delta (m), in URDF world coords:
-# ``+X = left side``, ``-Y = forward``, ``+Z = up``. Set both to zero to
-# skip the IK entirely. Edit these to close the last few millimetres of
-# the gap once the hand-measured angles are roughly right.
-_LEFT_OFFSET: np.ndarray = np.array([0.0, 0.0075, 0.0], dtype=np.float32)
-_RIGHT_OFFSET: np.ndarray = np.array([0.011, 0.0, 0.016], dtype=np.float32)
 
 
 def _build_q_touch(solver: KinematicsSolver) -> np.ndarray:
@@ -87,43 +78,6 @@ def _build_q_touch(solver: KinematicsSolver) -> np.ndarray:
     for i, j in enumerate(ARM_JOINTS):
         q[solver.left_indices[i]] = _TOUCH_LEFT[j]
         q[solver.right_indices[i]] = _TOUCH_RIGHT[j]
-    return q
-
-
-def _apply_cartesian_offsets(
-    solver: KinematicsSolver,
-    q_seed: np.ndarray,
-    left_offset: np.ndarray,
-    right_offset: np.ndarray,
-    *,
-    max_steps: int = 300,
-    eps: float = 2e-4,
-) -> np.ndarray:
-    """Nudge the gripper-link positions of ``q_seed`` by Cartesian offsets.
-
-    Position targets = ``FK(q_seed) + offset``; orientation targets =
-    ``FK(q_seed)`` (held fixed so the gripper stays pointing the same
-    way). Iterates ``solver.ik`` until the joint update settles below
-    ``eps`` — convergence is fast because the seed is already at the
-    target before the offset is applied. Offsets are in URDF world
-    coordinates (``+X = left side``, ``-Y = forward``, ``+Z = up``).
-    """
-    L_se3, R_se3 = solver.fk(q_seed)
-    L_pos = np.asarray(L_se3.translation(), dtype=np.float32) + left_offset
-    R_pos = np.asarray(R_se3.translation(), dtype=np.float32) + right_offset
-    L_rot = np.asarray(L_se3.rotation().as_matrix(), dtype=np.float32)
-    R_rot = np.asarray(R_se3.rotation().as_matrix(), dtype=np.float32)
-
-    # Keep the null-space attractor on the seed so the IK only spends
-    # itself on the position delta, not on global re-posturing.
-    solver.set_posture_pose(q_seed)
-
-    q = q_seed.astype(np.float32).copy()
-    for _ in range(max_steps):
-        q_new = solver.ik(q, left_pose=(L_pos, L_rot), right_pose=(R_pos, R_rot))
-        if float(np.max(np.abs(q_new - q))) < eps:
-            return q_new
-        q = q_new
     return q
 
 
@@ -380,32 +334,15 @@ async def _run(args: argparse.Namespace) -> None:
     solver = KinematicsSolver()
 
     # Build the full-N rest and touch vectors. ``q_touch`` is the hand-posed
-    # measurement at the top of this file; ``solver`` is only used here for
+    # measurement at the top of this file; ``solver`` is only used for
     # joint-index marshalling, FK reporting, and collision-aware path
-    # planning — not IK.
+    # planning.
     q_rest = np.zeros(solver.num_joints, dtype=np.float32)
     for i, gi in enumerate(solver.left_indices):
         q_rest[gi] = rest_cfg.rest_pose_left[i]
     for i, gi in enumerate(solver.right_indices):
         q_rest[gi] = rest_cfg.rest_pose_right[i]
     q_touch = _build_q_touch(solver)
-
-    # Apply :data:`_LEFT_OFFSET` / :data:`_RIGHT_OFFSET` by IK'ing from
-    # the measured-pose seed: orientations are held fixed, only positions
-    # are nudged. Skip the IK entirely when both offsets are zero so the
-    # JIT compile only fires when needed.
-    if (
-        float(np.max(np.abs(_LEFT_OFFSET))) > 0
-        or float(np.max(np.abs(_RIGHT_OFFSET))) > 0
-    ):
-        print(
-            f"Applying Cartesian offsets via IK:\n"
-            f"  left  → ({_LEFT_OFFSET[0]:+.4f}, {_LEFT_OFFSET[1]:+.4f}, "
-            f"{_LEFT_OFFSET[2]:+.4f}) m\n"
-            f"  right → ({_RIGHT_OFFSET[0]:+.4f}, {_RIGHT_OFFSET[1]:+.4f}, "
-            f"{_RIGHT_OFFSET[2]:+.4f}) m"
-        )
-        q_touch = _apply_cartesian_offsets(solver, q_touch, _LEFT_OFFSET, _RIGHT_OFFSET)
 
     # Report the FK-computed tip positions so the operator can eyeball the
     # touch geometry before any motors move.
