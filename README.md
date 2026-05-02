@@ -313,7 +313,7 @@ axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
 axol tune.friction --l --joint shoulder_2 --dump-csv
 ```
 
-### `gravity_comp`
+### `gravity-comp`
 
 Holds both arms in gravity-compensation mode so you can move them by hand. Each *free* arm joint is sent `set_impedance` with `kp=0`, `kd=KD`, and a feedforward torque equal to the URDF-modelled gravity. Joints not in the free set are held rigidly at their current position with their configured `ArmConfig` `kp`/`kd` (still gravity-compensated). The grippers are softly held at their current positions.
 
@@ -326,11 +326,11 @@ Holds both arms in gravity-compensation mode so you can move them by hand. Each 
 | `--telemetry-rate FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
 
 ```bash
-axol gravity_comp                                 # all 7 joints free, both arms
-axol gravity_comp --no-right                      # left arm only, all joints free
-axol gravity_comp --kd 1.0                        # heavier damping
-axol gravity_comp --joints WRIST_3                # only WRIST_3 free; everything else held rigid
-axol gravity_comp --no-right --joints SHOULDER_1,WRIST_3   # one-arm, two-joint isolation
+axol gravity-comp                                 # all 7 joints free, both arms
+axol gravity-comp --no-right                      # left arm only, all joints free
+axol gravity-comp --kd 1.0                        # heavier damping
+axol gravity-comp --joints WRIST_3                # only WRIST_3 free; everything else held rigid
+axol gravity-comp --no-right --joints SHOULDER_1,WRIST_3   # one-arm, two-joint isolation
 ```
 
 Use `--joints` to test gravity comp on a single joint at a time: only the named joints float freely, while the rest of the arm holds its pose so you can isolate the effect.

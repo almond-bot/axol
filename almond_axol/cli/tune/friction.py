@@ -231,7 +231,7 @@ def _compare_to_gravity_model(
         if pct > 20.0 and rms_after_bias > 0.1:
             print(
                 "    ! Large shape residual: URDF mass/com likely off for this "
-                "joint or its children. Verify with `axol gravity_comp`."
+                "joint or its children. Verify with `axol gravity-comp`."
             )
     return Fo
 

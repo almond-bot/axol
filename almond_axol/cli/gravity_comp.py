@@ -1,5 +1,5 @@
 """
-axol gravity_comp
+axol gravity-comp
 
 Put the Axol arms into gravity-compensation mode so the operator can move them
 by hand. Each free arm joint is sent ``set_impedance(p_des=current, v_des=0,
@@ -8,11 +8,11 @@ set are held rigidly at their current position with their configured
 ``ArmConfig`` gains; the gripper is held softly at its current position.
 
 Examples:
-    axol gravity_comp
-    axol gravity_comp --no-right
-    axol gravity_comp --kd 1.0
-    axol gravity_comp --joints WRIST_3
-    axol gravity_comp --no-right --joints SHOULDER_1,WRIST_3
+    axol gravity-comp
+    axol gravity-comp --no-right
+    axol gravity-comp --kd 1.0
+    axol gravity-comp --joints WRIST_3
+    axol gravity-comp --no-right --joints SHOULDER_1,WRIST_3
 """
 
 from __future__ import annotations
@@ -58,7 +58,7 @@ def _parse_joints(spec: str) -> set[Joint]:
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "gravity_comp",
+        "gravity-comp",
         help="Hold the Axol in gravity-compensation mode (move by hand).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
