@@ -277,17 +277,23 @@ _RIGHT_FRICTION = _ArmFriction(
 def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     """Build an :class:`ArmConfig` for one side: shared gains + masses, with
     per-side CoMs (mirrored on the right) and per-motor friction injected.
+
+    Each :class:`FrictionParams` is copied (``replace()`` with no field
+    overrides) so that mutating one config's friction — e.g.
+    ``config.left.shoulder_1.friction.fc = 0.5`` — does not aliasing-leak
+    back into :data:`_LEFT_FRICTION` / :data:`_RIGHT_FRICTION` and corrupt
+    every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
     return replace(
         arm,
-        shoulder_1=replace(arm.shoulder_1, friction=friction.shoulder_1),
-        shoulder_2=replace(arm.shoulder_2, friction=friction.shoulder_2),
-        shoulder_3=replace(arm.shoulder_3, friction=friction.shoulder_3),
-        elbow=replace(arm.elbow, friction=friction.elbow),
-        wrist_1=replace(arm.wrist_1, friction=friction.wrist_1),
-        wrist_2=replace(arm.wrist_2, friction=friction.wrist_2),
-        wrist_3=replace(arm.wrist_3, friction=friction.wrist_3),
+        shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),
+        shoulder_2=replace(arm.shoulder_2, friction=replace(friction.shoulder_2)),
+        shoulder_3=replace(arm.shoulder_3, friction=replace(friction.shoulder_3)),
+        elbow=replace(arm.elbow, friction=replace(friction.elbow)),
+        wrist_1=replace(arm.wrist_1, friction=replace(friction.wrist_1)),
+        wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
+        wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
     )
 
 
