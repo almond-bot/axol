@@ -157,7 +157,6 @@ def _run(
     rerun_port: int = 9876,
 ) -> None:
     import time
-    from dataclasses import replace
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.policies.factory import make_pre_post_processors
@@ -171,7 +170,7 @@ def _run(
     from ..lerobot.camera.configuration_zed import ZedCameraConfig
     from ..lerobot.robot.config_axol import AxolRobotConfig
     from ..lerobot.robot.robot_axol import AxolRobot
-    from ..robot.config import ArmConfig, AxolConfig
+    from ..robot.config import AxolConfig
     from ..shared import setup_link_ip
 
     if zed_iface:
@@ -183,11 +182,9 @@ def _run(
     policy.to(device)
     policy.eval()
 
-    left = ArmConfig()
-    right = ArmConfig().mirror_gravity()
-    gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
-    left = replace(left, gripper=gripper)
-    right = replace(right, gripper=gripper)
+    axol_config = AxolConfig()
+    axol_config.left.gripper.torque_limit = gripper_torque_limit
+    axol_config.right.gripper.torque_limit = gripper_torque_limit
 
     # Build robot with 3 ZED cameras — resolution/FPS auto-detected from stream
     robot_config = AxolRobotConfig(
@@ -196,7 +193,7 @@ def _run(
             "left_arm": ZedCameraConfig(host=zed_host, port=30002),
             "right_arm": ZedCameraConfig(host=zed_host, port=30004),
         },
-        axol_config=AxolConfig(left=left, right=right),
+        axol_config=axol_config,
     )
     robot = AxolRobot(robot_config)
 

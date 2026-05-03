@@ -1,4 +1,10 @@
-"""Motor control utilities: friction model, velocity differentiator, gravity feedforward."""
+"""Motor control utilities: friction model and velocity differentiator.
+
+Gravity compensation is handled separately — see
+:class:`almond_axol.robot.gravity.GravityCompensator` — because the simple
+per-joint ``ga·cos(q) + gb·sin(q)`` model used here previously ignored child
+links and produced incorrect torques.
+"""
 
 from __future__ import annotations
 
@@ -9,30 +15,11 @@ import time
 CUTOFF_FREQ = 20.0
 
 
-def compute_gravity(q: float, ga: float, gb: float) -> float:
-    """Single-joint gravity model: τ = ga·cos(q) + gb·sin(q)"""
-    return ga * math.cos(q) + gb * math.sin(q)
-
-
 def compute_friction(
     velocity: float, Fc: float, k: float, Fv: float, Fo: float
 ) -> float:
     """Tanh friction model: τ = Fc * tanh(0.1 * k * v) + Fv * v + Fo"""
     return Fc * math.tanh(0.1 * k * velocity) + Fv * velocity + Fo
-
-
-def compute_feedforward(
-    q: float,
-    velocity: float,
-    ga: float,
-    gb: float,
-    Fc: float,
-    k: float,
-    Fv: float,
-    Fo: float,
-) -> float:
-    """Full feedforward torque: gravity + friction."""
-    return compute_gravity(q, ga, gb) + compute_friction(velocity, Fc, k, Fv, Fo)
 
 
 class Differentiator:

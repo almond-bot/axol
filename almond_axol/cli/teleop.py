@@ -35,6 +35,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
     )
     p.add_argument(
+        "--stiffness",
+        type=float,
+        default=0.0,
+        help=(
+            "Compliance ↔ stiffness blend in [0, 1]. 0 (default) is fully "
+            "compliant; 1 restores the pre-tuning industrial gains. See "
+            "AxolConfig.stiffness."
+        ),
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -64,6 +74,7 @@ def run(args: argparse.Namespace) -> None:
             no_left=args.no_left,
             no_right=args.no_right,
             gripper_torque_limit=args.gripper_torque_limit,
+            stiffness=args.stiffness,
         )
     )
 
@@ -74,11 +85,10 @@ async def _run(
     no_left: bool = False,
     no_right: bool = False,
     gripper_torque_limit: float = 1.0,
+    stiffness: float = 0.0,
 ) -> None:
-    from dataclasses import replace
-
     from ..robot import Axol, Sim
-    from ..robot.config import ArmConfig, AxolConfig
+    from ..robot.config import AxolConfig
     from ..teleop import VRTeleop
 
     if robot_type == "sim":
@@ -89,11 +99,9 @@ async def _run(
             kwargs["left_channel"] = None
         if no_right:
             kwargs["right_channel"] = None
-        left = ArmConfig()
-        right = ArmConfig().mirror_gravity()
-        gripper = replace(left.gripper, torque_limit=gripper_torque_limit)
-        left = replace(left, gripper=gripper)
-        right = replace(right, gripper=gripper)
-        robot = Axol(config=AxolConfig(left=left, right=right), **kwargs)
+        axol_config = AxolConfig(stiffness=stiffness)
+        axol_config.left.gripper.torque_limit = gripper_torque_limit
+        axol_config.right.gripper.torque_limit = gripper_torque_limit
+        robot = Axol(config=axol_config, **kwargs)
     async with VRTeleop(robot) as teleop:
         await teleop.run()

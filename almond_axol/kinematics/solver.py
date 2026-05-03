@@ -18,39 +18,90 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..shared import URDF_PATH
+from ..shared import (
+    URDF_PATH,
+    Joint,
+    urdf_arm_joint_names,
+    urdf_body_name,
+)
 from .config import KinematicsConfig
 
 _logger = logging.getLogger(__name__)
 
-# Link names in axol.urdf
-_LEFT_EE = "left_gripper"
-_RIGHT_EE = "right_gripper"
-_LEFT_ELBOW = "left_e2"
-_RIGHT_ELBOW = "right_e2"
-_LEFT_SHOULDER = "left_s2"
-_RIGHT_SHOULDER = "right_s2"
 
-# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3).
-# Must match the ordering assumed by rest_pose / motion_control.
-_LEFT_JOINT_NAMES = [
-    "left_s1_0",  # SHOULDER_1
-    "left_s2_0",  # SHOULDER_2
-    "left_s3_0",  # SHOULDER_3
-    "left_e1_0",  # ELBOW
-    "left_e2_0",  # WRIST_1
-    "left_w1_0",  # WRIST_2
-    "left_w2_0",  # WRIST_3
-]
-_RIGHT_JOINT_NAMES = [
-    "right_s1_0",  # SHOULDER_1
-    "right_s2_0",  # SHOULDER_2
-    "right_s3_0",  # SHOULDER_3
-    "right_e1_0",  # ELBOW
-    "right_e2_0",  # WRIST_1
-    "right_w1_0",  # WRIST_2
-    "right_w2_0",  # WRIST_3
-]
+_TORSO_LINKS: tuple[str, ...] = ("base", "s1")
+"""Static body links that the arms must not collide into.
+
+Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
+"""
+
+
+def _build_robot_collision(
+    urdf: yourdfpy.URDF, robot: pk.Robot
+) -> pk.collision.RobotCollision:
+    """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
+
+    Each Axol arm is a serial chain attached to a static torso (``base`` +
+    ``s1``). pyroki's PCA capsule fit produces conservative single-capsule-
+    per-link shapes that always overlap at adjacent-link joint interfaces,
+    so blanket self-collision causes persistent jitter the IK cannot
+    resolve. We restrict the active pair set to the only collisions that
+    actually matter: any link pair where exactly one side is the torso
+    and the other is an arm link. Within-arm, cross-arm, and torso<->torso
+    pairs are filtered out (cross-arm contacts are unreachable, within-arm
+    is constrained by joint limits, and torso<->torso is rigidly fixed).
+
+    A second pass excludes any remaining pair that is already penetrating
+    at the home pose — those are over-conservative capsule fits the IK
+    can never separate (e.g. ``base <-> shoulder`` capsules that overlap
+    by construction because the arms mount onto the torso).
+    """
+    link_names = [link.name for link in urdf.robot.links]
+
+    def is_arm(n: str) -> bool:
+        return n.startswith("left_") or n.startswith("right_")
+
+    def is_torso(n: str) -> bool:
+        return n in _TORSO_LINKS
+
+    ignore: set[tuple[str, str]] = set()
+    for i, a in enumerate(link_names):
+        for b in link_names[i + 1 :]:
+            keep = (is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))
+            if not keep:
+                ignore.add((a, b))
+
+    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
+    q0 = jnp.zeros(robot.joints.num_actuated_joints)
+    d = np.asarray(rc.compute_self_collision_distance(robot, q0))
+    ai = np.asarray(rc.active_idx_i)
+    aj = np.asarray(rc.active_idx_j)
+    for k in np.where(d < 0.0)[0]:
+        ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
+
+    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
+    _logger.info(
+        "RobotCollision: restricted to %d torso<->arm pairs.",
+        len(rc.active_idx_i),
+    )
+    return rc
+
+
+# Convenience aliases for URDF link / joint names. The single source of
+# truth for these strings lives in :mod:`almond_axol.shared`; the helpers
+# below just compose ``"left_*"`` / ``"right_*"`` from a side-agnostic
+# suffix table so renaming the URDF only requires editing one place.
+_LEFT_EE = urdf_body_name(Joint.GRIPPER, is_left=True)
+_RIGHT_EE = urdf_body_name(Joint.GRIPPER, is_left=False)
+_LEFT_ELBOW = urdf_body_name(Joint.ELBOW, is_left=True)
+_RIGHT_ELBOW = urdf_body_name(Joint.ELBOW, is_left=False)
+_LEFT_SHOULDER = urdf_body_name(Joint.SHOULDER_1, is_left=True)
+_RIGHT_SHOULDER = urdf_body_name(Joint.SHOULDER_1, is_left=False)
+
+# Actuated joint names in ARM_JOINTS order (shoulder_1 … wrist_3). Must
+# match the ordering assumed by rest_pose / motion_control.
+_LEFT_JOINT_NAMES = urdf_arm_joint_names(is_left=True)
+_RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +351,7 @@ class KinematicsSolver:
         _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
-        self.robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
+        self.robot_coll = _build_robot_collision(urdf, self.robot)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)

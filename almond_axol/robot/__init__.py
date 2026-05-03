@@ -2,7 +2,13 @@
 
 from .axol import Axol, AxolArm, arm_limits
 from .base import RobotBase
-from .config import ArmConfig, AxolConfig, JointGains
+from .config import (
+    ArmConfig,
+    AxolConfig,
+    FrictionParams,
+    JointConfig,
+    PositionForceConfig,
+)
 from .sim import Sim
 
 __all__ = [
@@ -12,6 +18,8 @@ __all__ = [
     "arm_limits",
     "ArmConfig",
     "AxolConfig",
-    "JointGains",
+    "FrictionParams",
+    "JointConfig",
+    "PositionForceConfig",
     "Sim",
 ]

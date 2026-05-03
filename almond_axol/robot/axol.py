@@ -12,11 +12,20 @@ import math
 
 import numpy as np
 
-from ..motor import CanBus, ControlMode, Joint, Motor, MotorGains, MotorStatus
-from ..shared import CAN_LEFT, CAN_RIGHT
+from ..motor import (
+    CanBus,
+    ControlMode,
+    Joint,
+    Motor,
+    MotorError,
+    MotorGains,
+    MotorStatus,
+)
+from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
-from .control import Differentiator, compute_feedforward
+from .control import Differentiator, compute_friction
+from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
 
@@ -78,20 +87,32 @@ class AxolArm:
         self,
         bus: CanBus,
         config: AxolConfig,
+        gravity_comp: GravityCompensator,
         is_left: bool = True,
     ) -> None:
         """Construct an AxolArm.
 
         Args:
-            bus:     Shared CAN bus for this arm (one per physical interface).
-            config:  Full dual-arm gains config; the correct side is selected via ``is_left``.
-            is_left: ``True`` for the left arm, ``False`` for the right.
+            bus:          Shared CAN bus for this arm (one per physical interface).
+            config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
+            gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
+            is_left:      ``True`` for the left arm, ``False`` for the right.
         """
         self._config = config
         self._arm_config = config.left if is_left else config.right
+        self._gravity_comp = gravity_comp
+        self._is_left = is_left
         self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
-        self._differentiator = Differentiator(n=len(list(Joint)))
+        # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
+        # the impedance-control velocity FF and the friction model; a_des
+        # feeds inertia FF (``j_eff``); v_meas feeds software damping
+        # (``kd_soft``) — all in :class:`JointConfig`.
+        self._vel_diff = Differentiator(n=len(list(Joint)))
+        self._accel_diff = Differentiator(n=len(list(Joint)))
+        self._meas_vel_diff = Differentiator(n=len(list(Joint)))
         self._last_q_commanded: np.ndarray | None = None
+        self._gc_hold_q: np.ndarray | None = None
+        self._gc_hold_free: frozenset[Joint] | None = None
 
         # Clipping arrays in raw motor radians.  arm_limits() returns normalised [0, 1]
         # for the gripper, so the gripper entries are seeded with raw defaults here;
@@ -412,25 +433,36 @@ class AxolArm:
         )
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
-        # Velocity feedforward via differentiation of commanded positions (rad/s).
-        velocities = self._differentiator.differentiate(list(clipped))
+        # Velocity feedforward via differentiation of commanded positions (rad/s),
+        # and acceleration feedforward via a second pass for inertia FF (rad/s²).
+        velocities = self._vel_diff.differentiate(list(clipped))
+        accelerations = self._accel_diff.differentiate(velocities)
+        # v_meas drives software velocity damping. The position cache is
+        # empty until the first set_impedance reply lands; fall back to v_des
+        # so the ``kd_soft`` term collapses to 0 for those first cycles.
+        try:
+            v_meas = self._meas_vel_diff.differentiate(list(self.positions))
+        except MotorError:
+            v_meas = list(velocities)
 
         gripper_i = self._gripper_i
         gripper_pos = float(clipped[gripper_i])
         gripper_max_speed = self._arm_config.gripper.max_speed
         gripper_torque_limit = self._arm_config.gripper.torque_limit
 
+        # Gravity feedforward (Nm) for the seven arm joints, computed from the
+        # full URDF chain so child links contribute to each parent joint's load.
+        arm_q = clipped[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
-            t_ff = compute_feedforward(
-                float(clipped[i]),
-                velocities[i],
-                gains.ga,
-                gains.gb,
-                gains.fc,
-                gains.k,
-                gains.fv,
-                gains.fo,
+            f = gains.friction
+            t_ff = (
+                float(gravity[i])
+                + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
+                + gains.j_eff * accelerations[i]
+                + gains.kd_soft * (velocities[i] - v_meas[i])
             )
             return self.motors[j].set_impedance(
                 float(clipped[i]),
@@ -449,6 +481,103 @@ class AxolArm:
             ),
         )
         self._last_q_commanded = clipped
+
+    async def gravity_compensate(
+        self,
+        kd: float = 0.5,
+        free_joints: set[Joint] | None = None,
+    ) -> None:
+        """Apply one cycle of gravity compensation.
+
+        For each joint in ``free_joints``: send ``set_impedance(p_des=current,
+        v_des=0, kp=0, kd=kd, t_ff=gravity)``. Gravity is supported by the
+        feedforward torque, and ``kd`` provides a small velocity-damping term so
+        motion does not feel twitchy. These joints are free to be moved by hand.
+
+        For each arm joint *not* in ``free_joints``: send ``set_impedance``
+        with the joint's configured ``kp``/``kd`` from :class:`ArmConfig` to
+        hold it rigidly at the position it had at the *first* call (or at the
+        moment the free-joint set last changed), with gravity feedforward.
+        This lets the operator isolate one joint at a time — everything else
+        stays put for testing. To re-snapshot the hold position (e.g. after
+        repositioning the arm), call :meth:`reset_gravity_hold` between calls.
+
+        The gripper is always softly held at its current position regardless
+        of ``free_joints``.
+
+        Requires :meth:`start_telemetry` to be active so cached positions are
+        fresh.
+
+        Args:
+            kd: Velocity damping for *free* joints (Nm·s/rad). 0 lets the arm
+                coast freely (may feel underdamped); 0.5 is a good starting
+                point. Tune to taste.
+            free_joints: Set of arm joints to gravity-compensate. ``None`` (the
+                default) frees all 7 arm joints. Joints not in this set are
+                held rigidly at their initial position. ``Joint.GRIPPER`` is
+                ignored if present.
+        """
+        free_set: frozenset[Joint] = (
+            frozenset(ARM_JOINTS) if free_joints is None else frozenset(free_joints)
+        )
+
+        positions = self.positions
+        arm_q = positions[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+
+        # Snapshot held positions on first call or whenever the free-joint set
+        # changes; otherwise keep the original setpoint so kp can produce a
+        # real restoring torque.
+        if self._gc_hold_q is None or self._gc_hold_free != free_set:
+            self._gc_hold_q = arm_q.copy()
+            self._gc_hold_free = free_set
+
+        gripper_i = self._gripper_i
+        gripper_pos = float(positions[gripper_i])
+        gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
+            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+        )
+
+        tasks = []
+        for i, j in enumerate(ARM_JOINTS):
+            if j in free_set:
+                p_des = float(arm_q[i])
+                kp_cmd = 0.0
+                kd_cmd = kd
+            else:
+                p_des = float(self._gc_hold_q[i])
+                gains = getattr(self._arm_config, j.value)
+                kp_cmd = gains.kp
+                kd_cmd = gains.kd
+            tasks.append(
+                self.motors[j].set_impedance(
+                    p_des,
+                    0.0,
+                    kp_cmd,
+                    kd_cmd,
+                    float(gravity[i]),
+                )
+            )
+        # Hold the gripper softly so it does not drift open/closed.
+        tasks.append(
+            self.motors[Joint.GRIPPER].set_position_force(
+                gripper_pos_raw,
+                self._arm_config.gripper.max_speed,
+                0.5,
+            )
+        )
+        await asyncio.gather(*tasks)
+
+    def reset_gravity_hold(self) -> None:
+        """Forget the cached hold setpoint used by :meth:`gravity_compensate`.
+
+        The next call to ``gravity_compensate`` will re-snapshot the held
+        joints' positions from the current telemetry. Use this if you have
+        manually repositioned the arm and want the held joints to lock in
+        their new pose.
+        """
+        self._gc_hold_q = None
+        self._gc_hold_free = None
 
 
 class Axol(RobotBase):
@@ -499,15 +628,21 @@ class Axol(RobotBase):
                 "At least one of left_channel or right_channel must be specified."
             )
 
+        self._gravity_comp = GravityCompensator(config)
+
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
-            self.left = AxolArm(self._left_bus, config, is_left=True)
+            self.left = AxolArm(
+                self._left_bus, config, self._gravity_comp, is_left=True
+            )
         else:
             self.left = None
 
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = AxolArm(self._right_bus, config, is_left=False)
+            self.right = AxolArm(
+                self._right_bus, config, self._gravity_comp, is_left=False
+            )
         else:
             self.right = None
 
@@ -816,3 +951,43 @@ class Axol(RobotBase):
             tasks.append(self.right.motion_control(right))
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def gravity_compensate(
+        self,
+        kd: float = 0.5,
+        free_joints: set[Joint] | None = None,
+    ) -> None:
+        """Put both arms into gravity-compensation mode for one cycle.
+
+        Joints in ``free_joints`` are sent ``set_impedance`` with ``kp=0``,
+        ``kd=kd``, and a feedforward torque equal to the model-predicted
+        gravity (free to move by hand). Joints *not* in ``free_joints`` are
+        held rigidly at their current position using their configured
+        ``ArmConfig`` gains, with gravity feedforward. ``free_joints=None``
+        frees all 7 arm joints on each side. The grippers are softly held at
+        their current positions.
+
+        Telemetry must be active (positions are read from the cache) — call
+        :meth:`start_telemetry` before driving this in a loop.
+
+        Args:
+            kd: Velocity damping coefficient for *free* joints (Nm·s/rad).
+                Tune to taste; ``0.5`` is a reasonable starting point.
+            free_joints: Set of arm joints to gravity-compensate. ``None`` (the
+                default) frees every arm joint. Joints not in this set are
+                held in place. The same filter is applied to both arms.
+        """
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.gravity_compensate(kd, free_joints))
+        if self.right is not None:
+            tasks.append(self.right.gravity_compensate(kd, free_joints))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    def reset_gravity_hold(self) -> None:
+        """Re-snapshot the held setpoint on both arms' :meth:`gravity_compensate`."""
+        if self.left is not None:
+            self.left.reset_gravity_hold()
+        if self.right is not None:
+            self.right.reset_gravity_hold()
