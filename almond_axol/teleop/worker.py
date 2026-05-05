@@ -187,6 +187,17 @@ class IKWorker:
         self._f_l_elbow = OneEuroFilter(freq, mc, beta)
         self._f_r_elbow = OneEuroFilter(freq, mc, beta)
 
+        # Pre-settle the configured rest pose to the manipulability-balanced
+        # IK fixed point. The configured pose has a non-zero manipulability
+        # gradient, so a first engage there walks q in the EE null space
+        # toward higher manipulability over the next ~10-30 frames. Baking the
+        # settling in at startup means the trajectory ends at the fixed point
+        # and the first engage produces no motion.
+        q_settled = self._settle_rest_pose()
+        self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
+        self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
+        self._solver.set_posture_pose(self.get_rest_q())
+
     # -- Properties the main process needs ----------------------------------
 
     @property
@@ -216,6 +227,18 @@ class IKWorker:
         if not deadman:
             self._active = False
             return q_current
+
+        if not self._active:
+            # OneEuroFilter ``_x_prev`` froze at the controller pose held when
+            # the deadman was last released; reset so the engage-snap uses the
+            # actual current pose instead of biasing toward stale state and
+            # sweeping the IK target as the filter catches up.
+            self._reset_pose_filters()
+            # Pin posture to ``q_current`` so the held pose is itself the IK
+            # fixed point. The default rest-pose attractor would otherwise pull
+            # q in the EE null space at every frame, growing with distance from
+            # rest; reset() restores the rest-pose attractor.
+            self._solver.set_posture_pose(q_current)
 
         # Filter raw VR poses before IK to remove tracking noise / tremor.
         lp = self._f_l_pos.update(
@@ -339,6 +362,15 @@ class IKWorker:
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
         self._snap_elbow_fk = {}
+        self._reset_pose_filters()
+        # step() pins posture to q_current on each engage; an explicit reset
+        # restores the default rest-pose attractor.
+        self._solver.set_posture_pose(self.get_rest_q())
+
+    # -- Internal -----------------------------------------------------------
+
+    def _reset_pose_filters(self) -> None:
+        """Clear the OneEuroFilter state for every controller and elbow stream."""
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()
@@ -346,7 +378,49 @@ class IKWorker:
         self._f_l_elbow.reset()
         self._f_r_elbow.reset()
 
-    # -- Internal -----------------------------------------------------------
+    def _settle_rest_pose(
+        self, max_iterations: int = 200, tol: float = 1e-5
+    ) -> np.ndarray:
+        """Iterate the full teleop IK to the manipulability-balanced rest pose.
+
+        EE and elbow targets are the configured rest pose's own FK, and posture
+        is pinned to the current iterate, so all costs except manipulability
+        have zero gradient at the starting q. The remaining manipulability
+        gradient drives q in the EE null space until it stops changing — the
+        same conditions the rising-edge posture pin in :meth:`step` produces
+        at engage time.
+        """
+        q = self.get_rest_q()
+        fk = self._solver.robot.forward_kinematics(jnp.asarray(q))
+
+        def _pose(idx: int) -> tuple[np.ndarray, np.ndarray]:
+            T = jaxlie.SE3(fk[idx])
+            return (
+                np.asarray(T.translation(), dtype=np.float32),
+                np.asarray(T.rotation().as_matrix(), dtype=np.float32),
+            )
+
+        def _elbow(idx: int) -> np.ndarray:
+            return np.asarray(jaxlie.SE3(fk[idx]).translation(), dtype=np.float32)
+
+        l_pose = _pose(self._solver.l_ee_idx)
+        r_pose = _pose(self._solver.r_ee_idx)
+        l_elbow = _elbow(self._solver.l_elbow_idx)
+        r_elbow = _elbow(self._solver.r_elbow_idx)
+
+        for _ in range(max_iterations):
+            self._solver.set_posture_pose(q)
+            q_new = self._solver.ik(
+                q,
+                left_pose=l_pose,
+                right_pose=r_pose,
+                left_elbow_pos=l_elbow,
+                right_elbow_pos=r_elbow,
+            )
+            if float(np.max(np.abs(q_new - q))) < tol:
+                return q_new
+            q = q_new
+        return q
 
     def _engage_snap(
         self,
