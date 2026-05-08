@@ -414,14 +414,14 @@
         <axis xyz="-1 0 2.98117e-16" />
         <parent link="left_e1" />
         <child link="left_e2" />
-        <limit lower="0.0" upper="2.6389" velocity="30.0" effort="87.0" />
+        <limit lower="0.0" upper="2.6180" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_e2_0" type="revolute">
         <origin xyz="-0.04229 -1.48698e-17 -0.12429" rpy="-8.32667e-17 -6.33174e-17 7.22079e-17" />
         <axis xyz="0 0 1" />
         <parent link="left_e2" />
         <child link="left_w0" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_gripper_0" type="fixed">
         <origin xyz="-0.0285 -7.09742e-18 -0.032251" rpy="9.71445e-17 -2.22045e-16 2.77556e-17" />
@@ -434,21 +434,21 @@
         <axis xyz="-1 0 0" />
         <parent link="s1" />
         <child link="left_s2" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-1.5708" upper="3.1416" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_s2_0" type="revolute">
         <origin xyz="0.06958 -0.04475 4.44089e-16" rpy="2.498e-16 3.92274e-16 -2.48934e-16" />
         <axis xyz="0 1 0" />
         <parent link="left_s2" />
         <child link="left_s3" />
-        <limit lower="-1.5708" upper="0.1885" velocity="30.0" effort="87.0" />
+        <limit lower="-0.3491" upper="3.1416" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_s3_0" type="revolute">
         <origin xyz="-1.91513e-15 0.04475 -0.07335" rpy="3.33067e-16 -1.05818e-16 -2.03288e-16" />
         <axis xyz="0 0 1" />
         <parent link="left_s3" />
         <child link="left_e1" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_w1_0" type="revolute">
         <origin xyz="-5.55112e-17 -0.0285 -0.13567" rpy="-4.71845e-16 3.45904e-15 -1.18829e-15" />
@@ -469,14 +469,14 @@
         <axis xyz="1 0 2.98117e-16" />
         <parent link="right_e1" />
         <child link="right_e2" />
-        <limit lower="-2.6389" upper="0.0" velocity="30.0" effort="87.0" />
+        <limit lower="-2.6180" upper="0.0" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_e2_0" type="revolute">
         <origin xyz="0.04229 -5.37817e-17 -0.12429" rpy="7.66335e-47 -2.46519e-32 3.14159" />
         <axis xyz="0 0 1" />
         <parent link="right_e2" />
         <child link="right_w0" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_gripper_0" type="fixed">
         <origin xyz="0.0285 -7.09742e-18 -0.032251" rpy="0 -0 0" />
@@ -489,21 +489,21 @@
         <axis xyz="1 0 0" />
         <parent link="s1" />
         <child link="right_s2" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-1.5708" upper="3.1416" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_s2_0" type="revolute">
         <origin xyz="-0.06958 -0.04475 4.44089e-16" rpy="-1.28654e-32 -9.17877e-18 -7.824e-17" />
         <axis xyz="0 1 0" />
         <parent link="right_s2" />
         <child link="right_s3" />
-        <limit lower="-0.1885" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-3.1416" upper="0.3491" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_s3_0" type="revolute">
         <origin xyz="3.88578e-16 0.04475 -0.07335" rpy="-1.08655e-45 -1.28919e-43 -6.16298e-33" />
         <axis xyz="0 0 1" />
         <parent link="right_s3" />
         <child link="right_e1" />
-        <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+        <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_w1_0" type="revolute">
         <origin xyz="1.11022e-16 0.0285 -0.13567" rpy="1.09476e-47 2.55312e-94 -4.66423e-47" />

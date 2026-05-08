@@ -29,25 +29,23 @@ from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
 
-_TAU = 2 * math.pi
-
-# Per-joint position limits (rad).  shoulder_2 is asymmetric across arms.
-SHOULDER_2_LEFT_LIMITS = (-0.25 * _TAU, 0.03 * _TAU)
-SHOULDER_2_RIGHT_LIMITS = (-0.03 * _TAU, 0.25 * _TAU)
-ELBOW_LEFT_LIMITS = (0.0, 0.42 * _TAU)
-ELBOW_RIGHT_LIMITS = (-0.42 * _TAU, 0.0)
+# Per-joint position limits (rad).  shoulder_2 and elbow are mirrored across arms.
+SHOULDER_2_LEFT_LIMITS = (math.radians(-20), math.radians(180))
+SHOULDER_2_RIGHT_LIMITS = (math.radians(-180), math.radians(20))
+ELBOW_LEFT_LIMITS = (math.radians(0), math.radians(150))
+ELBOW_RIGHT_LIMITS = (math.radians(-150), math.radians(0))
 
 LIMITS: dict[Joint, tuple[float, float]] = {
-    Joint.SHOULDER_1: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.SHOULDER_3: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.WRIST_1: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.WRIST_2: (-0.25 * _TAU, 0.25 * _TAU),
-    Joint.WRIST_3: (-0.25 * _TAU, 0.25 * _TAU),
+    Joint.SHOULDER_1: (math.radians(-90), math.radians(180)),
+    Joint.SHOULDER_3: (math.radians(-135), math.radians(135)),
+    Joint.WRIST_1: (math.radians(-135), math.radians(135)),
+    Joint.WRIST_2: (math.radians(-90), math.radians(90)),
+    Joint.WRIST_3: (math.radians(-90), math.radians(90)),
     # Gripper absent: open position varies per unit, found at runtime by _calibrate_gripper().
 }
 
 # Fixed open-to-close travel of the gripper (rad).
-GRIPPER_TRAVEL = 0.8037 * _TAU
+GRIPPER_TRAVEL = math.radians(290)
 
 # Gripper open-position calibration parameters.
 _GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm
