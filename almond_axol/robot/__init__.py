@@ -1,6 +1,6 @@
 """Public re-exports for almond_axol.robot."""
 
-from .axol import Axol, AxolArm, arm_limits
+from .axol import Axol, AxolArm, arm_limits, closer_end_stop
 from .base import RobotBase
 from .config import (
     ArmConfig,
@@ -16,6 +16,7 @@ __all__ = [
     "Axol",
     "AxolArm",
     "arm_limits",
+    "closer_end_stop",
     "ArmConfig",
     "AxolConfig",
     "FrictionParams",

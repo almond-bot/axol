@@ -29,14 +29,15 @@ from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
 
-# Per-joint position limits (rad).  shoulder_2 and elbow are mirrored across arms.
-SHOULDER_2_LEFT_LIMITS = (math.radians(-20), math.radians(180))
-SHOULDER_2_RIGHT_LIMITS = (math.radians(-180), math.radians(20))
+# Per-joint position limits (rad).  shoulder_1, shoulder_2, and elbow are mirrored across arms.
+SHOULDER_1_LEFT_LIMITS = (math.radians(-90), math.radians(180))
+SHOULDER_1_RIGHT_LIMITS = (math.radians(-180), math.radians(90))
+SHOULDER_2_LEFT_LIMITS = (math.radians(-180), math.radians(20))
+SHOULDER_2_RIGHT_LIMITS = (math.radians(-20), math.radians(180))
 ELBOW_LEFT_LIMITS = (math.radians(0), math.radians(150))
 ELBOW_RIGHT_LIMITS = (math.radians(-150), math.radians(0))
 
 LIMITS: dict[Joint, tuple[float, float]] = {
-    Joint.SHOULDER_1: (math.radians(-90), math.radians(180)),
     Joint.SHOULDER_3: (math.radians(-135), math.radians(135)),
     Joint.WRIST_1: (math.radians(-135), math.radians(135)),
     Joint.WRIST_2: (math.radians(-90), math.radians(90)),
@@ -66,6 +67,8 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     1 = open] — the raw motor limits vary per unit and are calibrated at
     runtime by AxolArm._calibrate_gripper().
     """
+    if joint == Joint.SHOULDER_1:
+        return SHOULDER_1_LEFT_LIMITS if is_left else SHOULDER_1_RIGHT_LIMITS
     if joint == Joint.SHOULDER_2:
         return SHOULDER_2_LEFT_LIMITS if is_left else SHOULDER_2_RIGHT_LIMITS
     if joint == Joint.ELBOW:
@@ -73,6 +76,52 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     if joint == Joint.GRIPPER:
         return (0.0, 1.0)
     return LIMITS.get(joint, (-math.inf, math.inf))
+
+
+# Joints whose joint frame is kinematically mirrored across arms but whose
+# limits are symmetric (equidistant from 0).  For these the calibration end
+# stop on the right arm is the upper bound rather than the lower (the
+# physical end stop closer to rest is at +X on the right arm and -X on the
+# left).  Joints with already-asymmetric per-arm limits (s1, s2, elbow) are
+# disambiguated by their range and don't need to be listed here.
+_MIRRORED_SYMMETRIC_JOINTS: frozenset[Joint] = frozenset({Joint.WRIST_2, Joint.WRIST_3})
+
+
+def closer_end_stop(joint: Joint, is_left: bool) -> tuple[float, int]:
+    """Return ``(target_rad, expected_motion_sign)`` for the joint's calibration end stop.
+
+    Picks the limit with the smallest absolute value, except when that limit
+    is exactly 0 (it coincides with the rest position, so direction detection
+    is unreliable) — in that case the *other* limit is used instead.  When
+    both limits are equidistant the lower bound wins, except for joints in
+    :data:`_MIRRORED_SYMMETRIC_JOINTS` on the right arm, which default to
+    the upper bound to follow the kinematic mirror.
+
+    ``expected_motion_sign`` is the sign of motion when the user starts inside
+    the joint range and moves toward the chosen end stop:
+
+    - target == lower bound  → range extends positively → motion is negative
+    - target == upper bound  → range extends negatively → motion is positive
+
+    Used by the guided ``set-zero-pos`` flow and by :class:`AxolArm` to derive
+    the per-joint offset between motor frame (zero at end stop) and joint
+    frame (zero at rest).  Not defined for ``Joint.GRIPPER``.
+    """
+    if joint == Joint.GRIPPER:
+        raise ValueError("closer_end_stop is undefined for the gripper")
+    lo, hi = arm_limits(joint, is_left)
+    if lo == 0.0:
+        return hi, +1
+    if hi == 0.0:
+        return lo, -1
+    if abs(hi) < abs(lo):
+        return hi, +1
+    if abs(lo) < abs(hi):
+        return lo, -1
+    # Equidistant: default to lo, except mirrored joints on the right arm.
+    if not is_left and joint in _MIRRORED_SYMMETRIC_JOINTS:
+        return hi, +1
+    return lo, -1
 
 
 class AxolArm:
@@ -112,10 +161,13 @@ class AxolArm:
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
 
-        # Clipping arrays in raw motor radians.  arm_limits() returns normalised [0, 1]
-        # for the gripper, so the gripper entries are seeded with raw defaults here;
-        # _calibrate_gripper() overwrites them on enable.
-        # Pre-calibration defaults assume zero is closed — do not rely on for actual motion.
+        # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
+        # matching the URDF and ``arm_limits``); gripper entries are in raw
+        # motor radians (``arm_limits`` returns normalised [0, 1] for the
+        # gripper, so the gripper bounds are seeded with raw defaults here
+        # and ``_calibrate_gripper()`` overwrites them on enable).
+        # Pre-calibration gripper defaults assume zero is closed — do not rely
+        # on for actual motion.
         joints = list(Joint)
         self._gripper_i: int = joints.index(Joint.GRIPPER)
         self._limits_lo = np.array(
@@ -127,6 +179,20 @@ class AxolArm:
         )
         self._limits_hi = np.array(
             [0.0 if j == Joint.GRIPPER else arm_limits(j, is_left)[1] for j in joints],
+            dtype=float,
+        )
+
+        # Per-joint offset between motor frame and joint frame:
+        #   joint_angle (rad) = motor_angle (rad) + offset
+        # After end-stop calibration the motor's encoder zero coincides with
+        # the closer end stop, so motor 0 → joint angle ``target_rad``.  The
+        # gripper offset is 0 because the gripper uses its own [0, 1]
+        # normalisation and is calibrated against torque, not an end stop.
+        self._joint_offsets = np.array(
+            [
+                0.0 if j == Joint.GRIPPER else closer_end_stop(j, is_left)[0]
+                for j in joints
+            ],
             dtype=float,
         )
 
@@ -153,9 +219,10 @@ class AxolArm:
     def positions(self) -> np.ndarray:
         """Latest cached joint positions. Requires start_telemetry().
 
-        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
-        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
-        consistent with set_position_velocity and motion_control.
+        Returns shape (8,) array in Joint enum order. Arm joints are in
+        radians in the joint frame (0 = rest position); the gripper is
+        normalized to [0, 1] (0.0 = closed, 1.0 = fully open), consistent
+        with set_position_velocity and motion_control.
         """
         joints = list(Joint)
         values = [self.motors[j].position for j in joints]
@@ -163,7 +230,8 @@ class AxolArm:
         values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
         )
-        return np.array(values, dtype=np.float32)
+        arr = np.array(values, dtype=np.float32)
+        return arr + self._joint_offsets.astype(np.float32)
 
     @property
     def torques(self) -> np.ndarray:
@@ -241,9 +309,10 @@ class AxolArm:
     async def get_positions(self) -> np.ndarray:
         """Return joint positions for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order. Arm joints are in radians;
-        the gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open),
-        consistent with set_position_velocity and motion_control.
+        Returns shape (8,) array in Joint enum order. Arm joints are in
+        radians in the joint frame (0 = rest position); the gripper is
+        normalized to [0, 1] (0.0 = closed, 1.0 = fully open), consistent
+        with set_position_velocity and motion_control.
         """
         joints = list(Joint)
         values = list(
@@ -253,7 +322,8 @@ class AxolArm:
         values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
         )
-        return np.array(values, dtype=np.float32)
+        arr = np.array(values, dtype=np.float32)
+        return arr + self._joint_offsets.astype(np.float32)
 
     async def get_velocities(self) -> np.ndarray:
         """Return shaft velocity (rad/s) for every joint, fetched concurrently.
@@ -347,7 +417,8 @@ class AxolArm:
         """Move joints to absolute positions using each motor's built-in controller.
 
         Positions are clipped to the arm's joint limits before being sent.
-        The gripper value is normalized: 0.0 = closed, 1.0 = fully open.
+        Arm joints are in joint frame (0 = rest position); the gripper value
+        is normalized: 0.0 = closed, 1.0 = fully open.
 
         Args:
             positions: Shape (8,) array of target positions (rad) in Joint enum order,
@@ -360,9 +431,12 @@ class AxolArm:
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
         )
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
+        # Convert arm joints from joint frame to motor frame before sending.
+        # Gripper offset is 0, so its raw motor value is unchanged.
+        motor_targets = clipped - self._joint_offsets
         await asyncio.gather(
             *[
-                self.motors[j].set_position_velocity(float(clipped[i]), max_speed)
+                self.motors[j].set_position_velocity(float(motor_targets[i]), max_speed)
                 for i, j in enumerate(Joint)
             ]
         )
@@ -395,12 +469,13 @@ class AxolArm:
 
         Args:
             q: Shape (8,) array of desired positions in Joint enum order.
-               Arm joints are in radians; gripper is normalized to [0, 1]
-               (0.0 = closed, 1.0 = fully open).
+               Arm joints are in radians in the joint frame (0 = rest);
+               gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open).
         """
         q = q.copy()
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
+        # Deltas are frame-invariant (constant offset), so compute in joint frame.
         max_step = self._config.max_step_rad
         if self._last_q_commanded is not None and max_step < float("inf"):
             gripper_i = self._gripper_i
@@ -433,6 +508,8 @@ class AxolArm:
 
         # Velocity feedforward via differentiation of commanded positions (rad/s),
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
+        # Velocities/accelerations are frame-invariant under a constant offset,
+        # so we differentiate the joint-frame ``clipped`` array directly.
         velocities = self._vel_diff.differentiate(list(clipped))
         accelerations = self._accel_diff.differentiate(velocities)
         # v_meas drives software velocity damping. The position cache is
@@ -443,15 +520,19 @@ class AxolArm:
         except MotorError:
             v_meas = list(velocities)
 
-        gripper_i = self._gripper_i
-        gripper_pos = float(clipped[gripper_i])
         gripper_max_speed = self._arm_config.gripper.max_speed
         gripper_torque_limit = self._arm_config.gripper.torque_limit
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
+        # ``arm_q`` is in joint frame, which matches the URDF convention.
         arm_q = clipped[: len(ARM_JOINTS)].astype(np.float32)
         gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+
+        # Convert arm joints to motor frame for the impedance command.  Gripper
+        # offset is 0, so its raw motor value is unchanged.
+        motor_targets = clipped - self._joint_offsets
+        gripper_pos = float(motor_targets[gripper_i])
 
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
@@ -463,7 +544,7 @@ class AxolArm:
                 + gains.kd_soft * (velocities[i] - v_meas[i])
             )
             return self.motors[j].set_impedance(
-                float(clipped[i]),
+                float(motor_targets[i]),
                 velocities[i],
                 gains.kp,
                 gains.kd,
@@ -536,14 +617,18 @@ class AxolArm:
             self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
         )
 
+        # ``arm_q`` and ``_gc_hold_q`` are in joint frame; convert to motor
+        # frame before sending to the impedance controller.
+        arm_offsets = self._joint_offsets[: len(ARM_JOINTS)]
+
         tasks = []
         for i, j in enumerate(ARM_JOINTS):
             if j in free_set:
-                p_des = float(arm_q[i])
+                p_des = float(arm_q[i] - arm_offsets[i])
                 kp_cmd = 0.0
                 kd_cmd = kd
             else:
-                p_des = float(self._gc_hold_q[i])
+                p_des = float(self._gc_hold_q[i] - arm_offsets[i])
                 gains = getattr(self._arm_config, j.value)
                 kp_cmd = gains.kp
                 kd_cmd = gains.kd

@@ -441,7 +441,7 @@
         <axis xyz="0 1 0" />
         <parent link="left_s2" />
         <child link="left_s3" />
-        <limit lower="-0.3491" upper="3.1416" velocity="30.0" effort="87.0" />
+        <limit lower="-3.1416" upper="0.3491" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="left_s3_0" type="revolute">
         <origin xyz="-1.91513e-15 0.04475 -0.07335" rpy="3.33067e-16 -1.05818e-16 -2.03288e-16" />
@@ -489,14 +489,14 @@
         <axis xyz="1 0 0" />
         <parent link="s1" />
         <child link="right_s2" />
-        <limit lower="-1.5708" upper="3.1416" velocity="30.0" effort="87.0" />
+        <limit lower="-3.1416" upper="1.5708" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_s2_0" type="revolute">
         <origin xyz="-0.06958 -0.04475 4.44089e-16" rpy="-1.28654e-32 -9.17877e-18 -7.824e-17" />
         <axis xyz="0 1 0" />
         <parent link="right_s2" />
         <child link="right_s3" />
-        <limit lower="-3.1416" upper="0.3491" velocity="30.0" effort="87.0" />
+        <limit lower="-0.3491" upper="3.1416" velocity="30.0" effort="87.0" />
     </joint>
     <joint name="right_s3_0" type="revolute">
         <origin xyz="3.88578e-16 0.04475 -0.07335" rpy="-1.08655e-45 -1.28919e-43 -6.16298e-33" />
