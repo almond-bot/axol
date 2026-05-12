@@ -57,9 +57,10 @@ CYCLE_PAUSE = 2.0  # seconds
 WRIST_TEST_ELBOW_ANGLE = math.pi / 2  # rad
 SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 
-GRIPPER_TORQUE_THRESHOLD = 0.5  # Nm — placeholder, tune as needed
+GRIPPER_TORQUE_THRESHOLD = 0.6  # Nm
 GRIPPER_STEP = 0.005  # normalized [0, 1] per iteration
 GRIPPER_STEP_DELAY = 0.01  # seconds between steps
+GRIPPER_OSC_SPEED = 0.5  # normalized [0, 1] per second — oscillation speed
 
 JOINT_INDEX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
 NUM_JOINTS = len(list(Joint))
@@ -126,6 +127,77 @@ async def countdown(seconds: int) -> None:
     print()
 
 
+async def oscillate_grippers_until_caught(
+    axol: Axol,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+    torque_threshold: float,  # Nm
+) -> tuple[np.ndarray, np.ndarray]:
+    """Oscillate both grippers open↔closed; each side holds when |torque| ≥ threshold during a close pass.
+
+    Returns once both grippers are holding. Each gripper acts independently.
+    Torque is only checked while closing — during opening the gripper is
+    allowed to reach the open hard-stop without triggering a hold.
+    """
+    gripper_index = JOINT_INDEX[Joint.GRIPPER]
+    left_motor = axol.left.motors[Joint.GRIPPER]
+    right_motor = axol.right.motors[Joint.GRIPPER]
+
+    left = left_q.copy()
+    right = right_q.copy()
+    left[gripper_index] = 0.0
+    right[gripper_index] = 0.0
+
+    left_direction = +1  # +1 opening, -1 closing
+    right_direction = +1
+    left_holding = False
+    right_holding = False
+
+    dt = GRIPPER_STEP_DELAY  # seconds per iteration
+
+    while not (left_holding and right_holding):
+        if not left_holding:
+            new_pos = left[gripper_index] + left_direction * GRIPPER_OSC_SPEED * dt
+            if new_pos >= 1.0:
+                new_pos = 1.0
+                left_direction = -1
+            elif new_pos <= 0.0:
+                new_pos = 0.0
+                left_direction = +1
+            left[gripper_index] = new_pos
+        if not right_holding:
+            new_pos = right[gripper_index] + right_direction * GRIPPER_OSC_SPEED * dt
+            if new_pos >= 1.0:
+                new_pos = 1.0
+                right_direction = -1
+            elif new_pos <= 0.0:
+                new_pos = 0.0
+                right_direction = +1
+            right[gripper_index] = new_pos
+
+        await axol.motion_control(left=left, right=right)
+        await asyncio.sleep(dt)
+
+        if not left_holding and left_direction == -1:
+            left_torque = await left_motor.get_torque()
+            if abs(left_torque) >= torque_threshold:
+                print(
+                    f"  LEFT gripper: |torque| {abs(left_torque):.3f} Nm ≥ "
+                    f"{torque_threshold} Nm — holding at {left[gripper_index]:.3f}"
+                )
+                left_holding = True
+        if not right_holding and right_direction == -1:
+            right_torque = await right_motor.get_torque()
+            if abs(right_torque) >= torque_threshold:
+                print(
+                    f"  RIGHT gripper: |torque| {abs(right_torque):.3f} Nm ≥ "
+                    f"{torque_threshold} Nm — holding at {right[gripper_index]:.3f}"
+                )
+                right_holding = True
+
+    return left, right
+
+
 async def drive_grippers_to_torque(
     axol: Axol,
     left_q: np.ndarray,  # rad
@@ -134,7 +206,12 @@ async def drive_grippers_to_torque(
     right_direction: int,  # +1 to open, -1 to close, 0 to hold
     torque_threshold: float,  # Nm
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Step each gripper toward open/close until torque crosses threshold or limit reached."""
+    """Step each gripper toward open/close until torque crosses threshold or limit reached.
+
+    Returns the final (left_q, right_q) with gripper positions captured at the
+    point each side stopped. Callers hold this position for the rest of the
+    test by re-using these joint vectors.
+    """
     gripper_index = JOINT_INDEX[Joint.GRIPPER]
     left_motor = axol.left.motors[Joint.GRIPPER]
     right_motor = axol.right.motors[Joint.GRIPPER]
@@ -151,6 +228,7 @@ async def drive_grippers_to_torque(
             )
             left[gripper_index] = new_pos
             if new_pos in (0.0, 1.0):
+                print(f"  LEFT gripper: position bound {new_pos:.2f} reached")
                 left_done = True
         if not right_done:
             new_pos = max(
@@ -158,6 +236,7 @@ async def drive_grippers_to_torque(
             )
             right[gripper_index] = new_pos
             if new_pos in (0.0, 1.0):
+                print(f"  RIGHT gripper: position bound {new_pos:.2f} reached")
                 right_done = True
 
         await axol.motion_control(left=left, right=right)
@@ -166,10 +245,18 @@ async def drive_grippers_to_torque(
         if not left_done:
             left_torque = await left_motor.get_torque()
             if abs(left_torque) >= torque_threshold:
+                print(
+                    f"  LEFT gripper: |torque| {abs(left_torque):.3f} Nm ≥ "
+                    f"{torque_threshold} Nm — holding at {left[gripper_index]:.3f}"
+                )
                 left_done = True
         if not right_done:
             right_torque = await right_motor.get_torque()
             if abs(right_torque) >= torque_threshold:
+                print(
+                    f"  RIGHT gripper: |torque| {abs(right_torque):.3f} Nm ≥ "
+                    f"{torque_threshold} Nm — holding at {right[gripper_index]:.3f}"
+                )
                 right_done = True
 
     return left, right
@@ -597,25 +684,11 @@ async def run_axol() -> None:
     try:
         home = home_pose()
 
-        print("Opening both grippers ...")
-        left_q, right_q = await drive_grippers_to_torque(
-            axol, home, home, +1, +1, GRIPPER_TORQUE_THRESHOLD
+        print("Oscillating grippers until each one catches torque ≥ threshold ...")
+        left_q, right_q = await oscillate_grippers_until_caught(
+            axol, home, home, GRIPPER_TORQUE_THRESHOLD
         )
-        print("Both grippers open. Waiting 5 s ...")
-        await asyncio.sleep(5.0)
-
-        print("Closing right gripper ...")
-        left_q, right_q = await drive_grippers_to_torque(
-            axol, left_q, right_q, 0, -1, GRIPPER_TORQUE_THRESHOLD
-        )
-        print("Right gripper closed. Waiting 5 s ...")
-        await asyncio.sleep(5.0)
-
-        print("Closing left gripper ...")
-        left_q, right_q = await drive_grippers_to_torque(
-            axol, left_q, right_q, -1, 0, GRIPPER_TORQUE_THRESHOLD
-        )
-        print("Left gripper closed. Waiting 10 s ...")
+        print("Both grippers held. Waiting 10 s ...")
         await asyncio.sleep(10.0)
 
         closed_left_q = left_q.copy()
@@ -650,9 +723,16 @@ async def run_axol() -> None:
 
         print(f"\n1-hour soak complete — {cycle} cycle(s) finished.")
 
-        print("Opening grippers ...")
+        print("Opening right gripper")
+        await asyncio.sleep(2.0)
         left_q, right_q = await drive_grippers_to_torque(
-            axol, left_q, right_q, +1, +1, GRIPPER_TORQUE_THRESHOLD
+            axol, left_q, right_q, 0, +1, GRIPPER_TORQUE_THRESHOLD
+        )
+
+        print("Opening left gripper")
+        await asyncio.sleep(2.0)
+        left_q, right_q = await drive_grippers_to_torque(
+            axol, left_q, right_q, +1, 0, GRIPPER_TORQUE_THRESHOLD
         )
         print("Grippers open.")
 
