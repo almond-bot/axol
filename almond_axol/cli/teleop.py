@@ -29,10 +29,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Disable the right arm.",
     )
     p.add_argument(
-        "--gripper-torque-limit",
+        "--left-gripper-torque-limit",
         type=float,
         default=1.0,
-        help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+        help="Max output torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
+        "--right-gripper-torque-limit",
+        type=float,
+        default=1.0,
+        help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0).",
     )
     p.add_argument(
         "--stiffness",
@@ -73,7 +79,8 @@ def run(args: argparse.Namespace) -> None:
             args.robot,
             no_left=args.no_left,
             no_right=args.no_right,
-            gripper_torque_limit=args.gripper_torque_limit,
+            left_gripper_torque_limit=args.left_gripper_torque_limit,
+            right_gripper_torque_limit=args.right_gripper_torque_limit,
             stiffness=args.stiffness,
         )
     )
@@ -84,7 +91,8 @@ async def _run(
     *,
     no_left: bool = False,
     no_right: bool = False,
-    gripper_torque_limit: float = 1.0,
+    left_gripper_torque_limit: float = 1.0,
+    right_gripper_torque_limit: float = 1.0,
     stiffness: float = 0.0,
 ) -> None:
     from ..robot import Axol, Sim
@@ -100,8 +108,8 @@ async def _run(
         if no_right:
             kwargs["right_channel"] = None
         axol_config = AxolConfig(stiffness=stiffness)
-        axol_config.left.gripper.torque_limit = gripper_torque_limit
-        axol_config.right.gripper.torque_limit = gripper_torque_limit
+        axol_config.left.gripper.torque_limit = left_gripper_torque_limit
+        axol_config.right.gripper.torque_limit = right_gripper_torque_limit
         robot = Axol(config=axol_config, **kwargs)
     async with VRTeleop(robot) as teleop:
         await teleop.run()
