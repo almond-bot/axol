@@ -128,9 +128,20 @@ axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
 
 Sets the motor's zero-position reference to its current mechanical position (persisted to flash). Damiao motors require a power cycle afterward.
 
+| Flag | Description |
+|---|---|
+| `--id ID` | CAN ID of the motor to zero (single-motor mode) |
+| `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
+| `--guided` | Walk through every arm joint, zeroing each at its closer end stop |
+
+In `--guided` mode the CLI iterates through all 7 arm joints (the gripper is auto-calibrated at runtime). For each joint you place it somewhere inside its operating range, press Enter, then move it to the prompted end stop and press Enter again. If the motion direction doesn't match the expected sign the CLI loops back automatically and asks you to retry. Once the direction checks out, press Enter once more to commit the zero, or Ctrl-C to skip that joint.
+
 ```bash
-axol motor.set-zero-pos --l --id 0x01
+axol motor.set-zero-pos --l --id 0x01      # single motor
+axol motor.set-zero-pos --l --guided       # all left-arm joints
 ```
+
+> After `--guided` calibration each motor's encoder zero coincides with its calibration end stop. `AxolArm` carries a per-joint offset internally so the public API (`positions`, `motion_control`, etc.) stays in joint frame (`0` = rest position). Damiao motors (`WRIST_2`, `WRIST_3`) need a power cycle for the new zero to take effect.
 
 ---
 
@@ -289,30 +300,53 @@ axol tune.pid --l --joint elbow --kp 25 --kd 0.6
 axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
 ```
 
-### `tune.feedforward`
+### `tune.friction`
 
-Identifies all six feedforward parameters for one joint via a bidirectional velocity sweep. Fits gravity and friction models and prints a ready-to-paste config snippet.
+Identifies the four friction-model parameters for one joint via a bidirectional velocity sweep. Gravity is computed centrally from the URDF (see [Gravity compensation](#gravity-compensation)), so this command only fits the friction half-difference and a constant offset.
 
-**Gravity model:** `τ = ga·cos(q) + gb·sin(q) + Fo`
-
-**Friction model:** `τ = Fc·tanh(0.1·k·v) + Fv·v`
+**Friction model:** `τ = Fc·tanh(0.1·k·v) + Fv·v + Fo`
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
-| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3`, `gripper` (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
 | `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
 | `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
 | `--velocities V [V ...]` | Velocity setpoints in rad/s (default: ~0.1, 0.3, 0.6, 0.9, 1.3) |
 | `--lo RAD` | Override lower joint limit for the sweep |
 | `--hi RAD` | Override upper joint limit for the sweep |
+| `--dump-csv [PATH]` | Write per-bin `(v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff)` rows to a CSV for offline plotting / arm-vs-arm comparison. Pass without a value to auto-name as `logs/friction_<side>_<joint>_<timestamp>.csv` |
 
 ```bash
-axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
-axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
-axol tune.feedforward --r --joint gripper --kp 10 --kd 0.3
+axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
+axol tune.friction --r --joint elbow --kp 20 --kd 0.6
+axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
+axol tune.friction --l --joint shoulder_2 --dump-csv
 ```
+
+### `gravity-comp`
+
+Holds both arms in gravity-compensation mode so you can move them by hand. Each *free* arm joint is sent `set_impedance` with `kp=0`, `kd=KD`, and a feedforward torque equal to the URDF-modelled gravity. Joints not in the free set are held rigidly at their current position with their configured `ArmConfig` `kp`/`kd` (still gravity-compensated). The grippers are softly held at their current positions.
+
+| Flag | Description |
+|---|---|
+| `--no-left` / `--no-right` | Disable an arm |
+| `--joints J1,J2,...` | Comma-separated joints to gravity-compensate (e.g. `WRIST_3` or `SHOULDER_1,ELBOW`). Other arm joints are held in place. Default: all 7 joints free. |
+| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.5 |
+| `--rate FLOAT` | Control loop rate in Hz (default: 100) |
+| `--telemetry-rate FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
+
+```bash
+axol gravity-comp                                 # all 7 joints free, both arms
+axol gravity-comp --no-right                      # left arm only, all joints free
+axol gravity-comp --kd 1.0                        # heavier damping
+axol gravity-comp --joints WRIST_3                # only WRIST_3 free; everything else held rigid
+axol gravity-comp --no-right --joints SHOULDER_1,WRIST_3   # one-arm, two-joint isolation
+```
+
+Use `--joints` to test gravity comp on a single joint at a time: only the named joints float freely, while the rest of the arm holds its pose so you can isolate the effect.
+
+If the arm sags or pushes back, tune the per-joint `mass` and `com` fields on `AxolConfig` (each `JointConfig` carries the inertial of the URDF body it drives) — see [Gravity compensation](#gravity-compensation).
 
 ---
 
@@ -380,7 +414,7 @@ VR headset → AxolVRTeleop.get_action() → AxolRobot.send_action() → motors
 Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
 
 ```python
-from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointGains, Sim
+from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointConfig, FrictionParams, Sim
 ```
 
 #### `Axol`
@@ -472,46 +506,85 @@ asyncio.run(main())
 
 Open `http://localhost:8080` in a browser to view the robot.
 
-#### Configuration — `AxolConfig`, `ArmConfig`, `JointGains`
+#### Configuration — `AxolConfig`, `ArmConfig`, `JointConfig`
 
-`ArmConfig` holds per-joint gains and friction parameters. All joints ship with pre-tuned defaults; override individual joints with `dataclasses.replace()`:
+Each arm joint is configured with a single `JointConfig` carrying its impedance gains, friction-comp model, and the inertial of the body it drives:
 
 ```python
-from dataclasses import replace
-from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointGains
+from almond_axol.robot import Axol, AxolConfig, FrictionParams
 
-left = replace(
-    ArmConfig(),
-    shoulder_1=JointGains(kp=35.0, kd=1.2, ga=2.1, gb=0.3, fc=0.0, k=0.0, fv=0.0, fo=0.0),
-    elbow=JointGains(kp=25.0, kd=0.6, fc=0.4, k=10.0, fv=0.05, fo=0.0, ga=-0.18, gb=5.66),
-)
-config = AxolConfig(left=left)
-# right defaults to left with gb negated for shoulder_2 and elbow
+config = AxolConfig()
+config.left.elbow.kp = 200
+config.left.elbow.mass = 0.6
+config.left.elbow.com = (-0.025, 0.0, -0.07)
+config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
 async with Axol(config=config) as axol: ...
 ```
 
-**`JointGains` fields**
+Or build a fully custom arm with `dataclasses.replace` (start from the
+`AxolConfig` defaults so you keep the per-side friction values that get
+injected at construction):
 
-| Field | Range | Description |
+```python
+from dataclasses import replace
+from almond_axol.robot import AxolConfig, JointConfig, FrictionParams
+
+left = replace(
+    AxolConfig().left,
+    shoulder_1=JointConfig(
+        kp=35.0, kd=1.2,
+        friction=FrictionParams(fc=0.0, k=0.0, fv=0.0, fo=0.0),
+        mass=2.0, com=(0.065, 0.0, 0.0),
+    ),
+)
+```
+
+**`JointConfig` fields**
+
+| Field | Type | Description |
 |---|---|---|
-| `kp` | `[0, 500]` | Impedance position stiffness |
-| `kd` | `[0, 5]` | Impedance velocity damping |
-| `ga` | — | Gravity feedforward cosine coefficient: `τ = ga·cos(q) + gb·sin(q)` |
-| `gb` | — | Gravity feedforward sine coefficient |
-| `fc` | — | Coulomb friction magnitude (Nm) |
-| `k` | — | Tanh sharpness factor for the friction model |
-| `fv` | — | Viscous friction coefficient (Nm·s/rad) |
-| `fo` | — | Constant friction offset (Nm) |
+| `kp` | `float` (`[0, 500]`) | Impedance position stiffness |
+| `kd` | `float` (`[0, 5]`) | Impedance velocity damping. Hardware-capped by the motor firmware at 5; use `kd_soft` to augment. |
+| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(k·v) + fv·v + fo` |
+| `mass` | `float` | Mass of the URDF body this joint drives (kg). For `wrist_3` this includes the gripper. |
+| `com` | `tuple[float, float, float]` | Centre-of-mass of the same body in its URDF link frame (m). Used by gravity comp. |
+| `j_eff` | `float` (default `0.0`) | Effective scalar inertia (kg·m²) for acceleration feedforward `τ = j_eff · q̈_des`. |
+| `kd_soft` | `float` (default `0.0`) | Extra software velocity damping (Nm·s/rad) applied as `τ = kd_soft · (v_des − v_meas)`. Equivalent to raising `kd` past the firmware's 5 cap. |
 
-`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s).
+Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
 
-`AxolConfig` also exposes a top-level safety parameter:
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+
+`AxolConfig` also exposes top-level parameters:
 
 | Field | Default | Description |
 |---|---|---|
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
+| `stiffness` | `0.0` | Compliance ↔ stiffness blend in `[0, 1]`. `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. |
 
-`AxolConfig.right` automatically mirrors `gb` for `shoulder_2` and `elbow`, because those joints have inverted angle ranges on the right arm. Override either arm independently by passing both `left=` and `right=` to `AxolConfig`.
+```python
+config = AxolConfig(stiffness=1.0)   # stiff industrial feel
+config = AxolConfig(stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
+```
+
+Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
+
+### Gravity compensation
+
+`almond_axol.robot.gravity.GravityCompensator` builds a MuJoCo model from the bundled URDF and computes per-joint gravity torques as `qfrc_bias` with `qvel=0` (Coriolis terms vanish). Because the URDF is the full kinematic chain, each parent joint's gravity load includes the contribution of every child link — this is the main improvement over the previous per-joint `ga·cos(q) + gb·sin(q)` model, which silently ignored child-link mass.
+
+Per-link masses are not taken from the bundled URDF — the Onshape exporter leaves placeholder sub-gram values that produce essentially zero gravity. Real per-link mass and CoM live on each `JointConfig.mass` / `JointConfig.com` in `almond_axol/robot/config.py` (CoMs come from the CAD inertial origins; masses are tuned in place against measured joint torques and are typically lower than the CAD values, since Onshape often over-assigns aluminum-class densities to parts that are hollow / 3D-printed).
+
+If the arms sag or push back in gravity-comp mode, tune the relevant joint's `mass` and `com` on `AxolConfig` and pass it to `Axol`:
+
+```python
+from almond_axol.robot import AxolConfig, Axol
+
+config = AxolConfig()
+config.left.elbow.mass = 0.6
+config.left.elbow.com = (-0.025, 0.0, -0.07)
+async with Axol(config=config) as axol: ...
+```
 
 ---
 

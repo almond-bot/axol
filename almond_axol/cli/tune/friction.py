@@ -1,34 +1,37 @@
 """
-axol tune.feedforward
+axol tune.friction
 
-Identify all six feedforward parameters (gravity + friction) for an Axol joint
+Identify the four friction-model parameters (Fc, k, Fv, Fo) for an Axol joint
 in a single bidirectional sweep.
 
 Sweeps the full joint range at multiple velocities, both forward and backward.
 Bidirectional averaging at the same position separates gravity from friction:
 
-    avg(τ_fwd, τ_bwd) at same q     →  ga·cos(q) + gb·sin(q) + Fo
+    avg(τ_fwd, τ_bwd) at same q     →  gravity(q) + Fo
     half(τ_fwd - τ_bwd) at same q   →  Fc·tanh(0.1·k·v) + Fv·v
 
-Fits six parameters at once:
-    ga, gb  — gravity model (τ_grav = ga·cos(q) + gb·sin(q))
-    Fc, k   — Coulomb friction magnitude and tanh sharpness
-    Fv      — viscous friction coefficient
-    Fo      — constant torque offset (from gravity fit)
+The half-difference (the part that flips sign with velocity) is fit to the
+friction model and yields ``Fc``, ``k``, and ``Fv``. The average is then
+compared against the URDF gravity model (see
+:class:`almond_axol.robot.gravity.GravityCompensator`) — the constant residual
+becomes ``Fo`` and the shape residual is reported as a sanity check on the
+``mass`` / ``com`` values in :class:`JointConfig`.
 
 At runtime:
-    tff(q, v) = ga·cos(q) + gb·sin(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
+    tff(q, v) = gravity_model(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
 Examples:
-    axol tune.feedforward --l --joint shoulder_1 --kp 30 --kd 0.8
-    axol tune.feedforward --r --joint elbow --kp 20 --kd 0.6
-    axol tune.feedforward --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
+    axol tune.friction --r --joint elbow --kp 20 --kd 0.6
+    axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
 import argparse
 import asyncio
+import csv
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy.optimize import curve_fit
@@ -36,6 +39,7 @@ from scipy.optimize import curve_fit
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import ArmConfig, AxolConfig
+from ...robot.gravity import GravityCompensator
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _TAU = 2 * math.pi
@@ -104,8 +108,13 @@ async def _run_sweep_raw(
 ) -> list[tuple[float, float]]:
     """Sweep from start_pos to end_pos at constant velocity.
 
-    Returns list of (q_actual, tau_est). No friction subtraction.
-    The first WARMUP_FRACTION of travel is discarded for motor settling.
+    Returns list of ``(q_actual, tau_measured)``. The first
+    ``WARMUP_FRACTION`` of travel is discarded for motor settling.
+    ``tau_measured`` is read from the motor's feedback frame (motor-side
+    torque estimate), **not** computed from host-side ``kp·pos_err +
+    kd·vel_err`` — host-side numerical differentiation of position is
+    too noisy at the velocities we sweep, and the motor's own estimate is
+    already what we want.
     """
     travel = abs(end_pos - start_pos)
     if travel < 0.02:
@@ -115,8 +124,6 @@ async def _run_sweep_raw(
     dt = 1.0 / _RATE_HZ
 
     samples: list[tuple[float, float]] = []
-    pos_prev: float | None = None
-    t_prev: float | None = None
 
     t0 = time.monotonic()
     while True:
@@ -127,19 +134,12 @@ async def _run_sweep_raw(
         loop_start = now
 
         target = start_pos + velocity_rad_s * t
+        # set_impedance returns a feedback frame, which updates
+        # motor.position / motor.torque via the driver _on_feedback hook.
         await motor.set_impedance(target, velocity_rad_s, kp, kd, 0.0)
-        q_actual = await motor.get_position()
 
-        if t >= warmup_time and pos_prev is not None and t_prev is not None:
-            pos_err = target - q_actual
-            dt_actual = now - t_prev
-            v_actual = (q_actual - pos_prev) / dt_actual if dt_actual > 0 else 0.0
-            vel_err = velocity_rad_s - v_actual
-            tau_est = kp * pos_err + kd * vel_err
-            samples.append((q_actual, tau_est))
-
-        pos_prev = q_actual
-        t_prev = now
+        if t >= warmup_time:
+            samples.append((motor.position, motor.torque))
 
         spent = time.monotonic() - loop_start
         if spent < dt:
@@ -171,27 +171,69 @@ def _bin_by_position(
     }
 
 
-def _fit_gravity_with_offset(
+def _compare_to_gravity_model(
     avg_samples: list[tuple[float, float]],
-) -> tuple[float, float, float] | None:
-    """Linear fit: tau_avg = ga*cos(q) + gb*sin(q) + Fo.
+    joint: Joint,
+    is_left: bool,
+    other_targets: dict[Joint, float],
+) -> float | None:
+    """Compare ``tau_avg`` to the URDF gravity model and return ``Fo``.
 
-    Returns (ga, gb, Fo) or None.
+    For each ``(q, tau_avg)`` sample, predicts gravity at the pose used during
+    the sweep — test joint at ``q``, other arm joints at the targets they
+    were ramped to — and reports the residual. The mean residual is the
+    constant friction offset ``Fo``; the residual after removing the bias is
+    a sanity check on the per-link ``mass`` / ``com`` values.
     """
-    if len(avg_samples) < 10:
-        print("  ! Too few avg samples to fit gravity.")
+    if len(avg_samples) < 5:
+        print("  ! Too few avg samples to compare against gravity model.")
         return None
-    q_arr = np.array([s[0] for s in avg_samples])
-    t_arr = np.array([s[1] for s in avg_samples])
-    A = np.column_stack([np.cos(q_arr), np.sin(q_arr), np.ones_like(q_arr)])
-    coeffs, *_ = np.linalg.lstsq(A, t_arr, rcond=None)
-    ga, gb, Fo = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
-    residual_rms = float(np.sqrt(np.mean((t_arr - A @ coeffs) ** 2)))
-    amplitude = float(np.sqrt(ga**2 + gb**2))
-    print(
-        f"  Gravity fit residual RMS: {residual_rms:.4f} Nm  (amplitude: {amplitude:.4f} Nm)"
-    )
-    return ga, gb, Fo
+
+    gc = GravityCompensator()
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q_buf = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+    for j, target in other_targets.items():
+        if j in ARM_JOINTS and j != joint:
+            arm_q_buf[ARM_JOINTS.index(j)] = float(target)
+
+    measured = np.array([s[1] for s in avg_samples], dtype=np.float64)
+    predicted = np.empty_like(measured)
+    for i, (q, _) in enumerate(avg_samples):
+        arm_q_buf[test_idx] = float(q)
+        predicted[i] = float(gc.gravity_arm(arm_q_buf, is_left=is_left)[test_idx])
+
+    residual = measured - predicted
+    Fo = float(np.mean(residual))
+    rms_after_bias = float(np.sqrt(np.mean((residual - Fo) ** 2)))
+    rms_total = float(np.sqrt(np.mean(residual**2)))
+
+    pred_rms = float(np.sqrt(np.mean(predicted**2)))
+    pred_peak = float(np.max(np.abs(predicted)))
+
+    print("\n  URDF gravity check (mass/com from JointConfig):")
+    print(f"    Predicted gravity : {pred_rms:.4f} Nm RMS  (peak {pred_peak:.4f} Nm)")
+    print(f"    Fo                : {Fo:+.4f} Nm  (mean residual → FrictionParams.fo)")
+    # Joints with a vertical rotation axis (e.g. shoulder_3, wrist_3 at q≈0)
+    # see no gravity moment, so the relative-error metric is meaningless;
+    # report the absolute residual without a percentage or warning.
+    if pred_rms < 0.1:
+        print(
+            f"    Shape residual    : {rms_after_bias:.4f} Nm RMS  "
+            "(no gravity dependence at this pose — abs residual is just noise)"
+        )
+        print(f"    Total residual    : {rms_total:.4f} Nm RMS")
+    else:
+        pct = rms_after_bias / pred_rms * 100.0
+        print(
+            f"    Shape residual    : {rms_after_bias:.4f} Nm RMS  ({pct:.1f}% of predicted)"
+        )
+        print(f"    Total residual    : {rms_total:.4f} Nm RMS")
+        if pct > 20.0 and rms_after_bias > 0.1:
+            print(
+                "    ! Large shape residual: URDF mass/com likely off for this "
+                "joint or its children. Verify with `axol gravity-comp`."
+            )
+    return Fo
 
 
 def _tanh_friction(v: np.ndarray, Fc: float, k: float, Fv: float) -> np.ndarray:
@@ -239,12 +281,17 @@ async def _identify_joint(
     velocities: list[float],
     lo_override: float | None = None,
     hi_override: float | None = None,
+    dump_csv: Path | None = None,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run bidirectional multi-velocity sweep over the full joint range.
 
     Returns:
         avg_samples:      (q, tau_avg)  — for gravity+Fo fitting
         halfdiff_samples: (v, tau_half) — for Fc/k/Fv fitting
+
+    If ``dump_csv`` is given, every matched (fwd, bwd) bin is also written to
+    a CSV with the per-velocity, per-position torque values. Useful for
+    plotting the raw friction-vs-velocity curve and comparing arms.
     """
     lo, hi = arm_limits(joint, is_left)
     if lo_override is not None:
@@ -265,48 +312,89 @@ async def _identify_joint(
     all_avg: list[tuple[float, float]] = []
     all_halfdiff: list[tuple[float, float]] = []
 
-    for v in velocities:
-        print(f"\n  v = {v:.3f} rad/s ...")
+    csv_file = None
+    csv_writer = None
+    if dump_csv is not None:
+        csv_file = dump_csv.open("w", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow(
+            [
+                "joint",
+                "side",
+                "v_rad_s",
+                "q_rad",
+                "tau_fwd_nm",
+                "tau_bwd_nm",
+                "tau_avg_nm",
+                "tau_halfdiff_nm",
+            ]
+        )
+        print(f"  Dumping per-bin samples to {dump_csv}")
 
-        # Ramp to sweep start with time proportional to distance
-        cur = await motor.get_position()
-        ramp_dur = abs(sweep_lo - cur) / _RAMP_SPEED + 1.0
-        await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur)
-        await asyncio.sleep(0.3)
+    try:
+        for v in velocities:
+            print(f"\n  v = {v:.3f} rad/s ...")
 
-        # Forward sweep: sweep_lo → sweep_hi
-        fwd = await _run_sweep_raw(motor, kp, kd, sweep_lo, +v, sweep_hi)
-        cur = await motor.get_position()
-        print(f"    fwd: {len(fwd)} samples")
+            # Ramp to sweep start with time proportional to distance
+            cur = await motor.get_position()
+            ramp_dur = abs(sweep_lo - cur) / _RAMP_SPEED + 1.0
+            await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur)
+            await asyncio.sleep(0.3)
 
-        # Hold at turnaround to damp velocity before reversing
-        await _ramp_to(motor, kp, kd, cur, duration=2.0)
+            # Forward sweep: sweep_lo → sweep_hi
+            fwd = await _run_sweep_raw(motor, kp, kd, sweep_lo, +v, sweep_hi)
+            cur = await motor.get_position()
+            print(f"    fwd: {len(fwd)} samples")
 
-        # Backward sweep: sweep_hi → sweep_lo
-        bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
-        print(f"    bwd: {len(bwd)} samples")
+            # Hold at turnaround to damp velocity before reversing
+            await _ramp_to(motor, kp, kd, cur, duration=2.0)
 
-        # Bin by position and match fwd/bwd
-        fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi)
-        bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi)
-        matched = sum(1 for q in fwd_bins if q in bwd_bins)
-        print(f"    {matched}/{_N_BINS} position bins matched")
+            # Backward sweep: sweep_hi → sweep_lo
+            bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
+            print(f"    bwd: {len(bwd)} samples")
 
-        for q_center, tau_f in fwd_bins.items():
-            if q_center in bwd_bins:
-                tau_b = bwd_bins[q_center]
-                all_avg.append((q_center, (tau_f + tau_b) / 2.0))
-                all_halfdiff.append((v, (tau_f - tau_b) / 2.0))
+            # Bin by position and match fwd/bwd
+            fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi)
+            bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi)
+            matched = sum(1 for q in fwd_bins if q in bwd_bins)
+            print(f"    {matched}/{_N_BINS} position bins matched")
 
-        await asyncio.sleep(0.2)
+            for q_center, tau_f in fwd_bins.items():
+                if q_center in bwd_bins:
+                    tau_b = bwd_bins[q_center]
+                    tau_avg = (tau_f + tau_b) / 2.0
+                    tau_half = (tau_f - tau_b) / 2.0
+                    all_avg.append((q_center, tau_avg))
+                    all_halfdiff.append((v, tau_half))
+                    if csv_writer is not None:
+                        csv_writer.writerow(
+                            [
+                                joint.value,
+                                "left" if is_left else "right",
+                                f"{v:.6f}",
+                                f"{q_center:.6f}",
+                                f"{tau_f:.6f}",
+                                f"{tau_b:.6f}",
+                                f"{tau_avg:.6f}",
+                                f"{tau_half:.6f}",
+                            ]
+                        )
+
+            if csv_file is not None:
+                csv_file.flush()
+
+            await asyncio.sleep(0.2)
+    finally:
+        if csv_file is not None:
+            csv_file.close()
 
     return all_avg, all_halfdiff
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser(
-        "tune.feedforward",
-        help="Identify all feedforward parameters (gravity + friction) in one pass.",
+        "tune.friction",
+        help="Identify the friction-model parameters (Fc, k, Fv, Fo) for one joint.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -316,9 +404,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--joint",
         required=True,
-        choices=[j.value for j in [*ARM_JOINTS, Joint.GRIPPER]],
+        choices=[j.value for j in ARM_JOINTS],
         metavar="JOINT",
-        help=f"Joint to identify: {', '.join(j.value for j in [*ARM_JOINTS, Joint.GRIPPER])}",
+        help=f"Joint to identify: {', '.join(j.value for j in ARM_JOINTS)}",
     )
     p.add_argument(
         "--kp",
@@ -351,6 +439,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="RAD",
         help="Override upper joint limit for the sweep (rad)",
     )
+    p.add_argument(
+        "--dump-csv",
+        nargs="?",
+        const="__auto__",
+        default=None,
+        metavar="PATH",
+        help="Write per-bin (v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff) "
+        "rows to a CSV for offline plotting / arm-vs-arm comparison. Pass "
+        "without a value to auto-name as "
+        "logs/friction_<side>_<joint>_<timestamp>.csv, or pass an explicit "
+        "path.",
+    )
     p.set_defaults(func=run)
 
 
@@ -367,7 +467,16 @@ async def _run(args: argparse.Namespace) -> None:
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd
 
-    print(f"\nAxol feedforward identification — {side_str} {joint.value}")
+    dump_csv: Path | None = None
+    if args.dump_csv == "__auto__":
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        dump_csv = Path("logs") / f"friction_{side_str}_{joint.value}_{timestamp}.csv"
+    elif args.dump_csv is not None:
+        dump_csv = Path(args.dump_csv)
+    if dump_csv is not None:
+        dump_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\nAxol friction identification — {side_str} {joint.value}")
     print(f"  Velocity sweep: {[round(v, 3) for v in args.velocities]} rad/s")
     print(f"  Kp={kp}  Kd={kd}")
 
@@ -375,8 +484,6 @@ async def _run(args: argparse.Namespace) -> None:
 
     async with CanBus(channel) as bus:
         motors = {j: Motor(bus, j) for j in ARM_JOINTS}
-        if joint == Joint.GRIPPER:
-            motors[Joint.GRIPPER] = Motor(bus, Joint.GRIPPER)
         await asyncio.gather(*[m.enable() for m in motors.values()])
         await asyncio.gather(
             *[
@@ -403,6 +510,16 @@ async def _run(args: argparse.Namespace) -> None:
             await _ramp_others(motors, joint, other_targets)
             await asyncio.sleep(1.0)
 
+            # shoulder_2 swings into the robot base on the inboard side; cap
+            # the sweep at 0 so it stays on the safe half of its range.
+            lo_default = hi_default = None
+            if joint == Joint.SHOULDER_2:
+                if is_left:
+                    hi_default = 0.0
+                else:
+                    lo_default = 0.0
+                print("  Capping shoulder_2 sweep at 0 rad to avoid the base.")
+
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
                 joint,
@@ -410,8 +527,9 @@ async def _run(args: argparse.Namespace) -> None:
                 kd,
                 is_left,
                 args.velocities,
-                lo_override=args.lo,
-                hi_override=args.hi,
+                lo_override=args.lo if args.lo is not None else lo_default,
+                hi_override=args.hi if args.hi is not None else hi_default,
+                dump_csv=dump_csv,
             )
 
             if not avg_samples and not halfdiff_samples:
@@ -422,20 +540,13 @@ async def _run(args: argparse.Namespace) -> None:
             print(f"  Avg samples:       {len(avg_samples)}")
             print(f"  Half-diff samples: {len(halfdiff_samples)}")
 
-            gravity_result = _fit_gravity_with_offset(avg_samples)
+            Fo_result = _compare_to_gravity_model(
+                avg_samples, joint, is_left, other_targets
+            )
             friction_result = _fit_friction_halfdiff(halfdiff_samples)
 
-            ga_out = gb_out = Fo_out = Fc_out = k_out = Fv_out = 0.0
-
-            if gravity_result is not None:
-                ga_out, gb_out, Fo_out = gravity_result
-                amplitude = math.sqrt(ga_out**2 + gb_out**2)
-                phase_deg = math.degrees(math.atan2(gb_out, ga_out))
-                print("\n  Fitted gravity model: τ = ga·cos(q) + gb·sin(q)")
-                print(f"    ga = {ga_out:.4f} Nm")
-                print(f"    gb = {gb_out:.4f} Nm")
-                print(f"    amplitude = {amplitude:.4f} Nm  phase = {phase_deg:.1f}°")
-                print(f"    Fo = {Fo_out:.4f} Nm  (offset, from avg fit)")
+            Fo_out = Fo_result if Fo_result is not None else 0.0
+            Fc_out = k_out = Fv_out = 0.0
 
             if friction_result is not None:
                 Fc_out, k_out, Fv_out = friction_result
@@ -444,12 +555,12 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"    k  = {k_out:.2f}      (tanh steepness)")
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
 
-            if gravity_result is not None or friction_result is not None:
-                print(f"\n  Add to config.py JointGains for {joint.value}:")
+            if friction_result is not None or Fo_result is not None:
+                print(f"\n  Add to config.py JointConfig.{joint.value}.friction:")
                 print(
-                    f"    fc={Fc_out:.4f}, k={k_out:.2f}, fv={Fv_out:.4f}, fo={Fo_out:.4f},"
+                    f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
+                    f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
                 )
-                print(f"    ga={ga_out:.4f}, gb={gb_out:.4f}")
 
             print(f"{'─' * 50}")
 

@@ -18,14 +18,39 @@ import asyncio
 import math
 import time
 
+import numpy as np
+
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import ArmConfig, AxolConfig
-from ...robot.control import Differentiator, compute_feedforward
+from ...robot.control import Differentiator, compute_friction
+from ...robot.gravity import GravityCompensator
 from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
-_DEFAULT_AMP_FRACTION = 0.3
+# Default sine amplitude / step size (rad). 0.175 rad ≈ 10° — well above
+# the encoder noise floor and the ``5%`` settling threshold (≈0.5°), well
+# clear of the friction-stiction breakaway condition (``kp · amp > Fc``)
+# at all typical PID-tuning gains, and small enough to avoid hitting joint
+# limits or driving any joint into its high-velocity saturation regime.
+_DEFAULT_AMP_RAD = 0.175
 _RAMP_SPEED = 0.25  # rad/s
+
+
+# Joints whose 0 position physically collides with the robot base. ``run_step``
+# frames the test entirely in the safe (outboard) half for these, and
+# ``_ramp_others_to_zero`` leaves them in place rather than commanding 0.
+_BASE_COLLISION_JOINTS = frozenset({Joint.SHOULDER_2, Joint.WRIST_2})
+
+
+def _safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
+    """Step direction that swings away from the robot base, or ``None`` if the
+    joint has no base-collision constraint."""
+    if joint == Joint.SHOULDER_2:
+        return -1 if is_left else 1
+    if joint == Joint.WRIST_2:
+        # symmetric across arms; +π/2 side is always away from the base.
+        return 1
+    return None
 
 
 def _sine_center(joint: Joint, is_left: bool) -> float:
@@ -52,7 +77,6 @@ def _safe_amplitude(
             f"Sine test centers on the joint midpoint ({_sine_center(joint, is_left):.4f} rad) — "
             f"move there first, or use --mode step."
         )
-    default_amp = headroom * _DEFAULT_AMP_FRACTION
     if requested is not None:
         amp = min(requested, headroom)
         if amp < requested:
@@ -60,7 +84,7 @@ def _safe_amplitude(
                 f"  ! requested amp {requested:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
             )
     else:
-        amp = default_amp
+        amp = min(_DEFAULT_AMP_RAD, headroom)
     return amp
 
 
@@ -68,8 +92,16 @@ async def _ramp_others_to_zero(
     motors: dict[Joint, Motor],
     exclude: Joint,
 ) -> None:
-    """Send non-test joints to 0 via set_position_velocity and poll until arrival."""
-    joints = [j for j in ARM_JOINTS if j != exclude]
+    """Send non-test joints to 0 via set_position_velocity and poll until arrival.
+
+    Joints listed in ``_BASE_COLLISION_JOINTS`` are also skipped: 0 physically
+    collides with the robot base (the URDF limits don't capture this), and the
+    rest of the workflow keeps them safely outboard — ``run_step`` repositions
+    before testing, and ``run_sine`` centers them in the safe half. The user is
+    responsible for initially posing those joints outside the danger zone.
+    """
+    skip = {exclude} | _BASE_COLLISION_JOINTS
+    joints = [j for j in ARM_JOINTS if j not in skip]
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max((abs(p) for p in pos_vals), default=0.0)
     await asyncio.gather(
@@ -94,12 +126,11 @@ async def run_sine(
     duration: float,
     rate_hz: float,
     is_left: bool,
+    gravity_fn=lambda q: 0.0,
     fc: float = 0.0,
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
-    ga: float = 0.0,
-    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
     lo, hi = arm_limits(joint, is_left)
@@ -139,7 +170,7 @@ async def run_sine(
 
         target = center + amp * math.sin(2 * math.pi * freq * t)
         v_des = diff.differentiate([target])[0]
-        tff = compute_feedforward(target, v_des, ga, gb, fc, k, fv, fo)
+        tff = gravity_fn(target) + compute_friction(v_des, fc, k, fv, fo)
         await test_motor.set_impedance(target, v_des, kp, kd, tff)
         actual = await test_motor.get_position()
         t_read = time.monotonic() - start
@@ -169,46 +200,80 @@ async def run_step(
     hold: float,
     rate_hz: float,
     is_left: bool,
+    gravity_fn=lambda q: 0.0,
     fc: float = 0.0,
     k: float = 0.0,
     fv: float = 0.0,
     fo: float = 0.0,
-    ga: float = 0.0,
-    gb: float = 0.0,
 ) -> tuple[list[dict], float]:
     test_motor = motors[joint]
-    center = await test_motor.get_position()
+    current = await test_motor.get_position()
     lo, hi = arm_limits(joint, is_left)
 
-    headroom_up = hi - center
-    headroom_down = center - lo
-    if headroom_up < 0.03 and headroom_down < 0.03:
-        raise ValueError(
-            f"{joint.value} at {center:.4f} rad has no headroom within [{lo:.4f}, {hi:.4f}]."
+    safe_dir = _safe_outboard_direction(joint, is_left)
+    if safe_dir is not None:
+        # 0 physically collides with the robot base; frame the whole test in
+        # the safe half so that center *and* step_target stay outboard. amp
+        # goes from 0 → safe-limit/2 (room for a 2× swing).
+        direction = safe_dir
+        outboard_limit = lo if direction < 0 else hi
+        max_safe_amp = abs(outboard_limit) / 2.0
+        amp = min(
+            requested_amp if requested_amp is not None else _DEFAULT_AMP_RAD,
+            max_safe_amp,
         )
-    if joint == Joint.WRIST_2:
-        # going negative hits the robot base
-        direction, headroom = 1, headroom_up
-    elif headroom_up >= headroom_down:
-        direction, headroom = 1, headroom_up
-    else:
-        direction, headroom = -1, headroom_down
-
-    if requested_amp is not None:
-        amp = min(requested_amp, headroom)
-        if amp < requested_amp:
+        center = direction * amp
+        step_target = direction * 2.0 * amp
+        if requested_amp is not None and amp < requested_amp:
             print(
-                f"  ! requested amp {requested_amp:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+                f"  ! requested amp {requested_amp:.4f} rad would push past the safe half; clamped to {amp:.4f} rad"
             )
     else:
-        amp = headroom * _DEFAULT_AMP_FRACTION
+        center = current
+        headroom_up = hi - center
+        headroom_down = center - lo
+        if headroom_up < 0.03 and headroom_down < 0.03:
+            raise ValueError(
+                f"{joint.value} at {center:.4f} rad has no headroom within [{lo:.4f}, {hi:.4f}]."
+            )
+        if headroom_up >= headroom_down:
+            direction, headroom = 1, headroom_up
+        else:
+            direction, headroom = -1, headroom_down
 
-    step_target = center + direction * amp
+        if requested_amp is not None:
+            amp = min(requested_amp, headroom)
+            if amp < requested_amp:
+                print(
+                    f"  ! requested amp {requested_amp:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+                )
+        else:
+            amp = min(_DEFAULT_AMP_RAD, headroom)
+        step_target = center + direction * amp
+
     sign_str = f"+{amp:.4f}" if direction == 1 else f"-{amp:.4f}"
     print(
         f"  limits=[{lo:.4f}, {hi:.4f}] rad  center={center:.4f} rad  "
         f"step={sign_str} rad  hold={hold:.1f} s  rate={rate_hz:.0f} Hz"
     )
+
+    if abs(current - center) > 0.01:
+        ramp_duration = max(abs(current - center) / _RAMP_SPEED, 0.5)
+        print(
+            f"  moving to step center ({center:.4f} rad) over {ramp_duration:.1f} s ..."
+        )
+        dt = 1.0 / rate_hz
+        t0 = time.monotonic()
+        while True:
+            t = time.monotonic() - t0
+            alpha = min(t / ramp_duration, 1.0)
+            target = current + alpha * (center - current)
+            tff = gravity_fn(target) + compute_friction(0.0, fc, k, fv, fo)
+            await test_motor.set_impedance(target, 0.0, kp, kd, tff)
+            if alpha >= 1.0:
+                break
+            await asyncio.sleep(dt)
+        await asyncio.sleep(0.5)
 
     dt = 1.0 / rate_hz
     log: list[dict] = []
@@ -219,7 +284,7 @@ async def run_step(
         while time.monotonic() - phase_start < hold:
             loop_start = time.monotonic()
             t = time.monotonic() - start
-            tff = compute_feedforward(phase_target, 0.0, ga, gb, fc, k, fv, fo)
+            tff = gravity_fn(phase_target) + compute_friction(0.0, fc, k, fv, fo)
             await test_motor.set_impedance(phase_target, 0.0, kp, kd, tff)
             actual = await test_motor.get_position()
             log.append(
@@ -326,7 +391,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--amp",
         type=float,
         default=None,
-        help="Motion amplitude in rad (default: joint safe value)",
+        help="Motion amplitude in rad (default: 0.175 rad ≈ 10°, clamped to joint headroom)",
     )
     p.add_argument(
         "--freq", type=float, default=1.0, help="[sine] Frequency in Hz (default: 1.0)"
@@ -362,17 +427,31 @@ async def _run(args: argparse.Namespace) -> None:
     arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
     joint_gains = getattr(arm_cfg, joint.value)
     if args.tff:
-        fc, k, fv, fo = joint_gains.fc, joint_gains.k, joint_gains.fv, joint_gains.fo
-        ga, gb = joint_gains.ga, joint_gains.gb
+        f = joint_gains.friction
+        fc, k, fv, fo = f.fc, f.k, f.fv, f.fo
     else:
-        fc = k = fv = fo = ga = gb = 0.0
+        fc = k = fv = fo = 0.0
+
+    # Gravity feedforward is computed from the URDF for the *full* arm pose;
+    # other joints sit at 0 during tuning so we just substitute the test joint
+    # angle into a single-joint MuJoCo lookup.
+    gravity_comp = GravityCompensator() if args.tff else None
+    test_idx = ARM_JOINTS.index(joint)
+    arm_q_buf = np.zeros(len(ARM_JOINTS), dtype=np.float32)
+
+    def gravity_fn(q: float) -> float:
+        if gravity_comp is None:
+            return 0.0
+        arm_q_buf[test_idx] = q
+        return float(gravity_comp.gravity_arm(arm_q_buf, is_left=is_left)[test_idx])
 
     print(
         f"\nAxol PID tuner — {side_str} {joint.value}  limits=[{lo:.4f}, {hi:.4f}] rad"
     )
     print(f"  testing  Kp={args.kp}  Kd={args.kd}  mode={args.mode}")
     if args.tff:
-        print(f"  tff  Fc={fc}  k={k}  Fv={fv}  Fo={fo}  ga={ga}  gb={gb}")
+        g0 = gravity_fn(0.0)
+        print(f"  tff  Fc={fc}  k={k}  Fv={fv}  Fo={fo}  gravity@0={g0:.4f} Nm (model)")
 
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
@@ -404,12 +483,11 @@ async def _run(args: argparse.Namespace) -> None:
                     args.duration,
                     args.rate,
                     is_left,
+                    gravity_fn=gravity_fn,
                     fc=fc,
                     k=k,
                     fv=fv,
                     fo=fo,
-                    ga=ga,
-                    gb=gb,
                 )
                 _print_stats_sine(log, args.kp, args.kd)
                 await asyncio.sleep(1.0)
@@ -423,18 +501,20 @@ async def _run(args: argparse.Namespace) -> None:
                     args.hold,
                     args.rate,
                     is_left,
+                    gravity_fn=gravity_fn,
                     fc=fc,
                     k=k,
                     fv=fv,
                     fo=fo,
-                    ga=ga,
-                    gb=gb,
                 )
                 _print_stats_step(log, amp, args.kp, args.kd)
 
         except KeyboardInterrupt:
             print("\n  interrupted")
         finally:
+            # Slow controlled ramp to 0 — for shoulder_2 this is the *safe*
+            # way to reach the base side: the danger was a fast mid-step
+            # return-to-center, not the gentle approach at _RAMP_SPEED.
             print("  returning to 0 ...")
             try:
                 start_rad = await motors[joint].get_position()
