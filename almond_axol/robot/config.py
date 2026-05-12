@@ -144,7 +144,7 @@ class ArmConfig:
             kp=50.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
-            mass=1.50,
+            mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             # Identified from step response (ζ ≈ 0.36 at kp=50, kd=5 → J ≈ 0.91).
             j_eff=0.91,
@@ -156,7 +156,7 @@ class ArmConfig:
             kp=45.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=2.75,
+            mass=3.50,
             com=(0.0, 0.00286547, -0.164964),
         )
     )
@@ -165,7 +165,7 @@ class ArmConfig:
             kp=40.0,
             kd=3.0,
             friction=_ZERO_FRICTION,
-            mass=0.80,
+            mass=0.9,
             com=(-0.0256064, 0.0, -0.072044),
         )
     )
@@ -174,7 +174,7 @@ class ArmConfig:
             kp=30.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=0.50,
+            mass=0.1,
             com=(0.0, 0.0, -0.0614121),
         )
     )
