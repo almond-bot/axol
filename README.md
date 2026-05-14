@@ -560,11 +560,15 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 | Field | Default | Description |
 |---|---|---|
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
-| `stiffness` | `0.0` | Compliance ↔ stiffness blend in `[0, 1]`. `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. |
+| `left_stiffness` | `0.0` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. |
+| `right_stiffness` | `0.0` | Same, for the **right** arm. |
 
 ```python
-config = AxolConfig(stiffness=1.0)   # stiff industrial feel
-config = AxolConfig(stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
+config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)   # both arms, stiff industrial feel
+config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
+config = AxolConfig(                                           # per-joint, left only
+    left_stiffness=(0.8, 0.8, 0.5, 0.5, 0.2, 0.2, 0.0),
+)
 ```
 
 Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.

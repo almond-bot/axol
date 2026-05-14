@@ -9,6 +9,44 @@ import asyncio
 import logging
 import socket
 
+from ..shared import ARM_JOINTS
+
+
+def _parse_stiffness(value: str) -> float | tuple[float, ...]:
+    """Parse a ``--*-stiffness`` value.
+
+    Accepts either a single number in ``[0, 1]`` (applied to all arm
+    joints) or exactly ``len(ARM_JOINTS)`` comma-separated numbers in
+    ``[0, 1]`` — one per joint in :data:`almond_axol.shared.ARM_JOINTS`
+    order (the gripper is not blended).
+    """
+    parts = [p.strip() for p in value.split(",")]
+
+    def _parse_one(raw: str, label: str) -> float:
+        try:
+            x = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} is not a number: {raw!r}"
+            ) from exc
+        if not 0.0 <= x <= 1.0:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} must be in [0, 1], got {x}"
+            )
+        return x
+
+    if len(parts) == 1:
+        return _parse_one(parts[0], "")
+    if len(parts) != len(ARM_JOINTS):
+        raise argparse.ArgumentTypeError(
+            f"stiffness must be a single value or {len(ARM_JOINTS)} "
+            f"comma-separated values (one per joint: "
+            f"{', '.join(j.value for j in ARM_JOINTS)}), got {len(parts)}"
+        )
+    return tuple(
+        _parse_one(p, f"[{i}={ARM_JOINTS[i].value}]") for i, p in enumerate(parts)
+    )
+
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser("teleop", help="Run a VR teleoperation session.")
@@ -40,15 +78,28 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=1.0,
         help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0).",
     )
+    stiffness_help = (
+        "Compliance ↔ stiffness blend in [0, 1] for the {side} arm. "
+        f"Either a single value applied to all {len(ARM_JOINTS)} joints, "
+        f"or {len(ARM_JOINTS)} comma-separated values (one per joint, in "
+        f"order: {', '.join(j.value for j in ARM_JOINTS)}; gripper "
+        "excluded). 0 (default) is fully compliant; 1 restores the "
+        "pre-tuning industrial gains. See AxolConfig.{attr}."
+    )
+    stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
     p.add_argument(
-        "--stiffness",
-        type=float,
+        "--left-stiffness",
+        type=_parse_stiffness,
         default=0.0,
-        help=(
-            "Compliance ↔ stiffness blend in [0, 1]. 0 (default) is fully "
-            "compliant; 1 restores the pre-tuning industrial gains. See "
-            "AxolConfig.stiffness."
-        ),
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="left", attr="left_stiffness"),
+    )
+    p.add_argument(
+        "--right-stiffness",
+        type=_parse_stiffness,
+        default=0.0,
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="right", attr="right_stiffness"),
     )
     p.add_argument(
         "--log-level",
@@ -81,7 +132,8 @@ def run(args: argparse.Namespace) -> None:
             no_right=args.no_right,
             left_gripper_torque_limit=args.left_gripper_torque_limit,
             right_gripper_torque_limit=args.right_gripper_torque_limit,
-            stiffness=args.stiffness,
+            left_stiffness=args.left_stiffness,
+            right_stiffness=args.right_stiffness,
         )
     )
 
@@ -93,7 +145,8 @@ async def _run(
     no_right: bool = False,
     left_gripper_torque_limit: float = 1.0,
     right_gripper_torque_limit: float = 1.0,
-    stiffness: float = 0.0,
+    left_stiffness: float | tuple[float, ...] = 0.0,
+    right_stiffness: float | tuple[float, ...] = 0.0,
 ) -> None:
     from ..robot import Axol, Sim
     from ..robot.config import AxolConfig
@@ -107,7 +160,10 @@ async def _run(
             kwargs["left_channel"] = None
         if no_right:
             kwargs["right_channel"] = None
-        axol_config = AxolConfig(stiffness=stiffness)
+        axol_config = AxolConfig(
+            left_stiffness=left_stiffness,
+            right_stiffness=right_stiffness,
+        )
         axol_config.left.gripper.torque_limit = left_gripper_torque_limit
         axol_config.right.gripper.torque_limit = right_gripper_torque_limit
         robot = Axol(config=axol_config, **kwargs)
