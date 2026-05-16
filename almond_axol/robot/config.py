@@ -131,11 +131,9 @@ class ArmConfig:
             kp=40.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
-            mass=2.00,
+            mass=1.8,
             com=(0.0652231, 0.0, 0.0),
-            # Identified from step response (ζ ≈ 0.35 at kp=40, kd=5 → J ≈ 1.27).
             j_eff=1.27,
-            # Doubles effective kd past the firmware's 5 cap (ζ ≈ 0.35 → 0.70).
             kd_soft=5.0,
         )
     )
@@ -146,7 +144,6 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
-            # Identified from step response (ζ ≈ 0.36 at kp=50, kd=5 → J ≈ 0.91).
             j_eff=0.91,
             kd_soft=5.0,
         )
@@ -156,7 +153,7 @@ class ArmConfig:
             kp=45.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=3.50,
+            mass=3,
             com=(0.0, 0.00286547, -0.164964),
         )
     )
@@ -165,7 +162,7 @@ class ArmConfig:
             kp=40.0,
             kd=3.0,
             friction=_ZERO_FRICTION,
-            mass=0.9,
+            mass=0.75,
             com=(-0.0256064, 0.0, -0.072044),
         )
     )
@@ -174,7 +171,7 @@ class ArmConfig:
             kp=30.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=0.1,
+            mass=0.25,
             com=(0.0, 0.0, -0.0614121),
         )
     )
@@ -183,8 +180,7 @@ class ArmConfig:
             kp=25.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=0.60,
-            # left_w1 CoM (right side has y sign-flipped — done by mirror_to_right).
+            mass=0.65,
             com=(0.0, 0.0285, -0.0285),
         )
     )
@@ -193,10 +189,7 @@ class ArmConfig:
             kp=25.0,
             kd=0.5,
             friction=_ZERO_FRICTION,
-            mass=0.65,
-            # left_w2 lumps wrist-3 segment with the gripper assembly (fixed
-            # joint): merged CAD inertial is 1.267 kg @ (-0.0285, 0, -0.08945);
-            # the mass is tuned in place.
+            mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
         )
     )

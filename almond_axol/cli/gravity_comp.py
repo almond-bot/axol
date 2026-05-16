@@ -88,14 +88,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--kd",
         type=float,
-        default=0.5,
-        help="Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.5.",
+        default=0.25,
+        help="Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.25.",
     )
     p.add_argument(
         "--rate",
         type=float,
-        default=100.0,
-        help="Control loop rate in Hz (default: 100).",
+        default=250.0,
+        help="Control loop rate in Hz (default: 250).",
     )
     p.add_argument(
         "--telemetry-rate",
