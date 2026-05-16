@@ -332,8 +332,8 @@ Holds both arms in gravity-compensation mode so you can move them by hand. Each 
 |---|---|
 | `--no-left` / `--no-right` | Disable an arm |
 | `--joints J1,J2,...` | Comma-separated joints to gravity-compensate (e.g. `WRIST_3` or `SHOULDER_1,ELBOW`). Other arm joints are held in place. Default: all 7 joints free. |
-| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.5 |
-| `--rate FLOAT` | Control loop rate in Hz (default: 100) |
+| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.25 |
+| `--rate FLOAT` | Control loop rate in Hz (default: 250) |
 | `--telemetry-rate FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
 
 ```bash
