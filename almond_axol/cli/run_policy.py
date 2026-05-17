@@ -238,6 +238,15 @@ def _run(
             while time.perf_counter() < deadline:
                 t0 = time.perf_counter()
 
+                # NOTE: training datasets collected by `axol collect-data` use
+                # sender-clock alignment via `ZedCamera.read_at_or_after(T_n)`
+                # so each row pairs the joint sample taken at T_n with camera
+                # frames whose exposure time is at or after T_n. This loop
+                # still uses `robot.get_observation()` which calls
+                # `cam.read_latest()` — that introduces a ~1 frame-period skew
+                # vs training. To match training exactly, swap in
+                # `ZedCamera.read_at_or_after(t0)` here. Tracking as a
+                # follow-up to keep this PR scoped to data collection.
                 obs = robot.get_observation()
                 obs_processed = robot_obs_proc(obs)
 
