@@ -165,12 +165,17 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 | `--robot {axol,sim}` | `axol` uses real hardware; `sim` uses the software visualizer (required) |
 | `--no-left` | Disable the left arm |
 | `--no-right` | Disable the right arm |
-| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` (default) = fully compliant; `1` = pre-tuning industrial gains. See [`AxolConfig.left_stiffness`](#almond_axolrobot). |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
 axol teleop --robot axol
 axol teleop --robot sim --no-right
+axol teleop --robot axol --left-stiffness 0.5 --right-stiffness 0.5
+axol teleop --robot axol --left-stiffness 0.8,0.8,0.5,0.5,0.2,0.2,0.0
 ```
 
 ---
@@ -191,7 +196,10 @@ Records teleoperation episodes using VR controller inputs and three ZED cameras.
 | `--push-to-hub` | Push to HuggingFace Hub when done |
 | `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
 | `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
-| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` (default) = fully compliant; `1` = pre-tuning industrial gains. See [`AxolConfig.left_stiffness`](#almond_axolrobot). |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
 | `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
@@ -199,6 +207,7 @@ Records teleoperation episodes using VR controller inputs and three ZED cameras.
 ```bash
 axol collect-data --repo-id myorg/pick-place --task "Pick the red cube and place it in the bin"
 axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --fps 30 --zed-iface eth0
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --left-stiffness 0.5 --right-stiffness 0.5
 ```
 
 **VR controller events:**
@@ -230,7 +239,7 @@ Runs a trained policy autonomously on the robot using three ZED cameras. Between
 | `--push-to-hub` | Push rollout dataset to HuggingFace Hub when done |
 | `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
 | `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
-| `--gripper-torque-limit FLOAT` | Max gripper torque in POSITION_FORCE mode in Nm (default: 1.0) |
+| `--gripper-torque-limit FLOAT` | Max gripper torque (Nm) in POSITION_FORCE mode, applied to both grippers (default: 1.0) |
 | `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
 | `--device STR` | PyTorch device for inference (default: `cuda`) |
@@ -254,7 +263,7 @@ Streams ZED-X One cameras over the local network using HEVC encoding. At least o
 | `--overhead SERIAL` | Serial number of the overhead camera |
 | `--left-arm SERIAL` | Serial number of the left-arm camera |
 | `--right-arm SERIAL` | Serial number of the right-arm camera |
-| `--resolution {HD1080,HD1200,SVGA}` | Default: `HD1080` |
+| `--resolution {HD1080,HD1200,SVGA}` | Default: `SVGA` |
 | `--fps FPS` | Default: 60 |
 | `--bitrate KBPS` | HEVC bitrate in kbit/s (default: 8000) |
 | `--setup-ip IFACE` | Assign sender IP to a network interface before streaming (e.g. `eth0`); requires `sudo` |
@@ -323,6 +332,26 @@ axol tune.friction --r --joint elbow --kp 20 --kd 0.6
 axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
 axol tune.friction --l --joint shoulder_2 --dump-csv
 ```
+
+### `tune.repeatability`
+
+Drives both arms between the rest pose and a hard-coded crossed-arms tips-touching pose, planning each leg with pyroki + the URDF so the arms can't clip the torso during the long arc. The gripper is held closed throughout and the arms run at maximum stiffness (the pre-tuning industrial gains) — repeatability is meaningless under the compliant teleop gains. Useful for measuring how reliably the grippers return to the same physical contact point after many motions.
+
+| Flag | Description |
+|---|---|
+| `--cycles INT` | Number of touch-and-return cycles; `0` (default) = run until Ctrl-C |
+| `--gripper-torque-limit FLOAT` | Gripper closing torque limit in Nm (default: 0.3); kept low so the tips collide gently |
+| `--dwell FLOAT` | Seconds to hold each end of the cycle (default: 0.5) |
+| `--rate FLOAT` | Control loop rate in Hz (default: 100) |
+| `--no-left` / `--no-right` | Disable an arm (the disabled side stays at rest while the other still moves) |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol tune.repeatability               # forever
+axol tune.repeatability --cycles 5    # five touch-and-return cycles
+```
+
+The touching pose is hand-posed and lives at the top of `almond_axol/cli/tune/repeatability.py` — edit `_TOUCH_LEFT` / `_TOUCH_RIGHT` in place to re-calibrate the contact point.
 
 ### `gravity-comp`
 
