@@ -273,6 +273,31 @@ Downloads and installs the `pyzed` Python wheel matching the installed ZED SDK v
 axol zed.install
 ```
 
+### `zed.sync-clocks` — Time synchronization
+
+The Jetson sender and the upper-computer receiver run independent system clocks. The ZED SDK stamps every frame with the sender's `CLOCK_REALTIME` via `TIME_REFERENCE.IMAGE`; the receiver then converts that timestamp onto its own `perf_counter` so dataset rows record the moment of *capture*, not the moment of decode. None of that produces aligned data unless both machines agree on what time it is.
+
+`axol zed.sync-clocks` runs a PTP (Precision Time Protocol) daemon over the direct ethernet link, holding the two clocks to sub-millisecond agreement — well below one camera frame period at 60 fps. The startup pipeline-latency check in `ZedCamera.connect()` warns loudly if the mean `receive_perf - capture_perf` falls outside `[0, 200] ms`, which is the operator-visible "PTP isn't running" canary.
+
+| Flag | Description |
+|---|---|
+| `--role {master,slave}` | `master` on the long-lived upper computer (owns the dataset); `slave` on the Jetson sender |
+| `--iface IFACE` | Network interface carrying the direct link (e.g. `eth0`) |
+| `--transport {l2,udpv4}` | `l2` (raw ethernet, default) or `udpv4` |
+| `--timestamping {auto,hardware,software}` | `auto` (default) probes `ethtool -T` and prefers hardware |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+Two-terminal recipe (one per machine, both stay running for the whole session):
+
+```bash
+sudo axol zed.sync-clocks --role master --iface eth0   # upper computer
+sudo axol zed.sync-clocks --role slave  --iface eth0   # Jetson
+```
+
+The command requires the `linuxptp` package (`ptp4l` + `phc2sys`); install with `sudo apt install linuxptp` on Debian/Ubuntu. Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.
+
+If you cannot install `linuxptp` for some reason, `chronyd` over the same direct link is a serviceable fallback — accuracy is worse (milliseconds rather than microseconds), so the DEBUG capture-skew logs will show wider spreads, but data will still align well enough for training.
+
 ---
 
 ## Tuning
