@@ -5,6 +5,26 @@ ZedCamera connects to a single ZED video stream produced by ZedStreamer and
 exposes it as a standard LeRobot Camera. One instance per camera — instantiate
 three to cover overhead, left_arm, and right_arm.
 
+Timestamping
+------------
+
+Every grabbed frame is stamped with two timestamps:
+
+* ``capture_perf_ts`` — when the *sender* exposed the frame, expressed on the
+  receiver's ``time.perf_counter`` clock. Derived from
+  ``TIME_REFERENCE.IMAGE`` (UNIX-ns wall-clock on the sender) plus a per-frame
+  delta between receiver wall-clock and ``perf_counter``. Recomputing the
+  delta per frame means PTP step adjustments to ``CLOCK_REALTIME`` are
+  absorbed instantly.
+* ``receive_perf_ts`` — receiver ``perf_counter`` at the moment the frame
+  was decoded.
+
+The difference ``receive_perf_ts - capture_perf_ts`` is the end-to-end
+pipeline latency (encode + network + decode), typically 33-50 ms with HEVC
+streaming. The capture thread in ``collect_data`` consumes
+``capture_perf_ts`` directly so the dataset row's "frame time" reflects the
+moment of capture, not the moment of decode.
+
 Typical usage::
 
     from almond_axol.lerobot.zed import ZedCamera, ZedCameraConfig
@@ -58,7 +78,8 @@ class ZedCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
-        self.latest_timestamp: float | None = None
+        self.latest_capture_perf_ts: float | None = None
+        self.latest_receive_perf_ts: float | None = None
         self.new_frame_event: Event = Event()
 
     def __str__(self) -> str:
@@ -137,7 +158,55 @@ class ZedCamera(Camera):
                     pass
                 time.sleep(0.05)
 
+        self._log_pipeline_latency()
+
         _logger.info(f"{self} connected ({self.width}x{self.height} @ {self.fps}fps).")
+
+    def _log_pipeline_latency(self, num_samples: int = 30) -> None:
+        """Sample the first ~N frames and log mean/max receive-vs-capture skew.
+
+        Acts as a startup canary for PTP: if the sender and receiver wall
+        clocks are out of sync the latency will look wildly negative or huge.
+        """
+        samples: list[float] = []
+        deadline = time.perf_counter() + 5.0
+        while len(samples) < num_samples and time.perf_counter() < deadline:
+            self.new_frame_event.clear()
+            if not self.new_frame_event.wait(timeout=0.5):
+                continue
+            with self.frame_lock:
+                cap = self.latest_capture_perf_ts
+                recv = self.latest_receive_perf_ts
+            if cap is None or recv is None:
+                continue
+            samples.append(recv - cap)
+
+        if not samples:
+            _logger.warning(
+                "%s: no frames captured during pipeline-latency probe; "
+                "skipping startup PTP check.",
+                self,
+            )
+            return
+
+        mean_ms = sum(samples) / len(samples) * 1e3
+        max_ms = max(samples) * 1e3
+        _logger.info(
+            "%s pipeline latency over %d frames: mean=%.1fms max=%.1fms.",
+            self,
+            len(samples),
+            mean_ms,
+            max_ms,
+        )
+
+        if mean_ms < 0.0 or mean_ms > 200.0:
+            _logger.warning(
+                "%s pipeline latency looks unhealthy (mean=%.1fms). "
+                "Looks like the sender/receiver wall-clocks aren't synced — "
+                "is `axol zed.sync-clocks` running on both machines?",
+                self,
+                mean_ms,
+            )
 
     def _start_read_thread(self) -> None:
         self._stop_read_thread()
@@ -156,7 +225,8 @@ class ZedCamera(Camera):
         self.stop_event = None
         with self.frame_lock:
             self.latest_frame = None
-            self.latest_timestamp = None
+            self.latest_capture_perf_ts = None
+            self.latest_receive_perf_ts = None
             self.new_frame_event.clear()
 
     def _read_loop(self) -> None:
@@ -181,10 +251,22 @@ class ZedCamera(Camera):
                 else:
                     frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
-                capture_time = time.perf_counter()
+                # Sender-side wall-clock timestamp of when the frame was
+                # exposed, shared across all ZED cameras on the sender.
+                cap_wall = (
+                    self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+                    * 1e-9
+                )
+                # Recompute the wall ↔ perf delta per frame so PTP step
+                # adjustments don't accumulate as silent skew.
+                recv_wall = time.time()
+                recv_perf = time.perf_counter()
+                cap_perf = recv_perf - (recv_wall - cap_wall)
+
                 with self.frame_lock:
                     self.latest_frame = frame
-                    self.latest_timestamp = capture_time
+                    self.latest_capture_perf_ts = cap_perf
+                    self.latest_receive_perf_ts = recv_perf
                 self.new_frame_event.set()
                 failure_count = 0
 
@@ -233,26 +315,96 @@ class ZedCamera(Camera):
         """Return the most recent frame immediately without waiting.
 
         Raises:
-            TimeoutError: If the latest frame is older than max_age_ms.
+            TimeoutError: If the latest frame is older than max_age_ms
+                (measured against ``receive_perf_ts``).
             RuntimeError: If no frame has been captured yet.
+        """
+        frame, _cap_ts, recv_ts = self.read_latest_with_ts()
+        age_ms = (time.perf_counter() - recv_ts) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest frame is too old: {age_ms:.1f}ms (max {max_age_ms}ms)."
+            )
+        return frame
+
+    @check_if_not_connected
+    def read_latest_with_ts(self) -> tuple[NDArray[Any], float, float]:
+        """Return the most recent frame and its ``(capture_ts, receive_ts)``.
+
+        Both timestamps are on the receiver's ``perf_counter`` clock —
+        ``capture_ts`` is the sender's exposure time converted via the per
+        frame wall→perf offset, and ``receive_ts`` is when this process
+        decoded the frame.
+
+        Raises:
+            RuntimeError: If the grab thread is not running or no frame has
+                been captured yet.
         """
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
 
         with self.frame_lock:
             frame = self.latest_frame
-            timestamp = self.latest_timestamp
+            cap_ts = self.latest_capture_perf_ts
+            recv_ts = self.latest_receive_perf_ts
 
-        if frame is None or timestamp is None:
+        if frame is None or cap_ts is None or recv_ts is None:
             raise RuntimeError(f"{self} has not captured any frames yet.")
 
-        age_ms = (time.perf_counter() - timestamp) * 1e3
-        if age_ms > max_age_ms:
-            raise TimeoutError(
-                f"{self} latest frame is too old: {age_ms:.1f}ms (max {max_age_ms}ms)."
-            )
+        return frame, cap_ts, recv_ts
 
-        return frame
+    @check_if_not_connected
+    def read_at_or_after(
+        self,
+        target_capture_perf_ts: float,
+        timeout_ms: float = 500,
+    ) -> tuple[NDArray[Any], float, float]:
+        """Block until a frame with capture time ``>= target`` is available.
+
+        This is the primary read path for dataset capture: by waiting for a
+        frame whose *sender-side* exposure time is at or after the teleop
+        tick, every camera and the joint sample share the same timeline.
+
+        Args:
+            target_capture_perf_ts: Earliest acceptable ``capture_perf_ts``,
+                expressed on the receiver's ``perf_counter`` clock.
+            timeout_ms: Maximum time to wait for a qualifying frame.
+
+        Returns:
+            ``(frame, capture_perf_ts, receive_perf_ts)``.
+
+        Raises:
+            TimeoutError: If no qualifying frame arrives within ``timeout_ms``.
+            RuntimeError: If the grab thread is not running.
+        """
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+
+        while True:
+            with self.frame_lock:
+                frame = self.latest_frame
+                cap_ts = self.latest_capture_perf_ts
+                recv_ts = self.latest_receive_perf_ts
+            if (
+                frame is not None
+                and cap_ts is not None
+                and recv_ts is not None
+                and cap_ts >= target_capture_perf_ts
+            ):
+                return frame, cap_ts, recv_ts
+
+            self.new_frame_event.clear()
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self} timed out waiting for frame at "
+                    f"capture_perf_ts >= {target_capture_perf_ts:.6f} "
+                    f"after {timeout_ms:.1f}ms "
+                    f"(latest cap_ts={cap_ts!r})."
+                )
+            self.new_frame_event.wait(timeout=remaining)
 
     def disconnect(self) -> None:
         """Stop the grab thread and close the ZED stream."""
