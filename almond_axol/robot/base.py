@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Self
 
 import numpy as np
 
@@ -12,6 +13,10 @@ class RobotBase(ABC):
 
     All position values are in radians. Gripper is normalised
     [0.0 closed, 1.0 open].
+
+    Subclasses inherit ``__aenter__`` / ``__aexit__`` which call
+    :meth:`enable` and :meth:`disable`, so they can be used with
+    ``async with``.
     """
 
     @abstractmethod
@@ -23,6 +28,13 @@ class RobotBase(ABC):
     async def disable(self) -> None:
         """Disable the robot, or stop the simulation server."""
         ...
+
+    async def __aenter__(self) -> Self:
+        await self.enable()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.disable()
 
     @abstractmethod
     async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:

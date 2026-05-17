@@ -10,11 +10,10 @@ Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no p
 
 - **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --robot sim`
   - Opens a viser 3D viewer at `http://localhost:8080` and a VR WebSocket server on port 8000.
-- The `Sim` class does not implement `__aenter__`/`__aexit__`; call `await sim.enable()` / `await sim.disable()` directly (despite the README showing `async with Sim()`).
 
 ### Linting
 
-- `ruff check .` and `ruff format --check .` — ruff is configured in `.pre-commit-config.yaml` (v0.9.7), not as a project dependency. Install via `uv tool install ruff@0.9.7`.
+- `ruff check .` and `ruff format --check .` — ruff is not a project dependency; it's pinned in `.pre-commit-config.yaml` (see the `rev:` field). Easiest: `uv tool install pre-commit && pre-commit run --all-files`, which uses the pinned version automatically. Or install ruff directly at the same version, e.g. `uv tool install ruff@0.9.7`.
 
 ### Testing
 
