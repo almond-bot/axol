@@ -729,13 +729,6 @@ class Axol(RobotBase):
         else:
             self.right = None
 
-    async def __aenter__(self) -> Axol:
-        await self.enable()
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        await self.disable()
-
     # ------------------------------------------------------------------ #
     # Polling                                                              #
     # ------------------------------------------------------------------ #
