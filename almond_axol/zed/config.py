@@ -25,7 +25,7 @@ class ZedConfig:
         overhead_port:    Streaming port for the overhead camera (default 30000).
         left_arm_port:    Streaming port for the left-arm camera (default 30002).
         right_arm_port:   Streaming port for the right-arm camera (default 30004).
-        resolution:       Capture resolution for all cameras (default HD1080).
+        resolution:       Capture resolution for all cameras (default SVGA).
         fps:              Capture frame rate for all cameras (default 60).
         bitrate:          HEVC encoding bitrate in kbits/s (default 8000).
     """
@@ -36,7 +36,7 @@ class ZedConfig:
     overhead_port: int = 30000
     left_arm_port: int = 30002
     right_arm_port: int = 30004
-    resolution: sl.RESOLUTION = field(default_factory=lambda: sl.RESOLUTION.HD1080)
+    resolution: sl.RESOLUTION = field(default_factory=lambda: sl.RESOLUTION.SVGA)
     fps: int = 60
     bitrate: int = 8000
 

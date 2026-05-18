@@ -10,6 +10,7 @@ from .motor import set_can_id, set_zero_pos
 from .tune import friction, pid, repeatability
 from .zed import install as zed_install
 from .zed import stream as zed_stream
+from .zed import sync_clocks as zed_sync_clocks
 
 
 def main() -> None:
@@ -26,6 +27,7 @@ def main() -> None:
     run_policy.add_parser(subparsers)
     teleop.add_parser(subparsers)
     zed_stream.add_parser(subparsers)
+    zed_sync_clocks.add_parser(subparsers)
     zed_install.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)

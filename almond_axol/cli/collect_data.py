@@ -11,14 +11,216 @@ While saving, the VR headset is pushed into the SAVING state so recording
 controls are blocked until save_episode() completes.
 
 Recording continues until Ctrl+C.
+
+Capture is decoupled from teleop
+--------------------------------
+
+The teleop loop runs at ``--teleop-hz`` and produces a fresh
+``(joint_obs, act_processed, t0)`` snapshot every iteration via
+``_SnapshotPublisher``. A separate ``_CaptureThread`` ticks at ``--fps`` and,
+for each tick, blocks on ``ZedCamera.read_at_or_after(T_n)`` so every
+recorded frame uses sender-clock-aligned camera data plus the latest joint
+snapshot. This keeps camera reads, image conversion, and ``dataset.add_frame``
+off the hot 120 Hz control loop.
 """
 
 import argparse
 import logging
+import shutil
 import socket
+import threading
 import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable
 
 from ..shared import ARM_JOINTS
+
+if TYPE_CHECKING:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.types import RobotAction, RobotObservation
+
+    from ..lerobot.robot.robot_axol import AxolRobot
+
+_logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _Snapshot:
+    """Atomic ``(joint_obs, action, capture_ts)`` bundle from one teleop tick.
+
+    Stored references — the producer always builds fresh dicts per tick, so
+    the capture thread observes a consistent slice without copying.
+    """
+
+    joint_obs: "RobotObservation"
+    action: "RobotAction"
+    ts: float
+
+
+class _SnapshotPublisher:
+    """Single-slot atomic publisher: teleop loop writes, capture thread reads.
+
+    The lock protects the slot itself, not the contained dicts — those are
+    rebuilt by the teleop loop on every tick and never mutated in place.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: _Snapshot | None = None
+        self._first_event = threading.Event()
+
+    def publish(
+        self,
+        joint_obs: "RobotObservation",
+        action: "RobotAction",
+        ts: float,
+    ) -> None:
+        snap = _Snapshot(joint_obs=joint_obs, action=action, ts=ts)
+        with self._lock:
+            self._latest = snap
+        self._first_event.set()
+
+    def latest(self) -> _Snapshot | None:
+        with self._lock:
+            return self._latest
+
+    def wait_for_first(self, timeout: float) -> bool:
+        return self._first_event.wait(timeout=timeout)
+
+
+class _CaptureThread(threading.Thread):
+    """Captures dataset frames at ``fps`` Hz, decoupled from the teleop loop.
+
+    Per tick the thread:
+
+    1. Sleeps until ``T_n = recording_start + n * frame_interval``.
+    2. For every camera, calls ``read_at_or_after(T_n)`` so the frame's
+       sender-clock capture time is at or after the tick boundary.
+    3. Snapshots ``publisher.latest()`` for the matching joint sample +
+       action that was actually commanded around the same instant.
+    4. Runs ``robot_obs_proc`` on the combined obs and appends the dataset
+       row.
+
+    On per-camera read timeout / failure the thread reuses the previous good
+    frame for that camera (use-cached policy) and logs at DEBUG.
+    """
+
+    def __init__(
+        self,
+        *,
+        publisher: _SnapshotPublisher,
+        robot: "AxolRobot",
+        dataset: "LeRobotDataset",
+        robot_obs_proc: Callable[[Any], Any],
+        fps: int,
+        task: str,
+        rerun_ip: str | None,
+    ) -> None:
+        super().__init__(name="axol-capture", daemon=True)
+        self.publisher = publisher
+        self.robot = robot
+        self.dataset = dataset
+        self.robot_obs_proc = robot_obs_proc
+        self.fps = fps
+        self.task = task
+        self.rerun_ip = rerun_ip
+        self.stop_event = threading.Event()
+
+    def run(self) -> None:
+        from lerobot.utils.constants import ACTION, OBS_STR
+        from lerobot.utils.feature_utils import build_dataset_frame
+        from lerobot.utils.visualization_utils import log_rerun_data
+
+        if not self.publisher.wait_for_first(timeout=5.0):
+            _logger.warning(
+                "Capture thread saw no publisher snapshot within 5s; exiting."
+            )
+            return
+        if self.stop_event.is_set():
+            return
+
+        frame_interval = 1.0 / self.fps
+        timeout_ms = int(2 * frame_interval * 1000 + 200)
+        recording_start = time.perf_counter()
+        last_frames: dict[str, tuple[Any, float, float]] = {}
+        tick = 0
+
+        while not self.stop_event.is_set():
+            target_perf_ts = recording_start + tick * frame_interval
+
+            wait_s = target_perf_ts - time.perf_counter()
+            if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
+                return
+
+            frames: dict[str, tuple[Any, float, float]] = {}
+            skip_tick = False
+            for cam_key, cam in self.robot.cameras.items():
+                try:
+                    frame, cap_ts, recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                        target_perf_ts, timeout_ms=timeout_ms
+                    )
+                except (TimeoutError, RuntimeError) as exc:
+                    cached = last_frames.get(cam_key)
+                    if cached is None:
+                        _logger.debug(
+                            "Capture tick %d: %s read failed (%s) and no "
+                            "cached frame; skipping tick.",
+                            tick,
+                            cam_key,
+                            exc,
+                        )
+                        skip_tick = True
+                        break
+                    _logger.debug(
+                        "Capture tick %d: %s read failed (%s); reusing cached frame.",
+                        tick,
+                        cam_key,
+                        exc,
+                    )
+                    frame, cap_ts, recv_ts = cached
+                frames[cam_key] = (frame, cap_ts, recv_ts)
+                last_frames[cam_key] = (frame, cap_ts, recv_ts)
+
+            if skip_tick:
+                tick += 1
+                continue
+
+            snap = self.publisher.latest()
+            if snap is None:
+                tick += 1
+                continue
+
+            obs: dict[str, Any] = dict(snap.joint_obs)
+            for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
+                obs[cam_key] = frame
+            obs_processed = self.robot_obs_proc(obs)
+
+            obs_frame = build_dataset_frame(
+                self.dataset.features, obs_processed, prefix=OBS_STR
+            )
+            act_frame = build_dataset_frame(
+                self.dataset.features, snap.action, prefix=ACTION
+            )
+            if self.stop_event.is_set():
+                return
+            self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
+
+            if self.rerun_ip:
+                log_rerun_data(observation=obs_processed, action=snap.action)
+
+            if _logger.isEnabledFor(logging.DEBUG) and tick % 30 == 0:
+                cam_skews = ", ".join(
+                    f"{k}: cap-T={1e3 * (cap_ts - target_perf_ts):+.1f}ms"
+                    for k, (_, cap_ts, _) in frames.items()
+                )
+                _logger.debug(
+                    "Capture tick %d skews — %s, T-snap.ts=%+.1fms",
+                    tick,
+                    cam_skews,
+                    1e3 * (target_perf_ts - snap.ts),
+                )
+
+            tick += 1
 
 
 def _parse_stiffness(value: str) -> float | tuple[float, ...]:
@@ -207,11 +409,10 @@ def _run(
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
     from lerobot.utils.feature_utils import (
-        build_dataset_frame,
         hw_to_dataset_features,
     )
     from lerobot.utils.utils import log_say
-    from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+    from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.camera.configuration_zed import ZedCameraConfig
     from ..lerobot.robot.config_axol import AxolRobotConfig
@@ -277,6 +478,9 @@ def _run(
             repo_id=repo_id,
             root=str(dataset_root),
             image_writer_threads=4,
+            streaming_encoding=True,
+            encoder_threads=4,
+            vcodec="auto",
         )
     else:
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -289,15 +493,19 @@ def _run(
             robot_type=robot.name,
             use_videos=True,
             image_writer_threads=4,
+            streaming_encoding=True,
+            encoder_threads=4,
+            vcodec="auto",
         )
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
     episodes_recorded = 0
-    episode_idx = dataset.num_episodes  # global index; increments as episodes are saved
+    episode_idx = dataset.num_episodes
     teleop_interval = 1.0 / teleop_hz
-    frame_interval = 1.0 / fps
+    publisher = _SnapshotPublisher()
+    capture: _CaptureThread | None = None
     try:
         while True:
             log_say(
@@ -306,41 +514,34 @@ def _run(
             dataset.clear_episode_buffer()
             recording = False
             rerecord = False
-            last_frame_t = 0.0  # timestamp of the last dataset frame written
 
             while True:
                 t0 = time.perf_counter()
 
-                # Joints-only observation — no camera copies at teleop rate.
+                # Joints-only observation — no camera reads on the hot loop.
                 joint_obs = robot.get_joint_observation()
                 teleop.send_feedback(joint_obs)
                 act = teleop.get_action()
                 act_processed = teleop_action_proc((act, joint_obs))
                 robot.send_action(robot_action_proc((act_processed, joint_obs)))
 
+                publisher.publish(joint_obs, act_processed, t0)
+
                 events = teleop.get_teleop_events()
 
                 if events.get("start_recording") and not recording:
                     recording = True
-                    last_frame_t = (
-                        t0 - frame_interval
-                    )  # align first frame to recording start
+                    capture = _CaptureThread(
+                        publisher=publisher,
+                        robot=robot,
+                        dataset=dataset,
+                        robot_obs_proc=robot_obs_proc,
+                        fps=fps,
+                        task=task,
+                        rerun_ip=rerun_ip,
+                    )
+                    capture.start()
                     log_say("Recording started.")
-
-                # Dataset frame at --fps rate: read cameras + process images here only.
-                if recording and (t0 - last_frame_t) >= frame_interval:
-                    last_frame_t += frame_interval
-                    obs = robot.get_observation()
-                    obs_processed = robot_obs_proc(obs)
-                    obs_frame = build_dataset_frame(
-                        dataset.features, obs_processed, prefix=OBS_STR
-                    )
-                    act_frame = build_dataset_frame(
-                        dataset.features, act_processed, prefix=ACTION
-                    )
-                    dataset.add_frame({**obs_frame, **act_frame, "task": task})
-                    if rerun_ip:
-                        log_rerun_data(observation=obs_processed, action=act_processed)
 
                 if events[TeleopEvents.TERMINATE_EPISODE]:
                     teleop.send_feedback_state(VRState.SAVING)
@@ -351,8 +552,11 @@ def _run(
 
                 time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
 
-            # Return to rest pose before the next episode so the operator
-            # starts each take from a consistent configuration.
+            if capture is not None:
+                capture.stop_event.set()
+                capture.join()
+                capture = None
+
             log_say("Returning to rest pose.")
             teleop.request_reset()
             reset_deadline = time.perf_counter() + 30.0
@@ -362,7 +566,7 @@ def _run(
                 act = teleop.get_action()
                 robot.send_action(robot_action_proc((act, joint_obs)))
                 time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
-            # Drain any VR events that fired during the reset move.
+            # Drain VR events fired during the reset move.
             teleop.get_teleop_events()
 
             if rerecord:
@@ -387,9 +591,25 @@ def _run(
         teleop.send_feedback_error()
         raise
     finally:
+        if capture is not None:
+            capture.stop_event.set()
+            capture.join()
+
         log_say("Stopping.")
+
         robot.disconnect()
         teleop.disconnect()
+
         dataset.finalize()
+
         if push_to_hub and episodes_recorded > 0:
             dataset.push_to_hub()
+
+        if not is_complete and episodes_recorded == 0 and dataset_root.exists():
+            try:
+                shutil.rmtree(dataset_root)
+                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                )

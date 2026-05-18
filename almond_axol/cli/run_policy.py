@@ -238,6 +238,10 @@ def _run(
             while time.perf_counter() < deadline:
                 t0 = time.perf_counter()
 
+                # TODO: swap in `ZedCamera.read_at_or_after(t0)` so inference
+                # uses the same sender-clock-aligned camera/joint pairing as
+                # the training data — `read_latest()` introduces a ~1 frame
+                # skew vs training.
                 obs = robot.get_observation()
                 obs_processed = robot_obs_proc(obs)
 

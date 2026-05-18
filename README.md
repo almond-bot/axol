@@ -218,7 +218,9 @@ axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --left-s
 | `TERMINATE_EPISODE` | Save the episode; headset enters `Saving` state until write completes |
 | `RERECORD_EPISODE` | Discard and retry |
 
-After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off.
+After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off; conversely, if no episodes were saved before exit the empty dataset directory is removed on shutdown so an aborted session does not leave a half-initialized dataset on disk.
+
+Dataset frame capture runs on a dedicated thread decoupled from the teleop control loop. Teleop ticks at `--teleop-hz` and only ever touches joint state; the capture thread ticks at `--fps`, blocks on `ZedCamera.read_at_or_after(T_n)` per camera so every recorded frame is sender-clock-aligned with the joint sample taken at `T_n`, and writes the dataset row. This keeps camera reads, image conversion, and `dataset.add_frame()` off the hot control loop, and produces datasets whose camera/joint pairing matches the sender's exposure timeline rather than the receiver's decode timeline. Both clocks must agree — make sure [`zed.sync-clocks`](#zedsync-clocks--time-synchronization) is running on both machines.
 
 ---
 
@@ -281,6 +283,33 @@ Downloads and installs the `pyzed` Python wheel matching the installed ZED SDK v
 ```bash
 axol zed.install
 ```
+
+### `zed.sync-clocks` — Time synchronization
+
+The Jetson sender and the upper-computer receiver run independent system clocks. The ZED SDK stamps every frame with the sender's `CLOCK_REALTIME` via `TIME_REFERENCE.IMAGE`; the receiver then converts that timestamp onto its own `perf_counter` so dataset rows record the moment of *capture*, not the moment of decode. None of that produces aligned data unless both machines agree on what time it is.
+
+`axol zed.sync-clocks` runs a PTP (Precision Time Protocol) daemon over the direct ethernet link, holding the two clocks to sub-millisecond agreement — well below one camera frame period at 60 fps. The startup pipeline-latency check in `ZedCamera.connect()` warns loudly if the mean `receive_perf - capture_perf` falls outside `[0, 200] ms`, which is the operator-visible "PTP isn't running" canary.
+
+| Flag | Description |
+|---|---|
+| `--role {master,slave}` | `master` on the long-lived upper computer (owns the dataset); `slave` on the Jetson sender |
+| `--iface IFACE` | Network interface carrying the direct link (e.g. `eth0`) |
+| `--transport {l2,udpv4}` | `l2` (raw ethernet, default) or `udpv4` |
+| `--timestamping {auto,hardware,software}` | `auto` (default) probes `ethtool -T` and prefers hardware |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+Two-terminal recipe (one per machine, both stay running for the whole session):
+
+```bash
+axol zed.sync-clocks --role master --iface eth0   # upper computer
+axol zed.sync-clocks --role slave  --iface eth0   # Jetson
+```
+
+The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install fallback) are escalated inline via `sudo`, so you do **not** run `axol` itself as root. Sudo will prompt for a password the first time and reuse cached credentials for the rest of the session. The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`; on Debian/Ubuntu these are auto-installed if missing. On non-apt systems install them manually (`linuxptp`, `ethtool`) and rerun.
+
+Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.
+
+If you cannot install `linuxptp` for some reason, `chronyd` over the same direct link is a serviceable fallback — accuracy is worse (milliseconds rather than microseconds), so the DEBUG capture-skew logs will show wider spreads, but data will still align well enough for training.
 
 ---
 
@@ -823,7 +852,7 @@ asyncio.run(main())
 | `overhead_port` | `30000` | Streaming port for the overhead camera |
 | `left_arm_port` | `30002` | Streaming port for the left-arm camera |
 | `right_arm_port` | `30004` | Streaming port for the right-arm camera |
-| `resolution` | `HD1080` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
+| `resolution` | `SVGA` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
 | `fps` | `60` | Capture frame rate for all cameras |
 | `bitrate` | `8000` kbps | HEVC encoding bitrate |
 
@@ -1009,6 +1038,14 @@ cam.connect()
 frame = cam.read_latest()   # shape (H, W, 3), non-blocking, returns most recent frame
 cam.disconnect()
 ```
+
+Each grabbed frame carries two timestamps on the receiver's `perf_counter` clock: `capture_perf_ts` (when the *sender* exposed the frame, derived from `TIME_REFERENCE.IMAGE`) and `receive_perf_ts` (when this process decoded it). Cross-clock alignment requires PTP — see [`zed.sync-clocks`](#zedsync-clocks--time-synchronization). The receive-vs-capture skew is sampled on `connect()` and a warning is logged if the mean falls outside `[0, 200] ms`.
+
+| Method | Description |
+|---|---|
+| `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
+| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Used by `collect-data` to align every camera and the joint sample on the same sender-side timeline. |
 
 **`ZedCameraConfig` fields**
 

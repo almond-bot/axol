@@ -145,6 +145,7 @@ class ZedStreamer:
         stream_params.codec = sl.STREAMING_CODEC.H265
         stream_params.bitrate = self._config.bitrate
         stream_params.port = port
+        stream_params.target_framerate = self._config.fps
 
         err = zed.enable_streaming(stream_params)
         if err != sl.ERROR_CODE.SUCCESS:
