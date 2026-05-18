@@ -14,17 +14,18 @@ this command exists to deliver.
 
 Typical operator workflow (one terminal per machine):
 
-    sudo axol zed.sync-clocks --role master --iface eth0   # upper computer
-    sudo axol zed.sync-clocks --role slave  --iface eth0   # Jetson
+    axol zed.sync-clocks --role master --iface eth0   # upper computer
+    axol zed.sync-clocks --role slave  --iface eth0   # Jetson
 
 Both processes stay running in the foreground for the duration of any
 collection session.
 
-Dependencies (`ptp4l`, `phc2sys`, optionally `ethtool`) are auto-installed
-via `apt-get` on Debian/Ubuntu if missing. Because the command must already
-be run with sudo (or as root) for PTP to discipline the system clock, the
-install runs with the same privileges. On non-apt systems install them
-manually (`linuxptp` for ptp4l/phc2sys, plus `ethtool`).
+The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install
+fallback) are escalated inline via `sudo`, so the `axol` invocation itself
+does not need to be run as root. Sudo will prompt for a password on first
+escalation and reuse cached credentials for the rest of the session. On
+non-apt systems install `linuxptp` (for ptp4l/phc2sys) and `ethtool`
+manually before running this command.
 """
 
 from __future__ import annotations
@@ -139,16 +140,20 @@ def _run(*, role: str, iface: str, transport: str, timestamping: str) -> None:
         timestamping_mode,
     )
 
-    ptp4l_cmd = _build_ptp4l_cmd(
-        iface=iface,
-        role=role,
-        transport=transport,
-        timestamping=timestamping_mode,
+    ptp4l_cmd = _with_sudo(
+        _build_ptp4l_cmd(
+            iface=iface,
+            role=role,
+            transport=transport,
+            timestamping=timestamping_mode,
+        )
     )
-    phc2sys_cmd = _build_phc2sys_cmd(
-        iface=iface,
-        role=role,
-        timestamping=timestamping_mode,
+    phc2sys_cmd = _with_sudo(
+        _build_phc2sys_cmd(
+            iface=iface,
+            role=role,
+            timestamping=timestamping_mode,
+        )
     )
 
     _logger.info("ptp4l:   %s", " ".join(ptp4l_cmd))
@@ -211,6 +216,17 @@ def _run(*, role: str, iface: str, transport: str, timestamping: str) -> None:
             t.join(timeout=2.0)
 
 
+def _with_sudo(cmd: list[str]) -> list[str]:
+    """Prepend `sudo` when the current process is not already root.
+
+    Sudo caches credentials per-tty for ~5 minutes by default, so back-to-back
+    privileged subprocesses (ptp4l + phc2sys) only prompt for a password once.
+    """
+    if os.geteuid() == 0:
+        return cmd
+    return ["sudo", *cmd]
+
+
 def _ensure_executable(name: str, *, required: bool) -> bool:
     """Return True if ``name`` is on PATH, installing it via apt if missing.
 
@@ -229,17 +245,7 @@ def _ensure_executable(name: str, *, required: bool) -> bool:
             name,
             pkg,
         )
-        # Prepend `sudo` only when we're not already root so this also works
-        # in container/CI environments that run as root without sudo installed.
-        prefix = [] if os.geteuid() == 0 else ["sudo"]
-        cmd = [
-            *prefix,
-            "apt-get",
-            "install",
-            "-y",
-            "--no-install-recommends",
-            pkg,
-        ]
+        cmd = _with_sudo(["apt-get", "install", "-y", "--no-install-recommends", pkg])
         env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
         try:
             subprocess.run(cmd, check=True, env=env)

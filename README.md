@@ -290,11 +290,11 @@ The Jetson sender and the upper-computer receiver run independent system clocks.
 Two-terminal recipe (one per machine, both stay running for the whole session):
 
 ```bash
-sudo axol zed.sync-clocks --role master --iface eth0   # upper computer
-sudo axol zed.sync-clocks --role slave  --iface eth0   # Jetson
+axol zed.sync-clocks --role master --iface eth0   # upper computer
+axol zed.sync-clocks --role slave  --iface eth0   # Jetson
 ```
 
-The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`. On Debian/Ubuntu these are auto-installed via `apt-get` on first run if missing — the command must already be invoked with `sudo` (or as root) for PTP to discipline the system clock, so the install runs with the same privileges. On non-apt systems, install them manually (`linuxptp`, `ethtool`) and rerun.
+The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install fallback) are escalated inline via `sudo`, so you do **not** run `axol` itself as root. Sudo will prompt for a password the first time and reuse cached credentials for the rest of the session. The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`; on Debian/Ubuntu these are auto-installed if missing. On non-apt systems install them manually (`linuxptp`, `ethtool`) and rerun.
 
 Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.
 
