@@ -14,10 +14,13 @@ touch.
 Useful for measuring how reliably the grippers return to the same
 physical contact point after a long sequence of motions.
 
+The arms always run at maximum stiffness (the pre-tuning industrial gains
+in :data:`_STIFF_GAINS`) — repeatability is meaningless under the compliant
+gains used for teleop.
+
 Examples:
-    axol tune.repeatability                    # forever, max compliance
-    axol tune.repeatability --stiffness 0.5    # blend partway to stiff gains
-    axol tune.repeatability --cycles 5         # five touch-and-return cycles
+    axol tune.repeatability               # forever
+    axol tune.repeatability --cycles 5    # five touch-and-return cycles
 """
 
 from __future__ import annotations
@@ -256,16 +259,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         description=__doc__,
     )
     p.add_argument(
-        "--stiffness",
-        type=float,
-        default=0.0,
-        help=(
-            "Compliance ↔ stiffness blend in [0, 1]. 0 (default) is fully "
-            "compliant; 1 restores the pre-tuning industrial gains. See "
-            "AxolConfig.stiffness."
-        ),
-    )
-    p.add_argument(
         "--cycles",
         type=int,
         default=0,
@@ -325,8 +318,6 @@ def run(args: argparse.Namespace) -> None:
 async def _run(args: argparse.Namespace) -> None:
     if args.no_left and args.no_right:
         raise SystemExit("Both arms disabled — nothing to test.")
-    if not 0.0 <= args.stiffness <= 1.0:
-        raise SystemExit(f"--stiffness must be in [0, 1], got {args.stiffness}")
 
     rest_cfg = VRTeleopConfig()
 
@@ -373,12 +364,12 @@ async def _run(args: argparse.Namespace) -> None:
         axol_kwargs["left_channel"] = None
     if args.no_right:
         axol_kwargs["right_channel"] = None
-    axol_config = AxolConfig(stiffness=args.stiffness)
+    axol_config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
     axol_config.left.gripper.torque_limit = args.gripper_torque_limit
     axol_config.right.gripper.torque_limit = args.gripper_torque_limit
 
     print(
-        f"Repeatability run: stiffness={args.stiffness:.2f}, "
+        f"Repeatability run: "
         f"{'∞' if args.cycles == 0 else args.cycles} cycle(s), "
         f"rate={args.rate:.0f} Hz. Press Ctrl-C to stop."
     )

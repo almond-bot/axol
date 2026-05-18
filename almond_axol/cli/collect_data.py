@@ -217,6 +217,44 @@ class _CaptureThread(threading.Thread):
 
             tick += 1
 
+from ..shared import ARM_JOINTS
+
+
+def _parse_stiffness(value: str) -> float | tuple[float, ...]:
+    """Parse a ``--*-stiffness`` value.
+
+    Accepts either a single number in ``[0, 1]`` (applied to all arm
+    joints) or exactly ``len(ARM_JOINTS)`` comma-separated numbers in
+    ``[0, 1]`` — one per joint in :data:`almond_axol.shared.ARM_JOINTS`
+    order (the gripper is not blended).
+    """
+    parts = [p.strip() for p in value.split(",")]
+
+    def _parse_one(raw: str, label: str) -> float:
+        try:
+            x = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} is not a number: {raw!r}"
+            ) from exc
+        if not 0.0 <= x <= 1.0:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} must be in [0, 1], got {x}"
+            )
+        return x
+
+    if len(parts) == 1:
+        return _parse_one(parts[0], "")
+    if len(parts) != len(ARM_JOINTS):
+        raise argparse.ArgumentTypeError(
+            f"stiffness must be a single value or {len(ARM_JOINTS)} "
+            f"comma-separated values (one per joint: "
+            f"{', '.join(j.value for j in ARM_JOINTS)}), got {len(parts)}"
+        )
+    return tuple(
+        _parse_one(p, f"[{i}={ARM_JOINTS[i].value}]") for i, p in enumerate(parts)
+    )
+
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
     p = subparsers.add_parser("collect-data", help="Record teleoperation episodes.")
@@ -267,10 +305,39 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         ),
     )
     p.add_argument(
-        "--gripper-torque-limit",
+        "--left-gripper-torque-limit",
         type=float,
         default=1.0,
-        help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+        help="Max output torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
+        "--right-gripper-torque-limit",
+        type=float,
+        default=1.0,
+        help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    stiffness_help = (
+        "Compliance ↔ stiffness blend in [0, 1] for the {side} arm. "
+        f"Either a single value applied to all {len(ARM_JOINTS)} joints, "
+        f"or {len(ARM_JOINTS)} comma-separated values (one per joint, in "
+        f"order: {', '.join(j.value for j in ARM_JOINTS)}; gripper "
+        "excluded). 0 (default) is fully compliant; 1 restores the "
+        "pre-tuning industrial gains. See AxolConfig.{attr}."
+    )
+    stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
+    p.add_argument(
+        "--left-stiffness",
+        type=_parse_stiffness,
+        default=0.0,
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="left", attr="left_stiffness"),
+    )
+    p.add_argument(
+        "--right-stiffness",
+        type=_parse_stiffness,
+        default=0.0,
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="right", attr="right_stiffness"),
     )
     p.add_argument(
         "--rerun-ip",
@@ -307,7 +374,10 @@ def run(args: argparse.Namespace) -> None:
         push_to_hub=args.push_to_hub,
         zed_host=args.zed_host,
         zed_iface=args.zed_iface,
-        gripper_torque_limit=args.gripper_torque_limit,
+        left_gripper_torque_limit=args.left_gripper_torque_limit,
+        right_gripper_torque_limit=args.right_gripper_torque_limit,
+        left_stiffness=args.left_stiffness,
+        right_stiffness=args.right_stiffness,
         rerun_ip=args.rerun_ip,
         rerun_port=args.rerun_port,
     )
@@ -322,7 +392,10 @@ def _run(
     push_to_hub: bool = False,
     zed_host: str = "192.168.10.1",
     zed_iface: str | None = None,
-    gripper_torque_limit: float = 1.0,
+    left_gripper_torque_limit: float = 1.0,
+    right_gripper_torque_limit: float = 1.0,
+    left_stiffness: float | tuple[float, ...] = 0.0,
+    right_stiffness: float | tuple[float, ...] = 0.0,
     rerun_ip: str | None = None,
     rerun_port: int = 9876,
 ) -> None:
@@ -350,9 +423,12 @@ def _run(
     if zed_iface:
         setup_link_ip(zed_iface, "192.168.10.2/24")
 
-    axol_config = AxolConfig()
-    axol_config.left.gripper.torque_limit = gripper_torque_limit
-    axol_config.right.gripper.torque_limit = gripper_torque_limit
+    axol_config = AxolConfig(
+        left_stiffness=left_stiffness,
+        right_stiffness=right_stiffness,
+    )
+    axol_config.left.gripper.torque_limit = left_gripper_torque_limit
+    axol_config.right.gripper.torque_limit = right_gripper_torque_limit
     robot_config = AxolRobotConfig(
         cameras={
             "overhead": ZedCameraConfig(host=zed_host, port=30000),

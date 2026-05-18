@@ -101,7 +101,10 @@ The terminal will print the hostname and IP address. Open the VR app at [axol.al
 |---|---|
 | `--no-left` | Disable the left arm |
 | `--no-right` | Disable the right arm |
-| `--gripper-torque-limit FLOAT` | Max gripper torque in Nm (default: `1.0`) |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper (default: `1.0`) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper (default: `1.0`) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`; scalar or 7 comma-separated values. `0` (default) = fully compliant. |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ### Test without hardware
