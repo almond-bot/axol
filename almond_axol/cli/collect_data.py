@@ -46,10 +46,11 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _Snapshot:
-    """Atomic ``(joint_obs, action, capture_ts)`` bundle from one teleop tick.
+    """One teleop tick's ``(joint_obs, action, ts)`` bundle.
 
-    Stored references — the producer always builds fresh dicts per tick, so
-    the capture thread observes a consistent slice without copying.
+    The teleop loop rebuilds the inner dicts every tick rather than mutating
+    them in place, so the capture thread can read a published snapshot
+    without copying or locking the dicts themselves.
     """
 
     joint_obs: "RobotObservation"
@@ -58,10 +59,10 @@ class _Snapshot:
 
 
 class _SnapshotPublisher:
-    """Single-slot atomic publisher: teleop loop writes, capture thread reads.
+    """Single-slot atomic publisher: teleop writes, capture reads.
 
-    The lock protects the slot itself, not the contained dicts — those are
-    rebuilt by the teleop loop on every tick and never mutated in place.
+    The lock only protects the slot pointer; the inner dicts are immutable
+    per tick (see :class:`_Snapshot`).
     """
 
     def __init__(self) -> None:
@@ -75,16 +76,19 @@ class _SnapshotPublisher:
         action: "RobotAction",
         ts: float,
     ) -> None:
+        """Publish a fresh snapshot, replacing any previous one."""
         snap = _Snapshot(joint_obs=joint_obs, action=action, ts=ts)
         with self._lock:
             self._latest = snap
         self._first_event.set()
 
     def latest(self) -> _Snapshot | None:
+        """Return the most recently published snapshot, or ``None`` if none yet."""
         with self._lock:
             return self._latest
 
     def wait_for_first(self, timeout: float) -> bool:
+        """Block until the first :meth:`publish` call, up to ``timeout`` seconds."""
         return self._first_event.wait(timeout=timeout)
 
 

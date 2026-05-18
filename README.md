@@ -1041,11 +1041,13 @@ cam.disconnect()
 
 Each grabbed frame carries two timestamps on the receiver's `perf_counter` clock: `capture_perf_ts` (when the *sender* exposed the frame, derived from `TIME_REFERENCE.IMAGE`) and `receive_perf_ts` (when this process decoded it). Cross-clock alignment requires PTP — see [`zed.sync-clocks`](#zedsync-clocks--time-synchronization). The receive-vs-capture skew is sampled on `connect()` and a warning is logged if the mean falls outside `[0, 200] ms`.
 
+**Key methods**
+
 | Method | Description |
 |---|---|
-| `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
-| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
-| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Used by `collect-data` to align every camera and the joint sample on the same sender-side timeline. |
+| `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms` |
+| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available; used by `collect-data` to align every camera and the joint sample on the same sender-side timeline |
 
 **`ZedCameraConfig` fields**
 
