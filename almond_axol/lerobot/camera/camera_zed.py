@@ -383,6 +383,7 @@ class ZedCamera(Camera):
         deadline = time.perf_counter() + timeout_ms / 1000.0
 
         while True:
+            self.new_frame_event.clear()
             with self.frame_lock:
                 frame = self.latest_frame
                 cap_ts = self.latest_capture_perf_ts
@@ -395,7 +396,6 @@ class ZedCamera(Camera):
             ):
                 return frame, cap_ts, recv_ts
 
-            self.new_frame_event.clear()
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 raise TimeoutError(

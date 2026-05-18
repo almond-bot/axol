@@ -201,6 +201,8 @@ class _CaptureThread(threading.Thread):
             act_frame = build_dataset_frame(
                 self.dataset.features, snap.action, prefix=ACTION
             )
+            if self.stop_event.is_set():
+                return
             self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
 
             if self.rerun_ip:
@@ -552,11 +554,7 @@ def _run(
 
             if capture is not None:
                 capture.stop_event.set()
-                capture.join(timeout=2.0)
-                if capture.is_alive():
-                    _logger.warning(
-                        "Capture thread did not stop within 2.0s; continuing."
-                    )
+                capture.join()
                 capture = None
 
             log_say("Returning to rest pose.")
@@ -595,7 +593,7 @@ def _run(
     finally:
         if capture is not None:
             capture.stop_event.set()
-            capture.join(timeout=2.0)
+            capture.join()
 
         log_say("Stopping.")
 
