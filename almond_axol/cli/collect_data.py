@@ -500,7 +500,7 @@ def _run(
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
     episodes_recorded = 0
-    episode_idx = dataset.num_episodes  # global index; increments as episodes are saved
+    episode_idx = dataset.num_episodes
     teleop_interval = 1.0 / teleop_hz
     publisher = _SnapshotPublisher()
     capture: _CaptureThread | None = None
@@ -516,15 +516,13 @@ def _run(
             while True:
                 t0 = time.perf_counter()
 
-                # Joints-only observation — no camera copies at teleop rate.
+                # Joints-only observation — no camera reads on the hot loop.
                 joint_obs = robot.get_joint_observation()
                 teleop.send_feedback(joint_obs)
                 act = teleop.get_action()
                 act_processed = teleop_action_proc((act, joint_obs))
                 robot.send_action(robot_action_proc((act_processed, joint_obs)))
 
-                # Publish every iteration so the capture thread always has a
-                # fresh snapshot (and a non-empty publisher) when it starts.
                 publisher.publish(joint_obs, act_processed, t0)
 
                 events = teleop.get_teleop_events()
@@ -561,8 +559,6 @@ def _run(
                     )
                 capture = None
 
-            # Return to rest pose before the next episode so the operator
-            # starts each take from a consistent configuration.
             log_say("Returning to rest pose.")
             teleop.request_reset()
             reset_deadline = time.perf_counter() + 30.0
@@ -572,7 +568,7 @@ def _run(
                 act = teleop.get_action()
                 robot.send_action(robot_action_proc((act, joint_obs)))
                 time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
-            # Drain any VR events that fired during the reset move.
+            # Drain VR events fired during the reset move.
             teleop.get_teleop_events()
 
             if rerecord:
