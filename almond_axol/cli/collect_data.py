@@ -32,6 +32,8 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
+from ..shared import ARM_JOINTS
+
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.types import RobotAction, RobotObservation
@@ -216,8 +218,6 @@ class _CaptureThread(threading.Thread):
                 )
 
             tick += 1
-
-from ..shared import ARM_JOINTS
 
 
 def _parse_stiffness(value: str) -> float | tuple[float, ...]:
@@ -475,6 +475,9 @@ def _run(
             repo_id=repo_id,
             root=str(dataset_root),
             image_writer_threads=4,
+            streaming_encoding=True,
+            encoder_threads=4,
+            vcodec="auto",
         )
     else:
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -487,6 +490,9 @@ def _run(
             robot_type=robot.name,
             use_videos=True,
             image_writer_threads=4,
+            streaming_encoding=True,
+            encoder_threads=4,
+            vcodec="auto",
         )
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
