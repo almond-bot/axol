@@ -26,6 +26,7 @@ off the hot 120 Hz control loop.
 
 import argparse
 import logging
+import shutil
 import socket
 import threading
 import time
@@ -599,9 +600,22 @@ def _run(
         if capture is not None:
             capture.stop_event.set()
             capture.join(timeout=2.0)
+
         log_say("Stopping.")
+
         robot.disconnect()
         teleop.disconnect()
+
         dataset.finalize()
+
         if push_to_hub and episodes_recorded > 0:
             dataset.push_to_hub()
+
+        if not is_complete and episodes_recorded == 0 and dataset_root.exists():
+            try:
+                shutil.rmtree(dataset_root)
+                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                )
