@@ -294,7 +294,9 @@ sudo axol zed.sync-clocks --role master --iface eth0   # upper computer
 sudo axol zed.sync-clocks --role slave  --iface eth0   # Jetson
 ```
 
-The command requires the `linuxptp` package (`ptp4l` + `phc2sys`); install with `sudo apt install linuxptp` on Debian/Ubuntu. Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.
+The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`. On Debian/Ubuntu these are auto-installed via `apt-get` on first run if missing — the command must already be invoked with `sudo` (or as root) for PTP to discipline the system clock, so the install runs with the same privileges. On non-apt systems, install them manually (`linuxptp`, `ethtool`) and rerun.
+
+Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.
 
 If you cannot install `linuxptp` for some reason, `chronyd` over the same direct link is a serviceable fallback — accuracy is worse (milliseconds rather than microseconds), so the DEBUG capture-skew logs will show wider spreads, but data will still align well enough for training.
 

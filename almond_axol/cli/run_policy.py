@@ -238,7 +238,7 @@ def _run(
             while time.perf_counter() < deadline:
                 t0 = time.perf_counter()
 
-                # NOTE: training datasets collected by `axol collect-data` use
+                # TODO: training datasets collected by `axol collect-data` use
                 # sender-clock alignment via `ZedCamera.read_at_or_after(T_n)`
                 # so each row pairs the joint sample taken at T_n with camera
                 # frames whose exposure time is at or after T_n. This loop

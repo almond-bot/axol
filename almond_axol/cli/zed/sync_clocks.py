@@ -19,12 +19,19 @@ Typical operator workflow (one terminal per machine):
 
 Both processes stay running in the foreground for the duration of any
 collection session.
+
+Dependencies (`ptp4l`, `phc2sys`, optionally `ethtool`) are auto-installed
+via `apt-get` on Debian/Ubuntu if missing. Because the command must already
+be run with sudo (or as root) for PTP to discipline the system clock, the
+install runs with the same privileges. On non-apt systems install them
+manually (`linuxptp` for ptp4l/phc2sys, plus `ethtool`).
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shutil
 import signal
@@ -40,6 +47,14 @@ _OFFSET_RE = re.compile(
     r"master offset\s+(?P<offset>-?\d+)\b.*?freq\s+(?P<freq>-?\d+)",
     re.IGNORECASE,
 )
+
+# Map executable name -> apt package that provides it. Used by
+# `_ensure_executable` to auto-install missing dependencies on Debian/Ubuntu.
+_APT_PACKAGES = {
+    "ptp4l": "linuxptp",
+    "phc2sys": "linuxptp",
+    "ethtool": "ethtool",
+}
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -106,8 +121,8 @@ def run(args: argparse.Namespace) -> None:
 
 
 def _run(*, role: str, iface: str, transport: str, timestamping: str) -> None:
-    _require_executable("ptp4l")
-    _require_executable("phc2sys")
+    _ensure_executable("ptp4l", required=True)
+    _ensure_executable("phc2sys", required=True)
 
     if not Path(f"/sys/class/net/{iface}").exists():
         raise SystemExit(
@@ -196,12 +211,56 @@ def _run(*, role: str, iface: str, transport: str, timestamping: str) -> None:
             t.join(timeout=2.0)
 
 
-def _require_executable(name: str) -> None:
-    if shutil.which(name) is None:
-        raise SystemExit(
-            f"error: `{name}` not found on PATH. Install the `linuxptp` package "
-            f"(e.g. `sudo apt install linuxptp`) and rerun."
+def _ensure_executable(name: str, *, required: bool) -> bool:
+    """Return True if ``name`` is on PATH, installing it via apt if missing.
+
+    Auto-install only runs on systems where ``apt-get`` is available
+    (Debian/Ubuntu). When ``required`` is True and the executable cannot be
+    made available, raises ``SystemExit`` with a manual-install hint;
+    otherwise returns False and the caller is expected to degrade gracefully.
+    """
+    if shutil.which(name) is not None:
+        return True
+
+    pkg = _APT_PACKAGES.get(name)
+    if pkg is not None and shutil.which("apt-get") is not None:
+        _logger.info(
+            "`%s` not found on PATH — installing the `%s` apt package ...",
+            name,
+            pkg,
         )
+        # Prepend `sudo` only when we're not already root so this also works
+        # in container/CI environments that run as root without sudo installed.
+        prefix = [] if os.geteuid() == 0 else ["sudo"]
+        cmd = [
+            *prefix,
+            "apt-get",
+            "install",
+            "-y",
+            "--no-install-recommends",
+            pkg,
+        ]
+        env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        try:
+            subprocess.run(cmd, check=True, env=env)
+        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+            _logger.warning("Auto-install of `%s` failed: %s", pkg, exc)
+        else:
+            if shutil.which(name) is not None:
+                _logger.info("Installed `%s` (provides `%s`).", pkg, name)
+                return True
+
+    if required:
+        hint = (
+            f"sudo apt install {pkg}"
+            if pkg is not None
+            else f"install `{name}` and rerun"
+        )
+        raise SystemExit(
+            f"error: `{name}` not found on PATH and auto-install was "
+            f"unavailable or failed. Try manually: {hint}."
+        )
+    return False
 
 
 def _resolve_timestamping(iface: str, mode: str) -> str:
@@ -224,9 +283,10 @@ def _resolve_timestamping(iface: str, mode: str) -> str:
 
 
 def _probe_hardware_timestamping(iface: str) -> bool:
-    if shutil.which("ethtool") is None:
+    if not _ensure_executable("ethtool", required=False):
         _logger.warning(
-            "ethtool not installed; cannot probe hardware timestamping for %s.",
+            "ethtool not installed and auto-install failed; cannot probe "
+            "hardware timestamping for %s.",
             iface,
         )
         return False
