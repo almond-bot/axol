@@ -850,7 +850,7 @@ asyncio.run(main())
 | `overhead_port` | `30000` | Streaming port for the overhead camera |
 | `left_arm_port` | `30002` | Streaming port for the left-arm camera |
 | `right_arm_port` | `30004` | Streaming port for the right-arm camera |
-| `resolution` | `HD1080` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
+| `resolution` | `SVGA` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
 | `fps` | `60` | Capture frame rate for all cameras |
 | `bitrate` | `8000` kbps | HEVC encoding bitrate |
 
