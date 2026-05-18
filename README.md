@@ -218,7 +218,9 @@ axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --left-s
 | `TERMINATE_EPISODE` | Save the episode; headset enters `Saving` state until write completes |
 | `RERECORD_EPISODE` | Discard and retry |
 
-After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off.
+After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off; conversely, if no episodes were saved before exit the empty dataset directory is removed on shutdown so an aborted session does not leave a half-initialized dataset on disk.
+
+Dataset frame capture runs on a dedicated thread decoupled from the teleop control loop. Teleop ticks at `--teleop-hz` and only ever touches joint state; the capture thread ticks at `--fps`, blocks on `ZedCamera.read_at_or_after(T_n)` per camera so every recorded frame is sender-clock-aligned with the joint sample taken at `T_n`, and writes the dataset row. This keeps camera reads, image conversion, and `dataset.add_frame()` off the hot control loop, and produces datasets whose camera/joint pairing matches the sender's exposure timeline rather than the receiver's decode timeline. Both clocks must agree — make sure [`zed.sync-clocks`](#zedsync-clocks--time-synchronization) is running on both machines.
 
 ---
 
@@ -1036,6 +1038,14 @@ cam.connect()
 frame = cam.read_latest()   # shape (H, W, 3), non-blocking, returns most recent frame
 cam.disconnect()
 ```
+
+Each grabbed frame carries two timestamps on the receiver's `perf_counter` clock: `capture_perf_ts` (when the *sender* exposed the frame, derived from `TIME_REFERENCE.IMAGE`) and `receive_perf_ts` (when this process decoded it). Cross-clock alignment requires PTP — see [`zed.sync-clocks`](#zedsync-clocks--time-synchronization). The receive-vs-capture skew is sampled on `connect()` and a warning is logged if the mean falls outside `[0, 200] ms`.
+
+| Method | Description |
+|---|---|
+| `read_latest(max_age_ms=500)` | Most recent frame, non-blocking; raises `TimeoutError` if it is older than `max_age_ms`. |
+| `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
+| `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Used by `collect-data` to align every camera and the joint sample on the same sender-side timeline. |
 
 **`ZedCameraConfig` fields**
 
