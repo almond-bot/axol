@@ -243,31 +243,154 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
-def _move_to_rest(robot: "AxolRobot", fps: int, duration_s: float = 5.0) -> None:
-    """Send the robot to the default rest pose for ``duration_s`` seconds.
+class _IKResetController:
+    """Collision-aware return-to-rest, backed by an IK worker subprocess.
 
-    Uses the rest poses defined in VRTeleopConfig (arm joints) with gripper
-    fully open. The robot's impedance controller smoothly tracks the target.
+    Mirrors the reset path used by ``AxolVRTeleop`` (collect-data) but
+    without the VR server. ``start()`` spawns ``run_ik_worker`` in a
+    ``spawn``-mode subprocess; it imports JAX, JITs the IK solver
+    (~10-20 s), and reports ``("ready", ...)``. ``wait_ready()`` blocks on
+    that message. ``return_to_rest()`` then asks the worker for a
+    collision-aware joint-space trajectory from the current pose to the
+    rest pose and plays it back through a ``ResetInterpolator`` while
+    streaming each waypoint to the impedance controller.
+
+    Spawn it before ``client.start()`` so the IK JIT overlaps with the
+    policy load — by the time we actually need a rest move, the worker is
+    typically already ready.
     """
-    from ..shared import Joint
-    from ..teleop.config import VRTeleopConfig
 
-    cfg = VRTeleopConfig()
-    rest: dict[str, float] = {}
-    for j in Joint:
-        if j in ARM_JOINTS:
-            arm_i = ARM_JOINTS.index(j)
-            rest[f"left_{j.value}.pos"] = float(cfg.rest_pose_left[arm_i])
-            rest[f"right_{j.value}.pos"] = float(cfg.rest_pose_right[arm_i])
-        else:
-            rest[f"left_{j.value}.pos"] = 1.0
-            rest[f"right_{j.value}.pos"] = 1.0
+    def __init__(self) -> None:
+        from ..kinematics.config import KinematicsConfig
+        from ..teleop.config import VRTeleopConfig
 
-    steps = max(1, int(duration_s * fps))
-    for _ in range(steps):
-        t0 = time.perf_counter()
-        robot.send_action(rest)
-        time.sleep(max(0.0, 1.0 / fps - (time.perf_counter() - t0)))
+        self._vr_cfg = VRTeleopConfig()
+        self._kin_cfg = KinematicsConfig()
+        self._proc: Any | None = None
+        self._conn: Any | None = None
+        self._q_init: Any | None = None
+        self._left_indices: list[int] | None = None
+        self._right_indices: list[int] | None = None
+        self._ready = False
+
+    def start(self) -> None:
+        """Spawn the IK worker subprocess. Non-blocking — call wait_ready()."""
+        import multiprocessing as mp
+
+        from ..teleop.worker import run_ik_worker
+
+        ctx = mp.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe()
+        proc = ctx.Process(
+            target=run_ik_worker,
+            args=(child_conn, self._vr_cfg, self._kin_cfg, None, None),
+            name="axol-ik-worker",
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()
+        self._proc = proc
+        self._conn = parent_conn
+
+    def wait_ready(self, timeout: float = 60.0) -> None:
+        """Block until the IK worker has finished JIT compilation."""
+        if self._ready:
+            return
+        if self._conn is None:
+            raise RuntimeError("IK reset controller not started")
+        if not self._conn.poll(timeout):
+            raise TimeoutError(
+                f"IK worker did not become ready within {timeout:.1f}s "
+                "(JAX JIT compilation may have stalled)."
+            )
+        msg = self._conn.recv()
+        if not (isinstance(msg, tuple) and msg[0] == "ready"):
+            raise RuntimeError(f"Unexpected IK worker handshake: {msg!r}")
+        import numpy as np
+
+        _, q_init, left_indices, right_indices, _startup_traj = msg
+        self._q_init = np.asarray(q_init, dtype=np.float32)
+        self._left_indices = [int(i) for i in left_indices]
+        self._right_indices = [int(i) for i in right_indices]
+        self._ready = True
+
+    def return_to_rest(self, robot: "AxolRobot") -> None:
+        """Plan and play a collision-aware trajectory to the rest pose."""
+        import numpy as np
+
+        from ..shared import Joint
+        from ..teleop.filter import ResetInterpolator
+
+        self.wait_ready()
+        assert self._conn is not None
+        assert self._q_init is not None
+        assert self._left_indices is not None
+        assert self._right_indices is not None
+
+        pos_l, pos_r = robot.positions
+        pos_l = np.asarray(pos_l, dtype=np.float32)
+        pos_r = np.asarray(pos_r, dtype=np.float32)
+
+        q_current = self._q_init.copy()
+        for i, gi in enumerate(self._left_indices):
+            q_current[gi] = float(pos_l[i])
+        for i, gi in enumerate(self._right_indices):
+            q_current[gi] = float(pos_r[i])
+
+        self._conn.send(("reset", q_current))
+        result = self._conn.recv()
+        if not (isinstance(result, tuple) and result[0] == "reset_traj"):
+            raise RuntimeError(f"Unexpected IK worker response: {result!r}")
+        _, _q_rest, traj = result
+        if not traj:
+            _logger.warning("IK worker returned an empty reset trajectory; skipping.")
+            return
+
+        interp = ResetInterpolator()
+        interp.set_trajectory(traj, float(pos_l[7]), float(pos_r[7]))
+
+        joints = list(Joint)
+        play_hz = float(self._vr_cfg.frequency)
+        period = 1.0 / play_hz
+        while interp.is_active():
+            t0 = time.perf_counter()
+            new_q, l_grip, r_grip, _done = interp.step()
+            if new_q is None:
+                break
+            arm_left = np.asarray(new_q)[self._left_indices]
+            arm_right = np.asarray(new_q)[self._right_indices]
+            action: dict[str, float] = {}
+            for j in joints:
+                if j in ARM_JOINTS:
+                    ai = ARM_JOINTS.index(j)
+                    action[f"left_{j.value}.pos"] = float(arm_left[ai])
+                    action[f"right_{j.value}.pos"] = float(arm_right[ai])
+                else:
+                    action[f"left_{j.value}.pos"] = float(l_grip)
+                    action[f"right_{j.value}.pos"] = float(r_grip)
+            robot.send_action(action)
+            time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+
+    def stop(self) -> None:
+        """Signal shutdown, close the pipe, and reap the subprocess."""
+        if self._conn is not None:
+            try:
+                self._conn.send(None)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._conn = None
+        if self._proc is not None:
+            self._proc.join(timeout=3.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
+                self._proc.join(timeout=2.0)
+            if self._proc.is_alive():
+                self._proc.kill()
+            self._proc = None
 
 
 # ----------------------------------------------------------------------
@@ -584,11 +707,13 @@ def _run(
     rerun_port: int = 9876,
 ) -> None:
     import multiprocessing as mp
+    import shutil
+    from pathlib import Path
 
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
-    from lerobot.utils.constants import ACTION, OBS_STR
+    from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
     from lerobot.utils.feature_utils import hw_to_dataset_features
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
@@ -625,7 +750,26 @@ def _run(
     # joint enum, both static, so the dataset can be built before the robot
     # is connected. This lets us load the policy first (see below).
     dataset: "LeRobotDataset | None" = None
+    dataset_root: Path | None = None
     if repo_id:
+        dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        meta = dataset_root / "meta"
+        has_info = (meta / "info.json").exists()
+        if has_info:
+            # A previous run-policy invocation saved rollouts here — refuse
+            # to overwrite. (Unlike collect-data, run-policy doesn't resume:
+            # each invocation writes a fresh batch of rollouts.)
+            raise RuntimeError(
+                f"Rollout dataset already exists at {dataset_root}. "
+                f"Delete the directory and rerun to start fresh:\n"
+                f"  rm -rf {dataset_root}"
+            )
+        if dataset_root.exists():
+            # Empty leftover from a previous failed run — wipe so
+            # LeRobotDataset.create can mkdir(exist_ok=False).
+            log_say(f"Removing empty dataset directory at {dataset_root}.")
+            shutil.rmtree(dataset_root)
+
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
         obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
         dataset = LeRobotDataset.create(
@@ -664,6 +808,14 @@ def _run(
     server_proc.start()
     log_say(f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid}).")
 
+    # Spawn the IK worker in parallel with the policy server so JAX JIT
+    # compilation overlaps with policy load. The worker plans collision-aware
+    # return-to-rest trajectories; we wait for the "ready" handshake on first
+    # use (return_to_rest).
+    reset_controller = _IKResetController()
+    reset_controller.start()
+    log_say("Started IK reset worker (collision-aware return-to-rest).")
+
     client = None
     episodes_recorded = 0
     robot_connected = False
@@ -698,7 +850,7 @@ def _run(
         robot_connected = True
 
         log_say("Returning to rest pose.")
-        _move_to_rest(robot, fps)
+        reset_controller.return_to_rest(robot)
         try:
             input("Reset the scene, then press Enter to start the first episode.")
         except (EOFError, KeyboardInterrupt):
@@ -818,7 +970,7 @@ def _run(
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 log_say("Returning to rest pose.")
-                _move_to_rest(robot, fps)
+                reset_controller.return_to_rest(robot)
                 try:
                     input("Reset the scene, then press Enter to start.")
                 except (EOFError, KeyboardInterrupt):
@@ -831,7 +983,7 @@ def _run(
             episodes_recorded += 1
             log_say(f"Saved episode {episodes_recorded}.")
             log_say("Returning to rest pose.")
-            _move_to_rest(robot, fps)
+            reset_controller.return_to_rest(robot)
             try:
                 input("Reset the scene, then press Enter to start the next episode.")
             except (EOFError, KeyboardInterrupt):
@@ -852,6 +1004,11 @@ def _run(
             except Exception:  # noqa: BLE001
                 pass
 
+        try:
+            reset_controller.stop()
+        except Exception:  # noqa: BLE001
+            pass
+
         # Tear down the server child process.
         if server_proc.is_alive():
             server_proc.terminate()
@@ -864,3 +1021,16 @@ def _run(
             dataset.finalize()
             if push_to_hub and episodes_recorded > 0:
                 dataset.push_to_hub()
+
+        if (
+            dataset_root is not None
+            and episodes_recorded == 0
+            and dataset_root.exists()
+        ):
+            try:
+                shutil.rmtree(dataset_root)
+                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
+            except OSError as exc:
+                _logger.warning(
+                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
+                )
