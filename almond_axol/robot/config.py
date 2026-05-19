@@ -309,7 +309,7 @@ class _ArmGains:
 
 
 # Pre-compliance-tuning gains — the high-``kp`` "industrial robot" defaults
-# used as the ``s=1.0`` endpoint of :attr:`AxolConfig.left_stiffness` /
+# used as the ``s=1.0`` endpoint of :attr:`AxolConfig.left_stiffness` and
 # :attr:`AxolConfig.right_stiffness`.
 _STIFF_GAINS = _ArmGains(
     shoulder_1=(500.0, 5.0),
@@ -341,12 +341,10 @@ def _blend_joint(
 
 
 def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
-    """Coerce ``s`` to a 7-tuple of per-joint blend factors and validate.
+    """Coerce ``s`` to a 7-tuple of per-joint blend factors in ``[0, 1]``.
 
-    Accepts either a scalar (broadcast to all 7 joints) or a sequence of
-    length ``len(ARM_JOINTS)`` (one value per joint, in
-    :data:`almond_axol.shared.ARM_JOINTS` order). Every value must lie in
-    ``[0, 1]``.
+    Accepts a scalar (broadcast to all 7 joints) or a sequence of length
+    ``len(ARM_JOINTS)`` in :data:`almond_axol.shared.ARM_JOINTS` order.
     """
     if isinstance(s, (int, float)):
         if not 0.0 <= float(s) <= 1.0:
@@ -367,12 +365,11 @@ def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
 
 
 def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
-    """Return ``arm`` with each of the 7 joints blended toward
-    :data:`_STIFF_GAINS` by factors ``s`` ∈ ``[0, 1]``.
+    """Blend each of ``arm``'s 7 joints toward :data:`_STIFF_GAINS` by ``s``.
 
-    ``s`` may be a scalar (applied to every joint) or a 7-tuple of per-joint
-    factors in :data:`almond_axol.shared.ARM_JOINTS` order. An all-zero
-    blend returns ``arm`` unchanged.
+    ``s`` is either a scalar or a 7-tuple in
+    :data:`almond_axol.shared.ARM_JOINTS` order (see
+    :func:`_normalize_stiffness`). An all-zero blend returns ``arm`` unchanged.
     """
     factors = _normalize_stiffness(s)
     if all(f == 0.0 for f in factors):
@@ -408,21 +405,19 @@ class AxolConfig:
                          Commands that exceed this are dropped and a warning
                          is logged. Set to ``float('inf')`` to disable.
         left_stiffness:  Compliance ↔ stiffness blend for the **left** arm
-                         in ``[0, 1]``. A scalar applies the same blend to
-                         every joint; a 7-tuple sets each joint
-                         individually, in
+                         in ``[0, 1]``. Either a scalar (applied to every
+                         joint) or 7 values in
                          :data:`almond_axol.shared.ARM_JOINTS` order
-                         (shoulder_1, shoulder_2, shoulder_3, elbow,
-                         wrist_1, wrist_2, wrist_3 — the gripper is not
-                         blended). ``0`` (default) keeps the per-joint
-                         compliant gains; ``1`` restores the pre-tuning
-                         industrial gains in :data:`_STIFF_GAINS`. ``kp``
-                         / ``kd`` interpolate geometrically (log-space);
-                         ``j_eff`` / ``kd_soft`` scale linearly to 0 at
-                         ``s=1``. The blend is baked into ``left`` at
-                         construction time — mutating
-                         ``left_stiffness`` after the fact has no effect,
-                         and ``replace()`` would re-apply it (don't).
+                         (gripper excluded). ``0`` (default) keeps the
+                         per-joint compliant gains; ``1`` restores the
+                         pre-tuning industrial gains in
+                         :data:`_STIFF_GAINS`. ``kp`` / ``kd`` interpolate
+                         geometrically (log-space); ``j_eff`` /
+                         ``kd_soft`` scale linearly to 0 at ``s=1``. The
+                         blend is baked into ``left`` at construction —
+                         mutating ``left_stiffness`` afterwards has no
+                         effect, and ``replace()`` would re-apply it
+                         (don't).
         right_stiffness: Same, for the **right** arm.
     """
 

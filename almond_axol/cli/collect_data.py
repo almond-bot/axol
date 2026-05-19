@@ -12,16 +12,12 @@ controls are blocked until save_episode() completes.
 
 Recording continues until Ctrl+C.
 
-Capture is decoupled from teleop
---------------------------------
-
-The teleop loop runs at ``--teleop-hz`` and produces a fresh
-``(joint_obs, act_processed, t0)`` snapshot every iteration via
-``_SnapshotPublisher``. A separate ``_CaptureThread`` ticks at ``--fps`` and,
-for each tick, blocks on ``ZedCamera.read_at_or_after(T_n)`` so every
-recorded frame uses sender-clock-aligned camera data plus the latest joint
-snapshot. This keeps camera reads, image conversion, and ``dataset.add_frame``
-off the hot 120 Hz control loop.
+The teleop loop runs at ``--teleop-hz`` and publishes the latest
+``(joint_obs, action)`` to a single-slot ``_SnapshotPublisher``. A separate
+``_CaptureThread`` ticks at ``--fps`` and, for each tick, blocks on
+``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame
+shares the sender-clock instant ``T_n`` with the joint sample, then writes
+the dataset row off the hot control loop.
 """
 
 import argparse
@@ -46,11 +42,7 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _Snapshot:
-    """Atomic ``(joint_obs, action, capture_ts)`` bundle from one teleop tick.
-
-    Stored references — the producer always builds fresh dicts per tick, so
-    the capture thread observes a consistent slice without copying.
-    """
+    """``(joint_obs, action, ts)`` bundle from one teleop tick."""
 
     joint_obs: "RobotObservation"
     action: "RobotAction"
@@ -58,10 +50,12 @@ class _Snapshot:
 
 
 class _SnapshotPublisher:
-    """Single-slot atomic publisher: teleop loop writes, capture thread reads.
+    """Single-slot publisher shared between the teleop loop and capture thread.
 
-    The lock protects the slot itself, not the contained dicts — those are
-    rebuilt by the teleop loop on every tick and never mutated in place.
+    The teleop loop rebuilds fresh ``joint_obs`` / ``action`` dicts every
+    tick and calls :meth:`publish`; the capture thread reads the latest
+    slot via :meth:`latest`. The lock protects the slot pointer only — the
+    contained dicts are never mutated in place.
     """
 
     def __init__(self) -> None:
@@ -89,20 +83,14 @@ class _SnapshotPublisher:
 
 
 class _CaptureThread(threading.Thread):
-    """Captures dataset frames at ``fps`` Hz, decoupled from the teleop loop.
+    """Capture dataset frames at ``fps`` Hz, decoupled from the teleop loop.
 
-    Per tick the thread:
-
-    1. Sleeps until ``T_n = recording_start + n * frame_interval``.
-    2. For every camera, calls ``read_at_or_after(T_n)`` so the frame's
-       sender-clock capture time is at or after the tick boundary.
-    3. Snapshots ``publisher.latest()`` for the matching joint sample +
-       action that was actually commanded around the same instant.
-    4. Runs ``robot_obs_proc`` on the combined obs and appends the dataset
-       row.
-
-    On per-camera read timeout / failure the thread reuses the previous good
-    frame for that camera (use-cached policy) and logs at DEBUG.
+    Each tick the thread sleeps until ``T_n = recording_start + n / fps``,
+    waits for a frame with ``capture_perf_ts >= T_n`` from every camera,
+    pulls the latest joint+action snapshot from ``publisher``, and appends
+    one dataset row. If any camera read times out the previous frame for
+    that camera is reused (logged at DEBUG); if no frame has ever arrived
+    for it the tick is skipped.
     """
 
     def __init__(
@@ -224,12 +212,11 @@ class _CaptureThread(threading.Thread):
 
 
 def _parse_stiffness(value: str) -> float | tuple[float, ...]:
-    """Parse a ``--*-stiffness`` value.
+    """Parse a ``--*-stiffness`` value into a scalar or 7-tuple.
 
-    Accepts either a single number in ``[0, 1]`` (applied to all arm
-    joints) or exactly ``len(ARM_JOINTS)`` comma-separated numbers in
-    ``[0, 1]`` — one per joint in :data:`almond_axol.shared.ARM_JOINTS`
-    order (the gripper is not blended).
+    Accepts a single number in ``[0, 1]`` (applied to all arm joints) or
+    ``len(ARM_JOINTS)`` comma-separated numbers in ``[0, 1]`` — one per
+    joint in :data:`almond_axol.shared.ARM_JOINTS` order (gripper excluded).
     """
     parts = [p.strip() for p in value.split(",")]
 
@@ -518,7 +505,8 @@ def _run(
             while True:
                 t0 = time.perf_counter()
 
-                # Joints-only observation — no camera reads on the hot loop.
+                # Camera reads happen on the capture thread; the teleop loop
+                # only ever touches joint state.
                 joint_obs = robot.get_joint_observation()
                 teleop.send_feedback(joint_obs)
                 act = teleop.get_action()

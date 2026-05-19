@@ -5,25 +5,15 @@ ZedCamera connects to a single ZED video stream produced by ZedStreamer and
 exposes it as a standard LeRobot Camera. One instance per camera — instantiate
 three to cover overhead, left_arm, and right_arm.
 
-Timestamping
-------------
+Each grabbed frame carries two timestamps, both on the receiver's
+``time.perf_counter`` clock:
 
-Every grabbed frame is stamped with two timestamps:
-
-* ``capture_perf_ts`` — when the *sender* exposed the frame, expressed on the
-  receiver's ``time.perf_counter`` clock. Derived from
-  ``TIME_REFERENCE.IMAGE`` (UNIX-ns wall-clock on the sender) plus a per-frame
-  delta between receiver wall-clock and ``perf_counter``. Recomputing the
-  delta per frame means PTP step adjustments to ``CLOCK_REALTIME`` are
-  absorbed instantly.
-* ``receive_perf_ts`` — receiver ``perf_counter`` at the moment the frame
-  was decoded.
-
-The difference ``receive_perf_ts - capture_perf_ts`` is the end-to-end
-pipeline latency (encode + network + decode), typically 33-50 ms with HEVC
-streaming. The capture thread in ``collect_data`` consumes
-``capture_perf_ts`` directly so the dataset row's "frame time" reflects the
-moment of capture, not the moment of decode.
+* ``capture_perf_ts`` — when the sender exposed the frame, derived from
+  the SDK's ``TIME_REFERENCE.IMAGE`` (sender wall clock) plus a per-frame
+  wall→perf offset. Used by ``collect_data`` so dataset rows record the
+  moment of capture, not the moment of decode. Requires the two machines'
+  ``CLOCK_REALTIME`` to be aligned — see ``axol zed.sync-clocks``.
+* ``receive_perf_ts`` — when this process decoded the frame.
 
 Typical usage::
 
@@ -163,10 +153,10 @@ class ZedCamera(Camera):
         _logger.info(f"{self} connected ({self.width}x{self.height} @ {self.fps}fps).")
 
     def _log_pipeline_latency(self, num_samples: int = 30) -> None:
-        """Sample the first ~N frames and log mean/max receive-vs-capture skew.
+        """Log mean/max ``receive_perf_ts - capture_perf_ts`` over ~N frames.
 
         Acts as a startup canary for PTP: if the sender and receiver wall
-        clocks are out of sync the latency will look wildly negative or huge.
+        clocks are out of sync the latency looks wildly negative or huge.
         """
         samples: list[float] = []
         deadline = time.perf_counter() + 5.0
@@ -251,13 +241,11 @@ class ZedCamera(Camera):
                 else:
                     frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
 
-                # Sender-side wall-clock timestamp of when the frame was
-                # exposed, shared across all ZED cameras on the sender.
                 cap_wall = (
                     self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
                     * 1e-9
                 )
-                # Recompute the wall ↔ perf delta per frame so PTP step
+                # Recompute the wall→perf offset per frame so PTP step
                 # adjustments don't accumulate as silent skew.
                 recv_wall = time.time()
                 recv_perf = time.perf_counter()
@@ -329,12 +317,10 @@ class ZedCamera(Camera):
 
     @check_if_not_connected
     def read_latest_with_ts(self) -> tuple[NDArray[Any], float, float]:
-        """Return the most recent frame and its ``(capture_ts, receive_ts)``.
+        """Return ``(frame, capture_perf_ts, receive_perf_ts)`` for the latest frame.
 
-        Both timestamps are on the receiver's ``perf_counter`` clock —
-        ``capture_ts`` is the sender's exposure time converted via the per
-        frame wall→perf offset, and ``receive_ts`` is when this process
-        decoded the frame.
+        Both timestamps are on the receiver's ``perf_counter`` clock (see the
+        module docstring).
 
         Raises:
             RuntimeError: If the grab thread is not running or no frame has
@@ -359,16 +345,14 @@ class ZedCamera(Camera):
         target_capture_perf_ts: float,
         timeout_ms: float = 500,
     ) -> tuple[NDArray[Any], float, float]:
-        """Block until a frame with capture time ``>= target`` is available.
+        """Block until a frame with ``capture_perf_ts >= target`` is available.
 
-        This is the primary read path for dataset capture: by waiting for a
-        frame whose *sender-side* exposure time is at or after the teleop
-        tick, every camera and the joint sample share the same timeline.
+        Used by ``collect-data`` so every camera and the joint sample share
+        the same sender-side timeline.
 
         Args:
-            target_capture_perf_ts: Earliest acceptable ``capture_perf_ts``,
-                expressed on the receiver's ``perf_counter`` clock.
-            timeout_ms: Maximum time to wait for a qualifying frame.
+            target_capture_perf_ts: Earliest acceptable ``capture_perf_ts``.
+            timeout_ms:             Maximum time to wait for a qualifying frame.
 
         Returns:
             ``(frame, capture_perf_ts, receive_perf_ts)``.
