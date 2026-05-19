@@ -98,6 +98,13 @@ class ZedCamera(Camera):
         zed = sl.CameraOne()
         init_params = sl.InitParametersOne()
         init_params.set_from_stream(self.config.host, self.config.port)
+        # Without async recovery, a briefly disrupted stream (e.g. transient
+        # packet loss while another process loads a model onto CUDA) makes
+        # ``grab()`` block indefinitely until the connection is restored,
+        # which silently freezes ``latest_*_perf_ts``. With async recovery
+        # ``grab()`` returns CAMERA_REBOOTING quickly and the SDK reconnects
+        # in the background, so our read loop can keep retrying.
+        init_params.async_grab_camera_recovery = True
 
         err = zed.open(init_params)
         if err != sl.ERROR_CODE.SUCCESS:
@@ -225,13 +232,38 @@ class ZedCamera(Camera):
 
         image = sl.Mat()
         failure_count = 0
+        grab_failure_streak = 0
+        last_grab_warning_perf = 0.0
 
         while not self.stop_event.is_set():
             try:
                 err = self.zed.grab()
                 if err != sl.ERROR_CODE.SUCCESS:
-                    _logger.debug(f"{self} grab returned {err}, skipping frame.")
+                    grab_failure_streak += 1
+                    # Throttled WARN so silent freezes are visible at INFO
+                    # level; previously this was DEBUG-only and got swallowed.
+                    now = time.perf_counter()
+                    if now - last_grab_warning_perf >= 1.0:
+                        _logger.warning(
+                            "%s grab returned %s (%d consecutive failures); "
+                            "stream is recovering in the background.",
+                            self,
+                            err,
+                            grab_failure_streak,
+                        )
+                        last_grab_warning_perf = now
+                    # Backoff so a persistent failure doesn't pin a CPU.
+                    if self.stop_event.wait(timeout=0.05):
+                        return
                     continue
+
+                if grab_failure_streak > 0:
+                    _logger.info(
+                        "%s grab recovered after %d failed attempts.",
+                        self,
+                        grab_failure_streak,
+                    )
+                    grab_failure_streak = 0
 
                 self.zed.retrieve_image(image)
                 raw = image.get_data()  # BGRA uint8 (height, width, 4)

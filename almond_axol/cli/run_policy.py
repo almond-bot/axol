@@ -621,11 +621,9 @@ def _run(
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
-    # Connect first so cameras auto-detect resolution; dataset features are
-    # then derived from the live robot.
-    robot.connect()
-
-    # Optional rollout dataset
+    # Dataset features are derived from the camera configs (width/height) and
+    # joint enum, both static, so the dataset can be built before the robot
+    # is connected. This lets us load the policy first (see below).
     dataset: "LeRobotDataset | None" = None
     if repo_id:
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
@@ -644,6 +642,13 @@ def _run(
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
 
     # --- Launch PolicyServer in a child process on localhost --------------
+    # Important: we spawn the server and fully load the policy BEFORE
+    # connecting cameras. The model download + CUDA load is a ~15s spike of
+    # network + GPU activity; if the ZED streams are already open during
+    # that window the streams can get briefly disrupted, and (without async
+    # recovery) ``grab()`` blocks indefinitely waiting for the connection
+    # to recover. Connecting cameras after the policy is ready avoids
+    # walking into that contention window in the first place.
     server_cfg_dict = {
         "host": "127.0.0.1",
         "port": server_port,
@@ -661,6 +666,7 @@ def _run(
 
     client = None
     episodes_recorded = 0
+    robot_connected = False
     try:
         _wait_for_port("127.0.0.1", server_port, timeout=30.0)
 
@@ -685,6 +691,18 @@ def _run(
         log_say("Loading policy on server (one-time)...")
         if not client.start():
             raise RuntimeError("Failed to connect to policy server / load policy.")
+
+        # Policy is now resident on cuda — safe to connect cameras.
+        log_say("Connecting robot...")
+        robot.connect()
+        robot_connected = True
+
+        log_say("Returning to rest pose.")
+        _move_to_rest(robot, fps)
+        try:
+            input("Reset the scene, then press Enter to start the first episode.")
+        except (EOFError, KeyboardInterrupt):
+            return
 
         while True:
             log_say(f"Episode {episodes_recorded + 1}: starting in 1s.")
@@ -828,10 +846,11 @@ def _run(
                 client.stop()
             except Exception:  # noqa: BLE001
                 pass
-        try:
-            robot.disconnect()
-        except Exception:  # noqa: BLE001
-            pass
+        if robot_connected:
+            try:
+                robot.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
 
         # Tear down the server child process.
         if server_proc.is_alive():
