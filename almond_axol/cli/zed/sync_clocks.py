@@ -2,30 +2,19 @@
 axol zed.sync-clocks
 
 Run a PTP (Precision Time Protocol) daemon over the direct ethernet link
-between the Jetson sender and the upper-computer receiver so both machines'
-``CLOCK_REALTIME`` clocks stay aligned to sub-millisecond accuracy.
+between the Jetson sender and the upper-computer receiver, holding both
+machines' ``CLOCK_REALTIME`` to sub-millisecond agreement. Required for the
+ZED-frame ``TIME_REFERENCE.IMAGE`` timestamps consumed by ``collect-data``.
 
-The ZED SDK stamps every frame on the *sender's* ``CLOCK_REALTIME`` via
-``TIME_REFERENCE.IMAGE``. The receiver later converts that wall-clock stamp
-into its own monotonic ``perf_counter`` so the dataset row's "frame time"
-reflects the moment of capture rather than the moment of decode. None of
-that works unless both machines agree on what time it is — which is what
-this command exists to deliver.
-
-Typical operator workflow (one terminal per machine):
+Both processes run in the foreground for the duration of a collection
+session, one per machine:
 
     axol zed.sync-clocks --role master --iface eth0   # upper computer
     axol zed.sync-clocks --role slave  --iface eth0   # Jetson
 
-Both processes stay running in the foreground for the duration of any
-collection session.
-
-The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install
-fallback) are escalated inline via `sudo`, so the `axol` invocation itself
-does not need to be run as root. Sudo will prompt for a password on first
-escalation and reuse cached credentials for the rest of the session. On
-non-apt systems install `linuxptp` (for ptp4l/phc2sys) and `ethtool`
-manually before running this command.
+``ptp4l``, ``phc2sys`` and the apt-get auto-install fallback are escalated
+via ``sudo`` so the ``axol`` invocation itself does not need to be root.
+On non-apt systems install ``linuxptp`` and ``ethtool`` manually first.
 """
 
 from __future__ import annotations
@@ -49,8 +38,8 @@ _OFFSET_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Map executable name -> apt package that provides it. Used by
-# `_ensure_executable` to auto-install missing dependencies on Debian/Ubuntu.
+# Executable -> apt package, used by ``_ensure_executable`` to auto-install
+# missing dependencies on Debian/Ubuntu.
 _APT_PACKAGES = {
     "ptp4l": "linuxptp",
     "phc2sys": "linuxptp",
@@ -217,23 +206,19 @@ def _run(*, role: str, iface: str, transport: str, timestamping: str) -> None:
 
 
 def _with_sudo(cmd: list[str]) -> list[str]:
-    """Prepend `sudo` when the current process is not already root.
-
-    Sudo caches credentials per-tty for ~5 minutes by default, so back-to-back
-    privileged subprocesses (ptp4l + phc2sys) only prompt for a password once.
-    """
+    """Prepend ``sudo`` unless the current process is already root."""
     if os.geteuid() == 0:
         return cmd
     return ["sudo", *cmd]
 
 
 def _ensure_executable(name: str, *, required: bool) -> bool:
-    """Return True if ``name`` is on PATH, installing it via apt if missing.
+    """Return True if ``name`` is on PATH, installing via apt if missing.
 
-    Auto-install only runs on systems where ``apt-get`` is available
-    (Debian/Ubuntu). When ``required`` is True and the executable cannot be
-    made available, raises ``SystemExit`` with a manual-install hint;
-    otherwise returns False and the caller is expected to degrade gracefully.
+    Auto-install runs only on Debian/Ubuntu (where ``apt-get`` exists). If
+    ``required`` is True and the executable still isn't available, raises
+    ``SystemExit`` with a manual-install hint; otherwise returns False so
+    the caller can degrade gracefully.
     """
     if shutil.which(name) is not None:
         return True
@@ -341,9 +326,8 @@ def _build_ptp4l_cmd(
 
 def _build_phc2sys_cmd(*, iface: str, role: str, timestamping: str) -> list[str]:
     if timestamping != "hardware":
-        # No PHC available — phc2sys runs in "free" mode pinning CLOCK_REALTIME
-        # to itself, which is a no-op but lets ptp4l (in software mode) still
-        # discipline the kernel clock through its own SO_TIMESTAMPING path.
+        # No PHC available — pin CLOCK_REALTIME to itself so ptp4l's own
+        # SO_TIMESTAMPING path is the only thing disciplining the kernel clock.
         return [
             "phc2sys",
             "-c",
@@ -356,9 +340,7 @@ def _build_phc2sys_cmd(*, iface: str, role: str, timestamping: str) -> list[str]
         ]
 
     if role == "slave":
-        # Receiver follows the PHC that ptp4l is disciplining.
         return ["phc2sys", "-s", iface, "-c", "CLOCK_REALTIME", "-O", "0", "-w", "-m"]
-    # Master pushes its system clock onto the PHC so ptp4l serves it out.
     return ["phc2sys", "-s", "CLOCK_REALTIME", "-c", iface, "-O", "0", "-w", "-m"]
 
 
