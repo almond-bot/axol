@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 
 import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
@@ -223,10 +224,21 @@ class AxolRobot(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Return cached joint positions and latest camera frames."""
+        """Return cached joint positions and timestamp-aligned camera frames.
+
+        Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
+        shared ``time.perf_counter()`` target so every frame in the
+        observation shares the sender-clock instant — matching the alignment
+        guarantee that ``collect-data`` writes into the training dataset. If a
+        camera fails to produce a qualifying frame within ``timeout_ms``, we
+        fall back to ``read_latest()`` so a single stale stream doesn't stall
+        inference.
+        """
         assert self._axol is not None
         assert self._axol.left is not None
         assert self._axol.right is not None
+
+        target_ts = time.perf_counter()
 
         left_pos = self._axol.left.positions  # np.ndarray (8,), from telemetry cache
         right_pos = self._axol.right.positions
@@ -246,7 +258,22 @@ class AxolRobot(Robot):
                 obs[key] = float(right_trq[i])
 
         for cam_key, cam in self.cameras.items():
-            obs[cam_key] = cam.read_latest()
+            cam_fps = getattr(cam, "fps", None) or 30
+            timeout_ms = int(2 * 1000.0 / cam_fps + 200)
+            try:
+                frame, _cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                    target_ts, timeout_ms=timeout_ms
+                )
+            except (TimeoutError, RuntimeError) as exc:
+                _logger.debug(
+                    "get_observation: %s read_at_or_after(%.6f) failed (%s); "
+                    "falling back to read_latest().",
+                    cam_key,
+                    target_ts,
+                    exc,
+                )
+                frame = cam.read_latest()
+            obs[cam_key] = frame
 
         return obs
 
