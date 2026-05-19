@@ -9,43 +9,7 @@ import asyncio
 import logging
 import socket
 
-from ..shared import ARM_JOINTS
-
-
-def _parse_stiffness(value: str) -> float | tuple[float, ...]:
-    """Parse a ``--*-stiffness`` value.
-
-    Accepts either a single number in ``[0, 1]`` (applied to all arm
-    joints) or exactly ``len(ARM_JOINTS)`` comma-separated numbers in
-    ``[0, 1]`` — one per joint in :data:`almond_axol.shared.ARM_JOINTS`
-    order (the gripper is not blended).
-    """
-    parts = [p.strip() for p in value.split(",")]
-
-    def _parse_one(raw: str, label: str) -> float:
-        try:
-            x = float(raw)
-        except ValueError as exc:
-            raise argparse.ArgumentTypeError(
-                f"stiffness{label} is not a number: {raw!r}"
-            ) from exc
-        if not 0.0 <= x <= 1.0:
-            raise argparse.ArgumentTypeError(
-                f"stiffness{label} must be in [0, 1], got {x}"
-            )
-        return x
-
-    if len(parts) == 1:
-        return _parse_one(parts[0], "")
-    if len(parts) != len(ARM_JOINTS):
-        raise argparse.ArgumentTypeError(
-            f"stiffness must be a single value or {len(ARM_JOINTS)} "
-            f"comma-separated values (one per joint: "
-            f"{', '.join(j.value for j in ARM_JOINTS)}), got {len(parts)}"
-        )
-    return tuple(
-        _parse_one(p, f"[{i}={ARM_JOINTS[i].value}]") for i, p in enumerate(parts)
-    )
+from ..shared import ARM_JOINTS, parse_stiffness
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -89,14 +53,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
     p.add_argument(
         "--left-stiffness",
-        type=_parse_stiffness,
+        type=parse_stiffness,
         default=0.0,
         metavar=stiffness_metavar,
         help=stiffness_help.format(side="left", attr="left_stiffness"),
     )
     p.add_argument(
         "--right-stiffness",
-        type=_parse_stiffness,
+        type=parse_stiffness,
         default=0.0,
         metavar=stiffness_metavar,
         help=stiffness_help.format(side="right", attr="right_stiffness"),

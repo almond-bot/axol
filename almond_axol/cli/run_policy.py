@@ -35,6 +35,8 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
+from ..shared import ARM_JOINTS, parse_stiffness
+
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.types import RobotAction
@@ -155,10 +157,40 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         ),
     )
     p.add_argument(
-        "--gripper-torque-limit",
+        "--left-gripper-torque-limit",
         type=float,
         default=1.0,
-        help="Max output torque (Nm) for the gripper in POSITION_FORCE mode (default: 1.0).",
+        help="Max output torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    p.add_argument(
+        "--right-gripper-torque-limit",
+        type=float,
+        default=1.0,
+        help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0).",
+    )
+    stiffness_help = (
+        "Compliance ↔ stiffness blend in [0, 1] for the {side} arm. "
+        f"Either a single value applied to all {len(ARM_JOINTS)} joints, "
+        f"or {len(ARM_JOINTS)} comma-separated values (one per joint, in "
+        f"order: {', '.join(j.value for j in ARM_JOINTS)}; gripper "
+        "excluded). 0 (default) is fully compliant; 1 restores the "
+        "pre-tuning industrial gains. See AxolConfig.{attr}. Should match "
+        "the values used at data collection time."
+    )
+    stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
+    p.add_argument(
+        "--left-stiffness",
+        type=parse_stiffness,
+        default=0.0,
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="left", attr="left_stiffness"),
+    )
+    p.add_argument(
+        "--right-stiffness",
+        type=parse_stiffness,
+        default=0.0,
+        metavar=stiffness_metavar,
+        help=stiffness_help.format(side="right", attr="right_stiffness"),
     )
     p.add_argument(
         "--rerun-ip",
@@ -202,7 +234,10 @@ def run(args: argparse.Namespace) -> None:
         aggregate_fn=args.aggregate_fn,
         zed_host=args.zed_host,
         zed_iface=args.zed_iface,
-        gripper_torque_limit=args.gripper_torque_limit,
+        left_gripper_torque_limit=args.left_gripper_torque_limit,
+        right_gripper_torque_limit=args.right_gripper_torque_limit,
+        left_stiffness=args.left_stiffness,
+        right_stiffness=args.right_stiffness,
         rerun_ip=args.rerun_ip,
         rerun_port=args.rerun_port,
     )
@@ -214,7 +249,7 @@ def _move_to_rest(robot: "AxolRobot", fps: int, duration_s: float = 5.0) -> None
     Uses the rest poses defined in VRTeleopConfig (arm joints) with gripper
     fully open. The robot's impedance controller smoothly tracks the target.
     """
-    from ..shared import ARM_JOINTS, Joint
+    from ..shared import Joint
     from ..teleop.config import VRTeleopConfig
 
     cfg = VRTeleopConfig()
@@ -541,7 +576,10 @@ def _run(
     aggregate_fn: str = "weighted_average",
     zed_host: str = "192.168.10.1",
     zed_iface: str | None = None,
-    gripper_torque_limit: float = 1.0,
+    left_gripper_torque_limit: float = 1.0,
+    right_gripper_torque_limit: float = 1.0,
+    left_stiffness: float | tuple[float, ...] = 0.0,
+    right_stiffness: float | tuple[float, ...] = 0.0,
     rerun_ip: str | None = None,
     rerun_port: int = 9876,
 ) -> None:
@@ -564,9 +602,12 @@ def _run(
     if zed_iface:
         setup_link_ip(zed_iface, "192.168.10.2/24")
 
-    axol_config = AxolConfig()
-    axol_config.left.gripper.torque_limit = gripper_torque_limit
-    axol_config.right.gripper.torque_limit = gripper_torque_limit
+    axol_config = AxolConfig(
+        left_stiffness=left_stiffness,
+        right_stiffness=right_stiffness,
+    )
+    axol_config.left.gripper.torque_limit = left_gripper_torque_limit
+    axol_config.right.gripper.torque_limit = right_gripper_torque_limit
 
     # Build robot with 3 ZED cameras — resolution/FPS auto-detected from stream
     robot_config = AxolRobotConfig(

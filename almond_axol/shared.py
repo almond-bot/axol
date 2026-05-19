@@ -1,5 +1,6 @@
 """Shared constants and utilities for the Almond Axol robot."""
 
+import argparse
 import logging
 import subprocess
 import sys
@@ -52,6 +53,44 @@ CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
+
+
+def parse_stiffness(value: str) -> float | tuple[float, ...]:
+    """Parse a ``--*-stiffness`` CLI value into a scalar or 7-tuple.
+
+    Accepts a single number in ``[0, 1]`` (applied to all arm joints) or
+    ``len(ARM_JOINTS)`` comma-separated numbers in ``[0, 1]`` — one per
+    joint in :data:`ARM_JOINTS` order (gripper excluded). Raises
+    :class:`argparse.ArgumentTypeError` so it composes cleanly with
+    ``argparse``'s ``type=`` callable.
+    """
+    parts = [p.strip() for p in value.split(",")]
+
+    def _parse_one(raw: str, label: str) -> float:
+        try:
+            x = float(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} is not a number: {raw!r}"
+            ) from exc
+        if not 0.0 <= x <= 1.0:
+            raise argparse.ArgumentTypeError(
+                f"stiffness{label} must be in [0, 1], got {x}"
+            )
+        return x
+
+    if len(parts) == 1:
+        return _parse_one(parts[0], "")
+    if len(parts) != len(ARM_JOINTS):
+        raise argparse.ArgumentTypeError(
+            f"stiffness must be a single value or {len(ARM_JOINTS)} "
+            f"comma-separated values (one per joint: "
+            f"{', '.join(j.value for j in ARM_JOINTS)}), got {len(parts)}"
+        )
+    return tuple(
+        _parse_one(p, f"[{i}={ARM_JOINTS[i].value}]") for i, p in enumerate(parts)
+    )
+
 
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"
 
