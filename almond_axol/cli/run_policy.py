@@ -559,7 +559,14 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
     Lives in the parent module so it's picklable by ``mp.get_context('spawn')``
     on macOS/Linux. Re-imports lerobot inside the child to avoid sharing
     CUDA/JAX state with the parent.
+
+    The child ignores SIGINT so Ctrl+C in the controlling terminal doesn't
+    dump a gRPC traceback from this process; the parent explicitly
+    terminates the server during its cleanup path.
     """
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
@@ -751,36 +758,51 @@ def _run(
     # is connected. This lets us load the policy first (see below).
     dataset: "LeRobotDataset | None" = None
     dataset_root: Path | None = None
+    resumed_dataset = False
     if repo_id:
         dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         meta = dataset_root / "meta"
         has_info = (meta / "info.json").exists()
-        if has_info:
-            # A previous run-policy invocation saved rollouts here — refuse
-            # to overwrite. (Unlike collect-data, run-policy doesn't resume:
-            # each invocation writes a fresh batch of rollouts.)
+        is_complete = (
+            has_info
+            and (meta / "tasks.parquet").exists()
+            and (meta / "episodes").is_dir()
+        )
+        # Mirror collect-data:
+        #   - complete dataset  → resume (append new rollouts)
+        #   - incomplete dataset (info.json but missing tasks.parquet / episodes/)
+        #                       → refuse, force explicit rm -rf
+        #   - empty leftover dir (no info.json) → wipe so create() can mkdir
+        if has_info and not is_complete:
             raise RuntimeError(
-                f"Rollout dataset already exists at {dataset_root}. "
-                f"Delete the directory and rerun to start fresh:\n"
-                f"  rm -rf {dataset_root}"
+                f"Incomplete dataset found at {dataset_root} (missing "
+                f"tasks.parquet or episodes/). Delete the directory and "
+                f"rerun to start fresh:\n  rm -rf {dataset_root}"
             )
-        if dataset_root.exists():
-            # Empty leftover from a previous failed run — wipe so
-            # LeRobotDataset.create can mkdir(exist_ok=False).
+        if dataset_root.exists() and not is_complete:
             log_say(f"Removing empty dataset directory at {dataset_root}.")
             shutil.rmtree(dataset_root)
 
-        action_features = hw_to_dataset_features(robot.action_features, ACTION)
-        obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
-        dataset = LeRobotDataset.create(
-            repo_id=repo_id,
-            fps=fps,
-            root=root,
-            features={**action_features, **obs_features},
-            robot_type=robot.name,
-            use_videos=True,
-            image_writer_threads=4,
-        )
+        if is_complete:
+            log_say(f"Resuming existing dataset at {dataset_root}.")
+            dataset = LeRobotDataset.resume(
+                repo_id=repo_id,
+                root=str(dataset_root),
+                image_writer_threads=4,
+            )
+            resumed_dataset = True
+        else:
+            action_features = hw_to_dataset_features(robot.action_features, ACTION)
+            obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+            dataset = LeRobotDataset.create(
+                repo_id=repo_id,
+                fps=fps,
+                root=root,
+                features={**action_features, **obs_features},
+                robot_type=robot.name,
+                use_videos=True,
+                image_writer_threads=4,
+            )
 
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
@@ -992,6 +1014,17 @@ def _run(
     except KeyboardInterrupt:
         pass
     finally:
+        # Ignore further SIGINT during cleanup so an impatient second
+        # Ctrl+C doesn't abort partway through robot.disconnect() / server
+        # teardown and leave hardware in a weird state. Cleanup is the
+        # same path Ctrl+C ("behave like q") needs anyway.
+        import signal
+
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
         log_say("Stopping.")
         if client is not None:
             try:
@@ -1024,9 +1057,13 @@ def _run(
 
         if (
             dataset_root is not None
+            and not resumed_dataset
             and episodes_recorded == 0
             and dataset_root.exists()
         ):
+            # Only auto-wipe a freshly-created dataset that ended up empty.
+            # A resumed dataset already has saved rollouts on disk that we
+            # must never clobber, even if this session added zero new ones.
             try:
                 shutil.rmtree(dataset_root)
                 log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
