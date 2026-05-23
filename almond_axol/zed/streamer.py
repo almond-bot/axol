@@ -159,7 +159,7 @@ class ZedStreamer:
         init_params = sl.InitParametersOne()
         init_params.camera_resolution = self._config.resolution
         init_params.camera_fps = self._config.fps
-        init_params.input.set_from_camera_id(camera_id, sl.BUS_TYPE.GMSL)
+        init_params.set_from_serial_number(serial)
 
         err = zed.open(init_params)
         if err != sl.ERROR_CODE.SUCCESS:
