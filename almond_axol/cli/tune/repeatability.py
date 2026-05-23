@@ -41,7 +41,7 @@ from ...teleop.trajectory import plan_collision_aware_trajectory
 
 _RATE_HZ = 100.0
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — joint-space speed for the planned trajectory
-_PLAN_MIN_DURATION = 0.5  # seconds — floor matches VRTeleopConfig.reset_min_duration
+_PLAN_MIN_DURATION = 0.5  # seconds — floor on planned trajectory duration
 
 
 # ---------------------------------------------------------------------------
