@@ -27,7 +27,7 @@ class VRTeleopConfig:
         reset_min_duration: Floor (seconds) on the return-to-rest trajectory
             duration. Prevents near-rest starts from snapping home in a
             handful of frames and gives every reset a consistent minimum
-            feel regardless of starting pose. Defaults to ``0.5`` s.
+            feel regardless of starting pose. Defaults to ``1.5`` s.
         reset_rest_weight: Cost weight penalising deviation from the reset
             target pose during collision-aware trajectory generation.
         reset_limit_weight: Cost weight penalising joint-limit violations
