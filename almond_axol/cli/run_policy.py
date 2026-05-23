@@ -129,17 +129,55 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--chunk-size-threshold",
         type=float,
-        default=0.5,
+        default=0.9,
         help=(
-            "Send a fresh observation to the server when the local action queue "
-            "drops to this fraction of a full chunk (default: 0.5)."
+            "Send a fresh observation to the server when the local "
+            "action queue drops to this fraction of a full chunk "
+            "(default: 0.9). Upstream lerobot defaults to 0.5 because "
+            "obs send and action pops share a thread there; on Axol "
+            "obs send runs on a dedicated thread (see "
+            "AxolRobotClient._observation_loop) so a higher threshold "
+            "is strictly better — it triggers the next obs while the "
+            "queue still has plenty of margin, so a fresh chunk almost "
+            "always lands before the queue drains and the arm doesn't "
+            "freeze waiting at chunk boundaries."
         ),
     )
     p.add_argument(
         "--aggregate-fn",
-        default="weighted_average",
-        choices=["weighted_average", "latest_only", "average", "conservative"],
-        help="Action chunk aggregation function (default: weighted_average).",
+        default="temporal_ensemble",
+        choices=[
+            "temporal_ensemble",
+            "weighted_average",
+            "latest_only",
+            "average",
+            "conservative",
+        ],
+        help=(
+            "Action chunk aggregation strategy (default: "
+            "temporal_ensemble). temporal_ensemble is ACT's Algorithm 2: "
+            "every future timestep is the exponentially-weighted average "
+            "of all buffered chunks covering it (see "
+            "--temporal-ensemble-coeff), with the gripper indices "
+            "carved out to use the newest chunk's value so bang-bang "
+            "grasps aren't smeared. The other choices are the upstream "
+            "lerobot scalar blends, applied uniformly across all 16 "
+            "action components."
+        ),
+    )
+    p.add_argument(
+        "--temporal-ensemble-coeff",
+        type=float,
+        default=0.01,
+        metavar="K",
+        help=(
+            "Decay coefficient for --aggregate-fn temporal_ensemble "
+            "(default: 0.01, matching the ACT paper). Weights are "
+            "wᵢ = exp(-K·i), i=0 is the oldest buffered chunk; K>0 "
+            "favors older chunks (smoother), K=0 averages uniformly, "
+            "K<0 favors newer chunks (more reactive). Ignored for "
+            "other --aggregate-fn values."
+        ),
     )
     p.add_argument(
         "--zed-host",
@@ -218,29 +256,49 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level))
-    _run(
-        policy_path=args.policy,
-        policy_type=args.policy_type,
-        task=args.task,
-        episode_time_s=args.episode_time_s,
-        fps=args.fps,
-        repo_id=args.repo_id,
-        root=args.root,
-        push_to_hub=args.push_to_hub,
-        device=args.device,
-        server_port=args.server_port,
-        actions_per_chunk=args.actions_per_chunk,
-        chunk_size_threshold=args.chunk_size_threshold,
-        aggregate_fn=args.aggregate_fn,
-        zed_host=args.zed_host,
-        zed_iface=args.zed_iface,
-        left_gripper_torque_limit=args.left_gripper_torque_limit,
-        right_gripper_torque_limit=args.right_gripper_torque_limit,
-        left_stiffness=args.left_stiffness,
-        right_stiffness=args.right_stiffness,
-        rerun_ip=args.rerun_ip,
-        rerun_port=args.rerun_port,
-    )
+
+    # Hardware errors bubble up from inside ``_run`` — either at
+    # connect time (motor unresponsive: ``MotorError``) or mid-episode
+    # (CAN socket faults like "Transmit buffer full": ``CanError``).
+    # Catch them here so we exit with a brief error and a non-zero
+    # status instead of dumping a multi-frame traceback for what is
+    # really an operator-actionable hardware fault. ``_run``'s own
+    # ``finally`` has already torn down the robot + policy server by
+    # the time we get here.
+    import sys
+
+    import can
+
+    from ..motor.errors import MotorError
+
+    try:
+        _run(
+            policy_path=args.policy,
+            policy_type=args.policy_type,
+            task=args.task,
+            episode_time_s=args.episode_time_s,
+            fps=args.fps,
+            repo_id=args.repo_id,
+            root=args.root,
+            push_to_hub=args.push_to_hub,
+            device=args.device,
+            server_port=args.server_port,
+            actions_per_chunk=args.actions_per_chunk,
+            chunk_size_threshold=args.chunk_size_threshold,
+            aggregate_fn=args.aggregate_fn,
+            temporal_ensemble_coeff=args.temporal_ensemble_coeff,
+            zed_host=args.zed_host,
+            zed_iface=args.zed_iface,
+            left_gripper_torque_limit=args.left_gripper_torque_limit,
+            right_gripper_torque_limit=args.right_gripper_torque_limit,
+            left_stiffness=args.left_stiffness,
+            right_stiffness=args.right_stiffness,
+            rerun_ip=args.rerun_ip,
+            rerun_port=args.rerun_port,
+        )
+    except (MotorError, can.CanError) as exc:
+        _logger.error("Robot hardware error: %s. Exiting.", exc)
+        sys.exit(1)
 
 
 class _IKResetController:
@@ -563,10 +621,23 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
     The child ignores SIGINT so Ctrl+C in the controlling terminal doesn't
     dump a gRPC traceback from this process; the parent explicitly
     terminates the server during its cleanup path.
+
+    Before serving we monkey-patch ``policy_server.observations_similar``
+    to always return ``False``. The upstream default uses a 1-rad L2
+    joint-state tolerance to drop "too similar" observations, which on
+    Axol's 16-DOF arms at 60 Hz drops nearly every observation — a fresh
+    chunk only lands every ~2 s, the action queue runs dry, and the arm
+    freezes for ~135 ms at every chunk boundary. The filter has no
+    config knob on ``PolicyServerConfig`` so we patch the module symbol.
     """
     import signal
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    from lerobot.async_inference import policy_server as _ps
+
+    _ps.observations_similar = lambda *args, **kwargs: False
+
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
@@ -579,7 +650,12 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
 
 def _build_axol_robot_client(
-    *, config: Any, robot: "AxolRobot", publisher: _ActionPublisher
+    *,
+    config: Any,
+    robot: "AxolRobot",
+    publisher: _ActionPublisher,
+    aggregate_strategy: str = "temporal_ensemble",
+    temporal_ensemble_coeff: float = 0.01,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -602,18 +678,68 @@ def _build_axol_robot_client(
     class AxolRobotClient(RobotClient):  # type: ignore[misc, valid-type]
         """RobotClient that reuses a pre-connected AxolRobot.
 
-        - Skips ``make_robot_from_config(...)`` and ``robot.connect()`` so we
-          don't pay the camera reconnect cost between episodes.
-        - Publishes each executed action to ``_ActionPublisher`` for the
-          dataset capture thread.
-        - Overrides ``stop()`` to tear down the gRPC channel without
-          disconnecting the shared robot.
+        Three overrides relative to upstream ``RobotClient``:
+
+        - ``_aggregate_action_queues`` dispatches to a vectorized
+          ``temporal_ensemble`` (ACT-style smoothing) when selected,
+          otherwise falls through to upstream's scalar blends. The
+          final queue swap is gated by ``_install_future_queue`` to
+          stop the control thread from re-popping a just-executed
+          timestep.
+        - ``control_loop`` runs *only* action pops; observation capture
+          + send is moved to ``_observation_loop`` so the 60-70 ms
+          ZED-read + pickle + gRPC round-trip can't stall the 60 Hz
+          control stream.
+        - ``control_loop_action`` updates ``latest_action`` atomically
+          with the queue pop (upstream does the update *after* the
+          ~5-10 ms ``robot.send_action`` call, leaving a window for the
+          aggregator to re-insert the popped timestep).
+
+        We also skip ``make_robot_from_config + robot.connect()`` so
+        re-recording an episode doesn't pay the camera reconnect cost,
+        publish executed actions through ``_ActionPublisher`` for the
+        dataset capture thread, and override ``stop()`` to tear down
+        just the gRPC channel (the robot is shared across episodes).
+
+        We do not post-filter the action stream: training data is
+        already EMA + TrapezoidalFilter-smoothed in ``collect_data``,
+        so the trained policy already emits smoothed commands.
         """
 
-        def __init__(self, config, robot, publisher):  # type: ignore[no-untyped-def]
+        # Action layout (see ``robot_axol._JOINTS = list(Joint)``,
+        # ``Joint.GRIPPER`` is last in each arm). Used by
+        # ``_temporal_ensemble_aggregate``: gripper joints always take
+        # the newest chunk's value so bang-bang grasp signals aren't
+        # smeared.
+        _GRIPPER_INDICES = (7, 15)
+
+        def __init__(  # type: ignore[no-untyped-def]
+            self,
+            config,
+            robot,
+            publisher,
+            aggregate_strategy,
+            temporal_ensemble_coeff,
+        ):
             self.config = config
             self.robot = robot
             self._publisher = publisher
+            self._aggregate_strategy = aggregate_strategy
+            self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
+            # ``temporal_ensemble`` buffer: ``(origin, packed_actions,
+            # timestamp)`` per chunk, sorted oldest-first.
+            # ``packed_actions`` is a ``(chunk_size, action_dim)`` tensor
+            # so the aggregation can run as a single batched op.
+            self._chunk_buffer: list[tuple[int, Any, float]] = []
+            # WARN-once flag so a chronic race fires one informational
+            # log line per episode instead of spamming.
+            self._race_fix_warned: bool = False
+            # Set by ``control_loop`` when an unhandled exception escapes
+            # the per-tick work (typically a hardware fault like a CAN
+            # transmit-buffer overflow). The episode supervisor watches
+            # this and tears the whole run down without prompting to
+            # save the partial recording.
+            self.fatal_error: BaseException | None = None
 
             lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -644,35 +770,305 @@ def _build_axol_robot_client(
             self.action_queue = Queue()
             self.action_queue_lock = _threading.Lock()
             self.action_queue_size = []
-            self.start_barrier = _threading.Barrier(2)
+            # 3 threads sync at episode start: action receiver, control
+            # loop, observation loop.
+            self.start_barrier = _threading.Barrier(3)
             self.fps_tracker = FPSTracker(target_fps=self.config.fps)
             self.must_go = _threading.Event()
             self.must_go.set()
 
         def reset_episode_state(self) -> None:
-            """Reset queues + flags so threads can run a fresh episode.
-
-            Recreates ``start_barrier`` (so two new threads can synchronize)
-            and clears any leftover action queue entries.
-            """
+            """Reset queues + flags so threads can run a fresh episode."""
             with self.action_queue_lock:
                 self.action_queue = Queue()
                 self.action_queue_size = []
+                self._chunk_buffer = []
             with self.latest_action_lock:
                 self.latest_action = -1
             self.action_chunk_size = -1
             self.must_go.set()
             self.fps_tracker.reset()
             self.shutdown_event.clear()
-            self.start_barrier = _threading.Barrier(2)
+            self.start_barrier = _threading.Barrier(3)
+            self._race_fix_warned = False
+            self.fatal_error = None
             if self._publisher is not None:
                 self._publisher.reset()
 
+        def _install_future_queue(self, future_queue) -> None:  # type: ignore[no-untyped-def]
+            """Atomically swap in ``future_queue``, filtering out any
+            timestep already popped by the control thread.
+
+            Even when the aggregator re-reads ``latest_action`` while
+            building the future queue, the control thread can pop more
+            actions between that read and the swap. We hold
+            ``action_queue_lock`` here and re-filter against the live
+            ``latest_action`` so the post-swap queue cannot contain
+            already-executed timesteps — which would otherwise let the
+            next pop walk ``latest_action`` backwards and snap the arm.
+            """
+            with self.action_queue_lock:
+                with self.latest_action_lock:
+                    live_latest = self.latest_action
+                filtered = Queue()
+                dropped = 0
+                while not future_queue.empty():
+                    ta = future_queue.get_nowait()
+                    if ta.get_timestep() > live_latest:
+                        filtered.put(ta)
+                    else:
+                        dropped += 1
+                self.action_queue = filtered
+            if dropped and not self._race_fix_warned:
+                self._race_fix_warned = True
+                _logger.warning(
+                    "Aggregator race fix engaged: %d timestep(s) popped "
+                    "during aggregation were filtered out of the new "
+                    "queue (informational; fix handled it).",
+                    dropped,
+                )
+
+        def _temporal_ensemble_aggregate(self, incoming_actions):  # type: ignore[no-untyped-def]
+            """ACT-paper Algorithm 2: each future timestep is the
+            exponentially-weighted average of all buffered chunks that
+            cover it.
+
+            On every incoming chunk we (1) append it to the buffer
+            (sorted oldest origin first), (2) drop chunks whose entire
+            range has been executed, then (3) rebuild the action queue
+            so every future timestep ``ts > latest_action`` covered by
+            at least one buffered chunk gets::
+
+                commanded[ts] = Σ wᵢ · chunkᵢ[ts] / Σ wᵢ
+
+            with ``wᵢ = exp(-coeff · i)``, ``i=0`` the oldest buffered
+            chunk. The rebuild is one batched op over an
+            ``(n_chunks, n_ts, action_dim)`` grid + mask — sub-ms even
+            with 20 chunks in flight, so the aggregation thread doesn't
+            hold the GIL long enough to perturb the 60 Hz action
+            stream.
+
+            Coefficient intuition (matches ``ACTTemporalEnsembler``):
+            ``coeff=0`` → uniform average; ``coeff>0`` weights older
+            chunks more (smoother, more inertia; ACT default 0.01);
+            ``coeff<0`` weights newer chunks more.
+
+            Gripper indices in ``_GRIPPER_INDICES`` skip the average
+            and take the newest contributing chunk's value so
+            bang-bang grasp commands aren't smeared over ~50 ticks.
+            """
+            import torch
+            from lerobot.async_inference.helpers import TimedAction
+
+            if not incoming_actions:
+                return
+
+            # Pack the incoming chunk into a contiguous tensor laid out
+            # by ascending timestep. Origin = smallest timestep = the
+            # ``obs.timestep`` the server saw. Fail loudly if timesteps
+            # aren't contiguous (upstream always emits contiguous chunks
+            # via ``_time_action_chunk``).
+            sorted_incoming = sorted(incoming_actions, key=lambda a: a.get_timestep())
+            new_origin = sorted_incoming[0].get_timestep()
+            chunk_size = len(sorted_incoming)
+            sample = sorted_incoming[0].get_action()
+            new_packed = torch.empty(
+                (chunk_size, sample.shape[0]),
+                dtype=sample.dtype,
+                device=sample.device,
+            )
+            for offset, ta in enumerate(sorted_incoming):
+                if ta.get_timestep() != new_origin + offset:
+                    raise RuntimeError(
+                        "temporal_ensemble: incoming chunk timesteps are "
+                        f"non-contiguous (expected {new_origin + offset}, "
+                        f"got {ta.get_timestep()} at offset {offset})"
+                    )
+                new_packed[offset] = ta.get_action()
+            new_timestamp = sorted_incoming[0].get_timestamp()
+
+            self._chunk_buffer.append((new_origin, new_packed, new_timestamp))
+            self._chunk_buffer.sort(key=lambda entry: entry[0])
+
+            with self.latest_action_lock:
+                latest_action = self.latest_action
+
+            # Drop chunks whose entire range has already been executed.
+            self._chunk_buffer = [
+                entry
+                for entry in self._chunk_buffer
+                if entry[0] + entry[1].shape[0] - 1 > latest_action
+            ]
+            n_chunks = len(self._chunk_buffer)
+            if n_chunks == 0:
+                self._install_future_queue(Queue())
+                return
+
+            # Grid spans every future timestep covered by at least one
+            # buffered chunk: [latest_action+1, max(origin+size-1)].
+            grid_min_ts = latest_action + 1
+            grid_max_ts = max(
+                origin + packed.shape[0] - 1 for origin, packed, _ in self._chunk_buffer
+            )
+            if grid_min_ts > grid_max_ts:
+                self._install_future_queue(Queue())
+                return
+
+            n_ts = grid_max_ts - grid_min_ts + 1
+            dtype = sample.dtype
+            device = sample.device
+            action_dim = sample.shape[0]
+
+            # Assemble the (n_chunks, n_ts, action_dim) action grid via
+            # one slice copy per chunk. ``mask`` is 1.0 wherever a
+            # chunk contributes to a grid cell.
+            action_grid = torch.zeros(
+                (n_chunks, n_ts, action_dim), dtype=dtype, device=device
+            )
+            mask = torch.zeros((n_chunks, n_ts), dtype=dtype, device=device)
+            for ci, (origin, packed, _) in enumerate(self._chunk_buffer):
+                chunk_max = origin + packed.shape[0] - 1
+                lo = max(origin, grid_min_ts)
+                hi = min(chunk_max, grid_max_ts)
+                if lo > hi:
+                    continue
+                src_start = lo - origin
+                src_stop = hi - origin + 1
+                dst_start = lo - grid_min_ts
+                dst_stop = hi - grid_min_ts + 1
+                action_grid[ci, dst_start:dst_stop] = packed[src_start:src_stop]
+                mask[ci, dst_start:dst_stop] = 1.0
+
+            # One batched weighted sum across chunks for every ts.
+            coeff = self._temporal_ensemble_coeff
+            chunk_weights = torch.exp(
+                -coeff * torch.arange(n_chunks, dtype=dtype, device=device)
+            )
+            weighted_mask = chunk_weights.unsqueeze(1) * mask  # (n_chunks, n_ts)
+            norm = weighted_mask.sum(dim=0).clamp(min=1e-12)
+            ensembled = (action_grid * weighted_mask.unsqueeze(-1)).sum(
+                dim=0
+            ) / norm.unsqueeze(-1)  # (n_ts, action_dim)
+
+            # Gripper carve-out: pick the newest contributing chunk per
+            # ts via a reverse-cumsum one-hot (cheaper than ``torch.max``
+            # on tiny CPU tensors, which has surprisingly large dispatch
+            # overhead).
+            reverse_cumsum = mask.flip(0).cumsum(dim=0).flip(0)
+            newest_mask = mask * (reverse_cumsum == 1).to(dtype)
+            for gidx in self._GRIPPER_INDICES:
+                ensembled[:, gidx] = (action_grid[:, :, gidx] * newest_mask).sum(dim=0)
+
+            # Emit only ts that had at least one contributor.
+            contributed_indices = (
+                mask.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+            )
+            future_queue = Queue()
+            for ti in contributed_indices:
+                future_queue.put(
+                    TimedAction(
+                        timestamp=new_timestamp,
+                        timestep=grid_min_ts + ti,
+                        action=ensembled[ti].clone(),
+                    )
+                )
+            self._install_future_queue(future_queue)
+
+        def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
+            """Dispatch to ``temporal_ensemble`` when selected;
+            otherwise fall through to upstream's scalar blends."""
+            if self._aggregate_strategy == "temporal_ensemble":
+                return self._temporal_ensemble_aggregate(incoming_actions)
+            return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
+
         def control_loop_action(self, verbose: bool = False):  # type: ignore[no-untyped-def]
-            performed = super().control_loop_action(verbose)
+            """Pop the next action, set ``latest_action`` atomically with
+            the pop, send to the robot.
+
+            Upstream's order is (1) pop, (2) release lock + send (~5-10
+            ms), (3) update ``latest_action``. Between (2) and (3) the
+            popped timestep is gone from the queue but ``latest_action``
+            still reports the previous one, so a concurrent aggregator
+            pass can re-insert the popped timestep with a freshly
+            re-ensembled action. At 60 Hz that race fires ~0.8/s. We
+            close it by updating ``latest_action`` inside the same lock
+            block as the pop.
+            """
+            with self.action_queue_lock:
+                self.action_queue_size.append(self.action_queue.qsize())
+                timed_action = self.action_queue.get_nowait()
+                with self.latest_action_lock:
+                    self.latest_action = timed_action.get_timestep()
+                qs_after = self.action_queue.qsize()
+
+            performed = self.robot.send_action(
+                self._action_tensor_to_action_dict(timed_action.get_action())
+            )
+
+            if verbose:
+                self.logger.debug(
+                    f"Ts={timed_action.get_timestamp()} | "
+                    f"Action #{timed_action.get_timestep()} performed | "
+                    f"Queue size: {qs_after}"
+                )
+
             if self._publisher is not None and performed is not None:
                 self._publisher.publish(performed)
             return performed
+
+        def control_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def,override]
+            """Action-only control loop; ``_observation_loop`` runs in
+            parallel.
+
+            The upstream loop interleaves action pops (microseconds)
+            with ``control_loop_observation`` (60-70 ms on Axol: three
+            ZED reads + pickle + gRPC streaming) on a single thread.
+            Every time the queue drops below ``chunk_size_threshold``
+            the obs send blocks action pops for a full ZED frame
+            interval, collapsing the 60 Hz target to ~27 Hz. Decoupling
+            the obs send lets the action stream run at the target rate.
+
+            Any unhandled exception (typically a hardware fault like a
+            CAN transmit-buffer overflow inside ``robot.send_action``)
+            is captured in ``self.fatal_error`` and triggers shutdown so
+            the episode supervisor can tear down cleanly.
+            """
+            self.start_barrier.wait()
+            self.logger.info("Action-only control loop starting (obs send decoupled)")
+            try:
+                while self.running:
+                    control_loop_start = time.perf_counter()
+                    if self.actions_available():
+                        self.control_loop_action(verbose)
+                    elapsed = time.perf_counter() - control_loop_start
+                    time.sleep(max(0.0, self.config.environment_dt - elapsed))
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(
+                    f"Control loop hit an unhandled exception ({exc!r}); "
+                    "signalling shutdown so the episode tears down."
+                )
+                self.fatal_error = exc
+                self.shutdown_event.set()
+
+        def _observation_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def]
+            """Dedicated thread for observation capture + send.
+
+            When the action queue is at or below
+            ``_ready_to_send_observation``'s threshold, fire
+            ``control_loop_observation`` (camera read + pickle + gRPC
+            stream). Otherwise sleep one tick.
+            """
+            self.start_barrier.wait()
+            self.logger.info("Observation loop thread starting")
+            while self.running:
+                try:
+                    if self._ready_to_send_observation():
+                        self.control_loop_observation(task, verbose)
+                    else:
+                        time.sleep(self.config.environment_dt)
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(f"Observation loop error: {exc!r}; continuing")
+                    time.sleep(self.config.environment_dt)
 
         def stop(self) -> None:  # type: ignore[override]
             self.shutdown_event.set()
@@ -682,7 +1078,13 @@ def _build_axol_robot_client(
                 pass
             self.logger.debug("AxolRobotClient channel closed (robot left connected)")
 
-    return AxolRobotClient(config, robot, publisher)
+    return AxolRobotClient(
+        config,
+        robot,
+        publisher,
+        aggregate_strategy,
+        temporal_ensemble_coeff,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -702,8 +1104,9 @@ def _run(
     device: str,
     server_port: int = 8765,
     actions_per_chunk: int = 50,
-    chunk_size_threshold: float = 0.5,
+    chunk_size_threshold: float = 0.9,
     aggregate_fn: str = "weighted_average",
+    temporal_ensemble_coeff: float = 0.01,
     zed_host: str = "192.168.10.1",
     zed_iface: str | None = None,
     left_gripper_torque_limit: float = 1.0,
@@ -840,10 +1243,20 @@ def _run(
 
     client = None
     episodes_recorded = 0
-    robot_connected = False
     try:
         _wait_for_port("127.0.0.1", server_port, timeout=30.0)
 
+        # temporal_ensemble lives in our ``_aggregate_action_queues``
+        # override; ``RobotClientConfig`` still needs a name from its
+        # own registry so we pass ``latest_only`` as a placeholder that
+        # we short-circuit before it's ever called.
+        if aggregate_fn == "temporal_ensemble":
+            log_say(
+                f"Aggregation: temporal_ensemble "
+                f"(coeff={temporal_ensemble_coeff:+.3f}, ACT default 0.01)."
+            )
+        else:
+            log_say(f"Aggregation: {aggregate_fn}.")
         client_cfg = RobotClientConfig(
             robot=robot_config,
             policy_type=policy_type,
@@ -855,11 +1268,17 @@ def _run(
             client_device="cpu",
             chunk_size_threshold=chunk_size_threshold,
             fps=fps,
-            aggregate_fn_name=aggregate_fn,
+            aggregate_fn_name=(
+                "latest_only" if aggregate_fn == "temporal_ensemble" else aggregate_fn
+            ),
         )
         publisher = _ActionPublisher()
         client = _build_axol_robot_client(
-            config=client_cfg, robot=robot, publisher=publisher
+            config=client_cfg,
+            robot=robot,
+            publisher=publisher,
+            aggregate_strategy=aggregate_fn,
+            temporal_ensemble_coeff=temporal_ensemble_coeff,
         )
 
         log_say("Loading policy on server (one-time)...")
@@ -869,7 +1288,6 @@ def _run(
         # Policy is now resident on cuda — safe to connect cameras.
         log_say("Connecting robot...")
         robot.connect()
-        robot_connected = True
 
         log_say("Returning to rest pose.")
         reset_controller.return_to_rest(robot)
@@ -897,6 +1315,15 @@ def _run(
                 target=client.control_loop,
                 args=(task,),
                 name="axol-control-loop",
+                daemon=True,
+            )
+            # Dedicated obs send thread (see AxolRobotClient.control_loop
+            # for why: the upstream design runs obs send on the control
+            # thread, which stalls 60 Hz down to ~27 Hz).
+            obs_thread = threading.Thread(
+                target=client._observation_loop,
+                args=(task,),
+                name="axol-obs-loop",
                 daemon=True,
             )
 
@@ -929,6 +1356,7 @@ def _run(
 
             receiver_thread.start()
             control_thread.start()
+            obs_thread.start()
             if capture is not None:
                 capture.start()
             stdin_thread.start()
@@ -943,12 +1371,16 @@ def _run(
                     if time.perf_counter() >= deadline:
                         timed_out = True
                         break
-                    if not control_thread.is_alive() and not receiver_thread.is_alive():
-                        # Both inference threads died unexpectedly; abort
-                        # the episode and surface to the operator.
-                        _logger.warning(
-                            "Control/receiver threads exited before any "
-                            "end signal; aborting episode."
+                    if client.fatal_error is not None:
+                        # Hardware fault (e.g. CAN transmit-buffer full)
+                        # raised out of the control loop. Drop the
+                        # episode entirely and exit the run — no save
+                        # prompt, no rerecord, the operator needs to
+                        # check the robot.
+                        log_say(
+                            f"Fatal error in control loop: "
+                            f"{client.fatal_error!r}. Aborting run without "
+                            "saving the current episode."
                         )
                         break
                     time.sleep(0.1)
@@ -963,11 +1395,16 @@ def _run(
                 capture.join(timeout=5.0)
             control_thread.join(timeout=5.0)
             receiver_thread.join(timeout=5.0)
+            obs_thread.join(timeout=5.0)
             # The stdin watcher blocks on select with a short timeout, so
             # it will wake up on its own; don't join (it may still be in
             # select if the user never typed anything).
 
             if interrupted:
+                break
+            if client.fatal_error is not None:
+                if dataset is not None:
+                    dataset.clear_episode_buffer()
                 break
 
             choice = stdin_result["choice"]
@@ -1011,13 +1448,20 @@ def _run(
             except (EOFError, KeyboardInterrupt):
                 break
 
+        # Re-raise a control-loop hardware fault (e.g. CAN transmit
+        # buffer full) so ``run()`` exits the CLI with a non-zero
+        # status. The ``finally`` block below still runs first and
+        # tears the robot / server down cleanly.
+        if client is not None and client.fatal_error is not None:
+            raise client.fatal_error
+
     except KeyboardInterrupt:
         pass
     finally:
-        # Ignore further SIGINT during cleanup so an impatient second
-        # Ctrl+C doesn't abort partway through robot.disconnect() / server
-        # teardown and leave hardware in a weird state. Cleanup is the
-        # same path Ctrl+C ("behave like q") needs anyway.
+        # Ignore SIGINT during cleanup so an impatient second Ctrl+C
+        # doesn't abort partway through robot.disconnect() / server
+        # teardown and leave hardware in a weird state. We restore the
+        # default handler at the end of this block.
         import signal
 
         try:
@@ -1031,11 +1475,16 @@ def _run(
                 client.stop()
             except Exception:  # noqa: BLE001
                 pass
-        if robot_connected:
-            try:
-                robot.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+        # Always attempt disconnect — ``robot.connect()`` starts the
+        # asyncio event-loop thread *before* the motor-enable step, so a
+        # MotorError during enable leaves the loop thread and any
+        # already-opened CAN buses dangling. ``disconnect()`` is
+        # null-safe and idempotent, so this is fine even if connect
+        # never even started.
+        try:
+            robot.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
 
         try:
             reset_controller.stop()
@@ -1071,3 +1520,11 @@ def _run(
                 _logger.warning(
                     "Failed to remove empty dataset at %s: %s", dataset_root, exc
                 )
+
+        # Restore the default SIGINT handler so the user can still kill
+        # the process if any non-daemon thread we don't control (e.g. a
+        # leaked driver thread) is keeping the interpreter alive.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
