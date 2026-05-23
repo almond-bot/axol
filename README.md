@@ -765,7 +765,7 @@ See `teleop --robot axol` in [Teleoperation](#teleoperation) for the equivalent 
 | `pose_min_cutoff` | `1.5` Hz | One Euro Filter tremor cutoff for raw VR poses |
 | `pose_beta` | `5.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
 | `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
-| `reset_min_duration` | `0.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
+| `reset_min_duration` | `1.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
 | `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
 
 **Deadman switch behaviour.** Grip is a toggle, not a hold. Press both grip buttons together to enable arm movement; press either grip alone to freeze the arms. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.

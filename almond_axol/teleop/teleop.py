@@ -384,7 +384,6 @@ class VRTeleop:
             right[7] = r_grip
             return left, right
 
-        # ----- Normal teleop: smooth the IK output -----
         q = self._q
         l_grip = self._l_grip
         r_grip = self._r_grip
