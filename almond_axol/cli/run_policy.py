@@ -1105,7 +1105,7 @@ def _run(
     server_port: int = 8765,
     actions_per_chunk: int = 50,
     chunk_size_threshold: float = 0.9,
-    aggregate_fn: str = "weighted_average",
+    aggregate_fn: str = "temporal_ensemble",
     temporal_ensemble_coeff: float = 0.01,
     zed_host: str = "192.168.10.1",
     zed_iface: str | None = None,
