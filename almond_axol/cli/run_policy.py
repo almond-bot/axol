@@ -1096,6 +1096,9 @@ def _run(
                 repo_id=repo_id,
                 root=str(dataset_root),
                 image_writer_threads=4,
+                streaming_encoding=True,
+                encoder_threads=4,
+                vcodec="auto",
             )
             resumed_dataset = True
         else:
@@ -1109,6 +1112,9 @@ def _run(
                 robot_type=robot.name,
                 use_videos=True,
                 image_writer_threads=4,
+                streaming_encoding=True,
+                encoder_threads=4,
+                vcodec="auto",
             )
 
     if rerun_ip:
