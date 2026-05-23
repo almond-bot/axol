@@ -172,6 +172,23 @@ class ZedStreamer:
             )
             return None
 
+        opened_serial = int(zed.get_camera_information().serial_number)
+        if opened_serial != serial:
+            _logger.warning(
+                "%s: requested serial %d (camera_id %d) but SDK opened serial %d",
+                name,
+                serial,
+                camera_id,
+                opened_serial,
+            )
+        else:
+            _logger.info(
+                "%s: opened camera serial %d (camera_id %d)",
+                name,
+                opened_serial,
+                camera_id,
+            )
+
         stream_params = sl.StreamingParameters()
         stream_params.codec = sl.STREAMING_CODEC.H265
         stream_params.bitrate = self._config.bitrate
