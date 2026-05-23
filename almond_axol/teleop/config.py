@@ -19,8 +19,15 @@ class VRTeleopConfig:
             ARM_JOINTS order (no gripper). Used as the reset target.
         frequency: Control loop rate in Hz used by :meth:`VRTeleop.run` and
             as waypoint density for reset trajectories.
-        reset_speed: Speed of the reset move in rad/s. Determines the number
-            of trajectory waypoints based on the distance to the rest pose.
+        reset_speed: Average joint velocity (rad/s) of the worst-case joint
+            during a return-to-rest move. The smoothstep profile gives a
+            peak joint velocity of ``1.5 * reset_speed``. Determines the
+            number of trajectory waypoints based on the distance to the
+            rest pose, subject to ``reset_min_duration`` below.
+        reset_min_duration: Floor (seconds) on the return-to-rest trajectory
+            duration. Prevents near-rest starts from snapping home in a
+            handful of frames and gives every reset a consistent minimum
+            feel regardless of starting pose. Defaults to ``0.5`` s.
         reset_rest_weight: Cost weight penalising deviation from the reset
             target pose during collision-aware trajectory generation.
         reset_limit_weight: Cost weight penalising joint-limit violations
@@ -30,11 +37,6 @@ class VRTeleopConfig:
         reset_collision_weight: Cost weight on self-collision penalty during
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
-        startup_max_accel: Maximum joint acceleration (rad/s²) used only during
-            the initial startup trajectory (current pose → rest pose).  Motors
-            are cold at this point and respond sharply; a gentler ramp avoids
-            the initial jerk.  Restored to ``teleop_max_accel`` once the
-            startup trajectory completes.  Defaults to 0.3 rev/s².
         engage_max_vel: Maximum joint velocity (rad/s) used by the
             trapezoidal filter when the deadman switch is first pressed after a
             rest-pose trajectory (startup or reset).  Slows the transition from
@@ -102,12 +104,12 @@ class VRTeleopConfig:
     )
     frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
+    reset_min_duration: float = 1.5
     reset_rest_weight: float = 50.0
     reset_limit_weight: float = 100.0
     reset_collision_margin: float = 0.025
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
-    startup_max_accel: float = 0.3 * 2 * math.pi
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi

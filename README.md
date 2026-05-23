@@ -761,11 +761,11 @@ See `teleop --robot axol` in [Teleoperation](#teleoperation) for the equivalent 
 | `teleop_max_accel` | `3.5 rev/s²` | Trapezoidal filter acceleration cap |
 | `engage_max_vel` | `0.1 rev/s` | Slower velocity limit when the deadman switch is first pressed after a reset |
 | `engage_duration` | `1.0` s | How long `engage_max_vel` is held before restoring `teleop_max_vel` |
-| `startup_max_accel` | `0.3 rev/s²` | Gentler accel during the initial startup move to rest pose |
 | `ik_alpha` | `0.5` | EMA blend factor on IK output; `1.0` disables smoothing |
 | `pose_min_cutoff` | `1.5` Hz | One Euro Filter tremor cutoff for raw VR poses |
 | `pose_beta` | `5.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
-| `reset_speed` | `0.1 rev/s` | Speed of the collision-aware return-to-rest trajectory |
+| `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
+| `reset_min_duration` | `0.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
 | `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
 
 **Deadman switch behaviour.** Grip is a toggle, not a hold. Press both grip buttons together to enable arm movement; press either grip alone to freeze the arms. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.

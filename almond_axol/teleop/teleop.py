@@ -137,7 +137,6 @@ class VRTeleop:
         self._prev_either: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
-        self._startup_complete: bool = False
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -231,8 +230,6 @@ class VRTeleop:
             self._smooth_right.reset(seed=seed_r[:7])
 
         if startup_traj:
-            self._smooth_left.max_accel = self._config.startup_max_accel
-            self._smooth_right.max_accel = self._config.startup_max_accel
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
         self._ik_stop.clear()
@@ -362,24 +359,35 @@ class VRTeleop:
         if self._q is None:
             return None, None
 
-        q = self._q
-
-        l_grip = self._l_grip
-        r_grip = self._r_grip
-
         if self._reset_interp.is_active():
             new_q, l_grip, r_grip, done = self._reset_interp.step()
-            if new_q is not None:
-                q = np.asarray(new_q, dtype=np.float32)
-                if done:
-                    self._q = q.copy()
-                    self._l_grip = l_grip
-                    self._r_grip = r_grip
-                    self._at_rest = True
-                    if not self._startup_complete:
-                        self._startup_complete = True
-                        self._smooth_left.max_accel = self._config.teleop_max_accel
-                        self._smooth_right.max_accel = self._config.teleop_max_accel
+            if new_q is None:
+                return None, None
+            q = np.asarray(new_q, dtype=np.float32)
+            if done:
+                self._q = q.copy()
+                self._l_grip = l_grip
+                self._r_grip = r_grip
+                self._at_rest = True
+                seed_l = np.append(q[self._left_indices], l_grip)
+                seed_r = np.append(q[self._right_indices], r_grip)
+                self._ema_left.reset(seed=seed_l)
+                self._ema_right.reset(seed=seed_r)
+                self._smooth_left.reset(seed=q[self._left_indices])
+                self._smooth_right.reset(seed=q[self._right_indices])
+
+            left = np.empty(8, dtype=np.float32)
+            left[:7] = q[self._left_indices]
+            left[7] = l_grip
+            right = np.empty(8, dtype=np.float32)
+            right[:7] = q[self._right_indices]
+            right[7] = r_grip
+            return left, right
+
+        # ----- Normal teleop: smooth the IK output -----
+        q = self._q
+        l_grip = self._l_grip
+        r_grip = self._r_grip
 
         ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
         ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
@@ -485,16 +493,17 @@ class VRTeleop:
                         if isinstance(result, tuple) and result[0] == "reset_traj":
                             _, q_default, trajectory = result
                             if trajectory:
+                                # Reset trajectory playback in step() bypasses
+                                # the EMA and trapezoidal filters and reseeds
+                                # them on completion, so there's no filter
+                                # state to clear here.
                                 self._reset_interp.set_trajectory(
                                     trajectory, self._l_grip, self._r_grip
                                 )
-                                self._ema_left.reset()
-                                self._ema_right.reset()
-                                self._smooth_left.reset()
-                                self._smooth_right.reset()
                                 self._teleop_enabled = False
                                 self._prev_both = False
                                 self._prev_either = False
+                                self._engage_time = None
                             self._q = np.asarray(q_default, dtype=np.float32)
                     except Exception as e:
                         _logger.error("Reset error: %s", e)

@@ -8,23 +8,20 @@ All intermediate computations stay in NumPy; the single JAX boundary is the
 
 from __future__ import annotations
 
-import functools
 import multiprocessing
 import multiprocessing.connection
 import os
 
-import jax
 import jax.numpy as jnp
 import jaxlie
-import jaxls
 import numpy as np
-import pyroki as pk
 
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
 from .filter import OneEuroFilter
+from .trajectory import plan_collision_aware_trajectory
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -87,55 +84,6 @@ def _relative_target_np(
     R_delta[1, :] = (-A[1, 2], A[1, 1], -A[1, 0])
     R_delta[2, :] = (A[0, 2], -A[0, 1], A[0, 0])
     return new_t.astype(np.float32), (rot_snap_fk @ R_delta).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# JIT-compiled reset step
-# ---------------------------------------------------------------------------
-
-
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
-def _solve_reset_step(
-    robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
-    q_interp: jax.Array,
-    q_current: jax.Array,
-    rest_weight: float,
-    limit_weight: float,
-    collision_margin: float,
-    collision_weight: float,
-    max_iterations: int,
-) -> jax.Array:
-    """One IK step toward ``q_interp`` with limit and self-collision costs only."""
-    JointVar = robot.joint_var_cls
-    costs = [
-        pk.costs.rest_cost(JointVar(0), rest_pose=q_interp, weight=rest_weight),
-        pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight),
-        pk.costs.self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            margin=collision_margin,
-            weight=collision_weight,
-        ),
-    ]
-    var_joints = JointVar(jnp.array([0]))
-    initial_vals = jaxls.VarValues.make(
-        [var_joints.with_value(q_current[jnp.newaxis, :])]
-    )
-    problem = jaxls.LeastSquaresProblem(costs, [var_joints])
-    analyzed = problem.analyze()
-    solution_vals = analyzed.solve(
-        initial_vals=initial_vals,
-        verbose=False,
-        linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(),
-        termination=jaxls.TerminationConfig(
-            max_iterations=max_iterations,
-            cost_tolerance=1e-2,
-        ),
-    )
-    return solution_vals[var_joints][0]
 
 
 # ---------------------------------------------------------------------------
@@ -327,29 +275,20 @@ class IKWorker:
     ) -> list[np.ndarray]:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
-        max_dist_rad = float(np.max(np.abs(q_current - q_target)))
-        duration = max_dist_rad / cfg.reset_speed
-        n_steps = max(1, round(duration * cfg.frequency))
-        trajectory: list[np.ndarray] = []
-        q = np.array(q_current, dtype=np.float32)
-        for i in range(n_steps):
-            t = (i + 1) / n_steps
-            alpha = t * t * (3.0 - 2.0 * t)
-            q_interp = (q_current * (1.0 - alpha) + q_target * alpha).astype(np.float32)
-            result = _solve_reset_step(
-                self._solver.robot,
-                self._solver.robot_coll,
-                jnp.asarray(q_interp),
-                jnp.asarray(q),
-                cfg.reset_rest_weight,
-                cfg.reset_limit_weight,
-                cfg.reset_collision_margin,
-                cfg.reset_collision_weight,
-                cfg.reset_max_iterations,
-            )
-            q = np.array(result, dtype=np.float32)
-            trajectory.append(q.copy())
-        return trajectory
+        return plan_collision_aware_trajectory(
+            self._solver.robot,
+            self._solver.robot_coll,
+            q_current,
+            q_target,
+            speed=cfg.reset_speed,
+            rate=cfg.frequency,
+            min_duration=cfg.reset_min_duration,
+            rest_weight=cfg.reset_rest_weight,
+            limit_weight=cfg.reset_limit_weight,
+            collision_margin=cfg.reset_collision_margin,
+            collision_weight=cfg.reset_collision_weight,
+            max_iterations=cfg.reset_max_iterations,
+        )
 
     def reset(self) -> None:
         """Deactivate the deadman-switch state and clear snap poses and filter state.

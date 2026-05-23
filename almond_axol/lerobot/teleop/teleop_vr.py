@@ -439,18 +439,33 @@ class AxolVRTeleop(Teleoperator):
         if q is None:
             return self._q_out
 
-        l_grip = self._l_grip
-        r_grip = self._r_grip
-
         if self._reset_interp.is_active():
             new_q, l_grip, r_grip, done = self._reset_interp.step()
-            if new_q is not None:
-                q = np.asarray(new_q, dtype=np.float32)
-                if done:
-                    self._q = q.copy()
-                    self._l_grip = l_grip
-                    self._r_grip = r_grip
-                    self._at_rest = True
+            if new_q is None:
+                return self._q_out
+            q = np.asarray(new_q, dtype=np.float32)
+            if done:
+                self._q = q.copy()
+                self._l_grip = l_grip
+                self._r_grip = r_grip
+                self._at_rest = True
+                seed_l = np.append(q[self._left_indices], l_grip)
+                seed_r = np.append(q[self._right_indices], r_grip)
+                self._ema_left.reset(seed=seed_l)
+                self._ema_right.reset(seed=seed_r)
+                self._smooth_left.reset(seed=q[self._left_indices])
+                self._smooth_right.reset(seed=q[self._right_indices])
+
+            out = np.empty(16, dtype=np.float32)
+            out[:7] = q[self._left_indices]
+            out[7] = l_grip
+            out[8:15] = q[self._right_indices]
+            out[15] = r_grip
+            return out
+
+        # ----- Normal teleop: smooth the IK output -----
+        l_grip = self._l_grip
+        r_grip = self._r_grip
 
         ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
         ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
@@ -480,11 +495,6 @@ class AxolVRTeleop(Teleoperator):
         while True:
             t0 = time.perf_counter()
 
-            # Process a pending reset before checking for VR frames so it fires
-            # even without a live headset.  _reset_latched is cleared only in the
-            # finally block — after the IK subprocess responds and the trajectory is
-            # armed — so is_resetting() stays True throughout the async IK call and
-            # the collect_data reset loop cannot exit prematurely.
             if (
                 self._reset_latched
                 and not self._reset_interp.is_active()
@@ -499,13 +509,10 @@ class AxolVRTeleop(Teleoperator):
                             self._reset_interp.set_trajectory(
                                 trajectory, self._l_grip, self._r_grip
                             )
-                            self._ema_left.reset()
-                            self._ema_right.reset()
-                            self._smooth_left.reset()
-                            self._smooth_right.reset()
                             self._teleop_enabled = False
                             self._prev_both = False
                             self._prev_either = False
+                            self._engage_time = None
                             self._at_rest = True
                         self._q = np.asarray(q_default, dtype=np.float32)
                 except Exception as e:
