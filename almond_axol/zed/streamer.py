@@ -89,12 +89,12 @@ class ZedStreamer:
         ]
 
         loop = asyncio.get_running_loop()
-        states = await asyncio.gather(
-            *[
-                loop.run_in_executor(None, self._open_camera, name, serial, port)
-                for name, serial, port in specs
-            ]
-        )
+        states: list[_CameraState | None] = []
+        for name, serial, port in specs:
+            state = await loop.run_in_executor(
+                None, self._open_camera, name, serial, port
+            )
+            states.append(state)
 
         self._cameras = [s for s in states if s is not None]
         _logger.info(
