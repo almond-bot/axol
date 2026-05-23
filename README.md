@@ -228,29 +228,44 @@ Dataset frame capture runs on a dedicated thread decoupled from the teleop contr
 
 ### `run-policy`
 
-Runs a trained policy autonomously on the robot using three ZED cameras. Between episodes, prompts the operator via stdin to save (`Enter`), re-record (`r`), or quit (`q`).
+Runs a trained policy autonomously on the robot using three ZED cameras and LeRobot's async inference (`lerobot.async_inference`). A `PolicyServer` is launched in a child process on localhost and the parent drives a thin `RobotClient` subclass that streams observations to it and consumes the returned action chunks. Type `s` on stdin to save the rollout and end the episode, `r` to discard and re-record, or `q` to discard and quit. `--episode-time-s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
 
 | Flag | Description |
 |---|---|
 | `--policy PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
+| `--policy-type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy` (required) |
 | `--task TEXT` | Natural language task description (required) |
-| `--episode-time-s INT` | Max duration per episode in seconds (default: 30) |
-| `--fps INT` | Control loop frame rate (default: 60) |
+| `--episode-time-s INT` | Safety cap on episode duration in seconds (default: 120). Episodes normally end on operator keypress |
+| `--fps INT` | Control loop frame rate (default: 60). Must match the fps the policy was trained on |
 | `--repo-id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push-to-hub` | Push rollout dataset to HuggingFace Hub when done |
+| `--device STR` | PyTorch device for policy inference (default: `cuda`) |
+| `--server-port INT` | Port for the localhost `PolicyServer` child process (default: 8765) |
+| `--actions-per-chunk INT` | Number of actions returned per inference call (default: 50); capped by the policy's max action horizon |
+| `--chunk-size-threshold FLOAT` | Trigger a fresh observation when the action queue drops to this fraction of a chunk (default: 0.9) |
+| `--aggregate-fn {temporal_ensemble,weighted_average,latest_only,average,conservative}` | Action chunk aggregation strategy (default: `temporal_ensemble`, ACT Algorithm 2; gripper indices take the newest chunk). The other choices are upstream scalar blends |
+| `--temporal-ensemble-coeff K` | Decay coefficient for `temporal_ensemble` (default: 0.01, ACT paper). `wᵢ = exp(-K·i)`, `i=0` oldest chunk; `K>0` smoother, `K=0` uniform, `K<0` more reactive |
 | `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
 | `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
-| `--gripper-torque-limit FLOAT` | Max gripper torque (Nm) in POSITION_FORCE mode, applied to both grippers (default: 1.0) |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 1.0) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 1.0) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` (default) = fully compliant; `1` = pre-tuning industrial gains. Should match the value used at data collection time. See [`AxolConfig.left_stiffness`](#almond_axolrobot). |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
 | `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
-| `--device STR` | PyTorch device for inference (default: `cuda`) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
-axol run-policy --policy myorg/pick-place-policy --task "Pick the red cube"
-axol run-policy --policy ./checkpoints/epoch_100 --task "Stack blocks" --episode-time-s 20 --device cpu
+axol run-policy --policy myorg/pick-place-policy --policy-type act --task "Pick the red cube"
+axol run-policy --policy ./checkpoints/epoch_100 --policy-type smolvla --task "Stack blocks" --device cpu
+axol run-policy --policy myorg/pick-place-policy --policy-type act --task "Pick the red cube" \
+    --repo-id myorg/pick-place-rollouts --left-stiffness 0.5 --right-stiffness 0.5
 ```
+
+If `--repo-id` is supplied, each saved episode is appended to a LeRobot-format dataset using the same resume/refuse/wipe semantics as `collect-data` (resume a complete dataset, refuse an incomplete one, wipe a leftover empty directory). Between episodes the arms return to the rest pose via a collision-aware IK trajectory planned in a worker subprocess, mirroring the reset path used by `collect-data`.
+
+Action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by the buffered chunks is the exponentially-weighted average across those chunks, with the gripper indices snapped to the newest contributing chunk so bang-bang grasp commands aren't smeared. The control loop and observation send run on separate threads — decoupling the ~60-70 ms ZED-read + gRPC send from the 60 Hz action stream that would otherwise collapse to ~27 Hz on the upstream single-threaded design.
 
 ---
 
