@@ -463,7 +463,6 @@ class AxolVRTeleop(Teleoperator):
             out[15] = r_grip
             return out
 
-        # ----- Normal teleop: smooth the IK output -----
         l_grip = self._l_grip
         r_grip = self._r_grip
 
