@@ -2,28 +2,18 @@
 axol run-policy
 
 Run a trained policy on the Axol robot with three ZED cameras using
-LeRobot's async inference (``lerobot.async_inference``).
+LeRobot's async inference (``lerobot.async_inference``). A ``PolicyServer``
+is auto-launched in a child process on localhost and the parent drives an
+``AxolRobotClient`` (a thin ``RobotClient`` subclass) that streams
+observations to it and consumes the returned action chunks. Cameras and
+joints are sampled via ``ZedCamera.read_at_or_after(now)`` so every
+inference observation is global-timestamp aligned the same way the
+training data is (see ``AxolRobot.get_observation``).
 
-Architecture
-============
-A ``PolicyServer`` is auto-launched in a child process on localhost. The
-parent process drives an ``AxolRobotClient`` (a thin subclass of LeRobot's
-``RobotClient``) that streams observations to the server and consumes the
-action chunks the server returns. Cameras + joints are sampled via
-``ZedCamera.read_at_or_after(now)`` (see ``AxolRobot.get_observation``) so
-each inference observation is global-timestamp aligned the same way the
-training data is.
-
-Episode termination
-===================
-Each episode runs until the operator presses a key:
-
-    s  → end + save  (writes the rollout to ``--repo-id`` when set)
-    r  → end + rerecord (discard buffer)
-    q  → end + quit  (discard buffer, exit ``axol run-policy``)
-
-``--episode-time-s`` is kept as a safety cap: when it fires the operator
-gets the same ``[Enter]=save / r / q`` prompt as before.
+Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
++ discard), or ``q`` (quit + discard) on stdin. ``--episode-time-s`` is a
+safety cap that falls back to the same ``[Enter]=save / r / q`` prompt
+when no key has been pressed.
 """
 
 from __future__ import annotations
@@ -66,10 +56,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
             "pi05",
             "groot",
         ],
-        help=(
-            "Policy architecture as registered in lerobot.async_inference "
-            "(must match the checkpoint at --policy)."
-        ),
+        help="Policy architecture; must match the checkpoint at --policy.",
     )
     p.add_argument("--task", required=True, help="Natural language task description.")
     p.add_argument(
@@ -78,8 +65,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=120,
         help=(
             "Safety cap on episode duration in seconds (default: 120). "
-            "Episodes normally end on operator keypress; this only fires if "
-            "the operator never signals s/r/q."
+            "Episodes normally end on operator keypress (s/r/q)."
         ),
     )
     p.add_argument(
@@ -87,8 +73,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=int,
         default=60,
         help=(
-            "Control loop frame rate (default: 60, matching collect-data). "
-            "Must match the fps the policy was trained on."
+            "Control loop frame rate (default: 60). Must match the fps "
+            "the policy was trained on."
         ),
     )
     p.add_argument(
@@ -131,16 +117,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         type=float,
         default=0.9,
         help=(
-            "Send a fresh observation to the server when the local "
-            "action queue drops to this fraction of a full chunk "
-            "(default: 0.9). Upstream lerobot defaults to 0.5 because "
-            "obs send and action pops share a thread there; on Axol "
-            "obs send runs on a dedicated thread (see "
-            "AxolRobotClient._observation_loop) so a higher threshold "
-            "is strictly better — it triggers the next obs while the "
-            "queue still has plenty of margin, so a fresh chunk almost "
-            "always lands before the queue drains and the arm doesn't "
-            "freeze waiting at chunk boundaries."
+            "Trigger a fresh observation when the action queue drops to "
+            "this fraction of a full chunk (default: 0.9). Higher than "
+            "upstream's 0.5 because obs send runs on its own thread here."
         ),
     )
     p.add_argument(
@@ -154,15 +133,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
             "conservative",
         ],
         help=(
-            "Action chunk aggregation strategy (default: "
-            "temporal_ensemble). temporal_ensemble is ACT's Algorithm 2: "
-            "every future timestep is the exponentially-weighted average "
-            "of all buffered chunks covering it (see "
-            "--temporal-ensemble-coeff), with the gripper indices "
-            "carved out to use the newest chunk's value so bang-bang "
-            "grasps aren't smeared. The other choices are the upstream "
-            "lerobot scalar blends, applied uniformly across all 16 "
-            "action components."
+            "Action chunk aggregation strategy (default: temporal_ensemble, "
+            "ACT Algorithm 2; gripper indices take the newest chunk). The "
+            "other choices are upstream scalar blends applied uniformly."
         ),
     )
     p.add_argument(
@@ -172,11 +145,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="K",
         help=(
             "Decay coefficient for --aggregate-fn temporal_ensemble "
-            "(default: 0.01, matching the ACT paper). Weights are "
-            "wᵢ = exp(-K·i), i=0 is the oldest buffered chunk; K>0 "
-            "favors older chunks (smoother), K=0 averages uniformly, "
-            "K<0 favors newer chunks (more reactive). Ignored for "
-            "other --aggregate-fn values."
+            "(default: 0.01, ACT paper). wᵢ = exp(-K·i), i=0 oldest chunk; "
+            "K>0 smoother, K=0 uniform, K<0 more reactive."
         ),
     )
     p.add_argument(
@@ -257,14 +227,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def run(args: argparse.Namespace) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level))
 
-    # Hardware errors bubble up from inside ``_run`` — either at
-    # connect time (motor unresponsive: ``MotorError``) or mid-episode
-    # (CAN socket faults like "Transmit buffer full": ``CanError``).
-    # Catch them here so we exit with a brief error and a non-zero
-    # status instead of dumping a multi-frame traceback for what is
-    # really an operator-actionable hardware fault. ``_run``'s own
-    # ``finally`` has already torn down the robot + policy server by
-    # the time we get here.
+    # Translate operator-actionable hardware faults into a clean non-zero
+    # exit instead of a multi-frame traceback.
     import sys
 
     import can
@@ -305,17 +269,11 @@ class _IKResetController:
     """Collision-aware return-to-rest, backed by an IK worker subprocess.
 
     Mirrors the reset path used by ``AxolVRTeleop`` (collect-data) but
-    without the VR server. ``start()`` spawns ``run_ik_worker`` in a
-    ``spawn``-mode subprocess; it imports JAX, JITs the IK solver
-    (~10-20 s), and reports ``("ready", ...)``. ``wait_ready()`` blocks on
-    that message. ``return_to_rest()`` then asks the worker for a
-    collision-aware joint-space trajectory from the current pose to the
-    rest pose and plays it back through a ``ResetInterpolator`` while
-    streaming each waypoint to the impedance controller.
-
-    Spawn it before ``client.start()`` so the IK JIT overlaps with the
-    policy load — by the time we actually need a rest move, the worker is
-    typically already ready.
+    without the VR server. ``start()`` spawns ``run_ik_worker`` (JAX +
+    JITed solver, ~10-20 s); ``wait_ready()`` blocks on the handshake;
+    ``return_to_rest()`` plans a joint-space trajectory and streams its
+    waypoints to the impedance controller. Spawn before ``client.start()``
+    so the IK JIT overlaps with the policy load.
     """
 
     def __init__(self) -> None:
@@ -332,7 +290,7 @@ class _IKResetController:
         self._ready = False
 
     def start(self) -> None:
-        """Spawn the IK worker subprocess. Non-blocking — call wait_ready()."""
+        """Spawn the IK worker subprocess. Non-blocking; pair with ``wait_ready``."""
         import multiprocessing as mp
 
         from ..teleop.worker import run_ik_worker
@@ -489,8 +447,11 @@ class _ActionPublisher:
 
 
 class _RolloutCaptureThread(threading.Thread):
-    """Tick at ``fps`` Hz, sample one global-timestamp-aligned observation per
-    tick, pair it with the latest executed action, and append a dataset row.
+    """Tick at ``fps`` Hz and append one ``(obs, action)`` row per tick.
+
+    Each tick samples a global-timestamp-aligned observation via
+    ``AxolRobot.get_observation`` and pairs it with the latest action
+    published by ``AxolRobotClient.control_loop_action``.
     """
 
     def __init__(
@@ -614,21 +575,12 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
 def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
     """Entry point for the policy-server child process.
 
-    Lives in the parent module so it's picklable by ``mp.get_context('spawn')``
-    on macOS/Linux. Re-imports lerobot inside the child to avoid sharing
-    CUDA/JAX state with the parent.
+    Lives at module scope so it's picklable by ``mp.get_context('spawn')``.
+    SIGINT is ignored so Ctrl+C in the parent terminal doesn't dump a gRPC
+    traceback; the parent explicitly terminates the server during cleanup.
 
-    The child ignores SIGINT so Ctrl+C in the controlling terminal doesn't
-    dump a gRPC traceback from this process; the parent explicitly
-    terminates the server during its cleanup path.
-
-    Before serving we monkey-patch ``policy_server.observations_similar``
-    to always return ``False``. The upstream default uses a 1-rad L2
-    joint-state tolerance to drop "too similar" observations, which on
-    Axol's 16-DOF arms at 60 Hz drops nearly every observation — a fresh
-    chunk only lands every ~2 s, the action queue runs dry, and the arm
-    freezes for ~135 ms at every chunk boundary. The filter has no
-    config knob on ``PolicyServerConfig`` so we patch the module symbol.
+    Args:
+        server_cfg_dict: ``PolicyServerConfig`` keyword arguments.
     """
     import signal
 
@@ -636,6 +588,9 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     from lerobot.async_inference import policy_server as _ps
 
+    # Upstream's 1-rad L2 similarity filter drops nearly every observation
+    # on Axol's 16-DOF arms at 60 Hz, starving the action queue. There is
+    # no config knob, so patch the module symbol before ``serve``.
     _ps.observations_similar = lambda *args, **kwargs: False
 
     from lerobot.async_inference.configs import PolicyServerConfig
@@ -659,8 +614,14 @@ def _build_axol_robot_client(
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
-    Defined as a helper so the heavy lerobot imports happen lazily inside
-    ``_run`` and we don't pay the import cost at CLI parse time.
+    Wrapped in a helper so the lerobot imports stay lazy.
+
+    Args:
+        config: Built ``RobotClientConfig``.
+        robot: Connected ``AxolRobot`` instance, reused across episodes.
+        publisher: Sink for executed actions, drained by the capture thread.
+        aggregate_strategy: One of the ``--aggregate-fn`` choices.
+        temporal_ensemble_coeff: Decay coefficient for temporal_ensemble.
     """
     import threading as _threading
     from queue import Queue
@@ -676,41 +637,33 @@ def _build_axol_robot_client(
     from lerobot.transport.utils import grpc_channel_options
 
     class AxolRobotClient(RobotClient):  # type: ignore[misc, valid-type]
-        """RobotClient that reuses a pre-connected AxolRobot.
+        """``RobotClient`` adapted to reuse a pre-connected ``AxolRobot``.
 
-        Three overrides relative to upstream ``RobotClient``:
+        Diverges from upstream in three places:
 
         - ``_aggregate_action_queues`` dispatches to a vectorized
-          ``temporal_ensemble`` (ACT-style smoothing) when selected,
-          otherwise falls through to upstream's scalar blends. The
-          final queue swap is gated by ``_install_future_queue`` to
-          stop the control thread from re-popping a just-executed
-          timestep.
-        - ``control_loop`` runs *only* action pops; observation capture
-          + send is moved to ``_observation_loop`` so the 60-70 ms
-          ZED-read + pickle + gRPC round-trip can't stall the 60 Hz
-          control stream.
+          ``temporal_ensemble`` (ACT smoothing) when selected, otherwise
+          falls through to the scalar blends. The final queue swap goes
+          through ``_install_future_queue`` to avoid re-popping a
+          just-executed timestep.
+        - ``control_loop`` only pops actions; observation capture + send
+          moves to ``_observation_loop`` so the ~60-70 ms ZED read + gRPC
+          send can't stall the 60 Hz action stream.
         - ``control_loop_action`` updates ``latest_action`` atomically
-          with the queue pop (upstream does the update *after* the
-          ~5-10 ms ``robot.send_action`` call, leaving a window for the
-          aggregator to re-insert the popped timestep).
+          with the queue pop (upstream updates it after ``send_action``,
+          which leaves a re-pop race for the aggregator).
 
-        We also skip ``make_robot_from_config + robot.connect()`` so
-        re-recording an episode doesn't pay the camera reconnect cost,
-        publish executed actions through ``_ActionPublisher`` for the
-        dataset capture thread, and override ``stop()`` to tear down
-        just the gRPC channel (the robot is shared across episodes).
-
-        We do not post-filter the action stream: training data is
-        already EMA + TrapezoidalFilter-smoothed in ``collect_data``,
-        so the trained policy already emits smoothed commands.
+        The constructor also skips ``make_robot_from_config`` / connect so
+        re-recording doesn't pay the camera reconnect cost, publishes
+        executed actions to ``_ActionPublisher``, and ``stop()`` tears
+        down only the gRPC channel (the robot is shared across episodes).
+        No post-filter is applied: training actions are already
+        EMA + trapezoidal-filtered in ``collect_data``.
         """
 
-        # Action layout (see ``robot_axol._JOINTS = list(Joint)``,
-        # ``Joint.GRIPPER`` is last in each arm). Used by
-        # ``_temporal_ensemble_aggregate``: gripper joints always take
-        # the newest chunk's value so bang-bang grasp signals aren't
-        # smeared.
+        # Indices of the gripper joints in the 16-element action vector.
+        # ``_temporal_ensemble_aggregate`` snaps these to the newest
+        # contributing chunk so bang-bang grasps aren't smeared.
         _GRIPPER_INDICES = (7, 15)
 
         def __init__(  # type: ignore[no-untyped-def]
@@ -726,19 +679,13 @@ def _build_axol_robot_client(
             self._publisher = publisher
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
-            # ``temporal_ensemble`` buffer: ``(origin, packed_actions,
-            # timestamp)`` per chunk, sorted oldest-first.
-            # ``packed_actions`` is a ``(chunk_size, action_dim)`` tensor
-            # so the aggregation can run as a single batched op.
+            # ``(origin, packed_actions, timestamp)`` per chunk, sorted
+            # oldest-first. ``packed_actions`` is a (chunk_size, action_dim)
+            # tensor so aggregation runs as one batched op.
             self._chunk_buffer: list[tuple[int, Any, float]] = []
-            # WARN-once flag so a chronic race fires one informational
-            # log line per episode instead of spamming.
             self._race_fix_warned: bool = False
-            # Set by ``control_loop`` when an unhandled exception escapes
-            # the per-tick work (typically a hardware fault like a CAN
-            # transmit-buffer overflow). The episode supervisor watches
-            # this and tears the whole run down without prompting to
-            # save the partial recording.
+            # Surfaces unhandled control-loop exceptions (typically CAN
+            # faults) to the episode supervisor for an immediate teardown.
             self.fatal_error: BaseException | None = None
 
             lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
@@ -770,8 +717,7 @@ def _build_axol_robot_client(
             self.action_queue = Queue()
             self.action_queue_lock = _threading.Lock()
             self.action_queue_size = []
-            # 3 threads sync at episode start: action receiver, control
-            # loop, observation loop.
+            # Receiver + control + observation threads sync at episode start.
             self.start_barrier = _threading.Barrier(3)
             self.fps_tracker = FPSTracker(target_fps=self.config.fps)
             self.must_go = _threading.Event()
@@ -796,16 +742,16 @@ def _build_axol_robot_client(
                 self._publisher.reset()
 
         def _install_future_queue(self, future_queue) -> None:  # type: ignore[no-untyped-def]
-            """Atomically swap in ``future_queue``, filtering out any
-            timestep already popped by the control thread.
+            """Swap in ``future_queue``, dropping already-executed timesteps.
 
-            Even when the aggregator re-reads ``latest_action`` while
-            building the future queue, the control thread can pop more
-            actions between that read and the swap. We hold
-            ``action_queue_lock`` here and re-filter against the live
-            ``latest_action`` so the post-swap queue cannot contain
-            already-executed timesteps — which would otherwise let the
-            next pop walk ``latest_action`` backwards and snap the arm.
+            The control thread can pop further actions between the
+            aggregator reading ``latest_action`` and the queue swap. Holding
+            ``action_queue_lock`` while re-filtering against the live
+            ``latest_action`` prevents the post-swap queue from walking
+            ``latest_action`` backwards and snapping the arm.
+
+            Args:
+                future_queue: Newly aggregated action queue to install.
             """
             with self.action_queue_lock:
                 with self.latest_action_lock:
@@ -829,33 +775,20 @@ def _build_axol_robot_client(
                 )
 
         def _temporal_ensemble_aggregate(self, incoming_actions):  # type: ignore[no-untyped-def]
-            """ACT-paper Algorithm 2: each future timestep is the
-            exponentially-weighted average of all buffered chunks that
-            cover it.
+            """Aggregate buffered chunks with ACT Algorithm 2.
 
-            On every incoming chunk we (1) append it to the buffer
-            (sorted oldest origin first), (2) drop chunks whose entire
-            range has been executed, then (3) rebuild the action queue
-            so every future timestep ``ts > latest_action`` covered by
-            at least one buffered chunk gets::
+            Each future timestep ``ts > latest_action`` covered by at
+            least one buffered chunk gets ``commanded[ts] = Σ wᵢ ·
+            chunkᵢ[ts] / Σ wᵢ`` with ``wᵢ = exp(-coeff · i)`` and
+            ``i = 0`` the oldest chunk. ``_GRIPPER_INDICES`` bypass the
+            average and snap to the newest contributing chunk's value.
+            The rebuild is one batched op over an
+            ``(n_chunks, n_ts, action_dim)`` grid, sub-ms even with
+            ~20 chunks in flight.
 
-                commanded[ts] = Σ wᵢ · chunkᵢ[ts] / Σ wᵢ
-
-            with ``wᵢ = exp(-coeff · i)``, ``i=0`` the oldest buffered
-            chunk. The rebuild is one batched op over an
-            ``(n_chunks, n_ts, action_dim)`` grid + mask — sub-ms even
-            with 20 chunks in flight, so the aggregation thread doesn't
-            hold the GIL long enough to perturb the 60 Hz action
-            stream.
-
-            Coefficient intuition (matches ``ACTTemporalEnsembler``):
-            ``coeff=0`` → uniform average; ``coeff>0`` weights older
-            chunks more (smoother, more inertia; ACT default 0.01);
-            ``coeff<0`` weights newer chunks more.
-
-            Gripper indices in ``_GRIPPER_INDICES`` skip the average
-            and take the newest contributing chunk's value so
-            bang-bang grasp commands aren't smeared over ~50 ticks.
+            Args:
+                incoming_actions: Latest action chunk from the policy
+                    server. Empty input is a no-op.
             """
             import torch
             from lerobot.async_inference.helpers import TimedAction
@@ -863,11 +796,9 @@ def _build_axol_robot_client(
             if not incoming_actions:
                 return
 
-            # Pack the incoming chunk into a contiguous tensor laid out
-            # by ascending timestep. Origin = smallest timestep = the
-            # ``obs.timestep`` the server saw. Fail loudly if timesteps
-            # aren't contiguous (upstream always emits contiguous chunks
-            # via ``_time_action_chunk``).
+            # Pack into a tensor sorted by ascending timestep. Upstream
+            # always emits contiguous chunks via ``_time_action_chunk``;
+            # fail loudly if that invariant is violated.
             sorted_incoming = sorted(incoming_actions, key=lambda a: a.get_timestep())
             new_origin = sorted_incoming[0].get_timestep()
             chunk_size = len(sorted_incoming)
@@ -904,8 +835,7 @@ def _build_axol_robot_client(
                 self._install_future_queue(Queue())
                 return
 
-            # Grid spans every future timestep covered by at least one
-            # buffered chunk: [latest_action+1, max(origin+size-1)].
+            # Grid: every future timestep covered by ≥1 buffered chunk.
             grid_min_ts = latest_action + 1
             grid_max_ts = max(
                 origin + packed.shape[0] - 1 for origin, packed, _ in self._chunk_buffer
@@ -919,9 +849,7 @@ def _build_axol_robot_client(
             device = sample.device
             action_dim = sample.shape[0]
 
-            # Assemble the (n_chunks, n_ts, action_dim) action grid via
-            # one slice copy per chunk. ``mask`` is 1.0 wherever a
-            # chunk contributes to a grid cell.
+            # ``mask[ci, ts]`` is 1.0 where chunk ``ci`` covers ``ts``.
             action_grid = torch.zeros(
                 (n_chunks, n_ts, action_dim), dtype=dtype, device=device
             )
@@ -939,7 +867,6 @@ def _build_axol_robot_client(
                 action_grid[ci, dst_start:dst_stop] = packed[src_start:src_stop]
                 mask[ci, dst_start:dst_stop] = 1.0
 
-            # One batched weighted sum across chunks for every ts.
             coeff = self._temporal_ensemble_coeff
             chunk_weights = torch.exp(
                 -coeff * torch.arange(n_chunks, dtype=dtype, device=device)
@@ -950,16 +877,14 @@ def _build_axol_robot_client(
                 dim=0
             ) / norm.unsqueeze(-1)  # (n_ts, action_dim)
 
-            # Gripper carve-out: pick the newest contributing chunk per
-            # ts via a reverse-cumsum one-hot (cheaper than ``torch.max``
-            # on tiny CPU tensors, which has surprisingly large dispatch
-            # overhead).
+            # Gripper carve-out: snap to the newest contributing chunk via
+            # a reverse-cumsum one-hot (cheaper than ``torch.max`` on tiny
+            # CPU tensors).
             reverse_cumsum = mask.flip(0).cumsum(dim=0).flip(0)
             newest_mask = mask * (reverse_cumsum == 1).to(dtype)
             for gidx in self._GRIPPER_INDICES:
                 ensembled[:, gidx] = (action_grid[:, :, gidx] * newest_mask).sum(dim=0)
 
-            # Emit only ts that had at least one contributor.
             contributed_indices = (
                 mask.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
             )
@@ -975,24 +900,18 @@ def _build_axol_robot_client(
             self._install_future_queue(future_queue)
 
         def _aggregate_action_queues(self, incoming_actions, aggregate_fn=None):  # type: ignore[no-untyped-def]
-            """Dispatch to ``temporal_ensemble`` when selected;
-            otherwise fall through to upstream's scalar blends."""
+            """Dispatch ``temporal_ensemble`` locally, else upstream scalar blends."""
             if self._aggregate_strategy == "temporal_ensemble":
                 return self._temporal_ensemble_aggregate(incoming_actions)
             return super()._aggregate_action_queues(incoming_actions, aggregate_fn)
 
         def control_loop_action(self, verbose: bool = False):  # type: ignore[no-untyped-def]
-            """Pop the next action, set ``latest_action`` atomically with
-            the pop, send to the robot.
+            """Pop the next action, advance ``latest_action``, send to robot.
 
-            Upstream's order is (1) pop, (2) release lock + send (~5-10
-            ms), (3) update ``latest_action``. Between (2) and (3) the
-            popped timestep is gone from the queue but ``latest_action``
-            still reports the previous one, so a concurrent aggregator
-            pass can re-insert the popped timestep with a freshly
-            re-ensembled action. At 60 Hz that race fires ~0.8/s. We
-            close it by updating ``latest_action`` inside the same lock
-            block as the pop.
+            ``latest_action`` is updated inside the queue lock so the
+            aggregator can never see a stale value and re-insert a
+            just-popped timestep — a race that fires ~0.8/s at 60 Hz with
+            upstream's pop-then-update ordering.
             """
             with self.action_queue_lock:
                 self.action_queue_size.append(self.action_queue.qsize())
@@ -1017,21 +936,13 @@ def _build_axol_robot_client(
             return performed
 
         def control_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def,override]
-            """Action-only control loop; ``_observation_loop`` runs in
-            parallel.
+            """Action-only control loop; obs send is on ``_observation_loop``.
 
-            The upstream loop interleaves action pops (microseconds)
-            with ``control_loop_observation`` (60-70 ms on Axol: three
-            ZED reads + pickle + gRPC streaming) on a single thread.
-            Every time the queue drops below ``chunk_size_threshold``
-            the obs send blocks action pops for a full ZED frame
-            interval, collapsing the 60 Hz target to ~27 Hz. Decoupling
-            the obs send lets the action stream run at the target rate.
-
-            Any unhandled exception (typically a hardware fault like a
-            CAN transmit-buffer overflow inside ``robot.send_action``)
-            is captured in ``self.fatal_error`` and triggers shutdown so
-            the episode supervisor can tear down cleanly.
+            Upstream interleaves microsecond action pops with the 60-70 ms
+            obs send on one thread, collapsing 60 Hz down to ~27 Hz on
+            Axol. Decoupling restores the target rate. Unhandled
+            exceptions (typically CAN faults from ``send_action``) are
+            captured in ``self.fatal_error`` and trigger shutdown.
             """
             self.start_barrier.wait()
             self.logger.info("Action-only control loop starting (obs send decoupled)")
@@ -1051,12 +962,10 @@ def _build_axol_robot_client(
                 self.shutdown_event.set()
 
         def _observation_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def]
-            """Dedicated thread for observation capture + send.
+            """Dedicated thread: capture and send observations.
 
-            When the action queue is at or below
-            ``_ready_to_send_observation``'s threshold, fire
-            ``control_loop_observation`` (camera read + pickle + gRPC
-            stream). Otherwise sleep one tick.
+            Fires ``control_loop_observation`` once the action queue
+            drops to ``chunk_size_threshold``; sleeps one tick otherwise.
             """
             self.start_barrier.wait()
             self.logger.info("Observation loop thread starting")
@@ -1144,7 +1053,6 @@ def _run(
     axol_config.left.gripper.torque_limit = left_gripper_torque_limit
     axol_config.right.gripper.torque_limit = right_gripper_torque_limit
 
-    # Build robot with 3 ZED cameras — resolution/FPS auto-detected from stream
     robot_config = AxolRobotConfig(
         cameras={
             "overhead": ZedCameraConfig(host=zed_host, port=30000),
@@ -1156,9 +1064,9 @@ def _run(
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
-    # Dataset features are derived from the camera configs (width/height) and
-    # joint enum, both static, so the dataset can be built before the robot
-    # is connected. This lets us load the policy first (see below).
+    # Dataset features come from static camera configs + joint enum, so the
+    # dataset can be constructed before the robot connects — letting us load
+    # the policy first (see PolicyServer spawn below).
     dataset: "LeRobotDataset | None" = None
     dataset_root: Path | None = None
     resumed_dataset = False
@@ -1171,11 +1079,7 @@ def _run(
             and (meta / "tasks.parquet").exists()
             and (meta / "episodes").is_dir()
         )
-        # Mirror collect-data:
-        #   - complete dataset  → resume (append new rollouts)
-        #   - incomplete dataset (info.json but missing tasks.parquet / episodes/)
-        #                       → refuse, force explicit rm -rf
-        #   - empty leftover dir (no info.json) → wipe so create() can mkdir
+        # Mirror collect-data's resume/refuse/wipe decision tree.
         if has_info and not is_complete:
             raise RuntimeError(
                 f"Incomplete dataset found at {dataset_root} (missing "
@@ -1210,14 +1114,9 @@ def _run(
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
 
-    # --- Launch PolicyServer in a child process on localhost --------------
-    # Important: we spawn the server and fully load the policy BEFORE
-    # connecting cameras. The model download + CUDA load is a ~15s spike of
-    # network + GPU activity; if the ZED streams are already open during
-    # that window the streams can get briefly disrupted, and (without async
-    # recovery) ``grab()`` blocks indefinitely waiting for the connection
-    # to recover. Connecting cameras after the policy is ready avoids
-    # walking into that contention window in the first place.
+    # Spawn the policy server and load the policy BEFORE connecting cameras:
+    # the model download + CUDA load is a ~15 s network + GPU spike that can
+    # disrupt already-open ZED streams.
     server_cfg_dict = {
         "host": "127.0.0.1",
         "port": server_port,
@@ -1233,10 +1132,7 @@ def _run(
     server_proc.start()
     log_say(f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid}).")
 
-    # Spawn the IK worker in parallel with the policy server so JAX JIT
-    # compilation overlaps with policy load. The worker plans collision-aware
-    # return-to-rest trajectories; we wait for the "ready" handshake on first
-    # use (return_to_rest).
+    # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
     reset_controller = _IKResetController()
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
@@ -1246,10 +1142,9 @@ def _run(
     try:
         _wait_for_port("127.0.0.1", server_port, timeout=30.0)
 
-        # temporal_ensemble lives in our ``_aggregate_action_queues``
-        # override; ``RobotClientConfig`` still needs a name from its
-        # own registry so we pass ``latest_only`` as a placeholder that
-        # we short-circuit before it's ever called.
+        # ``RobotClientConfig`` requires a name from upstream's registry;
+        # ``temporal_ensemble`` is handled in our override so pass a
+        # placeholder that the dispatcher short-circuits.
         if aggregate_fn == "temporal_ensemble":
             log_say(
                 f"Aggregation: temporal_ensemble "
@@ -1285,7 +1180,6 @@ def _run(
         if not client.start():
             raise RuntimeError("Failed to connect to policy server / load policy.")
 
-        # Policy is now resident on cuda — safe to connect cameras.
         log_say("Connecting robot...")
         robot.connect()
 
@@ -1317,9 +1211,7 @@ def _run(
                 name="axol-control-loop",
                 daemon=True,
             )
-            # Dedicated obs send thread (see AxolRobotClient.control_loop
-            # for why: the upstream design runs obs send on the control
-            # thread, which stalls 60 Hz down to ~27 Hz).
+            # Decoupled from the control thread — see AxolRobotClient.control_loop.
             obs_thread = threading.Thread(
                 target=client._observation_loop,
                 args=(task,),
@@ -1372,11 +1264,8 @@ def _run(
                         timed_out = True
                         break
                     if client.fatal_error is not None:
-                        # Hardware fault (e.g. CAN transmit-buffer full)
-                        # raised out of the control loop. Drop the
-                        # episode entirely and exit the run — no save
-                        # prompt, no rerecord, the operator needs to
-                        # check the robot.
+                        # Hardware fault from the control loop — drop the
+                        # episode and exit the run.
                         log_say(
                             f"Fatal error in control loop: "
                             f"{client.fatal_error!r}. Aborting run without "
@@ -1396,9 +1285,7 @@ def _run(
             control_thread.join(timeout=5.0)
             receiver_thread.join(timeout=5.0)
             obs_thread.join(timeout=5.0)
-            # The stdin watcher blocks on select with a short timeout, so
-            # it will wake up on its own; don't join (it may still be in
-            # select if the user never typed anything).
+            # ``stdin_thread`` wakes itself via ``select``; don't join.
 
             if interrupted:
                 break
@@ -1448,20 +1335,15 @@ def _run(
             except (EOFError, KeyboardInterrupt):
                 break
 
-        # Re-raise a control-loop hardware fault (e.g. CAN transmit
-        # buffer full) so ``run()`` exits the CLI with a non-zero
-        # status. The ``finally`` block below still runs first and
-        # tears the robot / server down cleanly.
+        # Re-raise the control-loop fault so ``run()`` exits non-zero.
         if client is not None and client.fatal_error is not None:
             raise client.fatal_error
 
     except KeyboardInterrupt:
         pass
     finally:
-        # Ignore SIGINT during cleanup so an impatient second Ctrl+C
-        # doesn't abort partway through robot.disconnect() / server
-        # teardown and leave hardware in a weird state. We restore the
-        # default handler at the end of this block.
+        # Ignore SIGINT during cleanup so a second Ctrl+C can't abort
+        # partway through disconnect/teardown. Restored at end of block.
         import signal
 
         try:
@@ -1475,12 +1357,9 @@ def _run(
                 client.stop()
             except Exception:  # noqa: BLE001
                 pass
-        # Always attempt disconnect — ``robot.connect()`` starts the
-        # asyncio event-loop thread *before* the motor-enable step, so a
-        # MotorError during enable leaves the loop thread and any
-        # already-opened CAN buses dangling. ``disconnect()`` is
-        # null-safe and idempotent, so this is fine even if connect
-        # never even started.
+        # ``disconnect()`` is null-safe and idempotent; always call it so a
+        # ``connect()`` that bailed mid-enable doesn't leak the asyncio
+        # event-loop thread or any already-opened CAN buses.
         try:
             robot.disconnect()
         except Exception:  # noqa: BLE001
@@ -1491,7 +1370,6 @@ def _run(
         except Exception:  # noqa: BLE001
             pass
 
-        # Tear down the server child process.
         if server_proc.is_alive():
             server_proc.terminate()
             server_proc.join(timeout=5.0)
@@ -1504,15 +1382,14 @@ def _run(
             if push_to_hub and episodes_recorded > 0:
                 dataset.push_to_hub()
 
+        # Auto-wipe only a freshly-created, never-written dataset. Resumed
+        # datasets already have saved rollouts on disk and must be kept.
         if (
             dataset_root is not None
             and not resumed_dataset
             and episodes_recorded == 0
             and dataset_root.exists()
         ):
-            # Only auto-wipe a freshly-created dataset that ended up empty.
-            # A resumed dataset already has saved rollouts on disk that we
-            # must never clobber, even if this session added zero new ones.
             try:
                 shutil.rmtree(dataset_root)
                 log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
@@ -1521,9 +1398,8 @@ def _run(
                     "Failed to remove empty dataset at %s: %s", dataset_root, exc
                 )
 
-        # Restore the default SIGINT handler so the user can still kill
-        # the process if any non-daemon thread we don't control (e.g. a
-        # leaked driver thread) is keeping the interpreter alive.
+        # Restore the default handler so Ctrl+C can still kill any leaked
+        # non-daemon thread keeping the interpreter alive.
         try:
             signal.signal(signal.SIGINT, signal.SIG_DFL)
         except (ValueError, OSError):
