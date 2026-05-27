@@ -157,7 +157,7 @@ class MyActuatorMotor(MotorDriver):
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
-        await self._request(self._cmd(_MA_RELEASE_BRAKE))
+        await self._request(self._cmd(_MA_RELEASE_BRAKE), timeout=1.0)
 
     async def disable(self) -> None:
         await self._request(self._cmd(_MA_SHUTDOWN))
