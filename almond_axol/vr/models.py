@@ -71,6 +71,15 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
+        motion_scale: Per-frame teleop position multiplier applied to the VR
+            controller delta after the engage-snap. ``1.0`` (default) is the
+            identity mapping (VR motion → equal arm motion, prior behaviour).
+            Values ``< 1.0`` magnify VR→arm motion (small controller move →
+            larger arm move) so the operator can drive the full arm workspace
+            while their hands stay inside the headset's tracking volume.
+            Only POSITION is scaled; orientation passes through 1:1 to avoid
+            confusing rotational behaviour. Optional — backwards compatible
+            with clients that don't send the field.
     """
 
     l_ee: VRPose
@@ -83,3 +92,4 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
+    motion_scale: float = 1.0
