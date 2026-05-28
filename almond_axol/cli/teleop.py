@@ -67,6 +67,21 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help=stiffness_help.format(side="right", attr="right_stiffness"),
     )
     p.add_argument(
+        "--motion-scale",
+        type=float,
+        default=1.0,
+        metavar="S",
+        help=(
+            "Server-side fallback for the VR→arm position multiplier (default: 1.0). "
+            "1.0 is identity (VR motion == arm motion). Values <1.0 magnify "
+            "VR motion (small controller move → larger arm move), useful when "
+            "the operator's controllers drift toward the edge of headset "
+            "tracking. Applied only when the incoming VRFrame leaves "
+            "motion_scale at its 1.0 default — a client that sends an "
+            "explicit motion_scale always wins. Orientation is never scaled."
+        ),
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -99,6 +114,7 @@ def run(args: argparse.Namespace) -> None:
             right_gripper_torque_limit=args.right_gripper_torque_limit,
             left_stiffness=args.left_stiffness,
             right_stiffness=args.right_stiffness,
+            motion_scale=args.motion_scale,
         )
     )
 
@@ -112,10 +128,12 @@ async def _run(
     right_gripper_torque_limit: float = 0.5,
     left_stiffness: float | tuple[float, ...] = 0.5,
     right_stiffness: float | tuple[float, ...] = 0.5,
+    motion_scale: float = 1.0,
 ) -> None:
     from ..robot import Axol, Sim
     from ..robot.config import AxolConfig
     from ..teleop import VRTeleop
+    from ..teleop.config import VRTeleopConfig
 
     if robot_type == "sim":
         robot = Sim()
@@ -132,5 +150,6 @@ async def _run(
         axol_config.left.gripper.torque_limit = left_gripper_torque_limit
         axol_config.right.gripper.torque_limit = right_gripper_torque_limit
         robot = Axol(config=axol_config, **kwargs)
-    async with VRTeleop(robot) as teleop:
+    teleop_config = VRTeleopConfig(motion_scale=motion_scale)
+    async with VRTeleop(robot, config=teleop_config) as teleop:
         await teleop.run()
