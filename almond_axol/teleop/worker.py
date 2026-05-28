@@ -69,9 +69,19 @@ def _relative_target_np(
     rot_snap_ctrl: np.ndarray,
     pos_snap_fk: np.ndarray,
     rot_snap_fk: np.ndarray,
+    motion_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3)."""
-    d = rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)
+    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3).
+
+    ``motion_scale`` multiplies the position delta in the controller's local
+    frame BEFORE it is mapped into the arm's FK frame, so a single scalar
+    setting works regardless of controller orientation at engage time. The
+    default ``1.0`` preserves prior identity behaviour. Values ``< 1.0``
+    magnify VR motion → arm motion (small controller move → larger arm
+    move). Orientation is intentionally not scaled — rotation passes through
+    1:1 so the operator's wrist twist always matches the arm wrist twist.
+    """
+    d = motion_scale * (rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl))
     new_t = (
         pos_snap_fk
         + rot_snap_fk[:, 0] * d[2]
@@ -111,6 +121,11 @@ class IKWorker:
             kinematics_config: IK solver cost weights forwarded to :class:`KinematicsSolver`.
         """
         self._config = config
+        # Server-side fallback scale used when an incoming VRFrame's
+        # ``motion_scale`` field is exactly ``1.0`` (i.e. the client did not
+        # send an explicit scale). Lets ``axol teleop --motion-scale`` work
+        # without a client-side change.
+        self._cli_motion_scale = float(getattr(config, "motion_scale", 1.0))
         self._solver = KinematicsSolver(kinematics_config)
 
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
@@ -243,22 +258,37 @@ class IKWorker:
             )
             return q_current
 
+        # Resolve per-frame motion scale. Client value wins unless it's
+        # exactly 1.0 (the default an unaware client sends), in which case
+        # the CLI fallback applies. Position is scaled; orientation is not.
+        # Elbow delta is scaled the same as EE delta so EE and elbow targets
+        # stay self-consistent (otherwise a magnified EE move with an
+        # unscaled elbow target produces poor IK posture).
+        client_scale = float(frame.motion_scale)
+        effective_scale = (
+            client_scale if client_scale != 1.0 else self._cli_motion_scale
+        )
+
         # Relative targets — pure numpy
         tl_pos, tl_rot = _relative_target_np(
             left_pos,
             left_rot,
             *self._snap_ctrl["left"],
             *self._snap_fk["left"],
+            motion_scale=effective_scale,
         )
         tr_pos, tr_rot = _relative_target_np(
             right_pos,
             right_rot,
             *self._snap_ctrl["right"],
             *self._snap_fk["right"],
+            motion_scale=effective_scale,
         )
 
-        elbow_l = self._snap_elbow_fk["left"] + (left_e - self._snap_elbow_ctrl["left"])
-        elbow_r = self._snap_elbow_fk["right"] + (
+        elbow_l = self._snap_elbow_fk["left"] + effective_scale * (
+            left_e - self._snap_elbow_ctrl["left"]
+        )
+        elbow_r = self._snap_elbow_fk["right"] + effective_scale * (
             right_e - self._snap_elbow_ctrl["right"]
         )
 

@@ -72,6 +72,14 @@ class VRTeleopConfig:
             keeping the filter transparent during fast intentional moves.  For
             meter-space positions at 120 Hz a value of ~20 works well; increase
             if fast moves feel sticky.  Defaults to ``20.0``.
+        motion_scale: Server-side fallback for the per-frame teleop position
+            multiplier. Used when a VRFrame arrives with ``motion_scale`` set
+            to its identity default ``1.0`` (i.e. a client unaware of the
+            field). Lets ``axol teleop --motion-scale 0.5`` drive scaled
+            behaviour without a client-side change. ``1.0`` (default)
+            preserves prior identity mapping (VR motion → equal arm motion).
+            Values ``< 1.0`` magnify VR→arm motion. Orientation is never
+            scaled.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -117,3 +125,4 @@ class VRTeleopConfig:
     ik_alpha: float = 0.5
     pose_min_cutoff: float = 1.5
     pose_beta: float = 5.0
+    motion_scale: float = 1.0
