@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 
-from ..shared import ARM_JOINTS, parse_stiffness
+from ..shared import ARM_JOINTS, Joint, parse_stiffness
 
 _TORQUE_JSONL_PATH = "/dev/shm/axol_torque.jsonl"
 _TORQUE_JSONL_HZ = 30.0
@@ -122,6 +122,7 @@ class _CaptureThread(threading.Thread):
         fps: int,
         task: str,
         rerun_ip: str | None,
+        record_torques: bool = False,
     ) -> None:
         super().__init__(name="axol-capture", daemon=True)
         self.publisher = publisher
@@ -131,6 +132,7 @@ class _CaptureThread(threading.Thread):
         self.fps = fps
         self.task = task
         self.rerun_ip = rerun_ip
+        self.record_torques = record_torques
         self.stop_event = threading.Event()
 
     def run(self) -> None:
@@ -210,7 +212,21 @@ class _CaptureThread(threading.Thread):
             )
             if self.stop_event.is_set():
                 return
-            self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
+
+            # Joint torques are first-class observation channels for force-
+            # aware policies. Read the cached snapshot from the robot's
+            # telemetry buffer; falls back to zero arrays on transient
+            # errors (handled inside _read_cached_torques) so a CAN miss
+            # never aborts a frame.
+            torque_frame: dict[str, Any] = {}
+            if self.record_torques:
+                left_t, right_t = _read_cached_torques(self.robot)
+                torque_frame[_OBS_TORQUE_LEFT_KEY] = left_t
+                torque_frame[_OBS_TORQUE_RIGHT_KEY] = right_t
+
+            self.dataset.add_frame(
+                {**obs_frame, **act_frame, **torque_frame, "task": self.task}
+            )
 
             if self.rerun_ip:
                 log_rerun_data(observation=obs_processed, action=snap.action)
@@ -585,6 +601,25 @@ def _run(
         )
         torque_writer.start()
 
+    # Joint-torque observations are stored as two dedicated `(8,)` float32
+    # arrays per frame. Adding them as standalone features (instead of
+    # packing into `observation.state` via `observe_torques=True` on the
+    # AxolRobotConfig) keeps the upstream LeRobot scalar-key schema stable
+    # for existing callers and gives downstream policies a clean per-arm
+    # tensor to consume.
+    torque_features = {
+        _OBS_TORQUE_LEFT_KEY: {
+            "dtype": "float32",
+            "shape": (_TORQUE_DOF,),
+            "names": [f"left_{j.value}.trq" for j in list(Joint)],
+        },
+        _OBS_TORQUE_RIGHT_KEY: {
+            "dtype": "float32",
+            "shape": (_TORQUE_DOF,),
+            "names": [f"right_{j.value}.trq" for j in list(Joint)],
+        },
+    }
+
     if is_complete:
         log_say(f"Resuming existing dataset at {dataset_root}.")
         dataset = LeRobotDataset.resume(
@@ -595,14 +630,33 @@ def _run(
             encoder_threads=4,
             vcodec="auto",
         )
+        # Adaptive resume: only embed torques in frames if the resumed
+        # dataset's schema already includes them. Mixing schemas mid-dataset
+        # would break readers and is rejected by validate_frame, so we just
+        # disable the torque embed (the dashboard JSONL tap still works).
+        record_torques = (
+            _OBS_TORQUE_LEFT_KEY in dataset.features
+            and _OBS_TORQUE_RIGHT_KEY in dataset.features
+        )
+        if not record_torques and torque_enabled:
+            _logger.warning(
+                "Resuming dataset %s which lacks %s/%s features; torque will "
+                "NOT be embedded in new frames. Live HUD JSONL still works.",
+                dataset_root,
+                _OBS_TORQUE_LEFT_KEY,
+                _OBS_TORQUE_RIGHT_KEY,
+            )
     else:
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
         obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+        # Torque features are always declared in new datasets — even when
+        # the robot doesn't support telemetry torque, frames carry zero
+        # arrays so the schema stays consistent across the whole dataset.
         dataset = LeRobotDataset.create(
             repo_id=repo_id,
             fps=fps,
             root=root,
-            features={**action_features, **obs_features},
+            features={**action_features, **obs_features, **torque_features},
             robot_type=robot.name,
             use_videos=True,
             image_writer_threads=4,
@@ -610,6 +664,7 @@ def _run(
             encoder_threads=4,
             vcodec="auto",
         )
+        record_torques = True
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -653,6 +708,7 @@ def _run(
                         fps=fps,
                         task=task,
                         rerun_ip=rerun_ip,
+                        record_torques=record_torques,
                     )
                     capture.start()
                     log_say("Recording started.")
