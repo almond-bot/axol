@@ -18,10 +18,21 @@ The teleop loop runs at ``--teleop-hz`` and publishes the latest
 ``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame
 shares the sender-clock instant ``T_n`` with the joint sample, then writes
 the dataset row off the hot control loop.
+
+Joint-torque telemetry is upgraded after ``robot.connect()`` so cached
+torques are available to two consumers in lockstep: a daemon thread
+``_TorqueJsonlWriter`` that streams one JSON line per cycle to
+``/dev/shm/axol_torque.jsonl`` (consumed by the dashboard's force HUD over
+SSE), and the per-frame dataset writer in ``_CaptureThread`` which embeds
+joint torques into every recorded LeRobot frame under
+``observation.torque.left`` and ``observation.torque.right``.
 """
 
 import argparse
+import asyncio
+import json
 import logging
+import os
 import shutil
 import socket
 import threading
@@ -29,7 +40,15 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
+import numpy as np
+
 from ..shared import ARM_JOINTS, parse_stiffness
+
+_TORQUE_JSONL_PATH = "/dev/shm/axol_torque.jsonl"
+_TORQUE_JSONL_HZ = 30.0
+_TORQUE_DOF = 8  # joints per arm (7 arm joints + gripper) — matches Joint enum
+_OBS_TORQUE_LEFT_KEY = "observation.torque.left"
+_OBS_TORQUE_RIGHT_KEY = "observation.torque.right"
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -209,6 +228,135 @@ class _CaptureThread(threading.Thread):
                 )
 
             tick += 1
+
+
+def _read_cached_torques(
+    robot: "AxolRobot",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the latest cached torques from both arms.
+
+    Returns ``(left, right)`` each shape ``(_TORQUE_DOF,)`` of float32. Falls
+    back to zero arrays per arm on any error (transient CAN miss, telemetry
+    not started yet, robot subclass without torque support).
+
+    Reads :attr:`AxolArm.torques` directly from the telemetry cache; safe to
+    call from any thread (numpy snapshot per call).
+    """
+    left = np.zeros(_TORQUE_DOF, dtype=np.float32)
+    right = np.zeros(_TORQUE_DOF, dtype=np.float32)
+    axol = getattr(robot, "_axol", None)
+    if axol is None:
+        return left, right
+    try:
+        if axol.left is not None:
+            left = np.asarray(axol.left.torques, dtype=np.float32)
+    except Exception:
+        pass
+    try:
+        if axol.right is not None:
+            right = np.asarray(axol.right.torques, dtype=np.float32)
+    except Exception:
+        pass
+    return left, right
+
+
+class _TorqueJsonlWriter(threading.Thread):
+    """Daemon thread streaming joint torques to ``/dev/shm/axol_torque.jsonl``.
+
+    Reads the cached torques from the underlying ``Axol`` driver at
+    ``_TORQUE_JSONL_HZ`` and writes one JSON line per cycle so the dashboard
+    force HUD can render the live values over SSE. Line schema mirrors
+    ``axol-ui/torque_publisher.py``::
+
+        {"ts": <float>, "left": [8 floats], "right": [8 floats]}
+
+    On any per-cycle error the writer silently drops the sample and
+    continues — torque streaming must never block or crash recording.
+    """
+
+    def __init__(self, robot: "AxolRobot", path: str, hz: float) -> None:
+        super().__init__(name="axol-torque-jsonl", daemon=True)
+        self.robot = robot
+        self.path = path
+        self.hz = hz
+        self.stop_event = threading.Event()
+        self._fh = None
+
+    def run(self) -> None:
+        period = 1.0 / self.hz
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            # Line-buffered so each sample is immediately visible to SSE.
+            self._fh = open(self.path, "w", buffering=1)
+        except Exception as exc:
+            _logger.warning(
+                "Failed to open torque JSONL %s: %s", self.path, exc
+            )
+            return
+        try:
+            while not self.stop_event.is_set():
+                cycle_start = time.perf_counter()
+                left, right = _read_cached_torques(self.robot)
+                try:
+                    line = json.dumps(
+                        {
+                            "ts": time.time(),
+                            "left": [float(v) for v in left.tolist()],
+                            "right": [float(v) for v in right.tolist()],
+                        }
+                    )
+                    self._fh.write(line + "\n")
+                except Exception:
+                    # A transient write error must never stop recording.
+                    pass
+                wait_s = period - (time.perf_counter() - cycle_start)
+                if wait_s > 0:
+                    if self.stop_event.wait(timeout=wait_s):
+                        break
+        finally:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
+
+
+def _upgrade_telemetry_to_torque(
+    robot: "AxolRobot", hz: float
+) -> bool:
+    """Restart background telemetry on the connected robot with ``torque=True``.
+
+    ``AxolRobot._connect_async`` already starts telemetry, but with
+    ``torque=self.config.observe_torques`` (default False). We upgrade it
+    here so cached torques are populated for the JSONL writer and the
+    per-frame embed without forcing callers to flip ``observe_torques``
+    (which would also change the upstream LeRobot scalar-key schema).
+
+    Returns True if telemetry was successfully (re)started with torque
+    polling, False otherwise. Failure is silent at INFO level — collect-data
+    must keep working even if the robot subclass lacks torque support.
+    """
+    axol = getattr(robot, "_axol", None)
+    loop = getattr(robot, "_loop", None)
+    if axol is None or loop is None:
+        _logger.info(
+            "Robot has no underlying Axol driver; skipping torque telemetry upgrade."
+        )
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(
+            axol.start_telemetry(hz, torque=True), loop
+        ).result(timeout=10)
+        return True
+    except (AttributeError, NotImplementedError):
+        _logger.info(
+            "Robot does not support start_telemetry(torque=True); "
+            "torque tap disabled for this session."
+        )
+        return False
+    except Exception as exc:  # pragma: no cover - defensive
+        _logger.warning("Failed to upgrade telemetry to torque=True: %s", exc)
+        return False
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -425,6 +573,18 @@ def _run(
     # which is then used to define the dataset observation features.
     robot.connect()
 
+    # Upgrade telemetry so motor torque is cached on every cycle (no-op on
+    # robot subclasses without torque support). Required for both the dashboard
+    # JSONL tap AND the per-frame torque embed in the recorded dataset.
+    torque_enabled = _upgrade_telemetry_to_torque(robot, _TORQUE_JSONL_HZ)
+
+    torque_writer: _TorqueJsonlWriter | None = None
+    if torque_enabled:
+        torque_writer = _TorqueJsonlWriter(
+            robot, _TORQUE_JSONL_PATH, _TORQUE_JSONL_HZ
+        )
+        torque_writer.start()
+
     if is_complete:
         log_say(f"Resuming existing dataset at {dataset_root}.")
         dataset = LeRobotDataset.resume(
@@ -548,6 +708,10 @@ def _run(
         if capture is not None:
             capture.stop_event.set()
             capture.join()
+
+        if torque_writer is not None:
+            torque_writer.stop_event.set()
+            torque_writer.join(timeout=2.0)
 
         log_say("Stopping.")
 
