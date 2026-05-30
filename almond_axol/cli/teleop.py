@@ -2,14 +2,26 @@
 axol teleop --robot [axol|sim]
 
 Run a VR teleoperation session with default parameters.
+
+While teleop runs, a torque-telemetry tap writes one JSON line per cycle to
+``/dev/shm/axol_torque.jsonl`` so the dashboard's force HUD can read joint
+torques without contending with this process for the CAN bus. The tap is a
+no-op on the Sim backend (no torque sensors) and is silent on transient
+read errors so it cannot crash teleop.
 """
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import socket
+import time
 
 from ..shared import ARM_JOINTS, parse_stiffness
+
+_TORQUE_JSONL_PATH = "/dev/shm/axol_torque.jsonl"
+_TORQUE_HZ = 30.0
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -103,6 +115,44 @@ def run(args: argparse.Namespace) -> None:
     )
 
 
+async def _torque_writer(robot, fh, hz: float) -> None:
+    """Periodically fetch joint torques and append one JSON line per cycle.
+
+    Schema matches /home/twolabs/axol-ui/torque_publisher.py: one line per
+    sample with ``ts``, ``left[8]``, ``right[8]``. The dashboard reads the
+    file via SSE; the FastAPI side trims it as needed.
+
+    Silent on any per-cycle error so a transient telemetry hiccup never
+    crashes teleop. Exits on :class:`asyncio.CancelledError`.
+    """
+    period = 1.0 / hz
+    while True:
+        cycle_start = time.perf_counter()
+        try:
+            left_t, right_t = await robot.get_torques()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Don't kill teleop on a telemetry hiccup.
+            left_t = None
+            right_t = None
+
+        try:
+            sample = {
+                "ts": time.time(),
+                "left": [float(v) for v in (left_t if left_t is not None else [])],
+                "right": [float(v) for v in (right_t if right_t is not None else [])],
+            }
+            fh.write(json.dumps(sample) + "\n")
+        except Exception:
+            pass
+
+        try:
+            await asyncio.sleep(max(0.0, period - (time.perf_counter() - cycle_start)))
+        except asyncio.CancelledError:
+            raise
+
+
 async def _run(
     robot_type: str,
     *,
@@ -132,5 +182,58 @@ async def _run(
         axol_config.left.gripper.torque_limit = left_gripper_torque_limit
         axol_config.right.gripper.torque_limit = right_gripper_torque_limit
         robot = Axol(config=axol_config, **kwargs)
+
     async with VRTeleop(robot) as teleop:
-        await teleop.run()
+        # Robot is now enabled by VRTeleop.enable(). Start the torque tap.
+        torque_fh = None
+        torque_task: asyncio.Task[None] | None = None
+        telemetry_started = False
+        try:
+            try:
+                await robot.start_telemetry(hz=_TORQUE_HZ, torque=True)
+                telemetry_started = True
+            except (AttributeError, NotImplementedError):
+                # Sim or any robot subclass without telemetry support.
+                logging.getLogger(__name__).info(
+                    "Robot does not support start_telemetry(torque=True); "
+                    "skipping torque JSONL tap."
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.getLogger(__name__).warning(
+                    "Failed to start torque telemetry: %s", exc
+                )
+
+            if telemetry_started:
+                try:
+                    os.makedirs(os.path.dirname(_TORQUE_JSONL_PATH), exist_ok=True)
+                    # Line-buffered so each sample is immediately visible to
+                    # the dashboard's SSE tailer.
+                    torque_fh = open(_TORQUE_JSONL_PATH, "w", buffering=1)
+                    torque_task = asyncio.create_task(
+                        _torque_writer(robot, torque_fh, _TORQUE_HZ)
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logging.getLogger(__name__).warning(
+                        "Failed to open torque JSONL %s: %s",
+                        _TORQUE_JSONL_PATH,
+                        exc,
+                    )
+
+            await teleop.run()
+        finally:
+            if torque_task is not None:
+                torque_task.cancel()
+                try:
+                    await torque_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if torque_fh is not None:
+                try:
+                    torque_fh.close()
+                except Exception:
+                    pass
+            if telemetry_started:
+                try:
+                    await robot.stop_telemetry()
+                except Exception:
+                    pass
