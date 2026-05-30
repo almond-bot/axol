@@ -1,9 +1,8 @@
 """
 Shared rollout machinery for policy CLIs.
 
-Pulled out of ``axol run-policy`` so additional CLIs (e.g.
-``axol run-pi-policy``) can reuse the same episode plumbing without
-duplicating it:
+Pulled out of ``axol run-policy`` so other policy-running CLIs can reuse
+the same episode plumbing without duplicating it:
 
 - :class:`IKResetController` — collision-aware return-to-rest backed by
   an out-of-process JAX IK worker.
