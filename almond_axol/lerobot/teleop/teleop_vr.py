@@ -124,6 +124,9 @@ class AxolVRTeleop(Teleoperator):
         # Reset latch
         self._prev_reset: bool = False
         self._reset_latched: bool = False
+        # Shutdown latch: routes a return-to-soldier (safe stow) move through
+        # the same trajectory-playback path as a reset.
+        self._shutdown_latched: bool = False
 
         # Deadman toggle (mirrors native VRTeleop behaviour):
         #   both grips rising edge → enable, either grip rising edge → disable
@@ -320,10 +323,26 @@ class AxolVRTeleop(Teleoperator):
         """
         self._reset_latched = True
 
+    def request_return_to_soldier(self) -> None:
+        """Programmatically trigger a return to the soldier (safe stow) pose.
+
+        Safe to call from any thread. The IK loop picks up the latch on its
+        next iteration and asks the IK subprocess to plan a collision-aware
+        trajectory back to the soldier pose (staged through the lift waypoint
+        when the operating pose is the table pose). Poll :attr:`is_resetting`
+        to know when the move completes. Used at shutdown so the arms settle
+        into the stow pose instead of crashing down.
+        """
+        self._shutdown_latched = True
+
     @property
     def is_resetting(self) -> bool:
-        """True while a reset is pending or a reset trajectory is playing back."""
-        return self._reset_latched or self._reset_interp.is_active()
+        """True while a reset/return is pending or a trajectory is playing back."""
+        return (
+            self._reset_latched
+            or self._shutdown_latched
+            or self._reset_interp.is_active()
+        )
 
     # ------------------------------------------------------------------
     # Teleoperator interface
@@ -495,14 +514,18 @@ class AxolVRTeleop(Teleoperator):
             t0 = time.perf_counter()
 
             if (
-                self._reset_latched
+                (self._reset_latched or self._shutdown_latched)
                 and not self._reset_interp.is_active()
                 and self._q is not None
             ):
+                message = "shutdown" if self._shutdown_latched else "reset"
                 try:
-                    conn.send(("reset", self._q.copy()))
+                    conn.send((message, self._q.copy()))
                     result = await loop.run_in_executor(None, conn.recv)
-                    if isinstance(result, tuple) and result[0] == "reset_traj":
+                    if isinstance(result, tuple) and result[0] in (
+                        "reset_traj",
+                        "shutdown_traj",
+                    ):
                         _, q_default, trajectory = result
                         if trajectory:
                             self._reset_interp.set_trajectory(
@@ -515,9 +538,10 @@ class AxolVRTeleop(Teleoperator):
                             self._at_rest = True
                         self._q = np.asarray(q_default, dtype=np.float32)
                 except Exception as e:
-                    _logger.error("Reset error: %s", e)
+                    _logger.error("%s error: %s", message.capitalize(), e)
                 finally:
                     self._reset_latched = False
+                    self._shutdown_latched = False
                 out = self._compute_output()
                 with self._q_lock:
                     self._q_out = out

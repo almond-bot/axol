@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import Literal
 
 import numpy as np
+
+# Named operating poses selectable via :attr:`VRTeleopConfig.start_pose`.
+# "soldier" is the always-safe stow pose; "table" extends the grippers in
+# front above a worktable; "custom" uses the explicit ``custom_pose_*``
+# joint vectors. Declared here (not in the CLI module) so the draccus
+# decoder registration in ``almond_axol.cli.config`` reuses the same alias.
+StartPose = Literal["soldier", "table", "custom"]
 
 
 @dataclass
@@ -13,10 +21,28 @@ class VRTeleopConfig:
     """Configuration for a :class:`VRTeleop` session.
 
     Attributes:
-        rest_pose_left: Left arm rest configuration in radians, shape (7,) in
-            ARM_JOINTS order (no gripper). Used as the reset target.
-        rest_pose_right: Right arm rest configuration in radians, shape (7,) in
-            ARM_JOINTS order (no gripper). Used as the reset target.
+        soldier_pose_left: Left arm "soldier" stow configuration in radians,
+            shape (7,) in ARM_JOINTS order (no gripper). This is the always-safe
+            transit pose: every startup routes through it and every shutdown
+            returns to it so the arms never crash into or down onto the table.
+        soldier_pose_right: Right arm soldier configuration (see above).
+        start_pose: Which pose the arms operate from once startup completes.
+            ``"soldier"`` (default) stays in the stow pose; ``"table"`` routes
+            current -> soldier -> table via a collision-safe "lift" waypoint;
+            ``"custom"`` uses ``custom_pose_left`` / ``custom_pose_right``.
+        custom_pose_left: Left arm operating configuration used only when
+            ``start_pose == "custom"``, shape (7,) in ARM_JOINTS order.
+        custom_pose_right: Right arm custom configuration (see above).
+        table_elbow_angle: Elbow flexion magnitude (radians) of the table
+            pose. The table pose keeps the soldier ``shoulder_1`` angle, zeros
+            every other joint, and bends the elbow to this magnitude (positive
+            on the left arm, negative on the right). Defaults to ``pi / 2``.
+        table_lift_shoulder_1_delta: Magnitude (radians) by which the
+            intermediate "lift" waypoint rotates ``shoulder_1`` away from its
+            soldier value (positive on the left arm, negative on the right) so
+            the gripper swings up and back, clearing the table, before the arm
+            extends forward into the table pose. The shutdown descent reverses
+            the same path. Only used when ``start_pose == "table"``.
         frequency: Control loop rate in Hz used by :meth:`VRTeleop.run` and
             as waypoint density for reset trajectories.
         reset_speed: Average joint velocity (rad/s) of the worst-case joint
@@ -87,7 +113,7 @@ class VRTeleopConfig:
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
     """
 
-    rest_pose_left: np.ndarray = field(
+    soldier_pose_left: np.ndarray = field(
         default_factory=lambda: np.array(
             [
                 -0.025 * 2 * math.pi,
@@ -101,7 +127,7 @@ class VRTeleopConfig:
             dtype=np.float32,
         )
     )
-    rest_pose_right: np.ndarray = field(
+    soldier_pose_right: np.ndarray = field(
         default_factory=lambda: np.array(
             [
                 0.025 * 2 * math.pi,
@@ -115,6 +141,37 @@ class VRTeleopConfig:
             dtype=np.float32,
         )
     )
+    start_pose: StartPose = "soldier"
+    custom_pose_left: np.ndarray = field(
+        default_factory=lambda: np.array(
+            [
+                -0.025 * 2 * math.pi,
+                0.0,
+                0.0,
+                0.05 * 2 * math.pi,
+                0.0,
+                0.0,
+                -0.025 * 2 * math.pi,
+            ],
+            dtype=np.float32,
+        )
+    )
+    custom_pose_right: np.ndarray = field(
+        default_factory=lambda: np.array(
+            [
+                0.025 * 2 * math.pi,
+                0.0,
+                0.0,
+                -0.05 * 2 * math.pi,
+                0.0,
+                0.0,
+                0.025 * 2 * math.pi,
+            ],
+            dtype=np.float32,
+        )
+    )
+    table_elbow_angle: float = math.pi / 2
+    table_lift_shoulder_1_delta: float = 1.0
     frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
     reset_min_duration: float = 1.5

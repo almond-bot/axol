@@ -455,6 +455,23 @@ def _run(cfg: CollectDataConfig) -> None:
 
         log_say("Stopping.")
 
+        # Return the arms to the soldier (safe stow) pose before releasing the
+        # motors so they don't crash down. Best-effort and mirrors the
+        # inter-episode reset pump above.
+        try:
+            if robot.is_connected and teleop.is_connected:
+                log_say("Returning to soldier pose.")
+                teleop.request_return_to_soldier()
+                shutdown_deadline = time.perf_counter() + 30.0
+                while teleop.is_resetting and time.perf_counter() < shutdown_deadline:
+                    t0 = time.perf_counter()
+                    joint_obs = robot.get_joint_observation()
+                    act = teleop.get_action()
+                    robot.send_action(robot_action_proc((act, joint_obs)))
+                    time.sleep(max(0.0, teleop_interval - (time.perf_counter() - t0)))
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("Return-to-soldier on shutdown failed: %s", exc)
+
         robot.disconnect()
         teleop.disconnect()
 

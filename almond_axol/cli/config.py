@@ -48,7 +48,7 @@ import numpy as np
 
 from ..robot.config import AxolConfig
 from ..shared import CAN_LEFT, CAN_RIGHT
-from ..teleop.config import VRTeleopConfig
+from ..teleop.config import StartPose, VRTeleopConfig
 
 T = TypeVar("T")
 
@@ -116,6 +116,10 @@ def _register_literal(lit: T) -> T:
 
 
 LogLevel = _register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
+# VRTeleopConfig.start_pose: registered so draccus validates the choice the
+# way argparse ``choices=`` used to. The alias itself lives in the teleop
+# config module so the dataclass field and this decoder share one object.
+_register_literal(StartPose)
 PolicyType = _register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 )

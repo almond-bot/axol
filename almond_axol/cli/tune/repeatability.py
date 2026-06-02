@@ -261,9 +261,9 @@ async def _run(args: argparse.Namespace) -> None:
     # planning.
     q_rest = np.zeros(solver.num_joints, dtype=np.float32)
     for i, gi in enumerate(solver.left_indices):
-        q_rest[gi] = rest_cfg.rest_pose_left[i]
+        q_rest[gi] = rest_cfg.soldier_pose_left[i]
     for i, gi in enumerate(solver.right_indices):
-        q_rest[gi] = rest_cfg.rest_pose_right[i]
+        q_rest[gi] = rest_cfg.soldier_pose_right[i]
     q_touch = _build_q_touch(solver)
 
     # Report the FK-computed tip positions so the operator can eyeball the

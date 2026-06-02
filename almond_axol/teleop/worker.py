@@ -155,10 +155,43 @@ class IKWorker:
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
 
-        self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
-        self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
+        # Build the named full-(N,) joint poses. ``soldier`` is the always-safe
+        # stow pose; ``table`` keeps the soldier shoulder_1 angle, zeros every
+        # other joint and bends the elbow to ``table_elbow_angle``; ``lift`` is
+        # ``table`` with shoulder_1 swung back by ``table_lift_shoulder_1_delta``
+        # so the gripper clears the table mid-transit; ``custom`` is the
+        # user-supplied operating pose.
+        self._start_pose = config.start_pose
+        self._soldier_q = self._full_q(
+            config.soldier_pose_left, config.soldier_pose_right
+        )
+        self._custom_q = self._full_q(config.custom_pose_left, config.custom_pose_right)
 
-        self._solver.set_posture_pose(self.get_rest_q())
+        elbow = float(config.table_elbow_angle)
+        delta = float(config.table_lift_shoulder_1_delta)
+        s1_l = float(config.soldier_pose_left[0])
+        s1_r = float(config.soldier_pose_right[0])
+        # ARM_JOINTS order: index 0 == shoulder_1, index 3 == elbow.
+        table_left = np.zeros(7, dtype=np.float32)
+        table_left[0], table_left[3] = s1_l, elbow
+        table_right = np.zeros(7, dtype=np.float32)
+        table_right[0], table_right[3] = s1_r, -elbow
+        self._table_q = self._full_q(table_left, table_right)
+
+        lift_left = table_left.copy()
+        lift_left[0] = s1_l + delta
+        lift_right = table_right.copy()
+        lift_right[0] = s1_r - delta
+        self._lift_q = self._full_q(lift_left, lift_right)
+
+        operating = {
+            "soldier": self._soldier_q,
+            "table": self._table_q,
+            "custom": self._custom_q,
+        }[self._start_pose]
+        self._operating_q = operating.copy()
+
+        self._solver.set_posture_pose(self._operating_q)
 
         self._active: bool = False
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
@@ -177,16 +210,14 @@ class IKWorker:
         self._f_l_elbow = OneEuroFilter(freq, mc, beta)
         self._f_r_elbow = OneEuroFilter(freq, mc, beta)
 
-        # Pre-settle the configured rest pose to the manipulability-balanced
-        # IK fixed point. The configured pose has a non-zero manipulability
-        # gradient, so a first engage there walks q in the EE null space
-        # toward higher manipulability over the next ~10-30 frames. Baking the
-        # settling in at startup means the trajectory ends at the fixed point
-        # and the first engage produces no motion.
-        q_settled = self._settle_rest_pose()
-        self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
-        self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
-        self._solver.set_posture_pose(self.get_rest_q())
+        # Pre-settle the operating pose to the manipulability-balanced IK fixed
+        # point. The configured pose has a non-zero manipulability gradient, so
+        # a first engage there walks q in the EE null space toward higher
+        # manipulability over the next ~10-30 frames. Baking the settling in at
+        # startup means the startup trajectory ends at the fixed point and the
+        # first engage produces no motion.
+        self._operating_q = self._settle_pose(self._operating_q).astype(np.float32)
+        self._solver.set_posture_pose(self._operating_q)
 
     # -- Properties the main process needs ----------------------------------
 
@@ -200,14 +231,24 @@ class IKWorker:
         """Indices of the right arm joints within the full ``(N,)`` joint array, in ARM_JOINTS order."""
         return self._solver.right_indices
 
-    def get_rest_q(self) -> np.ndarray:
-        """Full (N,) rest pose vector in radians."""
+    def _full_q(self, left7: np.ndarray, right7: np.ndarray) -> np.ndarray:
+        """Pack per-arm (7,) ARM_JOINTS-order vectors into a full (N,) joint array."""
+        left7 = np.asarray(left7, dtype=np.float32)
+        right7 = np.asarray(right7, dtype=np.float32)
         q = np.zeros(self._solver.num_joints, dtype=np.float32)
         for i, gi in enumerate(self._solver.left_indices):
-            q[gi] = self._rest_pose_left[i]
+            q[gi] = left7[i]
         for i, gi in enumerate(self._solver.right_indices):
-            q[gi] = self._rest_pose_right[i]
+            q[gi] = right7[i]
         return q
+
+    def get_rest_q(self) -> np.ndarray:
+        """Full (N,) operating rest pose vector in radians (selected by ``start_pose``)."""
+        return self._operating_q.copy()
+
+    def get_soldier_q(self) -> np.ndarray:
+        """Full (N,) soldier (safe stow / transit) pose vector in radians."""
+        return self._soldier_q.copy()
 
     # -- Core ---------------------------------------------------------------
 
@@ -318,16 +359,14 @@ class IKWorker:
             right_elbow_pos=elbow_r,
         )
 
-    def compute_reset_trajectory(
-        self, q_current: np.ndarray, q_target: np.ndarray
-    ) -> list[np.ndarray]:
+    def _plan(self, q_from: np.ndarray, q_to: np.ndarray) -> list[np.ndarray]:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
         return plan_collision_aware_trajectory(
             self._solver.robot,
             self._solver.robot_coll,
-            q_current,
-            q_target,
+            q_from,
+            q_to,
             speed=cfg.reset_speed,
             rate=cfg.frequency,
             min_duration=cfg.reset_min_duration,
@@ -337,6 +376,44 @@ class IKWorker:
             collision_weight=cfg.reset_collision_weight,
             max_iterations=cfg.reset_max_iterations,
         )
+
+    def compute_reset_trajectory(self, q_current: np.ndarray) -> list[np.ndarray]:
+        """Collision-aware trajectory from ``q_current`` directly to the operating pose.
+
+        Mid-session resets go straight to the operating pose (no soldier
+        detour); only startup and shutdown route through the soldier pose.
+        """
+        return self._plan(q_current, self._operating_q)
+
+    def compute_startup_trajectory(self, q_start: np.ndarray) -> list[np.ndarray]:
+        """Collision-aware startup trajectory ending at the operating pose.
+
+        Always routes ``q_start -> soldier`` first. When ``start_pose`` is
+        ``"table"`` the soldier -> table leg is staged through the ``lift``
+        waypoint (gripper swings up and back to clear the table, then extends
+        forward); ``"custom"`` plans soldier -> custom directly; ``"soldier"``
+        stops at the soldier pose. Returns the concatenated waypoint list.
+        """
+        traj = list(self._plan(q_start, self._soldier_q))
+        if self._start_pose == "table":
+            traj.extend(self._plan(self._soldier_q, self._lift_q))
+            traj.extend(self._plan(self._lift_q, self._operating_q))
+        elif self._start_pose == "custom":
+            traj.extend(self._plan(self._soldier_q, self._operating_q))
+        return traj
+
+    def compute_shutdown_trajectory(self, q_current: np.ndarray) -> list[np.ndarray]:
+        """Collision-aware trajectory returning ``q_current`` to the soldier pose.
+
+        When ``start_pose`` is ``"table"`` the descent is staged through the
+        ``lift`` waypoint (reverse of startup) so the gripper rises and swings
+        back to clear the table before settling into the soldier pose.
+        """
+        if self._start_pose == "table":
+            traj = list(self._plan(q_current, self._lift_q))
+            traj.extend(self._plan(self._lift_q, self._soldier_q))
+            return traj
+        return self._plan(q_current, self._soldier_q)
 
     def reset(self) -> None:
         """Deactivate the deadman-switch state and clear snap poses and filter state.
@@ -351,8 +428,8 @@ class IKWorker:
         self._snap_elbow_fk = {}
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
-        # restores the default rest-pose attractor.
-        self._solver.set_posture_pose(self.get_rest_q())
+        # restores the default operating-pose attractor.
+        self._solver.set_posture_pose(self._operating_q)
 
     # -- Internal -----------------------------------------------------------
 
@@ -365,19 +442,19 @@ class IKWorker:
         self._f_l_elbow.reset()
         self._f_r_elbow.reset()
 
-    def _settle_rest_pose(
-        self, max_iterations: int = 200, tol: float = 1e-5
+    def _settle_pose(
+        self, q_start: np.ndarray, max_iterations: int = 200, tol: float = 1e-5
     ) -> np.ndarray:
-        """Iterate the full teleop IK to the manipulability-balanced rest pose.
+        """Iterate the full teleop IK from ``q_start`` to its manipulability-balanced fixed point.
 
-        EE and elbow targets are the configured rest pose's own FK, and posture
-        is pinned to the current iterate, so all costs except manipulability
-        have zero gradient at the starting q. The remaining manipulability
-        gradient drives q in the EE null space until it stops changing — the
-        same conditions the rising-edge posture pin in :meth:`step` produces
-        at engage time.
+        EE and elbow targets are ``q_start``'s own FK, and posture is pinned to
+        the current iterate, so all costs except manipulability have zero
+        gradient at the starting q. The remaining manipulability gradient
+        drives q in the EE null space until it stops changing — the same
+        conditions the rising-edge posture pin in :meth:`step` produces at
+        engage time.
         """
-        q = self.get_rest_q()
+        q = np.asarray(q_start, dtype=np.float32)
         fk = self._solver.robot.forward_kinematics(jnp.asarray(q))
 
         def _pose(idx: int) -> tuple[np.ndarray, np.ndarray]:
@@ -471,6 +548,7 @@ def run_ik_worker(
 
     worker = IKWorker(config, kinematics_config)
     q_rest = worker.get_rest_q()
+    q_soldier = worker.get_soldier_q()
 
     q_start = np.zeros_like(q_rest)
     if q_current_left is not None:
@@ -480,7 +558,7 @@ def run_ik_worker(
         for i, gi in enumerate(worker.right_indices):
             q_start[gi] = q_current_right[i]
 
-    startup_traj = worker.compute_reset_trajectory(q_start, q_rest)
+    startup_traj = worker.compute_startup_trajectory(q_start)
     q = startup_traj[-1].copy() if startup_traj else q_rest.copy()
 
     conn.send(
@@ -494,10 +572,16 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                traj = worker.compute_reset_trajectory(q_current)
                 worker.reset()
                 q = traj[-1].copy() if traj else q_rest.copy()
                 conn.send(("reset_traj", q_rest.copy(), traj))
+            elif isinstance(msg, tuple) and msg[0] == "shutdown":
+                q_current = np.asarray(msg[1], dtype=np.float32)
+                traj = worker.compute_shutdown_trajectory(q_current)
+                worker.reset()
+                q = traj[-1].copy() if traj else q_soldier.copy()
+                conn.send(("shutdown_traj", q_soldier.copy(), traj))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())

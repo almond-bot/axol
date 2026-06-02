@@ -905,6 +905,13 @@ def _run(cfg: RunPolicyConfig) -> None:
                 client.stop()
             except Exception:  # noqa: BLE001
                 pass
+        # Return the arms to the soldier (safe stow) pose before releasing the
+        # motors so they don't crash down. Best-effort: the robot is still
+        # connected and the IK worker alive at this point.
+        try:
+            reset_controller.return_to_soldier(robot)
+        except Exception:  # noqa: BLE001
+            pass
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses.

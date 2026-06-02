@@ -105,7 +105,19 @@ class IKResetController:
         self._ready = True
 
     def return_to_rest(self, robot: "AxolRobot") -> None:
-        """Plan and play a collision-aware trajectory to the rest pose."""
+        """Plan and play a collision-aware trajectory to the operating rest pose."""
+        self._return_to(robot, "reset")
+
+    def return_to_soldier(self, robot: "AxolRobot") -> None:
+        """Plan and play a collision-aware return to the soldier (safe stow) pose.
+
+        Used at shutdown so the arms settle into the stow pose before the
+        motors release rather than crashing down.
+        """
+        self._return_to(robot, "shutdown")
+
+    def _return_to(self, robot: "AxolRobot", message: str) -> None:
+        """Request a ``message`` trajectory from the worker and stream it to the robot."""
         import numpy as np
 
         from ..shared import Joint
@@ -127,13 +139,15 @@ class IKResetController:
         for i, gi in enumerate(self._right_indices):
             q_current[gi] = float(pos_r[i])
 
-        self._conn.send(("reset", q_current))
+        self._conn.send((message, q_current))
         result = self._conn.recv()
-        if not (isinstance(result, tuple) and result[0] == "reset_traj"):
+        if not (isinstance(result, tuple) and len(result) == 3):
             raise RuntimeError(f"Unexpected IK worker response: {result!r}")
-        _, _q_rest, traj = result
+        _, _q_target, traj = result
         if not traj:
-            _logger.warning("IK worker returned an empty reset trajectory; skipping.")
+            _logger.warning(
+                "IK worker returned an empty %s trajectory; skipping.", message
+            )
             return
 
         interp = ResetInterpolator()

@@ -244,6 +244,11 @@ class VRTeleop:
             self._ik_thread.join(timeout=3.0)
             self._ik_thread = None
 
+        # Return the arms to the soldier (safe stow) pose before releasing the
+        # motors so they don't crash down. The IK thread is already stopped, so
+        # the connection is uncontended; the robot is still enabled.
+        await self._play_shutdown_trajectory()
+
         if self._parent_conn is not None:
             try:
                 self._parent_conn.send(None)
@@ -264,6 +269,46 @@ class VRTeleop:
             self._vr_thread = None
 
         await self._robot.disable()
+
+    async def _play_shutdown_trajectory(self) -> None:
+        """Plan and play a collision-aware return-to-soldier move on the robot.
+
+        Requested from the (still-alive) IK subprocess and streamed to the
+        robot at the control frequency, holding the current gripper positions.
+        A no-op if the worker, connection, or current pose is unavailable.
+        """
+        if self._parent_conn is None or self._q is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._parent_conn.send(("shutdown", self._q.copy()))
+            msg = await loop.run_in_executor(
+                None, lambda: _recv_with_timeout(self._parent_conn, _IK_RECV_TIMEOUT)
+            )
+        except Exception as e:  # noqa: BLE001
+            _logger.error("Shutdown trajectory request failed: %s", e)
+            return
+        if not (isinstance(msg, tuple) and msg[0] == "shutdown_traj"):
+            return
+        _, _q_soldier, trajectory = msg
+        if not trajectory:
+            return
+
+        interval = 1.0 / self._config.frequency
+        l_grip, r_grip = self._l_grip, self._r_grip
+        deadline = time.perf_counter()
+        for waypoint in trajectory:
+            wp = np.asarray(waypoint, dtype=np.float32)
+            left = np.empty(8, dtype=np.float32)
+            left[:7] = wp[self._left_indices]
+            left[7] = l_grip
+            right = np.empty(8, dtype=np.float32)
+            right[:7] = wp[self._right_indices]
+            right[7] = r_grip
+            await self._robot.motion_control(left=left, right=right)
+            deadline += interval
+            await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+        self._q = np.asarray(trajectory[-1], dtype=np.float32)
 
     async def __aenter__(self) -> VRTeleop:
         await self.enable()
