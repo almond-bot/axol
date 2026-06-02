@@ -46,6 +46,7 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 | `pose_min_cutoff` | `1.5` Hz | One Euro Filter tremor cutoff for raw VR poses |
 | `pose_beta` | `5.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
 | `position_multiplier` | `1.0` | Scale on hand **position** (not orientation): the EE target moves this many times as far as the hand. `>1` extends reach when the arm is longer than the operator's |
+| `rotation_multiplier` | `1.0` | Scale on hand **orientation** (not position): the EE target rotates this many times as far as the hand. `>1` rotates the arm further than the wrist |
 | `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
 | `reset_min_duration` | `1.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
 | `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
