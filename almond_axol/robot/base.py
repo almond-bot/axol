@@ -30,10 +30,12 @@ class RobotBase(ABC):
         ...
 
     async def __aenter__(self) -> Self:
+        """Enter the async context, enabling the robot via :meth:`enable`."""
         await self.enable()
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        """Exit the async context, disabling the robot via :meth:`disable`."""
         await self.disable()
 
     @abstractmethod

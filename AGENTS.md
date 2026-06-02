@@ -4,11 +4,11 @@
 
 ### Overview
 
-Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no physical robot hardware is available in the cloud VM, all development and testing uses the **sim** mode (`--robot sim`), which renders the robot in a browser via viser.
+Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no physical robot hardware is available in the cloud VM, all development and testing uses the **sim** mode (`--sim`), which renders the robot in a browser via viser.
 
 ### Running the application
 
-- **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --robot sim`
+- **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --sim`
   - Opens a viser 3D viewer at `http://localhost:8080` and a VR WebSocket server on port 8000.
 
 ### Linting

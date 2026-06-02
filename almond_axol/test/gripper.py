@@ -75,6 +75,7 @@ async def _run(no_left: bool, no_right: bool) -> None:
 
 
 def main() -> None:
+    """Parse CLI arguments and run the gripper open/close routine."""
     parser = argparse.ArgumentParser(
         description="Open then close the gripper on each arm."
     )

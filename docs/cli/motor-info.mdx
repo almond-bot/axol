@@ -1,0 +1,15 @@
+---
+title: "motor.info"
+description: "Read and print a full status snapshot from a single motor."
+---
+
+Reads and prints a full status snapshot from a motor: status/error code, control mode (Damiao only), position, velocity, torque, temperature, and voltage.
+
+<Note>
+  All motor commands accept a mutually exclusive `--l` / `--r` flag to select the left or right arm, and `--id` for the motor's CAN address (hex or decimal). `--type` can be `myactuator` or `damiao` and is inferred from the ID if omitted.
+</Note>
+
+```bash
+axol motor.info --l --id 0x01
+axol motor.info --r --id 6 --type damiao
+```

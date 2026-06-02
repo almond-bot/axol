@@ -13,10 +13,11 @@ Typical usage::
 
     config = AxolRobotConfig(
         id="axol_01",
+        zed_host="192.168.1.10",  # shared by all cameras below
         cameras={
-            "overhead": ZedCameraConfig(host="192.168.1.10", port=30000),
-            "left_arm": ZedCameraConfig(host="192.168.1.10", port=30002),
-            "right_arm": ZedCameraConfig(host="192.168.1.10", port=30004),
+            "overhead": ZedCameraConfig(port=30000),
+            "left_arm": ZedCameraConfig(port=30002),
+            "right_arm": ZedCameraConfig(port=30004),
         },
     )
     with AxolRobot(config) as robot:
@@ -69,7 +70,7 @@ class AxolRobot(Robot):
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        self.cameras = make_cameras_from_configs(config.cameras)
+        self.cameras = make_cameras_from_configs(config.resolved_cameras())
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
 

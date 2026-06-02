@@ -22,12 +22,16 @@ from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _MotorType(Enum):
+    """Identifies which vendor protocol a joint's motor speaks."""
+
     MYACTUATOR = "myactuator"
     DAMIAO = "damiao"
 
 
 @dataclass(frozen=True)
 class _JointConfig:
+    """Per-joint motor configuration: vendor type, default CAN ID, and torque constant."""
+
     kind: _MotorType
     motor_id: int
     kt: float

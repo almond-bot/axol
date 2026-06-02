@@ -131,6 +131,7 @@ name = "almond-axol"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "draccus" },
     { name = "fastapi" },
     { name = "jax" },
     { name = "jaxlie" },
@@ -159,6 +160,7 @@ sim = [
 
 [package.metadata]
 requires-dist = [
+    { name = "draccus", specifier = "==0.10.0" },
     { name = "fastapi", specifier = ">=0.135.2" },
     { name = "jax", specifier = ">=0.9.2" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.9.2" },

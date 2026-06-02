@@ -9,6 +9,7 @@ from .setup import _CRON_SCRIPT, _bring_up_can
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``can.enable`` subcommand."""
     subparsers.add_parser(
         "can.enable",
         help="Bring up CAN interfaces using the startup script.",
@@ -16,6 +17,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(_args: object = None) -> None:
+    """Bring up the CAN interfaces using the saved startup script."""
     if not _CRON_SCRIPT.exists():
         print(f"ERROR: Startup script not found at {_CRON_SCRIPT}.")
         print("Run 'axol can.setup' first.")

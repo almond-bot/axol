@@ -182,6 +182,7 @@ class OneEuroFilter:
 
     @staticmethod
     def _alpha(cutoff: float | np.ndarray, freq: float) -> float | np.ndarray:
+        """Return the low-pass smoothing factor for a cutoff and sample rate (both Hz)."""
         tau = 1.0 / (2.0 * np.pi * cutoff)
         te = 1.0 / freq
         return 1.0 / (1.0 + tau / te)

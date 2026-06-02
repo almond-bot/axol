@@ -40,6 +40,7 @@ def _sdk_version() -> tuple[str, str]:
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``zed.install`` subcommand."""
     subparsers.add_parser(
         "zed.install",
         help="Download the pyzed wheel for the installed ZED SDK version.",
@@ -47,6 +48,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(_args: object = None) -> None:
+    """Download and install the pyzed wheel for the installed ZED SDK."""
     if not _ZED_INCLUDE.exists():
         print(
             "ERROR: ZED SDK not found at /usr/local/zed\n"

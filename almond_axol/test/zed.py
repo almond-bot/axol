@@ -22,6 +22,7 @@ _RECEIVER_IP = "192.168.10.2/24"
 
 
 def main() -> None:
+    """Parse CLI arguments, capture one frame from the stream, and save it as PNG."""
     parser = argparse.ArgumentParser(
         description="Capture one frame from a ZED stream and save as PNG."
     )

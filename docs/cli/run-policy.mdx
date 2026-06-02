@@ -1,0 +1,51 @@
+---
+title: "run-policy"
+description: "Run a trained policy autonomously on the robot with async inference."
+---
+
+Runs a trained policy autonomously on the robot using three ZED cameras and LeRobot's async inference (`lerobot.async_inference`). A `PolicyServer` is launched in a child process on localhost and the parent drives a thin `RobotClient` subclass that streams observations to it and consumes the returned action chunks. Type `s` on stdin to save the rollout and end the episode, `r` to discard and re-record, or `q` to discard and quit. `--episode_time_s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
+
+<Tip>
+  Policy inference runs across two machines (main host + ZED box). For the end-to-end two-machine workflow, see the [Policy Inference quickstart](/quickstart/inference).
+</Tip>
+
+This command is configured via draccus. The robot subsystem is exposed as the nested `robot_config` (camera streams, per-joint gains) — nest into it with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
+
+| Flag | Description |
+|---|---|
+| `--policy_path PATH_OR_REPO` | Local checkpoint path or HuggingFace repo ID (required) |
+| `--policy_type {act,smolvla,diffusion,tdmpc,vqbet,pi0,pi05,groot}` | Policy architecture; must match the checkpoint at `--policy_path` (required) |
+| `--task TEXT` | Natural language task description (required) |
+| `--episode_time_s INT` | Safety cap on episode duration in seconds (default: 120). Episodes normally end on operator keypress |
+| `--fps INT` | Control loop frame rate (default: 60). Must match the fps the policy was trained on |
+| `--repo_id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
+| `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
+| `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |
+| `--device STR` | PyTorch device for policy inference (default: `cuda`) |
+| `--server_port INT` | Port for the localhost `PolicyServer` child process (default: 8765) |
+| `--actions_per_chunk INT` | Number of actions returned per inference call (default: 50); capped by the policy's max action horizon |
+| `--chunk_size_threshold FLOAT` | Trigger a fresh observation when the action queue drops to this fraction of a chunk (default: 0.9) |
+| `--aggregate_fn {temporal_ensemble,weighted_average,latest_only,average,conservative}` | Action chunk aggregation strategy (default: `temporal_ensemble`, ACT Algorithm 2; gripper indices take the newest chunk). The other choices are upstream scalar blends |
+| `--temporal_ensemble_coeff K` | Decay coefficient for `temporal_ensemble` (default: 0.01, ACT paper). `wᵢ = exp(-K·i)`, `i=0` oldest chunk; `K>0` smoother, `K=0` uniform, `K<0` more reactive |
+| `--zed_iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
+| `--robot_config.zed_host IP` | Shared IP of the ZED streamer for all three cameras (default `192.168.10.1`; cameras use ports 30000/30002/30004). Override a single camera with `--robot_config.cameras.<name>.host IP` (`<name>` ∈ `overhead`/`left_arm`/`right_arm`). |
+| `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper in POSITION_FORCE mode (default: 0.5); `<side>` is `left`/`right` |
+| `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Should match the value used at data collection time. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
+| `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
+
+```bash
+axol run-policy --policy_path myorg/pick-place-policy --policy_type act --task "Pick the red cube"
+axol run-policy --policy_path ./checkpoints/epoch_100 --policy_type smolvla --task "Stack blocks" --device cpu
+axol run-policy --policy_path myorg/pick-place-policy --policy_type act --task "Pick the red cube" \
+    --repo_id myorg/pick-place-rollouts \
+    --robot_config.axol_config.left_stiffness 1.0 --robot_config.axol_config.right_stiffness 1.0
+```
+
+If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format dataset using the same resume/refuse/wipe semantics as [`collect-data`](/cli/collect-data) (resume a complete dataset, refuse an incomplete one, wipe a leftover empty directory). Between episodes the arms return to the rest pose via a collision-aware IK trajectory planned in a worker subprocess, mirroring the reset path used by `collect-data`.
+
+<Info>
+  Action chunk aggregation defaults to ACT's Algorithm 2 (`temporal_ensemble`): every future timestep covered by the buffered chunks is the exponentially-weighted average across those chunks, with the gripper indices snapped to the newest contributing chunk so bang-bang grasp commands aren't smeared. The control loop and observation send run on separate threads — decoupling the ~60-70 ms ZED-read + gRPC send from the 60 Hz action stream that would otherwise collapse to ~27 Hz on the upstream single-threaded design.
+</Info>

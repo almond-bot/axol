@@ -341,7 +341,6 @@ async def _identify_joint(
             await _ramp_to(motor, kp, kd, sweep_lo, duration=ramp_dur)
             await asyncio.sleep(0.3)
 
-            # Forward sweep: sweep_lo → sweep_hi
             fwd = await _run_sweep_raw(motor, kp, kd, sweep_lo, +v, sweep_hi)
             cur = await motor.get_position()
             print(f"    fwd: {len(fwd)} samples")
@@ -349,11 +348,9 @@ async def _identify_joint(
             # Hold at turnaround to damp velocity before reversing
             await _ramp_to(motor, kp, kd, cur, duration=2.0)
 
-            # Backward sweep: sweep_hi → sweep_lo
             bwd = await _run_sweep_raw(motor, kp, kd, cur, -v, sweep_lo)
             print(f"    bwd: {len(bwd)} samples")
 
-            # Bin by position and match fwd/bwd
             fwd_bins = _bin_by_position(fwd, sweep_lo, sweep_hi)
             bwd_bins = _bin_by_position(bwd, sweep_lo, sweep_hi)
             matched = sum(1 for q in fwd_bins if q in bwd_bins)
@@ -392,6 +389,7 @@ async def _identify_joint(
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``tune.friction`` subcommand."""
     p = subparsers.add_parser(
         "tune.friction",
         help="Identify the friction-model parameters (Fc, k, Fv, Fo) for one joint.",
@@ -455,6 +453,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run the friction-identification session for the selected joint."""
     asyncio.run(_run(args))
 
 
@@ -462,7 +461,11 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
-    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    # ``resolved()`` bakes in the default stiffness blend so the fallback
+    # kp/kd match what the robot actually runs (stiffness is applied at the
+    # ``Axol`` boundary now, not in ``AxolConfig.__post_init__``).
+    resolved = AxolConfig().resolved()
+    arm_cfg: ArmConfig = resolved.left if is_left else resolved.right
     config_gains = getattr(arm_cfg, joint.value)
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd

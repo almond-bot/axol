@@ -1,0 +1,24 @@
+---
+title: "motor.set-zero-pos"
+description: "Set a motor's zero-position reference to its current mechanical position."
+---
+
+Sets the motor's zero-position reference to its current mechanical position (persisted to flash). Damiao motors require a power cycle afterward.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--id ID` | CAN ID of the motor to zero, hex or decimal (required unless `--guided`) |
+| `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
+| `--guided` | Walk through every arm joint, zeroing each at its closer end stop |
+
+In `--guided` mode the CLI iterates through all 7 arm joints (the gripper is auto-calibrated at runtime). For each joint you place it somewhere inside its operating range, press Enter, then move it to the prompted end stop and press Enter again. If the motion direction doesn't match the expected sign the CLI loops back automatically and asks you to retry. Once the direction checks out, press Enter once more to commit the zero, or Ctrl-C to skip that joint.
+
+```bash
+axol motor.set-zero-pos --l --id 0x01      # single motor
+axol motor.set-zero-pos --l --guided       # all left-arm joints
+```
+
+<Note>
+  After `--guided` calibration each motor's encoder zero coincides with its calibration end stop. `AxolArm` carries a per-joint offset internally so the public API (`positions`, `motion_control`, etc.) stays in joint frame (`0` = rest position). Damiao motors (`WRIST_2`, `WRIST_3`) need a power cycle for the new zero to take effect.
+</Note>

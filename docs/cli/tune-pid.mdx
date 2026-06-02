@@ -1,0 +1,25 @@
+---
+title: "tune.pid"
+description: "Tune Kp/Kd gains for a single joint via sinusoidal or step-response tracking."
+---
+
+Tunes `Kp`/`Kd` gains for a single joint at ~100 Hz using sinusoidal tracking or step-response, and prints error statistics.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Arm side (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
+| `--kp FLOAT` | Proportional gain (required) |
+| `--kd FLOAT` | Derivative gain (required) |
+| `--tff` | Apply full feedforward (gravity + friction) |
+| `--mode {sine,step}` | `sine` = sinusoidal tracking (default); `step` = step response |
+| `--amp FLOAT` | Motion amplitude in rad (default: auto safe value) |
+| `--freq FLOAT` | [sine] Frequency in Hz (default: 1.0) |
+| `--duration FLOAT` | [sine] Duration in seconds (default: 5.0) |
+| `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) |
+| `--rate FLOAT` | Command rate in Hz (default: 100.0) |
+
+```bash
+axol tune.pid --l --joint elbow --kp 25 --kd 0.6
+axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
+```
