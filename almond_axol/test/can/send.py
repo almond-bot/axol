@@ -237,7 +237,11 @@ async def _run(
 
     try:
         async with CanBus(channel) as bus:
-            cfg = AxolConfig()
+            # ``resolved()`` bakes in the default stiffness blend (now applied
+            # at the ``Axol`` construction boundary rather than in
+            # ``AxolConfig.__post_init__``), so this directly-built arm keeps
+            # the same gains it had before the stiffness refactor.
+            cfg = AxolConfig().resolved()
             arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
 
             stats_task = asyncio.create_task(

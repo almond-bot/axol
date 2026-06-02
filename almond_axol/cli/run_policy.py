@@ -18,20 +18,24 @@ when no key has been pressed.
 
 from __future__ import annotations
 
-import argparse
 import logging
 import socket
 import threading
 import time
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from lerobot.robots.config import RobotConfig
+
+from ..lerobot.camera.configuration_zed import ZedCameraConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
     stdin_watcher,
 )
-from ..shared import ARM_JOINTS, parse_stiffness
+from .config import AggregateFn, LogLevel, PolicyType, parse
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -41,197 +45,58 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    p = subparsers.add_parser("run-policy", help="Run a trained policy on the robot.")
-    p.add_argument(
-        "--policy",
-        required=True,
-        help="Local path or HuggingFace repo ID of the trained policy checkpoint.",
+def _default_robot_config() -> AxolRobotConfig:
+    """Default Axol robot config for inference: three ZED streams.
+
+    Override any field from the CLI, e.g.
+    ``--robot_config.cameras.overhead.host 10.0.0.5`` or
+    ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
+    used at data-collection time).
+    """
+    return AxolRobotConfig(
+        cameras={
+            "overhead": ZedCameraConfig(host="192.168.10.1", port=30000),
+            "left_arm": ZedCameraConfig(host="192.168.10.1", port=30002),
+            "right_arm": ZedCameraConfig(host="192.168.10.1", port=30004),
+        },
     )
-    p.add_argument(
-        "--policy-type",
-        required=True,
-        choices=[
-            "act",
-            "smolvla",
-            "diffusion",
-            "tdmpc",
-            "vqbet",
-            "pi0",
-            "pi05",
-            "groot",
-        ],
-        help="Policy architecture; must match the checkpoint at --policy.",
-    )
-    p.add_argument("--task", required=True, help="Natural language task description.")
-    p.add_argument(
-        "--episode-time-s",
-        type=int,
-        default=120,
-        help=(
-            "Safety cap on episode duration in seconds (default: 120). "
-            "Episodes normally end on operator keypress (s/r/q)."
-        ),
-    )
-    p.add_argument(
-        "--fps",
-        type=int,
-        default=60,
-        help=(
-            "Control loop frame rate (default: 60). Must match the fps "
-            "the policy was trained on."
-        ),
-    )
-    p.add_argument(
-        "--repo-id",
-        default=None,
-        help="HuggingFace dataset repo ID to save rollouts (<user>/<dataset>). Optional.",
-    )
-    p.add_argument(
-        "--root",
-        default=None,
-        help="Local dataset root path (default: HF_LEROBOT_HOME).",
-    )
-    p.add_argument(
-        "--push-to-hub",
-        action="store_true",
-        help="Push rollout dataset to HuggingFace Hub when done.",
-    )
-    p.add_argument(
-        "--device",
-        default="cuda",
-        help="Torch device for policy inference (default: cuda).",
-    )
-    p.add_argument(
-        "--server-port",
-        type=int,
-        default=8765,
-        help="Port for the localhost PolicyServer child process (default: 8765).",
-    )
-    p.add_argument(
-        "--actions-per-chunk",
-        type=int,
-        default=50,
-        help=(
-            "Number of actions returned per inference call (default: 50). "
-            "Capped by the policy's max action horizon."
-        ),
-    )
-    p.add_argument(
-        "--chunk-size-threshold",
-        type=float,
-        default=0.9,
-        help=(
-            "Trigger a fresh observation when the action queue drops to "
-            "this fraction of a full chunk (default: 0.9). Higher than "
-            "upstream's 0.5 because obs send runs on its own thread here."
-        ),
-    )
-    p.add_argument(
-        "--aggregate-fn",
-        default="temporal_ensemble",
-        choices=[
-            "temporal_ensemble",
-            "weighted_average",
-            "latest_only",
-            "average",
-            "conservative",
-        ],
-        help=(
-            "Action chunk aggregation strategy (default: temporal_ensemble, "
-            "ACT Algorithm 2; gripper indices take the newest chunk). The "
-            "other choices are upstream scalar blends applied uniformly."
-        ),
-    )
-    p.add_argument(
-        "--temporal-ensemble-coeff",
-        type=float,
-        default=0.01,
-        metavar="K",
-        help=(
-            "Decay coefficient for --aggregate-fn temporal_ensemble "
-            "(default: 0.01, ACT paper). wᵢ = exp(-K·i), i=0 oldest chunk; "
-            "K>0 smoother, K=0 uniform, K<0 more reactive."
-        ),
-    )
-    p.add_argument(
-        "--zed-host",
-        default="192.168.10.1",
-        help="IP address of the ZED streamer (default: 192.168.10.1).",
-    )
-    p.add_argument(
-        "--zed-iface",
-        default=None,
-        metavar="IFACE",
-        help=(
-            "Network interface to configure for the ZED link before connecting "
-            "(e.g. eth0). Assigns 192.168.10.2/24 and requires sudo. "
-            "Skip if the interface is already configured."
-        ),
-    )
-    p.add_argument(
-        "--left-gripper-torque-limit",
-        type=float,
-        default=0.5,
-        help="Max output torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5).",
-    )
-    p.add_argument(
-        "--right-gripper-torque-limit",
-        type=float,
-        default=0.5,
-        help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 0.5).",
-    )
-    stiffness_help = (
-        "Compliance ↔ stiffness blend in [0, 1] for the {side} arm. "
-        f"Either a single value applied to all {len(ARM_JOINTS)} joints, "
-        f"or {len(ARM_JOINTS)} comma-separated values (one per joint, in "
-        f"order: {', '.join(j.value for j in ARM_JOINTS)}; gripper "
-        "excluded). 0 is fully compliant; 1 restores the pre-tuning "
-        "industrial gains; 0.5 (default) is the geometric mean. See "
-        "AxolConfig.{attr}. Should match the values used at data "
-        "collection time."
-    )
-    stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
-    p.add_argument(
-        "--left-stiffness",
-        type=parse_stiffness,
-        default=0.5,
-        metavar=stiffness_metavar,
-        help=stiffness_help.format(side="left", attr="left_stiffness"),
-    )
-    p.add_argument(
-        "--right-stiffness",
-        type=parse_stiffness,
-        default=0.5,
-        metavar=stiffness_metavar,
-        help=stiffness_help.format(side="right", attr="right_stiffness"),
-    )
-    p.add_argument(
-        "--rerun-ip",
-        default=None,
-        help=(
-            "IP of a Rerun viewer running on your local machine. "
-            "When set, streams live visualization to that viewer. "
-            "On the local machine run: rerun --connect rerun+http://<robot-ip>:<port>/proxy"
-        ),
-    )
-    p.add_argument(
-        "--rerun-port",
-        type=int,
-        default=9876,
-        help="Port of the Rerun viewer (default: 9876). Only used when --rerun-ip is set.",
-    )
-    p.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO).",
-    )
-    p.set_defaults(func=run)
 
 
-def run(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=getattr(logging, args.log_level))
+@dataclass
+class RunPolicyConfig:
+    """Config for ``axol run-policy``.
+
+    ``robot_config`` is the full Axol robot config (camera streams,
+    per-joint gains); nest into it from the CLI (e.g.
+    ``--robot_config.axol_config.left_stiffness 0.8``) or pass a
+    whole-config file with ``--config_path``. The compliance/stiffness
+    blend should match the values used at data-collection time.
+    """
+
+    policy_path: str
+    policy_type: PolicyType
+    task: str
+    robot_config: RobotConfig = field(default_factory=_default_robot_config)
+    episode_time_s: int = 120
+    fps: int = 60
+    repo_id: str | None = None
+    root: str | None = None
+    push_to_hub: bool = False
+    device: str = "cuda"
+    server_port: int = 8765
+    actions_per_chunk: int = 50
+    chunk_size_threshold: float = 0.9
+    aggregate_fn: AggregateFn = "temporal_ensemble"
+    temporal_ensemble_coeff: float = 0.01
+    zed_iface: str | None = None
+    rerun_ip: str | None = None
+    rerun_port: int = 9876
+    log_level: LogLevel = "INFO"
+
+
+def main(argv: list[str]) -> None:
+    cfg = parse(RunPolicyConfig, argv)
+    logging.basicConfig(level=getattr(logging, cfg.log_level))
 
     # Translate operator-actionable hardware faults into a clean non-zero
     # exit instead of a multi-frame traceback.
@@ -242,30 +107,7 @@ def run(args: argparse.Namespace) -> None:
     from ..motor.errors import MotorError
 
     try:
-        _run(
-            policy_path=args.policy,
-            policy_type=args.policy_type,
-            task=args.task,
-            episode_time_s=args.episode_time_s,
-            fps=args.fps,
-            repo_id=args.repo_id,
-            root=args.root,
-            push_to_hub=args.push_to_hub,
-            device=args.device,
-            server_port=args.server_port,
-            actions_per_chunk=args.actions_per_chunk,
-            chunk_size_threshold=args.chunk_size_threshold,
-            aggregate_fn=args.aggregate_fn,
-            temporal_ensemble_coeff=args.temporal_ensemble_coeff,
-            zed_host=args.zed_host,
-            zed_iface=args.zed_iface,
-            left_gripper_torque_limit=args.left_gripper_torque_limit,
-            right_gripper_torque_limit=args.right_gripper_torque_limit,
-            left_stiffness=args.left_stiffness,
-            right_stiffness=args.right_stiffness,
-            rerun_ip=args.rerun_ip,
-            rerun_port=args.rerun_port,
-        )
+        _run(cfg)
     except (MotorError, can.CanError) as exc:
         _logger.error("Robot hardware error: %s. Exiting.", exc)
         sys.exit(1)
@@ -717,30 +559,7 @@ def _build_axol_robot_client(
 # ----------------------------------------------------------------------
 
 
-def _run(
-    policy_path: str,
-    policy_type: str,
-    task: str,
-    episode_time_s: int,
-    fps: int,
-    repo_id: str | None,
-    root: str | None,
-    push_to_hub: bool,
-    device: str,
-    server_port: int = 8765,
-    actions_per_chunk: int = 50,
-    chunk_size_threshold: float = 0.9,
-    aggregate_fn: str = "temporal_ensemble",
-    temporal_ensemble_coeff: float = 0.01,
-    zed_host: str = "192.168.10.1",
-    zed_iface: str | None = None,
-    left_gripper_torque_limit: float = 0.5,
-    right_gripper_torque_limit: float = 0.5,
-    left_stiffness: float | tuple[float, ...] = 0.5,
-    right_stiffness: float | tuple[float, ...] = 0.5,
-    rerun_ip: str | None = None,
-    rerun_port: int = 9876,
-) -> None:
+def _run(cfg: RunPolicyConfig) -> None:
     import multiprocessing as mp
     import shutil
     from pathlib import Path
@@ -753,30 +572,30 @@ def _run(
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
-    from ..lerobot.camera.configuration_zed import ZedCameraConfig
-    from ..lerobot.robot.config_axol import AxolRobotConfig
     from ..lerobot.robot.robot_axol import AxolRobot
-    from ..robot.config import AxolConfig
     from ..shared import setup_link_ip
 
-    if zed_iface:
-        setup_link_ip(zed_iface, "192.168.10.2/24")
+    policy_path = cfg.policy_path
+    policy_type = cfg.policy_type
+    task = cfg.task
+    episode_time_s = cfg.episode_time_s
+    fps = cfg.fps
+    repo_id = cfg.repo_id
+    root = cfg.root
+    push_to_hub = cfg.push_to_hub
+    device = cfg.device
+    server_port = cfg.server_port
+    actions_per_chunk = cfg.actions_per_chunk
+    chunk_size_threshold = cfg.chunk_size_threshold
+    aggregate_fn = cfg.aggregate_fn
+    temporal_ensemble_coeff = cfg.temporal_ensemble_coeff
+    rerun_ip = cfg.rerun_ip
+    rerun_port = cfg.rerun_port
+    robot_config = cfg.robot_config
 
-    axol_config = AxolConfig(
-        left_stiffness=left_stiffness,
-        right_stiffness=right_stiffness,
-    )
-    axol_config.left.gripper.torque_limit = left_gripper_torque_limit
-    axol_config.right.gripper.torque_limit = right_gripper_torque_limit
+    if cfg.zed_iface:
+        setup_link_ip(cfg.zed_iface, "192.168.10.2/24")
 
-    robot_config = AxolRobotConfig(
-        cameras={
-            "overhead": ZedCameraConfig(host=zed_host, port=30000),
-            "left_arm": ZedCameraConfig(host=zed_host, port=30002),
-            "right_arm": ZedCameraConfig(host=zed_host, port=30004),
-        },
-        axol_config=axol_config,
-    )
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 

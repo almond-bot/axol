@@ -20,16 +20,21 @@ shares the sender-clock instant ``T_n`` with the joint sample, then writes
 the dataset row off the hot control loop.
 """
 
-import argparse
 import logging
 import shutil
 import socket
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..shared import ARM_JOINTS, parse_stiffness
+from lerobot.robots.config import RobotConfig
+from lerobot.teleoperators.config import TeleoperatorConfig
+
+from ..lerobot.camera.configuration_zed import ZedCameraConfig
+from ..lerobot.robot.config_axol import AxolRobotConfig
+from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from .config import LogLevel, parse
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -38,6 +43,46 @@ if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
+
+
+def _default_robot_config() -> AxolRobotConfig:
+    """Default Axol robot config for data collection: three ZED streams.
+
+    Override any field from the CLI, e.g.
+    ``--robot_config.cameras.overhead.host 10.0.0.5`` or
+    ``--robot_config.axol_config.left.elbow.kp 60``.
+    """
+    return AxolRobotConfig(
+        cameras={
+            "overhead": ZedCameraConfig(host="192.168.10.1", port=30000),
+            "left_arm": ZedCameraConfig(host="192.168.10.1", port=30002),
+            "right_arm": ZedCameraConfig(host="192.168.10.1", port=30004),
+        },
+    )
+
+
+@dataclass
+class CollectDataConfig:
+    """Config for ``axol collect-data``.
+
+    ``robot_config`` and ``teleop_config`` are the full lerobot subsystem
+    configs (camera streams, per-joint gains, IK, VR server); nest into
+    them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
+    0.8``) or supply a whole-config file with ``--config_path``.
+    """
+
+    repo_id: str
+    task: str
+    robot_config: RobotConfig = field(default_factory=_default_robot_config)
+    teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
+    fps: int = 60
+    teleop_hz: int = 120
+    root: str | None = None
+    push_to_hub: bool = False
+    zed_iface: str | None = None
+    rerun_ip: str | None = None
+    rerun_port: int = 9876
+    log_level: LogLevel = "INFO"
 
 
 @dataclass
@@ -211,150 +256,13 @@ class _CaptureThread(threading.Thread):
             tick += 1
 
 
-def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    p = subparsers.add_parser("collect-data", help="Record teleoperation episodes.")
-    p.add_argument(
-        "--repo-id",
-        required=True,
-        help="HuggingFace dataset repo ID (<user>/<dataset>).",
-    )
-    p.add_argument("--task", required=True, help="Natural language task description.")
-    p.add_argument(
-        "--fps",
-        type=int,
-        default=60,
-        help="Dataset recording frame rate (default: 60).",
-    )
-    p.add_argument(
-        "--teleop-hz",
-        type=int,
-        default=120,
-        help=(
-            "Motor command rate in Hz (default: 120, matching the IK loop). "
-            "Teleop runs at this rate while dataset frames are captured at --fps."
-        ),
-    )
-    p.add_argument(
-        "--root",
-        default=None,
-        help="Local dataset root path (default: HF_LEROBOT_HOME).",
-    )
-    p.add_argument(
-        "--push-to-hub",
-        action="store_true",
-        help="Push dataset to HuggingFace Hub when done.",
-    )
-    p.add_argument(
-        "--zed-host",
-        default="192.168.10.1",
-        help="IP address of the ZED streamer (default: 192.168.10.1).",
-    )
-    p.add_argument(
-        "--zed-iface",
-        default=None,
-        metavar="IFACE",
-        help=(
-            "Network interface to configure for the ZED link before connecting "
-            "(e.g. eth0). Assigns 192.168.10.2/24 and requires sudo. "
-            "Skip if the interface is already configured."
-        ),
-    )
-    p.add_argument(
-        "--left-gripper-torque-limit",
-        type=float,
-        default=0.5,
-        help="Max output torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5).",
-    )
-    p.add_argument(
-        "--right-gripper-torque-limit",
-        type=float,
-        default=0.5,
-        help="Max output torque (Nm) for the right gripper in POSITION_FORCE mode (default: 0.5).",
-    )
-    stiffness_help = (
-        "Compliance ↔ stiffness blend in [0, 1] for the {side} arm. "
-        f"Either a single value applied to all {len(ARM_JOINTS)} joints, "
-        f"or {len(ARM_JOINTS)} comma-separated values (one per joint, in "
-        f"order: {', '.join(j.value for j in ARM_JOINTS)}; gripper "
-        "excluded). 0 is fully compliant; 1 restores the pre-tuning "
-        "industrial gains; 0.5 (default) is the geometric mean. See "
-        "AxolConfig.{attr}."
-    )
-    stiffness_metavar = "S|" + ",".join("S" for _ in ARM_JOINTS)
-    p.add_argument(
-        "--left-stiffness",
-        type=parse_stiffness,
-        default=0.5,
-        metavar=stiffness_metavar,
-        help=stiffness_help.format(side="left", attr="left_stiffness"),
-    )
-    p.add_argument(
-        "--right-stiffness",
-        type=parse_stiffness,
-        default=0.5,
-        metavar=stiffness_metavar,
-        help=stiffness_help.format(side="right", attr="right_stiffness"),
-    )
-    p.add_argument(
-        "--rerun-ip",
-        default=None,
-        help=(
-            "IP of a Rerun viewer running on your local machine. "
-            "When set, streams live visualization to that viewer. "
-            "On the local machine run: rerun --connect rerun+http://<robot-ip>:<port>/proxy"
-        ),
-    )
-    p.add_argument(
-        "--rerun-port",
-        type=int,
-        default=9876,
-        help="Port of the Rerun viewer (default: 9876). Only used when --rerun-ip is set.",
-    )
-    p.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO).",
-    )
-    p.set_defaults(func=run)
+def main(argv: list[str]) -> None:
+    cfg = parse(CollectDataConfig, argv)
+    logging.basicConfig(level=getattr(logging, cfg.log_level))
+    _run(cfg)
 
 
-def run(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=getattr(logging, args.log_level))
-    _run(
-        repo_id=args.repo_id,
-        task=args.task,
-        fps=args.fps,
-        teleop_hz=args.teleop_hz,
-        root=args.root,
-        push_to_hub=args.push_to_hub,
-        zed_host=args.zed_host,
-        zed_iface=args.zed_iface,
-        left_gripper_torque_limit=args.left_gripper_torque_limit,
-        right_gripper_torque_limit=args.right_gripper_torque_limit,
-        left_stiffness=args.left_stiffness,
-        right_stiffness=args.right_stiffness,
-        rerun_ip=args.rerun_ip,
-        rerun_port=args.rerun_port,
-    )
-
-
-def _run(
-    repo_id: str,
-    task: str,
-    fps: int,
-    teleop_hz: int = 120,
-    root: str | None = None,
-    push_to_hub: bool = False,
-    zed_host: str = "192.168.10.1",
-    zed_iface: str | None = None,
-    left_gripper_torque_limit: float = 0.5,
-    right_gripper_torque_limit: float = 0.5,
-    left_stiffness: float | tuple[float, ...] = 0.5,
-    right_stiffness: float | tuple[float, ...] = 0.5,
-    rerun_ip: str | None = None,
-    rerun_port: int = 9876,
-) -> None:
+def _run(cfg: CollectDataConfig) -> None:
     from pathlib import Path
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -367,34 +275,25 @@ def _run(
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
-    from ..lerobot.camera.configuration_zed import ZedCameraConfig
-    from ..lerobot.robot.config_axol import AxolRobotConfig
     from ..lerobot.robot.robot_axol import AxolRobot
-    from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
-    from ..robot.config import AxolConfig
     from ..shared import setup_link_ip
     from ..vr.models import VRState
 
-    if zed_iface:
-        setup_link_ip(zed_iface, "192.168.10.2/24")
+    repo_id = cfg.repo_id
+    task = cfg.task
+    fps = cfg.fps
+    teleop_hz = cfg.teleop_hz
+    root = cfg.root
+    push_to_hub = cfg.push_to_hub
+    rerun_ip = cfg.rerun_ip
+    rerun_port = cfg.rerun_port
 
-    axol_config = AxolConfig(
-        left_stiffness=left_stiffness,
-        right_stiffness=right_stiffness,
-    )
-    axol_config.left.gripper.torque_limit = left_gripper_torque_limit
-    axol_config.right.gripper.torque_limit = right_gripper_torque_limit
-    robot_config = AxolRobotConfig(
-        cameras={
-            "overhead": ZedCameraConfig(host=zed_host, port=30000),
-            "left_arm": ZedCameraConfig(host=zed_host, port=30002),
-            "right_arm": ZedCameraConfig(host=zed_host, port=30004),
-        },
-        axol_config=axol_config,
-    )
-    robot = AxolRobot(robot_config)
-    teleop = AxolVRTeleop(AxolVRTeleopConfig())
+    if cfg.zed_iface:
+        setup_link_ip(cfg.zed_iface, "192.168.10.2/24")
+
+    robot = AxolRobot(cfg.robot_config)
+    teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id

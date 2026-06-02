@@ -127,6 +127,11 @@ class ArmConfig:
     place against measured joint torques — typically lower than the CAD
     values because Onshape often over-assigns aluminum-class densities to
     parts that are hollow / 3D-printed.
+
+    These ``kp`` / ``kd`` are the fully-compliant (``s=0``) endpoint of the
+    :attr:`AxolConfig.left_stiffness` / :attr:`AxolConfig.right_stiffness`
+    blend; the production default (``s=0.5``) interpolates them toward the
+    stiffer :data:`_STIFF_GAINS`.
     """
 
     shoulder_1: JointConfig = field(
@@ -414,10 +419,14 @@ class AxolConfig:
                          ``0.5`` (default) is the geometric mean of the
                          two. ``kp`` / ``kd`` interpolate geometrically
                          (log-space); ``j_eff`` / ``kd_soft`` scale
-                         linearly to 0 at ``s=1``. The blend is baked
-                         into ``left`` at construction — mutating
-                         ``left_stiffness`` afterwards has no effect,
-                         and ``replace()`` would re-apply it (don't).
+                         linearly to 0 at ``s=1``. The blend is baked into
+                         the ``left`` / ``right`` gains by :meth:`resolved`,
+                         which is called once at the robot-construction
+                         boundary (``Axol.__init__``). The stiffness fields
+                         are left untouched on the config itself, so a
+                         serialized :class:`AxolConfig` round-trips cleanly
+                         (loading a dumped config and resolving it again is
+                         idempotent).
         right_stiffness: Same, for the **right** arm.
     """
 
@@ -428,9 +437,24 @@ class AxolConfig:
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
     max_step_rad: float = 0.5
-    left_stiffness: float | Sequence[float] = 0.5
-    right_stiffness: float | Sequence[float] = 0.5
+    left_stiffness: float | list[float] = 0.5
+    right_stiffness: float | list[float] = 0.5
 
-    def __post_init__(self) -> None:
-        self.left = _apply_stiffness(self.left, self.left_stiffness)
-        self.right = _apply_stiffness(self.right, self.right_stiffness)
+    def resolved(self) -> "AxolConfig":
+        """Return a copy with stiffness baked into the ``left``/``right`` gains.
+
+        Blends each arm toward :data:`_STIFF_GAINS` by its stiffness factor
+        (see :func:`_apply_stiffness`) and resets ``left_stiffness`` /
+        ``right_stiffness`` to ``0.0`` so the result is **idempotent** —
+        calling :meth:`resolved` again is a no-op. This is applied once at
+        the single robot-construction boundary (``Axol.__init__``) so every
+        consumer sees consistent gains while the unresolved config stays
+        safe to serialize and reload.
+        """
+        return replace(
+            self,
+            left=_apply_stiffness(self.left, self.left_stiffness),
+            right=_apply_stiffness(self.right, self.right_stiffness),
+            left_stiffness=0.0,
+            right_stiffness=0.0,
+        )

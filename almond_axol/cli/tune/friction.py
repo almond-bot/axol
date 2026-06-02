@@ -462,7 +462,11 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
-    arm_cfg: ArmConfig = AxolConfig().left if is_left else AxolConfig().right
+    # ``resolved()`` bakes in the default stiffness blend so the fallback
+    # kp/kd match what the robot actually runs (stiffness is applied at the
+    # ``Axol`` boundary now, not in ``AxolConfig.__post_init__``).
+    resolved = AxolConfig().resolved()
+    arm_cfg: ArmConfig = resolved.left if is_left else resolved.right
     config_gains = getattr(arm_cfg, joint.value)
     kp = args.kp if args.kp is not None else config_gains.kp
     kd = args.kd if args.kd is not None else config_gains.kd

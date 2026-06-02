@@ -633,14 +633,14 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 | Field | Default | Description |
 |---|---|---|
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
-| `left_stiffness` | `0.5` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`); the default `0.5` is the geometric mean (e.g. `shoulder_1` `kp` ≈ 141). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. |
+| `left_stiffness` | `0.5` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`); the default `0.5` is the geometric mean (e.g. `shoulder_1` `kp` ≈ 141). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
 | `right_stiffness` | `0.5` | Same, for the **right** arm. |
 
 ```python
 config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)   # both arms, stiff industrial feel
 config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
 config = AxolConfig(                                           # per-joint, left only
-    left_stiffness=(0.8, 0.8, 0.5, 0.5, 0.2, 0.2, 0.0),
+    left_stiffness=[0.8, 0.8, 0.5, 0.5, 0.2, 0.2, 0.0],
 )
 ```
 

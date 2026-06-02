@@ -711,6 +711,11 @@ class Axol(RobotBase):
                 "At least one of left_channel or right_channel must be specified."
             )
 
+        # Bake stiffness into the per-joint gains exactly once, here at the
+        # single robot-construction boundary. ``resolved()`` is idempotent,
+        # so this is safe even if the caller already resolved the config.
+        config = config.resolved()
+
         self._gravity_comp = GravityCompensator(config)
 
         if left_channel is not None:
