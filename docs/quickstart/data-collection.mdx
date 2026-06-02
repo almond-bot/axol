@@ -3,7 +3,7 @@ title: "Data Collection Quickstart"
 description: "Record teleoperation episodes to a LeRobot dataset across the main host and ZED box."
 ---
 
-Data collection runs across **two machines** connected by a direct ethernet link:
+Data collection runs across **two machines** on the same network:
 
 - **Main host** (the upper computer) — owns the dataset, runs teleop and the recording loop.
 - **ZED box** (the Jetson sender) — streams the three ZED-X One cameras.
@@ -20,20 +20,37 @@ flowchart LR
     master["zed.sync-clocks --role master"]
     proc["collect-data"]
   end
-  slave -->|PTP over eth0| master
-  stream -->|HEVC over 192.168.10.x| proc
+  slave -->|PTP over the link| master
+  stream -->|HEVC video| proc
 ```
 
 <Warning>
   Start the clock-sync daemon on **both** machines before launching `collect-data`. If PTP isn't running, the receiver's capture/decode skew check in `ZedCamera.connect()` warns and recorded camera/joint pairs will not be time-aligned. See [`zed.sync-clocks`](/cli/zed-sync-clocks) for the PTP canary details.
 </Warning>
 
+## Network setup
+
+The two machines must be able to reach each other over the network. Pick the topology that matches your wiring — it determines whether you let `axol` assign static IPs or you point it at an existing address.
+
+<Tabs>
+  <Tab title="Direct ethernet">
+    A single cable between the two NICs, no router in between. Neither machine gets a DHCP address on that link, so `axol` assigns static IPs for you: the ZED box takes `192.168.10.1` (via `--setup-ip`) and the main host takes `192.168.10.2` (via `--zed_iface`). The receiver's default `zed_host` is already `192.168.10.1`, so no IP flag is needed on `collect-data`.
+  </Tab>
+  <Tab title="Shared router / switch">
+    Both machines plug into the same LAN and get their addresses from DHCP (or static config you manage). **Do not** pass `--setup-ip` / `--zed_iface` here — they would overwrite the address the network already assigned. Instead, find the ZED box's IP (e.g. `ip addr`) and point the receiver at it with `--robot_config.zed_host <zed-box-ip>`.
+  </Tab>
+</Tabs>
+
+Interface names vary by machine — the link might be `eth0`, `enp3s0`, `eno1`, and so on. Run `ip link` (or `ip addr`) on each machine to find the interface carrying the link, and substitute it for `<iface>` in the commands below.
+
+In both cases PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
+
 ## Prerequisites
 
 - The `lerobot` extra installed on the main host: `uv sync --extra lerobot` (see [Installation](/installation)).
 - CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
 - `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.
-- A direct ethernet link between the two machines (e.g. `eth0` on each).
+- A network link between the two machines — either a direct ethernet cable or a shared router/switch (see [Network setup](#network-setup)).
 
 ## ZED box (Jetson)
 
@@ -42,22 +59,38 @@ Open two terminals on the ZED box.
 <Steps>
   <Step title="Start clock sync (slave)">
     ```bash
-    axol zed.sync-clocks --role slave --iface eth0
+    axol zed.sync-clocks --role slave --iface <iface>
     ```
 
-    Leave this running for the whole session. See [`zed.sync-clocks`](/cli/zed-sync-clocks) for transport and timestamping options.
+    Replace `<iface>` with the ZED box's link interface (find it with `ip link`). Leave this running for the whole session. See [`zed.sync-clocks`](/cli/zed-sync-clocks) for transport and timestamping options.
   </Step>
 
   <Step title="Stream the cameras">
-    ```bash
-    axol zed.stream \
-        --overhead 12345678 \
-        --left-arm 23456789 \
-        --right-arm 34567890 \
-        --setup-ip eth0
-    ```
+    <Tabs>
+      <Tab title="Direct ethernet">
+        ```bash
+        axol zed.stream \
+            --overhead 12345678 \
+            --left-arm 23456789 \
+            --right-arm 34567890 \
+            --setup-ip <iface>
+        ```
 
-    `--setup-ip eth0` assigns the sender IP `192.168.10.1/24` to the link before streaming. Streams until `Ctrl+C`. See [`zed.stream`](/cli/zed-stream) for resolution, fps, and bitrate flags.
+        `--setup-ip <iface>` assigns the sender IP `192.168.10.1/24` to that interface before streaming.
+      </Tab>
+      <Tab title="Shared router / switch">
+        ```bash
+        axol zed.stream \
+            --overhead 12345678 \
+            --left-arm 23456789 \
+            --right-arm 34567890
+        ```
+
+        Drop `--setup-ip` so the box keeps its network-assigned address. Note that address (e.g. via `ip addr`) — you'll pass it to the main host as `--robot_config.zed_host`.
+      </Tab>
+    </Tabs>
+
+    Streams until `Ctrl+C`. See [`zed.stream`](/cli/zed-stream) for resolution, fps, and bitrate flags.
   </Step>
 </Steps>
 
@@ -68,21 +101,37 @@ Open two terminals on the main host.
 <Steps>
   <Step title="Start clock sync (master)">
     ```bash
-    axol zed.sync-clocks --role master --iface eth0
+    axol zed.sync-clocks --role master --iface <iface>
     ```
 
-    The `master` role runs on the long-lived upper computer that owns the dataset. Leave it running for the whole session.
+    Replace `<iface>` with the main host's link interface (find it with `ip link`). The `master` role runs on the long-lived upper computer that owns the dataset. Leave it running for the whole session.
   </Step>
 
   <Step title="Run data collection">
-    ```bash
-    axol collect-data \
-        --repo_id myorg/pick-place \
-        --task "Pick the red cube and place it in the bin" \
-        --zed_iface eth0
-    ```
+    <Tabs>
+      <Tab title="Direct ethernet">
+        ```bash
+        axol collect-data \
+            --repo_id myorg/pick-place \
+            --task "Pick the red cube and place it in the bin" \
+            --zed_iface <iface>
+        ```
 
-    `--zed_iface eth0` assigns the receiver IP `192.168.10.2/24` to the link. The robot is driven over VR (accept the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
+        `--zed_iface <iface>` assigns the receiver IP `192.168.10.2/24` to that interface; the cameras are reached at the default `zed_host` `192.168.10.1`.
+      </Tab>
+      <Tab title="Shared router / switch">
+        ```bash
+        axol collect-data \
+            --repo_id myorg/pick-place \
+            --task "Pick the red cube and place it in the bin" \
+            --robot_config.zed_host 192.168.1.42
+        ```
+
+        Replace `192.168.1.42` with the ZED box's address. Omit `--zed_iface` so the host keeps its network-assigned address.
+      </Tab>
+    </Tabs>
+
+    The robot is driven over VR (accept the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
   </Step>
 </Steps>
 

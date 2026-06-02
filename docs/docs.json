@@ -1,12 +1,12 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Almond Axol Docs",
+  "name": "Docs",
   "description": "Command-line interface and Python SDK for the Almond Axol dual-arm robot.",
   "colors": {
-    "primary": "#eff483",
+    "primary": "#c79760",
     "light": "#eff483",
-    "dark": "#b8bd2e"
+    "dark": "#c79760"
   },
   "favicon": "/assets/logo.png",
   "logo": {
@@ -66,9 +66,17 @@
       }
     ]
   },
-  "footer": {
-    "socials": {
-      "website": "https://axol.almond.bot"
+  "navbar": {
+    "links": [
+      {
+        "label": "VR Teleop",
+        "href": "https://axol.almond.bot"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get Axol",
+      "href": "https://almond.bot"
     }
   }
 }

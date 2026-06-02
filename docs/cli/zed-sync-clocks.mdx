@@ -18,9 +18,11 @@ The Jetson sender and the upper-computer receiver run independent system clocks.
 Two-terminal recipe (one per machine, both stay running for the whole session):
 
 ```bash
-axol zed.sync-clocks --role master --iface eth0   # upper computer
-axol zed.sync-clocks --role slave  --iface eth0   # Jetson
+axol zed.sync-clocks --role master --iface <iface>   # upper computer
+axol zed.sync-clocks --role slave  --iface <iface>   # Jetson
 ```
+
+Interface names vary by machine (`eth0`, `enp3s0`, `eno1`, …) — run `ip link` on each to find the one carrying the direct link and substitute it for `<iface>`.
 
 <Note>
   The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install fallback) are escalated inline via `sudo`, so you do **not** run `axol` itself as root. Sudo will prompt for a password the first time and reuse cached credentials for the rest of the session. The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`; on Debian/Ubuntu these are auto-installed if missing. On non-apt systems install them manually (`linuxptp`, `ethtool`) and rerun.
