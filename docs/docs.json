@@ -1,17 +1,17 @@
 {
   "$schema": "https://mintlify.com/docs.json",
   "theme": "mint",
-  "name": "Axol",
+  "name": "Almond Axol Docs",
   "description": "Command-line interface and Python SDK for the Almond Axol dual-arm robot.",
   "colors": {
-    "primary": "#0D9373",
-    "light": "#3CCFA0",
-    "dark": "#0A6E56"
+    "primary": "#eff483",
+    "light": "#eff483",
+    "dark": "#b8bd2e"
   },
-  "favicon": "/assets/axol.png",
+  "favicon": "/assets/logo.png",
   "logo": {
-    "light": "/assets/axol.png",
-    "dark": "/assets/axol.png"
+    "light": "/assets/logo.png",
+    "dark": "/assets/logo.png"
   },
   "navigation": {
     "groups": [

@@ -1,10 +1,10 @@
-# Axol
+# Almond Axol SDK
 
 <img src="assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
 
-The full documentation is authored as [Mintlify](https://mintlify.com) MDX under [`docs/`](docs/) and rendered as a docs site. The pages below link to the MDX sources.
+The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). The sources live under [`docs/`](docs/), and the pages below link to them.
 
 **New here?** See the [Teleoperation quickstart](docs/quickstart/teleop.mdx) to go from installation to a live teleoperation session.
 
@@ -99,12 +99,3 @@ See [`docs/installation.mdx`](docs/installation.mdx) for the full installation g
 - [`almond_axol.zed`](docs/api/zed.mdx)
 - [`almond_axol.motor`](docs/api/motor.mdx)
 - [`almond_axol.lerobot`](docs/api/lerobot.mdx)
-
-## Previewing the docs
-
-The docs are a Mintlify project rooted at [`docs/`](docs/). To preview locally:
-
-```bash
-npm i -g mint
-cd docs && mint dev
-```
