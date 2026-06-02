@@ -23,6 +23,7 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--robot_config.zed_host IP` | Shared IP of the ZED streamer for all three cameras (default `192.168.10.1`; cameras use ports 30000/30002/30004). Override a single camera with `--robot_config.cameras.<name>.host IP` (`<name>` ∈ `overhead`/`left_arm`/`right_arm`). |
 | `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper in POSITION_FORCE mode (default: 0.5); `<side>` is `left`/`right` |
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--teleop_config.vr_teleop_config.position_multiplier FLOAT` | Scale factor on hand **position** (not orientation): the end-effector target moves this many times as far as your hand. `1.0` (default) is 1:1; `2.0` moves the arm twice as far, helping cover the robot's full reach when the arm is longer than the operator's. |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |

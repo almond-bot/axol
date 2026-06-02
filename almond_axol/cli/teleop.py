@@ -9,6 +9,7 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --sim                                 # browser visualizer
     axol teleop --axol.left_stiffness 0.8
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+    axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
     axol teleop --config_path my_teleop.json          # whole-config file
 """
@@ -78,5 +79,5 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
         )
-    async with VRTeleop(robot) as teleop:
+    async with VRTeleop(robot, config=cfg.teleop) as teleop:
         await teleop.run()

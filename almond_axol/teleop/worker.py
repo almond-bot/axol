@@ -70,9 +70,14 @@ def _relative_target_np(
     rot_snap_ctrl: np.ndarray,
     pos_snap_fk: np.ndarray,
     rot_snap_fk: np.ndarray,
+    position_multiplier: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3)."""
-    d = rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)
+    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3).
+
+    ``position_multiplier`` scales only the translational displacement of the
+    controller relative to its engage snapshot; orientation is left untouched.
+    """
+    d = (rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)) * position_multiplier
     new_t = (
         pos_snap_fk
         + rot_snap_fk[:, 0] * d[2]
@@ -243,21 +248,26 @@ class IKWorker:
             )
             return q_current
 
+        pos_mult = self._config.position_multiplier
         tl_pos, tl_rot = _relative_target_np(
             left_pos,
             left_rot,
             *self._snap_ctrl["left"],
             *self._snap_fk["left"],
+            position_multiplier=pos_mult,
         )
         tr_pos, tr_rot = _relative_target_np(
             right_pos,
             right_rot,
             *self._snap_ctrl["right"],
             *self._snap_fk["right"],
+            position_multiplier=pos_mult,
         )
 
-        elbow_l = self._snap_elbow_fk["left"] + (left_e - self._snap_elbow_ctrl["left"])
-        elbow_r = self._snap_elbow_fk["right"] + (
+        elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
+            left_e - self._snap_elbow_ctrl["left"]
+        )
+        elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
             right_e - self._snap_elbow_ctrl["right"]
         )
 

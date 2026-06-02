@@ -72,6 +72,13 @@ class VRTeleopConfig:
             keeping the filter transparent during fast intentional moves.  For
             meter-space positions at 120 Hz a value of ~20 works well; increase
             if fast moves feel sticky.  Defaults to ``20.0``.
+        position_multiplier: Scale factor applied to the controller's
+            **position** displacement (not orientation) when mapping hand
+            motion to the end-effector target.  ``1.0`` is 1:1 motion;
+            ``2.0`` moves the arm twice as far as the hand, which helps cover
+            the robot's full reach when the arm is longer than the operator's.
+            Applied to both the end-effector and elbow position deltas so the
+            arm posture scales coherently.  Defaults to ``1.0``.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -117,3 +124,4 @@ class VRTeleopConfig:
     ik_alpha: float = 0.5
     pose_min_cutoff: float = 1.5
     pose_beta: float = 5.0
+    position_multiplier: float = 1.0

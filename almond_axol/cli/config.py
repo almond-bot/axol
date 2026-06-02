@@ -48,6 +48,7 @@ import numpy as np
 
 from ..robot.config import AxolConfig
 from ..shared import CAN_LEFT, CAN_RIGHT
+from ..teleop.config import VRTeleopConfig
 
 T = TypeVar("T")
 
@@ -369,10 +370,13 @@ class TeleopCmdConfig:
     blend live on the nested ``axol`` config — override them via
     ``--axol.left.gripper.torque_limit`` and ``--axol.left_stiffness``.
     Disable an arm with ``--left_channel null`` / ``--right_channel null``.
+    Teleop session parameters (e.g. the position multiplier) live on the
+    nested ``teleop`` config — e.g. ``--teleop.position_multiplier 2.0``.
     """
 
     sim: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
+    teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     log_level: LogLevel = "INFO"
