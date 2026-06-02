@@ -181,6 +181,7 @@ async def _execute(
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``tune.repeatability`` subcommand."""
     p = subparsers.add_parser(
         "tune.repeatability",
         help="Drive between rest pose and a crossed-arms tips-touching pose.",
@@ -234,6 +235,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run the repeatability test (rest ↔ touch cycles)."""
     logging.basicConfig(level=getattr(logging, args.log_level))
     try:
         asyncio.run(_run(args))

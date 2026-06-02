@@ -18,6 +18,7 @@ from ...motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``motor.set-can-id`` subcommand."""
     p = subparsers.add_parser(
         "motor.set-can-id",
         help="Change the CAN ID of a motor and persist it to flash.",
@@ -51,6 +52,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Change a motor's CAN ID and persist it to flash."""
     asyncio.run(_run(args))
 
 

@@ -23,6 +23,7 @@ from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``motor.set-zero-pos`` subcommand."""
     p = subparsers.add_parser(
         "motor.set-zero-pos",
         help="Set the zero position of a motor to its current position.",
@@ -54,6 +55,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Set a motor's zero position (single ``--id`` or ``--guided`` mode)."""
     asyncio.run(_run(args))
 
 

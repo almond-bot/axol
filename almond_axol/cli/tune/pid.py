@@ -132,6 +132,11 @@ async def run_sine(
     fv: float = 0.0,
     fo: float = 0.0,
 ) -> tuple[list[dict], float]:
+    """Track a sine reference on ``joint`` and log target/actual error.
+
+    Returns the per-sample log and the amplitude actually used (clamped
+    to the joint's headroom).
+    """
     test_motor = motors[joint]
     lo, hi = arm_limits(joint, is_left)
     center = _sine_center(joint, is_left)
@@ -206,6 +211,11 @@ async def run_step(
     fv: float = 0.0,
     fo: float = 0.0,
 ) -> tuple[list[dict], float]:
+    """Drive a step on ``joint`` and log the step-response error.
+
+    Returns the per-sample log and the amplitude actually used (clamped
+    to the joint's safe headroom).
+    """
     test_motor = motors[joint]
     current = await test_motor.get_position()
     lo, hi = arm_limits(joint, is_left)
@@ -358,6 +368,7 @@ def _print_stats_step(log: list[dict], amp: float, kp: float, kd: float) -> None
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``tune.pid`` subcommand."""
     p = subparsers.add_parser(
         "tune.pid",
         help="Tune Kp/Kd for a single Axol joint.",
@@ -415,6 +426,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run the PID tuning session for the selected joint."""
     asyncio.run(_run(args))
 
 

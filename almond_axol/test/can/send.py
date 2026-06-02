@@ -111,6 +111,8 @@ async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> Non
 
 @dataclass
 class _SendSnapshot:
+    """Latest per-arm cycling state shared with the side-by-side display renderer."""
+
     side: str
     hz: int
     log_file: str
@@ -237,10 +239,9 @@ async def _run(
 
     try:
         async with CanBus(channel) as bus:
-            # ``resolved()`` bakes in the default stiffness blend (now applied
-            # at the ``Axol`` construction boundary rather than in
-            # ``AxolConfig.__post_init__``), so this directly-built arm keeps
-            # the same gains it had before the stiffness refactor.
+            # ``resolved()`` applies the default stiffness blend (done at the
+            # ``Axol`` construction boundary) so this directly-built arm gets
+            # the same gains Axol would.
             cfg = AxolConfig().resolved()
             arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
 
@@ -359,7 +360,6 @@ async def _run(
                         print("\n".join(lines), end="", flush=True)
                         last_display = now
 
-                    # Log per-cycle timing to file every 10 seconds.
                     if now - last_stat_log >= 10.0:
                         elapsed_total = now - t_start
                         log.info(
@@ -427,6 +427,7 @@ async def _run(
 
 
 def main() -> None:
+    """Parse CLI arguments and cycle the selected joint on one or both arms."""
     valid_joints = [j.value for j in Joint]
     parser = argparse.ArgumentParser(
         description="Cycle one joint through its limits via motion control."

@@ -48,6 +48,7 @@ _APT_PACKAGES = {
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``zed.sync-clocks`` subcommand."""
     p = subparsers.add_parser(
         "zed.sync-clocks",
         help=(
@@ -98,6 +99,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run the PTP clock-sync daemons for this machine's role."""
     logging.basicConfig(level=getattr(logging, args.log_level))
     try:
         _run(

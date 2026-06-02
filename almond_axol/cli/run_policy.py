@@ -95,6 +95,7 @@ class RunPolicyConfig:
 
 
 def main(argv: list[str]) -> None:
+    """Parse the CLI config and run the policy, exiting cleanly on hardware faults."""
     cfg = parse(RunPolicyConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level))
 
@@ -538,6 +539,7 @@ def _build_axol_robot_client(
                     time.sleep(self.config.environment_dt)
 
         def stop(self) -> None:  # type: ignore[override]
+            """Tear down the gRPC channel; the shared robot stays connected."""
             self.shutdown_event.set()
             try:
                 self.channel.close()
@@ -560,6 +562,7 @@ def _build_axol_robot_client(
 
 
 def _run(cfg: RunPolicyConfig) -> None:
+    """Drive the full run-policy session: spawn the policy server, connect the robot, and run episodes."""
     import multiprocessing as mp
     import shutil
     from pathlib import Path

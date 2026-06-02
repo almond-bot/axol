@@ -67,6 +67,7 @@ async def _run(no_left: bool, no_right: bool) -> None:
 
 
 def main() -> None:
+    """Parse CLI arguments and run the homing routine."""
     parser = argparse.ArgumentParser(
         description="Enable Axol and bring all joints to zero."
     )

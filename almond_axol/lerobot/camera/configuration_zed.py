@@ -1,3 +1,5 @@
+"""Configuration dataclass for the ZED stream-receiver camera."""
+
 from dataclasses import dataclass
 
 from lerobot.cameras.configs import CameraConfig, ColorMode

@@ -16,6 +16,7 @@ _VALID_RESOLUTIONS = ["HD1080", "HD1200", "SVGA"]
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``zed.stream`` subcommand."""
     p = subparsers.add_parser(
         "zed.stream", help="Stream ZED-X One cameras over the local network."
     )
@@ -76,6 +77,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(args: argparse.Namespace) -> None:
+    """Validate the camera selection and stream the chosen ZED cameras."""
     if args.overhead is None and args.left_arm is None and args.right_arm is None:
         raise SystemExit(
             "error: at least one of --overhead, --left-arm, --right-arm must be provided"

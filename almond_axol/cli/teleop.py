@@ -50,6 +50,7 @@ def _normalize_sim_flag(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str]) -> None:
+    """Parse the CLI config and run a VR teleop session."""
     cfg = parse(TeleopCmdConfig, _normalize_sim_flag(argv))
     logging.basicConfig(level=getattr(logging, cfg.log_level))
 

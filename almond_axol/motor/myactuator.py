@@ -78,15 +78,18 @@ _MA_ERROR_MAP: list[tuple[int, MotorStatus]] = [
 
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
+    """Encode a clamped float into a fixed-point uint for the MIT protocol byte layout."""
     x = max(x_min, min(x_max, x))
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 
 
 def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
+    """Decode a fixed-point uint from the MIT protocol byte layout back into a float."""
     return float(x_int) * (x_max - x_min) / ((1 << bits) - 1) + x_min
 
 
 def _ma_error_to_status(error_code: int) -> MotorStatus:
+    """Map a MyActuator status-1 error bitmask to a MotorStatus (first match by severity)."""
     if error_code == 0:
         return MotorStatus.OK
     for bit, status in _MA_ERROR_MAP:
@@ -99,6 +102,14 @@ class MyActuatorMotor(MotorDriver):
     """MotorDriver implementation for MyActuator RMD motors using the 0x140-series protocol."""
 
     def __init__(self, bus: CanBus, motor_id: int, kt: float) -> None:
+        """Construct a MyActuator driver.
+
+        Args:
+            bus:      Shared CAN bus.
+            motor_id: Motor CAN ID; request/response arbitration IDs are derived
+                      from it (0x140/0x240/0x400/0x500 + motor_id).
+            kt:       Torque constant (Nm/A) used to convert current to torque.
+        """
         self._bus = bus
         self._motor_id = motor_id
         self._kt = kt

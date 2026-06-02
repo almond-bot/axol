@@ -210,7 +210,6 @@ class VRTeleop:
         child_conn.close()
         self._ik_process = process
 
-        # Receive ready message: (q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, parent_conn.recv)
         assert isinstance(msg, tuple) and msg[0] == "ready"

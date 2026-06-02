@@ -207,6 +207,7 @@ def _register_cron() -> None:
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``can.setup`` subcommand."""
     subparsers.add_parser(
         "can.setup",
         help="Configure CAN interfaces for the Axol arm.",
@@ -220,6 +221,7 @@ def _bring_up_can() -> None:
 
 
 def run(_args: object = None) -> None:
+    """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     serial = _find_serial()
     _write_udev_rules(serial)
     _reload_udev()

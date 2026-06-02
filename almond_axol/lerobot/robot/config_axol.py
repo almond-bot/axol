@@ -1,3 +1,5 @@
+"""Configuration dataclass for the Axol dual-arm robot as a LeRobot Robot."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

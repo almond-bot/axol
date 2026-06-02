@@ -41,6 +41,8 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _ArmSnapshot:
+    """Latest per-arm state shared with the side-by-side display renderer."""
+
     side: str
     hz: int
     log_file: str
@@ -206,10 +208,9 @@ async def _run(
 
     try:
         async with CanBus(channel) as bus:
-            # ``resolved()`` bakes in the default stiffness blend (now applied
-            # at the ``Axol`` construction boundary rather than in
-            # ``AxolConfig.__post_init__``), so this directly-built arm keeps
-            # the same gains it had before the stiffness refactor.
+            # ``resolved()`` applies the default stiffness blend (done at the
+            # ``Axol`` construction boundary) so this directly-built arm gets
+            # the same gains Axol would.
             cfg = AxolConfig().resolved()
             arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
 
@@ -336,6 +337,7 @@ async def _run(
 
 
 def main() -> None:
+    """Parse CLI arguments and run the live position display for one or both arms."""
     parser = argparse.ArgumentParser(description="Live motor position display")
     side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Monitor left arm")

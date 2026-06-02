@@ -58,6 +58,7 @@ def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
 
 
 def main(argv: list[str]) -> None:
+    """Parse the CLI config and run gravity-compensation mode."""
     cfg = parse(GravityCompCmdConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level))
     try:

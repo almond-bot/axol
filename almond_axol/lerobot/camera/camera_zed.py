@@ -114,7 +114,6 @@ class ZedCamera(Camera):
 
         self.zed = zed
 
-        # Read actual resolution and FPS from the stream and validate against config
         info = zed.get_camera_information()
         params = info.camera_configuration.resolution
         stream_fps = int(info.camera_configuration.fps)
@@ -240,8 +239,7 @@ class ZedCamera(Camera):
                 err = self.zed.grab()
                 if err != sl.ERROR_CODE.SUCCESS:
                     grab_failure_streak += 1
-                    # Throttled WARN so silent freezes are visible at INFO
-                    # level; previously this was DEBUG-only and got swallowed.
+                    # Throttled WARN so silent freezes are visible at INFO level.
                     now = time.perf_counter()
                     if now - last_grab_warning_perf >= 1.0:
                         _logger.warning(

@@ -19,6 +19,7 @@ from ...motor.motor import make_driver
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``motor.info`` subcommand."""
     p = subparsers.add_parser(
         "motor.info",
         help="Read status from a motor to verify it is reachable.",
@@ -45,6 +46,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Read and print one motor's status."""
     asyncio.run(_run(args))
 
 

@@ -257,6 +257,7 @@ class _CaptureThread(threading.Thread):
 
 
 def main(argv: list[str]) -> None:
+    """Parse the CLI config and run a data-collection session."""
     cfg = parse(CollectDataConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level))
     _run(cfg)

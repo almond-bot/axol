@@ -34,6 +34,7 @@ def _dispatch_draccus(command: str, argv: list[str]) -> None:
 
 
 def main() -> None:
+    """Dispatch ``axol <command>`` to the matching CLI handler."""
     argv = sys.argv[1:]
     if argv and argv[0] in _DRACCUS_COMMANDS:
         _dispatch_draccus(argv[0], argv[1:])

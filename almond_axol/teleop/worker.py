@@ -29,6 +29,7 @@ from .trajectory import plan_collision_aware_trajectory
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Convert an ``(x, y, z, w)`` quaternion to a 3x3 rotation matrix (float32)."""
     x, y, z, w = float(qx), float(qy), float(qz), float(qw)
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
@@ -223,7 +224,6 @@ class IKWorker:
         )
         rq = rq / np.linalg.norm(rq)
 
-        # Convert filtered poses to FLU — pure numpy
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
         right_pos, right_rot = _vr_to_flu_np(*rp, *rq)
 
@@ -243,7 +243,6 @@ class IKWorker:
             )
             return q_current
 
-        # Relative targets — pure numpy
         tl_pos, tl_rot = _relative_target_np(
             left_pos,
             left_rot,
@@ -371,6 +370,11 @@ class IKWorker:
         right_e: np.ndarray,
         q_current: np.ndarray,
     ) -> None:
+        """Snapshot controller and FK poses at deadman engage.
+
+        These snapshots become the origin against which subsequent controller
+        motion is measured to build relative EE and elbow targets in :meth:`step`.
+        """
         fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
 
         def _fk_pos_rot(idx: int) -> tuple[np.ndarray, np.ndarray]:

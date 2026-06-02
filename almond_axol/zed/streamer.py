@@ -38,6 +38,8 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _CameraState:
+    """Per-camera runtime state: SDK handle, grab thread, and stop signal."""
+
     name: str
     serial: int
     port: int
