@@ -1,76 +1,114 @@
 ---
 title: "Teleoperation Quickstart"
-description: "From a fresh clone to a live VR teleoperation session in five steps."
+description: "From a fresh clone to a live VR teleoperation session — on real hardware or in sim."
 ---
 
-From a fresh clone to a live teleoperation session in five steps.
+From a fresh clone to a live teleoperation session. Pick your path — drive the **real Axol robot**, or the **software simulator** with no hardware required. Both are driven from the VR headset; the simulator just swaps the motors for a browser visualizer.
 
-<Steps>
-  <Step title="Install">
-    Install the package using `uv`. The `sim` extra is optional — add it if you want to test with the software visualizer before touching hardware.
+<Tabs>
+  <Tab title="Real Axol robot">
+    <Steps>
+      <Step title="Install">
+        Install the package using `uv`, then activate the virtual environment so the `axol` CLI is on your path:
 
-    ```bash
-    uv sync              # hardware only
-    uv sync --extra sim  # + software visualizer
-    ```
+        ```bash
+        uv sync
+        source .venv/bin/activate
+        ```
 
-    Then activate the virtual environment so the `axol` CLI is on your path:
+        <Tip>
+          You will need to activate in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+        </Tip>
+      </Step>
 
-    ```bash
-    source .venv/bin/activate
-    ```
+      <Step title="Set up CAN (one-time)">
+        Plug in the Axol Hub, then run the one-time CAN setup. This writes udev rules, assigns fixed interface names, and registers a startup script so the interfaces come up automatically on every reboot.
 
-    <Tip>
-      You will need to do this in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
-    </Tip>
-  </Step>
+        ```bash
+        axol can.setup
+        ```
 
-  <Step title="Set up CAN (one-time)">
-    Plug in the Axol Hub, then run the one-time CAN setup. This writes udev rules, assigns fixed interface names, and registers a startup script so the interfaces come up automatically on every reboot.
+        <Note>
+          `sudo` is invoked automatically. You will not need to run this again unless you reinstall the OS or swap the Axol Hub.
+        </Note>
 
-    ```bash
-    axol can.setup
-    ```
+        After any subsequent replug mid-session (without a reboot), bring the interfaces back up with:
 
-    <Note>
-      `sudo` is invoked automatically. You will not need to run this again unless you reinstall the OS or swap the Axol Hub.
-    </Note>
+        ```bash
+        axol can.enable
+        ```
+      </Step>
 
-    After any subsequent replug mid-session (without a reboot), bring the interfaces back up with:
+      <Step title="Verify motors">
+        With the robot powered on and CAN up, read a status snapshot from one motor to confirm communication is working:
 
-    ```bash
-    axol can.enable
-    ```
-  </Step>
+        ```bash
+        axol motor.info --l --id 0x01   # left shoulder_1
+        axol motor.info --r --id 0x01   # right shoulder_1
+        ```
 
-  <Step title="Verify motors">
-    With the robot powered on and CAN up, read a status snapshot from one motor to confirm communication is working:
+        You should see position, velocity, torque, temperature, and voltage. Any `DISABLED` or error status means power or CAN isn't reaching that motor.
+      </Step>
 
-    ```bash
-    axol motor.info --l --id 0x01   # left shoulder_1
-    axol motor.info --r --id 0x01   # right shoulder_1
-    ```
+      <Step title="Accept the TLS certificate">
+        The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
 
-    You should see position, velocity, torque, temperature, and voltage. Any `DISABLED` or error status means power or CAN isn't reaching that motor.
-  </Step>
+        1. Start `axol teleop` briefly (see the next step) — it will print your hostname and IP.
+        2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
+        3. Proceed past the security warning.
+        4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
+      </Step>
 
-  <Step title="Accept the TLS certificate">
-    The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
+      <Step title="Teleop">
+        ```bash
+        axol teleop
+        ```
 
-    1. Start `axol teleop` briefly (see the next step) — it will print your hostname and IP.
-    2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
-    3. Proceed past the security warning.
-    4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
-  </Step>
+        The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect.
+      </Step>
+    </Steps>
+  </Tab>
 
-  <Step title="Teleop">
-    ```bash
-    axol teleop
-    ```
+  <Tab title="Simulator">
+    <Steps>
+      <Step title="Install">
+        Add the `sim` extra for the browser visualizer, then activate the virtual environment:
 
-    The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect.
-  </Step>
-</Steps>
+        ```bash
+        uv sync --extra sim
+        source .venv/bin/activate
+        ```
+
+        <Tip>
+          You will need to activate in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol teleop --sim`) to skip activation.
+        </Tip>
+
+        <Note>
+          No CAN setup or motor verification is needed in sim — there's no hardware to talk to.
+        </Note>
+      </Step>
+
+      <Step title="Accept the TLS certificate">
+        The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
+
+        1. Start `axol teleop --sim` briefly (see the next step) — it will print your hostname and IP.
+        2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
+        3. Proceed past the security warning.
+        4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
+      </Step>
+
+      <Step title="Teleop in sim">
+        ```bash
+        axol teleop --sim
+        ```
+
+        Opens a browser visualizer at [http://localhost:8080](http://localhost:8080) and runs the same VR server on port 8000 — drive the simulated robot from the headset exactly like the real one. Great for verifying network connectivity and VR tracking before powering the robot.
+      </Step>
+    </Steps>
+  </Tab>
+</Tabs>
+
+See the [`teleop`](/cli/teleop) CLI reference for the full flag list (stiffness, gripper limits, per-joint gains, config files).
 
 ## Controller layout
 
@@ -88,16 +126,6 @@ From a fresh clone to a live teleoperation session in five steps.
 <Note>
   Grip is a toggle, not a hold. Press both grips together to start moving the arms; press either grip on its own to freeze them.
 </Note>
-
-## Test without hardware
-
-```bash
-axol teleop --sim
-```
-
-Opens a browser visualizer at `http://localhost:8080` instead of commanding real motors. Useful for verifying network connectivity and VR tracking before powering the robot.
-
-See the [`teleop`](/cli/teleop) CLI reference for the full flag list.
 
 ## Network tip
 
