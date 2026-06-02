@@ -1,0 +1,26 @@
+---
+title: "zed.stream"
+description: "Stream ZED-X One cameras over the local network with HEVC encoding."
+---
+
+Streams ZED-X One cameras over the local network using HEVC encoding. At least one camera must be specified. Streams until `Ctrl+C`. Sender IP is `192.168.10.1/24`.
+
+| Flag | Description |
+|---|---|
+| `--overhead SERIAL` | Serial number of the overhead camera |
+| `--left-arm SERIAL` | Serial number of the left-arm camera |
+| `--right-arm SERIAL` | Serial number of the right-arm camera |
+| `--resolution {HD1080,HD1200,SVGA}` | Default: `SVGA` |
+| `--fps FPS` | Default: 60 |
+| `--bitrate KBPS` | HEVC bitrate in kbit/s (default: 8000) |
+| `--setup-ip IFACE` | Assign sender IP to a network interface before streaming (e.g. `eth0`); requires `sudo` |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol zed.stream --overhead 12345678 --left-arm 23456789 --right-arm 34567890
+axol zed.stream --overhead 12345678 --resolution SVGA --fps 30 --bitrate 4000
+```
+
+<Note>
+  `zed.stream` runs on the ZED box (Jetson sender). The receiving process — [`collect-data`](/cli/collect-data) or [`run-policy`](/cli/run-policy) — runs on the main host. See the [Data Collection](/quickstart/data-collection) and [Policy Inference](/quickstart/inference) quickstarts for the full two-machine setup.
+</Note>

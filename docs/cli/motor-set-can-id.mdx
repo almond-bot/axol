@@ -1,0 +1,16 @@
+---
+title: "motor.set-can-id"
+description: "Change a motor's CAN ID and persist it to flash."
+---
+
+Changes a motor's CAN ID and persists it to flash. The motor must be the only device on the bus or its current ID must be known. `--type` is required here.
+
+| Flag | Description |
+|---|---|
+| `--current-id ID` | Current CAN ID |
+| `--new-id ID` | New CAN ID to assign |
+| `--type {myactuator,damiao}` | Motor type (required) |
+
+```bash
+axol motor.set-can-id --l --current-id 0x01 --new-id 0x03 --type myactuator
+```

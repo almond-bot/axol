@@ -1,0 +1,73 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Axol",
+  "description": "Command-line interface and Python SDK for the Almond Axol dual-arm robot.",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#3CCFA0",
+    "dark": "#0A6E56"
+  },
+  "favicon": "/assets/axol.png",
+  "logo": {
+    "light": "/assets/axol.png",
+    "dark": "/assets/axol.png"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "index",
+          "installation"
+        ]
+      },
+      {
+        "group": "Quickstart",
+        "pages": [
+          "quickstart/teleop",
+          "quickstart/data-collection",
+          "quickstart/inference"
+        ]
+      },
+      {
+        "group": "CLI Reference",
+        "pages": [
+          "cli/can-setup",
+          "cli/can-enable",
+          "cli/motor-info",
+          "cli/motor-set-can-id",
+          "cli/motor-set-zero-pos",
+          "cli/teleop",
+          "cli/collect-data",
+          "cli/run-policy",
+          "cli/zed-stream",
+          "cli/zed-install",
+          "cli/zed-sync-clocks",
+          "cli/tune-pid",
+          "cli/tune-friction",
+          "cli/tune-repeatability",
+          "cli/gravity-comp"
+        ]
+      },
+      {
+        "group": "Python API",
+        "pages": [
+          "api/concepts",
+          "api/robot",
+          "api/kinematics",
+          "api/teleop",
+          "api/vr",
+          "api/zed",
+          "api/motor",
+          "api/lerobot"
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "website": "https://axol.almond.bot"
+    }
+  }
+}

@@ -1,0 +1,41 @@
+---
+title: "teleop"
+description: "Launch a VR teleoperation session on the robot or simulator."
+---
+
+Launches a VR teleoperation session. When started, the hostname (`.local`) and local IP address are printed — enter either of these in the VR app at [axol.almond.bot](https://axol.almond.bot) to connect.
+
+<Tip>
+  For a guided, step-by-step walkthrough including the VR controller layout, see the [Teleoperation quickstart](/quickstart/teleop).
+</Tip>
+
+<Warning>
+  **Before opening the VR app**, accept the self-signed HTTPS certificate in the VR browser by navigating to `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceeding past the security warning.
+</Warning>
+
+<Note>
+  **Network tip:** If VR tracking feels jittery or packets arrive in bursts, configure the following on your router/access point:
+  - **DTIM interval** → `1`
+  - **Beacon interval** → `100` ms
+  - **WMM APSD (U-APSD)** → disabled
+
+  These settings prevent the AP from buffering packets between beacon intervals, which causes intermittent delivery delays that are especially noticeable for latency-sensitive VR traffic.
+</Note>
+
+| Flag | Description |
+|---|---|
+| `--sim` | Use the software visualizer instead of the real robot. Omit to run on real hardware (the default). |
+| `--no-left` | Disable the left arm |
+| `--no-right` | Disable the right arm |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 0.5) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol teleop
+axol teleop --sim --no-right
+axol teleop --left-stiffness 1.0 --right-stiffness 1.0
+axol teleop --left-stiffness 0.8,0.8,0.5,0.5,0.2,0.2,0.0
+```

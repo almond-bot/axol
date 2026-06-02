@@ -1,0 +1,55 @@
+---
+title: "almond_axol.kinematics"
+description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
+---
+
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first call takes a few seconds; subsequent calls are fast.
+
+```python
+from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
+```
+
+```python
+import numpy as np
+from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
+
+solver = KinematicsSolver(KinematicsConfig(pos_weight=100.0))
+q = np.zeros(solver.num_joints, dtype=np.float32)
+
+# Forward kinematics → (left_SE3, right_SE3) as jaxlie.SE3
+left_se3, right_se3 = solver.fk(q)
+
+# Inverse kinematics → new joint array
+pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
+rot = np.eye(3, dtype=np.float32)
+q = solver.ik(q, left_pose=(pos, rot))
+```
+
+## `KinematicsSolver` interface
+
+| Member | Description |
+|---|---|
+| `num_joints` | Total actuated joints across both arms |
+| `joint_names` | Joint name strings (left arm then right) |
+| `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
+| `fk(q)` | Forward kinematics → `(left_SE3, right_SE3)` |
+| `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
+| `set_posture_pose(q)` | Set the null-space attractor (home pose for joint drift prevention) |
+
+## `KinematicsConfig` fields
+
+| Field | Default | Description |
+|---|---|---|
+| `pos_weight` | `50.0` | End-effector position tracking weight |
+| `ori_weight` | `10.0` | End-effector orientation tracking weight |
+| `elbow_weight` | `5.0` | Elbow hint tracking weight |
+| `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
+| `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
+| `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
+| `limit_weight` | `75.0` | Joint limit penalty weight |
+| `self_collision_margin` | `0.1` m | Minimum clearance between collision bodies |
+| `self_collision_weight` | `75.0` | Self-collision penalty weight |
+| `max_iterations` | `8` | Solver iterations per `ik()` call |
+| `cost_tolerance` | `1e-2` | Convergence tolerance |
+| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call |
+| `max_reach` | `0.8` m | EE target clamped to this distance from shoulder |

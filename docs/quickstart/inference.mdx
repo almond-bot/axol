@@ -1,0 +1,112 @@
+---
+title: "Policy Inference Quickstart"
+description: "Run a trained policy autonomously across the main host and ZED box."
+---
+
+Policy inference runs across **two machines** connected by a direct ethernet link, exactly like [data collection](/quickstart/data-collection):
+
+- **Main host** (the upper computer) — runs the policy server and the autonomous control loop.
+- **ZED box** (the Jetson sender) — streams the three ZED-X One cameras.
+
+Both machines must agree on the time (via PTP) so the camera observations fed to the policy are aligned with the joint state. Each machine runs **two long-lived processes**, each in its own terminal, that stay up for the entire rollout session.
+
+```mermaid
+flowchart LR
+  subgraph zedbox [ZED box / Jetson]
+    slave["zed.sync-clocks --role slave"]
+    stream["zed.stream (3 cameras)"]
+  end
+  subgraph mainhost [Main host / upper computer]
+    master["zed.sync-clocks --role master"]
+    proc["run-policy"]
+  end
+  slave -->|PTP over eth0| master
+  stream -->|HEVC over 192.168.10.x| proc
+```
+
+<Warning>
+  Start the clock-sync daemon on **both** machines before launching `run-policy`. If PTP isn't running, the receiver's capture/decode skew check in `ZedCamera.connect()` warns and the observations sent to the policy will not be time-aligned with joint state. See [`zed.sync-clocks`](/cli/zed-sync-clocks).
+</Warning>
+
+## Prerequisites
+
+- The `lerobot` extra installed on the main host. For GPU inference also add the `cuda` extra: `uv sync --extra lerobot --extra cuda` (see [Installation](/installation)).
+- A trained checkpoint (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …).
+- CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
+- `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.
+- A direct ethernet link between the two machines (e.g. `eth0` on each).
+
+## ZED box (Jetson)
+
+Open two terminals on the ZED box.
+
+<Steps>
+  <Step title="Start clock sync (slave)">
+    ```bash
+    axol zed.sync-clocks --role slave --iface eth0
+    ```
+
+    Leave this running for the whole session.
+  </Step>
+
+  <Step title="Stream the cameras">
+    ```bash
+    axol zed.stream \
+        --overhead 12345678 \
+        --left-arm 23456789 \
+        --right-arm 34567890 \
+        --setup-ip eth0
+    ```
+
+    Use the **same** `--resolution` and `--fps` the policy was trained on so the `ZedCamera` validation on the main host passes. See [`zed.stream`](/cli/zed-stream).
+  </Step>
+</Steps>
+
+## Main host (upper computer)
+
+Open two terminals on the main host.
+
+<Steps>
+  <Step title="Start clock sync (master)">
+    ```bash
+    axol zed.sync-clocks --role master --iface eth0
+    ```
+
+    Leave it running for the whole session.
+  </Step>
+
+  <Step title="Run the policy">
+    ```bash
+    axol run-policy \
+        --policy myorg/pick-place-policy \
+        --policy-type act \
+        --task "Pick the red cube" \
+        --zed-iface eth0
+    ```
+
+    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. `--fps` must match the rate the policy was trained on. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving flags.
+  </Step>
+</Steps>
+
+## Controlling a rollout
+
+While `run-policy` runs, control the episode from stdin in the `run-policy` terminal:
+
+| Key | Action |
+|---|---|
+| `s` | Save the rollout and end the episode |
+| `r` | Discard and re-record |
+| `q` | Discard and quit |
+
+`--episode-time-s` is a safety cap (default 120 s) that falls back to the same `[Enter]=save / r / q` prompt if no key is pressed. If `--repo-id` is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Data Collection" icon="record-vinyl" href="/quickstart/data-collection">
+    Record more episodes to improve the policy.
+  </Card>
+  <Card title="run-policy reference" icon="terminal" href="/cli/run-policy">
+    Every flag, aggregation strategy, and threading detail.
+  </Card>
+</CardGroup>

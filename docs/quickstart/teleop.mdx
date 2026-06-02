@@ -1,0 +1,123 @@
+---
+title: "Teleoperation Quickstart"
+description: "From a fresh clone to a live VR teleoperation session in five steps."
+---
+
+From a fresh clone to a live teleoperation session in five steps.
+
+<Steps>
+  <Step title="Install">
+    Install the package using `uv`. The `sim` extra is optional — add it if you want to test with the software visualizer before touching hardware.
+
+    ```bash
+    uv sync              # hardware only
+    uv sync --extra sim  # + software visualizer
+    ```
+
+    Then activate the virtual environment so the `axol` CLI is on your path:
+
+    ```bash
+    source .venv/bin/activate
+    ```
+
+    <Tip>
+      You will need to do this in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+    </Tip>
+  </Step>
+
+  <Step title="Set up CAN (one-time)">
+    Plug in the Axol Hub, then run the one-time CAN setup. This writes udev rules, assigns fixed interface names, and registers a startup script so the interfaces come up automatically on every reboot.
+
+    ```bash
+    axol can.setup
+    ```
+
+    <Note>
+      `sudo` is invoked automatically. You will not need to run this again unless you reinstall the OS or swap the Axol Hub.
+    </Note>
+
+    After any subsequent replug mid-session (without a reboot), bring the interfaces back up with:
+
+    ```bash
+    axol can.enable
+    ```
+  </Step>
+
+  <Step title="Verify motors">
+    With the robot powered on and CAN up, read a status snapshot from one motor to confirm communication is working:
+
+    ```bash
+    axol motor.info --l --id 0x01   # left shoulder_1
+    axol motor.info --r --id 0x01   # right shoulder_1
+    ```
+
+    You should see position, velocity, torque, temperature, and voltage. Any `DISABLED` or error status means power or CAN isn't reaching that motor.
+  </Step>
+
+  <Step title="Accept the TLS certificate">
+    The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
+
+    1. Start `axol teleop` briefly (see the next step) — it will print your hostname and IP.
+    2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
+    3. Proceed past the security warning.
+    4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
+  </Step>
+
+  <Step title="Teleop">
+    ```bash
+    axol teleop
+    ```
+
+    The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect.
+  </Step>
+</Steps>
+
+## Controller layout
+
+<img src="/assets/quest.png" alt="Quest controller diagram" />
+
+| # | Button | Action |
+|---|---|---|
+| 1 | Left grip | Press both 1 + 2 to **enable** arm movement; press either alone to **disable** |
+| 2 | Right grip | Same as above |
+| 3 | Left trigger | Actuate left gripper |
+| 4 | Right trigger | Actuate right gripper |
+| 5 | X | **Reset** — returns both arms to the rest pose |
+| 7 | Y | **Exit AR** — closes the VR session |
+
+<Note>
+  Grip is a toggle, not a hold. Press both grips together to start moving the arms; press either grip on its own to freeze them.
+</Note>
+
+## Test without hardware
+
+```bash
+axol teleop --sim
+```
+
+Opens a browser visualizer at `http://localhost:8080` instead of commanding real motors. Useful for verifying network connectivity and VR tracking before powering the robot.
+
+See the [`teleop`](/cli/teleop) CLI reference for the full flag list.
+
+## Network tip
+
+If VR tracking feels jittery or arrives in bursts, configure the following on your router or access point:
+
+| Setting | Value |
+|---|---|
+| DTIM interval | `1` |
+| Beacon interval | `100` ms |
+| WMM APSD (U-APSD) | disabled |
+
+These prevent the AP from batching packets between beacon intervals, which causes intermittent latency spikes that are especially noticeable in VR.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Data Collection" icon="record-vinyl" href="/quickstart/data-collection">
+    Record teleoperation episodes to a LeRobot dataset.
+  </Card>
+  <Card title="Policy Inference" icon="robot" href="/quickstart/inference">
+    Run a trained policy autonomously.
+  </Card>
+</CardGroup>

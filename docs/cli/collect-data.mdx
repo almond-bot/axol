@@ -1,0 +1,48 @@
+---
+title: "collect-data"
+description: "Record teleoperation episodes to a LeRobot-format dataset."
+---
+
+Records teleoperation episodes using VR controller inputs and three ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
+
+<Tip>
+  Data collection runs across two machines (main host + ZED box). For the end-to-end two-machine workflow, see the [Data Collection quickstart](/quickstart/data-collection).
+</Tip>
+
+| Flag | Description |
+|---|---|
+| `--repo-id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
+| `--task TEXT` | Natural language task description (required) |
+| `--fps INT` | Dataset recording frame rate — camera frames captured at this rate (default: 60) |
+| `--teleop-hz INT` | Motor command rate in Hz; decoupled from `--fps` for smooth control (default: 120) |
+| `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
+| `--push-to-hub` | Push to HuggingFace Hub when done |
+| `--zed-host IP` | IP address of the ZED camera streamer (default: `192.168.10.1`) |
+| `--zed-iface IFACE` | Network interface to configure for the ZED link (e.g. `eth0`); assigns `192.168.10.2/24`, requires `sudo` |
+| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5) |
+| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 0.5) |
+| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
+| `--rerun-ip IP` | IP of a Rerun viewer on your local machine for live visualization |
+| `--rerun-port INT` | Rerun viewer port (default: 9876); only used when `--rerun-ip` is set |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube and place it in the bin"
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --fps 30 --zed-iface eth0
+axol collect-data --repo-id myorg/pick-place --task "Pick the red cube" --left-stiffness 1.0 --right-stiffness 1.0
+```
+
+## VR controller events
+
+| Event | Action |
+|---|---|
+| `START_RECORDING` | Begin capturing frames |
+| `TERMINATE_EPISODE` | Save the episode; headset enters `Saving` state until write completes |
+| `RERECORD_EPISODE` | Discard and retry |
+
+After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off; conversely, if no episodes were saved before exit the empty dataset directory is removed on shutdown so an aborted session does not leave a half-initialized dataset on disk.
+
+<Info>
+  Dataset frame capture runs on a dedicated thread decoupled from the teleop control loop. Teleop ticks at `--teleop-hz` and only ever touches joint state; the capture thread ticks at `--fps`, blocks on `ZedCamera.read_at_or_after(T_n)` per camera so every recorded frame is sender-clock-aligned with the joint sample taken at `T_n`, and writes the dataset row. This keeps camera reads, image conversion, and `dataset.add_frame()` off the hot control loop, and produces datasets whose camera/joint pairing matches the sender's exposure timeline rather than the receiver's decode timeline. Both clocks must agree — make sure [`zed.sync-clocks`](/cli/zed-sync-clocks) is running on both machines.
+</Info>

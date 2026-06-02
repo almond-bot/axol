@@ -1,0 +1,26 @@
+---
+title: "tune.friction"
+description: "Identify the friction-model parameters for one joint via a velocity sweep."
+---
+
+Identifies the four friction-model parameters for one joint via a bidirectional velocity sweep. Gravity is computed centrally from the URDF (see [Gravity compensation](/cli/gravity-comp)), so this command only fits the friction half-difference and a constant offset.
+
+**Friction model:** `τ = Fc·tanh(0.1·k·v) + Fv·v + Fo`
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Arm side (required) |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
+| `--kp FLOAT` | Proportional gain (default: from `AxolConfig`) |
+| `--kd FLOAT` | Derivative gain (default: from `AxolConfig`) |
+| `--velocities V [V ...]` | Velocity setpoints in rad/s (default: ~0.1, 0.3, 0.6, 0.9, 1.3) |
+| `--lo RAD` | Override lower joint limit for the sweep |
+| `--hi RAD` | Override upper joint limit for the sweep |
+| `--dump-csv [PATH]` | Write per-bin `(v, q, tau_fwd, tau_bwd, tau_avg, tau_halfdiff)` rows to a CSV for offline plotting / arm-vs-arm comparison. Pass without a value to auto-name as `logs/friction_<side>_<joint>_<timestamp>.csv` |
+
+```bash
+axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
+axol tune.friction --r --joint elbow --kp 20 --kd 0.6
+axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
+axol tune.friction --l --joint shoulder_2 --dump-csv
+```
