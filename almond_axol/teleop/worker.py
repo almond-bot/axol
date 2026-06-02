@@ -8,6 +8,7 @@ All intermediate computations stay in NumPy; the single JAX boundary is the
 
 from __future__ import annotations
 
+import math
 import multiprocessing
 import multiprocessing.connection
 import os
@@ -63,6 +64,38 @@ def _vr_to_flu_np(
     return pos, rot
 
 
+def _scale_rotation_np(R: np.ndarray, scale: float) -> np.ndarray:
+    """Scale the angle of a rotation matrix by ``scale`` (a power in SO(3)).
+
+    Converts ``R`` to axis-angle, multiplies the angle by ``scale``, and maps
+    back via Rodrigues' formula.  ``scale == 1.0`` and near-identity rotations
+    are short-circuited.
+    """
+    if scale == 1.0:
+        return R
+    cos_theta = max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) * 0.5))
+    theta = math.acos(cos_theta)
+    if theta < 1e-6:
+        return R
+    axis = np.array(
+        (R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]),
+        dtype=np.float64,
+    ) / (2.0 * math.sin(theta))
+    new_theta = theta * scale
+    k = np.array(
+        (
+            (0.0, -axis[2], axis[1]),
+            (axis[2], 0.0, -axis[0]),
+            (-axis[1], axis[0], 0.0),
+        ),
+        dtype=np.float64,
+    )
+    r_scaled = (
+        np.eye(3) + math.sin(new_theta) * k + (1.0 - math.cos(new_theta)) * (k @ k)
+    )
+    return r_scaled.astype(np.float32)
+
+
 def _relative_target_np(
     pos_curr: np.ndarray,
     rot_curr: np.ndarray,
@@ -71,11 +104,13 @@ def _relative_target_np(
     pos_snap_fk: np.ndarray,
     rot_snap_fk: np.ndarray,
     position_multiplier: float = 1.0,
+    rotation_multiplier: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3).
 
     ``position_multiplier`` scales only the translational displacement of the
-    controller relative to its engage snapshot; orientation is left untouched.
+    controller relative to its engage snapshot; ``rotation_multiplier`` scales
+    only the angle of its orientation displacement.
     """
     d = (rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)) * position_multiplier
     new_t = (
@@ -89,6 +124,7 @@ def _relative_target_np(
     R_delta[0, :] = (A[2, 2], -A[2, 1], A[2, 0])
     R_delta[1, :] = (-A[1, 2], A[1, 1], -A[1, 0])
     R_delta[2, :] = (A[0, 2], -A[0, 1], A[0, 0])
+    R_delta = _scale_rotation_np(R_delta, rotation_multiplier)
     return new_t.astype(np.float32), (rot_snap_fk @ R_delta).astype(np.float32)
 
 
@@ -249,12 +285,14 @@ class IKWorker:
             return q_current
 
         pos_mult = self._config.position_multiplier
+        rot_mult = self._config.rotation_multiplier
         tl_pos, tl_rot = _relative_target_np(
             left_pos,
             left_rot,
             *self._snap_ctrl["left"],
             *self._snap_fk["left"],
             position_multiplier=pos_mult,
+            rotation_multiplier=rot_mult,
         )
         tr_pos, tr_rot = _relative_target_np(
             right_pos,
@@ -262,6 +300,7 @@ class IKWorker:
             *self._snap_ctrl["right"],
             *self._snap_fk["right"],
             position_multiplier=pos_mult,
+            rotation_multiplier=rot_mult,
         )
 
         elbow_l = self._snap_elbow_fk["left"] + pos_mult * (

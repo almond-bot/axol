@@ -79,6 +79,12 @@ class VRTeleopConfig:
             the robot's full reach when the arm is longer than the operator's.
             Applied to both the end-effector and elbow position deltas so the
             arm posture scales coherently.  Defaults to ``1.0``.
+        rotation_multiplier: Scale factor applied to the controller's
+            **orientation** displacement (not position) when mapping hand
+            motion to the end-effector target.  The relative rotation of the
+            controller since engage is converted to axis-angle and its angle
+            is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
+            the end-effector twice as far as the wrist.  Defaults to ``1.0``.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -125,3 +131,4 @@ class VRTeleopConfig:
     pose_min_cutoff: float = 1.5
     pose_beta: float = 5.0
     position_multiplier: float = 1.0
+    rotation_multiplier: float = 1.0
