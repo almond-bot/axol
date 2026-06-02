@@ -18,7 +18,10 @@ class ZedCameraConfig(CameraConfig):
     (axol zed.stream defaults: SVGA @ 60 fps).
 
     Args:
-        host:       IP address of the ZedStreamer host (default 192.168.10.1).
+        host:       IP address of the ZedStreamer host. ``None`` (the default)
+                    inherits the shared ``AxolRobotConfig.zed_host`` when the
+                    camera is built as part of an Axol robot; set it explicitly
+                    to point a single camera at a different sender.
         port:       Streaming port matching the sender (default 30000).
         fps:        Expected stream FPS (default 60, matches zed.stream default).
         width:      Expected frame width in pixels (default 960, SVGA).
@@ -27,7 +30,7 @@ class ZedCameraConfig(CameraConfig):
         warmup_s:   Seconds to read frames during connect() before returning.
     """
 
-    host: str = "192.168.10.1"
+    host: str | None = None
     port: int = 30000
     fps: int | None = 60
     width: int | None = 960

@@ -27,7 +27,7 @@ axol teleop --axol.left_stiffness 0.8
 axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
 axol collect-data --repo_id myorg/pick --task "pick" \
     --robot_config.axol_config.left_stiffness 0.8 \
-    --robot_config.cameras.overhead.host 10.0.0.5
+    --robot_config.zed_host 10.0.0.5
 ```
 
 Any field you don't override keeps its default — overriding `--axol.left.elbow.kp` leaves every other per-joint gain at its tuned default.

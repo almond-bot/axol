@@ -5,7 +5,7 @@ commands expose their full configuration via draccus, so every nested
 field is reachable two ways:
 
 - Dotted CLI overrides, lerobot-style: ``--axol.left.elbow.kp 200``,
-  ``--robot_config.cameras.overhead.host 10.0.0.5``.
+  ``--robot_config.zed_host 10.0.0.5``.
 - A whole-config file: ``--config_path run.json`` (JSON or YAML), with
   CLI overrides layered on top.
 

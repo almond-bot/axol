@@ -48,16 +48,17 @@ _logger = logging.getLogger(__name__)
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for inference: three ZED streams.
 
-    Override any field from the CLI, e.g.
-    ``--robot_config.cameras.overhead.host 10.0.0.5`` or
+    All three cameras share one host (``--robot_config.zed_host``); override
+    other fields from the CLI too, e.g.
+    ``--robot_config.zed_host 10.0.0.5`` or
     ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
     used at data-collection time).
     """
     return AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(host="192.168.10.1", port=30000),
-            "left_arm": ZedCameraConfig(host="192.168.10.1", port=30002),
-            "right_arm": ZedCameraConfig(host="192.168.10.1", port=30004),
+            "overhead": ZedCameraConfig(port=30000),
+            "left_arm": ZedCameraConfig(port=30002),
+            "right_arm": ZedCameraConfig(port=30004),
         },
     )
 

@@ -20,10 +20,11 @@ from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
 from almond_axol.lerobot.camera import ZedCameraConfig
 
 config = AxolRobotConfig(
+    zed_host="192.168.10.1",  # shared by every camera below
     cameras={
-        "overhead":  ZedCameraConfig(host="192.168.10.1", port=30000),
-        "left_arm":  ZedCameraConfig(host="192.168.10.1", port=30002),
-        "right_arm": ZedCameraConfig(host="192.168.10.1", port=30004),
+        "overhead":  ZedCameraConfig(port=30000),
+        "left_arm":  ZedCameraConfig(port=30002),
+        "right_arm": ZedCameraConfig(port=30004),
     },
 )
 with AxolRobot(config) as robot:
@@ -37,6 +38,7 @@ with AxolRobot(config) as robot:
 | Field | Default | Description |
 |---|---|---|
 | `cameras` | `{}` | `ZedCameraConfig` instances keyed by name |
+| `zed_host` | `"192.168.10.1"` | Shared ZED streamer IP; fills every camera whose `host` is left unset (`None`). A camera with an explicit `host` keeps it. |
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
 | `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
 | `observe_torques` | `False` | Include joint torques in `observation.state` |
@@ -111,7 +113,7 @@ Each grabbed frame carries two timestamps on the receiver's `perf_counter` clock
 
 | Field | Default | Description |
 |---|---|---|
-| `host` | `"192.168.10.1"` | IP address of the `zed.stream` sender |
+| `host` | `None` | IP of the `zed.stream` sender. `None` inherits the shared `AxolRobotConfig.zed_host` when built via `AxolRobot`; set it explicitly for standalone use or to point one camera at a different sender. |
 | `port` | `30000` | Streaming port; overhead=30000, left_arm=30002, right_arm=30004 |
 | `fps` | `60` | Expected stream FPS; validated against the live stream on connect |
 | `width` | `960` | Expected frame width (SVGA); validated on connect |

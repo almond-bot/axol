@@ -95,6 +95,11 @@ class ZedCamera(Camera):
         Raises:
             ConnectionError: If the stream cannot be opened.
         """
+        if self.config.host is None:
+            raise ValueError(
+                f"{self} has no host set. Pass host= explicitly, or build the "
+                "camera via AxolRobot so it inherits AxolRobotConfig.zed_host."
+            )
         zed = sl.CameraOne()
         init_params = sl.InitParametersOne()
         init_params.set_from_stream(self.config.host, self.config.port)
