@@ -6,7 +6,7 @@ Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI in
 
 The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). The sources live under [`docs/`](docs/), and the pages below link to them.
 
-**New here?** See the [Teleoperation quickstart](docs/quickstart/teleop.mdx) to go from installation to a live teleoperation session.
+**New here?** See the [Teleoperation quickstart](https://docs.almond.bot/quickstart/teleop) to go from installation to a live teleoperation session.
 
 ## Requirements
 
@@ -55,47 +55,47 @@ Before using any motor or robot commands, initialize the CAN hardware:
 axol can.setup
 ```
 
-See [`docs/installation.mdx`](docs/installation.mdx) for the full installation guide.
+See the [installation guide](https://docs.almond.bot/installation) for the full walkthrough.
 
 ## Sitemap
 
 ### Get Started
 
-- [Overview](docs/index.mdx)
-- [Installation](docs/installation.mdx)
+- [Overview](https://docs.almond.bot)
+- [Installation](https://docs.almond.bot/installation)
 
 ### Quickstart
 
-- [Teleoperation](docs/quickstart/teleop.mdx)
-- [Data Collection](docs/quickstart/data-collection.mdx) — two-machine workflow (main host + ZED box)
-- [Policy Inference](docs/quickstart/inference.mdx) — two-machine workflow (main host + ZED box)
+- [Teleoperation](https://docs.almond.bot/quickstart/teleop)
+- [Data Collection](https://docs.almond.bot/quickstart/data-collection) — two-machine workflow (main host + ZED box)
+- [Policy Inference](https://docs.almond.bot/quickstart/inference) — two-machine workflow (main host + ZED box)
 
 ### CLI Reference
 
-- [Command configuration](docs/cli/configuration.mdx) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`
-- [`can.setup`](docs/cli/can-setup.mdx)
-- [`can.enable`](docs/cli/can-enable.mdx)
-- [`motor.info`](docs/cli/motor-info.mdx)
-- [`motor.set-can-id`](docs/cli/motor-set-can-id.mdx)
-- [`motor.set-zero-pos`](docs/cli/motor-set-zero-pos.mdx)
-- [`teleop`](docs/cli/teleop.mdx)
-- [`collect-data`](docs/cli/collect-data.mdx)
-- [`run-policy`](docs/cli/run-policy.mdx)
-- [`zed.stream`](docs/cli/zed-stream.mdx)
-- [`zed.install`](docs/cli/zed-install.mdx)
-- [`zed.sync-clocks`](docs/cli/zed-sync-clocks.mdx)
-- [`tune.pid`](docs/cli/tune-pid.mdx)
-- [`tune.friction`](docs/cli/tune-friction.mdx)
-- [`tune.repeatability`](docs/cli/tune-repeatability.mdx)
-- [`gravity-comp`](docs/cli/gravity-comp.mdx)
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`
+- [`can.setup`](https://docs.almond.bot/cli/can-setup)
+- [`can.enable`](https://docs.almond.bot/cli/can-enable)
+- [`motor.info`](https://docs.almond.bot/cli/motor-info)
+- [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
+- [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
+- [`teleop`](https://docs.almond.bot/cli/teleop)
+- [`collect-data`](https://docs.almond.bot/cli/collect-data)
+- [`run-policy`](https://docs.almond.bot/cli/run-policy)
+- [`zed.stream`](https://docs.almond.bot/cli/zed-stream)
+- [`zed.install`](https://docs.almond.bot/cli/zed-install)
+- [`zed.sync-clocks`](https://docs.almond.bot/cli/zed-sync-clocks)
+- [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
+- [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
+- [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
+- [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
 
 ### Python API
 
-- [Core Concepts](docs/api/concepts.mdx)
-- [`almond_axol.robot`](docs/api/robot.mdx) — `Axol`, `Sim`, configuration, gravity compensation
-- [`almond_axol.kinematics`](docs/api/kinematics.mdx)
-- [`almond_axol.teleop`](docs/api/teleop.mdx)
-- [`almond_axol.vr`](docs/api/vr.mdx)
-- [`almond_axol.zed`](docs/api/zed.mdx)
-- [`almond_axol.motor`](docs/api/motor.mdx)
-- [`almond_axol.lerobot`](docs/api/lerobot.mdx)
+- [Core Concepts](https://docs.almond.bot/api/concepts)
+- [`almond_axol.robot`](https://docs.almond.bot/api/robot) — `Axol`, `Sim`, configuration, gravity compensation
+- [`almond_axol.kinematics`](https://docs.almond.bot/api/kinematics)
+- [`almond_axol.teleop`](https://docs.almond.bot/api/teleop)
+- [`almond_axol.vr`](https://docs.almond.bot/api/vr)
+- [`almond_axol.zed`](https://docs.almond.bot/api/zed)
+- [`almond_axol.motor`](https://docs.almond.bot/api/motor)
+- [`almond_axol.lerobot`](https://docs.almond.bot/api/lerobot)
