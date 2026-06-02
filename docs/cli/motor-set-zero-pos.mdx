@@ -7,7 +7,8 @@ Sets the motor's zero-position reference to its current mechanical position (per
 
 | Flag | Description |
 |---|---|
-| `--id ID` | CAN ID of the motor to zero (single-motor mode) |
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--id ID` | CAN ID of the motor to zero, hex or decimal (required unless `--guided`) |
 | `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
 | `--guided` | Walk through every arm joint, zeroing each at its closer end stop |
 

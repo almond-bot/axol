@@ -137,7 +137,7 @@ left = replace(
 |---|---|---|
 | `kp` | `float` (`[0, 500]`) | Impedance position stiffness |
 | `kd` | `float` (`[0, 5]`) | Impedance velocity damping. Hardware-capped by the motor firmware at 5; use `kd_soft` to augment. |
-| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(k·v) + fv·v + fo` |
+| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(0.1·k·v) + fv·v + fo` (see `compute_friction` in `robot/control.py`) |
 | `mass` | `float` | Mass of the URDF body this joint drives (kg). For `wrist_3` this includes the gripper. |
 | `com` | `tuple[float, float, float]` | Centre-of-mass of the same body in its URDF link frame (m). Used by gravity comp. |
 | `j_eff` | `float` (default `0.0`) | Effective scalar inertia (kg·m²) for acceleration feedforward `τ = j_eff · q̈_des`. |

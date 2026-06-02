@@ -77,26 +77,63 @@ Open two terminals on the main host.
   <Step title="Run data collection">
     ```bash
     axol collect-data \
-        --repo-id myorg/pick-place \
+        --repo_id myorg/pick-place \
         --task "Pick the red cube and place it in the bin" \
-        --zed-iface eth0
+        --zed_iface eth0
     ```
 
-    `--zed-iface eth0` assigns the receiver IP `192.168.10.2/24` to the link. The robot is driven over VR (accept the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full flag list, including `--fps`, `--teleop-hz`, stiffness, and `--push-to-hub`.
+    `--zed_iface eth0` assigns the receiver IP `192.168.10.2/24` to the link. The robot is driven over VR (accept the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
   </Step>
 </Steps>
 
-## Recording episodes
+## Controller layout
 
-Drive the robot from the VR headset and use the controller events to manage episodes:
+Episodes are driven entirely from the Quest controllers. The movement controls are the same as in [teleoperation](/quickstart/teleop); data collection adds the **A** (record) and **B** (mode) buttons.
 
-| Event | Action |
+<img src="/assets/quest.png" alt="Quest controller diagram" />
+
+| # | Button | Action |
+|---|---|---|
+| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** (toggle, not hold) |
+| 2 | Right grip | See above |
+| 3 | Left trigger | Actuate left gripper |
+| 4 | Right trigger | Actuate right gripper |
+| 5 | X | **Reset** to rest pose. During a recording, stops and **discards** the take (re-record); during the start countdown, cancels it |
+| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
+| 7 | Y | **Exit** the VR session |
+| 8 | B | Toggle between **Teleop** and **Data Collection** mode (disabled while recording or counting down) |
+
+## Recording an episode
+
+<Steps>
+  <Step title="Enter Data Collection mode">
+    Press **B** to switch from Teleop into Data Collection. You can drive the arms in either mode, but a take can only be started from Data Collection.
+  </Step>
+
+  <Step title="Start a take">
+    Press **A** to begin recording — a 3-second countdown runs (the headset stays in Data Collection), then frame capture begins. Press **A** again during the countdown, or **X**, to cancel.
+  </Step>
+
+  <Step title="Finish the take">
+    - Press **A** to stop and **save** the episode.
+    - Press **X** to stop and **discard** it (re-record).
+
+    While the episode is written to disk the headset enters the **Saving** state and every control except **Y** (exit) is blocked. When the write completes the headset returns to Data Collection and the arms move back to the rest pose, ready for the next take.
+  </Step>
+</Steps>
+
+| Headset state | Meaning |
 |---|---|
-| `START_RECORDING` | Begin capturing frames |
-| `TERMINATE_EPISODE` | Save the episode; the headset shows `Saving` until the write completes |
-| `RERECORD_EPISODE` | Discard and retry |
+| `Teleop` | Driving the arms; recording not armed |
+| `Data Collection` | Driving the arms; ready to record |
+| `Recording` | Capturing frames to the dataset |
+| `Saving` | Episode being written to disk; controls blocked |
 
-After each episode the robot automatically returns to its rest pose before the next take. Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown. Press `Ctrl+C` in the `collect-data` terminal to finish.
+Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown. Press `Ctrl+C` in the `collect-data` terminal to finish.
+
+<Note>
+  The full controller bindings and headset state machine are maintained in the [axol-vr](https://github.com/almond-bot/axol-vr) interface repo.
+</Note>
 
 ## Next steps
 

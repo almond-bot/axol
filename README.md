@@ -72,6 +72,7 @@ See [`docs/installation.mdx`](docs/installation.mdx) for the full installation g
 
 ### CLI Reference
 
+- [Command configuration](docs/cli/configuration.mdx) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`
 - [`can.setup`](docs/cli/can-setup.mdx)
 - [`can.enable`](docs/cli/can-enable.mdx)
 - [`motor.info`](docs/cli/motor-info.mdx)

@@ -7,8 +7,9 @@ Changes a motor's CAN ID and persists it to flash. The motor must be the only de
 
 | Flag | Description |
 |---|---|
-| `--current-id ID` | Current CAN ID |
-| `--new-id ID` | New CAN ID to assign |
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--current-id ID` | Current CAN ID (hex or decimal, required) |
+| `--new-id ID` | New CAN ID to assign (hex or decimal, required) |
 | `--type {myactuator,damiao}` | Motor type (required) |
 
 ```bash

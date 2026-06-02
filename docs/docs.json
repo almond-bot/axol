@@ -33,6 +33,7 @@
       {
         "group": "CLI Reference",
         "pages": [
+          "cli/configuration",
           "cli/can-setup",
           "cli/can-enable",
           "cli/motor-info",

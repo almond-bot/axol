@@ -78,13 +78,13 @@ Open two terminals on the main host.
   <Step title="Run the policy">
     ```bash
     axol run-policy \
-        --policy myorg/pick-place-policy \
-        --policy-type act \
+        --policy_path myorg/pick-place-policy \
+        --policy_type act \
         --task "Pick the red cube" \
-        --zed-iface eth0
+        --zed_iface eth0
     ```
 
-    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. `--fps` must match the rate the policy was trained on. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving flags.
+    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. `--fps` must match the rate the policy was trained on. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields, and [Command configuration](/cli/configuration) for the draccus override syntax.
   </Step>
 </Steps>
 
@@ -98,7 +98,7 @@ While `run-policy` runs, control the episode from stdin in the `run-policy` term
 | `r` | Discard and re-record |
 | `q` | Discard and quit |
 
-`--episode-time-s` is a safety cap (default 120 s) that falls back to the same `[Enter]=save / r / q` prompt if no key is pressed. If `--repo-id` is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
+`--episode_time_s` is a safety cap (default 120 s) that falls back to the same `[Enter]=save / r / q` prompt if no key is pressed. If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
 
 ## Next steps
 

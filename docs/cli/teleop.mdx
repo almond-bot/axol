@@ -5,6 +5,8 @@ description: "Launch a VR teleoperation session on the robot or simulator."
 
 Launches a VR teleoperation session. When started, the hostname (`.local`) and local IP address are printed — enter either of these in the VR app at [axol.almond.bot](https://axol.almond.bot) to connect.
 
+Runs on the **real robot by default**; pass `--sim` for the browser visualizer. The full robot config is exposed via draccus, so every gain, stiffness, and gripper limit is reachable from the CLI or a config file — see [Command configuration](/cli/configuration).
+
 <Tip>
   For a guided, step-by-step walkthrough including the VR controller layout, see the [Teleoperation quickstart](/quickstart/teleop).
 </Tip>
@@ -24,18 +26,25 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 
 | Flag | Description |
 |---|---|
-| `--sim` | Use the software visualizer instead of the real robot. Omit to run on real hardware (the default). |
-| `--no-left` | Disable the left arm |
-| `--no-right` | Disable the right arm |
-| `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5) |
-| `--right-gripper-torque-limit FLOAT` | Max torque (Nm) for the right gripper in POSITION_FORCE mode (default: 0.5) |
-| `--left-stiffness S\|S,S,...` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7 comma-separated values (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. See [`AxolConfig.left_stiffness`](/api/robot). |
-| `--right-stiffness S\|S,S,...` | Same, for the right arm. |
-| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--sim` | Use the software visualizer instead of the real robot. Bare `--sim` works (or `--sim true`). Omit to run on real hardware (the default). |
+| `--left_channel <ch\|null>` | CAN channel for the left arm; `null` disables it. Default: `CAN_LEFT`. |
+| `--right_channel <ch\|null>` | CAN channel for the right arm; `null` disables it. Default: `CAN_RIGHT`. |
+| `--axol.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar (`0.8`) or a 7-element list (`[0.8,0.8,0.5,0.5,0.2,0.2,0.0]`, one per arm joint in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. See [`AxolConfig.left_stiffness`](/api/robot). |
+| `--axol.right_stiffness S` | Same, for the right arm. |
+| `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5). Use `right` for the right gripper. |
+| `--axol.<side>.<joint>.<gain> VALUE` | Override any per-joint gain, e.g. `--axol.left.elbow.kp 60`. `<side>` is `left`/`right`; `<joint>` is `shoulder_1…wrist_3`; `<gain>` is `kp`/`kd`/etc. |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. See [Command configuration](/cli/configuration). |
 
 ```bash
-axol teleop
-axol teleop --sim --no-right
-axol teleop --left-stiffness 1.0 --right-stiffness 1.0
-axol teleop --left-stiffness 0.8,0.8,0.5,0.5,0.2,0.2,0.0
+axol teleop                                       # real robot
+axol teleop --sim                                 # browser visualizer
+axol teleop --axol.left_stiffness 0.8
+axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+axol teleop --left_channel null                   # disable the left arm
+axol teleop --config_path my_teleop.json          # whole-config file
 ```
+
+<Note>
+  This command takes its config via draccus, not fixed `argparse` flags. Field names use underscores, nested fields are dot-separated, `None` is `null`, and lists use `[a,b,c]` — see [Command configuration](/cli/configuration) for the full model.
+</Note>
