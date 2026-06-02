@@ -156,7 +156,7 @@ class ArmConfig:
             kp=45.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=3.25,
+            mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
         )
     )
