@@ -75,7 +75,7 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 | `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
 | `set_velocity(left, right)` | Motor built-in speed controller |
 | `set_gains(left, right)` | Write PID gains; persisted to flash |
-| `set_zero_position(left, right)` | Save current shaft position as encoder zero |
+| `set_zero_position(left, right)` | Save current shaft position as encoder zero (calibrated at a mechanical end stop, not the rest position) |
 | `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
 
 Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.

@@ -5,6 +5,10 @@ Set the zero position of a single motor, or walk every arm joint with
 ``--guided`` and zero each one against its closer end stop. The current
 mechanical position becomes the new zero reference (persisted to flash).
 
+Note: each motor's encoder zero is calibrated at one of the joint's
+mechanical END STOPS, not at the robot's rest position. ``AxolArm`` adds a
+per-joint offset so the public API stays in joint frame (``0`` = rest).
+
 Examples:
     axol motor.set-zero-pos --l --id 0x01
     axol motor.set-zero-pos --r --id 0x06
@@ -144,21 +148,27 @@ async def _calibrate_joint(
             continue
 
         if (1 if delta > 0 else -1) != expected_sign:
-            print(f"    ✗ wrong direction (expected {direction}) — retry.")
-            continue
-
-        mag_diff = abs(abs(delta) - abs(target_rad))
-        if mag_diff > _MAGNITUDE_WARN_RAD:
+            # Wrong direction: rather than restart, send the user to the
+            # correct end stop and zero there on the next Enter.
             print(
-                f"    ⚠  moved {math.degrees(abs(delta)):.1f}°, expected"
-                f" ~{abs(target_deg):.1f}° — make sure you're against the stop."
+                f"    ✗ wrong direction (expected {direction}) — move all the way"
+                f" to the OTHER end stop at {target_deg:+.1f}°."
             )
+            if not _prompt("    then Enter to set zero: "):
+                return False
+            p_end = await motor.get_position()
+            print(f"     end:   {_fmt(p_end)}")
+        else:
+            mag_diff = abs(abs(delta) - abs(target_rad))
+            if mag_diff > _MAGNITUDE_WARN_RAD:
+                print(
+                    f"    ⚠  moved {math.degrees(abs(delta)):.1f}°, expected"
+                    f" ~{abs(target_deg):.1f}° — make sure you're against the stop."
+                )
 
-        if not _prompt(f"    set zero at {_fmt(p_end)}? Enter to confirm: "):
-            return False
-
+        # Right direction → zero immediately, no extra confirmation.
         await motor.set_zero_position()
-        print("    ✓ zeroed.")
+        print(f"    ✓ zeroed at {_fmt(p_end)}.")
         return True
 
 

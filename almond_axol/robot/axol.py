@@ -395,6 +395,10 @@ class AxolArm:
     async def set_zero_position(self, joints: list[Joint]) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
 
+        The encoder zero is calibrated at the joint's mechanical end stop, not
+        at the rest position; ``AxolArm`` applies a per-joint offset so the
+        public API stays in joint frame (``0`` = rest).
+
         Args:
             joints: List of joints to zero.
         """
@@ -937,6 +941,10 @@ class Axol(RobotBase):
         right: list[Joint] | None = None,
     ) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
+
+        The encoder zero is calibrated at each joint's mechanical end stop, not
+        at the rest position; per-joint offsets keep the public API in joint
+        frame (``0`` = rest).
 
         Args:
             left:  Joints on the left arm to zero. ``None`` skips the arm.
