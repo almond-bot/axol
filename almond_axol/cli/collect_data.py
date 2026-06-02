@@ -12,7 +12,7 @@ controls are blocked until save_episode() completes.
 
 Recording continues until Ctrl+C.
 
-The teleop loop runs at ``--teleop-hz`` and publishes the latest
+The teleop loop runs at ``--teleop_hz`` and publishes the latest
 ``(joint_obs, action)`` to a single-slot ``_SnapshotPublisher``. A separate
 ``_CaptureThread`` ticks at ``--fps`` and, for each tick, blocks on
 ``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame

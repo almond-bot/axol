@@ -11,7 +11,7 @@ inference observation is global-timestamp aligned the same way the
 training data is (see ``AxolRobot.get_observation``).
 
 Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
-+ discard), or ``q`` (quit + discard) on stdin. ``--episode-time-s`` is a
++ discard), or ``q`` (quit + discard) on stdin. ``--episode_time_s`` is a
 safety cap that falls back to the same ``[Enter]=save / r / q`` prompt
 when no key has been pressed.
 """
@@ -180,7 +180,7 @@ def _build_axol_robot_client(
         config: Built ``RobotClientConfig``.
         robot: Connected ``AxolRobot`` instance, reused across episodes.
         publisher: Sink for executed actions, drained by the capture thread.
-        aggregate_strategy: One of the ``--aggregate-fn`` choices.
+        aggregate_strategy: One of the ``--aggregate_fn`` choices.
         temporal_ensemble_coeff: Decay coefficient for temporal_ensemble.
     """
     import threading as _threading
