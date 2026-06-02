@@ -17,7 +17,7 @@ from .zed import sync_clocks as zed_sync_clocks
 # dotted ``--section.field`` overrides aren't compatible with argparse
 # subparsers, so we intercept them before argparse runs and hand the raw
 # argv tail to the module's ``main(argv)``. They're imported lazily so that
-# e.g. ``axol teleop --robot sim`` never pulls in the lerobot/camera stack
+# e.g. ``axol teleop --sim`` never pulls in the lerobot/camera stack
 # that ``collect-data`` / ``run-policy`` import at module load.
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),

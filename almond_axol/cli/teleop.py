@@ -1,14 +1,16 @@
 """
-axol teleop --robot [axol|sim]
+axol teleop [--sim]
 
-Run a VR teleoperation session. Every robot config field is reachable
-from the CLI (draccus-style) or from a JSON/YAML file:
+Run a VR teleoperation session. Drives the real Axol robot by default;
+pass ``--sim`` to use the browser visualizer instead. Every robot config
+field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
 
-    axol teleop --robot sim
-    axol teleop --robot axol --axol.left_stiffness 0.8
-    axol teleop --robot axol --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
-    axol teleop --robot axol --left_channel null            # disable the left arm
-    axol teleop --robot axol --config_path my_teleop.json   # whole-config file
+    axol teleop                                       # real robot
+    axol teleop --sim                                 # browser visualizer
+    axol teleop --axol.left_stiffness 0.8
+    axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+    axol teleop --left_channel null                   # disable the left arm
+    axol teleop --config_path my_teleop.json          # whole-config file
 """
 
 import asyncio
@@ -24,8 +26,31 @@ def _get_local_ip() -> str:
         return s.getsockname()[0]
 
 
+def _normalize_sim_flag(argv: list[str]) -> list[str]:
+    """Let ``--sim`` be passed as a bare flag.
+
+    draccus parses bool fields as value-taking arguments (``--sim true``),
+    so rewrite a standalone ``--sim`` (one that's followed by another flag
+    or nothing) into ``--sim true``. An explicit ``--sim true`` / ``--sim
+    false`` / ``--sim=...`` is left untouched.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--sim":
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is None or nxt.startswith("-"):
+                out.extend(("--sim", "true"))
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 def main(argv: list[str]) -> None:
-    cfg = parse(TeleopCmdConfig, argv)
+    cfg = parse(TeleopCmdConfig, _normalize_sim_flag(argv))
     logging.basicConfig(level=getattr(logging, cfg.log_level))
 
     hostname = socket.gethostname()
@@ -41,7 +66,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
 
-    if cfg.robot == "sim":
+    if cfg.sim:
         robot = Sim()
     else:
         robot = Axol(

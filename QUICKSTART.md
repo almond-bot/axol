@@ -75,7 +75,7 @@ The VR app connects over a self-signed HTTPS/WSS connection. Before opening the 
 ## 5. Teleop
 
 ```bash
-axol teleop --robot axol
+axol teleop
 ```
 
 The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect.
@@ -99,6 +99,7 @@ The terminal will print the hostname and IP address. Open the VR app at [axol.al
 
 | Flag | Description |
 |---|---|
+| `--sim` | Use the browser visualizer instead of real hardware (default: real robot) |
 | `--no-left` | Disable the left arm |
 | `--no-right` | Disable the right arm |
 | `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper (default: `0.5`) |
@@ -110,7 +111,7 @@ The terminal will print the hostname and IP address. Open the VR app at [axol.al
 ### Test without hardware
 
 ```bash
-axol teleop --robot sim
+axol teleop --sim
 ```
 
 Opens a browser visualizer at `http://localhost:8080` instead of commanding real motors. Useful for verifying network connectivity and VR tracking before powering the robot.

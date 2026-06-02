@@ -48,7 +48,7 @@ Install optional dependency groups as needed:
 | Extra | Contents | When to use |
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
-| `sim` | viser | `teleop --robot sim` |
+| `sim` | viser | `teleop --sim` |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
@@ -162,7 +162,7 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 
 | Flag | Description |
 |---|---|
-| `--robot {axol,sim}` | `axol` uses real hardware; `sim` uses the software visualizer (required) |
+| `--sim` | Use the software visualizer instead of the real robot. Omit to run on real hardware (the default). |
 | `--no-left` | Disable the left arm |
 | `--no-right` | Disable the right arm |
 | `--left-gripper-torque-limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5) |
@@ -172,10 +172,10 @@ Launches a VR teleoperation session. When started, the hostname (`.local`) and l
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
-axol teleop --robot axol
-axol teleop --robot sim --no-right
-axol teleop --robot axol --left-stiffness 1.0 --right-stiffness 1.0
-axol teleop --robot axol --left-stiffness 0.8,0.8,0.5,0.5,0.2,0.2,0.0
+axol teleop
+axol teleop --sim --no-right
+axol teleop --left-stiffness 1.0 --right-stiffness 1.0
+axol teleop --left-stiffness 0.8,0.8,0.5,0.5,0.2,0.2,0.0
 ```
 
 ---
@@ -750,7 +750,7 @@ async with VRTeleop(axol) as teleop:
         await asyncio.sleep(1 / 120)
 ```
 
-See `teleop --robot axol` in [Teleoperation](#teleoperation) for the equivalent CLI command.
+See `teleop` in [Teleoperation](#teleoperation) for the equivalent CLI command.
 
 **`VRTeleopConfig` fields**
 

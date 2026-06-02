@@ -20,9 +20,9 @@ This module provides the pieces shared by all four commands:
   ``JointConfig`` fields). Seeding the encoded default config as the base
   of draccus's ``mergedeep`` step restores correct partial-override
   semantics (defaults -> ``--config_path`` file -> CLI flags).
-- :data:`RobotType` / :data:`LogLevel` / :data:`PolicyType` /
-  :data:`AggregateFn`, ``Literal`` aliases registered with draccus so it
-  validates choices the way ``argparse``'s ``choices=`` used to.
+- :data:`LogLevel` / :data:`PolicyType` / :data:`AggregateFn`, ``Literal``
+  aliases registered with draccus so it validates choices the way
+  ``argparse``'s ``choices=`` used to.
 - :class:`TeleopCmdConfig` and :class:`GravityCompCmdConfig`, the two
   command configs that do not touch ``lerobot`` (kept here so importing
   them stays cheap on the sim/teleop-only path). The ``collect-data`` and
@@ -30,8 +30,8 @@ This module provides the pieces shared by all four commands:
   ``lerobot`` imports already belong.
 
 This module intentionally imports no ``lerobot`` code so ``axol teleop
---robot sim`` keeps working in environments without the ``lerobot``
-extra installed.
+--sim`` keeps working in environments without the ``lerobot`` extra
+installed.
 """
 
 from __future__ import annotations
@@ -112,7 +112,6 @@ def _register_literal(lit: T) -> T:
     return lit
 
 
-RobotType = _register_literal(Literal["axol", "sim"])
 LogLevel = _register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
 PolicyType = _register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
@@ -237,14 +236,15 @@ def parse(config_class: type[T], argv: list[str]) -> T:
 class TeleopCmdConfig:
     """Config for ``axol teleop``.
 
-    Gripper torque limits and the compliance/stiffness blend now live on
-    the nested ``axol`` config — override them via
+    Runs on the real Axol robot by default; pass ``--sim`` to drive the
+    browser visualizer instead (the ``axol`` config and CAN channels are
+    ignored in sim). Gripper torque limits and the compliance/stiffness
+    blend live on the nested ``axol`` config — override them via
     ``--axol.left.gripper.torque_limit`` and ``--axol.left_stiffness``.
-    The ``axol`` config is ignored when ``robot`` is ``sim``. Disable an
-    arm with ``--left_channel null`` / ``--right_channel null``.
+    Disable an arm with ``--left_channel null`` / ``--right_channel null``.
     """
 
-    robot: RobotType
+    sim: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
