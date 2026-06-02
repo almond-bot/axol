@@ -57,4 +57,6 @@ Precedence is **defaults → `--config_path` file → CLI flags** (later wins), 
 
 ## Validation
 
-Choice fields (e.g. `--log_level`, `--policy_type`, `--aggregate_fn`) are validated against their allowed values, and missing required fields or type mismatches are reported as a clean usage error rather than a traceback. Run `axol <command> --help` to see the full field list for any of the four commands.
+Choice fields (e.g. `--log_level`, `--policy_type`, `--aggregate_fn`) are validated against their allowed values, and missing required fields or type mismatches are reported as a clean usage error rather than a traceback.
+
+`axol <command> --help` lists only the **common** fields (top-level options plus stiffness and gripper limits) to keep the output readable — the deeply-nested per-joint gains are hidden but remain fully overridable with their dotted paths (e.g. `--axol.left.elbow.kp`). This page is the complete reference for the override syntax.
