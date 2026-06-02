@@ -260,7 +260,10 @@ class _CaptureThread(threading.Thread):
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a data-collection session."""
     cfg = parse(CollectDataConfig, argv)
-    logging.basicConfig(level=getattr(logging, cfg.log_level))
+    # force=True: importing lerobot (at module load) installs a root handler
+    # and leaves the root level at WARNING, which would otherwise make this a
+    # no-op and silently drop every log_say() status line.
+    logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
     _run(cfg)
 
 

@@ -52,7 +52,10 @@ def _normalize_sim_flag(argv: list[str]) -> list[str]:
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
     cfg = parse(TeleopCmdConfig, _normalize_sim_flag(argv))
-    logging.basicConfig(level=getattr(logging, cfg.log_level))
+    # force=True: a dependency imported before this point may install a root
+    # handler (leaving the level at WARNING), which would make this a no-op
+    # and silently drop log_say() / INFO status lines.
+    logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
     hostname = socket.gethostname()
     local_ip = _get_local_ip()

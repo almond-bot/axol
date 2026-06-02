@@ -60,7 +60,10 @@ def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run gravity-compensation mode."""
     cfg = parse(GravityCompCmdConfig, argv)
-    logging.basicConfig(level=getattr(logging, cfg.log_level))
+    # force=True: a dependency imported before this point may install a root
+    # handler (leaving the level at WARNING), which would make this a no-op
+    # and silently drop log_say() / INFO status lines.
+    logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
     try:
         asyncio.run(_run(cfg))
     except KeyboardInterrupt:
