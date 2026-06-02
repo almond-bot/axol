@@ -127,7 +127,11 @@ class Motor:
         await self._driver.clear_errors()
 
     async def set_zero_position(self) -> None:
-        """Save the current shaft position as the encoder zero reference."""
+        """Save the current shaft position as the encoder zero reference.
+
+        For arm joints this is calibrated at one of the joint's mechanical
+        end stops, not at the rest position (see ``closer_end_stop``).
+        """
         await self._driver.set_zero_position()
 
     async def set_control_mode(self, mode: ControlMode) -> None:

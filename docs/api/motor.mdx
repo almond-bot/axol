@@ -34,7 +34,7 @@ asyncio.run(main())
 |---|---|
 | `enable()` / `disable()` | Enable motor / engage brake |
 | `clear_errors()` | Clear latched error flags |
-| `set_zero_position()` | Save current position as encoder zero (persisted to flash) |
+| `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
 | `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
 | `get_position()` | Shaft position (rad); raises if telemetry is active |
