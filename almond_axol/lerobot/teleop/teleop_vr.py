@@ -39,6 +39,7 @@ import multiprocessing.connection
 import multiprocessing.context
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -333,6 +334,17 @@ class AxolVRTeleop(Teleoperator):
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         """Accept robot observation. Currently a no-op — IK worker maintains its own state."""
         pass
+
+    def set_video_sources(self, sources: dict[str, Callable[[], Any]] | None) -> None:
+        """Stream wrist-camera frames to the headset via WebRTC.
+
+        Each source is a callable returning the latest RGB ``uint8`` numpy frame
+        ``(H, W, 3)`` or ``None``. Must be called after :meth:`connect` (so the
+        VR server exists). Safe to call from any thread. Requires the ``video``
+        extra; without it video is silently disabled.
+        """
+        if self._vr_server is not None:
+            self._vr_server.set_video_sources(sources)
 
     def send_feedback_state(self, state: VRState) -> None:
         """Broadcast a state override to all connected VR clients.

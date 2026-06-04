@@ -32,6 +32,7 @@ import logging
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.context
+import os
 import threading
 import time
 
@@ -182,6 +183,18 @@ class VRTeleop:
         self._vr_thread.start()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._vr_ready.wait)
+
+        # Opt-in synthetic wrist video so the WebRTC path is testable without
+        # ZED hardware: AXOL_VR_VIDEO_TEST=1 uv run axol teleop --sim
+        if os.environ.get("AXOL_VR_VIDEO_TEST"):
+            from ..vr.video import make_test_pattern_source
+
+            self._vr_server.set_video_sources(
+                {
+                    "left_arm": make_test_pattern_source(),
+                    "right_arm": make_test_pattern_source(),
+                }
+            )
 
         await self._robot.enable()
 

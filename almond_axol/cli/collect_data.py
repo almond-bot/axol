@@ -62,6 +62,46 @@ def _default_robot_config() -> AxolRobotConfig:
     )
 
 
+def _register_wrist_video(robot: "AxolRobot", teleop: Any) -> None:
+    """Register the wrist cameras as WebRTC video sources for the headset.
+
+    Best-effort: reads the latest decoded frame ZedCamera already keeps, so it
+    never blocks the capture pipeline. Set ``AXOL_VR_VIDEO_TEST=1`` to fall back
+    to a synthetic test pattern for any wrist camera that is absent (useful for
+    exercising the path without ZED hardware).
+    """
+    import os
+
+    def _make_source(cam: Any) -> Callable[[], Any]:
+        def _source() -> Any:
+            try:
+                return cam.read_latest(max_age_ms=1000)
+            except Exception:
+                return None
+
+        return _source
+
+    sources: dict[str, Callable[[], Any]] = {}
+    for name in ("left_arm", "right_arm"):
+        cam = robot.cameras.get(name)
+        if cam is not None:
+            sources[name] = _make_source(cam)
+
+    if os.environ.get("AXOL_VR_VIDEO_TEST"):
+        from ..vr.video import make_test_pattern_source
+
+        for name in ("left_arm", "right_arm"):
+            sources.setdefault(name, make_test_pattern_source())
+
+    if not sources:
+        return
+
+    try:
+        teleop.set_video_sources(sources)
+    except Exception as exc:
+        _logger.warning("failed to enable wrist video: %s", exc)
+
+
 @dataclass
 class CollectDataConfig:
     """Config for ``axol collect-data``.
@@ -356,6 +396,11 @@ def _run(cfg: CollectDataConfig) -> None:
         )
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+
+    # Relay the wrist cameras to the headset so the operator can see the
+    # grippers. Best-effort: reuses the frames ZedCamera already decodes.
+    _register_wrist_video(robot, teleop)
+
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
     episodes_recorded = 0
