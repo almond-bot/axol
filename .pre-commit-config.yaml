@@ -8,3 +8,13 @@ repos:
       args: [--fix, --extend-select, I]
     # Run the formatter.
     - id: ruff-format
+- repo: local
+  hooks:
+    # Format the web/ TypeScript app with the same Prettier version it pins.
+    - id: prettier
+      name: prettier (web)
+      entry: prettier --write
+      language: node
+      additional_dependencies: ["prettier@3.8.1"]
+      files: ^web/.*\.(ts|tsx|css|json)$
+      exclude: ^web/package-lock\.json$
