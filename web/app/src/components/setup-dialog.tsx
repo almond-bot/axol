@@ -213,7 +213,7 @@ export function ConnectionPill({
       <span
         className={`size-2 rounded-full ${dot} ${state === "loading" ? "animate-pulse" : ""}`}
       />
-      <span className="max-w-[14ch] truncate font-mono">{label}</span>
+      <span className="font-mono whitespace-nowrap">{label}</span>
     </button>
   )
 }

@@ -238,7 +238,6 @@ export default function ControlPanel() {
                       <div className="flex items-center gap-2">
                         <h2 className="font-heading text-lg font-semibold">{selected.label}</h2>
                         <StatusBadge session={liveHere ? effectiveStatus : null} />
-                        {selected.simCapable && <Badge variant="neutral">sim</Badge>}
                       </div>
                       <div className="mt-0.5 font-mono text-xs text-white/40">
                         axol {selected.cli}

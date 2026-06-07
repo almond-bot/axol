@@ -131,7 +131,6 @@ function CatalogRow({
         </div>
         <div className="truncate font-mono text-[0.7rem] text-white/40">axol {cmd.cli}</div>
       </div>
-      {cmd.simCapable && <Badge variant="neutral">sim</Badge>}
       {!cmd.available && <Badge variant="warning">N/A</Badge>}
     </button>
   )
