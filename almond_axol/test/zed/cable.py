@@ -1,9 +1,10 @@
 """
-Test script: verify a ZED camera cable by capturing and validating one frame.
+Test script: verify a ZED camera cable by capturing and validating frames.
 
 Run this on a ZED box with exactly one ZED-X One camera connected. The test
-enables the camera, grabs a frame, and checks that the frame is a valid image.
-Any failure raises an exception; if it returns cleanly the cable is good.
+restarts the ZED X daemon, opens the camera, and captures frames across a
+5-second window, checking that each frame is a valid image. Any failure raises
+an exception; if it returns cleanly the cable is good.
 
 Usage:
     python -m almond_axol.test.zed.cable
@@ -14,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -29,9 +32,35 @@ _MIN_STD = 1.0
 _MIN_MEAN = 1.0
 _MAX_MEAN = 254.0
 
+# The ZED X daemon must be restarted before opening the camera; give it time to
+# enumerate the sensor on the GMSL link before we connect.
+_DAEMON_RESTART_WAIT_S = 5.0
+# How long to keep capturing and validating frames.
+_CAPTURE_DURATION_S = 5.0
+
 
 class CableTestError(RuntimeError):
     """Raised when the ZED cable test fails at any step."""
+
+
+def _restart_zed_daemon() -> None:
+    """Restart the ZED X daemon and wait for it to come up.
+
+    Raises:
+        CableTestError: If the ``systemctl restart`` command fails.
+    """
+    _logger.info("Restarting zed_x_daemon...")
+    result = subprocess.run(
+        ["sudo", "systemctl", "restart", "zed_x_daemon"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise CableTestError(
+            f"Failed to restart zed_x_daemon: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    _logger.info("Waiting %.0fs for daemon to settle...", _DAEMON_RESTART_WAIT_S)
+    time.sleep(_DAEMON_RESTART_WAIT_S)
 
 
 def _validate_frame(bgr: np.ndarray) -> None:
@@ -53,7 +82,6 @@ def _validate_frame(bgr: np.ndarray) -> None:
 
     std = float(bgr.std())
     mean = float(bgr.mean())
-    _logger.info("Frame stats: %dx%d  mean=%.2f  std=%.2f", width, height, mean, std)
 
     if std < _MIN_STD:
         raise CableTestError(
@@ -68,16 +96,18 @@ def _validate_frame(bgr: np.ndarray) -> None:
 
 
 def run(output: str | None = None) -> None:
-    """Enable the connected camera, capture a frame, and validate it.
+    """Restart the daemon, open the camera, and validate frames over 5 seconds.
 
     Args:
-        output: Optional path to save the captured frame as PNG for inspection.
+        output: Optional path to save the last captured frame as PNG for inspection.
 
     Raises:
-        CableTestError: If the camera cannot be opened, no frame can be grabbed,
-            or the captured frame fails validation.
+        CableTestError: If the daemon cannot be restarted, the camera cannot be
+            opened, no frames can be grabbed, or any captured frame fails validation.
     """
     import pyzed.sl as sl
+
+    _restart_zed_daemon()
 
     zed = sl.CameraOne()
     init_params = sl.InitParametersOne()
@@ -87,6 +117,7 @@ def run(output: str | None = None) -> None:
     if err != sl.ERROR_CODE.SUCCESS:
         raise CableTestError(f"Failed to open camera: {err}")
 
+    last_bgr: np.ndarray | None = None
     try:
         info = zed.get_camera_information()
         serial = int(info.serial_number)
@@ -101,39 +132,53 @@ def run(output: str | None = None) -> None:
         )
 
         image = sl.Mat()
-        _logger.info("Grabbing frame...")
-        for _ in range(30):  # drain a few frames so the buffer is fresh
-            if zed.grab() == sl.ERROR_CODE.SUCCESS:
-                break
-        else:
-            raise CableTestError("Failed to grab a frame after 30 attempts.")
+        _logger.info(
+            "Capturing and validating frames for %.0fs...", _CAPTURE_DURATION_S
+        )
+        valid_frames = 0
+        deadline = time.monotonic() + _CAPTURE_DURATION_S
+        while time.monotonic() < deadline:
+            if zed.grab() != sl.ERROR_CODE.SUCCESS:
+                continue
+            if zed.retrieve_image(image) != sl.ERROR_CODE.SUCCESS:
+                raise CableTestError("Failed to retrieve image from camera.")
 
-        if zed.retrieve_image(image) != sl.ERROR_CODE.SUCCESS:
-            raise CableTestError("Failed to retrieve image from camera.")
+            raw = image.get_data()  # BGRA uint8
+            bgr = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+            _validate_frame(bgr)
+            last_bgr = bgr
+            valid_frames += 1
 
-        raw = image.get_data()  # BGRA uint8
-        bgr = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
-        _validate_frame(bgr)
+        if valid_frames == 0:
+            raise CableTestError(
+                f"No frames grabbed in {_CAPTURE_DURATION_S:.0f}s; "
+                "camera may be disconnected."
+            )
+        _logger.info(
+            "Validated %d frames over %.0fs.", valid_frames, _CAPTURE_DURATION_S
+        )
 
-        if output:
+        if output and last_bgr is not None:
             Path(output).parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(output, bgr)
+            cv2.imwrite(output, last_bgr)
             _logger.info("Saved frame to %s", output)
     finally:
         zed.close()
 
-    _logger.info("Cable test PASSED: captured a valid frame.")
+    _logger.info(
+        "Cable test PASSED: captured valid frames across %.0fs.", _CAPTURE_DURATION_S
+    )
 
 
 def main() -> None:
     """Parse CLI arguments and run the ZED cable test."""
     parser = argparse.ArgumentParser(
-        description="Test a ZED camera cable by capturing and validating one frame."
+        description="Test a ZED camera cable by validating frames across 5 seconds."
     )
     parser.add_argument(
         "--output",
         default=None,
-        help="Optional path to save the captured frame as PNG (e.g. logs/cable_frame.png).",
+        help="Optional path to save the last captured frame as PNG (e.g. logs/cable_frame.png).",
     )
     args = parser.parse_args()
     run(output=args.output)
