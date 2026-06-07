@@ -1,0 +1,143 @@
+"""
+Test script: verify a ZED camera cable by capturing and validating one frame.
+
+Run this on a ZED box with exactly one ZED-X One camera connected. The test
+enables the camera, grabs a frame, and checks that the frame is a valid image.
+Any failure raises an exception; if it returns cleanly the cable is good.
+
+Usage:
+    python -m almond_axol.test.zed.cable
+    python -m almond_axol.test.zed.cable --output logs/cable_frame.png
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+logging.basicConfig(level=logging.INFO)
+_logger = logging.getLogger(__name__)
+
+# A live frame from a working sensor varies across pixels and sits in a sane
+# brightness band. A disconnected/garbled cable typically yields a flat frame
+# (all black, all white, or a constant value), which these bounds reject.
+_MIN_STD = 1.0
+_MIN_MEAN = 1.0
+_MAX_MEAN = 254.0
+
+
+class CableTestError(RuntimeError):
+    """Raised when the ZED cable test fails at any step."""
+
+
+def _validate_frame(bgr: np.ndarray) -> None:
+    """Raise :class:`CableTestError` unless ``bgr`` looks like a real frame.
+
+    Checks shape, dtype, that the image is not empty, and that it carries actual
+    image content (non-trivial variation and a plausible brightness level).
+    """
+    if bgr is None or bgr.size == 0:
+        raise CableTestError("Retrieved frame is empty.")
+    if bgr.ndim != 3 or bgr.shape[2] != 3:
+        raise CableTestError(f"Frame has unexpected shape {bgr.shape}; expected HxWx3.")
+    if bgr.dtype != np.uint8:
+        raise CableTestError(f"Frame has unexpected dtype {bgr.dtype}; expected uint8.")
+
+    height, width = bgr.shape[:2]
+    if height <= 0 or width <= 0:
+        raise CableTestError(f"Frame has invalid dimensions {width}x{height}.")
+
+    std = float(bgr.std())
+    mean = float(bgr.mean())
+    _logger.info("Frame stats: %dx%d  mean=%.2f  std=%.2f", width, height, mean, std)
+
+    if std < _MIN_STD:
+        raise CableTestError(
+            f"Frame is nearly uniform (std={std:.2f} < {_MIN_STD}); "
+            "camera may be disconnected or the lens is covered."
+        )
+    if not (_MIN_MEAN <= mean <= _MAX_MEAN):
+        raise CableTestError(
+            f"Frame brightness out of range (mean={mean:.2f}); "
+            "expected a non-black, non-saturated image."
+        )
+
+
+def run(output: str | None = None) -> None:
+    """Enable the connected camera, capture a frame, and validate it.
+
+    Args:
+        output: Optional path to save the captured frame as PNG for inspection.
+
+    Raises:
+        CableTestError: If the camera cannot be opened, no frame can be grabbed,
+            or the captured frame fails validation.
+    """
+    import pyzed.sl as sl
+
+    zed = sl.CameraOne()
+    init_params = sl.InitParametersOne()
+
+    _logger.info("Opening connected ZED camera...")
+    err = zed.open(init_params)
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise CableTestError(f"Failed to open camera: {err}")
+
+    try:
+        info = zed.get_camera_information()
+        serial = int(info.serial_number)
+        res = info.camera_configuration.resolution
+        fps = int(info.camera_configuration.fps)
+        _logger.info(
+            "Camera opened: serial=%d  %dx%d @ %dfps",
+            serial,
+            res.width,
+            res.height,
+            fps,
+        )
+
+        image = sl.Mat()
+        _logger.info("Grabbing frame...")
+        for _ in range(30):  # drain a few frames so the buffer is fresh
+            if zed.grab() == sl.ERROR_CODE.SUCCESS:
+                break
+        else:
+            raise CableTestError("Failed to grab a frame after 30 attempts.")
+
+        if zed.retrieve_image(image) != sl.ERROR_CODE.SUCCESS:
+            raise CableTestError("Failed to retrieve image from camera.")
+
+        raw = image.get_data()  # BGRA uint8
+        bgr = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+        _validate_frame(bgr)
+
+        if output:
+            Path(output).parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(output, bgr)
+            _logger.info("Saved frame to %s", output)
+    finally:
+        zed.close()
+
+    _logger.info("Cable test PASSED: captured a valid frame.")
+
+
+def main() -> None:
+    """Parse CLI arguments and run the ZED cable test."""
+    parser = argparse.ArgumentParser(
+        description="Test a ZED camera cable by capturing and validating one frame."
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to save the captured frame as PNG (e.g. logs/cable_frame.png).",
+    )
+    args = parser.parse_args()
+    run(output=args.output)
+
+
+if __name__ == "__main__":
+    main()

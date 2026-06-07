@@ -2,9 +2,9 @@
 Test script: connect to a ZED stream and save one frame as a PNG.
 
 Usage:
-    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000
-    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000 --output logs/frame.png
-    python -m almond_axol.test.zed --host 192.168.10.1 --port 30000 --setup-ip eth0
+    python -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000
+    python -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000 --output logs/frame.png
+    python -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000 --setup-ip eth0
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.setup_ip:
-        from ..shared import setup_link_ip
+        from ...shared import setup_link_ip
 
         setup_link_ip(args.setup_ip, _RECEIVER_IP)
 
