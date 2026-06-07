@@ -15,11 +15,18 @@ stops ``axol`` commands as subprocesses.
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 import threading
 import time
 import webbrowser
 from pathlib import Path
+
+# Share the VR server's self-signed certificate so a single cert acceptance
+# covers both the teleop WSS link and this control-panel API.
+_CERTS_DIR = os.path.join(os.path.expanduser("~"), ".almond", "vr", "certs")
+_CERTFILE = os.path.join(_CERTS_DIR, "cert.pem")
+_KEYFILE = os.path.join(_CERTS_DIR, "key.pem")
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -43,6 +50,15 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "--no-open",
         action="store_true",
         help="Do not open a browser window on startup.",
+    )
+    parser.add_argument(
+        "--no-tls",
+        action="store_true",
+        help=(
+            "Serve plain HTTP instead of HTTPS. TLS is on by default so a "
+            "browser on an HTTPS site (e.g. axol.almond.bot) can reach this "
+            "machine without mixed-content blocking."
+        ),
     )
     parser.set_defaults(func=run)
 
@@ -73,11 +89,23 @@ def run(args: argparse.Namespace) -> None:
     static_dir = _find_static_dir()
     app = create_app(static_dir)
 
-    local = f"http://localhost:{args.port}"
+    tls = not args.no_tls
+    ssl_kwargs: dict[str, str] = {}
+    if tls:
+        _ensure_cert()
+        ssl_kwargs = {"ssl_certfile": _CERTFILE, "ssl_keyfile": _KEYFILE}
+    scheme = "https" if tls else "http"
+
+    local = f"{scheme}://localhost:{args.port}"
     print("Axol control panel:")
     print(f"  Local : {local}")
     if args.host == "0.0.0.0":
-        print(f"  LAN   : http://{_local_ip()}:{args.port}")
+        print(f"  LAN   : {scheme}://{_local_ip()}:{args.port}")
+    if tls:
+        print(
+            "  (self-signed TLS — to connect from a browser on another machine, "
+            "open the LAN URL once and accept the certificate; --no-tls disables)"
+        )
     if static_dir is None:
         print(
             "  (web UI not built — run `npm install && npm run build` in web/; "
@@ -87,7 +115,17 @@ def run(args: argparse.Namespace) -> None:
     if not args.no_open:
         _open_browser_when_ready(local)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", **ssl_kwargs)
+
+
+def _ensure_cert() -> None:
+    """Generate the shared self-signed cert on first use (idempotent)."""
+    if os.path.isfile(_CERTFILE) and os.path.isfile(_KEYFILE):
+        return
+    from ..vr.certs import create_self_signed_cert
+
+    print("Generating self-signed TLS certificate ...")
+    create_self_signed_cert(_CERTFILE, _KEYFILE)
 
 
 def _open_browser_when_ready(url: str) -> None:

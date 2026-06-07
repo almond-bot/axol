@@ -54,6 +54,38 @@ export type FormValue = string | boolean
 
 const MAX_LINES = 5000
 
+// All API/WebSocket calls target this base (the machine running `axol serve`).
+// Empty means same-origin — used when the panel is served by that machine
+// directly; the hosted site (axol.almond.bot) sets it to the entered address.
+let apiBase = ""
+
+/** Point the client at a serve address (host, host:port, or full URL). */
+export function setServerBase(host: string): void {
+  apiBase = serverHttpBase(host)
+}
+
+/**
+ * Normalize a user-entered address to an `https://host:port` origin (or "").
+ * Defaults to HTTPS + port 8090 since the local serve is TLS by default and an
+ * HTTPS page cannot call a plain-HTTP server (mixed content).
+ */
+export function serverHttpBase(host: string): string {
+  const h = host.trim()
+  if (!h) return ""
+  const withScheme = /^https?:\/\//.test(h) ? h : `https://${h}`
+  try {
+    const u = new URL(withScheme)
+    if (!u.port) u.port = "8090"
+    return u.origin
+  } catch {
+    return ""
+  }
+}
+
+function apiUrl(path: string): string {
+  return `${apiBase}${path}`
+}
+
 async function json<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
@@ -74,12 +106,12 @@ export interface ServerInfo {
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
-  return json(await fetch("/api/info"))
+  return json(await fetch(apiUrl("/api/info")))
 }
 
 /** Reach the ZED box's own `axol serve` (proxied) to validate + list ifaces. */
 export async function fetchBoxInfo(url: string): Promise<ServerInfo> {
-  return json(await fetch(`/api/zed/box-info?url=${encodeURIComponent(url)}`))
+  return json(await fetch(apiUrl(`/api/zed/box-info?url=${encodeURIComponent(url)}`)))
 }
 
 export type ZedTopology = "direct" | "lan"
@@ -99,11 +131,11 @@ export interface ZedSpec {
 }
 
 export async function fetchCommands(): Promise<CommandSpec[]> {
-  return json(await fetch("/api/commands"))
+  return json(await fetch(apiUrl("/api/commands")))
 }
 
 export async function fetchSessions(): Promise<SessionInfo[]> {
-  return json(await fetch("/api/sessions"))
+  return json(await fetch(apiUrl("/api/sessions")))
 }
 
 export async function runCommand(
@@ -112,7 +144,7 @@ export async function runCommand(
   zed?: ZedSpec
 ): Promise<SessionInfo> {
   return json(
-    await fetch("/api/run", {
+    await fetch(apiUrl("/api/run"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ command, args, zed: zed ?? null }),
@@ -121,7 +153,7 @@ export async function runCommand(
 }
 
 export async function stopSession(id: string): Promise<SessionInfo> {
-  return json(await fetch(`/api/sessions/${id}/stop`, { method: "POST" }))
+  return json(await fetch(apiUrl(`/api/sessions/${id}/stop`), { method: "POST" }))
 }
 
 export function zedCameraCount(spec: ZedSpec): number {
@@ -204,8 +236,10 @@ export function computeArgs(
 // ---------------------------------------------------------------------------
 
 function wsUrl(id: string): string {
-  const proto = window.location.protocol === "https:" ? "wss" : "ws"
-  return `${proto}://${window.location.host}/api/sessions/${id}/logs`
+  const base = apiBase || window.location.origin
+  const u = new URL(base)
+  const proto = u.protocol === "https:" ? "wss" : "ws"
+  return `${proto}://${u.host}/api/sessions/${id}/logs`
 }
 
 interface LogMessage {

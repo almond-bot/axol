@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Loader2,
   Play,
@@ -11,6 +11,7 @@ import {
   Copy,
   Check,
   ChevronRight,
+  Plug,
 } from "lucide-react"
 import {
   computeArgs,
@@ -20,6 +21,8 @@ import {
   flattenFields,
   missingRequired,
   runCommand,
+  serverHttpBase,
+  setServerBase,
   stopSession,
   useSessionLogs,
   zedMissing,
@@ -71,23 +74,32 @@ export default function ControlPanel() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [serverHost, setServerHost] = useState<string>(
-    () =>
-      localStorage.getItem("axolServerHost") ??
-      (typeof window !== "undefined" ? window.location.hostname : "")
+    () => localStorage.getItem("axolServerHost") ?? ""
   )
   const [viewerPort, setViewerPort] = useState(8080)
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [zed, setZed] = useState<ZedSpec>(() => loadZed())
+  const [conn, setConn] = useState<{
+    state: "loading" | "ok" | "err"
+    message?: string
+  }>({ state: "loading" })
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
-  useEffect(() => {
-    fetchCommands()
-      .then((cmds) => {
-        setCommands(cmds)
-        setSelectedId((prev) => prev || cmds[0]?.id || "")
-      })
-      .catch((e) => setError(String(e)))
+  const loadServer = useCallback(async (host: string) => {
+    setServerBase(host)
+    setConn({ state: "loading" })
+    setError(null)
+    try {
+      const cmds = await fetchCommands()
+      setCommands(cmds)
+      setSelectedId((prev) => prev || cmds[0]?.id || "")
+      setConn({ state: "ok" })
+    } catch (e) {
+      setConn({ state: "err", message: String(e) })
+      return
+    }
+    // Best-effort extras once the connection is known good.
     fetchSessions()
       .then((sessions) => {
         const live = sessions.find((s) => s.status === "running" || s.status === "starting")
@@ -105,16 +117,14 @@ export default function ControlPanel() {
         if (info.ethIface) {
           setZed((prev) => (prev.hostIface ? prev : { ...prev, hostIface: info.ethIface! }))
         }
-        // Adopt the detected LAN IP only if the user hasn't set one and the
-        // page was opened on the serve host itself (localhost is useless to a
-        // remote headset/browser).
-        setServerHost((prev) => {
-          if (localStorage.getItem("axolServerHost")) return prev
-          if (!prev || prev === "localhost" || prev === "127.0.0.1") return info.lanIp
-          return prev
-        })
       })
       .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    loadServer(serverHost)
+    // Only on mount — reconnects are explicit via the Server card.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   function updateServerHost(value: string) {
@@ -301,12 +311,17 @@ export default function ControlPanel() {
         </div>
 
         <div className="flex min-w-0 flex-col gap-6">
-          <ServerCard host={serverHost} onChange={updateServerHost} />
+          <ServerCard
+            host={serverHost}
+            onChange={updateServerHost}
+            conn={conn}
+            onConnect={() => loadServer(serverHost)}
+          />
           <StatusCard
             command={selected}
             session={effectiveStatus}
             overrides={overrides}
-            host={serverHost}
+            host={serverHost || hostInfo?.lanIp || ""}
             viewerPort={viewerPort}
           />
           <LogConsole lines={lines} />
@@ -452,30 +467,90 @@ function UnavailableNotice({ cmd }: { cmd: CommandSpec }) {
   )
 }
 
-function ServerCard({ host, onChange }: { host: string; onChange: (value: string) => void }) {
+function ServerCard({
+  host,
+  onChange,
+  conn,
+  onConnect,
+}: {
+  host: string
+  onChange: (value: string) => void
+  conn: { state: "loading" | "ok" | "err"; message?: string }
+  onConnect: () => void
+}) {
+  const base = serverHttpBase(host)
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>Server</CardTitle>
-        <CardDescription>
-          Address of the machine running <span className="font-mono">axol serve</span>. Used for the
-          3D viewer link and the headset connection.
-        </CardDescription>
+      <CardHeader className="flex-row items-start justify-between gap-3">
+        <div className="min-w-0">
+          <CardTitle>Server</CardTitle>
+          <CardDescription>
+            Address of the machine running <span className="font-mono">axol serve</span>. The
+            control panel sends every command there.
+          </CardDescription>
+        </div>
+        <ConnBadge state={conn.state} />
       </CardHeader>
       <CardContent className="gap-1.5">
         <Label htmlFor="server-host">Server address</Label>
-        <Input
-          id="server-host"
-          value={host}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="192.168.1.42"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-        />
+        <form
+          className="flex gap-2"
+          onSubmit={(e) => {
+            e.preventDefault()
+            onConnect()
+          }}
+        >
+          <Input
+            id="server-host"
+            value={host}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder="192.168.1.42"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+          />
+          <Button
+            type="submit"
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            disabled={conn.state === "loading"}
+          >
+            {conn.state === "loading" ? <Loader2 className="animate-spin" /> : <Plug />}
+            Connect
+          </Button>
+        </form>
+        {conn.state === "err" && (
+          <div className="mt-1 flex flex-col gap-1 text-xs text-red-400">
+            <span className="flex items-center gap-1.5">
+              <AlertTriangle className="size-3" />
+              Can&apos;t reach {base || "the server"}.
+            </span>
+            {base && (
+              <span className="text-white/45">
+                If it&apos;s running, the TLS certificate may need a one-time approval — open{" "}
+                <a
+                  href={base}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[#eff483] underline underline-offset-2"
+                >
+                  {base}
+                </a>{" "}
+                in a new tab, accept the warning, then Connect again.
+              </span>
+            )}
+          </div>
+        )}
       </CardContent>
     </Card>
   )
+}
+
+function ConnBadge({ state }: { state: "loading" | "ok" | "err" }) {
+  if (state === "ok") return <Badge variant="success">Connected</Badge>
+  if (state === "err") return <Badge variant="destructive">Offline</Badge>
+  return <Badge variant="warning">Connecting…</Badge>
 }
 
 function StatusCard({
