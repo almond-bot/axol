@@ -9,6 +9,12 @@ import {
   AxolState,
   useAxolVRClient,
 } from "@almond/axol-vr-client"
+import { Headset, Loader2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
+import { Card } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
+import { SiteNav } from "@/components/site-nav"
+import { cn } from "@/lib/utils"
 
 const store = createXRStore({
   handTracking: false,
@@ -364,6 +370,54 @@ function CountdownDisplay({ recordingPendingAt }: { recordingPendingAt: number |
   )
 }
 
+function ControlHints({ title, rows }: { title: string; rows: [string, string][] }) {
+  return (
+    <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
+      <div className="mb-1.5 font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
+        {title}
+      </div>
+      <div className="flex flex-col gap-1">
+        {rows.map(([key, label]) => (
+          <div key={key} className="flex items-center gap-2">
+            <kbd className="flex size-5 items-center justify-center rounded border border-white/15 bg-white/[0.06] font-mono text-[0.65rem] text-white/70">
+              {key}
+            </kbd>
+            <span className="text-white/60">{label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
+  const meta =
+    status === AxolConnectionStatus.Open
+      ? { dot: "bg-emerald-400", ring: "bg-emerald-400/40", label: "Connected" }
+      : status === AxolConnectionStatus.Connecting
+        ? { dot: "bg-amber-400", ring: "bg-amber-400/40", label: "Connecting…" }
+        : status === AxolConnectionStatus.Failed
+          ? { dot: "bg-red-400", ring: "bg-red-400/40", label: "Connection failed" }
+          : { dot: "bg-white/40", ring: "bg-white/10", label: "Not connected" }
+
+  return (
+    <div className="flex items-center justify-center gap-2 text-sm text-white/60">
+      <span className="relative flex size-2.5">
+        {status === AxolConnectionStatus.Connecting && (
+          <span
+            className={cn(
+              "absolute inline-flex h-full w-full animate-ping rounded-full",
+              meta.ring
+            )}
+          />
+        )}
+        <span className={cn("relative inline-flex size-2.5 rounded-full", meta.dot)} />
+      </span>
+      {meta.label}
+    </div>
+  )
+}
+
 export default function App() {
   const [hostname, setHostname] = useState(() => localStorage.getItem("wsHostname") ?? "")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
@@ -375,123 +429,93 @@ export default function App() {
     connect()
   }
 
-  const isActive =
-    status === AxolConnectionStatus.Connecting || status === AxolConnectionStatus.Open
-
   return (
     <>
-      <div
-        style={{
-          position: "fixed",
-          inset: 0,
-          zIndex: 10,
-          display: "flex",
-          flexDirection: "column",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 12,
-          pointerEvents: "none",
-        }}
-      >
-        <div
-          style={{
-            pointerEvents: "auto",
-            display: "flex",
-            flexDirection: "column",
-            alignItems: "center",
-            gap: 10,
-          }}
-        >
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 12 }}>
-            <img src="/almond.svg" alt="Almond" style={{ width: 48, height: 48 }} />
-            <span style={{ fontSize: 32, fontWeight: 800 }}>Almond Axol VR</span>
-          </div>
-          {status === AxolConnectionStatus.Open && (
-            <button type="button" onClick={() => store.enterAR()}>
-              Start
-            </button>
-          )}
-          {isActive && (
-            <span
-              style={{
-                fontSize: 12,
-                opacity: 0.9,
-                color: status === AxolConnectionStatus.Open ? "#4ade80" : "#eab308",
-              }}
-            >
-              {status === AxolConnectionStatus.Open ? "● Connected" : "○ Connecting…"}
-            </span>
-          )}
-          {!isActive && (
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                handleConnect()
-              }}
-              style={{ display: "flex", alignItems: "center", gap: 6 }}
-            >
-              <input
-                type="text"
-                value={hostname}
-                onChange={(e) => setHostname(e.target.value)}
-                placeholder="workstation.local"
-                style={{
-                  fontSize: 12,
-                  padding: "4px 8px",
-                  borderRadius: 4,
-                  border: "1px solid #333",
-                  background: "#1e1e1e",
-                  color: "white",
-                  width: 160,
+      <div className="pointer-events-none fixed inset-0 z-10 flex flex-col bg-[#121212]/70 backdrop-blur-sm">
+        <div className="pointer-events-auto">
+          <SiteNav current="vr" />
+        </div>
+        <div className="flex flex-1 items-center justify-center p-6">
+          <Card className="pointer-events-auto w-full max-w-sm gap-6">
+            <div className="flex flex-col items-center gap-3 text-center">
+              <img src="/almond.svg" alt="Almond" className="h-12 w-12" />
+              <div>
+                <h1 className="font-heading text-2xl font-bold tracking-tight">Almond Axol</h1>
+                <p className="text-sm text-white/40">VR teleoperation</p>
+              </div>
+            </div>
+
+            <ConnectionStatus status={status} />
+
+            {status === AxolConnectionStatus.Open ? (
+              <div className="flex flex-col gap-2">
+                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
+                  <Headset />
+                  Enter VR
+                </Button>
+                <Button variant="ghost" className="w-full" onClick={disconnect}>
+                  Disconnect
+                </Button>
+              </div>
+            ) : status === AxolConnectionStatus.Connecting ? (
+              <Button variant="secondary" className="w-full" onClick={disconnect}>
+                <Loader2 className="animate-spin" />
+                Cancel
+              </Button>
+            ) : (
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  handleConnect()
                 }}
-              />
-              <button
-                type="submit"
-                style={{ padding: "4px 10px", fontSize: 12, cursor: "pointer" }}
+                className="flex flex-col gap-2"
               >
-                Connect
-              </button>
-            </form>
-          )}
-          {isActive && (
-            <button
-              type="button"
-              onClick={disconnect}
-              style={{ padding: "4px 10px", fontSize: 12, cursor: "pointer" }}
-            >
-              Disconnect
-            </button>
-          )}
-          {status === AxolConnectionStatus.Open && (
-            <div style={{ display: "flex", gap: 16, fontSize: 14, color: "#9ca3af", marginTop: 8 }}>
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>LEFT</div>
-                <div>[Y] Exit VR</div>
-                <div>[X] Reset Pose</div>
+                <label
+                  htmlFor="vr-host"
+                  className="text-xs font-medium tracking-widest text-white/40 uppercase"
+                >
+                  Server address
+                </label>
+                <Input
+                  id="vr-host"
+                  type="text"
+                  value={hostname}
+                  onChange={(e) => setHostname(e.target.value)}
+                  placeholder="workstation.local"
+                />
+                <Button type="submit" className="w-full" disabled={!hostname.trim()}>
+                  Connect
+                </Button>
+              </form>
+            )}
+
+            {status === AxolConnectionStatus.Open && (
+              <div className="grid grid-cols-2 gap-3 text-left text-xs">
+                <ControlHints
+                  title="Left"
+                  rows={[
+                    ["Y", "Exit VR"],
+                    ["X", "Reset pose"],
+                  ]}
+                />
+                <ControlHints
+                  title="Right"
+                  rows={[
+                    ["B", "Toggle mode"],
+                    ["A", "Start / stop rec"],
+                  ]}
+                />
               </div>
-              <div style={{ width: 1, background: "#9ca3af", alignSelf: "stretch" }} />
-              <div style={{ textAlign: "center" }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>RIGHT</div>
-                <div>[B] Toggle Mode</div>
-                <div>[A] Start / Stop Rec</div>
-              </div>
-            </div>
-          )}
-          {status === AxolConnectionStatus.Failed && (
-            <div
-              style={{
-                fontSize: 12,
-                color: "#f87171",
-                padding: "6px 10px",
-                background: "rgba(248, 113, 113, 0.15)",
-                borderRadius: 6,
-                maxWidth: 280,
-                textAlign: "center",
-              }}
-            >
-              Could not connect to {hostname}. Check that the server is running.
-            </div>
-          )}
+            )}
+
+            {status === AxolConnectionStatus.Failed && (
+              <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
+                Could not connect to <span className="font-mono">{hostname || "the server"}</span>.
+                Check that <span className="font-mono">axol serve</span> is running on your
+                workstation.
+              </p>
+            )}
+          </Card>
         </div>
       </div>
 
