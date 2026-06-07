@@ -11,6 +11,7 @@ fields whose type is inferred from the default value.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import json
 from dataclasses import MISSING
@@ -48,14 +49,23 @@ _KNOWN_OPTIONS: dict[str, list[str]] = {
 
 
 class Schema:
-    """A command's form schema plus the data needed to validate submissions."""
+    """A command's form schema plus the data needed to rebuild its argv.
+
+    ``emit`` maps each leaf key to a recipe describing how that form value is
+    turned into CLI tokens (see :func:`build_argv`). draccus commands use dotted
+    ``--section.field value`` options; argparse commands use their own flags,
+    store_true switches, positionals, and choice groups.
+    """
 
     def __init__(
-        self, nodes: list[dict[str, Any]], leaf_keys: set[str], required: list[str]
+        self,
+        nodes: list[dict[str, Any]],
+        required: list[str],
+        emit: dict[str, dict[str, Any]],
     ) -> None:
         self.nodes = nodes
-        self.leaf_keys = leaf_keys
         self.required = required
+        self.emit = emit
 
 
 def _humanize(key: str) -> str:
@@ -134,4 +144,167 @@ def build_schema(config_class: type) -> Schema:
     nodes = [_make_node("", k, v, required) for k, v in encoded.items()]
     leaf_keys: set[str] = set()
     _collect_leaf_keys(nodes, leaf_keys)
-    return Schema(nodes=nodes, leaf_keys=leaf_keys, required=sorted(required))
+    # Every draccus leaf is a dotted ``--key value`` override.
+    emit = {key: {"t": "opt", "flag": f"--{key}"} for key in leaf_keys}
+    return Schema(nodes=nodes, required=sorted(required), emit=emit)
+
+
+# ---------------------------------------------------------------------------
+# argparse commands
+# ---------------------------------------------------------------------------
+
+
+def build_argparse_schema(add_parser: Any) -> Schema:
+    """Build a form :class:`Schema` from an argparse subcommand.
+
+    ``add_parser`` is the module's ``add_parser(subparsers)`` registrar; we run
+    it against a throwaway parser, then introspect the resulting subparser's
+    actions. Each flag/option/positional becomes a flat field (no nesting), and
+    a required mutually-exclusive group of switches (e.g. ``--l`` / ``--r``)
+    collapses into a single required dropdown.
+    """
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers()
+    add_parser(sub)
+    cmd_parser = next(iter(sub.choices.values()))
+
+    nodes: list[dict[str, Any]] = []
+    required: list[str] = []
+    emit: dict[str, dict[str, Any]] = {}
+
+    grouped: dict[int, argparse._MutuallyExclusiveGroup] = {}
+    for group in cmd_parser._mutually_exclusive_groups:
+        for action in group._group_actions:
+            grouped[id(action)] = group
+    handled_groups: set[int] = set()
+
+    for action in cmd_parser._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        group = grouped.get(id(action))
+        if group is not None:
+            if id(group) in handled_groups:
+                continue
+            handled_groups.add(id(group))
+            node, key, spec, is_req = _make_group_field(group)
+        else:
+            node, key, spec, is_req = _make_action_field(action)
+        if node is None:
+            continue
+        nodes.append(node)
+        emit[key] = spec
+        if is_req:
+            required.append(key)
+
+    return Schema(nodes=nodes, required=required, emit=emit)
+
+
+def _make_group_field(
+    group: argparse._MutuallyExclusiveGroup,
+) -> tuple[dict[str, Any] | None, str, dict[str, Any], bool]:
+    """Collapse a mutually-exclusive switch group into one dropdown field."""
+    actions = group._group_actions
+    dests = [a.dest for a in actions]
+    flags = {a.dest: a.option_strings[0] for a in actions if a.option_strings}
+
+    # The common left/right arm selector gets friendly labels.
+    if set(dests) == {"l", "r"}:
+        key, label = "arm", "Arm"
+        options = ["left", "right"]
+        value_to_flag = {"left": flags["l"], "right": flags["r"]}
+    else:
+        key = "__" + "_".join(dests)
+        label = " / ".join(dests)
+        options = dests
+        value_to_flag = {d: flags[d] for d in dests}
+
+    required = bool(group.required)
+    node = {
+        "kind": "field",
+        "key": key,
+        "label": label,
+        "type": "select",
+        "default": None if required else "",
+        "options": options,
+        "required": required,
+        "help": None,
+    }
+    return node, key, {"t": "choice", "map": value_to_flag}, required
+
+
+def _make_action_field(
+    action: argparse.Action,
+) -> tuple[dict[str, Any] | None, str, dict[str, Any], bool]:
+    key = action.dest
+    label = _humanize(key)
+    required = bool(getattr(action, "required", False))
+    help_text = action.help or None
+
+    # store_true / store_false switches → boolean toggle.
+    if isinstance(action, argparse._StoreTrueAction):
+        node = _field(
+            key, label, "boolean", bool(action.default), None, False, help_text
+        )
+        return node, key, {"t": "flag", "flag": action.option_strings[0]}, False
+    if isinstance(action, argparse._StoreFalseAction):
+        node = _field(
+            key, label, "boolean", bool(action.default), None, False, help_text
+        )
+        return node, key, {"t": "flag_off", "flag": action.option_strings[0]}, False
+
+    options = list(action.choices) if action.choices else None
+    ftype = "select" if options else _arg_value_type(action)
+    is_list = action.nargs in ("+", "*")
+    default = _arg_default(action, ftype, is_list, required)
+
+    if not action.option_strings:
+        # Positional argument.
+        node = _field(key, label, ftype, default, options, required, help_text)
+        return node, key, {"t": "pos"}, required
+
+    flag = action.option_strings[0]
+    spec = {"t": "optlist", "flag": flag} if is_list else {"t": "opt", "flag": flag}
+    node = _field(key, label, ftype, default, options, required, help_text)
+    return node, key, spec, required
+
+
+def _field(
+    key: str,
+    label: str,
+    ftype: str,
+    default: Any,
+    options: list[str] | None,
+    required: bool,
+    help_text: str | None,
+) -> dict[str, Any]:
+    return {
+        "kind": "field",
+        "key": key,
+        "label": label,
+        "type": ftype,
+        "default": None if required else default,
+        "options": options,
+        "required": required,
+        "help": help_text,
+    }
+
+
+def _arg_value_type(action: argparse.Action) -> str:
+    if action.type is int or action.type is float:
+        return "number"
+    return "text"
+
+
+def _arg_default(action: argparse.Action, ftype: str, is_list: bool, req: bool) -> Any:
+    if req:
+        return None
+    value = action.default
+    if value is None:
+        return None
+    if is_list and isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    if ftype == "boolean":
+        return bool(value)
+    if ftype == "number":
+        return value
+    return str(value)

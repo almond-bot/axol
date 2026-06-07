@@ -11,6 +11,8 @@ export interface SchemaField {
   default: string | number | boolean | null
   options?: string[] | null
   required: boolean
+  /** Optional one-line help (argparse commands carry their flag help). */
+  help?: string | null
 }
 
 /** A nested config section (a dataclass / dict in the config tree). */
@@ -29,6 +31,8 @@ export interface CommandSpec {
   cli: string
   label: string
   description: string
+  /** Catalog group: "Operate" | "Cameras" | "Calibrate" | "Setup". */
+  category: string
   simCapable: boolean
   requiresHardware: boolean
   available: boolean
@@ -36,6 +40,9 @@ export interface CommandSpec {
   schema: SchemaNode[]
   required: string[]
 }
+
+/** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
+export const CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "exited" | "error"
 

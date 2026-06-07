@@ -1,22 +1,26 @@
-"""The CLI commands the web control panel can launch, and how to configure them.
+"""Every ``axol`` CLI command the web control panel can launch.
 
-Each command maps to a real ``axol <cli>`` invocation. Its full configuration
-surface is introspected on demand from the command's draccus config dataclass
-(see :mod:`.introspect`) — every nested field the CLI accepts is exposed to the
-UI. ``collect-data`` / ``run-policy`` import lerobot, so their config classes
-are loaded lazily and a command is simply marked unavailable if the import
-fails (e.g. the ``lerobot`` extra isn't installed).
+Each command maps to a real ``axol <cli>`` invocation. Its configuration surface
+is introspected on demand (see :mod:`.introspect`): draccus commands expose their
+nested config dataclass; argparse commands expose their flags/options. Commands
+whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
+unavailable so the rest of the catalog still loads.
+
+``serve`` itself is intentionally absent — it is the server hosting this UI.
 """
 
 from __future__ import annotations
 
 from typing import Any, Callable
 
-from .introspect import Schema, build_schema
+from .introspect import Schema, build_argparse_schema, build_schema
+
+# Display order for the catalog's category groups.
+CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
 
 
 class CommandDef:
-    """A launchable command: its CLI name and a lazy loader for its config."""
+    """A launchable command and how to introspect its configuration."""
 
     def __init__(
         self,
@@ -24,7 +28,9 @@ class CommandDef:
         cli: str,
         label: str,
         description: str,
-        loader: Callable[[], type],
+        category: str,
+        kind: str,
+        loader: Callable[[], Any],
         *,
         sim_capable: bool = False,
         requires_hardware: bool = False,
@@ -33,46 +39,70 @@ class CommandDef:
         self.cli = cli
         self.label = label
         self.description = description
+        self.category = category
+        self.kind = kind  # "draccus" | "argparse"
         self.sim_capable = sim_capable
         self.requires_hardware = requires_hardware
         self._loader = loader
 
-    def load_config_class(self) -> type:
+    def load(self) -> Any:
+        """Return the config class (draccus) or ``add_parser`` fn (argparse)."""
         return self._loader()
 
 
-def _load_teleop() -> type:
+# -- draccus config-class loaders -------------------------------------------
+
+
+def _teleop() -> type:
     from ..cli.config import TeleopCmdConfig
 
     return TeleopCmdConfig
 
 
-def _load_gravity_comp() -> type:
+def _gravity_comp() -> type:
     from ..cli.config import GravityCompCmdConfig
 
     return GravityCompCmdConfig
 
 
-def _load_collect_data() -> type:
+def _collect_data() -> type:
     from ..cli.collect_data import CollectDataConfig
 
     return CollectDataConfig
 
 
-def _load_run_policy() -> type:
+def _run_policy() -> type:
     from ..cli.run_policy import RunPolicyConfig
 
     return RunPolicyConfig
 
 
+# -- argparse add_parser loaders --------------------------------------------
+
+
+def _argparse_loader(module: str, attr: str = "add_parser") -> Callable[[], Any]:
+    def load() -> Any:
+        import importlib
+
+        # ``module`` is relative to this package (``almond_axol.serve``); e.g.
+        # ``..cli.zed.stream`` resolves to ``almond_axol.cli.zed.stream``.
+        mod = importlib.import_module(module, __package__)
+        return getattr(mod, attr)
+
+    return load
+
+
 COMMANDS: dict[str, CommandDef] = {
+    # -- Operate ------------------------------------------------------------
     "teleop": CommandDef(
         "teleop",
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
         "browser without hardware.",
-        _load_teleop,
+        "Operate",
+        "draccus",
+        _teleop,
         sim_capable=True,
     ),
     "gravity-comp": CommandDef(
@@ -80,7 +110,9 @@ COMMANDS: dict[str, CommandDef] = {
         "gravity-comp",
         "Gravity compensation",
         "Hold the arms in gravity-comp so they can be moved by hand.",
-        _load_gravity_comp,
+        "Operate",
+        "draccus",
+        _gravity_comp,
         requires_hardware=True,
     ),
     "collect-data": CommandDef(
@@ -88,7 +120,9 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "Collect data",
         "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
-        _load_collect_data,
+        "Operate",
+        "draccus",
+        _collect_data,
         requires_hardware=True,
     ),
     "run-policy": CommandDef(
@@ -96,7 +130,122 @@ COMMANDS: dict[str, CommandDef] = {
         "run-policy",
         "Run policy",
         "Run a trained policy on the robot via LeRobot async inference.",
-        _load_run_policy,
+        "Operate",
+        "draccus",
+        _run_policy,
+        requires_hardware=True,
+    ),
+    # -- Cameras ------------------------------------------------------------
+    "zed.stream": CommandDef(
+        "zed.stream",
+        "zed.stream",
+        "Stream cameras",
+        "Stream the ZED-X One cameras over the network (run on the ZED box).",
+        "Cameras",
+        "argparse",
+        _argparse_loader("..cli.zed.stream"),
+        requires_hardware=True,
+    ),
+    "zed.sync-clocks": CommandDef(
+        "zed.sync-clocks",
+        "zed.sync-clocks",
+        "Sync clocks",
+        "PTP-sync this machine's clock with the ZED box for accurate timestamps.",
+        "Cameras",
+        "argparse",
+        _argparse_loader("..cli.zed.sync_clocks"),
+        requires_hardware=True,
+    ),
+    "zed.install": CommandDef(
+        "zed.install",
+        "zed.install",
+        "Install pyzed",
+        "Download and install the pyzed wheel matching the installed ZED SDK.",
+        "Cameras",
+        "argparse",
+        _argparse_loader("..cli.zed.install"),
+        requires_hardware=True,
+    ),
+    # -- Calibrate ----------------------------------------------------------
+    "tune.pid": CommandDef(
+        "tune.pid",
+        "tune.pid",
+        "Tune PID",
+        "Tune Kp/Kd for a single joint via sine or step tracking.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.tune.pid"),
+        requires_hardware=True,
+    ),
+    "tune.friction": CommandDef(
+        "tune.friction",
+        "tune.friction",
+        "Tune friction",
+        "Identify the friction-model parameters (Fc, k, Fv, Fo) for one joint.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.tune.friction"),
+        requires_hardware=True,
+    ),
+    "tune.repeatability": CommandDef(
+        "tune.repeatability",
+        "tune.repeatability",
+        "Repeatability",
+        "Drive between rest and a crossed-arms touching pose to measure repeatability.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.tune.repeatability"),
+        requires_hardware=True,
+    ),
+    "motor.set-zero-pos": CommandDef(
+        "motor.set-zero-pos",
+        "motor.set-zero-pos",
+        "Set zero position",
+        "Set a motor's zero, or walk every joint with guided end-stop zeroing.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.set_zero_pos"),
+        requires_hardware=True,
+    ),
+    "motor.set-can-id": CommandDef(
+        "motor.set-can-id",
+        "motor.set-can-id",
+        "Set CAN ID",
+        "Change a motor's CAN ID and persist it to flash.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.set_can_id"),
+        requires_hardware=True,
+    ),
+    "motor.info": CommandDef(
+        "motor.info",
+        "motor.info",
+        "Motor info",
+        "Read a motor's status to verify it is reachable at a CAN ID.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.info"),
+        requires_hardware=True,
+    ),
+    # -- Setup --------------------------------------------------------------
+    "can.setup": CommandDef(
+        "can.setup",
+        "can.setup",
+        "CAN setup",
+        "Name the CAN interfaces and register a @reboot bring-up entry.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.can.setup"),
+        requires_hardware=True,
+    ),
+    "can.enable": CommandDef(
+        "can.enable",
+        "can.enable",
+        "CAN enable",
+        "Bring up the CAN interfaces using the saved startup script.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.can.enable"),
         requires_hardware=True,
     ),
 }
@@ -108,12 +257,16 @@ _schema_cache: dict[str, Schema] = {}
 def get_schema(command_id: str) -> Schema:
     """Return (and memoize) the form schema for a command.
 
-    May raise ``ImportError`` (lerobot missing) or other errors while building
-    the config — callers that just want to list commands should catch those.
+    May raise ``ImportError`` (missing hardware extra) or other errors while
+    building the config — callers listing commands should catch those.
     """
     if command_id not in _schema_cache:
         cmd = COMMANDS[command_id]
-        _schema_cache[command_id] = build_schema(cmd.load_config_class())
+        loaded = cmd.load()
+        if cmd.kind == "draccus":
+            _schema_cache[command_id] = build_schema(loaded)
+        else:
+            _schema_cache[command_id] = build_argparse_schema(loaded)
     return _schema_cache[command_id]
 
 
@@ -126,6 +279,7 @@ def command_specs() -> list[dict[str, Any]]:
             "cli": cmd.cli,
             "label": cmd.label,
             "description": cmd.description,
+            "category": cmd.category,
             "simCapable": cmd.sim_capable,
             "requiresHardware": cmd.requires_hardware,
         }
@@ -144,8 +298,12 @@ def command_specs() -> list[dict[str, Any]]:
     return specs
 
 
+def _truthy(value: Any) -> bool:
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
 def _format_value(value: Any) -> str | None:
-    """Render a submitted form value as a draccus CLI token (or omit it)."""
+    """Render a submitted form value as a CLI token (or omit it)."""
     if value is None:
         return None
     if isinstance(value, bool):
@@ -157,21 +315,44 @@ def _format_value(value: Any) -> str | None:
 
 
 def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
-    """Translate submitted form values into a draccus-style argv tail.
+    """Translate submitted form values into an argv tail for the command.
 
-    Only keys that exist as leaves in the command's schema are forwarded, so
-    the UI can't inject arbitrary CLI arguments.
+    Each key is emitted per its schema recipe (see :class:`Schema`): dotted
+    draccus options, argparse flags/options/lists, choice switches, and
+    positionals. Keys not present in the schema are ignored so the UI cannot
+    inject arbitrary arguments.
     """
     if command_id not in COMMANDS:
         raise KeyError(command_id)
-    allowed = get_schema(command_id).leaf_keys
+    emit = get_schema(command_id).emit
 
-    argv: list[str] = []
+    options: list[str] = []
+    positionals: list[str] = []
     for key, raw in args.items():
-        if key not in allowed:
+        spec = emit.get(key)
+        if spec is None:
             continue
-        token = _format_value(raw)
-        if token is None:
-            continue
-        argv.extend((f"--{key}", token))
-    return argv
+        kind = spec["t"]
+        if kind == "flag":
+            if _truthy(raw):
+                options.append(spec["flag"])
+        elif kind == "flag_off":
+            if not _truthy(raw):
+                options.append(spec["flag"])
+        elif kind == "choice":
+            flag = spec["map"].get(str(raw).strip())
+            if flag:
+                options.append(flag)
+        elif kind == "optlist":
+            text = str(raw).strip()
+            if text:
+                options.extend([spec["flag"], *text.split()])
+        elif kind == "pos":
+            token = _format_value(raw)
+            if token is not None:
+                positionals.append(token)
+        else:  # "opt"
+            token = _format_value(raw)
+            if token is not None:
+                options.extend([spec["flag"], token])
+    return [*options, *positionals]

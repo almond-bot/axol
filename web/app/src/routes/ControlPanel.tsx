@@ -1,18 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import {
-  Loader2,
-  Play,
-  Square,
-  Terminal,
-  Boxes,
-  ExternalLink,
-  AlertTriangle,
-  Rocket,
-  Copy,
-  Check,
-  ChevronRight,
-  Plug,
-} from "lucide-react"
+import { Loader2, Play, Square, Terminal, ExternalLink, AlertTriangle } from "lucide-react"
 import {
   computeArgs,
   fetchCommands,
@@ -21,7 +8,6 @@ import {
   flattenFields,
   missingRequired,
   runCommand,
-  serverHttpBase,
   setServerBase,
   stopSession,
   useSessionLogs,
@@ -34,11 +20,11 @@ import {
 } from "@/lib/supervisor"
 import { ConfigForm } from "@/components/config-form"
 import { ZedOrchestration } from "@/components/zed-orchestration"
+import { CommandCatalog } from "@/components/command-catalog"
+import { SetupDialog, ConnectionPill, type ConnState } from "@/components/setup-dialog"
 import { SiteNav } from "@/components/site-nav"
 import { Button, buttonVariants } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
+import { Card, CardContent } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 
@@ -79,10 +65,8 @@ export default function ControlPanel() {
   const [viewerPort, setViewerPort] = useState(8080)
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [zed, setZed] = useState<ZedSpec>(() => loadZed())
-  const [conn, setConn] = useState<{
-    state: "loading" | "ok" | "err"
-    message?: string
-  }>({ state: "loading" })
+  const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
+  const [setupOpen, setSetupOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
@@ -93,9 +77,11 @@ export default function ControlPanel() {
     try {
       const cmds = await fetchCommands()
       setCommands(cmds)
-      setSelectedId((prev) => prev || cmds[0]?.id || "")
+      setSelectedId((prev) => prev || cmds.find((c) => c.available)?.id || cmds[0]?.id || "")
       setConn({ state: "ok" })
+      setSetupOpen(false)
     } catch (e) {
+      setCommands([])
       setConn({ state: "err", message: String(e) })
       return
     }
@@ -113,7 +99,6 @@ export default function ControlPanel() {
       .then((info) => {
         setViewerPort(info.viewerPort)
         setHostInfo(info)
-        // Default the host's ZED-link interface to the detected one (once).
         if (info.ethIface) {
           setZed((prev) => (prev.hostIface ? prev : { ...prev, hostIface: info.ethIface! }))
         }
@@ -123,7 +108,7 @@ export default function ControlPanel() {
 
   useEffect(() => {
     loadServer(serverHost)
-    // Only on mount — reconnects are explicit via the Server card.
+    // Only on mount — reconnects are explicit via the setup dialog.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -153,6 +138,8 @@ export default function ControlPanel() {
 
   const effectiveStatus = status ?? session
   const isLive = effectiveStatus?.status === "running" || effectiveStatus?.status === "starting"
+  // A live session belongs to whichever command spawned it, not the one being viewed.
+  const liveHere = isLive && effectiveStatus?.command === selected?.id
 
   const isZedCmd = !!selected && ZED_COMMANDS.has(selected.id)
   const zedActive = isZedCmd && zed.enabled
@@ -221,229 +208,191 @@ export default function ControlPanel() {
     }
   }
 
+  const viewerHost = serverHost || hostInfo?.lanIp || ""
+
   return (
     <div className="min-h-screen">
-      <SiteNav current="control" />
-      <main className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-6 py-8 lg:grid-cols-[400px_1fr]">
-        <div className="flex flex-col gap-6">
-          <Quickstart />
+      <SiteNav
+        current="control"
+        right={
+          <ConnectionPill state={conn.state} host={serverHost} onClick={() => setSetupOpen(true)} />
+        }
+      />
+      <main className="mx-auto max-w-6xl px-6 py-8">
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[260px_1fr]">
+          <CommandCatalog
+            commands={commands}
+            selectedId={selectedId}
+            disabled={isLive}
+            connected={conn.state === "ok"}
+            onSelect={setSelectedId}
+            onOpenSetup={() => setSetupOpen(true)}
+          />
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Command</CardTitle>
-              <CardDescription>Choose what to run on the robot.</CardDescription>
-            </CardHeader>
-            <CardContent className="gap-2">
-              {commands.map((cmd) => (
-                <CommandOption
-                  key={cmd.id}
-                  cmd={cmd}
-                  selected={cmd.id === selectedId}
-                  disabled={isLive}
-                  onSelect={() => setSelectedId(cmd.id)}
-                />
-              ))}
-            </CardContent>
-          </Card>
+          <div className="flex min-w-0 flex-col gap-6">
+            {selected ? (
+              <>
+                <Card className="gap-0 p-0">
+                  <div className="flex flex-col gap-4 border-b border-white/10 p-5 sm:flex-row sm:items-start sm:justify-between">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <h2 className="font-heading text-lg font-semibold">{selected.label}</h2>
+                        <StatusBadge session={liveHere ? effectiveStatus : null} />
+                        {selected.simCapable && <Badge variant="neutral">sim</Badge>}
+                      </div>
+                      <div className="mt-0.5 font-mono text-xs text-white/40">
+                        axol {selected.cli}
+                      </div>
+                      <p className="mt-2 max-w-prose text-sm text-white/55">
+                        {selected.description}
+                      </p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {editedCount > 0 && !liveHere && selected.available && (
+                        <button
+                          type="button"
+                          onClick={resetAll}
+                          className="text-xs whitespace-nowrap text-white/40 hover:text-white/70"
+                        >
+                          Reset ({editedCount})
+                        </button>
+                      )}
+                      {liveHere ? (
+                        <Button variant="destructive" onClick={handleStop} disabled={busy}>
+                          {busy ? <Loader2 className="animate-spin" /> : <Square />}
+                          Stop
+                        </Button>
+                      ) : (
+                        <Button
+                          onClick={handleStart}
+                          disabled={busy || !selected.available || missing.length > 0 || isLive}
+                        >
+                          {busy ? <Loader2 className="animate-spin" /> : <Play />}
+                          Start
+                        </Button>
+                      )}
+                    </div>
+                  </div>
 
-          {isZedCmd && selected?.available && (
-            <ZedOrchestration
-              spec={zed}
-              onChange={patchZed}
-              hostInfo={hostInfo}
-              disabled={isLive}
-            />
-          )}
+                  <CardContent className="gap-4 p-5">
+                    {isLive && !liveHere && (
+                      <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
+                        <span className="font-mono text-amber-200">{effectiveStatus?.command}</span>{" "}
+                        is currently running. Stop it before starting another command.
+                      </p>
+                    )}
 
-          {selected && (
-            <Card>
-              <CardHeader className="flex-row items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <CardTitle>Configure</CardTitle>
-                  <CardDescription>{selected.description}</CardDescription>
-                </div>
-                {editedCount > 0 && !isLive && selected.available && (
-                  <button
-                    type="button"
-                    onClick={resetAll}
-                    className="shrink-0 text-xs whitespace-nowrap text-white/40 hover:text-white/70"
-                  >
-                    Reset all ({editedCount})
-                  </button>
-                )}
-              </CardHeader>
-              <CardContent>
-                {selected.available ? (
-                  <ConfigForm
-                    schema={selected.schema}
-                    overrides={overrides}
+                    {selected.available ? (
+                      <ConfigForm
+                        schema={selected.schema}
+                        overrides={overrides}
+                        disabled={isLive}
+                        onChange={setOverride}
+                        onReset={resetOverride}
+                      />
+                    ) : (
+                      <UnavailableNotice cmd={selected} />
+                    )}
+
+                    {missing.length > 0 && !liveHere && selected.available && (
+                      <p className="text-xs text-white/40">Required: {missing.join(", ")}</p>
+                    )}
+                    {error && <p className="text-sm text-red-400">{error}</p>}
+
+                    <RunningHints
+                      session={liveHere ? effectiveStatus : null}
+                      overrides={overrides}
+                      host={viewerHost}
+                      viewerPort={viewerPort}
+                    />
+                  </CardContent>
+                </Card>
+
+                {isZedCmd && selected.available && (
+                  <ZedOrchestration
+                    spec={zed}
+                    onChange={patchZed}
+                    hostInfo={hostInfo}
                     disabled={isLive}
-                    onChange={setOverride}
-                    onReset={resetOverride}
                   />
-                ) : (
-                  <UnavailableNotice cmd={selected} />
                 )}
 
-                <div className="flex flex-col gap-2 pt-2">
-                  {isLive ? (
-                    <Button variant="destructive" onClick={handleStop} disabled={busy}>
-                      {busy ? <Loader2 className="animate-spin" /> : <Square />}
-                      Stop
-                    </Button>
-                  ) : (
-                    <Button
-                      onClick={handleStart}
-                      disabled={busy || !selected.available || missing.length > 0}
-                    >
-                      {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                      Start
-                    </Button>
-                  )}
-                  {missing.length > 0 && !isLive && selected.available && (
-                    <p className="text-xs text-white/40">Required: {missing.join(", ")}</p>
-                  )}
-                  {error && <p className="text-sm text-red-400">{error}</p>}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </div>
-
-        <div className="flex min-w-0 flex-col gap-6">
-          <ServerCard
-            host={serverHost}
-            onChange={updateServerHost}
-            conn={conn}
-            onConnect={() => loadServer(serverHost)}
-          />
-          <StatusCard
-            command={selected}
-            session={effectiveStatus}
-            overrides={overrides}
-            host={serverHost || hostInfo?.lanIp || ""}
-            viewerPort={viewerPort}
-          />
-          <LogConsole lines={lines} />
+                <LogConsole lines={lines} />
+              </>
+            ) : (
+              <EmptyState connected={conn.state === "ok"} onOpenSetup={() => setSetupOpen(true)} />
+            )}
+          </div>
         </div>
       </main>
+
+      <SetupDialog
+        open={setupOpen}
+        onClose={() => setSetupOpen(false)}
+        host={serverHost}
+        onChangeHost={updateServerHost}
+        conn={conn}
+        onConnect={() => loadServer(serverHost)}
+      />
     </div>
   )
 }
 
-const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
-  {
-    label: "1. Install uv",
-    cmd: "curl -LsSf https://astral.sh/uv/install.sh | sh",
-  },
-  {
-    label: "2. Install the Axol CLI globally",
-    hint: "straight from GitHub",
-    cmd: 'uv tool install --python 3.13 "almond-axol[sim] @ git+ssh://git@github.com/almond-bot/axol.git"',
-  },
-  {
-    label: "3. Launch this control panel",
-    cmd: "axol serve",
-  },
-]
-
-function Quickstart() {
-  const [open, setOpen] = useState(false)
+function EmptyState({ connected, onOpenSetup }: { connected: boolean; onOpenSetup: () => void }) {
   return (
-    <Card className="gap-0 p-0">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-3 px-5 py-4 text-left"
-      >
-        <Rocket className="size-4 shrink-0 text-[#eff483]" />
-        <div className="min-w-0 flex-1">
-          <div className="font-heading text-sm font-semibold">Quickstart</div>
-          <div className="text-xs text-white/40">Install uv, the CLI, and run the server</div>
-        </div>
-        <ChevronRight
-          className={cn("size-4 shrink-0 text-white/40 transition-transform", open && "rotate-90")}
-        />
-      </button>
-      {open && (
-        <div className="flex flex-col gap-4 border-t border-white/10 p-5">
-          {QUICKSTART.map((step) => (
-            <div key={step.label} className="flex flex-col gap-1.5">
-              <div className="flex items-baseline justify-between gap-3">
-                <span className="text-sm font-medium text-white/80">{step.label}</span>
-                {step.hint && <span className="shrink-0 text-xs text-white/35">{step.hint}</span>}
-              </div>
-              <CommandLine cmd={step.cmd} />
-            </div>
-          ))}
-        </div>
-      )}
+    <Card>
+      <CardContent className="items-center gap-3 py-16 text-center">
+        <Terminal className="size-8 text-white/20" />
+        <p className="text-sm text-white/45">
+          {connected
+            ? "Pick a command from the catalog to configure and run it."
+            : "Connect to a machine running axol serve to get started."}
+        </p>
+        {!connected && (
+          <Button variant="outline" size="sm" onClick={onOpenSetup}>
+            Open setup
+          </Button>
+        )}
+      </CardContent>
     </Card>
   )
 }
 
-function CommandLine({ cmd }: { cmd: string }) {
-  const [copied, setCopied] = useState(false)
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(cmd)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // clipboard unavailable (e.g. non-secure context) — ignore.
-    }
-  }
-
-  return (
-    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
-      <code className="flex-1 overflow-x-auto font-mono text-xs whitespace-pre text-white/80">
-        {cmd}
-      </code>
-      <button
-        type="button"
-        onClick={copy}
-        title="Copy"
-        className="shrink-0 text-white/40 transition-colors hover:text-white/80"
-      >
-        {copied ? <Check className="size-4 text-[#eff483]" /> : <Copy className="size-4" />}
-      </button>
-    </div>
-  )
-}
-
-function CommandOption({
-  cmd,
-  selected,
-  disabled,
-  onSelect,
+function RunningHints({
+  session,
+  overrides,
+  host,
+  viewerPort,
 }: {
-  cmd: CommandSpec
-  selected: boolean
-  disabled: boolean
-  onSelect: () => void
+  session: SessionInfo | null
+  overrides: Overrides
+  host: string
+  viewerPort: number
 }) {
+  if (!session || session.status !== "running") return null
+  const simRunning = session.args?.sim === true || overrides.sim === true
+  const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
+
   return (
-    <button
-      type="button"
-      onClick={onSelect}
-      disabled={disabled && !selected}
-      className={cn(
-        "flex w-full items-center gap-3 rounded-lg border px-3 py-2.5 text-left transition-all",
-        selected
-          ? "border-[#eff483]/40 bg-[#eff483]/10"
-          : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]",
-        disabled && !selected && "cursor-not-allowed opacity-40"
+    <div className="flex flex-col gap-3">
+      {simRunning && viewerUrl && (
+        <a
+          href={viewerUrl}
+          target="_blank"
+          rel="noreferrer"
+          className={cn(buttonVariants({ variant: "outline", size: "sm" }), "w-fit")}
+        >
+          <ExternalLink />
+          Open 3D viewer
+        </a>
       )}
-    >
-      <Boxes className={cn("size-4 shrink-0", selected ? "text-[#eff483]" : "text-white/50")} />
-      <div className="min-w-0 flex-1">
-        <div className="text-sm font-medium">{cmd.label}</div>
-        <div className="truncate font-mono text-xs text-white/40">axol {cmd.cli}</div>
-      </div>
-      {cmd.simCapable && <Badge variant="neutral">sim</Badge>}
-      {!cmd.available && <Badge variant="warning">unavailable</Badge>}
-    </button>
+      {session.command === "teleop" && (
+        <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
+          Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
+          connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.
+        </p>
+      )}
+    </div>
   )
 }
 
@@ -452,11 +401,11 @@ function UnavailableNotice({ cmd }: { cmd: CommandSpec }) {
     <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
       <div className="flex items-center gap-2 font-medium text-amber-300/90">
         <AlertTriangle className="size-4" />
-        Not available in this environment
+        Not available on this server
       </div>
       <p className="text-white/55">
-        This command needs hardware-only dependencies that aren&apos;t installed here (e.g. the ZED
-        SDK / <span className="font-mono">lerobot</span> extra).
+        This command needs dependencies that aren&apos;t installed on the connected machine (e.g.
+        the ZED SDK / <span className="font-mono">lerobot</span> extra, or robot hardware).
       </p>
       {cmd.error && (
         <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">
@@ -467,163 +416,8 @@ function UnavailableNotice({ cmd }: { cmd: CommandSpec }) {
   )
 }
 
-function ServerCard({
-  host,
-  onChange,
-  conn,
-  onConnect,
-}: {
-  host: string
-  onChange: (value: string) => void
-  conn: { state: "loading" | "ok" | "err"; message?: string }
-  onConnect: () => void
-}) {
-  const base = serverHttpBase(host)
-  return (
-    <Card>
-      <CardHeader className="flex-row items-start justify-between gap-3">
-        <div className="min-w-0">
-          <CardTitle>Server</CardTitle>
-          <CardDescription>
-            Address of the machine running <span className="font-mono">axol serve</span>. The
-            control panel sends every command there.
-          </CardDescription>
-        </div>
-        <ConnBadge state={conn.state} />
-      </CardHeader>
-      <CardContent className="gap-1.5">
-        <Label htmlFor="server-host">Server address</Label>
-        <form
-          className="flex gap-2"
-          onSubmit={(e) => {
-            e.preventDefault()
-            onConnect()
-          }}
-        >
-          <Input
-            id="server-host"
-            value={host}
-            onChange={(e) => onChange(e.target.value)}
-            placeholder="192.168.1.42"
-            spellCheck={false}
-            autoCapitalize="off"
-            autoCorrect="off"
-          />
-          <Button
-            type="submit"
-            variant="outline"
-            size="sm"
-            className="shrink-0"
-            disabled={conn.state === "loading"}
-          >
-            {conn.state === "loading" ? <Loader2 className="animate-spin" /> : <Plug />}
-            Connect
-          </Button>
-        </form>
-        {conn.state === "err" && (
-          <div className="mt-1 flex flex-col gap-1 text-xs text-red-400">
-            <span className="flex items-center gap-1.5">
-              <AlertTriangle className="size-3" />
-              Can&apos;t reach {base || "the server"}.
-            </span>
-            {base && (
-              <span className="text-white/45">
-                If it&apos;s running, the TLS certificate may need a one-time approval — open{" "}
-                <a
-                  href={base}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="text-[#eff483] underline underline-offset-2"
-                >
-                  {base}
-                </a>{" "}
-                in a new tab, accept the warning, then Connect again.
-              </span>
-            )}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-function ConnBadge({ state }: { state: "loading" | "ok" | "err" }) {
-  if (state === "ok") return <Badge variant="success">Connected</Badge>
-  if (state === "err") return <Badge variant="destructive">Offline</Badge>
-  return <Badge variant="warning">Connecting…</Badge>
-}
-
-function StatusCard({
-  command,
-  session,
-  overrides,
-  host,
-  viewerPort,
-}: {
-  command: CommandSpec | null
-  session: SessionInfo | null
-  overrides: Overrides
-  host: string
-  viewerPort: number
-}) {
-  const simRunning =
-    session?.status === "running" && (session.args?.sim === true || overrides.sim === true)
-  const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
-
-  return (
-    <Card>
-      <CardHeader className="flex-row items-center justify-between">
-        <CardTitle>Status</CardTitle>
-        <StatusBadge session={session} />
-      </CardHeader>
-      <CardContent className="gap-3">
-        <dl className="grid grid-cols-[auto_1fr] gap-x-6 gap-y-1.5 text-sm">
-          <dt className="text-white/40">Command</dt>
-          <dd className="text-right font-mono text-white/80">
-            {session?.command ?? command?.id ?? "—"}
-          </dd>
-          <dt className="text-white/40">PID</dt>
-          <dd className="text-right font-mono text-white/80">{session?.pid ?? "—"}</dd>
-          {session?.exitCode != null && (
-            <>
-              <dt className="text-white/40">Exit code</dt>
-              <dd
-                className={cn(
-                  "text-right font-mono",
-                  session.exitCode === 0 ? "text-white/80" : "text-red-400"
-                )}
-              >
-                {session.exitCode}
-              </dd>
-            </>
-          )}
-        </dl>
-
-        {simRunning && (
-          <a
-            href={viewerUrl}
-            target="_blank"
-            rel="noreferrer"
-            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "w-full")}
-          >
-            <ExternalLink />
-            Open 3D viewer
-          </a>
-        )}
-
-        {session?.status === "running" && session.command === "teleop" && (
-          <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
-            Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
-            connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.
-          </p>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
 function StatusBadge({ session }: { session: SessionInfo | null }) {
-  if (!session) return <Badge variant="neutral">Idle</Badge>
+  if (!session) return null
   switch (session.status) {
     case "starting":
       return <Badge variant="warning">Starting</Badge>

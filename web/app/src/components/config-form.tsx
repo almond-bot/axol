@@ -177,9 +177,12 @@ function FieldRow({
   if (field.type === "boolean") {
     const checked = has ? Boolean(value) : Boolean(field.default)
     return (
-      <div className="flex items-center justify-between gap-4">
-        {labelNode}
-        <Switch checked={checked} disabled={disabled} onChange={(v) => onChange(field.key, v)} />
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between gap-4">
+          {labelNode}
+          <Switch checked={checked} disabled={disabled} onChange={(v) => onChange(field.key, v)} />
+        </div>
+        {field.help && <FieldHelp text={field.help} />}
       </div>
     )
   }
@@ -214,8 +217,13 @@ function FieldRow({
           onChange={(e) => onChange(field.key, e.target.value)}
         />
       )}
+      {field.help && <FieldHelp text={field.help} />}
     </div>
   )
+}
+
+function FieldHelp({ text }: { text: string }) {
+  return <p className="text-xs leading-snug text-white/35">{text}</p>
 }
 
 function Switch({
