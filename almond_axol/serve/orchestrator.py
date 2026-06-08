@@ -578,6 +578,10 @@ class StreamLink:
 
     async def _tail(self, remote: _Remote) -> None:
         url = f"{remote.base}/api/sessions/{remote.id}/log"
+        # Remember the box's own error so the UI can show *why* it failed (e.g.
+        # which camera serial wasn't connected) instead of a generic message.
+        last_line = ""
+        error_line = ""
         while not self._stopping:
             try:
                 data = await asyncio.to_thread(
@@ -588,11 +592,21 @@ class StreamLink:
                 continue
             for line in data.get("lines", []):
                 self._emit(line, prefix="stream")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                last_line = stripped
+                low = stripped.lower()
+                if "could not start all requested zed cameras" in low or "error" in low:
+                    error_line = stripped
             remote.offset = data.get("nextOffset", remote.offset)
             if data.get("status") in ("exited", "error") and not data.get("lines"):
                 if not self._stopping:
+                    detail = error_line or last_line
                     self._fail(
-                        "camera streaming on the ZED box exited — see the stream log"
+                        f"ZED box: {detail}"
+                        if detail
+                        else "camera streaming on the ZED box exited — see the stream log"
                     )
                 return
             await asyncio.sleep(0.5)

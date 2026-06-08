@@ -23,7 +23,6 @@ function Tile({
   pulse,
   children,
   headerRight,
-  floatChildren,
 }: {
   icon: ReactNode
   title: string
@@ -32,8 +31,6 @@ function Tile({
   pulse?: boolean
   children?: ReactNode
   headerRight?: ReactNode
-  /** Hide the actions until the tile is hovered so the label gets full width. */
-  floatChildren?: boolean
 }) {
   return (
     <div className="group relative flex min-w-0 flex-1 flex-col gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
@@ -51,13 +48,8 @@ function Tile({
           />
           <span className="truncate text-white/75">{label}</span>
         </span>
-        {!floatChildren && children}
+        {children}
       </div>
-      {floatChildren && children ? (
-        <div className="pointer-events-none absolute right-3 bottom-3 flex items-center gap-1.5 rounded-lg bg-background/90 pl-4 opacity-0 backdrop-blur-sm transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
-          {children}
-        </div>
-      ) : null}
     </div>
   )
 }
@@ -180,7 +172,6 @@ export function ConnectionsBar({
         title="ZED box"
         dot={zedDot}
         label={zedLabel}
-        floatChildren={zedConnected}
         headerRight={
           zedConnected ? (
             <div className="flex items-center gap-2">
@@ -191,13 +182,15 @@ export function ConnectionsBar({
         }
       >
         {zedConnected ? (
-          <div className="flex items-center gap-1.5">
+          <div className="relative flex items-center">
+            {/* Restart stays out of the layout (and off the hostname) until hover. */}
             <Button
               variant="outline"
               size="sm"
               onClick={onZedRestart}
               disabled={zedBusy}
               title="Restart PTP clock sync and camera streams"
+              className="pointer-events-none absolute right-full mr-1.5 opacity-0 backdrop-blur-sm transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
             >
               {zedBusy ? <Loader2 className="animate-spin" /> : <RotateCw />}
               Restart
@@ -219,56 +212,62 @@ export function ConnectionsBar({
 }
 
 /**
- * Compact PTP clock-sync state for the ZED box header. The link comes up on
- * connect, so this shows the sync settling (syncing → locked) before any task.
+ * A labelled status light: tiny dot, no text (the label is the hover tooltip),
+ * so the ZED box header stays compact and never crowds the title.
+ * Green = good, amber (pulsing) = loading/starting, red = error.
  */
-function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
-  if (!ptp) return null
-  const [dot, text, pulse] = ptp.locked
-    ? (["ok", "clock locked", false] as const)
-    : ptp.needsSudo
-      ? (["warn", "needs sudo", false] as const)
-      : ptp.error
-        ? (["err", "sync error", false] as const)
-        : ptp.running
-          ? (["warn", "syncing clocks…", true] as const)
-          : (["idle", "clock idle", false] as const)
+function StatusDot({
+  name,
+  dot,
+  label,
+  pulse,
+}: {
+  name: string
+  dot: Dot
+  label: string
+  pulse?: boolean
+}) {
   return (
     <span
-      className="flex items-center gap-1.5 whitespace-nowrap text-[0.65rem] text-white/45"
-      title={ptp.error ?? undefined}
+      className="flex items-center gap-1.5 text-[0.6rem] tracking-wide text-white/35"
+      title={label}
     >
-      <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
-      {text}
+      <span>{name}</span>
+      <span className={cn("size-2 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
     </span>
   )
 }
 
 /**
- * Compact camera-stream state for the ZED box header. Streaming starts after
- * the clocks lock for whatever serials were entered on connect; hidden when no
- * cameras are configured so the header stays uncluttered.
+ * PTP clock-sync light for the ZED box header. The link comes up on connect, so
+ * it settles (syncing → locked) before any task.
+ */
+function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
+  if (!ptp) return null
+  const [dot, label, pulse] = ptp.locked
+    ? (["ok", "Clock locked", false] as const)
+    : ptp.needsSudo
+      ? (["warn", "Clock sync needs sudo", true] as const)
+      : ptp.error
+        ? (["err", ptp.error || "Clock sync error", false] as const)
+        : (["warn", "Syncing clocks…", true] as const)
+  return <StatusDot name="clock" dot={dot} label={label} pulse={pulse} />
+}
+
+/**
+ * Camera-stream light for the ZED box header. Streaming starts after the clocks
+ * lock for whatever serials were entered on connect; hidden when no cameras are
+ * configured.
  */
 function StreamBadge({ stream }: { stream?: StreamStatus }) {
   if (!stream) return null
   if (!stream.streaming && stream.cameras.length === 0 && !stream.error) return null
-  const n = stream.cameras.length
-  const [dot, text, pulse] = stream.ready
-    ? (["ok", `${n} camera${n === 1 ? "" : "s"} live`, false] as const)
+  const [dot, label, pulse] = stream.ready
+    ? (["ok", "Cameras live", false] as const)
     : stream.error
-      ? (["err", "stream error", false] as const)
-      : stream.streaming
-        ? (["warn", "starting cameras…", true] as const)
-        : (["idle", "cameras idle", false] as const)
-  return (
-    <span
-      className="flex items-center gap-1.5 whitespace-nowrap text-[0.65rem] text-white/45"
-      title={stream.error ?? undefined}
-    >
-      <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
-      {text}
-    </span>
-  )
+      ? (["err", stream.error || "Stream error", false] as const)
+      : (["warn", "Starting cameras…", true] as const)
+  return <StatusDot name="stream" dot={dot} label={label} pulse={pulse} />
 }
 
 /**
