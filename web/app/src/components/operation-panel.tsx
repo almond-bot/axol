@@ -97,6 +97,13 @@ export function OperationPanel({
   const blockers: string[] = []
   if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
   if (meta.requiresZed && !zedOk) blockers.push("Connect the ZED box")
+  // ZED frame timestamps are only valid once both machines' clocks are
+  // PTP-locked, so collect-data / run-policy can't start until then.
+  if (meta.requiresZed && zedOk && !zedLink?.ptp?.locked) {
+    if (zedLink?.ptp?.needsSudo) blockers.push("Enter the sudo password to start PTP clock sync")
+    else if (zedLink?.ptp?.error) blockers.push(`PTP clock sync failed: ${zedLink.ptp.error}`)
+    else blockers.push("Wait for PTP clock sync to lock")
+  }
   if (meta.requiresZed && camCount === 0) blockers.push("Add at least one camera serial")
   for (const f of allFields) {
     if (f.required) {
