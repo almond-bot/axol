@@ -191,13 +191,18 @@ function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
   if (!ptp) return null
   const [dot, text, pulse] = ptp.locked
     ? (["ok", "clock locked", false] as const)
-    : ptp.error
-      ? (["err", "sync error", false] as const)
-      : ptp.running
-        ? (["warn", "syncing clocks…", true] as const)
-        : (["idle", "clock idle", false] as const)
+    : ptp.needsSudo
+      ? (["warn", "needs sudo", false] as const)
+      : ptp.error
+        ? (["err", "sync error", false] as const)
+        : ptp.running
+          ? (["warn", "syncing clocks…", true] as const)
+          : (["idle", "clock idle", false] as const)
   return (
-    <span className="flex items-center gap-1.5 text-[0.65rem] text-white/45">
+    <span
+      className="flex items-center gap-1.5 text-[0.65rem] text-white/45"
+      title={ptp.error ?? undefined}
+    >
       <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
       {text}
     </span>

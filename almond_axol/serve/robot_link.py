@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -25,6 +24,7 @@ from typing import Any
 
 from ..motor import CanBus, Joint, Motor, MotorError
 from ..shared import CAN_LEFT, CAN_RIGHT
+from ..sudo import SudoPasswordIncorrect, SudoPasswordRequired, run_root
 
 _logger = logging.getLogger(__name__)
 
@@ -45,13 +45,6 @@ STATE_ERROR = "error"
 
 # IFF_UP flag in /sys/class/net/<iface>/flags (administratively up).
 _IFF_UP = 0x1
-
-
-class SudoPasswordRequired(Exception):
-    """CAN bring-up needs root, but no (valid) sudo password was supplied.
-
-    Surfaced to the UI so it can prompt for a password and retry the connect.
-    """
 
 
 class _ArmLink:
@@ -151,6 +144,12 @@ class RobotLink:
                 self._state = STATE_DISCONNECTED
                 self._needs_sudo = True
                 self._error = "CAN bring-up needs a sudo password."
+            return self.status()
+        except SudoPasswordIncorrect:
+            with self._lock:
+                self._state = STATE_ERROR
+                self._needs_sudo = False
+                self._error = "Incorrect sudo password."
             return self.status()
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
             with self._lock:
@@ -313,51 +312,26 @@ class RobotLink:
         Order of attempts:
           1. If the interfaces are already up, do nothing (common case: cron
              brought them up at boot).
-          2. Run the startup script under passwordless sudo (``sudo -n``).
-          3. If that fails for lack of a password, either raise
-             :class:`SudoPasswordRequired` (no password supplied) or retry with
-             ``sudo -S`` feeding the supplied password on stdin.
+          2. If CAN was never configured on this machine, run the full
+             ``can.setup`` (udev rules, persistent names, @reboot bring-up)
+             non-interactively — it may not have been set up before.
+          3. Otherwise just run the persisted startup script.
+
+        Privileged steps escalate through :func:`run_root`, which raises
+        :class:`SudoPasswordRequired` when a password is needed but absent (the
+        UI then prompts) or :class:`SudoPasswordIncorrect` when it's wrong.
         """
         if self._can_already_up():
             _logger.info("CAN interfaces already up; skipping bring-up.")
             return
 
-        from ..cli.can.setup import _CRON_SCRIPT
+        from ..cli.can.setup import _CRON_SCRIPT, ensure_setup, is_configured
 
-        if not _CRON_SCRIPT.exists():
-            _logger.info(
-                "CAN startup script missing (%s); assuming interfaces are "
-                "managed elsewhere. Run `axol can.setup` to generate it.",
-                _CRON_SCRIPT,
-            )
+        if not is_configured():
+            _logger.info("CAN not configured yet; running can.setup.")
+            ensure_setup(password=sudo_password)
+            _logger.info("CAN setup complete; interfaces brought up.")
             return
 
-        script_cmd = ["bash", str(_CRON_SCRIPT)]
-
-        # Attempt 1: passwordless sudo (configured NOPASSWD or cached creds).
-        probe = subprocess.run(
-            ["sudo", "-n", *script_cmd],
-            capture_output=True,
-            text=True,
-        )
-        if probe.returncode == 0:
-            _logger.info("CAN interfaces brought up.")
-            return
-
-        # A password is required.
-        if not sudo_password:
-            raise SudoPasswordRequired()
-
-        result = subprocess.run(
-            ["sudo", "-S", "-p", "", *script_cmd],
-            input=f"{sudo_password}\n",
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip().splitlines()
-            detail = stderr[-1] if stderr else f"exit code {result.returncode}"
-            if "incorrect password" in detail.lower() or "try again" in detail.lower():
-                raise RuntimeError("Incorrect sudo password.")
-            raise RuntimeError(f"CAN bring-up failed: {detail}")
+        run_root(["bash", str(_CRON_SCRIPT)], password=sudo_password, check=True)
         _logger.info("CAN interfaces brought up.")

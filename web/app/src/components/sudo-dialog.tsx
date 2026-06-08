@@ -16,12 +16,14 @@ export function SudoDialog({
   error,
   onClose,
   onSubmit,
+  message = "Bringing up the CAN interfaces needs root. Enter your sudo password to continue — it\u2019s used once and not stored.",
 }: {
   open: boolean
   busy: boolean
   error: string | null
   onClose: () => void
   onSubmit: (password: string) => void
+  message?: string
 }) {
   const [password, setPassword] = useState("")
 
@@ -63,10 +65,7 @@ export function SudoDialog({
         </div>
 
         <div className="flex flex-col gap-5 p-5">
-          <p className="text-xs text-white/45">
-            Bringing up the CAN interfaces needs root. Enter your sudo password to continue —
-            it&apos;s used once and not stored.
-          </p>
+          <p className="text-xs text-white/45">{message}</p>
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="sudo-password">Password</Label>

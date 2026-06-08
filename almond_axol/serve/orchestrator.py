@@ -34,6 +34,21 @@ import urllib.request
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
+from ..sudo import (
+    SUDO_BAD_PASSWORD_CODE as _SUDO_BAD_PASSWORD_CODE,
+)
+from ..sudo import (
+    SUDO_BAD_PASSWORD_MARKER as _SUDO_BAD_PASSWORD_MARKER,
+)
+from ..sudo import (
+    SUDO_PASSWORD_ENV as _SUDO_PASSWORD_ENV,
+)
+from ..sudo import (
+    SUDO_REQUIRED_CODE as _SUDO_REQUIRED_CODE,
+)
+from ..sudo import (
+    SUDO_REQUIRED_MARKER as _SUDO_REQUIRED_MARKER,
+)
 from .commands import build_argv
 from .manager import Session, pump_into, spawn_proc
 from .netdetect import best_eth_iface, iface_for_route
@@ -149,6 +164,8 @@ class PtpLink:
         self._ptp_samples = 0
         self._offset_ns: int | None = None
         self._stopping = False
+        self._needs_sudo = False
+        self._bad_password = False
         self._lock = asyncio.Lock()
 
     @property
@@ -161,21 +178,39 @@ class PtpLink:
         return self._locked.is_set()
 
     def status(self) -> dict[str, Any]:
+        s = self.session
+        error = s.error if (s is not None and s.status == "error") else None
         return {
             "running": self.running,
             "locked": self.locked,
             "offsetNs": self._offset_ns,
-            "sessionId": self.session.id if self.session else None,
+            "sessionId": s.id if s else None,
+            # The PTP daemons need root; when passwordless sudo isn't available
+            # (or the supplied password was wrong) the UI prompts for one.
+            "needsSudo": self._needs_sudo or self._bad_password,
+            "badPassword": self._bad_password,
+            # Surface a failed link (e.g. the ptp4l/phc2sys daemons exiting) so
+            # the UI shows "sync error" with a reason instead of "idle".
+            "error": error,
         }
 
-    async def start(self, box_url: str) -> dict[str, Any]:
-        """Bring up the master (local) + slave (box) PTP daemons. Idempotent."""
+    async def start(
+        self, box_url: str, sudo_password: str | None = None
+    ) -> dict[str, Any]:
+        """Bring up the master (local) + slave (box) PTP daemons. Idempotent.
+
+        ``sudo_password`` (when supplied) is forwarded to both the local daemons
+        and the box's so PTP can escalate without a tty; it's used once per
+        daemon launch and never stored.
+        """
         await self.stop()
         async with self._lock:
             self._stopping = False
             self._locked.clear()
             self._ptp_samples = 0
             self._offset_ns = None
+            self._needs_sudo = False
+            self._bad_password = False
             self.box = _normalize_url(box_url)
             if not self.box:
                 return {
@@ -202,17 +237,19 @@ class PtpLink:
             session.emit(
                 f"[serve] PTP clock sync starting (host interface {host_iface})"
             )
+            env_extra = {_SUDO_PASSWORD_ENV: sudo_password} if sudo_password else None
             try:
                 self._master_proc = await spawn_proc(
-                    ["zed.sync-clocks", "--role", "master", "--iface", host_iface]
+                    ["zed.sync-clocks", "--role", "master", "--iface", host_iface],
+                    env_extra,
                 )
             except OSError as exc:
                 self._fail(f"failed to start host PTP master: {exc}")
                 return {"running": False, "locked": False, "error": str(exc)}
-            self._spawn(pump_into(self._master_proc, session, prefix="master-sync"))
+            self._spawn(self._run_master(self._master_proc))
 
             try:
-                self._slave = await self._box_slave(box_host)
+                self._slave = await self._box_slave(box_host, sudo_password)
             except OrchestrationError as exc:
                 self._fail(str(exc))
                 return {"running": False, "locked": False, "error": str(exc)}
@@ -240,6 +277,8 @@ class PtpLink:
             session.close_stream()
             self.session = None
             self._locked.clear()
+            self._needs_sudo = False
+            self._bad_password = False
 
     # -- internals ----------------------------------------------------------
 
@@ -256,9 +295,30 @@ class PtpLink:
             self.session.status = "error"
             self.session.emit(f"[serve] error: {message}")
 
-    async def _box_slave(self, box_host: str) -> _Remote:
+    async def _run_master(self, proc: asyncio.subprocess.Process) -> None:
+        """Pump the host master daemon and flag the link if it exits early."""
+        rc = await pump_into(
+            proc, self.session, prefix="master-sync", on_line=self._watch_sudo
+        )
+        if self._stopping:
+            return
+        if self._bad_password or rc == _SUDO_BAD_PASSWORD_CODE:
+            self._bad_password = True
+            self._fail("incorrect sudo password")
+        elif self._needs_sudo or rc == _SUDO_REQUIRED_CODE:
+            self._needs_sudo = True
+            self._fail("PTP needs a sudo password")
+        else:
+            self._fail(
+                f"host PTP daemon (ptp4l/phc2sys) exited with code {rc}; clocks "
+                "are not synced — see the clock-sync log"
+            )
+
+    async def _box_slave(self, box_host: str, sudo_password: str | None) -> _Remote:
         url = f"{self.box}/api/zed/sync-clocks"
-        payload = {"role": "slave", "ip": box_host}
+        payload: dict[str, Any] = {"role": "slave", "ip": box_host}
+        if sudo_password:
+            payload["password"] = sudo_password
         try:
             result = await asyncio.to_thread(_post_json, url, payload)
         except urllib.error.HTTPError as exc:
@@ -298,13 +358,27 @@ class PtpLink:
                 if self.session is not None:
                     self.session.emit(f"[slave-sync] {line}")
                 self._watch(line)
+                self._watch_sudo(line)
             remote.offset = data.get("nextOffset", remote.offset)
             if data.get("status") in ("exited", "error") and not data.get("lines"):
-                if not self._stopping and self.session is not None:
-                    self.session.emit("[serve] PTP slave on the ZED box ended")
-                    self.session.status = "error"
+                if not self._stopping:
+                    if self._bad_password:
+                        self._fail("incorrect sudo password")
+                    elif self._needs_sudo:
+                        self._fail("PTP needs a sudo password")
+                    else:
+                        self._fail(
+                            "PTP daemon on the ZED box exited; clocks are not "
+                            "synced — see the clock-sync log"
+                        )
                 return
             await asyncio.sleep(0.5)
+
+    def _watch_sudo(self, line: str) -> None:
+        if _SUDO_BAD_PASSWORD_MARKER in line:
+            self._bad_password = True
+        elif _SUDO_REQUIRED_MARKER in line:
+            self._needs_sudo = True
 
     def _watch(self, line: str) -> None:
         m = _OFFSET_RE.search(line)

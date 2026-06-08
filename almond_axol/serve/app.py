@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from ..sudo import SUDO_PASSWORD_ENV
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
@@ -66,9 +67,14 @@ class RobotConnectRequest(BaseModel):
 
 
 class ZedConnectRequest(BaseModel):
-    """Lightweight ZED box link: store url and verify reachability."""
+    """Lightweight ZED box link: store url and verify reachability.
+
+    ``password`` (optional) is forwarded to the PTP daemons on both machines
+    when passwordless sudo isn't available; used once and never stored.
+    """
 
     url: str
+    password: str | None = None
 
 
 class SyncClocksRequest(BaseModel):
@@ -84,6 +90,8 @@ class SyncClocksRequest(BaseModel):
     ip: str | None = None
     transport: str | None = None
     timestamping: str | None = None
+    # Forwarded sudo password for the box's PTP daemons (never stored).
+    password: str | None = None
 
 
 class StreamRequest(BaseModel):
@@ -240,7 +248,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             zed_state["error"] = None
             # Start clock sync immediately so the link is already locked by the
             # time a collect-data / run-policy task begins.
-            zed_state["ptp"] = await ptp.start(req.url)
+            zed_state["ptp"] = await ptp.start(req.url, req.password)
             return JSONResponse(zed_state)
         zed_state["connected"] = False
         zed_state["info"] = None
@@ -363,7 +371,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             argv += ["--transport", req.transport]
         if req.timestamping:
             argv += ["--timestamping", req.timestamping]
-        session = await manager.start_raw("zed.sync-clocks", argv)
+        env_extra = {SUDO_PASSWORD_ENV: req.password} if req.password else None
+        session = await manager.start_raw("zed.sync-clocks", argv, env_extra=env_extra)
         return JSONResponse(session.to_dict())
 
     @app.post("/api/zed/stream")

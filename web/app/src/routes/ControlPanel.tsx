@@ -19,6 +19,7 @@ import {
   startOperation,
   stopOperation,
   useSessionLogs,
+  zedConnect,
   zedDisconnect,
   type CommandSpec,
   type FormValue,
@@ -77,6 +78,9 @@ export default function ControlPanel() {
   const [sudoError, setSudoError] = useState<string | null>(null)
   const [zedLink, setZedLink] = useState<ZedLinkStatus | null>(null)
   const [zedSettings, setZedSettings] = useState<ZedSpec>(() => loadZed())
+  const [zedSudoOpen, setZedSudoOpen] = useState(false)
+  const [zedSudoBusy, setZedSudoBusy] = useState(false)
+  const [zedSudoDismissed, setZedSudoDismissed] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -244,8 +248,38 @@ export default function ControlPanel() {
   async function zedDisconnectClick() {
     try {
       setZedLink(await zedDisconnect())
+      setZedSudoOpen(false)
+      setZedSudoDismissed(false)
     } catch (e) {
       setError(String(e))
+    }
+  }
+
+  // PTP daemons need root; the box connect starts them without a password, so
+  // the "needs sudo" state surfaces via polling. Prompt once (until dismissed).
+  const zedNeedsSudo = !!zedLink?.ptp?.needsSudo
+  useEffect(() => {
+    if (zedSudoBusy) return
+    if (zedNeedsSudo && !zedSudoDismissed) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setZedSudoOpen(true)
+    } else if (!zedNeedsSudo) {
+      setZedSudoDismissed(false)
+    }
+  }, [zedNeedsSudo, zedSudoDismissed, zedSudoBusy])
+
+  async function zedSudoSubmit(password: string) {
+    setZedSudoBusy(true)
+    try {
+      const next = await zedConnect(zedLink?.boxUrl ?? "", password)
+      setZedLink(next)
+      // ptp4l validates the password asynchronously; close optimistically and
+      // let polling reopen this with an error if the password was wrong.
+      setZedSudoOpen(false)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setZedSudoBusy(false)
     }
   }
 
@@ -365,7 +399,14 @@ export default function ControlPanel() {
         open={zedDialogOpen}
         onClose={() => setZedDialogOpen(false)}
         initial={zedLink}
-        onConnected={setZedLink}
+        defaultUrl={zedSettings.boxUrl}
+        onConnected={(status, url) => {
+          setZedLink(status)
+          // Remember the box address (as typed) so it survives a server
+          // restart / browser reopen, like the workstation IP does.
+          patchZed({ boxUrl: url })
+          setZedSudoDismissed(false)
+        }}
       />
       <SudoDialog
         open={sudoOpen}
@@ -376,6 +417,17 @@ export default function ControlPanel() {
           setSudoError(null)
         }}
         onSubmit={(password) => robotConnectClick(password)}
+      />
+      <SudoDialog
+        open={zedSudoOpen}
+        busy={zedSudoBusy}
+        error={zedLink?.ptp?.badPassword ? "Incorrect sudo password." : null}
+        message="The PTP clock-sync daemons (ptp4l/phc2sys) need root on both machines. Enter the sudo password — it's used once on each and not stored."
+        onClose={() => {
+          setZedSudoOpen(false)
+          setZedSudoDismissed(true)
+        }}
+        onSubmit={zedSudoSubmit}
       />
     </div>
   )

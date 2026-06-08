@@ -172,6 +172,8 @@ export interface PtpStatus {
   locked: boolean
   offsetNs: number | null
   sessionId: string | null
+  needsSudo?: boolean
+  badPassword?: boolean
   error?: string | null
 }
 
@@ -187,12 +189,12 @@ export async function fetchZedStatus(): Promise<ZedLinkStatus> {
   return json(await fetch(apiUrl("/api/zed/status")))
 }
 
-export async function zedConnect(url: string): Promise<ZedLinkStatus> {
+export async function zedConnect(url: string, password?: string): Promise<ZedLinkStatus> {
   return json(
     await fetch(apiUrl("/api/zed/connect"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
+      body: JSON.stringify(password ? { url, password } : { url }),
     })
   )
 }

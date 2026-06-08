@@ -16,14 +16,17 @@ export function ZedConnectDialog({
   open,
   onClose,
   initial,
+  defaultUrl,
   onConnected,
 }: {
   open: boolean
   onClose: () => void
   initial: ZedLinkStatus | null
-  onConnected: (status: ZedLinkStatus) => void
+  /** Persisted box address to prefill when not currently connected. */
+  defaultUrl?: string
+  onConnected: (status: ZedLinkStatus, url: string) => void
 }) {
-  const [url, setUrl] = useState(initial?.boxUrl ?? "")
+  const [url, setUrl] = useState(initial?.boxUrl || defaultUrl || "")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -42,7 +45,7 @@ export function ZedConnectDialog({
     setError(null)
     try {
       const status = await zedConnect(url.trim())
-      onConnected(status)
+      onConnected(status, url.trim())
       onClose()
     } catch (e) {
       setError(String(e).replace(/^Error:\s*/, ""))

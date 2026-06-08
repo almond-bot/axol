@@ -6,9 +6,9 @@ robot can be driven from a browser instead of a terminal. It serves the built
 web UI (when present) and a JSON/WebSocket API that launches, streams, and
 stops ``axol`` commands as subprocesses.
 
-    axol serve                  # http://localhost:8090, opens a browser
+    axol serve                  # serve on http://localhost:8090
     axol serve --port 9000
-    axol serve --no-open        # don't auto-open a browser
+    axol serve --open           # also open a browser window on startup
     axol serve --host 127.0.0.1 # localhost only
 """
 
@@ -47,9 +47,9 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         help="Port to listen on (default: 8090).",
     )
     parser.add_argument(
-        "--no-open",
+        "--open",
         action="store_true",
-        help="Do not open a browser window on startup.",
+        help="Open a browser window on startup (off by default).",
     )
     parser.add_argument(
         "--no-tls",
@@ -112,7 +112,7 @@ def run(args: argparse.Namespace) -> None:
             "the API is still available)"
         )
 
-    if not args.no_open:
+    if args.open:
         _open_browser_when_ready(local)
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", **ssl_kwargs)
