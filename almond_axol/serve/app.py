@@ -24,7 +24,7 @@ from ..sudo import SUDO_PASSWORD_ENV
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
-from .orchestrator import PtpLink, box_ssl_context
+from .orchestrator import PtpLink, StreamLink, box_ssl_context
 from .robot_link import RobotLink
 from .runner import OperationRunner
 
@@ -71,10 +71,15 @@ class ZedConnectRequest(BaseModel):
 
     ``password`` (optional) is forwarded to the PTP daemons on both machines
     when passwordless sudo isn't available; used once and never stored.
+
+    ``cameras`` (optional) maps camera slot (``overhead`` / ``left_arm`` /
+    ``right_arm``) to its ZED-X One serial. When any are given, streaming for
+    those cameras starts once the clocks lock.
     """
 
     url: str
     password: str | None = None
+    cameras: dict[str, str] | None = None
 
 
 class SyncClocksRequest(BaseModel):
@@ -160,17 +165,24 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # connected so the clocks are already disciplined before a task; reused by
     # the collect-data / run-policy orchestrator.
     ptp = PtpLink(manager)
-    runner = OperationRunner(robot, ptp)
-    # Detached ZED box link (light reachability check; PTP clock sync starts on
-    # connect, camera streaming starts at task time via the orchestrator).
-    # Mutated by /api/zed/connect|disconnect.
+    # ZED camera streams from the box; started on connect (after the clocks
+    # lock) when serials are configured, and reused by the orchestrator.
+    stream = StreamLink(manager, ptp)
+    runner = OperationRunner(robot, ptp, stream)
+    # Detached ZED box link (light reachability check; PTP clock sync + camera
+    # streaming both start on connect). Mutated by /api/zed/connect|disconnect.
     zed_state: dict[str, Any] = {
         "connected": False,
         "boxUrl": None,
         "info": None,
         "error": None,
         "ptp": ptp.status(),
+        "stream": stream.status(),
     }
+    # Background task that re-pings the box while connected; the connect-time
+    # reachability check is a one-shot, so without this the link would show
+    # "connected" forever after the box is powered off.
+    zed_monitor: dict[str, asyncio.Task[None] | None] = {"task": None}
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
@@ -233,15 +245,49 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- ZED box link (detached, lightweight) -------------------------------
 
+    def _stop_zed_monitor() -> None:
+        task = zed_monitor["task"]
+        if task is not None:
+            task.cancel()
+            zed_monitor["task"] = None
+
+    async def _zed_monitor(url: str) -> None:
+        """Poll the box while connected; tear the link down if it disappears.
+
+        The PTP master keeps running locally and the slave tail silently retries
+        a dead box, so neither notices a power-off on its own — this heartbeat is
+        what flips the UI back to disconnected (and unlocks the clock).
+        """
+        fails = 0
+        while True:
+            await asyncio.sleep(2.5)
+            ok, _data = await asyncio.to_thread(_fetch_box_info, url)
+            if ok:
+                fails = 0
+                continue
+            fails += 1
+            if fails < 2:  # tolerate a transient blip before tearing down
+                continue
+            zed_state["connected"] = False
+            zed_state["error"] = "ZED box is no longer reachable"
+            await stream.stop()
+            await ptp.stop()
+            zed_state["ptp"] = ptp.status()
+            zed_state["stream"] = stream.status()
+            zed_monitor["task"] = None
+            return
+
     @app.get("/api/zed/status")
     async def zed_status() -> dict[str, Any]:
         zed_state["ptp"] = ptp.status()
+        zed_state["stream"] = stream.status()
         return zed_state
 
     @app.post("/api/zed/connect")
     async def zed_connect(req: ZedConnectRequest) -> JSONResponse:
         ok, data = await asyncio.to_thread(_fetch_box_info, req.url)
         zed_state["boxUrl"] = _normalize_box_url(req.url)
+        _stop_zed_monitor()
         if ok:
             zed_state["connected"] = True
             zed_state["info"] = data
@@ -249,16 +295,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # Start clock sync immediately so the link is already locked by the
             # time a collect-data / run-policy task begins.
             zed_state["ptp"] = await ptp.start(req.url, req.password)
+            # If camera serials were given, start streaming them too (it waits
+            # for the clocks to lock first); a task then reuses the live feeds.
+            zed_state["stream"] = await stream.start(req.url, req.cameras or {})
+            # Heartbeat the box so the link drops if it goes away.
+            zed_monitor["task"] = asyncio.create_task(_zed_monitor(req.url))
             return JSONResponse(zed_state)
         zed_state["connected"] = False
         zed_state["info"] = None
         zed_state["error"] = data.get("error", "unreachable")
+        await stream.stop()
         await ptp.stop()
         zed_state["ptp"] = ptp.status()
+        zed_state["stream"] = stream.status()
         return JSONResponse(zed_state, status_code=502)
 
     @app.post("/api/zed/disconnect")
     async def zed_disconnect() -> dict[str, Any]:
+        _stop_zed_monitor()
+        await stream.stop()
         await ptp.stop()
         zed_state.update(
             {
@@ -267,6 +322,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "info": None,
                 "error": None,
                 "ptp": ptp.status(),
+                "stream": stream.status(),
             }
         )
         return zed_state
@@ -456,7 +512,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        _stop_zed_monitor()
         await runner.shutdown()
+        await stream.stop()
         await ptp.stop()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)

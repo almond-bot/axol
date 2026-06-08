@@ -1,7 +1,7 @@
-import { Cpu, Loader2, Plug, Camera, Server, Power } from "lucide-react"
+import { Cpu, Loader2, Plug, Camera, RotateCw, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import type { PtpStatus, RobotStatus, ZedLinkStatus } from "@/lib/supervisor"
+import type { PtpStatus, RobotStatus, StreamStatus, ZedLinkStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -63,8 +63,10 @@ export function ConnectionsBar({
   onRobotConnect,
   onRobotDisconnect,
   zed,
+  zedBusy,
   onZedConnect,
   onZedDisconnect,
+  onZedRestart,
 }: {
   conn: ConnState
   host: string
@@ -74,8 +76,10 @@ export function ConnectionsBar({
   onRobotConnect: () => void
   onRobotDisconnect: () => void
   zed: ZedLinkStatus | null
+  zedBusy: boolean
   onZedConnect: () => void
   onZedDisconnect: () => void
+  onZedRestart: () => void
 }) {
   const online = conn === "ok"
 
@@ -165,13 +169,32 @@ export function ConnectionsBar({
         title="ZED box"
         dot={zedDot}
         label={zedLabel}
-        headerRight={zedConnected ? <PtpBadge ptp={zed?.ptp} /> : undefined}
+        headerRight={
+          zedConnected ? (
+            <div className="flex flex-col items-end gap-0.5">
+              <PtpBadge ptp={zed?.ptp} />
+              <StreamBadge stream={zed?.stream} />
+            </div>
+          ) : undefined
+        }
       >
         {zedConnected ? (
-          <Button variant="outline" size="sm" onClick={onZedDisconnect}>
-            <Power />
-            Disconnect
-          </Button>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onZedRestart}
+              disabled={zedBusy}
+              title="Restart PTP clock sync and camera streams"
+            >
+              {zedBusy ? <Loader2 className="animate-spin" /> : <RotateCw />}
+              Restart
+            </Button>
+            <Button variant="outline" size="sm" onClick={onZedDisconnect} disabled={zedBusy}>
+              <Power />
+              Disconnect
+            </Button>
+          </div>
         ) : (
           <Button variant="outline" size="sm" onClick={onZedConnect} disabled={!online}>
             <Plug />
@@ -202,6 +225,33 @@ function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
     <span
       className="flex items-center gap-1.5 text-[0.65rem] text-white/45"
       title={ptp.error ?? undefined}
+    >
+      <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
+      {text}
+    </span>
+  )
+}
+
+/**
+ * Compact camera-stream state for the ZED box header. Streaming starts after
+ * the clocks lock for whatever serials were entered on connect; hidden when no
+ * cameras are configured so the header stays uncluttered.
+ */
+function StreamBadge({ stream }: { stream?: StreamStatus }) {
+  if (!stream) return null
+  if (!stream.streaming && stream.cameras.length === 0 && !stream.error) return null
+  const n = stream.cameras.length
+  const [dot, text, pulse] = stream.ready
+    ? (["ok", `${n} camera${n === 1 ? "" : "s"} live`, false] as const)
+    : stream.error
+      ? (["err", "stream error", false] as const)
+      : stream.streaming
+        ? (["warn", "starting cameras…", true] as const)
+        : (["idle", "cameras idle", false] as const)
+  return (
+    <span
+      className="flex items-center gap-1.5 text-[0.65rem] text-white/45"
+      title={stream.error ?? undefined}
     >
       <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
       {text}

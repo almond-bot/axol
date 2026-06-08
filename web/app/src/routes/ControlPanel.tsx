@@ -78,6 +78,7 @@ export default function ControlPanel() {
   const [sudoError, setSudoError] = useState<string | null>(null)
   const [zedLink, setZedLink] = useState<ZedLinkStatus | null>(null)
   const [zedSettings, setZedSettings] = useState<ZedSpec>(() => loadZed())
+  const [zedBusy, setZedBusy] = useState(false)
   const [zedSudoOpen, setZedSudoOpen] = useState(false)
   const [zedSudoBusy, setZedSudoBusy] = useState(false)
   const [zedSudoDismissed, setZedSudoDismissed] = useState(false)
@@ -255,6 +256,24 @@ export default function ControlPanel() {
     }
   }
 
+  // Re-establish the box link: restarts PTP clock sync and (if serials are
+  // configured) camera streaming, reusing the saved box address + cameras.
+  async function zedRestartClick() {
+    const url = zedLink?.boxUrl ?? zedSettings.boxUrl
+    if (!url) return
+    setZedBusy(true)
+    setError(null)
+    try {
+      const next = await zedConnect(url, undefined, zedSettings.cameras)
+      setZedLink(next)
+      setZedSudoDismissed(false)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setZedBusy(false)
+    }
+  }
+
   // PTP daemons need root; the box connect starts them without a password, so
   // the "needs sudo" state surfaces via polling. Prompt once (until dismissed).
   const zedNeedsSudo = !!zedLink?.ptp?.needsSudo
@@ -271,7 +290,7 @@ export default function ControlPanel() {
   async function zedSudoSubmit(password: string) {
     setZedSudoBusy(true)
     try {
-      const next = await zedConnect(zedLink?.boxUrl ?? "", password)
+      const next = await zedConnect(zedLink?.boxUrl ?? "", password, zedSettings.cameras)
       setZedLink(next)
       // ptp4l validates the password asynchronously; close optimistically and
       // let polling reopen this with an error if the password was wrong.
@@ -347,8 +366,10 @@ export default function ControlPanel() {
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
           zed={zedLink}
+          zedBusy={zedBusy}
           onZedConnect={() => setZedDialogOpen(true)}
           onZedDisconnect={zedDisconnectClick}
+          onZedRestart={zedRestartClick}
         />
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
@@ -371,7 +392,6 @@ export default function ControlPanel() {
           onExport={() => exportOpSettings(selectedOp, settings)}
           onImport={importSettings}
           zedSettings={zedSettings}
-          onZedChange={patchZed}
           zedLink={zedLink}
           robot={robot}
           live={selectedLive}
@@ -400,11 +420,12 @@ export default function ControlPanel() {
         onClose={() => setZedDialogOpen(false)}
         initial={zedLink}
         defaultUrl={zedSettings.boxUrl}
-        onConnected={(status, url) => {
+        defaultCameras={zedSettings.cameras}
+        onConnected={(status, url, cameras) => {
           setZedLink(status)
-          // Remember the box address (as typed) so it survives a server
-          // restart / browser reopen, like the workstation IP does.
-          patchZed({ boxUrl: url })
+          // Remember the box address + camera serials (as typed) so they
+          // survive a server restart / browser reopen, like the workstation IP.
+          patchZed({ boxUrl: url, cameras })
           setZedSudoDismissed(false)
         }}
       />

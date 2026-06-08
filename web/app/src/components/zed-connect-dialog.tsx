@@ -1,22 +1,33 @@
 import { useEffect, useState } from "react"
 import { AlertTriangle, Camera, Loader2, Plug, X } from "lucide-react"
-import { zedConnect, type ZedLinkStatus } from "@/lib/supervisor"
+import { zedConnect, type ZedLinkStatus, type ZedSpec } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
+type Cameras = ZedSpec["cameras"]
+
+const EMPTY_CAMERAS: Cameras = { overhead: "", left_arm: "", right_arm: "" }
+
+const CAMERA_SLOTS: { key: keyof Cameras; label: string }[] = [
+  { key: "overhead", label: "Overhead" },
+  { key: "left_arm", label: "Left arm" },
+  { key: "right_arm", label: "Right arm" },
+]
+
 /**
  * Lightweight ZED box link dialog. Verifies the box's `axol serve` is reachable
  * and stores the box URL on the host. Connecting also starts PTP clock sync so
- * the clocks are locked before a task; camera streaming starts when a
- * collect-data / run-policy task begins. The PTP interfaces on both machines
- * are derived automatically from the box address.
+ * the clocks are locked before a task. Any camera serials entered here start
+ * streaming once the clocks lock (a task then reuses the live feeds). The PTP
+ * interfaces on both machines are derived automatically from the box address.
  */
 export function ZedConnectDialog({
   open,
   onClose,
   initial,
   defaultUrl,
+  defaultCameras,
   onConnected,
 }: {
   open: boolean
@@ -24,9 +35,12 @@ export function ZedConnectDialog({
   initial: ZedLinkStatus | null
   /** Persisted box address to prefill when not currently connected. */
   defaultUrl?: string
-  onConnected: (status: ZedLinkStatus, url: string) => void
+  /** Persisted camera serials to prefill. */
+  defaultCameras?: Cameras
+  onConnected: (status: ZedLinkStatus, url: string, cameras: Cameras) => void
 }) {
   const [url, setUrl] = useState(initial?.boxUrl || defaultUrl || "")
+  const [cameras, setCameras] = useState<Cameras>(defaultCameras ?? EMPTY_CAMERAS)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -43,9 +57,14 @@ export function ZedConnectDialog({
     if (!url.trim()) return
     setBusy(true)
     setError(null)
+    const trimmed: Cameras = {
+      overhead: cameras.overhead.trim(),
+      left_arm: cameras.left_arm.trim(),
+      right_arm: cameras.right_arm.trim(),
+    }
     try {
-      const status = await zedConnect(url.trim())
-      onConnected(status, url.trim())
+      const status = await zedConnect(url.trim(), undefined, trimmed)
+      onConnected(status, url.trim(), trimmed)
       onClose()
     } catch (e) {
       setError(String(e).replace(/^Error:\s*/, ""))
@@ -119,6 +138,31 @@ export function ZedConnectDialog({
                 {error}
               </p>
             )}
+          </div>
+
+          <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
+            <div className="flex flex-col gap-0.5">
+              <Label>Camera serials (optional)</Label>
+              <p className="text-xs text-white/35">
+                Serial of each wired ZED-X One. Any you enter start streaming once the clocks lock;
+                leave blank to skip. Saved for next time.
+              </p>
+            </div>
+            {CAMERA_SLOTS.map((slot) => (
+              <div key={slot.key} className="flex items-center justify-between gap-4">
+                <Label className="text-white/70">{slot.label}</Label>
+                <Input
+                  value={cameras[slot.key]}
+                  inputMode="numeric"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  onChange={(e) => setCameras((c) => ({ ...c, [slot.key]: e.target.value }))}
+                  placeholder="serial"
+                  className="max-w-[180px]"
+                />
+              </div>
+            ))}
           </div>
         </div>
       </div>

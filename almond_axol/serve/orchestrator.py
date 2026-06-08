@@ -129,6 +129,22 @@ def _get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
         return json.loads(resp.read().decode())
 
 
+async def _tcp_port_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    """True if a TCP connection to ``host:port`` succeeds (stream readiness probe)."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout
+        )
+    except (OSError, asyncio.TimeoutError):
+        return False
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except OSError:
+        pass
+    return True
+
+
 class _Remote:
     """A session running on the ZED box, tailed into the local log stream."""
 
@@ -397,6 +413,224 @@ class PtpLink:
             self._ptp_samples = 0
 
 
+class StreamLink:
+    """Long-lived ZED camera streams started when the box is connected.
+
+    Mirrors :class:`PtpLink`: once the box is reachable and the clocks are
+    locking, this POSTs ``zed.stream`` to the box for the configured camera
+    serials and keeps it running while the rig is idle, so a collect-data /
+    run-policy task reuses the live streams instead of starting them itself.
+    Lives on the server event loop; torn down on disconnect. If no serials were
+    given it stays idle (nothing to stream).
+    """
+
+    def __init__(self, manager: "SessionManager", ptp: "PtpLink | None" = None) -> None:
+        self._manager = manager
+        self._ptp = ptp
+        self.box: str = ""
+        self.cameras: dict[str, str] = {}
+        self.session: Session | None = None
+        self._remote: _Remote | None = None
+        self._tasks: list[asyncio.Task[Any]] = []
+        self._ready = asyncio.Event()
+        self._stopping = False
+        self._lock = asyncio.Lock()
+
+    @property
+    def running(self) -> bool:
+        s = self.session
+        return s is not None and s.status == "running" and not self._stopping
+
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
+    def status(self) -> dict[str, Any]:
+        s = self.session
+        error = s.error if (s is not None and s.status == "error") else None
+        return {
+            "streaming": self.running,
+            "ready": self.ready,
+            "cameras": sorted(self.cameras),
+            "sessionId": s.id if s else None,
+            "error": error,
+        }
+
+    async def start(
+        self,
+        box_url: str,
+        cameras: dict[str, str],
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """(Re)start streaming the given camera serials. Idempotent.
+
+        Waits for the PTP clocks to lock first (frames carry PTP timestamps),
+        then asks the box to stream and waits for the ports to open. With no
+        serials it tears any prior stream down and stays idle.
+        """
+        await self.stop()
+        async with self._lock:
+            self._stopping = False
+            self._ready.clear()
+            self.box = _normalize_url(box_url)
+            self.cameras = {
+                slot: str(cameras.get(slot, "")).strip()
+                for slot in _CAMERA_PORTS
+                if str(cameras.get(slot, "")).strip()
+            }
+            if not self.box or not self.cameras:
+                return self.status()
+
+            session = self._manager.new_session("zed.stream")
+            session.teardown = self.stop
+            session.status = "running"
+            self.session = session
+            session.emit("[serve] ZED camera streaming queued")
+            self._spawn(self._run(options or {}))
+            return self.status()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            session = self.session
+            if session is None:
+                return
+            self._stopping = True
+            if self._remote is not None:
+                await self._box_stop(self._remote)
+                self._remote = None
+            for task in self._tasks:
+                task.cancel()
+            self._tasks = []
+            if session.status == "running":
+                session.status = "exited"
+            session.emit("[serve] ZED camera streaming stopped")
+            session.close_stream()
+            self.session = None
+            self._ready.clear()
+
+    # -- internals ----------------------------------------------------------
+
+    async def _run(self, options: dict[str, Any]) -> None:
+        # Frames carry PTP timestamps, so hold off until the clocks lock.
+        if self._ptp is not None:
+            self._emit("waiting for clocks to lock before streaming…")
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + _PTP_TIMEOUT_S
+            while not self._ptp.locked:
+                if self._stopping:
+                    return
+                if not self._ptp.running:
+                    self._fail("clocks did not lock; cameras not started")
+                    return
+                if loop.time() > deadline:
+                    self._fail("clocks did not lock; cameras not started")
+                    return
+                await asyncio.sleep(0.5)
+
+        payload: dict[str, Any] = dict(self.cameras)
+        for opt in ("resolution", "fps", "bitrate"):
+            if options.get(opt) not in (None, ""):
+                payload[opt] = options[opt]
+        try:
+            self._remote = await self._box_run("/api/zed/stream", payload)
+        except OrchestrationError as exc:
+            self._fail(str(exc))
+            return
+        self._spawn(self._tail(self._remote))
+
+        try:
+            await self._await_ports()
+        except OrchestrationError as exc:
+            self._fail(str(exc))
+            return
+        self._emit("camera streams up")
+        self._ready.set()
+
+    async def _box_run(self, path: str, payload: dict[str, Any]) -> _Remote:
+        url = f"{self.box}{path}"
+        try:
+            result = await asyncio.to_thread(_post_json, url, payload)
+        except urllib.error.HTTPError as exc:
+            raise OrchestrationError(
+                f"stream: ZED box returned HTTP {exc.code}"
+            ) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise OrchestrationError(
+                f"stream: cannot reach ZED box at {self.box} ({exc})"
+            ) from exc
+        if result.get("error"):
+            raise OrchestrationError(f"stream: {result['error']}")
+        session_id = result.get("id")
+        if not session_id:
+            raise OrchestrationError("stream: ZED box did not return a session id")
+        return _Remote(self.box, "stream", session_id)
+
+    async def _box_stop(self, remote: _Remote) -> None:
+        try:
+            await asyncio.to_thread(
+                _post_json, f"{remote.base}/api/sessions/{remote.id}/stop", {}
+            )
+        except (urllib.error.URLError, OSError):
+            pass
+
+    async def _tail(self, remote: _Remote) -> None:
+        url = f"{remote.base}/api/sessions/{remote.id}/log"
+        while not self._stopping:
+            try:
+                data = await asyncio.to_thread(
+                    _get_json, f"{url}?{urlencode({'offset': remote.offset})}"
+                )
+            except (urllib.error.URLError, OSError):
+                await asyncio.sleep(1.0)
+                continue
+            for line in data.get("lines", []):
+                self._emit(line, prefix="stream")
+            remote.offset = data.get("nextOffset", remote.offset)
+            if data.get("status") in ("exited", "error") and not data.get("lines"):
+                if not self._stopping:
+                    self._fail(
+                        "camera streaming on the ZED box exited — see the stream log"
+                    )
+                return
+            await asyncio.sleep(0.5)
+
+    async def _await_ports(self) -> None:
+        host = self._box_host()
+        ports = [_CAMERA_PORTS[slot] for slot in self.cameras]
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _STREAM_TIMEOUT_S
+        pending = set(ports)
+        while pending:
+            if self._stopping:
+                raise OrchestrationError("stopped before streams were ready")
+            if loop.time() > deadline:
+                missing = ", ".join(f"{host}:{p}" for p in sorted(pending))
+                raise OrchestrationError(f"camera streams not reachable: {missing}")
+            for port in list(pending):
+                if await _tcp_port_open(host, port):
+                    pending.discard(port)
+                    self._emit(f"stream port {host}:{port} ready")
+            if pending:
+                await asyncio.sleep(1.0)
+
+    def _box_host(self) -> str:
+        netloc = self.box.split("://", 1)[-1]
+        return netloc.split(":", 1)[0].split("/", 1)[0]
+
+    def _spawn(self, coro: Any) -> None:
+        self._tasks.append(asyncio.create_task(coro))
+
+    def _emit(self, line: str, *, prefix: str = "serve") -> None:
+        if self.session is not None:
+            self.session.emit(f"[{prefix}] {line}")
+
+    def _fail(self, message: str) -> None:
+        if self.session is not None:
+            self.session.error = message
+            self.session.status = "error"
+            self.session.emit(f"[serve] error: {message}")
+
+
 class ZedOrchestrator:
     def __init__(
         self,
@@ -406,6 +640,7 @@ class ZedOrchestrator:
         zed: dict[str, Any],
         run_main: Any = None,
         ptp: "PtpLink | None" = None,
+        stream: "StreamLink | None" = None,
     ) -> None:
         self.session = session
         self.command_id = command_id
@@ -420,6 +655,10 @@ class ZedOrchestrator:
         # already up for this box, steps 1–3 are skipped and we just wait on its
         # lock; the link is left running afterwards (owned by the connection).
         self._ptp = ptp
+        # Long-lived camera streams started when the box was connected. When
+        # they're already up for this box, steps 4–5 are skipped and we just
+        # wait until they're ready; left running afterwards (owned by connect).
+        self._stream_link = stream
         self.box: str = _normalize_url(str(zed.get("boxUrl", "")))
 
         self._master_proc: asyncio.subprocess.Process | None = None
@@ -471,19 +710,28 @@ class ZedOrchestrator:
         else:
             await self._start_ptp()
 
-        # 4. Start camera streaming on the ZED box.
-        self.session.emit("[serve] step 4/6 — starting ZED camera streams (box)")
-        stream_args: dict[str, Any] = dict(cameras)
-        for opt in ("resolution", "fps", "bitrate"):
-            if self.zed.get(opt) not in (None, ""):
-                stream_args[opt] = self.zed[opt]
-        stream = await self._box_run("/api/zed/stream", stream_args, label="stream")
-        self._tail_remote(stream)
+        # Steps 4–5: camera streams. Prefer the streams the operator already
+        # started when connecting the box; only start our own otherwise.
+        if (
+            self._stream_link is not None
+            and self._stream_link.running
+            and self._stream_link.box == self.box
+        ):
+            await self._reuse_streams()
+        else:
+            # 4. Start camera streaming on the ZED box.
+            self.session.emit("[serve] step 4/6 — starting ZED camera streams (box)")
+            stream_args: dict[str, Any] = dict(cameras)
+            for opt in ("resolution", "fps", "bitrate"):
+                if self.zed.get(opt) not in (None, ""):
+                    stream_args[opt] = self.zed[opt]
+            stream = await self._box_run("/api/zed/stream", stream_args, label="stream")
+            self._tail_remote(stream)
 
-        # 5. Wait for the stream ports to accept connections.
-        self.session.emit("[serve] step 5/6 — waiting for camera streams…")
-        await self._await_streams(cameras)
-        self.session.emit("[serve] camera streams up")
+            # 5. Wait for the stream ports to accept connections.
+            self.session.emit("[serve] step 5/6 — waiting for camera streams…")
+            await self._await_streams(cameras)
+            self.session.emit("[serve] camera streams up")
 
         # 6. Run the main command — in-process (runner) or as a subprocess.
         if self._stopping:
@@ -572,6 +820,33 @@ class ZedOrchestrator:
                 raise OrchestrationError("clocks did not lock")
             await asyncio.sleep(0.5)
         self.session.emit("[serve] clocks locked")
+
+    async def _reuse_streams(self) -> None:
+        """Wait on the camera streams the operator started when connecting.
+
+        Like :meth:`_reuse_ptp`, the link lives on the server loop while this
+        orchestrator runs on the runner's loop, so we poll the plain ``ready``
+        flag. The streams are left running on completion (torn down on
+        disconnect, not at task end).
+        """
+        assert self._stream_link is not None
+        self.session.emit(
+            "[serve] steps 4–5/6 — reusing the camera streams from the ZED box "
+            "connection"
+        )
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + _STREAM_TIMEOUT_S
+        while not self._stream_link.ready:
+            if self._stopping:
+                raise OrchestrationError("stopped before streams were ready")
+            if not self._stream_link.running:
+                raise OrchestrationError(
+                    "the ZED camera streams dropped before they were ready"
+                )
+            if loop.time() > deadline:
+                raise OrchestrationError("camera streams did not become ready")
+            await asyncio.sleep(0.5)
+        self.session.emit("[serve] camera streams up")
 
     # -- argv / camera helpers ---------------------------------------------
 

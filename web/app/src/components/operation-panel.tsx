@@ -27,15 +27,7 @@ import { ConfigForm, CuratedForm } from "@/components/config-form"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
-
-const CAMERAS: { key: keyof ZedSpec["cameras"]; label: string; port: number }[] = [
-  { key: "overhead", label: "Overhead", port: 30000 },
-  { key: "left_arm", label: "Left arm", port: 30002 },
-  { key: "right_arm", label: "Right arm", port: 30004 },
-]
 
 export function OperationPanel({
   meta,
@@ -47,7 +39,6 @@ export function OperationPanel({
   onExport,
   onImport,
   zedSettings,
-  onZedChange,
   zedLink,
   robot,
   live,
@@ -68,7 +59,6 @@ export function OperationPanel({
   onExport: () => void
   onImport: (text: string) => void
   zedSettings: ZedSpec
-  onZedChange: (patch: Partial<ZedSpec>) => void
   zedLink: ZedLinkStatus | null
   robot: RobotStatus | null
   live: boolean
@@ -104,7 +94,8 @@ export function OperationPanel({
     else if (zedLink?.ptp?.error) blockers.push(`PTP clock sync failed: ${zedLink.ptp.error}`)
     else blockers.push("Wait for PTP clock sync to lock")
   }
-  if (meta.requiresZed && camCount === 0) blockers.push("Add at least one camera serial")
+  if (meta.requiresZed && camCount === 0)
+    blockers.push("Add at least one camera serial in the ZED connection")
   for (const f of allFields) {
     if (f.required) {
       const v = settings[f.key]
@@ -215,15 +206,6 @@ export function OperationPanel({
                 <p className="text-sm text-white/40">No settings — just press Start.</p>
               )}
 
-              {meta.requiresZed && (
-                <ZedSettings
-                  spec={zedSettings}
-                  onChange={onZedChange}
-                  disabled={live}
-                  camCount={camCount}
-                />
-              )}
-
               {blockers.length > 0 && !live && (
                 <div className="flex flex-col gap-1 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
                   <span className="font-medium">Before you can start:</span>
@@ -298,50 +280,6 @@ function OptionalSettings({
           />
         </div>
       )}
-    </div>
-  )
-}
-
-function ZedSettings({
-  spec,
-  onChange,
-  disabled,
-  camCount,
-}: {
-  spec: ZedSpec
-  onChange: (patch: Partial<ZedSpec>) => void
-  disabled: boolean
-  camCount: number
-}) {
-  return (
-    <div className="flex flex-col gap-4 rounded-lg border border-white/10 bg-white/[0.02] p-4">
-      <div className="flex items-center justify-between">
-        <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
-          ZED cameras
-        </span>
-        <Badge variant={camCount > 0 ? "success" : "warning"}>{camCount} set</Badge>
-      </div>
-
-      <p className="text-xs text-white/45">
-        Cameras stream from the ZED box address you connected. Serial of each wired ZED-X One — at
-        least one is required.
-      </p>
-      {CAMERAS.map((cam) => (
-        <div key={cam.key} className="flex items-center justify-between gap-4">
-          <div className="flex items-baseline gap-2">
-            <Label>{cam.label}</Label>
-            <span className="text-xs text-white/35">port {cam.port}</span>
-          </div>
-          <Input
-            value={spec.cameras[cam.key]}
-            disabled={disabled}
-            inputMode="numeric"
-            onChange={(e) => onChange({ cameras: { ...spec.cameras, [cam.key]: e.target.value } })}
-            placeholder="serial"
-            className="max-w-[180px]"
-          />
-        </div>
-      ))}
     </div>
   )
 }

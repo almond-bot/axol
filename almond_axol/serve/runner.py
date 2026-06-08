@@ -156,12 +156,17 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None, ptp: Any = None) -> None:
+    def __init__(
+        self, robot_link: Any = None, ptp: Any = None, stream: Any = None
+    ) -> None:
         self._robot_link = robot_link
         # Long-lived PTP link (started at ZED box connect); reused by the
         # orchestrated collect-data / run-policy path so PTP need not be brought
         # up per task.
         self._ptp = ptp
+        # Long-lived camera streams (started at ZED box connect); reused by the
+        # orchestrated path so streaming need not be started per task.
+        self._stream = stream
         self._lock = threading.Lock()
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
@@ -422,7 +427,13 @@ class OperationRunner:
             return 0
 
         orch = ZedOrchestrator(
-            session, op_id, args, zed, run_main=run_main, ptp=self._ptp
+            session,
+            op_id,
+            args,
+            zed,
+            run_main=run_main,
+            ptp=self._ptp,
+            stream=self._stream,
         )
         self._orch = orch
 

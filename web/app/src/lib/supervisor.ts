@@ -177,24 +177,40 @@ export interface PtpStatus {
   error?: string | null
 }
 
+export interface StreamStatus {
+  streaming: boolean
+  ready: boolean
+  cameras: string[]
+  sessionId: string | null
+  error?: string | null
+}
+
 export interface ZedLinkStatus {
   connected: boolean
   boxUrl: string | null
   info: ServerInfo | null
   error: string | null
   ptp?: PtpStatus
+  stream?: StreamStatus
 }
 
 export async function fetchZedStatus(): Promise<ZedLinkStatus> {
   return json(await fetch(apiUrl("/api/zed/status")))
 }
 
-export async function zedConnect(url: string, password?: string): Promise<ZedLinkStatus> {
+export async function zedConnect(
+  url: string,
+  password?: string,
+  cameras?: ZedSpec["cameras"]
+): Promise<ZedLinkStatus> {
+  const body: { url: string; password?: string; cameras?: ZedSpec["cameras"] } = { url }
+  if (password) body.password = password
+  if (cameras) body.cameras = cameras
   return json(
     await fetch(apiUrl("/api/zed/connect"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(password ? { url, password } : { url }),
+      body: JSON.stringify(body),
     })
   )
 }
