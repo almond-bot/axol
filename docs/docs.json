@@ -77,8 +77,12 @@
   "navbar": {
     "links": [
       {
+        "label": "Control Panel",
+        "href": "https://axol.almond.bot/control"
+      },
+      {
         "label": "VR Teleop",
-        "href": "https://axol.almond.bot"
+        "href": "https://axol.almond.bot/vr"
       }
     ],
     "primary": {
