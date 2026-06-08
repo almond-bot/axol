@@ -98,14 +98,14 @@ class ZedStreamer:
             ", ".join(str(int(d.serial_number)) for d in devices) or "<none>",
         )
 
+        failures: list[str] = []
         resolved_specs: list[tuple[str, int, int]] = []
         for name, serial, port in specs:
             if int(serial) not in available_serials:
                 _logger.error(
-                    "Requested %s serial %d not found in device list; skipping.",
-                    name,
-                    serial,
+                    "Requested %s serial %d not found in device list.", name, serial
                 )
+                failures.append(f"{name} (serial {serial}): not connected")
                 continue
             resolved_specs.append((name, serial, port))
 
@@ -113,14 +113,25 @@ class ZedStreamer:
         # path touches shared NVENC state on Jetson and isn't safe to call
         # concurrently across sl.CameraOne instances.
         loop = asyncio.get_running_loop()
-        states: list[_CameraState | None] = []
         for name, serial, port in resolved_specs:
             state = await loop.run_in_executor(
                 None, self._open_camera, name, serial, port
             )
-            states.append(state)
+            if state is None:
+                failures.append(f"{name} (serial {serial}): failed to open")
+                continue
+            self._cameras.append(state)
 
-        self._cameras = [s for s in states if s is not None]
+        # A requested camera that won't open means the receiving host would wait
+        # forever for a stream port that never opens. Fail loudly instead so the
+        # caller (and the control-panel UI) sees the error immediately rather
+        # than a stream that's silently down.
+        if failures:
+            await self.disable()
+            raise RuntimeError(
+                "could not start all requested ZED cameras: " + "; ".join(failures)
+            )
+
         _logger.info(
             "ZedStreamer enabled (%d/%d cameras)", len(self._cameras), len(specs)
         )

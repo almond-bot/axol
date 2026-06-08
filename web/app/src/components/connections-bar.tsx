@@ -23,6 +23,7 @@ function Tile({
   pulse,
   children,
   headerRight,
+  floatChildren,
 }: {
   icon: ReactNode
   title: string
@@ -31,9 +32,11 @@ function Tile({
   pulse?: boolean
   children?: ReactNode
   headerRight?: ReactNode
+  /** Hide the actions until the tile is hovered so the label gets full width. */
+  floatChildren?: boolean
 }) {
   return (
-    <div className="flex min-w-0 flex-1 flex-col gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
+    <div className="group relative flex min-w-0 flex-1 flex-col gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
           {icon}
@@ -48,8 +51,13 @@ function Tile({
           />
           <span className="truncate text-white/75">{label}</span>
         </span>
-        {children}
+        {!floatChildren && children}
       </div>
+      {floatChildren && children ? (
+        <div className="pointer-events-none absolute right-3 bottom-3 flex items-center gap-1.5 rounded-lg bg-background/90 pl-4 opacity-0 backdrop-blur-sm transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+          {children}
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -57,6 +65,7 @@ function Tile({
 export function ConnectionsBar({
   conn,
   host,
+  hostName,
   onOpenSetup,
   robot,
   robotBusy,
@@ -70,6 +79,7 @@ export function ConnectionsBar({
 }: {
   conn: ConnState
   host: string
+  hostName?: string
   onOpenSetup: () => void
   robot: RobotStatus | null
   robotBusy: boolean
@@ -85,7 +95,8 @@ export function ConnectionsBar({
 
   // -- workstation --
   const wsDot: Dot = conn === "ok" ? "ok" : conn === "err" ? "err" : "warn"
-  const wsLabel = conn === "ok" ? host || "Connected" : conn === "err" ? "Offline" : "Connecting…"
+  const wsLabel =
+    conn === "ok" ? hostName || host || "Connected" : conn === "err" ? "Offline" : "Connecting…"
 
   // -- robot --
   const rs = robot?.state ?? "disconnected"
@@ -169,9 +180,10 @@ export function ConnectionsBar({
         title="ZED box"
         dot={zedDot}
         label={zedLabel}
+        floatChildren={zedConnected}
         headerRight={
           zedConnected ? (
-            <div className="flex flex-col items-end gap-0.5">
+            <div className="flex items-center gap-2">
               <PtpBadge ptp={zed?.ptp} />
               <StreamBadge stream={zed?.stream} />
             </div>
@@ -223,7 +235,7 @@ function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
           : (["idle", "clock idle", false] as const)
   return (
     <span
-      className="flex items-center gap-1.5 text-[0.65rem] text-white/45"
+      className="flex items-center gap-1.5 whitespace-nowrap text-[0.65rem] text-white/45"
       title={ptp.error ?? undefined}
     >
       <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
@@ -250,7 +262,7 @@ function StreamBadge({ stream }: { stream?: StreamStatus }) {
         : (["idle", "cameras idle", false] as const)
   return (
     <span
-      className="flex items-center gap-1.5 text-[0.65rem] text-white/45"
+      className="flex items-center gap-1.5 whitespace-nowrap text-[0.65rem] text-white/45"
       title={stream.error ?? undefined}
     >
       <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />

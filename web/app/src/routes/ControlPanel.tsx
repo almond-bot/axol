@@ -360,6 +360,7 @@ export default function ControlPanel() {
         <ConnectionsBar
           conn={conn.state}
           host={serverHost}
+          hostName={hostInfo?.hostname}
           onOpenSetup={() => setSetupOpen(true)}
           robot={robot}
           robotBusy={robotBusy}

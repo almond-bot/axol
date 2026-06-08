@@ -541,7 +541,10 @@ class StreamLink:
         try:
             await self._await_ports()
         except OrchestrationError as exc:
-            self._fail(str(exc))
+            # _tail may have already recorded the box's own error; don't clobber
+            # it with the generic "ports not reachable" message.
+            if self.session is None or self.session.status != "error":
+                self._fail(str(exc))
             return
         self._emit("camera streams up")
         self._ready.set()
@@ -603,6 +606,10 @@ class StreamLink:
         while pending:
             if self._stopping:
                 raise OrchestrationError("stopped before streams were ready")
+            # If the box-side stream session died (e.g. a camera couldn't open),
+            # bail right away instead of waiting out the full timeout.
+            if self.session is None or self.session.status == "error":
+                raise OrchestrationError("camera streaming stopped on the ZED box")
             if loop.time() > deadline:
                 missing = ", ".join(f"{host}:{p}" for p in sorted(pending))
                 raise OrchestrationError(f"camera streams not reachable: {missing}")
