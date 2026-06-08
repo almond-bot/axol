@@ -66,8 +66,13 @@ _PTP_LOCK_NS = 100_000
 _PTP_LOCK_SAMPLES = 3
 _PTP_TIMEOUT_S = 150.0
 
-# How long to wait for each streamed camera port to start accepting connections.
+# How long to wait for the ZED box to report its cameras streaming.
 _STREAM_TIMEOUT_S = 90.0
+
+# ZedStreamer logs this once every requested camera has opened and started
+# streaming. The streams are UDP (RTP/HEVC), so this log line — not a TCP probe
+# of the stream ports — is the authoritative "cameras are live" signal.
+_STREAM_READY_MARKER = "ZedStreamer enabled"
 
 _OFFSET_RE = re.compile(r"master offset\s+(-?\d+)")
 
@@ -127,22 +132,6 @@ def _get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
         url, timeout=timeout, context=box_ssl_context()
     ) as resp:
         return json.loads(resp.read().decode())
-
-
-async def _tcp_port_open(host: str, port: int, timeout: float = 2.0) -> bool:
-    """True if a TCP connection to ``host:port`` succeeds (stream readiness probe)."""
-    try:
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=timeout
-        )
-    except (OSError, asyncio.TimeoutError):
-        return False
-    writer.close()
-    try:
-        await writer.wait_closed()
-    except OSError:
-        pass
-    return True
 
 
 class _Remote:
@@ -539,10 +528,10 @@ class StreamLink:
         self._spawn(self._tail(self._remote))
 
         try:
-            await self._await_ports()
+            await self._await_ready()
         except OrchestrationError as exc:
             # _tail may have already recorded the box's own error; don't clobber
-            # it with the generic "ports not reachable" message.
+            # it with the generic "not ready" message.
             if self.session is None or self.session.status != "error":
                 self._fail(str(exc))
             return
@@ -596,6 +585,8 @@ class StreamLink:
                 if not stripped:
                     continue
                 last_line = stripped
+                if _STREAM_READY_MARKER in stripped:
+                    self._ready.set()
                 low = stripped.lower()
                 if "could not start all requested zed cameras" in low or "error" in low:
                     error_line = stripped
@@ -611,13 +602,16 @@ class StreamLink:
                 return
             await asyncio.sleep(0.5)
 
-    async def _await_ports(self) -> None:
-        host = self._box_host()
-        ports = [_CAMERA_PORTS[slot] for slot in self.cameras]
+    async def _await_ready(self) -> None:
+        """Wait for the box to report every camera streaming.
+
+        The streams are UDP, so we key off the box's ``ZedStreamer enabled`` log
+        line (set in :meth:`_tail`) rather than probing the ports — a TCP probe
+        of a UDP stream port never connects even when streaming is healthy.
+        """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + _STREAM_TIMEOUT_S
-        pending = set(ports)
-        while pending:
+        while not self._ready.is_set():
             if self._stopping:
                 raise OrchestrationError("stopped before streams were ready")
             # If the box-side stream session died (e.g. a camera couldn't open),
@@ -625,18 +619,11 @@ class StreamLink:
             if self.session is None or self.session.status == "error":
                 raise OrchestrationError("camera streaming stopped on the ZED box")
             if loop.time() > deadline:
-                missing = ", ".join(f"{host}:{p}" for p in sorted(pending))
-                raise OrchestrationError(f"camera streams not reachable: {missing}")
-            for port in list(pending):
-                if await _tcp_port_open(host, port):
-                    pending.discard(port)
-                    self._emit(f"stream port {host}:{port} ready")
-            if pending:
-                await asyncio.sleep(1.0)
-
-    def _box_host(self) -> str:
-        netloc = self.box.split("://", 1)[-1]
-        return netloc.split(":", 1)[0].split("/", 1)[0]
+                raise OrchestrationError(
+                    "cameras did not report ready (no 'ZedStreamer enabled' from "
+                    "the ZED box)"
+                )
+            await asyncio.sleep(0.5)
 
     def _spawn(self, coro: Any) -> None:
         self._tasks.append(asyncio.create_task(coro))
@@ -688,6 +675,7 @@ class ZedOrchestrator:
         self._tasks: list[asyncio.Task[Any]] = []
         self._ptp_samples = 0
         self._ptp_locked = asyncio.Event()
+        self._stream_ready = asyncio.Event()
         self._stopping = False
         self._lock = asyncio.Lock()
 
@@ -747,11 +735,15 @@ class ZedOrchestrator:
                 if self.zed.get(opt) not in (None, ""):
                     stream_args[opt] = self.zed[opt]
             stream = await self._box_run("/api/zed/stream", stream_args, label="stream")
-            self._tail_remote(stream)
+            self._tail_remote(stream, self._watch_stream)
 
-            # 5. Wait for the stream ports to accept connections.
+            # 5. Wait for the box to report every camera streaming.
             self.session.emit("[serve] step 5/6 — waiting for camera streams…")
-            await self._await_streams(cameras)
+            await self._await(
+                self._stream_ready,
+                _STREAM_TIMEOUT_S,
+                "camera streams did not report ready",
+            )
             self.session.emit("[serve] camera streams up")
 
         # 6. Run the main command — in-process (runner) or as a subprocess.
@@ -982,37 +974,11 @@ class ZedOrchestrator:
         if self._stopping:
             raise OrchestrationError("stopped before ready")
 
-    async def _await_streams(self, cameras: dict[str, str]) -> None:
-        host = self._box_host()
-        ports = [_CAMERA_PORTS[slot] for slot in cameras]
-        deadline = asyncio.get_event_loop().time() + _STREAM_TIMEOUT_S
-        pending = set(ports)
-        while pending:
-            if self._stopping:
-                raise OrchestrationError("stopped before streams were ready")
-            if asyncio.get_event_loop().time() > deadline:
-                missing = ", ".join(f"{host}:{p}" for p in sorted(pending))
-                raise OrchestrationError(f"camera streams not reachable: {missing}")
-            for port in list(pending):
-                if await self._port_open(host, port):
-                    pending.discard(port)
-                    self.session.emit(f"[serve] stream port {host}:{port} ready")
-            if pending:
-                await asyncio.sleep(1.0)
-
-    async def _port_open(self, host: str, port: int) -> bool:
-        try:
-            _, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=2.0
-            )
-        except (OSError, asyncio.TimeoutError):
-            return False
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except OSError:
-            pass
-        return True
+    def _watch_stream(self, line: str) -> None:
+        # ZED streams are UDP, so key readiness off the box's own log line rather
+        # than probing the (UDP) stream ports, which a TCP probe never connects.
+        if _STREAM_READY_MARKER in line:
+            self._stream_ready.set()
 
     # -- teardown -----------------------------------------------------------
 

@@ -94,8 +94,14 @@ export function OperationPanel({
     else if (zedLink?.ptp?.error) blockers.push(`PTP clock sync failed: ${zedLink.ptp.error}`)
     else blockers.push("Wait for PTP clock sync to lock")
   }
-  if (meta.requiresZed && camCount === 0)
+  // Likewise the cameras must actually be streaming before a task can record /
+  // run a policy — gate on the live stream the same way we gate on the clock.
+  if (meta.requiresZed && camCount === 0) {
     blockers.push("Add at least one camera serial in the ZED connection")
+  } else if (meta.requiresZed && zedOk && zedLink?.ptp?.locked && !zedLink?.stream?.ready) {
+    if (zedLink?.stream?.error) blockers.push(`ZED camera stream failed: ${zedLink.stream.error}`)
+    else blockers.push("Wait for the ZED cameras to start streaming")
+  }
   for (const f of allFields) {
     if (f.required) {
       const v = settings[f.key]
