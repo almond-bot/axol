@@ -10,8 +10,6 @@ import argparse
 import asyncio
 import logging
 
-_SENDER_IP = "192.168.10.1/24"
-
 _VALID_RESOLUTIONS = ["HD1080", "HD1200", "SVGA"]
 
 
@@ -62,12 +60,6 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         help="HEVC encoding bitrate in kbits/s (default: 8000).",
     )
     p.add_argument(
-        "--setup-ip",
-        metavar="IFACE",
-        default=None,
-        help=f"Assign the sender IP ({_SENDER_IP}) to IFACE before streaming (e.g. eth0). Requires sudo.",
-    )
-    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -83,10 +75,6 @@ def run(args: argparse.Namespace) -> None:
             "error: at least one of --overhead, --left-arm, --right-arm must be provided"
         )
     logging.basicConfig(level=getattr(logging, args.log_level))
-    if args.setup_ip:
-        from ...shared import setup_link_ip
-
-        setup_link_ip(args.setup_ip, _SENDER_IP)
     try:
         asyncio.run(
             _run(

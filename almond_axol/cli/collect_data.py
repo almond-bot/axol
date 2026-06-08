@@ -48,10 +48,10 @@ _logger = logging.getLogger(__name__)
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for data collection: three ZED streams.
 
-    All three cameras share one host (``--robot_config.zed_host``); override
-    other fields from the CLI too, e.g.
-    ``--robot_config.zed_host 10.0.0.5`` or
-    ``--robot_config.axol_config.left.elbow.kp 60``.
+    All three cameras share one host, which is **required** — pass
+    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
+    stripped from the config overlay so draccus enforces the input). Other
+    fields are overridable too, e.g. ``--robot_config.axol_config.left.elbow.kp 60``.
     """
     return AxolRobotConfig(
         cameras={
@@ -59,6 +59,7 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(port=30002),
             "right_arm": ZedCameraConfig(port=30004),
         },
+        zed_host="",
     )
 
 
@@ -80,7 +81,6 @@ class CollectDataConfig:
     teleop_hz: int = 120
     root: str | None = None
     push_to_hub: bool = False
-    zed_iface: str | None = None
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
@@ -282,7 +282,6 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
-    from ..shared import setup_link_ip
     from ..vr.models import VRState
 
     repo_id = cfg.repo_id
@@ -293,9 +292,6 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     push_to_hub = cfg.push_to_hub
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
-
-    if cfg.zed_iface:
-        setup_link_ip(cfg.zed_iface, "192.168.10.2/24")
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)

@@ -167,29 +167,32 @@ export async function robotDisconnect(): Promise<RobotStatus> {
 // ZED box link (detached, lightweight reachability check)
 // ---------------------------------------------------------------------------
 
+export interface PtpStatus {
+  running: boolean
+  locked: boolean
+  offsetNs: number | null
+  sessionId: string | null
+  error?: string | null
+}
+
 export interface ZedLinkStatus {
   connected: boolean
   boxUrl: string | null
-  hostIface: string | null
-  boxIface: string | null
   info: ServerInfo | null
   error: string | null
+  ptp?: PtpStatus
 }
 
 export async function fetchZedStatus(): Promise<ZedLinkStatus> {
   return json(await fetch(apiUrl("/api/zed/status")))
 }
 
-export async function zedConnect(
-  url: string,
-  hostIface?: string,
-  boxIface?: string
-): Promise<ZedLinkStatus> {
+export async function zedConnect(url: string): Promise<ZedLinkStatus> {
   return json(
     await fetch(apiUrl("/api/zed/connect"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url, hostIface: hostIface ?? null, boxIface: boxIface ?? null }),
+      body: JSON.stringify({ url }),
     })
   )
 }
@@ -242,16 +245,16 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
-export type ZedTopology = "direct" | "lan"
-
-/** Serve-side orchestration spec for collect-data / run-policy (see orchestrator.py). */
+/** Serve-side orchestration spec for collect-data / run-policy (see orchestrator.py).
+ *
+ * The cameras stream from, and the clocks are PTP-synced over, the same ZED box
+ * address ``axol serve`` is reachable on; the PTP interfaces on both machines
+ * are auto-derived from it server-side. Network addressing between this host
+ * and the box is the operator's job.
+ */
 export interface ZedSpec {
   enabled: boolean
   boxUrl: string
-  topology: ZedTopology
-  hostIface: string
-  boxIface: string
-  zedHost: string
   cameras: { overhead: string; left_arm: string; right_arm: string }
   resolution?: string
   fps?: number
@@ -293,9 +296,6 @@ export function zedMissing(spec: ZedSpec): string[] {
   if (!spec.enabled) return []
   const missing: string[] = []
   if (!spec.boxUrl.trim()) missing.push("ZED box address")
-  if (!spec.hostIface.trim()) missing.push("host interface")
-  if (!spec.boxIface.trim()) missing.push("ZED box interface")
-  if (spec.topology === "lan" && !spec.zedHost.trim()) missing.push("ZED stream IP")
   if (zedCameraCount(spec) === 0) missing.push("at least one camera serial")
   return missing
 }

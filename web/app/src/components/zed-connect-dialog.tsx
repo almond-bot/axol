@@ -1,35 +1,29 @@
 import { useEffect, useState } from "react"
 import { AlertTriangle, Camera, Check, Loader2, Plug, X } from "lucide-react"
-import { fetchBoxInfo, zedConnect, type ServerInfo, type ZedLinkStatus } from "@/lib/supervisor"
+import { fetchBoxInfo, zedConnect, type ZedLinkStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
-const selectClass =
-  "h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
-
 /**
  * Lightweight ZED box link dialog. Verifies the box's `axol serve` is reachable
- * and stores the box URL + wired interfaces on the host. Clock-sync + camera
- * streaming still start when a collect-data / run-policy task begins.
+ * and stores the box URL on the host. Connecting also starts PTP clock sync so
+ * the clocks are locked before a task; camera streaming starts when a
+ * collect-data / run-policy task begins. The PTP interfaces on both machines
+ * are derived automatically from the box address.
  */
 export function ZedConnectDialog({
   open,
   onClose,
-  hostInfo,
   initial,
   onConnected,
 }: {
   open: boolean
   onClose: () => void
-  hostInfo: ServerInfo | null
   initial: ZedLinkStatus | null
   onConnected: (status: ZedLinkStatus) => void
 }) {
   const [url, setUrl] = useState(initial?.boxUrl ?? "")
-  const [hostIface, setHostIface] = useState(initial?.hostIface ?? hostInfo?.ethIface ?? "")
-  const [boxIface, setBoxIface] = useState(initial?.boxIface ?? "")
-  const [boxIfaces, setBoxIfaces] = useState<string[]>([])
   const [probe, setProbe] = useState<{ state: "idle" | "loading" | "ok" | "err"; msg?: string }>({
     state: "idle",
   })
@@ -50,9 +44,7 @@ export function ZedConnectDialog({
     setProbe({ state: "loading" })
     try {
       const info = await fetchBoxInfo(url.trim())
-      setBoxIfaces(info.ethIfaces ?? [])
       setProbe({ state: "ok", msg: info.hostname })
-      if (!boxIface && info.ethIface) setBoxIface(info.ethIface)
     } catch (e) {
       setProbe({ state: "err", msg: String(e) })
     }
@@ -63,7 +55,7 @@ export function ZedConnectDialog({
     setBusy(true)
     setError(null)
     try {
-      const status = await zedConnect(url.trim(), hostIface || undefined, boxIface || undefined)
+      const status = await zedConnect(url.trim())
       onConnected(status)
       onClose()
     } catch (e) {
@@ -94,19 +86,19 @@ export function ZedConnectDialog({
 
         <div className="flex flex-col gap-5 p-5">
           <p className="text-xs text-white/45">
-            The ZED box runs its own <span className="font-mono">axol serve</span>. This only checks
-            it&apos;s reachable and remembers the wired link — streaming starts when you record or
-            run a policy.
+            The ZED box runs its own <span className="font-mono">axol serve</span>. Connecting
+            checks it&apos;s reachable and starts PTP clock sync between the two machines; camera
+            streaming starts when you record or run a policy.
           </p>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="zed-box-url">ZED box address</Label>
+            <Label htmlFor="zed-box-url">ZED box IP</Label>
             <div className="flex gap-2">
               <Input
                 id="zed-box-url"
                 value={url}
                 onChange={(e) => setUrl(e.target.value)}
-                placeholder="192.168.1.50:8090"
+                placeholder="192.168.1.50"
                 spellCheck={false}
                 autoCapitalize="off"
                 autoCorrect="off"
@@ -135,21 +127,10 @@ export function ZedConnectDialog({
                 {probe.msg}
               </p>
             )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div className="flex flex-col gap-1.5">
-              <Label>Host interface</Label>
-              <IfaceSelect
-                value={hostIface}
-                candidates={hostInfo?.ethIfaces ?? []}
-                onChange={setHostIface}
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label>ZED box interface</Label>
-              <IfaceSelect value={boxIface} candidates={boxIfaces} onChange={setBoxIface} />
-            </div>
+            <p className="text-xs text-white/35">
+              Just the IP — port <span className="font-mono">8090</span> (
+              <span className="font-mono">axol serve</span>) is assumed.
+            </p>
           </div>
 
           {error && <p className="text-sm text-red-400">{error}</p>}
@@ -166,41 +147,5 @@ export function ZedConnectDialog({
         </div>
       </div>
     </div>
-  )
-}
-
-function IfaceSelect({
-  value,
-  candidates,
-  onChange,
-}: {
-  value: string
-  candidates: string[]
-  onChange: (v: string) => void
-}) {
-  const known = candidates.includes(value) || value === ""
-  if (candidates.length > 0 && known) {
-    return (
-      <select className={selectClass} value={value} onChange={(e) => onChange(e.target.value)}>
-        <option value="" className="bg-[#1a1a1a]">
-          Select…
-        </option>
-        {candidates.map((c) => (
-          <option key={c} value={c} className="bg-[#1a1a1a]">
-            {c}
-          </option>
-        ))}
-      </select>
-    )
-  }
-  return (
-    <Input
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder="eth0"
-      spellCheck={false}
-      autoCapitalize="off"
-      autoCorrect="off"
-    />
   )
 }

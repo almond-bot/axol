@@ -22,7 +22,8 @@ from pydantic import BaseModel
 
 from .commands import command_specs
 from .manager import Session, SessionManager
-from .netdetect import best_eth_iface, list_eth_ifaces
+from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
+from .orchestrator import PtpLink
 from .robot_link import RobotLink
 from .runner import OperationRunner
 
@@ -65,18 +66,22 @@ class RobotConnectRequest(BaseModel):
 
 
 class ZedConnectRequest(BaseModel):
-    """Lightweight ZED box link: store url + ifaces and verify reachability."""
+    """Lightweight ZED box link: store url and verify reachability."""
 
     url: str
-    hostIface: str | None = None
-    boxIface: str | None = None
 
 
 class SyncClocksRequest(BaseModel):
-    """Remote ``zed.sync-clocks`` launch (host → ZED box, orchestrator only)."""
+    """Remote ``zed.sync-clocks`` launch (host → ZED box, orchestrator only).
+
+    The interface can be given explicitly (``iface``) or resolved on the box
+    from the streaming IP it owns (``ip``); if neither pins a NIC the box
+    falls back to its best wired interface.
+    """
 
     role: str
-    iface: str
+    iface: str | None = None
+    ip: str | None = None
     transport: str | None = None
     timestamping: str | None = None
 
@@ -90,7 +95,6 @@ class StreamRequest(BaseModel):
     resolution: str | None = None
     fps: int | None = None
     bitrate: int | None = None
-    setup_ip: str | None = None
 
 
 # Ports the launched commands expose on the serve host.
@@ -137,16 +141,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="axol serve")
     manager = SessionManager()
     robot = RobotLink()
-    runner = OperationRunner(robot)
-    # Detached ZED box link (light reachability check; streaming starts at task
-    # time via the orchestrator). Mutated by /api/zed/connect|disconnect.
+    # PTP clock sync between this host and the box. Started when the box is
+    # connected so the clocks are already disciplined before a task; reused by
+    # the collect-data / run-policy orchestrator.
+    ptp = PtpLink(manager)
+    runner = OperationRunner(robot, ptp)
+    # Detached ZED box link (light reachability check; PTP clock sync starts on
+    # connect, camera streaming starts at task time via the orchestrator).
+    # Mutated by /api/zed/connect|disconnect.
     zed_state: dict[str, Any] = {
         "connected": False,
         "boxUrl": None,
-        "hostIface": None,
-        "boxIface": None,
         "info": None,
         "error": None,
+        "ptp": ptp.status(),
     }
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
@@ -212,28 +220,39 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/zed/status")
     async def zed_status() -> dict[str, Any]:
+        zed_state["ptp"] = ptp.status()
         return zed_state
 
     @app.post("/api/zed/connect")
     async def zed_connect(req: ZedConnectRequest) -> JSONResponse:
         ok, data = await asyncio.to_thread(_fetch_box_info, req.url)
         zed_state["boxUrl"] = _normalize_box_url(req.url)
-        zed_state["hostIface"] = req.hostIface
-        zed_state["boxIface"] = req.boxIface
         if ok:
             zed_state["connected"] = True
             zed_state["info"] = data
             zed_state["error"] = None
+            # Start clock sync immediately so the link is already locked by the
+            # time a collect-data / run-policy task begins.
+            zed_state["ptp"] = await ptp.start(req.url)
             return JSONResponse(zed_state)
         zed_state["connected"] = False
         zed_state["info"] = None
         zed_state["error"] = data.get("error", "unreachable")
+        await ptp.stop()
+        zed_state["ptp"] = ptp.status()
         return JSONResponse(zed_state, status_code=502)
 
     @app.post("/api/zed/disconnect")
     async def zed_disconnect() -> dict[str, Any]:
+        await ptp.stop()
         zed_state.update(
-            {"connected": False, "boxUrl": None, "info": None, "error": None}
+            {
+                "connected": False,
+                "boxUrl": None,
+                "info": None,
+                "error": None,
+                "ptp": ptp.status(),
+            }
         )
         return zed_state
 
@@ -312,8 +331,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/zed/sync-clocks")
     async def zed_sync_clocks(req: SyncClocksRequest) -> JSONResponse:
-        """Launch ``zed.sync-clocks`` (driven remotely by a host orchestrator)."""
-        argv = ["zed.sync-clocks", "--role", req.role, "--iface", req.iface]
+        """Launch ``zed.sync-clocks`` (driven remotely by a host orchestrator).
+
+        The PTP interface is resolved here on the box: an explicit ``iface``
+        wins, else the NIC that owns the streaming ``ip``, else the best wired
+        interface. Returns ``{"error": ...}`` if none can be determined.
+        """
+        iface = req.iface
+        if not iface and req.ip:
+            iface = iface_owning(req.ip)
+        if not iface:
+            iface = best_eth_iface()
+        if not iface:
+            return JSONResponse(
+                {
+                    "error": (
+                        "could not determine the ZED box network interface "
+                        f"(no NIC owns {req.ip!r} and no wired NIC was found)"
+                    )
+                }
+            )
+        argv = ["zed.sync-clocks", "--role", req.role, "--iface", iface]
         if req.transport:
             argv += ["--transport", req.transport]
         if req.timestamping:
@@ -338,8 +376,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             argv += ["--fps", str(req.fps)]
         if req.bitrate is not None:
             argv += ["--bitrate", str(req.bitrate)]
-        if req.setup_ip:
-            argv += ["--setup-ip", req.setup_ip]
         session = await manager.start_raw("zed.stream", argv)
         return JSONResponse(session.to_dict())
 
@@ -405,6 +441,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await runner.shutdown()
+        await ptp.stop()
         await manager.shutdown()
         await asyncio.to_thread(robot.shutdown)
 

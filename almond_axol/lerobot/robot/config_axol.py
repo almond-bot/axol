@@ -18,10 +18,12 @@ class AxolRobotConfig(RobotConfig):
 
     Args:
         cameras:          Camera configs keyed by name (e.g. "overhead", "left_arm", "right_arm").
-        zed_host:         Shared IP of the ZED streamer. Applied to every
+        zed_host:         Shared IP of the ZED streamer. Required — there is no
+                          default, so it must be supplied (e.g.
+                          ``--robot_config.zed_host 10.0.0.5``). Applied to every
                           ``ZedCameraConfig`` camera that leaves its ``host``
-                          unset (``None``), so all cameras share one host by
-                          default; a camera with an explicit ``host`` keeps it.
+                          unset (``None``); a camera with an explicit ``host``
+                          keeps it.
         axol_config:      Per-joint gain config forwarded to the Axol hardware driver.
         telemetry_hz:     Background telemetry polling rate in Hz.
         observe_torques:  Include joint torques in observations. Default False.
@@ -30,7 +32,10 @@ class AxolRobotConfig(RobotConfig):
     """
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
-    zed_host: str = "192.168.10.1"
+    # Required: no default. The CLI/serve config overlay (see
+    # almond_axol.cli.config) strips ``required_input`` fields so draccus
+    # forces the operator to supply a value instead of falling back to one.
+    zed_host: str = field(kw_only=True, metadata={"required_input": True})
     axol_config: AxolConfig = field(default_factory=AxolConfig)
     telemetry_hz: float = 120.0
     observe_torques: bool = False

@@ -42,10 +42,6 @@ type OpSettings = Record<OperationId, Record<string, FormValue>>
 const DEFAULT_ZED: ZedSpec = {
   enabled: false,
   boxUrl: "",
-  topology: "direct",
-  hostIface: "",
-  boxIface: "",
-  zedHost: "192.168.10.1",
   cameras: { overhead: "", left_arm: "", right_arm: "" },
 }
 
@@ -113,9 +109,6 @@ export default function ControlPanel() {
       .then((info) => {
         setViewerPort(info.viewerPort)
         setHostInfo(info)
-        if (info.ethIface) {
-          setZedSettings((prev) => (prev.hostIface ? prev : { ...prev, hostIface: info.ethIface! }))
-        }
       })
       .catch(() => {})
     fetchRobotStatus()
@@ -147,6 +140,11 @@ export default function ControlPanel() {
     const t = setInterval(() => {
       fetchRobotStatus()
         .then(setRobot)
+        .catch(() => {})
+      // Keep the ZED link (and its PTP clock-sync state) fresh so the badge
+      // settles from "syncing" to "locked" after connecting the box.
+      fetchZedStatus()
+        .then(setZedLink)
         .catch(() => {})
     }, 2000)
     return () => clearInterval(t)
@@ -268,8 +266,6 @@ export default function ControlPanel() {
       ...zedSettings,
       enabled: true,
       boxUrl: zedLink?.boxUrl ?? zedSettings.boxUrl,
-      hostIface: zedLink?.hostIface || zedSettings.hostIface,
-      boxIface: zedLink?.boxIface || zedSettings.boxIface,
     }
   }
 
@@ -368,7 +364,6 @@ export default function ControlPanel() {
       <ZedConnectDialog
         open={zedDialogOpen}
         onClose={() => setZedDialogOpen(false)}
-        hostInfo={hostInfo}
         initial={zedLink}
         onConnected={setZedLink}
       />

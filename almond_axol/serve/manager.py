@@ -159,6 +159,19 @@ class SessionManager:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
+    def new_session(
+        self, command_id: str, args: dict[str, Any] | None = None
+    ) -> Session:
+        """Create and register a tracked session with no subprocess of its own.
+
+        For aggregators that drive their own processes/tails and emit into the
+        session manually (e.g. the long-lived PTP clock-sync link). It shows up
+        in ``list()`` and is tailable through the normal log endpoints.
+        """
+        session = Session(command_id, args or {})
+        self._sessions[session.id] = session
+        return session
+
     async def start(self, command_id: str, args: dict[str, Any]) -> Session:
         if command_id not in COMMANDS:
             raise KeyError(command_id)

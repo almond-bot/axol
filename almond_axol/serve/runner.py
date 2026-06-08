@@ -156,8 +156,12 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None) -> None:
+    def __init__(self, robot_link: Any = None, ptp: Any = None) -> None:
         self._robot_link = robot_link
+        # Long-lived PTP link (started at ZED box connect); reused by the
+        # orchestrated collect-data / run-policy path so PTP need not be brought
+        # up per task.
+        self._ptp = ptp
         self._lock = threading.Lock()
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
@@ -417,7 +421,9 @@ class OperationRunner:
                 await asyncio.to_thread(core, cfg, self._stop_event, control)
             return 0
 
-        orch = ZedOrchestrator(session, op_id, args, zed, run_main=run_main)
+        orch = ZedOrchestrator(
+            session, op_id, args, zed, run_main=run_main, ptp=self._ptp
+        )
         self._orch = orch
 
         with _Capture(session, log_level):

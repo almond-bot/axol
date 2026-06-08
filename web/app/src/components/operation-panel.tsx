@@ -22,7 +22,6 @@ import {
   type SessionInfo,
   type ZedLinkStatus,
   type ZedSpec,
-  type ZedTopology,
 } from "@/lib/supervisor"
 import { ConfigForm, CuratedForm } from "@/components/config-form"
 import { Card, CardContent } from "@/components/ui/card"
@@ -31,9 +30,6 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
-
-const selectClass =
-  "h-9 w-full rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50"
 
 const CAMERAS: { key: keyof ZedSpec["cameras"]; label: string; port: number }[] = [
   { key: "overhead", label: "Overhead", port: 30000 },
@@ -319,38 +315,9 @@ function ZedSettings({
         <Badge variant={camCount > 0 ? "success" : "warning"}>{camCount} set</Badge>
       </div>
 
-      <div className="flex flex-col gap-1.5">
-        <Label>Network topology</Label>
-        <select
-          className={selectClass}
-          value={spec.topology}
-          disabled={disabled}
-          onChange={(e) => onChange({ topology: e.target.value as ZedTopology })}
-        >
-          <option value="direct" className="bg-[#1a1a1a]">
-            Direct cable (auto 192.168.10.1 / .2)
-          </option>
-          <option value="lan" className="bg-[#1a1a1a]">
-            Shared LAN (DHCP)
-          </option>
-        </select>
-      </div>
-
-      {spec.topology === "lan" && (
-        <div className="flex flex-col gap-1.5">
-          <Label>ZED stream IP</Label>
-          <Input
-            value={spec.zedHost}
-            disabled={disabled}
-            onChange={(e) => onChange({ zedHost: e.target.value })}
-            placeholder="192.168.1.50"
-            spellCheck={false}
-          />
-        </div>
-      )}
-
       <p className="text-xs text-white/45">
-        Serial of each wired ZED-X One — at least one is required.
+        Cameras stream from the ZED box address you connected. Serial of each wired ZED-X One — at
+        least one is required.
       </p>
       {CAMERAS.map((cam) => (
         <div key={cam.key} className="flex items-center justify-between gap-4">

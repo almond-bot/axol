@@ -47,9 +47,10 @@ _logger = logging.getLogger(__name__)
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for inference: three ZED streams.
 
-    All three cameras share one host (``--robot_config.zed_host``); override
-    other fields from the CLI too, e.g.
-    ``--robot_config.zed_host 10.0.0.5`` or
+    All three cameras share one host, which is **required** — pass
+    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
+    stripped from the config overlay so draccus enforces the input). Other
+    fields are overridable too, e.g.
     ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
     used at data-collection time).
     """
@@ -59,6 +60,7 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(port=30002),
             "right_arm": ZedCameraConfig(port=30004),
         },
+        zed_host="",
     )
 
 
@@ -88,7 +90,6 @@ class RunPolicyConfig:
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
     temporal_ensemble_coeff: float = 0.01
-    zed_iface: str | None = None
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
@@ -732,7 +733,6 @@ def _run(
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import AxolRobot
-    from ..shared import setup_link_ip
 
     policy_path = cfg.policy_path
     policy_type = cfg.policy_type
@@ -751,9 +751,6 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
-
-    if cfg.zed_iface:
-        setup_link_ip(cfg.zed_iface, "192.168.10.2/24")
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()

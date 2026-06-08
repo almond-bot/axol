@@ -1,7 +1,7 @@
 import { Cpu, Loader2, Plug, Camera, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import type { RobotStatus, ZedLinkStatus } from "@/lib/supervisor"
+import type { PtpStatus, RobotStatus, ZedLinkStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -160,7 +160,13 @@ export function ConnectionsBar({
         )}
       </Tile>
 
-      <Tile icon={<Camera className="size-3.5" />} title="ZED box" dot={zedDot} label={zedLabel}>
+      <Tile
+        icon={<Camera className="size-3.5" />}
+        title="ZED box"
+        dot={zedDot}
+        label={zedLabel}
+        headerRight={zedConnected ? <PtpBadge ptp={zed?.ptp} /> : undefined}
+      >
         {zedConnected ? (
           <Button variant="outline" size="sm" onClick={onZedDisconnect}>
             <Power />
@@ -174,6 +180,27 @@ export function ConnectionsBar({
         )}
       </Tile>
     </div>
+  )
+}
+
+/**
+ * Compact PTP clock-sync state for the ZED box header. The link comes up on
+ * connect, so this shows the sync settling (syncing → locked) before any task.
+ */
+function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
+  if (!ptp) return null
+  const [dot, text, pulse] = ptp.locked
+    ? (["ok", "clock locked", false] as const)
+    : ptp.error
+      ? (["err", "sync error", false] as const)
+      : ptp.running
+        ? (["warn", "syncing clocks…", true] as const)
+        : (["idle", "clock idle", false] as const)
+  return (
+    <span className="flex items-center gap-1.5 text-[0.65rem] text-white/45">
+      <span className={cn("size-1.5 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
+      {text}
+    </span>
   )
 }
 

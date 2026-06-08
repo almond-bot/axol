@@ -75,12 +75,13 @@ export function SetupDialog({
         <div className="flex flex-col gap-6 p-5">
           <section className="flex flex-col gap-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="setup-server-host">Server address</Label>
+              <Label htmlFor="setup-server-host">Server IP</Label>
               <ConnBadge state={conn.state} />
             </div>
             <p className="text-xs text-white/45">
               The machine running <span className="font-mono">axol serve</span>. Every command and
-              the live logs are sent there.
+              the live logs are sent there. Just the IP — port{" "}
+              <span className="font-mono">8090</span> is assumed.
             </p>
             <form
               className="flex gap-2"
