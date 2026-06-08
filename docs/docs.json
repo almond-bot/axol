@@ -31,9 +31,17 @@
         ]
       },
       {
+        "group": "Web Interfaces",
+        "pages": [
+          "guides/control-panel",
+          "guides/vr-interface"
+        ]
+      },
+      {
         "group": "CLI Reference",
         "pages": [
           "cli/configuration",
+          "cli/serve",
           "cli/can-setup",
           "cli/can-enable",
           "cli/motor-info",

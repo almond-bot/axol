@@ -1,0 +1,103 @@
+---
+title: "VR Interface"
+description: "The WebXR teleop app that streams Quest controller pose to the Axol SDK — now hosted in this repo under web/."
+---
+
+The Axol VR interface is a **WebXR app** that runs in a Meta Quest browser and streams hand/elbow pose from the headset to the Axol SDK over a secure WebSocket. It's what you connect to during [teleoperation](/quickstart/teleop) and [data collection](/quickstart/data-collection).
+
+The app's source lives in this repository under `web/` (it was previously the separate `axol-vr` repo). The same `web/` build also produces the [web control panel](/guides/control-panel), and [`axol serve`](/cli/serve) serves both.
+
+## Hosted vs. self-hosted
+
+| | URL | When to use |
+|---|---|---|
+| **Hosted** | [axol.almond.bot](https://axol.almond.bot) | The easiest path — open it on the Quest, enter your host's address, connect. Recommended for most users. |
+| **Self-hosted** | `https://<host>:8090/` | Served from your own machine by [`axol serve`](/cli/serve), or by `npm run dev` for development. Use when iterating on the interface or running fully offline. |
+
+Either way, the headset connects to the **VR WebSocket server on port 8000** that [`axol teleop`](/cli/teleop) (and the control panel's teleop/collect operations) runs on the host.
+
+<Warning>
+  The WSS link is self-signed. Before the app can connect, accept the certificate once in the Quest browser by visiting `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceeding past the warning. The cert is cached in `~/.almond/vr/certs/` and shared with [`axol serve`](/cli/serve).
+</Warning>
+
+## Repository layout
+
+```
+web/
+├── app/                      # Vite + React WebXR app (and the control panel)
+│   └── dist/                 # build output — served by `axol serve`
+└── packages/
+    └── axol-vr-client/       # reusable R3F components + hooks (@almond/axol-vr-client)
+```
+
+## Build & develop
+
+From `web/`:
+
+```bash
+npm install
+
+# Production build — client package first, then the app (outputs web/app/dist,
+# which axol serve picks up)
+npm run build --workspace=packages/axol-vr-client
+npm run build --workspace=app
+
+# Local dev server with hot reload
+npm run dev --workspace=app
+```
+
+For dev, open the printed localhost URL in the Quest browser, enter the hostname of the machine running the Axol SDK, and press **Connect**, then **Start** to enter the XR session.
+
+### Deployment
+
+The hosted app is built on Vercel; `vercel.json` builds the client package first so it's available as a local workspace dependency:
+
+```json
+{
+  "buildCommand": "npm run build --workspace=packages/axol-vr-client && npm run build --workspace=app",
+  "outputDirectory": "app/dist",
+  "installCommand": "rm -f package-lock.json && npm install"
+}
+```
+
+## Controller bindings
+
+<img src="/assets/quest.png" alt="Quest controller diagram" />
+
+| # | Button | Action |
+|---|---|---|
+| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
+| 2 | Right grip | See above |
+| 3 | Left trigger | Actuate left gripper |
+| 4 | Right trigger | Actuate right gripper |
+| 5 | X | **Reset** pose; cancels a recording countdown; stops and discards an in-progress take |
+| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
+| 7 | Y | **Exit** the XR session |
+| 8 | B | Toggle between **Teleop** and **Data Collection** (disabled while recording or counting down) |
+
+## State machine
+
+```
+Teleop ──[B]──► DataCollection ──[A]──► (3s countdown) ──► Recording
+   ▲                 ▲                                          │
+   └────────[B]──────┘                                    [A or X]
+                                                               │
+                                                          (server push)
+                                                               │
+                                                             Saving ──► DataCollection
+```
+
+During the countdown the state sent to the server stays `DataCollection`; it becomes `Recording` once the countdown completes.
+
+**Saving** and **Error** are *server-driven*. When recording stops, the SDK pushes `{"type": "state", "value": "saving"}` and blocks every control except **Y** (exit) until the episode is written, then pushes `data_collection` to re-enable controls. Broadcasting `error` shows an error indicator in the headset. See [`almond_axol.vr`](/api/vr) for the frame protocol and `send_feedback_state()`.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Teleoperation quickstart" icon="gamepad" href="/quickstart/teleop">
+    Go from install to a live VR session.
+  </Card>
+  <Card title="VR server API" icon="code" href="/api/vr">
+    The WSS server, frame schema, and feedback messages.
+  </Card>
+</CardGroup>

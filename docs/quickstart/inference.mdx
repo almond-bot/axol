@@ -109,6 +109,10 @@ While `run-policy` runs, control the episode from stdin in the `run-policy` term
 
 `--episode_time_s` is a safety cap (default 120 s) that falls back to the same `[Enter]=save / r / q` prompt if no key is pressed. If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
 
+<Tip>
+  The [web control panel](/guides/control-panel) exposes these same controls as **Start episode** / **Save** / **Discard** buttons, so you can run a policy and manage rollouts from a browser.
+</Tip>
+
 ## Next steps
 
 <CardGroup cols={2}>

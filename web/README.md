@@ -1,12 +1,22 @@
-# Almond Axol VR
+# Almond Axol Web
 
-WebXR teleoperation interface for the Almond Axol robot. Streams hand/elbow pose data from a Meta Quest headset to the Almond Axol SDK over WebSocket.
+The browser front-ends for the Almond Axol robot. This directory lives inside the main `axol` repo (it was previously the standalone `axol-vr` repo) and builds two surfaces from one app:
 
-## Monorepo structure
+- **VR interface** (`/vr`) — WebXR teleoperation. Streams hand/elbow pose from a Meta Quest headset to the Almond Axol SDK over WebSocket. Deployed to Vercel at [axol.almond.bot](https://axol.almond.bot).
+- **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
+
+The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`.
+
+> Docs: [Web Control Panel](https://almond.bot/docs/guides/control-panel) · [VR Interface](https://almond.bot/docs/guides/vr-interface). The `serve` backend (FastAPI) that the control panel talks to lives in `almond_axol/serve/`.
+
+## Structure
 
 ```
-axol-vr/
-├── app/                        # Vite + React app (deployed to Vercel)
+web/
+├── app/                        # Vite + React app — both /vr and /control routes
+│   ├── src/routes/VrApp.tsx        # WebXR teleop interface
+│   ├── src/routes/ControlPanel.tsx # control panel UI
+│   └── dist/                       # build output — served by `axol serve` and Vercel
 └── packages/
     └── axol-vr-client/         # Reusable R3F components and hooks
 ```
@@ -101,7 +111,7 @@ The `Error` state is also **server-driven**: broadcasting `{"type": "state", "va
 
 ## App
 
-The `app/` package is a Vite + React app that wraps the client library into a full WebXR UI deployed to Vercel.
+The `app/` package is a Vite + React app that serves both the WebXR teleop interface (`/vr`, wrapping the `axol-vr-client` library) and the control panel (`/control`). The two routes are lazy-loaded so opening the control panel doesn't pull in the heavy three.js / XR bundle.
 
 **Dev**
 
@@ -110,15 +120,17 @@ npm install
 npm run dev --workspace=app
 ```
 
-Open the printed localhost URL on your Quest browser, enter the hostname of the machine running the Almond Axol SDK, and press **Connect**. Once connected, press **Start** to enter the AR session.
+- **VR**: open the printed localhost URL on your Quest browser, enter the hostname of the machine running the Almond Axol SDK, press **Connect**, then **Start** to enter the AR session.
+- **Control panel**: open `/control` in a normal browser. It talks to the `axol serve` API (default `https://localhost:8090`).
 
 **Build**
 
 ```bash
-npm run build --workspace=packages/axol-vr-client
-npm run build --workspace=app
-# output: app/dist/
+npm run build --workspace=packages/axol-vr-client   # client package first
+npm run build --workspace=app                        # → app/dist/
 ```
+
+The built `app/dist/` is served two ways: by Vercel (the hosted VR app) and by `axol serve` locally (which hosts both routes from the same bundle).
 
 ## Deployment
 
