@@ -298,16 +298,13 @@ function EpisodeControls({ onEpisode }: { onEpisode: (command: string) => void }
       </span>
       <div className="flex flex-wrap gap-2">
         <Button size="sm" onClick={() => onEpisode("start")}>
-          Start episode
+          Start Episode
         </Button>
         <Button variant="outline" size="sm" onClick={() => onEpisode("s")}>
-          Save + next
+          Save
         </Button>
         <Button variant="outline" size="sm" onClick={() => onEpisode("r")}>
-          Re-record
-        </Button>
-        <Button variant="destructive" size="sm" onClick={() => onEpisode("q")}>
-          Quit episodes
+          Discard
         </Button>
       </div>
     </div>
