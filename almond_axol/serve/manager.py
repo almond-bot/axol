@@ -92,6 +92,11 @@ class Session:
         # When set, the manager calls this instead of the default process-group
         # signal on stop() — the ZED orchestrator uses it to unwind every step.
         self.teardown: Callable[[], Awaitable[None]] | None = None
+        # Server event loop. When emit/close_stream run off-loop (the in-process
+        # operation runner emits from worker threads), subscriber wakeups are
+        # marshalled back here via call_soon_threadsafe. None for subprocess
+        # sessions, which only ever emit from the server loop.
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,23 +110,30 @@ class Session:
             "pid": self.proc.pid if self.proc else None,
         }
 
+    @staticmethod
+    def _safe_put(q: asyncio.Queue[str | None], item: str | None) -> None:
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
+
+    def _fanout(self, item: str | None) -> None:
+        loop = self.loop
+        for q in list(self.subscribers):
+            if loop is not None:
+                loop.call_soon_threadsafe(self._safe_put, q, item)
+            else:
+                self._safe_put(q, item)
+
     def emit(self, line: str) -> None:
         """Append a log line and fan it out to live subscribers."""
         self.log.append(line)
         self.total_emitted += 1
-        for q in self.subscribers:
-            try:
-                q.put_nowait(line)
-            except asyncio.QueueFull:
-                pass
+        self._fanout(line)
 
     def close_stream(self) -> None:
         """Signal end-of-stream to subscribers so their WebSockets can close."""
-        for q in list(self.subscribers):
-            try:
-                q.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
+        self._fanout(None)
 
     def read_log(self, offset: int) -> tuple[list[str], int]:
         """Return log lines at/after ``offset`` plus the next offset to poll.

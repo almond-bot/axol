@@ -16,7 +16,7 @@ const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
   {
     label: "2. Install the Axol CLI globally",
     hint: "straight from GitHub",
-    cmd: 'uv tool install --python 3.13 "almond-axol[sim] @ git+ssh://git@github.com/almond-bot/axol.git"',
+    cmd: 'uv tool install --python 3.13 "almond-axol[lerobot,sim] @ git+ssh://git@github.com/almond-bot/axol.git"',
   },
   {
     label: "3. Launch this control panel",

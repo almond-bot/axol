@@ -103,11 +103,17 @@ class ZedOrchestrator:
         command_id: str,
         args: dict[str, Any],
         zed: dict[str, Any],
+        run_main: Any = None,
     ) -> None:
         self.session = session
         self.command_id = command_id
         self.args = dict(args)
         self.zed = zed
+        # When set, step 6 awaits this coroutine factory (returning an exit
+        # code) instead of spawning the command as a subprocess — used by the
+        # in-process operation runner so the ZED pipeline wraps an in-process
+        # collect-data / run-policy task.
+        self._run_main = run_main
         self.box: str = _normalize_url(str(zed.get("boxUrl", "")))
         self.topology: str = zed.get("topology", "direct")
 
@@ -197,10 +203,17 @@ class ZedOrchestrator:
         await self._await_streams(cameras)
         self.session.emit("[serve] camera streams up")
 
-        # 6. Run the main command locally.
+        # 6. Run the main command — in-process (runner) or as a subprocess.
         if self._stopping:
             return
         self.session.emit(f"[serve] step 6/6 — starting {self.command_id}")
+        if self._run_main is not None:
+            self.session.status = "running"
+            rc = await self._run_main(self._main_args())
+            self.session.exit_code = rc
+            self.session.emit(f"[serve] {self.command_id} finished with code {rc}")
+            await self.stop()
+            return
         argv = build_argv(self.command_id, self._main_args())
         self._main_proc = await spawn_proc([self.command_id, *argv])
         self.session.proc = self._main_proc

@@ -7,6 +7,7 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import urllib.error
@@ -20,12 +21,17 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from .commands import command_specs
-from .manager import SessionManager
+from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, list_eth_ifaces
+from .robot_link import RobotLink
+from .runner import OperationRunner
 
 # Orchestrated commands launch the full ZED bring-up (clock sync + streaming)
 # instead of just the bare command when a ZED spec is supplied.
 _ZED_COMMANDS = {"collect-data", "run-policy"}
+
+# The four core operations run in-process via the OperationRunner.
+_OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
 
 
 class RunRequest(BaseModel):
@@ -34,6 +40,36 @@ class RunRequest(BaseModel):
     # When present with ``enabled`` true (and the command supports it), run the
     # multi-machine ZED orchestration (see :mod:`.orchestrator`).
     zed: dict[str, Any] | None = None
+
+
+class OpStartRequest(BaseModel):
+    """Start one of the four in-process core operations."""
+
+    op: str
+    args: dict[str, Any] = {}
+    # ZED spec (box url + camera/topology/iface settings) for collect-data /
+    # run-policy; the box link comes from ``/api/zed/connect``.
+    zed: dict[str, Any] | None = None
+
+
+class EpisodeRequest(BaseModel):
+    """run-policy episode control command: ``start`` | ``s`` | ``r`` | ``q``."""
+
+    command: str
+
+
+class RobotConnectRequest(BaseModel):
+    """Optional sudo password used only if CAN bring-up needs root access."""
+
+    password: str | None = None
+
+
+class ZedConnectRequest(BaseModel):
+    """Lightweight ZED box link: store url + ifaces and verify reachability."""
+
+    url: str
+    hostIface: str | None = None
+    boxIface: str | None = None
 
 
 class SyncClocksRequest(BaseModel):
@@ -72,9 +108,53 @@ def _lan_ip() -> str:
             return "127.0.0.1"
 
 
+def _normalize_box_url(url: str) -> str:
+    """Add scheme + default control port (8090) to a bare ZED box address."""
+    from urllib.parse import urlsplit
+
+    base = url.strip().rstrip("/")
+    if "://" not in base:
+        base = f"http://{base}"
+    parts = urlsplit(base)
+    if parts.port is None and parts.hostname:
+        base = f"{parts.scheme}://{parts.hostname}:8090"
+    return base
+
+
+def _fetch_box_info(url: str) -> tuple[bool, dict[str, Any]]:
+    """Fetch the ZED box's ``/api/info``; ``(ok, data_or_error)``."""
+    base = _normalize_box_url(url)
+    try:
+        with urllib.request.urlopen(f"{base}/api/info", timeout=5.0) as resp:
+            return True, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return False, {"error": f"box returned HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return False, {"error": f"cannot reach ZED box: {exc}"}
+
+
 def create_app(static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="axol serve")
     manager = SessionManager()
+    robot = RobotLink()
+    runner = OperationRunner(robot)
+    # Detached ZED box link (light reachability check; streaming starts at task
+    # time via the orchestrator). Mutated by /api/zed/connect|disconnect.
+    zed_state: dict[str, Any] = {
+        "connected": False,
+        "boxUrl": None,
+        "hostIface": None,
+        "boxIface": None,
+        "info": None,
+        "error": None,
+    }
+
+    def _find_session(session_id: str) -> tuple[Session | None, Any]:
+        """Resolve a session id to (session, owner) across runner + manager."""
+        s = runner.get(session_id)
+        if s is not None:
+            return s, runner
+        return manager.get(session_id), manager
 
     # Allow the Vite dev server (different origin) to call the API directly.
     app.add_middleware(
@@ -108,25 +188,94 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         Proxied through the host so the browser avoids cross-origin / mixed
         content calls to the box and a single page reports both machines.
         """
-        from urllib.parse import urlsplit
+        ok, data = await asyncio.to_thread(_fetch_box_info, url)
+        return JSONResponse(data, status_code=200 if ok else 502)
 
-        base = url.strip().rstrip("/")
-        if "://" not in base:
-            base = f"http://{base}"
-        parts = urlsplit(base)
-        if parts.port is None and parts.hostname:
-            base = f"{parts.scheme}://{parts.hostname}:8090"
+    # -- robot connection (detached CAN + 1 Hz motor ping) ------------------
+
+    @app.get("/api/robot/status")
+    async def robot_status() -> dict[str, Any]:
+        return robot.status()
+
+    @app.post("/api/robot/connect")
+    async def robot_connect(
+        req: RobotConnectRequest | None = None,
+    ) -> dict[str, Any]:
+        password = req.password if req else None
+        return await asyncio.to_thread(robot.connect, password)
+
+    @app.post("/api/robot/disconnect")
+    async def robot_disconnect() -> dict[str, Any]:
+        return await asyncio.to_thread(robot.disconnect)
+
+    # -- ZED box link (detached, lightweight) -------------------------------
+
+    @app.get("/api/zed/status")
+    async def zed_status() -> dict[str, Any]:
+        return zed_state
+
+    @app.post("/api/zed/connect")
+    async def zed_connect(req: ZedConnectRequest) -> JSONResponse:
+        ok, data = await asyncio.to_thread(_fetch_box_info, req.url)
+        zed_state["boxUrl"] = _normalize_box_url(req.url)
+        zed_state["hostIface"] = req.hostIface
+        zed_state["boxIface"] = req.boxIface
+        if ok:
+            zed_state["connected"] = True
+            zed_state["info"] = data
+            zed_state["error"] = None
+            return JSONResponse(zed_state)
+        zed_state["connected"] = False
+        zed_state["info"] = None
+        zed_state["error"] = data.get("error", "unreachable")
+        return JSONResponse(zed_state, status_code=502)
+
+    @app.post("/api/zed/disconnect")
+    async def zed_disconnect() -> dict[str, Any]:
+        zed_state.update(
+            {"connected": False, "boxUrl": None, "info": None, "error": None}
+        )
+        return zed_state
+
+    # -- in-process operations (teleop / gravity / collect / policy) --------
+
+    @app.get("/api/op/status")
+    async def op_status() -> dict[str, Any]:
+        session = runner.current()
+        return {
+            "running": runner.is_running(),
+            "session": session.to_dict() if session else None,
+        }
+
+    @app.post("/api/op/start")
+    async def op_start(req: OpStartRequest) -> JSONResponse:
+        if req.op not in _OPERATIONS:
+            return JSONResponse(
+                {"error": f"unknown operation: {req.op}"}, status_code=400
+            )
         try:
-            with urllib.request.urlopen(f"{base}/api/info", timeout=5.0) as resp:
-                return JSONResponse(json.loads(resp.read().decode()))
-        except urllib.error.HTTPError as exc:
-            return JSONResponse(
-                {"error": f"box returned HTTP {exc.code}"}, status_code=502
+            session = runner.start(
+                req.op, req.args, zed=req.zed, loop=asyncio.get_running_loop()
             )
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(session.to_dict())
+
+    @app.post("/api/op/stop")
+    async def op_stop() -> JSONResponse:
+        session = await asyncio.to_thread(runner.stop)
+        if session is None:
+            return JSONResponse({"error": "no operation running"}, status_code=404)
+        return JSONResponse(session.to_dict())
+
+    @app.post("/api/op/episode")
+    async def op_episode(req: EpisodeRequest) -> JSONResponse:
+        ok = runner.episode_command(req.command)
+        if not ok:
             return JSONResponse(
-                {"error": f"cannot reach ZED box: {exc}"}, status_code=502
+                {"error": "no run-policy episode control active"}, status_code=409
             )
+        return JSONResponse({"ok": True})
 
     @app.get("/api/commands")
     async def get_commands() -> list[dict[str, Any]]:
@@ -134,7 +283,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/sessions")
     async def get_sessions() -> list[dict[str, Any]]:
-        return manager.list()
+        sessions = manager.list()
+        current = runner.current()
+        if current is not None:
+            sessions.append(current.to_dict())
+        return sessions
 
     @app.post("/api/run")
     async def run(req: RunRequest) -> JSONResponse:
@@ -192,6 +345,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/sessions/{session_id}/stop")
     async def stop(session_id: str) -> JSONResponse:
+        # In-process operation sessions are stopped through the runner.
+        if runner.get(session_id) is not None:
+            session = await asyncio.to_thread(runner.stop)
+            return JSONResponse(session.to_dict() if session else {"ok": True})
         ok = await manager.stop(session_id)
         if not ok:
             return JSONResponse({"error": "unknown session"}, status_code=404)
@@ -205,7 +362,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         The WebSocket below is for live browser streaming; this HTTP variant is
         what one ``axol serve`` uses to tail another's sessions.
         """
-        session = manager.get(session_id)
+        session, _owner = _find_session(session_id)
         if session is None:
             return JSONResponse({"error": "unknown session"}, status_code=404)
         lines, next_offset = session.read_log(offset)
@@ -221,13 +378,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.websocket("/api/sessions/{session_id}/logs")
     async def logs(ws: WebSocket, session_id: str) -> None:
         await ws.accept()
-        session = manager.get(session_id)
+        session, owner = _find_session(session_id)
         if session is None:
             await ws.send_json({"type": "error", "message": "unknown session"})
             await ws.close()
             return
 
-        queue = manager.subscribe(session)
+        queue = owner.subscribe(session)
         try:
             # Replay the buffered backlog first.
             for line in list(session.log):
@@ -243,11 +400,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
-            manager.unsubscribe(session, queue)
+            owner.unsubscribe(session, queue)
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        await runner.shutdown()
         await manager.shutdown()
+        await asyncio.to_thread(robot.shutdown)
 
     if static_dir is not None:
         _mount_spa(app, static_dir)

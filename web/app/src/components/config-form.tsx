@@ -82,6 +82,23 @@ export function ConfigForm({ schema, ...common }: CommonProps & { schema: Schema
   )
 }
 
+/**
+ * Renders a curated, flat list of fields (a hand-picked subset of an op's
+ * full schema) — used by the purpose-built operation panels.
+ */
+export function CuratedForm({ fields, ...common }: CommonProps & { fields: SchemaField[] }) {
+  if (fields.length === 0) {
+    return <p className="text-sm text-white/40">No settings — just press Start.</p>
+  }
+  return (
+    <div className="flex flex-col gap-4">
+      {fields.map((f) => (
+        <FieldRow key={f.key} field={f} {...common} />
+      ))}
+    </div>
+  )
+}
+
 function GroupSection({
   group,
   depth,
@@ -148,10 +165,14 @@ function FieldRow({
   const has = field.key in overrides
   const value = has ? overrides[field.key] : undefined
   const modified = isModified(field, value)
+  // Namespace the DOM id so keys like "root" don't collide with app-level
+  // element ids (e.g. the React mount node <div id="root">, which a global
+  // `#root { min-height: 100vh }` rule would otherwise stretch the input to).
+  const fieldId = `cfg-${field.key}`
 
   const labelNode = (
     <div className="flex min-w-0 items-center gap-2">
-      <Label htmlFor={field.key} className="truncate">
+      <Label htmlFor={fieldId} className="truncate">
         {showPath ? (
           <span className="font-mono text-xs text-white/55">{field.key}</span>
         ) : (
@@ -194,7 +215,7 @@ function FieldRow({
       {labelNode}
       {field.type === "select" ? (
         <select
-          id={field.key}
+          id={fieldId}
           value={text}
           disabled={disabled}
           onChange={(e) => onChange(field.key, e.target.value)}
@@ -209,7 +230,7 @@ function FieldRow({
         </select>
       ) : (
         <Input
-          id={field.key}
+          id={fieldId}
           inputMode={field.type === "number" ? "decimal" : undefined}
           value={text}
           placeholder={field.required ? "required" : defaultString(field)}

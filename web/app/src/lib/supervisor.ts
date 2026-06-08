@@ -121,6 +121,127 @@ export async function fetchBoxInfo(url: string): Promise<ServerInfo> {
   return json(await fetch(apiUrl(`/api/zed/box-info?url=${encodeURIComponent(url)}`)))
 }
 
+// ---------------------------------------------------------------------------
+// Robot connection (detached CAN + 1 Hz motor ping)
+// ---------------------------------------------------------------------------
+
+export type RobotState = "disconnected" | "connecting" | "connected" | "busy" | "error"
+
+export interface MotorHealth {
+  arm: string
+  joint: string
+  reachable: boolean
+  status: string | null
+}
+
+export interface RobotStatus {
+  state: RobotState
+  connected: boolean
+  error: string | null
+  needsSudo: boolean
+  lastPing: number | null
+  motors: MotorHealth[]
+  motorCount: number
+  reachableCount: number
+}
+
+export async function fetchRobotStatus(): Promise<RobotStatus> {
+  return json(await fetch(apiUrl("/api/robot/status")))
+}
+
+export async function robotConnect(password?: string): Promise<RobotStatus> {
+  return json(
+    await fetch(apiUrl("/api/robot/connect"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: password ?? null }),
+    })
+  )
+}
+
+export async function robotDisconnect(): Promise<RobotStatus> {
+  return json(await fetch(apiUrl("/api/robot/disconnect"), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
+// ZED box link (detached, lightweight reachability check)
+// ---------------------------------------------------------------------------
+
+export interface ZedLinkStatus {
+  connected: boolean
+  boxUrl: string | null
+  hostIface: string | null
+  boxIface: string | null
+  info: ServerInfo | null
+  error: string | null
+}
+
+export async function fetchZedStatus(): Promise<ZedLinkStatus> {
+  return json(await fetch(apiUrl("/api/zed/status")))
+}
+
+export async function zedConnect(
+  url: string,
+  hostIface?: string,
+  boxIface?: string
+): Promise<ZedLinkStatus> {
+  return json(
+    await fetch(apiUrl("/api/zed/connect"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url, hostIface: hostIface ?? null, boxIface: boxIface ?? null }),
+    })
+  )
+}
+
+export async function zedDisconnect(): Promise<ZedLinkStatus> {
+  return json(await fetch(apiUrl("/api/zed/disconnect"), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
+// In-process operations (teleop / gravity-comp / collect-data / run-policy)
+// ---------------------------------------------------------------------------
+
+export type OperationId = "teleop" | "gravity-comp" | "collect-data" | "run-policy"
+
+export interface OpStatus {
+  running: boolean
+  session: SessionInfo | null
+}
+
+export async function fetchOpStatus(): Promise<OpStatus> {
+  return json(await fetch(apiUrl("/api/op/status")))
+}
+
+export async function startOperation(
+  op: OperationId,
+  args: Record<string, FormValue>,
+  zed?: ZedSpec
+): Promise<SessionInfo> {
+  return json(
+    await fetch(apiUrl("/api/op/start"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ op, args, zed: zed ?? null }),
+    })
+  )
+}
+
+export async function stopOperation(): Promise<SessionInfo> {
+  return json(await fetch(apiUrl("/api/op/stop"), { method: "POST" }))
+}
+
+/** run-policy episode control: ``start`` | ``s`` (save) | ``r`` (rerecord) | ``q`` (quit). */
+export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/op/episode"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command }),
+    })
+  )
+}
+
 export type ZedTopology = "direct" | "lan"
 
 /** Serve-side orchestration spec for collect-data / run-policy (see orchestrator.py). */
@@ -192,6 +313,24 @@ export function flattenFields(nodes: SchemaNode[]): SchemaField[] {
   return out
 }
 
+/**
+ * Prune a schema tree, dropping leaf fields whose key is in `exclude` (and any
+ * groups left empty as a result). Used to render "everything else" beneath an
+ * operation's curated common fields without showing them twice.
+ */
+export function filterSchema(nodes: SchemaNode[], exclude: Set<string>): SchemaNode[] {
+  const out: SchemaNode[] = []
+  for (const node of nodes) {
+    if (node.kind === "field") {
+      if (!exclude.has(node.key)) out.push(node)
+    } else {
+      const children = filterSchema(node.children, exclude)
+      if (children.length > 0) out.push({ ...node, children })
+    }
+  }
+  return out
+}
+
 export function defaultString(field: SchemaField): string {
   return field.default == null ? "" : String(field.default)
 }
@@ -236,6 +375,126 @@ export function computeArgs(
     }
   }
   return args
+}
+
+// ---------------------------------------------------------------------------
+// Curated operations: the friendly subset of fields each op panel shows.
+// Keys are the dotted draccus paths the backend understands (serve/commands.py
+// build_argv); unlisted fields fall back to their config defaults.
+// ---------------------------------------------------------------------------
+
+export interface OperationMeta {
+  id: OperationId
+  label: string
+  description: string
+  /** Curated config keys surfaced in the panel (others use their defaults). */
+  fields: string[]
+  /** Needs the persistent robot connection (CAN) to run. */
+  requiresRobot: boolean
+  /** Needs the ZED box link (collect-data / run-policy). */
+  requiresZed: boolean
+  /** Can run in sim (no hardware) — only teleop today. */
+  simCapable: boolean
+}
+
+export const OPERATIONS: OperationMeta[] = [
+  {
+    id: "teleop",
+    label: "Teleoperation",
+    description: "Drive the Axol from a VR headset. Enable sim to preview in the browser.",
+    fields: ["sim", "teleop.frequency", "axol.left_stiffness", "axol.right_stiffness"],
+    requiresRobot: true,
+    requiresZed: false,
+    simCapable: true,
+  },
+  {
+    id: "gravity-comp",
+    label: "Gravity Compensation",
+    description: "Hold the arms weightless so they can be moved by hand.",
+    fields: ["kd", "rate_hz", "free_joints"],
+    requiresRobot: true,
+    requiresZed: false,
+    simCapable: false,
+  },
+  {
+    id: "collect-data",
+    label: "Collect Data",
+    description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
+    fields: ["repo_id", "task", "fps", "push_to_hub"],
+    requiresRobot: true,
+    requiresZed: true,
+    simCapable: false,
+  },
+  {
+    id: "run-policy",
+    label: "Run Policy",
+    description: "Run a trained policy on Axol via LeRobot async inference.",
+    fields: ["policy_path", "repo_id", "task", "episode_time_s", "server_port"],
+    requiresRobot: true,
+    requiresZed: true,
+    simCapable: false,
+  },
+]
+
+export function operationMeta(op: OperationId): OperationMeta {
+  return OPERATIONS.find((o) => o.id === op) as OperationMeta
+}
+
+/** Curated fields for an op, resolved from the introspected command schema. */
+export function curatedFields(spec: CommandSpec, meta: OperationMeta): SchemaField[] {
+  const byKey = new Map(flattenFields(spec.schema).map((f) => [f.key, f]))
+  return meta.fields.map((k) => byKey.get(k)).filter((f): f is SchemaField => f != null)
+}
+
+// ---------------------------------------------------------------------------
+// Per-operation settings: localStorage persistence + JSON import/export
+// ---------------------------------------------------------------------------
+
+const OP_SETTINGS_PREFIX = "axolOp:"
+
+export function loadOpSettings(op: OperationId): Record<string, FormValue> {
+  try {
+    const raw = localStorage.getItem(`${OP_SETTINGS_PREFIX}${op}`)
+    if (raw) return JSON.parse(raw) as Record<string, FormValue>
+  } catch {
+    // ignore malformed storage
+  }
+  return {}
+}
+
+export function saveOpSettings(op: OperationId, settings: Record<string, FormValue>): void {
+  try {
+    localStorage.setItem(`${OP_SETTINGS_PREFIX}${op}`, JSON.stringify(settings))
+  } catch {
+    // ignore storage failures (private mode / quota)
+  }
+}
+
+/** Trigger a browser download of an operation's settings as JSON. */
+export function exportOpSettings(op: OperationId, settings: Record<string, FormValue>): void {
+  const blob = new Blob([JSON.stringify({ op, settings }, null, 2)], {
+    type: "application/json",
+  })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement("a")
+  a.href = url
+  a.download = `${op}-settings.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+/** Parse an imported settings file; accepts `{op, settings}` or a bare map. */
+export function parseImportedSettings(text: string): Record<string, FormValue> {
+  const data = JSON.parse(text)
+  const settings = data && typeof data === "object" && "settings" in data ? data.settings : data
+  if (!settings || typeof settings !== "object") throw new Error("invalid settings file")
+  const out: Record<string, FormValue> = {}
+  for (const [k, v] of Object.entries(settings as Record<string, unknown>)) {
+    if (typeof v === "string" || typeof v === "boolean" || typeof v === "number") {
+      out[k] = typeof v === "number" ? String(v) : v
+    }
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------

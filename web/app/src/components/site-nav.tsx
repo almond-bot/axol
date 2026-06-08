@@ -10,6 +10,11 @@ import { cn } from "@/lib/utils"
  * ``right`` injects route-specific controls (e.g. the connection pill) just
  * before the Docs / cross-link buttons.
  */
+const PAGE_LABEL: Record<string, string> = {
+  control: "Control Panel",
+  vr: "VR",
+}
+
 export function SiteNav({ current, right }: { current: "control" | "vr"; right?: ReactNode }) {
   return (
     <header className="sticky top-0 z-40 border-b border-white/10 bg-[#121212]/85 backdrop-blur-md">
@@ -17,9 +22,7 @@ export function SiteNav({ current, right }: { current: "control" | "vr"; right?:
         <div className="flex items-center gap-3">
           <img src="/almond.svg" alt="Almond" className="h-6 w-6" />
           <span className="font-heading text-base font-semibold tracking-tight">Almond Axol</span>
-          <span className="hidden text-sm text-white/35 sm:inline">
-            {current === "control" ? "Control Panel" : "VR"}
-          </span>
+          <span className="hidden text-sm text-white/35 sm:inline">{PAGE_LABEL[current]}</span>
         </div>
         <div className="flex items-center gap-2">
           {right}
@@ -32,13 +35,14 @@ export function SiteNav({ current, right }: { current: "control" | "vr"; right?:
             Docs
             <ExternalLink />
           </a>
-          {current === "control" ? (
-            <a href="/vr" className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}>
-              VR App
-            </a>
-          ) : (
+          {current !== "control" && (
             <a href="/control" className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}>
               Control Panel
+            </a>
+          )}
+          {current !== "vr" && (
+            <a href="/vr" className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}>
+              VR App
             </a>
           )}
         </div>

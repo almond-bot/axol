@@ -267,7 +267,7 @@ def main(argv: list[str]) -> None:
     _run(cfg)
 
 
-def _run(cfg: CollectDataConfig) -> None:
+def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) -> None:
     from pathlib import Path
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -363,8 +363,12 @@ def _run(cfg: CollectDataConfig) -> None:
     teleop_interval = 1.0 / teleop_hz
     publisher = _SnapshotPublisher()
     capture: _CaptureThread | None = None
+
+    def _stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
     try:
-        while True:
+        while not _stopped():
             log_say(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
@@ -373,6 +377,8 @@ def _run(cfg: CollectDataConfig) -> None:
             rerecord = False
 
             while True:
+                if _stopped():
+                    break
                 t0 = time.perf_counter()
 
                 # Camera reads happen on the capture thread; the teleop loop
@@ -414,6 +420,9 @@ def _run(cfg: CollectDataConfig) -> None:
                 capture.stop_event.set()
                 capture.join()
                 capture = None
+
+            if _stopped():
+                break
 
             log_say("Returning to rest pose.")
             teleop.request_reset()

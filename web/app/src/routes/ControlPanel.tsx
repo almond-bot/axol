@@ -1,36 +1,43 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, Play, Square, Terminal, ExternalLink, AlertTriangle } from "lucide-react"
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { cn } from "@/lib/utils"
 import {
-  computeArgs,
+  OPERATIONS,
+  exportOpSettings,
   fetchCommands,
   fetchInfo,
-  fetchSessions,
-  flattenFields,
-  missingRequired,
-  runCommand,
+  fetchOpStatus,
+  fetchRobotStatus,
+  fetchZedStatus,
+  loadOpSettings,
+  operationMeta,
+  parseImportedSettings,
+  robotConnect,
+  robotDisconnect,
+  saveOpSettings,
+  sendEpisodeCommand,
   setServerBase,
-  stopSession,
+  startOperation,
+  stopOperation,
   useSessionLogs,
-  zedMissing,
+  zedDisconnect,
   type CommandSpec,
   type FormValue,
+  type OperationId,
+  type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type ZedLinkStatus,
   type ZedSpec,
 } from "@/lib/supervisor"
-import { ConfigForm } from "@/components/config-form"
-import { ZedOrchestration } from "@/components/zed-orchestration"
-import { CommandCatalog } from "@/components/command-catalog"
-import { SetupDialog, ConnectionPill, type ConnState } from "@/components/setup-dialog"
+import { ConnectionsBar } from "@/components/connections-bar"
+import { OperationPanel } from "@/components/operation-panel"
+import { LogConsole } from "@/components/log-console"
+import { SetupDialog, type ConnState } from "@/components/setup-dialog"
+import { ZedConnectDialog } from "@/components/zed-connect-dialog"
+import { SudoDialog } from "@/components/sudo-dialog"
 import { SiteNav } from "@/components/site-nav"
-import { Button, buttonVariants } from "@/components/ui/button"
-import { Card, CardContent } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
-import { cn } from "@/lib/utils"
 
-type Overrides = Record<string, FormValue>
-
-const ZED_COMMANDS = new Set(["collect-data", "run-policy"])
+type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_ZED: ZedSpec = {
   enabled: false,
@@ -52,21 +59,39 @@ function loadZed(): ZedSpec {
   return DEFAULT_ZED
 }
 
+function loadAllOpSettings(): OpSettings {
+  return OPERATIONS.reduce((acc, op) => {
+    acc[op.id] = loadOpSettings(op.id)
+    return acc
+  }, {} as OpSettings)
+}
+
 export default function ControlPanel() {
   const [commands, setCommands] = useState<CommandSpec[]>([])
-  const [selectedId, setSelectedId] = useState<string>("")
-  const [overridesByCmd, setOverridesByCmd] = useState<Record<string, Overrides>>({})
-  const [session, setSession] = useState<SessionInfo | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
+  const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
     () => localStorage.getItem("axolServerHost") ?? ""
   )
-  const [viewerPort, setViewerPort] = useState(8080)
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
-  const [zed, setZed] = useState<ZedSpec>(() => loadZed())
-  const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
+  const [viewerPort, setViewerPort] = useState(8080)
+
+  const [robot, setRobot] = useState<RobotStatus | null>(null)
+  const [robotBusy, setRobotBusy] = useState(false)
+  const [sudoOpen, setSudoOpen] = useState(false)
+  const [sudoError, setSudoError] = useState<string | null>(null)
+  const [zedLink, setZedLink] = useState<ZedLinkStatus | null>(null)
+  const [zedSettings, setZedSettings] = useState<ZedSpec>(() => loadZed())
+
+  const [selectedOp, setSelectedOp] = useState<OperationId>(
+    () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
+  )
+  const [settingsByOp, setSettingsByOp] = useState<OpSettings>(() => loadAllOpSettings())
+
+  const [session, setSession] = useState<SessionInfo | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
+  const [zedDialogOpen, setZedDialogOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
@@ -77,7 +102,6 @@ export default function ControlPanel() {
     try {
       const cmds = await fetchCommands()
       setCommands(cmds)
-      setSelectedId((prev) => prev || cmds.find((c) => c.available)?.id || cmds[0]?.id || "")
       setConn({ state: "ok" })
       setSetupOpen(false)
     } catch (e) {
@@ -85,32 +109,48 @@ export default function ControlPanel() {
       setConn({ state: "err", message: String(e) })
       return
     }
-    // Best-effort extras once the connection is known good.
-    fetchSessions()
-      .then((sessions) => {
-        const live = sessions.find((s) => s.status === "running" || s.status === "starting")
-        if (live) {
-          setSelectedId(live.command)
-          setSession(live)
-        }
-      })
-      .catch(() => {})
     fetchInfo()
       .then((info) => {
         setViewerPort(info.viewerPort)
         setHostInfo(info)
         if (info.ethIface) {
-          setZed((prev) => (prev.hostIface ? prev : { ...prev, hostIface: info.ethIface! }))
+          setZedSettings((prev) => (prev.hostIface ? prev : { ...prev, hostIface: info.ethIface! }))
+        }
+      })
+      .catch(() => {})
+    fetchRobotStatus()
+      .then(setRobot)
+      .catch(() => {})
+    fetchZedStatus()
+      .then(setZedLink)
+      .catch(() => {})
+    fetchOpStatus()
+      .then((op) => {
+        if (op.running && op.session) {
+          setSession(op.session)
+          setSelectedOp(op.session.command as OperationId)
         }
       })
       .catch(() => {})
   }, [])
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     loadServer(serverHost)
     // Only on mount — reconnects are explicit via the setup dialog.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Poll the detached connections while online.
+  useEffect(() => {
+    if (conn.state !== "ok") return
+    const t = setInterval(() => {
+      fetchRobotStatus()
+        .then(setRobot)
+        .catch(() => {})
+    }, 2000)
+    return () => clearInterval(t)
+  }, [conn.state])
 
   function updateServerHost(value: string) {
     setServerHost(value)
@@ -119,7 +159,7 @@ export default function ControlPanel() {
   }
 
   function patchZed(patch: Partial<ZedSpec>) {
-    setZed((prev) => {
+    setZedSettings((prev) => {
       const next = { ...prev, ...patch }
       try {
         localStorage.setItem("axolZedSpec", JSON.stringify(next))
@@ -130,63 +170,115 @@ export default function ControlPanel() {
     })
   }
 
-  const selected = useMemo(
-    () => commands.find((c) => c.id === selectedId) ?? null,
-    [commands, selectedId]
-  )
-  const overrides = overridesByCmd[selectedId] ?? {}
-
-  const effectiveStatus = status ?? session
-  const isLive = effectiveStatus?.status === "running" || effectiveStatus?.status === "starting"
-  // A live session belongs to whichever command spawned it, not the one being viewed.
-  const liveHere = isLive && effectiveStatus?.command === selected?.id
-
-  const isZedCmd = !!selected && ZED_COMMANDS.has(selected.id)
-  const zedActive = isZedCmd && zed.enabled
-
-  const fields = useMemo(() => (selected ? flattenFields(selected.schema) : []), [selected])
-  const missing = useMemo(() => {
-    const base = missingRequired(fields, overrides)
-    return zedActive ? [...base, ...zedMissing(zed)] : base
-  }, [fields, overrides, zedActive, zed])
-  const editedCount = useMemo(
-    () => Object.keys(computeArgs(fields, overrides)).length,
-    [fields, overrides]
-  )
-
-  function setOverride(key: string, value: FormValue) {
-    setOverridesByCmd((prev) => ({
-      ...prev,
-      [selectedId]: { ...prev[selectedId], [key]: value },
-    }))
+  function selectOp(op: OperationId) {
+    setSelectedOp(op)
+    localStorage.setItem("axolOp", op)
+    setError(null)
   }
 
-  function resetOverride(key: string) {
-    setOverridesByCmd((prev) => {
-      const next = { ...(prev[selectedId] ?? {}) }
-      delete next[key]
-      return { ...prev, [selectedId]: next }
-    })
+  // -- per-operation settings --
+  const settings = settingsByOp[selectedOp] ?? {}
+
+  const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
+    setSettingsByOp((prev) => ({ ...prev, [op]: next }))
+    saveOpSettings(op, next)
+  }, [])
+
+  function setSetting(key: string, value: FormValue) {
+    updateSettings(selectedOp, { ...settings, [key]: value })
+  }
+
+  function resetSetting(key: string) {
+    const next = { ...settings }
+    delete next[key]
+    updateSettings(selectedOp, next)
   }
 
   function resetAll() {
-    setOverridesByCmd((prev) => ({ ...prev, [selectedId]: {} }))
+    updateSettings(selectedOp, {})
+  }
+
+  function importSettings(text: string) {
+    try {
+      updateSettings(selectedOp, parseImportedSettings(text))
+      setError(null)
+    } catch (e) {
+      setError(`Import failed: ${e}`)
+    }
+  }
+
+  // -- robot connection --
+  async function robotConnectClick(password?: string) {
+    setRobotBusy(true)
+    try {
+      const next = await robotConnect(password)
+      setRobot(next)
+      if (next.needsSudo) {
+        // CAN is down and passwordless sudo isn't available — prompt for it.
+        setSudoOpen(true)
+        setSudoError(null)
+      } else if (password && next.state === "error") {
+        // A password was supplied but bring-up still failed (e.g. wrong pw).
+        setSudoOpen(true)
+        setSudoError(next.error ?? "CAN bring-up failed.")
+      } else {
+        setSudoOpen(false)
+        setSudoError(null)
+      }
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRobotBusy(false)
+    }
+  }
+
+  async function robotDisconnectClick() {
+    setRobotBusy(true)
+    try {
+      setRobot(await robotDisconnect())
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setRobotBusy(false)
+    }
+  }
+
+  async function zedDisconnectClick() {
+    try {
+      setZedLink(await zedDisconnect())
+    } catch (e) {
+      setError(String(e))
+    }
+  }
+
+  // -- operation lifecycle --
+  const effectiveStatus = status ?? session
+  const isLive = effectiveStatus?.status === "running" || effectiveStatus?.status === "starting"
+  const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
+  const selectedLive = isLive && runningOp === selectedOp
+
+  const meta = operationMeta(selectedOp)
+  const spec = useMemo(
+    () => commands.find((c) => c.id === selectedOp) ?? null,
+    [commands, selectedOp]
+  )
+
+  function buildZedSpec(): ZedSpec {
+    return {
+      ...zedSettings,
+      enabled: true,
+      boxUrl: zedLink?.boxUrl ?? zedSettings.boxUrl,
+      hostIface: zedLink?.hostIface || zedSettings.hostIface,
+      boxIface: zedLink?.boxIface || zedSettings.boxIface,
+    }
   }
 
   async function handleStart() {
-    if (!selected) return
-    if (missing.length > 0) {
-      setError(`Fill required fields: ${missing.join(", ")}`)
-      return
-    }
     setBusy(true)
     setError(null)
     try {
-      const result = await runCommand(
-        selected.id,
-        computeArgs(fields, overrides),
-        zedActive ? zed : undefined
-      )
+      const zed = meta.requiresZed ? buildZedSpec() : undefined
+      const result = await startOperation(selectedOp, settings, zed)
       setSession(result)
     } catch (e) {
       setError(String(e))
@@ -196,11 +288,9 @@ export default function ControlPanel() {
   }
 
   async function handleStop() {
-    if (!session) return
     setBusy(true)
     try {
-      const result = await stopSession(session.id)
-      setSession(result)
+      setSession(await stopOperation())
     } catch (e) {
       setError(String(e))
     } finally {
@@ -208,121 +298,63 @@ export default function ControlPanel() {
     }
   }
 
+  function handleEpisode(command: string) {
+    sendEpisodeCommand(command).catch((e) => setError(String(e)))
+  }
+
   const viewerHost = serverHost || hostInfo?.lanIp || ""
 
   return (
     <div className="min-h-screen">
-      <SiteNav
-        current="control"
-        right={
-          <ConnectionPill state={conn.state} host={serverHost} onClick={() => setSetupOpen(true)} />
-        }
-      />
-      <main className="mx-auto max-w-6xl px-6 py-8">
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[260px_1fr]">
-          <CommandCatalog
-            commands={commands}
-            selectedId={selectedId}
-            disabled={isLive}
-            connected={conn.state === "ok"}
-            onSelect={setSelectedId}
-            onOpenSetup={() => setSetupOpen(true)}
-          />
+      <SiteNav current="control" />
+      <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-8">
+        <ConnectionsBar
+          conn={conn.state}
+          host={serverHost}
+          onOpenSetup={() => setSetupOpen(true)}
+          robot={robot}
+          robotBusy={robotBusy}
+          onRobotConnect={() => robotConnectClick()}
+          onRobotDisconnect={robotDisconnectClick}
+          zed={zedLink}
+          onZedConnect={() => setZedDialogOpen(true)}
+          onZedDisconnect={zedDisconnectClick}
+        />
 
-          <div className="flex min-w-0 flex-col gap-6">
-            {selected ? (
-              <>
-                <Card className="gap-0 p-0">
-                  <div className="flex flex-col gap-4 border-b border-white/10 p-5 sm:flex-row sm:items-start sm:justify-between">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <h2 className="font-heading text-lg font-semibold">{selected.label}</h2>
-                        <StatusBadge session={liveHere ? effectiveStatus : null} />
-                      </div>
-                      <div className="mt-0.5 font-mono text-xs text-white/40">
-                        axol {selected.cli}
-                      </div>
-                      <p className="mt-2 max-w-prose text-sm text-white/55">
-                        {selected.description}
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {editedCount > 0 && !liveHere && selected.available && (
-                        <button
-                          type="button"
-                          onClick={resetAll}
-                          className="text-xs whitespace-nowrap text-white/40 hover:text-white/70"
-                        >
-                          Reset ({editedCount})
-                        </button>
-                      )}
-                      {liveHere ? (
-                        <Button variant="destructive" onClick={handleStop} disabled={busy}>
-                          {busy ? <Loader2 className="animate-spin" /> : <Square />}
-                          Stop
-                        </Button>
-                      ) : (
-                        <Button
-                          onClick={handleStart}
-                          disabled={busy || !selected.available || missing.length > 0 || isLive}
-                        >
-                          {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                          Start
-                        </Button>
-                      )}
-                    </div>
-                  </div>
+        <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
 
-                  <CardContent className="gap-4 p-5">
-                    {isLive && !liveHere && (
-                      <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
-                        <span className="font-mono text-amber-200">{effectiveStatus?.command}</span>{" "}
-                        is currently running. Stop it before starting another command.
-                      </p>
-                    )}
+        {isLive && !selectedLive && (
+          <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
+            <span className="font-mono text-amber-200">{runningOp}</span> is currently running. Stop
+            it before starting another operation.
+          </p>
+        )}
+        {error && <p className="text-sm text-red-400">{error}</p>}
 
-                    {selected.available ? (
-                      <ConfigForm
-                        schema={selected.schema}
-                        overrides={overrides}
-                        disabled={isLive}
-                        onChange={setOverride}
-                        onReset={resetOverride}
-                      />
-                    ) : (
-                      <UnavailableNotice cmd={selected} />
-                    )}
+        <OperationPanel
+          meta={meta}
+          spec={spec}
+          settings={settings}
+          onChange={setSetting}
+          onReset={resetSetting}
+          onResetAll={resetAll}
+          onExport={() => exportOpSettings(selectedOp, settings)}
+          onImport={importSettings}
+          zedSettings={zedSettings}
+          onZedChange={patchZed}
+          zedLink={zedLink}
+          robot={robot}
+          live={selectedLive}
+          busy={busy}
+          session={selectedLive ? effectiveStatus : null}
+          host={viewerHost}
+          viewerPort={viewerPort}
+          onStart={handleStart}
+          onStop={handleStop}
+          onEpisode={handleEpisode}
+        />
 
-                    {missing.length > 0 && !liveHere && selected.available && (
-                      <p className="text-xs text-white/40">Required: {missing.join(", ")}</p>
-                    )}
-                    {error && <p className="text-sm text-red-400">{error}</p>}
-
-                    <RunningHints
-                      session={liveHere ? effectiveStatus : null}
-                      overrides={overrides}
-                      host={viewerHost}
-                      viewerPort={viewerPort}
-                    />
-                  </CardContent>
-                </Card>
-
-                {isZedCmd && selected.available && (
-                  <ZedOrchestration
-                    spec={zed}
-                    onChange={patchZed}
-                    hostInfo={hostInfo}
-                    disabled={isLive}
-                  />
-                )}
-
-                <LogConsole lines={lines} />
-              </>
-            ) : (
-              <EmptyState connected={conn.state === "ok"} onOpenSetup={() => setSetupOpen(true)} />
-            )}
-          </div>
-        </div>
+        <LogConsole lines={lines} />
       </main>
 
       <SetupDialog
@@ -333,138 +365,65 @@ export default function ControlPanel() {
         conn={conn}
         onConnect={() => loadServer(serverHost)}
       />
+      <ZedConnectDialog
+        open={zedDialogOpen}
+        onClose={() => setZedDialogOpen(false)}
+        hostInfo={hostInfo}
+        initial={zedLink}
+        onConnected={setZedLink}
+      />
+      <SudoDialog
+        open={sudoOpen}
+        busy={robotBusy}
+        error={sudoError}
+        onClose={() => {
+          setSudoOpen(false)
+          setSudoError(null)
+        }}
+        onSubmit={(password) => robotConnectClick(password)}
+      />
     </div>
   )
 }
 
-function EmptyState({ connected, onOpenSetup }: { connected: boolean; onOpenSetup: () => void }) {
-  return (
-    <Card>
-      <CardContent className="items-center gap-3 py-16 text-center">
-        <Terminal className="size-8 text-white/20" />
-        <p className="text-sm text-white/45">
-          {connected
-            ? "Pick a command from the catalog to configure and run it."
-            : "Connect to a machine running axol serve to get started."}
-        </p>
-        {!connected && (
-          <Button variant="outline" size="sm" onClick={onOpenSetup}>
-            Open setup
-          </Button>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-function RunningHints({
-  session,
-  overrides,
-  host,
-  viewerPort,
+function OperationSelector({
+  selected,
+  runningOp,
+  onSelect,
 }: {
-  session: SessionInfo | null
-  overrides: Overrides
-  host: string
-  viewerPort: number
+  selected: OperationId
+  runningOp: OperationId | null
+  onSelect: (op: OperationId) => void
 }) {
-  if (!session || session.status !== "running") return null
-  const simRunning = session.args?.sim === true || overrides.sim === true
-  const viewerUrl = host ? `http://${host}:${viewerPort}` : ""
-
   return (
-    <div className="flex flex-col gap-3">
-      {simRunning && viewerUrl && (
-        <a
-          href={viewerUrl}
-          target="_blank"
-          rel="noreferrer"
-          className={cn(buttonVariants({ variant: "outline", size: "sm" }), "w-fit")}
-        >
-          <ExternalLink />
-          Open 3D viewer
-        </a>
-      )}
-      {session.command === "teleop" && (
-        <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
-          Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
-          connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.
-        </p>
-      )}
-    </div>
-  )
-}
-
-function UnavailableNotice({ cmd }: { cmd: CommandSpec }) {
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-4 text-sm">
-      <div className="flex items-center gap-2 font-medium text-amber-300/90">
-        <AlertTriangle className="size-4" />
-        Not available on this server
-      </div>
-      <p className="text-white/55">
-        This command needs dependencies that aren&apos;t installed on the connected machine (e.g.
-        the ZED SDK / <span className="font-mono">lerobot</span> extra, or robot hardware).
-      </p>
-      {cmd.error && (
-        <code className="rounded bg-black/30 p-2 text-xs break-words text-white/45">
-          {cmd.error}
-        </code>
-      )}
-    </div>
-  )
-}
-
-function StatusBadge({ session }: { session: SessionInfo | null }) {
-  if (!session) return null
-  switch (session.status) {
-    case "starting":
-      return <Badge variant="warning">Starting</Badge>
-    case "running":
-      return <Badge variant="success">Running</Badge>
-    case "error":
-      return <Badge variant="destructive">Error</Badge>
-    case "exited":
-      return <Badge variant={session.exitCode === 0 ? "neutral" : "destructive"}>Exited</Badge>
-    default:
-      return <Badge variant="neutral">{session.status}</Badge>
-  }
-}
-
-function LogConsole({ lines }: { lines: string[] }) {
-  const scrollRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [lines])
-
-  return (
-    <Card className="min-h-0 flex-1 gap-3 p-0">
-      <div className="flex items-center gap-2 border-b border-white/10 px-4 py-3">
-        <Terminal className="size-4 text-white/40" />
-        <span className="font-heading text-sm font-semibold">Logs</span>
-      </div>
-      <div
-        ref={scrollRef}
-        className="max-h-[60vh] min-h-[280px] overflow-auto px-4 pb-4 font-mono text-xs leading-relaxed"
-      >
-        {lines.length === 0 ? (
-          <p className="text-white/30">No output yet.</p>
-        ) : (
-          lines.map((line, i) => (
-            <div
-              key={i}
-              className={cn(
-                "break-words whitespace-pre-wrap",
-                line.startsWith("[serve]") ? "text-[#eff483]/70" : "text-white/70"
-              )}
-            >
-              {line}
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      {OPERATIONS.map((op) => {
+        const active = op.id === selected
+        const running = op.id === runningOp
+        return (
+          <button
+            key={op.id}
+            type="button"
+            onClick={() => onSelect(op.id)}
+            className={cn(
+              "flex flex-col gap-1 rounded-xl border p-3 text-left transition-all",
+              active
+                ? "border-[#eff483]/40 bg-[#eff483]/10"
+                : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
+            )}
+          >
+            <div className="flex items-center gap-2">
+              <span className={cn("text-sm font-medium", !active && "text-white/85")}>
+                {op.label}
+              </span>
+              {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
             </div>
-          ))
-        )}
-      </div>
-    </Card>
+            <span className="text-xs text-white/40">
+              {op.requiresZed ? "Axol + ZED" : op.simCapable ? "Axol or Sim" : "Axol"}
+            </span>
+          </button>
+        )
+      })}
+    </div>
   )
 }
