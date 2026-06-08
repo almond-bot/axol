@@ -40,6 +40,27 @@ import { SiteNav } from "@/components/site-nav"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
+/** Inline error + log surface for a detached ZED link (clock sync / camera stream). */
+function ZedErrorPanel({
+  label,
+  error,
+  lines,
+}: {
+  label: string
+  error: string | null
+  lines: string[]
+}) {
+  if (!error) return null
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3">
+      <p className="text-xs text-red-300">
+        <span className="font-medium">{label}:</span> {error}
+      </p>
+      {lines.length > 0 && <LogConsole lines={lines} />}
+    </div>
+  )
+}
+
 const DEFAULT_ZED: ZedSpec = {
   enabled: false,
   boxUrl: "",
@@ -95,6 +116,14 @@ export default function ControlPanel() {
   const [zedDialogOpen, setZedDialogOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
+  // The ZED camera-stream link runs detached from any op session, so tail its
+  // own log to surface the box's failure reason (e.g. a camera that won't open).
+  const zedStreamLog = useSessionLogs(zedLink?.stream?.sessionId ?? null)
+  const zedPtpLog = useSessionLogs(zedLink?.ptp?.sessionId ?? null)
+  const zedPtpError = zedLink?.ptp?.error ?? null
+  // When the clocks fail, the stream link's own error is just the downstream
+  // "cameras not started" — show the clock panel (the root cause) instead.
+  const zedStreamError = zedPtpError ? null : (zedLink?.stream?.error ?? null)
 
   const loadServer = useCallback(async (host: string) => {
     setServerBase(host)
@@ -371,6 +400,13 @@ export default function ControlPanel() {
           onZedConnect={() => setZedDialogOpen(true)}
           onZedDisconnect={zedDisconnectClick}
           onZedRestart={zedRestartClick}
+        />
+
+        <ZedErrorPanel label="Clock sync failed" error={zedPtpError} lines={zedPtpLog.lines} />
+        <ZedErrorPanel
+          label="ZED camera stream failed"
+          error={zedStreamError}
+          lines={zedStreamLog.lines}
         />
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />

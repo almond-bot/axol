@@ -37,7 +37,12 @@ from ...sudo import (
     SUDO_REQUIRED_CODE,
     SUDO_REQUIRED_MARKER,
     password_from_env,
+    run_root,
 )
+
+# The PTP daemons we manage. Named so teardown can kill them by name as a
+# safety net (they run as root, so a non-root signal can't reach them).
+_DAEMON_NAMES = ("ptp4l", "phc2sys")
 
 _logger = logging.getLogger(__name__)
 
@@ -143,6 +148,11 @@ def _run(
         )
 
     _check_sudo(sudo_password)
+    # A prior `axol serve` that was killed (or a disconnect that couldn't reach
+    # the root daemons) can leave ptp4l/phc2sys orphaned and still disciplining
+    # the clock. Clear any strays so we don't stack duplicates fighting over
+    # CLOCK_REALTIME.
+    _reap_stale_daemons(sudo_password)
 
     timestamping_mode = _resolve_timestamping(iface, timestamping)
     _logger.info(
@@ -214,7 +224,7 @@ def _run(
                     break
             stop_event.wait(timeout=0.5)
     finally:
-        _terminate_procs(procs)
+        _terminate_procs(procs, sudo_password)
         for t in threads:
             t.join(timeout=2.0)
 
@@ -452,14 +462,40 @@ def _stream_subprocess(
             last_report = now
 
 
-def _terminate_procs(procs: list[tuple[str, subprocess.Popen[str]]]) -> None:
+def _root_kill(cmd: list[str], password: str | None) -> bool:
+    """Best-effort privileged ``kill``/``pkill``. Returns True if it matched.
+
+    The PTP daemons run as root (via ``sudo``), so a plain ``proc.terminate()``
+    from this non-root wrapper hits ``EPERM`` and leaves them orphaned. Routing
+    the kill back through ``sudo`` (cached creds from ``_check_sudo``, or the
+    forwarded password) is the only thing that actually stops them.
+    """
+    try:
+        result = run_root(cmd, password=password)
+    except Exception:  # noqa: BLE001 - teardown is best-effort
+        return False
+    return result.returncode == 0
+
+
+def _reap_stale_daemons(password: str | None) -> None:
+    """Kill leftover ptp4l/phc2sys from a previous run before starting fresh."""
+    for name in _DAEMON_NAMES:
+        if _root_kill(["pkill", "-TERM", "-x", name], password):
+            _logger.info("Reaped a stray %s from a previous run.", name)
+    time.sleep(0.5)
+    for name in _DAEMON_NAMES:
+        _root_kill(["pkill", "-KILL", "-x", name], password)
+
+
+def _terminate_procs(
+    procs: list[tuple[str, subprocess.Popen[str]]], password: str | None
+) -> None:
+    # SIGTERM via root first: sudo relays it to the daemon (or hits the daemon
+    # directly if sudo exec-replaced itself).
     for name, proc in procs:
         if proc.poll() is None:
             _logger.info("Terminating %s (pid %d).", name, proc.pid)
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+            _root_kill(["kill", "-TERM", str(proc.pid)], password)
     deadline = time.monotonic() + 3.0
     for name, proc in procs:
         timeout = max(0.0, deadline - time.monotonic())
@@ -467,10 +503,10 @@ def _terminate_procs(procs: list[tuple[str, subprocess.Popen[str]]]) -> None:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _logger.warning("%s did not exit cleanly; killing.", name)
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            # Kill the daemon by name too: a SIGKILL to the sudo pid isn't
+            # relayed and would orphan the root daemon.
+            _root_kill(["pkill", "-KILL", "-x", name], password)
+            _root_kill(["kill", "-KILL", str(proc.pid)], password)
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:

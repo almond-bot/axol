@@ -229,7 +229,7 @@ function StatusDot({
 }) {
   return (
     <span
-      className="flex items-center gap-1.5 text-[0.6rem] tracking-wide text-white/35"
+      className="flex items-center gap-1.5 text-[0.6rem] tracking-wide text-white/35 uppercase"
       title={label}
     >
       <span>{name}</span>
