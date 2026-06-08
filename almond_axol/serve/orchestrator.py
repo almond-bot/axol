@@ -23,10 +23,12 @@ The box is reached over HTTP (no SSH): the host POSTs to the box's
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
 import signal
+import ssl
 import urllib.error
 import urllib.request
 from typing import TYPE_CHECKING, Any
@@ -59,15 +61,33 @@ class OrchestrationError(Exception):
     """A step failed; the run is aborted and everything started is torn down."""
 
 
+@functools.cache
+def box_ssl_context() -> ssl.SSLContext:
+    """Unverified TLS context for a box's self-signed ``axol serve``.
+
+    ``axol serve`` uses a self-signed cert by default, so over HTTPS we skip
+    verification — the same trust model as the browser "accept the cert once"
+    flow. Used for every host→box request (info, sync-clocks, stream, logs).
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def _normalize_url(url: str) -> str:
-    """Normalize a box address to ``http://host:8090`` form (defaults applied)."""
+    """Normalize a box address to ``https://host:8090`` form (defaults applied).
+
+    A bare IP defaults to ``https`` since ``axol serve`` is TLS by default; an
+    explicit ``http://`` is preserved for boxes started with ``--no-tls``.
+    """
     from urllib.parse import urlsplit
 
     url = url.strip().rstrip("/")
     if not url:
         return ""
     if "://" not in url:
-        url = f"http://{url}"
+        url = f"https://{url}"
     parts = urlsplit(url)
     if parts.port is None and parts.hostname:
         url = f"{parts.scheme}://{parts.hostname}:8090"
@@ -81,12 +101,16 @@ def _post_json(
     req = urllib.request.Request(
         url, data=data, headers={"Content-Type": "application/json"}, method="POST"
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(
+        req, timeout=timeout, context=box_ssl_context()
+    ) as resp:
         return json.loads(resp.read().decode())
 
 
 def _get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
+    with urllib.request.urlopen(
+        url, timeout=timeout, context=box_ssl_context()
+    ) as resp:
         return json.loads(resp.read().decode())
 
 

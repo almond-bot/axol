@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
-import { AlertTriangle, Camera, Check, Loader2, Plug, X } from "lucide-react"
-import { fetchBoxInfo, zedConnect, type ZedLinkStatus } from "@/lib/supervisor"
+import { AlertTriangle, Camera, Loader2, Plug, X } from "lucide-react"
+import { zedConnect, type ZedLinkStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -24,9 +24,6 @@ export function ZedConnectDialog({
   onConnected: (status: ZedLinkStatus) => void
 }) {
   const [url, setUrl] = useState(initial?.boxUrl ?? "")
-  const [probe, setProbe] = useState<{ state: "idle" | "loading" | "ok" | "err"; msg?: string }>({
-    state: "idle",
-  })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -39,17 +36,6 @@ export function ZedConnectDialog({
 
   if (!open) return null
 
-  async function test() {
-    if (!url.trim()) return
-    setProbe({ state: "loading" })
-    try {
-      const info = await fetchBoxInfo(url.trim())
-      setProbe({ state: "ok", msg: info.hostname })
-    } catch (e) {
-      setProbe({ state: "err", msg: String(e) })
-    }
-  }
-
   async function connect() {
     if (!url.trim()) return
     setBusy(true)
@@ -59,7 +45,7 @@ export function ZedConnectDialog({
       onConnected(status)
       onClose()
     } catch (e) {
-      setError(String(e))
+      setError(String(e).replace(/^Error:\s*/, ""))
     } finally {
       setBusy(false)
     }
@@ -93,7 +79,13 @@ export function ZedConnectDialog({
 
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="zed-box-url">ZED box IP</Label>
-            <div className="flex gap-2">
+            <form
+              className="flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault()
+                connect()
+              }}
+            >
               <Input
                 id="zed-box-url"
                 value={url}
@@ -104,45 +96,26 @@ export function ZedConnectDialog({
                 autoCorrect="off"
               />
               <Button
-                type="button"
+                type="submit"
                 variant="outline"
                 size="sm"
                 className="shrink-0"
-                disabled={!url.trim() || probe.state === "loading"}
-                onClick={test}
+                disabled={busy || !url.trim()}
               >
-                {probe.state === "loading" ? <Loader2 className="animate-spin" /> : <Plug />}
-                Test
+                {busy ? <Loader2 className="animate-spin" /> : <Plug />}
+                Connect
               </Button>
-            </div>
-            {probe.state === "ok" && (
-              <p className="flex items-center gap-1.5 text-xs text-emerald-400/90">
-                <Check className="size-3" />
-                Reachable — {probe.msg}
-              </p>
-            )}
-            {probe.state === "err" && (
-              <p className="flex items-center gap-1.5 text-xs text-red-400">
-                <AlertTriangle className="size-3" />
-                {probe.msg}
-              </p>
-            )}
+            </form>
             <p className="text-xs text-white/35">
               Just the IP — port <span className="font-mono">8090</span> (
               <span className="font-mono">axol serve</span>) is assumed.
             </p>
-          </div>
-
-          {error && <p className="text-sm text-red-400">{error}</p>}
-
-          <div className="flex justify-end gap-2">
-            <Button variant="ghost" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button onClick={connect} disabled={busy || !url.trim()}>
-              {busy ? <Loader2 className="animate-spin" /> : <Plug />}
-              Connect
-            </Button>
+            {error && (
+              <p className="flex items-center gap-1.5 text-xs text-red-400">
+                <AlertTriangle className="size-3 shrink-0" />
+                {error}
+              </p>
+            )}
           </div>
         </div>
       </div>

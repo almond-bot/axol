@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
-from .orchestrator import PtpLink
+from .orchestrator import PtpLink, box_ssl_context
 from .robot_link import RobotLink
 from .runner import OperationRunner
 
@@ -113,12 +113,17 @@ def _lan_ip() -> str:
 
 
 def _normalize_box_url(url: str) -> str:
-    """Add scheme + default control port (8090) to a bare ZED box address."""
+    """Add scheme + default control port (8090) to a bare ZED box address.
+
+    A bare IP defaults to ``https`` because ``axol serve`` is TLS by default
+    (same as the workstation link); pass an explicit ``http://`` if the box was
+    started with ``--no-tls``.
+    """
     from urllib.parse import urlsplit
 
     base = url.strip().rstrip("/")
     if "://" not in base:
-        base = f"http://{base}"
+        base = f"https://{base}"
     parts = urlsplit(base)
     if parts.port is None and parts.hostname:
         base = f"{parts.scheme}://{parts.hostname}:8090"
@@ -129,7 +134,9 @@ def _fetch_box_info(url: str) -> tuple[bool, dict[str, Any]]:
     """Fetch the ZED box's ``/api/info``; ``(ok, data_or_error)``."""
     base = _normalize_box_url(url)
     try:
-        with urllib.request.urlopen(f"{base}/api/info", timeout=5.0) as resp:
+        with urllib.request.urlopen(
+            f"{base}/api/info", timeout=5.0, context=box_ssl_context()
+        ) as resp:
             return True, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         return False, {"error": f"box returned HTTP {exc.code}"}
