@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sys
 import threading
 from typing import Any
@@ -39,6 +40,26 @@ _logger = logging.getLogger(__name__)
 _HARDWARE_OPS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
 _ASYNC_OPS = {"teleop", "gravity-comp"}
 _OP_IDS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
+
+# Loggers whose records we never forward to the UI: webserver lifecycle,
+# access logs, low-level asyncio chatter. We still want the underlying ops'
+# own logs (``almond_axol.*``, ``can.*``, lerobot, jaxls, pyroki, etc.).
+_IGNORED_LOGGER_PREFIXES = (
+    "uvicorn",
+    "fastapi",
+    "starlette",
+    "watchfiles",
+    "websockets",
+    "httptools",
+    "asyncio",
+)
+
+# uvicorn's DefaultFormatter / AccessFormatter writes lines like
+# "INFO:     Started server process [...]"  or
+# "INFO:     127.0.0.1:36514 - \"GET /api/robot/status HTTP/1.1\" 200 OK".
+# Detect that distinctive ``LEVEL:<4+ spaces>`` prefix so the same lines that
+# go to the actual terminal don't also pollute the op's session log.
+_UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 
 class _StreamTee:
@@ -57,6 +78,10 @@ class _StreamTee:
         self._buf += s
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
+            # Don't echo uvicorn's own access / lifecycle lines into the UI;
+            # they still go to the real terminal via ``self._original`` above.
+            if _UVICORN_LINE.match(line):
+                continue
             self._sink(line)
         return len(s)
 
@@ -71,13 +96,22 @@ class _StreamTee:
 
 
 class _SessionLogHandler(logging.Handler):
-    """Logging handler that forwards formatted records into a session."""
+    """Logging handler that forwards formatted records into a session.
+
+    Drops records from web-server / framework loggers (``uvicorn.*`` etc.)
+    so an operation's log feed only contains output from the operation
+    itself and the libraries it uses.
+    """
 
     def __init__(self, sink: Any) -> None:
         super().__init__()
         self._sink = sink
 
     def emit(self, record: logging.LogRecord) -> None:
+        name = record.name or ""
+        for prefix in _IGNORED_LOGGER_PREFIXES:
+            if name == prefix or name.startswith(prefix + "."):
+                return
         try:
             self._sink(self.format(record))
         except Exception:  # noqa: BLE001
