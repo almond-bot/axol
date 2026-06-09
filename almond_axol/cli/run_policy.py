@@ -755,9 +755,10 @@ def _run(
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
 
-    # Dataset features come from static camera configs + joint enum, so the
-    # dataset can be constructed before the robot connects — letting us load
-    # the policy first (see PolicyServer spawn below).
+    # The dataset is constructed before the robot connects — letting us load
+    # the policy first (see PolicyServer spawn below). Pre-connect, camera
+    # feature shapes come from the camera configs; connect() later enforces
+    # that the live streams match, so the shapes baked in here stay valid.
     dataset: "LeRobotDataset | None" = None
     dataset_root: Path | None = None
     resumed_dataset = False
@@ -793,6 +794,22 @@ def _run(
             )
             resumed_dataset = True
         else:
+            # Guard against auto-detect camera configs (width/height of None):
+            # the robot is not connected yet, so unknown dimensions here would
+            # bake invalid image shapes into the dataset metadata.
+            incomplete_cams = [
+                name
+                for name, feat in robot.observation_features.items()
+                if isinstance(feat, tuple) and None in feat
+            ]
+            if incomplete_cams:
+                raise RuntimeError(
+                    "Cannot create a dataset before the robot connects: "
+                    f"camera(s) {', '.join(incomplete_cams)} have no width/"
+                    "height set in their config. Set explicit dimensions in "
+                    "the camera config (run-policy builds dataset features "
+                    "before connecting)."
+                )
             action_features = hw_to_dataset_features(robot.action_features, ACTION)
             obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
             dataset = LeRobotDataset.create(

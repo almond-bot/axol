@@ -37,7 +37,7 @@ with AxolRobot(config) as robot:
 
 | Field | Default | Description |
 |---|---|---|
-| `cameras` | `{}` | `ZedCameraConfig` instances keyed by name |
+| `cameras` | `{}` | `ZedCameraConfig` instances keyed by name. A camera with `stereo=True` expands into two observation keys, `<name>_left` / `<name>_right`, backed by a single decoded stream (see `ZedStereoCamera` below). |
 | `zed_host` | _required_ | Shared ZED streamer IP (no default — must be supplied). Fills every camera whose `host` is left unset (`None`); a camera with an explicit `host` keeps it. |
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
 | `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
@@ -109,15 +109,32 @@ Each grabbed frame carries two timestamps on the receiver's `perf_counter` clock
 | `read_latest_with_ts()` | `(frame, capture_perf_ts, receive_perf_ts)` for the most recent frame. |
 | `read_at_or_after(target_capture_perf_ts, timeout_ms=500)` | Block until a frame with `capture_perf_ts >= target` is available. Used by `collect-data` to align every camera and the joint sample on the same sender-side timeline. |
 
+## `ZedStereoCamera`
+
+Receiver for a **stereo ZED X** stream (sent with [`zed.stream --overhead-stereo`](/cli/zed-stream)). Opens one SDK connection and, on every grab, retrieves both eyes — so the HEVC stream is decoded once. The eyes are exposed as `left_view` / `right_view`, which present the same read API as `ZedCamera` so the rest of the pipeline can treat them as ordinary cameras.
+
+```python
+from almond_axol.lerobot.camera import ZedStereoCamera, ZedCameraConfig
+
+stereo = ZedStereoCamera(ZedCameraConfig(host="192.168.10.1", port=30000, stereo=True))
+stereo.connect()
+left = stereo.left_view.read_latest()    # (H, W, 3) — left eye
+right = stereo.right_view.read_latest()  # (H, W, 3) — right eye
+stereo.disconnect()
+```
+
+When an `AxolRobot` camera config has `stereo=True`, the robot expands camera `X` into observation keys `X_left` / `X_right` automatically (see `AxolRobotConfig.observation_cameras()`), and `collect-data` records both eyes in the dataset.
+
 ### `ZedCameraConfig` fields
 
 | Field | Default | Description |
 |---|---|---|
 | `host` | `None` | IP of the `zed.stream` sender. `None` inherits the shared `AxolRobotConfig.zed_host` when built via `AxolRobot`; set it explicitly for standalone use or to point one camera at a different sender. |
 | `port` | `30000` | Streaming port; overhead=30000, left_arm=30002, right_arm=30004 |
-| `fps` | `60` | Expected stream FPS; validated against the live stream on connect |
-| `width` | `960` | Expected frame width (SVGA); validated on connect |
-| `height` | `600` | Expected frame height (SVGA); validated on connect |
+| `fps` | `60` | Expected stream FPS; validated against the live stream on connect. `None` skips the check and adapts to the stream (used by teleop's headset relay). |
+| `width` | `960` | Expected frame width (SVGA); validated on connect. `None` skips the check. |
+| `height` | `600` | Expected frame height (SVGA); validated on connect. `None` skips the check. |
 | `warmup_s` | `1` | Seconds to read frames during `connect()` before returning |
+| `stereo` | `False` | Treat the stream as a stereo ZED X carrying both eyes. The robot expands camera `X` into observation keys `X_left` / `X_right` backed by a single decode. |
 
 If the live stream parameters differ from the config, `connect()` raises a `RuntimeError` with the mismatch details. Update the config to match the `--resolution` and `--fps` passed to `zed.stream`.

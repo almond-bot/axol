@@ -38,5 +38,6 @@ asyncio.run(main())
 | `resolution` | `SVGA` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
 | `fps` | `60` | Capture frame rate for all cameras |
 | `bitrate` | `None` (auto) | HEVC encoding bitrate in kbps; `None` picks a recommended value from the resolution (SVGA 8000, HD1080 12500, HD1200 14000; ×1.5 for the stereo overhead) |
+| `overhead_stereo` | `False` | Treat the overhead camera as a stereo ZED X (`sl.Camera`) instead of a mono ZED-X One (`sl.CameraOne`). The single stream then carries both eyes; receivers retrieve the LEFT/RIGHT views. The wrist cameras are always mono |
 
 At least one serial number must be provided. The sender binds to the streaming NIC's current IP — configure the interface on each machine before launching.

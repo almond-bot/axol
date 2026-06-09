@@ -60,6 +60,22 @@ The hosted app is built on Vercel; `vercel.json` builds the client package first
 }
 ```
 
+## Camera views
+
+When the host has camera video enabled ([`axol teleop --zed_host`](/cli/teleop), [`collect-data`](/cli/collect-data), or the [control panel](/guides/control-panel) with a connected ZED box), the robot's camera feeds stream to the headset over WebRTC and render as screens over passthrough.
+
+The screens are **world-anchored** — like TVs placed where you were looking when the session started, so you can move your head freely while they stay put. While arm tracking is disengaged, point a controller at a screen and hold the trigger to grab and reposition it (positions are remembered per view). Click the right thumbstick to re-anchor everything to your current gaze and reset moved screens.
+
+**Flick the right thumbstick** to switch views (a latched toggle — no holding; flicking the active direction returns to the default):
+
+| Flick | View |
+|---|---|
+| — | **Default** — passthrough with the left/right wrist cams as bottom-corner picture-in-picture |
+| Up | Fullscreen **overhead** (rendered per-eye in true stereo when the overhead is a stereo ZED X) |
+| Left | Fullscreen **left wrist** |
+| Right | Fullscreen **right wrist** |
+| Down | **Split** — left + right wrist cams side-by-side |
+
 ## Controller bindings
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
@@ -68,12 +84,14 @@ The hosted app is built on Vercel; `vercel.json` builds the client package first
 |---|---|---|
 | 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
 | 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper |
-| 4 | Right trigger | Actuate right gripper |
+| 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it |
+| 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it |
 | 5 | X | **Reset** pose; cancels a recording countdown; stops and discards an in-progress take |
 | 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
 | 7 | Y | **Exit** the XR session |
 | 8 | B | Toggle between **Teleop** and **Data Collection** (disabled while recording or counting down) |
+| — | Right thumbstick (flick) | **Switch camera view** — see [Camera views](#camera-views) |
+| — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moved positions |
 
 ## State machine
 

@@ -33,6 +33,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 |---|---|
 | `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over WebSocket |
 | `useAxolVRClient` | Hook — manages WebSocket lifecycle (connect, disconnect, auto-retry) |
+| `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
@@ -80,12 +81,13 @@ Each frame sends a JSON message over the WebSocket:
 |---|---|---|
 | 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
 | 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper |
-| 4 | Right trigger | Actuate right gripper |
+| 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to move it |
+| 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to move it |
 | 5 | Left **X** | Reset pose; cancels recording countdown; exits Recording → DataCollection |
 | 7 | Left **Y** | Exit XR session |
 | 6 | Right **A** | Start recording (3-second countdown); stop immediately if already recording; cancels countdown if pressed during it |
 | 8 | Right **B** | Toggle between Teleop and DataCollection (disabled while recording or countdown) |
+| — | Right thumbstick | Flick = latched camera-view picker (up = overhead, left/right = wrist fullscreen, down = split; re-flick = back to default passthrough + PiPs). Click = re-anchor the screens to the current gaze |
 
 ## State machine
 
@@ -180,3 +182,9 @@ The server can push a state override to all connected headsets at any time:
 ```
 
 Use `AxolVRTeleop.send_feedback_state(VRState.SAVING)` / `send_feedback_state(VRState.DATA_COLLECTION)` to block and unblock recording controls on the headset while an episode is being written to disk.
+
+The server also pushes `{ "type": "tracking", "value": true|false }` whenever the engage toggle changes; the headset uses it to only allow repositioning the camera screens while the robot isn't being controlled.
+
+**Camera video (WebRTC)**
+
+When the server has video sources registered (`VRServer.set_video_sources`, see `almond_axol/vr/video.py`), the headset negotiates a WebRTC connection over the same WebSocket: it sends `{ "type": "webrtc-request" }`, the server replies with `{ "type": "webrtc-offer", "sdp": ..., "tracks": { mid: cameraName } }`, and the client answers with `{ "type": "webrtc-answer", "sdp": ... }`. The `useAxolVideo` hook implements the client side and returns the labelled video tracks. A stereo overhead arrives as the two tracks `overhead_left` / `overhead_right`, rendered per-lens.

@@ -36,13 +36,14 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
+| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --zed_host`, `collect-data`) |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
-uv sync --extra lerobot --extra sim        # teleoperation + data collection
-uv sync --extra lerobot --extra cuda       # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra cuda   # everything
+uv sync --extra lerobot --extra sim --extra video   # teleoperation + data collection
+uv sync --extra lerobot --extra cuda                # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra video --extra cuda   # everything
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:

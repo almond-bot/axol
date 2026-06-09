@@ -63,7 +63,7 @@ Data collection and policy inference also need the **ZED Box** (the Jetson strea
 {/* SCREENSHOT: zed-connect-dialog.png — the "ZED Box" dialog with the address field and the three optional camera-serial fields */}
 <img src="/assets/zed-connect-dialog.png" alt="ZED Box dialog" />
 
-Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. Connecting then:
+Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. If the overhead is a **stereo ZED X**, tick the **Stereo** checkbox next to it — both eyes are then streamed (and recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`); the streaming bitrate is picked automatically from it. Connecting then:
 
 1. Checks the box is reachable.
 2. Starts **PTP clock sync** between the two machines (the Axol host as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.
@@ -90,7 +90,7 @@ Pick an operation from the selector. Each has its own settings form; required fi
 
 | Operation | Needs | Notes |
 |---|---|---|
-| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. |
+| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If the ZED box is connected and streaming, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
 | **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Collect Data** | Axol + ZED box | Record VR teleop episodes to a LeRobot dataset with the cameras. |
 | **Run Policy** | Axol + ZED box | Run a trained policy via LeRobot async inference. |

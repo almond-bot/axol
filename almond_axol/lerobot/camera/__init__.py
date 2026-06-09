@@ -1,6 +1,6 @@
-"""LeRobot ZED camera adapter: the stream-receiver camera and its config."""
+"""LeRobot ZED camera adapter: the stream-receiver cameras and their config."""
 
-from .camera_zed import ZedCamera
+from .camera_zed import ZedCamera, ZedStereoCamera
 from .configuration_zed import ZedCameraConfig
 
-__all__ = ["ZedCamera", "ZedCameraConfig"]
+__all__ = ["ZedCamera", "ZedCameraConfig", "ZedStereoCamera"]

@@ -50,6 +50,24 @@ async with VRServer() as vr:
 
 The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. `{"type": "state", "value": "error"}` shows an error indicator in the headset UI. `{"type": "state", "value": "data_collection"}` re-enables controls after saving. The `AxolVRTeleop.send_feedback_state(state)` helper wraps this for all `VRState` values.
 
+Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning the camera screens (a trigger gesture) while tracking is disengaged.
+
+## Camera video to the headset
+
+The server can stream camera frames to the headset over **WebRTC**. Register per-camera frame sources with `set_video_sources()` — each source is a callable returning the latest RGB `uint8` numpy frame `(H, W, 3)` or `None`:
+
+```python
+vr.set_video_sources({
+    "overhead":  lambda: overhead_cam.read_latest(max_age_ms=1000),
+    "left_arm":  lambda: left_cam.read_latest(max_age_ms=1000),
+    "right_arm": lambda: right_cam.read_latest(max_age_ms=1000),
+})
+```
+
+The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead is registered as two sources, `overhead_left` / `overhead_right`, which the VR app renders per-lens.
+
+Requires the `video` extra (`uv sync --extra video`, which installs `aiortc`); without it `set_video_sources()` logs a warning and video stays disabled. Pass `None` or `{}` to turn video off. [`axol teleop --zed_host`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
+
 ## `VRServerConfig` fields
 
 | Field | Default | Description |

@@ -8,6 +8,7 @@ Streams ZED-X One cameras over the local network using HEVC encoding. At least o
 | Flag | Description |
 |---|---|
 | `--overhead SERIAL` | Serial number of the overhead camera |
+| `--overhead-stereo` | Treat the overhead camera as a stereo ZED X instead of a mono ZED-X One. Both eyes are carried on the single overhead stream; receivers retrieve the left/right views. The wrist cameras are always mono. |
 | `--left-arm SERIAL` | Serial number of the left-arm camera |
 | `--right-arm SERIAL` | Serial number of the right-arm camera |
 | `--resolution {HD1080,HD1200,SVGA}` | Default: `SVGA` |
@@ -18,6 +19,7 @@ Streams ZED-X One cameras over the local network using HEVC encoding. At least o
 ```bash
 axol zed.stream --overhead 12345678 --left-arm 23456789 --right-arm 34567890
 axol zed.stream --overhead 12345678 --resolution SVGA --fps 30 --bitrate 4000
+axol zed.stream --overhead 50026922 --overhead-stereo --left-arm 23456789   # stereo ZED X overhead
 ```
 
 <Note>

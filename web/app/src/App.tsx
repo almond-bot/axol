@@ -935,7 +935,7 @@ function ControlHints({ title, rows }: { title: string; rows: [string, string][]
       <div className="flex flex-col gap-1">
         {rows.map(([key, label]) => (
           <div key={key} className="flex items-center gap-2">
-            <kbd className="flex size-5 items-center justify-center rounded border border-white/15 bg-white/[0.06] font-mono text-[0.65rem] text-white/70">
+            <kbd className="flex h-5 min-w-5 items-center justify-center rounded border border-white/15 bg-white/[0.06] px-1 font-mono text-[0.65rem] whitespace-nowrap text-white/70">
               {key}
             </kbd>
             <span className="text-white/60">{label}</span>
@@ -1059,7 +1059,9 @@ export default function App() {
                   rows={[
                     ["B", "Toggle mode"],
                     ["A", "Start / stop rec"],
-                    ["Stick", "Lock camera"],
+                    ["Stick", "Switch view"],
+                    ["Stick click", "Reset screens"],
+                    ["Trigger", "Move screen"],
                   ]}
                 />
               </div>
