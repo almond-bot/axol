@@ -110,6 +110,8 @@ export interface ServerInfo {
   ethIface: string | null
   /** All plausible wired interfaces, best candidate first. */
   ethIfaces: string[]
+  /** Installed git commit of the serve host (null for dev checkouts). */
+  commit?: string | null
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
@@ -138,7 +140,6 @@ export interface RobotStatus {
   state: RobotState
   connected: boolean
   error: string | null
-  needsSudo: boolean
   lastPing: number | null
   motors: MotorHealth[]
   motorCount: number
@@ -149,14 +150,8 @@ export async function fetchRobotStatus(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/status")))
 }
 
-export async function robotConnect(password?: string): Promise<RobotStatus> {
-  return json(
-    await fetch(apiUrl("/api/robot/connect"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ password: password ?? null }),
-    })
-  )
+export async function robotConnect(): Promise<RobotStatus> {
+  return json(await fetch(apiUrl("/api/robot/connect"), { method: "POST" }))
 }
 
 export async function robotDisconnect(): Promise<RobotStatus> {
@@ -172,8 +167,6 @@ export interface PtpStatus {
   locked: boolean
   offsetNs: number | null
   sessionId: string | null
-  needsSudo?: boolean
-  badPassword?: boolean
   error?: string | null
 }
 
@@ -202,19 +195,16 @@ export async function fetchZedStatus(): Promise<ZedLinkStatus> {
 
 export async function zedConnect(
   url: string,
-  password?: string,
   cameras?: ZedSpec["cameras"],
   overheadStereo?: boolean,
   resolution?: string
 ): Promise<ZedLinkStatus> {
   const body: {
     url: string
-    password?: string
     cameras?: ZedSpec["cameras"]
     overhead_stereo?: boolean
     resolution?: string
   } = { url }
-  if (password) body.password = password
   if (cameras) body.cameras = cameras
   if (overheadStereo) body.overhead_stereo = overheadStereo
   if (resolution) body.resolution = resolution

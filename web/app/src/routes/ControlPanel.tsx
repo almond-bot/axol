@@ -35,7 +35,6 @@ import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { ZedConnectDialog } from "@/components/zed-connect-dialog"
-import { SudoDialog } from "@/components/sudo-dialog"
 import { SiteNav } from "@/components/site-nav"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
@@ -97,14 +96,9 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
-  const [sudoOpen, setSudoOpen] = useState(false)
-  const [sudoError, setSudoError] = useState<string | null>(null)
   const [zedLink, setZedLink] = useState<ZedLinkStatus | null>(null)
   const [zedSettings, setZedSettings] = useState<ZedSpec>(() => loadZed())
   const [zedBusy, setZedBusy] = useState(false)
-  const [zedSudoOpen, setZedSudoOpen] = useState(false)
-  const [zedSudoBusy, setZedSudoBusy] = useState(false)
-  const [zedSudoDismissed, setZedSudoDismissed] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -282,23 +276,10 @@ export default function ControlPanel() {
   }
 
   // -- robot connection --
-  async function robotConnectClick(password?: string) {
+  async function robotConnectClick() {
     setRobotBusy(true)
     try {
-      const next = await robotConnect(password)
-      setRobot(next)
-      if (next.needsSudo) {
-        // CAN is down and passwordless sudo isn't available — prompt for it.
-        setSudoOpen(true)
-        setSudoError(null)
-      } else if (password && next.state === "error") {
-        // A password was supplied but bring-up still failed (e.g. wrong pw).
-        setSudoOpen(true)
-        setSudoError(next.error ?? "CAN bring-up failed.")
-      } else {
-        setSudoOpen(false)
-        setSudoError(null)
-      }
+      setRobot(await robotConnect())
     } catch (e) {
       setError(String(e))
     } finally {
@@ -321,8 +302,6 @@ export default function ControlPanel() {
     setZedBusy(true)
     try {
       setZedLink(await zedDisconnect())
-      setZedSudoOpen(false)
-      setZedSudoDismissed(false)
     } catch (e) {
       setError(String(e))
     } finally {
@@ -340,51 +319,15 @@ export default function ControlPanel() {
     try {
       const next = await zedConnect(
         url,
-        undefined,
         zedSettings.cameras,
         zedSettings.overheadStereo,
         zedSettings.resolution
       )
       setZedLink(next)
-      setZedSudoDismissed(false)
     } catch (e) {
       setError(String(e))
     } finally {
       setZedBusy(false)
-    }
-  }
-
-  // PTP daemons need root; the box connect starts them without a password, so
-  // the "needs sudo" state surfaces via polling. Prompt once (until dismissed).
-  const zedNeedsSudo = !!zedLink?.ptp?.needsSudo
-  useEffect(() => {
-    if (zedSudoBusy) return
-    if (zedNeedsSudo && !zedSudoDismissed) {
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setZedSudoOpen(true)
-    } else if (!zedNeedsSudo) {
-      setZedSudoDismissed(false)
-    }
-  }, [zedNeedsSudo, zedSudoDismissed, zedSudoBusy])
-
-  async function zedSudoSubmit(password: string) {
-    setZedSudoBusy(true)
-    try {
-      const next = await zedConnect(
-        zedLink?.boxUrl ?? "",
-        password,
-        zedSettings.cameras,
-        zedSettings.overheadStereo,
-        zedSettings.resolution
-      )
-      setZedLink(next)
-      // ptp4l validates the password asynchronously; close optimistically and
-      // let polling reopen this with an error if the password was wrong.
-      setZedSudoOpen(false)
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setZedSudoBusy(false)
     }
   }
 
@@ -523,29 +466,7 @@ export default function ControlPanel() {
           // Remember the box address + camera serials (as typed) + stereo flag
           // + resolution so they survive a server restart / browser reopen.
           patchZed({ boxUrl: url, cameras, overheadStereo, resolution })
-          setZedSudoDismissed(false)
         }}
-      />
-      <SudoDialog
-        open={sudoOpen}
-        busy={robotBusy}
-        error={sudoError}
-        onClose={() => {
-          setSudoOpen(false)
-          setSudoError(null)
-        }}
-        onSubmit={(password) => robotConnectClick(password)}
-      />
-      <SudoDialog
-        open={zedSudoOpen}
-        busy={zedSudoBusy}
-        error={zedLink?.ptp?.badPassword ? "Incorrect sudo password." : null}
-        message="The PTP clock-sync daemons (ptp4l/phc2sys) need root on both machines. Enter the sudo password — it's used once on each and not stored."
-        onClose={() => {
-          setZedSudoOpen(false)
-          setZedSudoDismissed(true)
-        }}
-        onSubmit={zedSudoSubmit}
       />
     </div>
   )

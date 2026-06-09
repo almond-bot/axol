@@ -26,20 +26,15 @@ _QUEUE_MAX = 1000
 _STOP_GRACE_S = 6.0
 
 
-async def spawn_proc(
-    argv_tail: list[str], env_extra: dict[str, str] | None = None
-) -> asyncio.subprocess.Process:
+async def spawn_proc(argv_tail: list[str]) -> asyncio.subprocess.Process:
     """Spawn ``python -m almond_axol <argv_tail>`` with merged, streamed stdout.
 
     Shared by plain sessions and the ZED orchestrator. Runs in its own session
     (process group) so the whole tree can be signalled on teardown, and uses the
-    serving interpreter so ``axol`` need not be on PATH. ``env_extra`` adds/over-
-    rides environment variables (e.g. a forwarded sudo password for PTP).
+    serving interpreter so ``axol`` need not be on PATH.
     """
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
-    if env_extra:
-        env.update(env_extra)
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
@@ -191,19 +186,17 @@ class SessionManager:
         argv_tail: list[str],
         *,
         args: dict[str, Any] | None = None,
-        env_extra: dict[str, str] | None = None,
     ) -> Session:
         """Spawn an arbitrary ``axol`` invocation as a tracked session.
 
         ``argv_tail`` is the full CLI tail (subcommand + flags). Used both for
         schema-validated commands and the ZED helper endpoints the orchestrator
-        drives remotely (``zed.sync-clocks`` / ``zed.stream``). ``env_extra``
-        injects extra env vars (e.g. a forwarded sudo password for PTP).
+        drives remotely (``zed.sync-clocks`` / ``zed.stream``).
         """
         session = Session(command_id, args or {})
         self._sessions[session.id] = session
         try:
-            proc = await spawn_proc(argv_tail, env_extra)
+            proc = await spawn_proc(argv_tail)
         except OSError as exc:
             session.status = "error"
             session.error = f"Failed to launch command: {exc}"

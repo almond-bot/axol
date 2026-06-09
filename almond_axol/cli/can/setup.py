@@ -121,9 +121,7 @@ def _find_serial() -> str:
     return unique[int(idx)]
 
 
-def _write_udev_rules(
-    serial: str, *, password: str | None = None, allow_prompt: bool = False
-) -> None:
+def _write_udev_rules(serial: str) -> None:
     print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
     content = (
         f"# Almond Axol dual-channel CAN adapter\n"
@@ -133,36 +131,18 @@ def _write_udev_rules(
         f"# Channel 1 -> right arm\n"
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
     )
-    run_root(
-        ["tee", str(_UDEV_RULES_FILE)],
-        input_text=content,
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
+    run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
     print("  Done.")
 
 
-def _reload_udev(*, password: str | None = None, allow_prompt: bool = False) -> None:
+def _reload_udev() -> None:
     print("Reloading udev rules (requires sudo)...")
-    run_root(
-        ["udevadm", "control", "--reload-rules"],
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
-    run_root(
-        ["systemctl", "restart", "systemd-udevd"],
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
+    run_root(["udevadm", "control", "--reload-rules"], check=True)
+    run_root(["systemctl", "restart", "systemd-udevd"], check=True)
     print("  Done.")
 
 
-def _rename_interfaces(
-    serial: str, *, password: str | None = None, allow_prompt: bool = False
-) -> None:
+def _rename_interfaces(serial: str) -> None:
     """Rename existing canX interfaces to their target names without replug."""
     print("Renaming CAN interfaces (requires sudo)...")
     target = {0: _CAN_L, 1: _CAN_R}
@@ -204,18 +184,8 @@ def _rename_interfaces(
             continue
 
         print(f"  {iface} -> {new_name}")
-        run_root(
-            ["ip", "link", "set", iface, "down"],
-            password=password,
-            allow_prompt=allow_prompt,
-            check=True,
-        )
-        run_root(
-            ["ip", "link", "set", iface, "name", new_name],
-            password=password,
-            allow_prompt=allow_prompt,
-            check=True,
-        )
+        run_root(["ip", "link", "set", iface, "down"], check=True)
+        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
 
     print("  Done.")
 
@@ -238,24 +208,15 @@ def _write_cron_script() -> None:
     print("  Done.")
 
 
-def _register_cron(*, password: str | None = None, allow_prompt: bool = False) -> None:
+def _register_cron() -> None:
     print("Registering @reboot cron entry in root crontab (requires sudo)...")
     cron_entry = f"@reboot {_CRON_SCRIPT}"
-    existing = (
-        run_root(["crontab", "-l"], password=password, allow_prompt=allow_prompt).stdout
-        or ""
-    )
+    existing = run_root(["crontab", "-l"]).stdout or ""
     if str(_CRON_SCRIPT) in existing:
         print("  Entry already present — skipping.")
     else:
         new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
-        run_root(
-            ["crontab", "-"],
-            input_text=new_crontab,
-            password=password,
-            allow_prompt=allow_prompt,
-            check=True,
-        )
+        run_root(["crontab", "-"], input_text=new_crontab, check=True)
         print(f"  Added: {cron_entry}")
 
 
@@ -267,14 +228,9 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def _bring_up_can(*, password: str | None = None, allow_prompt: bool = False) -> None:
+def _bring_up_can() -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
-    run_root(
-        ["bash", str(_CRON_SCRIPT)],
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
+    run_root(["bash", str(_CRON_SCRIPT)], check=True)
     print("  Done.")
 
 
@@ -288,32 +244,26 @@ def is_configured() -> bool:
     return _UDEV_RULES_FILE.exists() and _CRON_SCRIPT.exists()
 
 
-def ensure_setup(
-    *,
-    password: str | None = None,
-    serial: str | None = None,
-    allow_prompt: bool = False,
-) -> None:
+def ensure_setup(*, serial: str | None = None) -> None:
     """Run the full CAN configuration non-interactively (for the control panel).
 
-    Mirrors :func:`run` but resolves the adapter serial without prompting and
-    escalates every privileged step through the shared sudo helper, so the web
-    UI can supply the operator's password (or be told one is needed). Each step
-    is idempotent, so this is safe to call on a partially-configured machine.
+    Mirrors :func:`run` but resolves the adapter serial without prompting.
+    Each step is idempotent, so this is safe to call on a partially-configured
+    machine.
     """
     serial = serial or _resolve_serial()
-    _write_udev_rules(serial, password=password, allow_prompt=allow_prompt)
-    _reload_udev(password=password, allow_prompt=allow_prompt)
-    _rename_interfaces(serial, password=password, allow_prompt=allow_prompt)
+    _write_udev_rules(serial)
+    _reload_udev()
+    _rename_interfaces(serial)
     _write_cron_script()
-    _register_cron(password=password, allow_prompt=allow_prompt)
-    _bring_up_can(password=password, allow_prompt=allow_prompt)
+    _register_cron()
+    _bring_up_can()
 
 
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     serial = _find_serial()
-    ensure_setup(serial=serial, allow_prompt=True)
+    ensure_setup(serial=serial)
 
     print()
     print("Setup complete.")

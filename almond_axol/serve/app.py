@@ -21,13 +21,13 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from ..utils.certs import ACCEPT_PAGE_HTML
-from ..utils.sudo import SUDO_PASSWORD_ENV
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
 from .orchestrator import PtpLink, StreamLink, box_ssl_context
 from .robot_link import RobotLink
 from .runner import OperationRunner
+from .update import SelfUpdater
 
 # Orchestrated commands launch the full ZED bring-up (clock sync + streaming)
 # instead of just the bare command when a ZED spec is supplied.
@@ -61,17 +61,8 @@ class EpisodeRequest(BaseModel):
     command: str
 
 
-class RobotConnectRequest(BaseModel):
-    """Optional sudo password used only if CAN bring-up needs root access."""
-
-    password: str | None = None
-
-
 class ZedConnectRequest(BaseModel):
     """Lightweight ZED box link: store url and verify reachability.
-
-    ``password`` (optional) is forwarded to the PTP daemons on both machines
-    when passwordless sudo isn't available; used once and never stored.
 
     ``cameras`` (optional) maps camera slot (``overhead`` / ``left_arm`` /
     ``right_arm``) to its ZED-X One serial. When any are given, streaming for
@@ -85,7 +76,6 @@ class ZedConnectRequest(BaseModel):
     """
 
     url: str
-    password: str | None = None
     cameras: dict[str, str] | None = None
     overhead_stereo: bool = False
     resolution: str | None = None
@@ -104,8 +94,6 @@ class SyncClocksRequest(BaseModel):
     ip: str | None = None
     transport: str | None = None
     timestamping: str | None = None
-    # Forwarded sudo password for the box's PTP daemons (never stored).
-    password: str | None = None
 
 
 class StreamRequest(BaseModel):
@@ -196,6 +184,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # "connected" forever after the box is powered off.
     zed_monitor: dict[str, asyncio.Task[None] | None] = {"task": None}
 
+    def _is_idle() -> bool:
+        """Safe to restart: nothing running and no live robot/box links."""
+        if runner.is_running():
+            return False
+        if any(s["status"] in ("starting", "running") for s in manager.list()):
+            return False
+        if ptp.running or stream.running:
+            return False
+        return not robot.status()["connected"]
+
+    # Keeps a hosted (uv tool) install in sync with main: poked by the UI's
+    # connect/poll endpoints, upgrades in the background, and restarts the
+    # process (systemd relaunches it) once idle. No-ops for dev checkouts.
+    updater = SelfUpdater(_is_idle)
+
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
         """Resolve a session id to (session, owner) across runner + manager."""
         s = runner.get(session_id)
@@ -227,6 +230,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         dropdown for) the wired ZED-link interface on this machine; the box's
         own values are fetched the same way through ``/api/zed/box-info``.
         """
+        updater.poke()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
@@ -234,6 +238,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "vrPort": _VR_PORT,
             "ethIface": best_eth_iface(),
             "ethIfaces": list_eth_ifaces(),
+            "commit": updater.commit,
         }
 
     @app.get("/api/zed/box-info")
@@ -253,11 +258,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         return robot.status()
 
     @app.post("/api/robot/connect")
-    async def robot_connect(
-        req: RobotConnectRequest | None = None,
-    ) -> dict[str, Any]:
-        password = req.password if req else None
-        return await asyncio.to_thread(robot.connect, password)
+    async def robot_connect() -> dict[str, Any]:
+        return await asyncio.to_thread(robot.connect)
 
     @app.post("/api/robot/disconnect")
     async def robot_disconnect() -> dict[str, Any]:
@@ -316,7 +318,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             zed_state["error"] = None
             # Start clock sync immediately so the link is already locked by the
             # time a collect-data / run-policy task begins.
-            zed_state["ptp"] = await ptp.start(req.url, req.password)
+            zed_state["ptp"] = await ptp.start(req.url)
             # If camera serials were given, start streaming them too (it waits
             # for the clocks to lock first); a task then reuses the live feeds.
             zed_state["stream"] = await stream.start(
@@ -360,6 +362,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/op/status")
     async def op_status() -> dict[str, Any]:
+        # The UI polls this while the panel is open, so a long-lived tab still
+        # picks up updates (the poke itself is debounced).
+        updater.poke()
         session = runner.current()
         return {
             "running": runner.is_running(),
@@ -456,8 +461,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             argv += ["--transport", req.transport]
         if req.timestamping:
             argv += ["--timestamping", req.timestamping]
-        env_extra = {SUDO_PASSWORD_ENV: req.password} if req.password else None
-        session = await manager.start_raw("zed.sync-clocks", argv, env_extra=env_extra)
+        session = await manager.start_raw("zed.sync-clocks", argv)
         return JSONResponse(session.to_dict())
 
     @app.post("/api/zed/stream")

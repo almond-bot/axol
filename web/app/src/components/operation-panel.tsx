@@ -90,8 +90,7 @@ export function OperationPanel({
   // ZED frame timestamps are only valid once both machines' clocks are
   // PTP-locked, so collect-data / run-policy can't start until then.
   if (meta.requiresZed && zedOk && !zedLink?.ptp?.locked) {
-    if (zedLink?.ptp?.needsSudo) blockers.push("Enter sudo password for clock sync")
-    else if (zedLink?.ptp?.error) blockers.push(`Clock sync failed: ${zedLink.ptp.error}`)
+    if (zedLink?.ptp?.error) blockers.push(`Clock sync failed: ${zedLink.ptp.error}`)
     else blockers.push("Wait for clocks to lock")
   }
   // Likewise the cameras must actually be streaming before a task can record /

@@ -31,14 +31,7 @@ import threading
 import time
 from pathlib import Path
 
-from ...utils.sudo import (
-    SUDO_BAD_PASSWORD_CODE,
-    SUDO_BAD_PASSWORD_MARKER,
-    SUDO_REQUIRED_CODE,
-    SUDO_REQUIRED_MARKER,
-    password_from_env,
-    run_root,
-)
+from ...utils.sudo import run_root
 
 # The PTP daemons we manage. Named so teardown can kill them by name as a
 # safety net (they run as root, so a non-root signal can't reach them).
@@ -114,17 +107,12 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 def run(args: argparse.Namespace) -> None:
     """Run the PTP clock-sync daemons for this machine's role."""
     logging.basicConfig(level=getattr(logging, args.log_level))
-    # The PTP daemons need root. A password may be supplied out-of-band via the
-    # environment (the web control panel forwards the one the operator typed) so
-    # it never lands in argv / process listings.
-    sudo_password = password_from_env()
     try:
         _run(
             role=args.role,
             iface=args.iface,
             transport=args.transport,
             timestamping=args.timestamping,
-            sudo_password=sudo_password,
         )
     except KeyboardInterrupt:
         pass
@@ -136,7 +124,6 @@ def _run(
     iface: str,
     transport: str,
     timestamping: str,
-    sudo_password: str | None = None,
 ) -> None:
     _ensure_executable("ptp4l", required=True)
     _ensure_executable("phc2sys", required=True)
@@ -147,12 +134,12 @@ def _run(
             f"Plug in the cable or check `ip link show`."
         )
 
-    _check_sudo(sudo_password)
+    _check_sudo()
     # A prior `axol serve` that was killed (or a disconnect that couldn't reach
     # the root daemons) can leave ptp4l/phc2sys orphaned and still disciplining
     # the clock. Clear any strays so we don't stack duplicates fighting over
     # CLOCK_REALTIME.
-    _reap_stale_daemons(sudo_password)
+    _reap_stale_daemons()
 
     timestamping_mode = _resolve_timestamping(iface, timestamping)
     _logger.info(
@@ -169,23 +156,21 @@ def _run(
             role=role,
             transport=transport,
             timestamping=timestamping_mode,
-        ),
-        sudo_password,
+        )
     )
     phc2sys_cmd = _with_sudo(
         _build_phc2sys_cmd(
             iface=iface,
             role=role,
             timestamping=timestamping_mode,
-        ),
-        sudo_password,
+        )
     )
 
-    _logger.info("ptp4l:   %s", " ".join(_redact_sudo(ptp4l_cmd)))
-    _logger.info("phc2sys: %s", " ".join(_redact_sudo(phc2sys_cmd)))
+    _logger.info("ptp4l:   %s", " ".join(ptp4l_cmd))
+    _logger.info("phc2sys: %s", " ".join(phc2sys_cmd))
 
-    ptp4l_proc = _spawn_daemon(ptp4l_cmd, sudo_password)
-    phc2sys_proc = _spawn_daemon(phc2sys_cmd, sudo_password)
+    ptp4l_proc = _spawn_daemon(ptp4l_cmd)
+    phc2sys_proc = _spawn_daemon(phc2sys_cmd)
 
     procs: list[tuple[str, subprocess.Popen[str]]] = [
         ("ptp4l", ptp4l_proc),
@@ -224,73 +209,43 @@ def _run(
                     break
             stop_event.wait(timeout=0.5)
     finally:
-        _terminate_procs(procs, sudo_password)
+        _terminate_procs(procs)
         for t in threads:
             t.join(timeout=2.0)
 
 
-def _with_sudo(cmd: list[str], password: str | None = None) -> list[str]:
-    """Prepend ``sudo`` unless already root.
+def _with_sudo(cmd: list[str]) -> list[str]:
+    """Prepend ``sudo -n`` unless already root.
 
-    With a ``password`` we read it from stdin (``-S``); otherwise we require
-    passwordless sudo (``-n``) so the daemon fails fast instead of blocking on a
-    tty prompt that never comes (the web control panel runs without one).
+    Passwordless sudo (``-n``) so the daemon fails fast instead of blocking on
+    a tty prompt that never comes (the web control panel runs without one).
     """
     if os.geteuid() == 0:
         return cmd
-    if password:
-        return ["sudo", "-S", "-p", "", *cmd]
     return ["sudo", "-n", *cmd]
 
 
-def _redact_sudo(cmd: list[str]) -> list[str]:
-    """Drop the ``-S`` flag from a logged command (cosmetic; no secret in argv)."""
-    return [a for a in cmd if a != "-S"]
-
-
-def _check_sudo(password: str | None) -> None:
-    """Verify privilege escalation before launching the long-lived daemons.
-
-    The sentinel markers + exit codes (shared with the web orchestrator) let it
-    tell a *missing* password apart from a *wrong* one and react, instead of
-    just watching the daemons die.
-    """
+def _check_sudo() -> None:
+    """Verify privilege escalation before launching the long-lived daemons."""
     if os.geteuid() == 0:
         return
-    if password:
-        result = subprocess.run(
-            ["sudo", "-S", "-p", "", "-v"],
-            input=f"{password}\n",
-            text=True,
-            capture_output=True,
-        )
-        if result.returncode != 0:
-            print(SUDO_BAD_PASSWORD_MARKER, flush=True)
-            raise SystemExit(SUDO_BAD_PASSWORD_CODE)
-        return
     if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
-        print(SUDO_REQUIRED_MARKER, flush=True)
-        raise SystemExit(SUDO_REQUIRED_CODE)
+        raise SystemExit(
+            "error: the PTP daemons need root and passwordless sudo is "
+            "unavailable. Run as root (the hosted install's systemd service "
+            "does) or configure sudo."
+        )
 
 
-def _spawn_daemon(cmd: list[str], password: str | None) -> subprocess.Popen[str]:
-    """Popen a PTP daemon, feeding the sudo password on stdin when supplied."""
-    proc = subprocess.Popen(
+def _spawn_daemon(cmd: list[str]) -> subprocess.Popen[str]:
+    """Popen a PTP daemon with merged, line-buffered output."""
+    return subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        stdin=subprocess.PIPE if password else None,
         text=True,
         bufsize=1,
     )
-    if password and proc.stdin is not None:
-        try:
-            proc.stdin.write(f"{password}\n")
-            proc.stdin.flush()
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-    return proc
 
 
 def _ensure_executable(name: str, *, required: bool) -> bool:
@@ -462,40 +417,37 @@ def _stream_subprocess(
             last_report = now
 
 
-def _root_kill(cmd: list[str], password: str | None) -> bool:
+def _root_kill(cmd: list[str]) -> bool:
     """Best-effort privileged ``kill``/``pkill``. Returns True if it matched.
 
-    The PTP daemons run as root (via ``sudo``), so a plain ``proc.terminate()``
-    from this non-root wrapper hits ``EPERM`` and leaves them orphaned. Routing
-    the kill back through ``sudo`` (cached creds from ``_check_sudo``, or the
-    forwarded password) is the only thing that actually stops them.
+    The PTP daemons run as root, so a plain ``proc.terminate()`` from a
+    non-root wrapper hits ``EPERM`` and leaves them orphaned. Routing the kill
+    through :func:`run_root` is what actually stops them.
     """
     try:
-        result = run_root(cmd, password=password)
+        result = run_root(cmd)
     except Exception:  # noqa: BLE001 - teardown is best-effort
         return False
     return result.returncode == 0
 
 
-def _reap_stale_daemons(password: str | None) -> None:
+def _reap_stale_daemons() -> None:
     """Kill leftover ptp4l/phc2sys from a previous run before starting fresh."""
     for name in _DAEMON_NAMES:
-        if _root_kill(["pkill", "-TERM", "-x", name], password):
+        if _root_kill(["pkill", "-TERM", "-x", name]):
             _logger.info("Reaped a stray %s from a previous run.", name)
     time.sleep(0.5)
     for name in _DAEMON_NAMES:
-        _root_kill(["pkill", "-KILL", "-x", name], password)
+        _root_kill(["pkill", "-KILL", "-x", name])
 
 
-def _terminate_procs(
-    procs: list[tuple[str, subprocess.Popen[str]]], password: str | None
-) -> None:
+def _terminate_procs(procs: list[tuple[str, subprocess.Popen[str]]]) -> None:
     # SIGTERM via root first: sudo relays it to the daemon (or hits the daemon
     # directly if sudo exec-replaced itself).
     for name, proc in procs:
         if proc.poll() is None:
             _logger.info("Terminating %s (pid %d).", name, proc.pid)
-            _root_kill(["kill", "-TERM", str(proc.pid)], password)
+            _root_kill(["kill", "-TERM", str(proc.pid)])
     deadline = time.monotonic() + 3.0
     for name, proc in procs:
         timeout = max(0.0, deadline - time.monotonic())
@@ -505,8 +457,8 @@ def _terminate_procs(
             _logger.warning("%s did not exit cleanly; killing.", name)
             # Kill the daemon by name too: a SIGKILL to the sudo pid isn't
             # relayed and would orphan the root daemon.
-            _root_kill(["pkill", "-KILL", "-x", name], password)
-            _root_kill(["kill", "-KILL", str(proc.pid)], password)
+            _root_kill(["pkill", "-KILL", "-x", name])
+            _root_kill(["kill", "-KILL", str(proc.pid)])
             try:
                 proc.wait(timeout=2.0)
             except subprocess.TimeoutExpired:

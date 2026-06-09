@@ -5,6 +5,8 @@ description: "Run the Axol web control panel — drive the robot from a browser 
 
 Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, and policy inference — in-process.
 
+With the [quick install](/installation#quick-install-recommended), this command already runs as a root systemd service (`axol.service`) that starts at boot, restarts automatically, and keeps itself in sync with the latest release — you don't run it by hand. Manual invocation is for development installs:
+
 ```bash
 axol serve                    # https://localhost:8001 (LAN-reachable)
 axol serve --port 9000
@@ -32,7 +34,7 @@ To connect from a browser on another machine, open the printed **LAN** URL once 
 
 ## Building the web UI
 
-The server looks for the built web bundle at `web/app/dist`. If it isn't built, `axol serve` still runs and the **API is available**, but there's no UI to open. Build it once with:
+The server looks for the built web bundle at `web/app/dist` (a repo checkout only — quick installs have no checkout). If it isn't there, `axol serve` still runs and the **API is available**; use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to the server directly. To serve the UI locally instead, build it once with:
 
 ```bash
 cd web

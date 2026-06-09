@@ -89,7 +89,7 @@ export function ZedConnectDialog({
       right_arm: cameras.right_arm.trim(),
     }
     try {
-      const status = await zedConnect(url.trim(), undefined, trimmed, overheadStereo, resolution)
+      const status = await zedConnect(url.trim(), trimmed, overheadStereo, resolution)
       onConnected(status, url.trim(), trimmed, overheadStereo, resolution)
       onClose()
     } catch (e) {

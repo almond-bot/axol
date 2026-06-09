@@ -38,7 +38,7 @@ PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). 
 
 ## Prerequisites
 
-- The `lerobot` extra installed on the main host. For GPU inference also add the `cuda` extra: `uv sync --extra lerobot --extra cuda` (see [Installation](/installation)).
+- The `lerobot` extra installed on the main host — the [quick install](/installation#quick-install-recommended) includes it. For GPU inference the `cuda` extra is also needed, which the quick install does **not** include: on a development install run `uv sync --extra lerobot --extra cuda` (see [Installation](/installation)).
 - A trained checkpoint (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …).
 - CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
 - `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.

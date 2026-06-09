@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# Almond Axol installer.
+#
+#   curl https://axol.almond.bot/install -fsS | bash
+#
+# Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
+# except cuda/dev), and registers a root systemd service that keeps
+# `axol serve` running at boot and restarts it if it ever goes down.
+# Safe to re-run: re-running upgrades to the latest main.
+
+set -euo pipefail
+
+INSTALL_URL="https://axol.almond.bot/install"
+REPO="git+https://github.com/almond-bot/axol"
+EXTRAS="lerobot,sim,video"
+PYTHON_VERSION="3.13"
+BIN_DIR="/usr/local/bin"
+SERVICE_NAME="axol"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
+die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
+
+[ "$(uname -s)" = "Linux" ] || die "This installer only supports Linux."
+
+# The systemd service runs as root, so install everything as root. When piped
+# into a non-root shell, re-fetch ourselves and re-run elevated.
+if [ "$(id -u)" -ne 0 ]; then
+    say "Root privileges are required (systemd service); re-running with sudo..."
+    exec sudo bash -c "curl -fsS ${INSTALL_URL} | bash"
+fi
+
+command -v systemctl >/dev/null 2>&1 || die "systemd is required."
+command -v curl >/dev/null 2>&1 || die "curl is required."
+
+# -- uv -----------------------------------------------------------------------
+
+if ! command -v uv >/dev/null 2>&1; then
+    say "Installing uv to ${BIN_DIR}..."
+    curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="${BIN_DIR}" sh
+else
+    say "uv already installed ($(command -v uv))."
+fi
+UV="$(command -v uv || echo "${BIN_DIR}/uv")"
+
+# -- axol ---------------------------------------------------------------------
+
+say "Installing axol from GitHub (extras: ${EXTRAS}) — this can take a few minutes..."
+UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
+    --python "${PYTHON_VERSION}" \
+    --force \
+    "almond-axol[${EXTRAS}] @ ${REPO}"
+
+command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
+say "axol installed at $(command -v axol)."
+
+# -- systemd service ----------------------------------------------------------
+
+say "Writing ${SERVICE_FILE}..."
+cat > "${SERVICE_FILE}" <<EOF
+[Unit]
+Description=Axol control panel (axol serve)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=${BIN_DIR}/axol serve
+Restart=always
+RestartSec=3
+Environment=PATH=${BIN_DIR}:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+say "Enabling and starting the ${SERVICE_NAME} service..."
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
+systemctl restart "${SERVICE_NAME}"
+
+# -- done ---------------------------------------------------------------------
+
+LAN_IP="$(hostname -I 2>/dev/null | awk "{print \$1}")"
+say ""
+say "Done! axol serve is running and will start automatically at boot."
+say ""
+say "  Control panel : https://axol.almond.bot"
+if [ -n "${LAN_IP}" ]; then
+    say "  This machine  : https://${LAN_IP}:8001 (open once to accept the certificate)"
+fi
+say ""
+say "  Service logs  : journalctl -u ${SERVICE_NAME} -f"
+say "  Re-run this installer anytime to upgrade."

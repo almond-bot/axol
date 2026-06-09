@@ -12,7 +12,9 @@ It's served by [`axol serve`](/cli/serve) and runs each operation **in-process**
 
 ## Start the server
 
-On the **main host** (the upper computer wired to the robot):
+With the [quick install](/installation#quick-install-recommended), the server is already running on the **main host** (the upper computer wired to the robot) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+
+On a development install, start it yourself:
 
 ```bash
 axol serve
@@ -29,7 +31,7 @@ Axol control panel:
 Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`.
 
 <Note>
-  The UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). If it isn't, `axol serve` still exposes the API but has no page to open — see [Installation](/installation#web-control-panel-optional).
+  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Installation](/installation#web-control-panel-optional).
 </Note>
 
 <Tip>
@@ -54,7 +56,7 @@ Press **Connect** to bring up the robot. Under the hood this:
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
 
-If CAN bring-up needs `sudo` and passwordless sudo isn't configured, the panel prompts for your password (used once, never stored). While a task is running the 1 Hz polling pauses and the robot is handed to the task.
+The server runs as root under the quick install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
 ### ZED Box
 
@@ -72,7 +74,7 @@ Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of 
 The tile header shows two status lights — **CLOCK** and **STREAM** — that are **green** when healthy, **amber** while starting, and **red** on error (hover for the reason). The camera serials and box IP persist in your browser, so they're pre-filled next time.
 
 <Note>
-  PTP daemons need root. If passwordless `sudo` isn't available the **CLOCK** light turns amber ("needs sudo") and the panel prompts for a password, the same as Axol connect.
+  PTP daemons need root. Both machines' `axol serve` run as root under the quick install's systemd service, so this is automatic; on a development install run the server as root or configure passwordless `sudo`.
 </Note>
 
 When connected, the ZED tile shows **Restart** (re-run clock sync + streaming) and **Disconnect** buttons. If clock sync or streaming fails, an inline panel appears below the connections with the error and the full log streamed from the box, so you can see exactly which camera serial wasn't found or why the clocks didn't lock.

@@ -6,17 +6,9 @@ import { cn } from "@/lib/utils"
 
 const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
   {
-    label: "1. Install uv",
-    cmd: "curl -LsSf https://astral.sh/uv/install.sh | sh",
-  },
-  {
-    label: "2. Install the Axol CLI globally",
-    hint: "straight from GitHub",
-    cmd: 'uv tool install --python 3.13 "almond-axol[lerobot,sim] @ git+ssh://git@github.com/almond-bot/axol.git"',
-  },
-  {
-    label: "3. Launch this control panel",
-    cmd: "axol serve",
+    label: "Install Axol on the robot machine",
+    hint: "installs uv + the CLI, and starts the control panel server at boot",
+    cmd: "curl https://axol.almond.bot/install -fsS | bash",
   },
 ]
 
@@ -56,7 +48,7 @@ function QuickstartDialog({ open, onClose }: { open: boolean; onClose: () => voi
           <div className="flex items-center gap-2">
             <Rocket className="size-4 text-[#eff483]" />
             <span className="font-heading text-base font-semibold">Quickstart</span>
-            <span className="text-xs text-white/40">install the CLI &amp; run the server</span>
+            <span className="text-xs text-white/40">one command installs everything</span>
           </div>
           <button
             type="button"
@@ -78,6 +70,11 @@ function QuickstartDialog({ open, onClose }: { open: boolean; onClose: () => voi
               <CommandLine cmd={step.cmd} />
             </div>
           ))}
+          <p className="text-xs text-white/45">
+            The server starts automatically (and at every boot, staying in sync with the latest
+            release). Once it&apos;s running, press <span className="text-white/70">Connect</span>{" "}
+            in the top bar and enter the machine&apos;s IP address.
+          </p>
         </div>
       </div>
     </div>,

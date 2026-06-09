@@ -107,8 +107,9 @@ def run(args: argparse.Namespace) -> None:
         )
     if static_dir is None:
         print(
-            "  (web UI not built — run `npm install && npm run build` in web/; "
-            "the API is still available)"
+            "  (no local web bundle — drive this machine from "
+            "https://axol.almond.bot, or build one with `npm install && "
+            "npm run build` in web/)"
         )
 
     if args.open:

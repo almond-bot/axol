@@ -264,11 +264,9 @@ function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
   if (!ptp) return null
   const [dot, pulse] = ptp.locked
     ? (["ok", false] as const)
-    : ptp.needsSudo
-      ? (["warn", true] as const)
-      : ptp.error
-        ? (["err", false] as const)
-        : (["warn", true] as const)
+    : ptp.error
+      ? (["err", false] as const)
+      : (["warn", true] as const)
   return <StatusDot name="clock" dot={dot} pulse={pulse} />
 }
 

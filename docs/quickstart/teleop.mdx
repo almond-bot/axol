@@ -9,7 +9,13 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
   <Tab title="Real Axol robot">
     <Steps>
       <Step title="Install">
-        Install the package using `uv`, then activate the virtual environment so the `axol` CLI is on your path:
+        The fastest path is the [quick install](/installation#quick-install-recommended), which installs the `axol` CLI and starts the web control panel as a service:
+
+        ```bash
+        curl https://axol.almond.bot/install -fsS | bash
+        ```
+
+        Or, from a clone, install with `uv` and activate the virtual environment so the `axol` CLI is on your path:
 
         ```bash
         uv sync
@@ -17,7 +23,7 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
         ```
 
         <Tip>
-          You will need to activate in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+          With the clone path you will need to activate in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
         </Tip>
       </Step>
 

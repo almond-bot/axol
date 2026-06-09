@@ -25,7 +25,7 @@ axol zed.sync-clocks --role slave  --iface <iface>   # Jetson
 Interface names vary by machine (`eth0`, `enp3s0`, `eno1`, …) — run `ip link` on each to find the one carrying the direct link and substitute it for `<iface>`.
 
 <Note>
-  The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install fallback) are escalated inline via `sudo`, so you do **not** run `axol` itself as root. Sudo will prompt for a password the first time and reuse cached credentials for the rest of the session. The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`; on Debian/Ubuntu these are auto-installed if missing. On non-apt systems install them manually (`linuxptp`, `ethtool`) and rerun.
+  The privileged subprocesses (`ptp4l`, `phc2sys`, and the apt-get auto-install fallback) need root. Under the quick install's systemd service, `axol serve` (which launches this command) already runs as root; when running interactively as a non-root user, passwordless (or cached) `sudo` is required — the daemons are started with `sudo -n` and fail fast rather than blocking on a prompt. The command depends on the `linuxptp` package (`ptp4l` + `phc2sys`) and, for hardware-timestamping detection, `ethtool`; on Debian/Ubuntu these are auto-installed if missing. On non-apt systems install them manually (`linuxptp`, `ethtool`) and rerun.
 </Note>
 
 Hardware timestamping is detected via `ethtool -T` and used automatically when both NICs expose a PTP Hardware Clock. If only software timestamping is available the daemon still runs but expect ~10–100 µs extra jitter, which is still well under one frame period.

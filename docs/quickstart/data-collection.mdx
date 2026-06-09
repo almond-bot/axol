@@ -38,7 +38,7 @@ PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). 
 
 ## Prerequisites
 
-- The `lerobot` extra installed on the main host: `uv sync --extra lerobot` (add `--extra video` to also see the camera feeds in the headset — see [Installation](/installation)).
+- The `lerobot` and `video` extras installed on the main host. The [quick install](/installation#quick-install-recommended) includes both; on a development install run `uv sync --extra lerobot --extra video` (see [Installation](/installation)).
 - CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
 - `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.
 - A network link between the two machines — either a direct ethernet cable or a shared router/switch (see [Network setup](#network-setup)).

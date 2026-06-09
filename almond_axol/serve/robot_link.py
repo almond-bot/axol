@@ -24,7 +24,7 @@ from typing import Any
 
 from ..motor import CanBus, Joint, Motor, MotorError
 from ..utils.shared import CAN_LEFT, CAN_RIGHT
-from ..utils.sudo import SudoPasswordIncorrect, SudoPasswordRequired, run_root
+from ..utils.sudo import run_root
 
 _logger = logging.getLogger(__name__)
 
@@ -104,8 +104,6 @@ class RobotLink:
         self._state = STATE_DISCONNECTED
         self._error: str | None = None
         self._last_ping: float | None = None
-        # True when the last connect attempt needs a sudo password from the UI.
-        self._needs_sudo = False
 
         # Dedicated event loop running in a daemon thread.
         self._loop = asyncio.new_event_loop()
@@ -125,36 +123,18 @@ class RobotLink:
 
     # -- public API ---------------------------------------------------------
 
-    def connect(self, sudo_password: str | None = None) -> dict[str, Any]:
-        """Bring up CAN, open the buses, and start the ping loop.
-
-        ``sudo_password`` is only used (and never stored) if CAN is down and
-        passwordless sudo is unavailable. If a password is needed but absent,
-        the returned status has ``needsSudo`` set so the UI can prompt.
-        """
+    def connect(self) -> dict[str, Any]:
+        """Bring up CAN, open the buses, and start the ping loop."""
         with self._lock:
             if self._state in (STATE_CONNECTED, STATE_BUSY):
                 return self.status()
             self._state = STATE_CONNECTING
             self._error = None
         try:
-            self._enable_can(sudo_password)
-        except SudoPasswordRequired:
-            with self._lock:
-                self._state = STATE_DISCONNECTED
-                self._needs_sudo = True
-                self._error = "CAN bring-up needs a sudo password."
-            return self.status()
-        except SudoPasswordIncorrect:
-            with self._lock:
-                self._state = STATE_ERROR
-                self._needs_sudo = False
-                self._error = "Incorrect sudo password."
-            return self.status()
+            self._enable_can()
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
             with self._lock:
                 self._state = STATE_ERROR
-                self._needs_sudo = False
                 self._error = f"{type(exc).__name__}: {exc}"
             _logger.warning("robot connect failed: %s", self._error)
             return self.status()
@@ -163,13 +143,11 @@ class RobotLink:
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
             with self._lock:
                 self._state = STATE_ERROR
-                self._needs_sudo = False
                 self._error = f"{type(exc).__name__}: {exc}"
             _logger.warning("robot connect failed: %s", self._error)
             return self.status()
         with self._lock:
             self._state = STATE_CONNECTED
-            self._needs_sudo = False
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
@@ -181,7 +159,6 @@ class RobotLink:
         with self._lock:
             self._state = STATE_DISCONNECTED
             self._error = None
-            self._needs_sudo = False
             self._last_ping = None
         for arm in self._arms:
             arm.health = {}
@@ -223,7 +200,6 @@ class RobotLink:
             state = self._state
             error = self._error
             last_ping = self._last_ping
-            needs_sudo = self._needs_sudo
         motors: list[dict[str, Any]] = []
         for arm in self._arms:
             for joint in Joint:
@@ -241,7 +217,6 @@ class RobotLink:
             "state": state,
             "connected": state in (STATE_CONNECTED, STATE_BUSY),
             "error": error,
-            "needsSudo": needs_sudo,
             "lastPing": last_ping,
             "motors": motors,
             "motorCount": len(motors),
@@ -306,8 +281,8 @@ class RobotLink:
                 return False
         return True
 
-    def _enable_can(self, sudo_password: str | None) -> None:
-        """Bring up the CAN interfaces, asking the UI for a password if needed.
+    def _enable_can(self) -> None:
+        """Bring up the CAN interfaces.
 
         Order of attempts:
           1. If the interfaces are already up, do nothing (common case: cron
@@ -317,9 +292,8 @@ class RobotLink:
              non-interactively — it may not have been set up before.
           3. Otherwise just run the persisted startup script.
 
-        Privileged steps escalate through :func:`run_root`, which raises
-        :class:`SudoPasswordRequired` when a password is needed but absent (the
-        UI then prompts) or :class:`SudoPasswordIncorrect` when it's wrong.
+        ``axol serve`` runs as root under the hosted install, so privileged
+        steps run directly through :func:`run_root`.
         """
         if self._can_already_up():
             _logger.info("CAN interfaces already up; skipping bring-up.")
@@ -329,9 +303,9 @@ class RobotLink:
 
         if not is_configured():
             _logger.info("CAN not configured yet; running can.setup.")
-            ensure_setup(password=sudo_password)
+            ensure_setup()
             _logger.info("CAN setup complete; interfaces brought up.")
             return
 
-        run_root(["bash", str(_CRON_SCRIPT)], password=sudo_password, check=True)
+        run_root(["bash", str(_CRON_SCRIPT)], check=True)
         _logger.info("CAN interfaces brought up.")
