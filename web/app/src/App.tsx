@@ -159,11 +159,11 @@ function PoseVisualizer() {
 // thumbstick *locks* a camera in (it stays without holding): the left stick
 // rotates between the left wrist and the overhead, the right stick rotates
 // between the right wrist and the overhead.
-const FEED_DISTANCE = 1.1 // metres in front of the head-locked feed
+const FEED_DISTANCE = 1 // metres in front of the head-locked feed
 const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
 // rather than sitting high in view.
-const FEED_Y = -0.12
+const FEED_Y = -0.2
 const STICK_DEADZONE = 0.6
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
