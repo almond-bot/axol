@@ -260,6 +260,15 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // Screen grabbing is blocked while engaged, since the trigger drives the
   // gripper.
   const robotEngagedRef = useRef(false)
+  // True once a tracking push has arrived on this connection; until then we
+  // fall back to mirroring the grip toggle locally (covers servers that don't
+  // broadcast tracking yet).
+  const serverTrackingSeenRef = useRef(false)
+  // Local fallback mirror of the engage toggle (both grips together engage,
+  // either grip alone disengages) plus its edge-detection state.
+  const mirrorEngagedRef = useRef(false)
+  const prevBothGripsRef = useRef(false)
+  const prevEitherGripRef = useRef(false)
   // WebSocket we've attached the tracking listener to, to avoid re-attaching.
   const trackingWsRef = useRef<WebSocket | null>(null)
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
@@ -386,14 +395,41 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     if (ws !== trackingWsRef.current) {
       trackingWsRef.current = ws
       robotEngagedRef.current = false
+      serverTrackingSeenRef.current = false
+      mirrorEngagedRef.current = false
       ws?.addEventListener("message", (event: MessageEvent) => {
         try {
           const msg = JSON.parse(event.data as string) as { type: string; value: unknown }
-          if (msg.type === "tracking") robotEngagedRef.current = !!msg.value
+          if (msg.type === "tracking") {
+            serverTrackingSeenRef.current = true
+            robotEngagedRef.current = !!msg.value
+          }
         } catch {
           // ignore malformed messages
         }
       })
+    }
+
+    // Until the server has pushed tracking state at least once, mirror the
+    // grip toggle locally (same edges as teleop.py) so the trigger never
+    // drags screens mid-teleop even against an older backend.
+    const gripPressed = (hand: "left" | "right") => {
+      const src = sources.find((s) => s.handedness === hand)
+      return (src?.gamepad?.buttons?.[1]?.value ?? 0) >= 1.0
+    }
+    const lGrip = gripPressed("left")
+    const rGrip = gripPressed("right")
+    const bothGrips = lGrip && rGrip
+    const eitherGrip = lGrip || rGrip
+    if (!mirrorEngagedRef.current) {
+      if (bothGrips && !prevBothGripsRef.current) mirrorEngagedRef.current = true
+    } else {
+      if (eitherGrip && !prevEitherGripRef.current) mirrorEngagedRef.current = false
+    }
+    prevBothGripsRef.current = bothGrips
+    prevEitherGripRef.current = eitherGrip
+    if (!serverTrackingSeenRef.current) {
+      robotEngagedRef.current = mirrorEngagedRef.current
     }
 
     // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
