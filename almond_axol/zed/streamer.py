@@ -33,7 +33,7 @@ from dataclasses import dataclass
 
 import pyzed.sl as sl
 
-from .config import ZedConfig
+from .config import ZedConfig, auto_bitrate
 
 _logger = logging.getLogger(__name__)
 
@@ -209,9 +209,16 @@ class ZedStreamer:
             zed.close()
             return None
 
+        # An explicit config bitrate applies to every camera; otherwise pick a
+        # recommended bitrate from the resolution (the stereo overhead carries
+        # both eyes side-by-side, so it gets a higher one).
+        bitrate = self._config.bitrate
+        if bitrate is None:
+            bitrate = auto_bitrate(self._config.resolution, stereo=stereo)
+
         stream_params = sl.StreamingParameters()
         stream_params.codec = sl.STREAMING_CODEC.H265
-        stream_params.bitrate = self._config.bitrate
+        stream_params.bitrate = bitrate
         stream_params.port = port
         stream_params.target_framerate = self._config.fps
 
@@ -244,7 +251,7 @@ class ZedStreamer:
             port,
             self._config.resolution,
             self._config.fps,
-            self._config.bitrate,
+            bitrate,
         )
         return state
 

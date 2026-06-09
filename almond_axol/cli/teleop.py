@@ -101,12 +101,18 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
             _logger.warning("teleop: unknown ZED camera slot %r — skipping", name)
             continue
 
+        # Teleop only relays frames to the headset, so adapt to whatever the
+        # sender streams (fps/width/height of None skip the receiver's
+        # config-vs-stream mismatch check used for dataset features).
+        def _config(**kwargs: Any) -> "ZedCameraConfig":
+            return ZedCameraConfig(
+                host=cfg.zed_host, fps=None, width=None, height=None, **kwargs
+            )
+
         # A stereo overhead carries both eyes on one stream; expose them as
         # overhead_left / overhead_right so the headset can render per-lens.
         if name == "overhead" and cfg.overhead_stereo:
-            stereo = ZedStereoCamera(
-                ZedCameraConfig(host=cfg.zed_host, port=port, stereo=True)
-            )
+            stereo = ZedStereoCamera(_config(port=port, stereo=True))
             try:
                 stereo.connect(warmup=False)
             except Exception as exc:  # noqa: BLE001 - slot not streaming → skip it
@@ -116,7 +122,7 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
             cameras.append(("overhead_right", stereo.right_view))
             continue
 
-        cam = ZedCamera(ZedCameraConfig(host=cfg.zed_host, port=port))
+        cam = ZedCamera(_config(port=port))
         try:
             cam.connect(warmup=False)
         except Exception as exc:  # noqa: BLE001 - slot not streaming → skip it

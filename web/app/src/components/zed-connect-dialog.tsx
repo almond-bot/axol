@@ -15,6 +15,14 @@ const CAMERA_SLOTS: { key: keyof Cameras; label: string }[] = [
   { key: "right_arm", label: "Right arm" },
 ]
 
+const RESOLUTIONS: { value: string; label: string }[] = [
+  { value: "SVGA", label: "SVGA (960×600)" },
+  { value: "HD1080", label: "HD1080 (1920×1080)" },
+  { value: "HD1200", label: "HD1200 (1920×1200)" },
+]
+
+const DEFAULT_RESOLUTION = "SVGA"
+
 /**
  * Lightweight ZED box link dialog. Verifies the box's `axol serve` is reachable
  * and stores the box URL on the host. Connecting also starts PTP clock sync so
@@ -29,6 +37,7 @@ export function ZedConnectDialog({
   defaultUrl,
   defaultCameras,
   defaultOverheadStereo,
+  defaultResolution,
   onConnected,
 }: {
   open: boolean
@@ -40,17 +49,23 @@ export function ZedConnectDialog({
   defaultCameras?: Cameras
   /** Persisted "overhead is stereo" flag to prefill. */
   defaultOverheadStereo?: boolean
+  /** Persisted camera resolution to prefill. */
+  defaultResolution?: string
   onConnected: (
     status: ZedLinkStatus,
     url: string,
     cameras: Cameras,
-    overheadStereo: boolean
+    overheadStereo: boolean,
+    resolution: string
   ) => void
 }) {
   const [url, setUrl] = useState(initial?.boxUrl || defaultUrl || "")
   const [cameras, setCameras] = useState<Cameras>(defaultCameras ?? EMPTY_CAMERAS)
   const [overheadStereo, setOverheadStereo] = useState(
     initial?.overheadStereo ?? defaultOverheadStereo ?? false
+  )
+  const [resolution, setResolution] = useState(
+    initial?.resolution || defaultResolution || DEFAULT_RESOLUTION
   )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -74,8 +89,8 @@ export function ZedConnectDialog({
       right_arm: cameras.right_arm.trim(),
     }
     try {
-      const status = await zedConnect(url.trim(), undefined, trimmed, overheadStereo)
-      onConnected(status, url.trim(), trimmed, overheadStereo)
+      const status = await zedConnect(url.trim(), undefined, trimmed, overheadStereo, resolution)
+      onConnected(status, url.trim(), trimmed, overheadStereo, resolution)
       onClose()
     } catch (e) {
       setError(String(e).replace(/^Error:\s*/, ""))
@@ -181,6 +196,23 @@ export function ZedConnectDialog({
                 />
               </div>
             ))}
+            <div className="flex items-center justify-between gap-4">
+              <Label className="text-white/70" htmlFor="zed-resolution">
+                Resolution
+              </Label>
+              <select
+                id="zed-resolution"
+                value={resolution}
+                onChange={(e) => setResolution(e.target.value)}
+                className="h-9 w-full max-w-[180px] rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70"
+              >
+                {RESOLUTIONS.map((r) => (
+                  <option key={r.value} value={r.value} className="bg-[#1a1a1a]">
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
         </div>
       </div>

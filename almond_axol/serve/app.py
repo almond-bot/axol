@@ -79,12 +79,16 @@ class ZedConnectRequest(BaseModel):
 
     ``overhead_stereo`` (optional) marks the overhead camera as a stereo ZED X
     so the box streams both eyes.
+
+    ``resolution`` (optional) sets the capture resolution for all cameras
+    (``SVGA`` / ``HD1080`` / ``HD1200``); ``None`` keeps the sender default.
     """
 
     url: str
     password: str | None = None
     cameras: dict[str, str] | None = None
     overhead_stereo: bool = False
+    resolution: str | None = None
 
 
 class SyncClocksRequest(BaseModel):
@@ -183,6 +187,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         "info": None,
         "error": None,
         "overheadStereo": False,
+        "resolution": None,
         "ptp": ptp.status(),
         "stream": stream.status(),
     }
@@ -303,6 +308,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         ok, data = await asyncio.to_thread(_fetch_box_info, req.url)
         zed_state["boxUrl"] = _normalize_box_url(req.url)
         zed_state["overheadStereo"] = req.overhead_stereo
+        zed_state["resolution"] = req.resolution
         _stop_zed_monitor()
         if ok:
             zed_state["connected"] = True
@@ -314,7 +320,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # If camera serials were given, start streaming them too (it waits
             # for the clocks to lock first); a task then reuses the live feeds.
             zed_state["stream"] = await stream.start(
-                req.url, req.cameras or {}, overhead_stereo=req.overhead_stereo
+                req.url,
+                req.cameras or {},
+                options={"resolution": req.resolution},
+                overhead_stereo=req.overhead_stereo,
             )
             # Heartbeat the box so the link drops if it goes away.
             zed_monitor["task"] = asyncio.create_task(_zed_monitor(req.url))
@@ -340,6 +349,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "info": None,
                 "error": None,
                 "overheadStereo": False,
+                "resolution": None,
                 "ptp": ptp.status(),
                 "stream": stream.status(),
             }

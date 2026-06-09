@@ -461,6 +461,18 @@ class OperationRunner:
                 overhead = cams.get("overhead")
                 if overhead is not None:
                     overhead.stereo = True
+            # The receiver enforces config dims == live stream, so when the box
+            # streams at a non-default resolution the camera configs (and the
+            # dataset features built from them) must match.
+            resolution = str(zed.get("resolution") or "").strip()
+            if resolution:
+                from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+
+                dims = ZED_RESOLUTION_DIMS.get(resolution)
+                if dims is None:
+                    raise ValueError(f"unknown ZED resolution {resolution!r}")
+                for cam in (getattr(cfg.robot_config, "cameras", {}) or {}).values():
+                    cam.width, cam.height = dims
             if op_id == "collect-data":
                 from ..cli.collect_data import _run as core
 

@@ -60,9 +60,9 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     p.add_argument(
         "--bitrate",
         type=int,
-        default=8000,
+        default=None,
         metavar="KBPS",
-        help="HEVC encoding bitrate in kbits/s (default: 8000).",
+        help="HEVC encoding bitrate in kbits/s (default: auto from resolution).",
     )
     p.add_argument(
         "--log-level",
@@ -102,7 +102,7 @@ async def _run(
     right_arm: int | None,
     resolution: str,
     fps: int,
-    bitrate: int,
+    bitrate: int | None,
     overhead_stereo: bool = False,
 ) -> None:
     import pyzed.sl as sl

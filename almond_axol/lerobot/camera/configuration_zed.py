@@ -4,6 +4,14 @@ from dataclasses import dataclass
 
 from lerobot.cameras.configs import CameraConfig, ColorMode
 
+# Frame dimensions (width, height) for each sender resolution name
+# (``axol zed.stream --resolution``). For a stereo ZED X these are per eye.
+ZED_RESOLUTION_DIMS: dict[str, tuple[int, int]] = {
+    "SVGA": (960, 600),
+    "HD1080": (1920, 1080),
+    "HD1200": (1920, 1200),
+}
+
 
 @CameraConfig.register_subclass("zed")
 @dataclass

@@ -66,6 +66,7 @@ const DEFAULT_ZED: ZedSpec = {
   boxUrl: "",
   cameras: { overhead: "", left_arm: "", right_arm: "" },
   overheadStereo: false,
+  resolution: "SVGA",
 }
 
 function loadZed(): ZedSpec {
@@ -337,7 +338,13 @@ export default function ControlPanel() {
     setZedBusy(true)
     setError(null)
     try {
-      const next = await zedConnect(url, undefined, zedSettings.cameras, zedSettings.overheadStereo)
+      const next = await zedConnect(
+        url,
+        undefined,
+        zedSettings.cameras,
+        zedSettings.overheadStereo,
+        zedSettings.resolution
+      )
       setZedLink(next)
       setZedSudoDismissed(false)
     } catch (e) {
@@ -367,7 +374,8 @@ export default function ControlPanel() {
         zedLink?.boxUrl ?? "",
         password,
         zedSettings.cameras,
-        zedSettings.overheadStereo
+        zedSettings.overheadStereo,
+        zedSettings.resolution
       )
       setZedLink(next)
       // ptp4l validates the password asynchronously; close optimistically and
@@ -509,11 +517,12 @@ export default function ControlPanel() {
         defaultUrl={zedSettings.boxUrl}
         defaultCameras={zedSettings.cameras}
         defaultOverheadStereo={zedSettings.overheadStereo}
-        onConnected={(status, url, cameras, overheadStereo) => {
+        defaultResolution={zedSettings.resolution}
+        onConnected={(status, url, cameras, overheadStereo, resolution) => {
           setZedLink(status)
           // Remember the box address + camera serials (as typed) + stereo flag
-          // so they survive a server restart / browser reopen, like the host.
-          patchZed({ boxUrl: url, cameras, overheadStereo })
+          // + resolution so they survive a server restart / browser reopen.
+          patchZed({ boxUrl: url, cameras, overheadStereo, resolution })
           setZedSudoDismissed(false)
         }}
       />
