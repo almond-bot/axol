@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
@@ -196,6 +196,24 @@ export default function ControlPanel() {
     }
   }, [conn.state])
 
+  // Auto-connect Axol once after the host comes online, if it's sitting idle.
+  // The ref makes it fire at most once per host session, so a manual robot
+  // disconnect afterwards isn't immediately undone.
+  const autoRobotRef = useRef(false)
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      autoRobotRef.current = false
+      return
+    }
+    if (autoRobotRef.current || !robot) return
+    autoRobotRef.current = true
+    if (robot.state === "disconnected" && !robotBusy) {
+      robotConnectClick()
+    }
+    // robotConnectClick is stable enough (only uses state setters / fetch).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conn.state, robot, robotBusy])
+
   function hostDisconnectClick() {
     // Client-side disconnect: stop pointing the panel at the host. Any running
     // op keeps going server-side; reconnecting via Connect refetches its state.
@@ -204,6 +222,7 @@ export default function ControlPanel() {
     setRobot(null)
     setZedLink(null)
     setSession(null)
+    autoRobotRef.current = false
   }
 
   function updateServerHost(value: string) {
@@ -298,12 +317,15 @@ export default function ControlPanel() {
   }
 
   async function zedDisconnectClick() {
+    setZedBusy(true)
     try {
       setZedLink(await zedDisconnect())
       setZedSudoOpen(false)
       setZedSudoDismissed(false)
     } catch (e) {
       setError(String(e))
+    } finally {
+      setZedBusy(false)
     }
   }
 

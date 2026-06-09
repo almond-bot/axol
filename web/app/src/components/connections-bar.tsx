@@ -126,7 +126,7 @@ export function ConnectionsBar({
 
   // -- zed --
   const zedConnected = !!zed?.connected
-  const zedDot: Dot = zedConnected ? "ok" : zed?.error ? "err" : "idle"
+  const zedDot: Dot = zedBusy ? "busy" : zedConnected ? "ok" : zed?.error ? "err" : "idle"
   const zedLabel = zedConnected
     ? zed?.info?.hostname || zed?.boxUrl || "Connected"
     : zed?.error
@@ -228,7 +228,7 @@ export function ConnectionsBar({
               aria-label="Disconnect the ZED box"
               className="size-8"
             >
-              <Power />
+              {zedBusy ? <Loader2 className="animate-spin" /> : <Power />}
             </Button>
           </div>
         ) : (

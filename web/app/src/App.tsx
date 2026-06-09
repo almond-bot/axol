@@ -159,8 +159,11 @@ function PoseVisualizer() {
 // *locks* a camera in (it stays without holding): flick right toggles the right
 // wrist, flick left toggles the left wrist, and flicking the same way again
 // returns to overhead.
-const FEED_DISTANCE = 1.3 // metres in front of the head-locked feed
+const FEED_DISTANCE = 1.1 // metres in front of the head-locked feed
 const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
+// Drop the feed slightly so its centre lands on the operator's natural gaze
+// rather than sitting high in view.
+const FEED_Y = -0.12
 const STICK_DEADZONE = 0.6
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
@@ -367,11 +370,16 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   return (
     <>
       <group ref={groupRef} visible={false}>
-        <mesh ref={meshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1}>
+        <mesh ref={meshRef} position={[0, FEED_Y, -FEED_DISTANCE]} renderOrder={1}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
         </mesh>
-        <mesh ref={leftMeshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1} visible={false}>
+        <mesh
+          ref={leftMeshRef}
+          position={[0, FEED_Y, -FEED_DISTANCE]}
+          renderOrder={1}
+          visible={false}
+        >
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={leftMatRef}
@@ -380,7 +388,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             depthWrite={false}
           />
         </mesh>
-        <mesh ref={rightMeshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1} visible={false}>
+        <mesh
+          ref={rightMeshRef}
+          position={[0, FEED_Y, -FEED_DISTANCE]}
+          renderOrder={1}
+          visible={false}
+        >
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={rightMatRef}
