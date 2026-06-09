@@ -90,7 +90,7 @@ import numpy as np
 from almond_axol.robot import Sim
 
 async def main():
-    async with Sim(port=8080) as sim:
+    async with Sim(port=8002) as sim:
         q = np.zeros(8, dtype=np.float32)
         await sim.motion_control(left=q)
         await asyncio.sleep(float("inf"))  # keep the viser server alive
@@ -98,7 +98,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Open `http://localhost:8080` in a browser to view the robot.
+Open `http://localhost:8002` in a browser to view the robot.
 
 ## Configuration — `AxolConfig`, `ArmConfig`, `JointConfig`
 

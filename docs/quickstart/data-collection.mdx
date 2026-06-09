@@ -30,20 +30,11 @@ flowchart LR
 
 ## Network setup
 
-The two machines must be able to reach each other over the network. Pick the topology that matches your wiring — it determines whether you let `axol` assign static IPs or you point it at an existing address.
-
-<Tabs>
-  <Tab title="Direct ethernet">
-    A single cable between the two NICs, no router in between. Neither machine gets a DHCP address on that link, so `axol` assigns static IPs for you: the ZED box takes `192.168.10.1` (via `--setup-ip`) and the main host takes `192.168.10.2` (via `--zed_iface`). The receiver's default `zed_host` is already `192.168.10.1`, so no IP flag is needed on `collect-data`.
-  </Tab>
-  <Tab title="Shared router / switch">
-    Both machines plug into the same LAN and get their addresses from DHCP (or static config you manage). **Do not** pass `--setup-ip` / `--zed_iface` here — they would overwrite the address the network already assigned. Instead, find the ZED box's IP (e.g. `ip addr`) and point the receiver at it with `--robot_config.zed_host <zed-box-ip>`.
-  </Tab>
-</Tabs>
+The two machines must be able to reach each other over the network. Configure each NIC with an IP however you like — DHCP on a shared switch, or static IPs (e.g. `192.168.10.1/24` on the ZED box and `192.168.10.2/24` on the main host) over a direct ethernet cable. Find the ZED box's IP (`ip addr`) and pass it to the main host as `--robot_config.zed_host <zed-box-ip>`.
 
 Interface names vary by machine — the link might be `eth0`, `enp3s0`, `eno1`, and so on. Run `ip link` (or `ip addr`) on each machine to find the interface carrying the link, and substitute it for `<iface>` in the commands below.
 
-In both cases PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
+PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
 
 ## Prerequisites
 
@@ -66,31 +57,14 @@ Open two terminals on the ZED box.
   </Step>
 
   <Step title="Stream the cameras">
-    <Tabs>
-      <Tab title="Direct ethernet">
-        ```bash
-        axol zed.stream \
-            --overhead 12345678 \
-            --left-arm 23456789 \
-            --right-arm 34567890 \
-            --setup-ip <iface>
-        ```
+    ```bash
+    axol zed.stream \
+        --overhead 12345678 \
+        --left-arm 23456789 \
+        --right-arm 34567890
+    ```
 
-        `--setup-ip <iface>` assigns the sender IP `192.168.10.1/24` to that interface before streaming.
-      </Tab>
-      <Tab title="Shared router / switch">
-        ```bash
-        axol zed.stream \
-            --overhead 12345678 \
-            --left-arm 23456789 \
-            --right-arm 34567890
-        ```
-
-        Drop `--setup-ip` so the box keeps its network-assigned address. Note that address (e.g. via `ip addr`) — you'll pass it to the main host as `--robot_config.zed_host`.
-      </Tab>
-    </Tabs>
-
-    Streams until `Ctrl+C`. See [`zed.stream`](/cli/zed-stream) for resolution, fps, and bitrate flags.
+    Streams from the NIC's current IP until `Ctrl+C`. Note that IP — you'll pass it to the main host as `--robot_config.zed_host`. See [`zed.stream`](/cli/zed-stream) for resolution, fps, and bitrate flags.
   </Step>
 </Steps>
 
@@ -108,30 +82,16 @@ Open two terminals on the main host.
   </Step>
 
   <Step title="Run data collection">
-    <Tabs>
-      <Tab title="Direct ethernet">
-        ```bash
-        axol collect-data \
-            --repo_id myorg/pick-place \
-            --task "Pick the red cube and place it in the bin" \
-            --zed_iface <iface>
-        ```
+    ```bash
+    axol collect-data \
+        --repo_id myorg/pick-place \
+        --task "Pick the red cube and place it in the bin" \
+        --robot_config.zed_host 192.168.1.42
+    ```
 
-        `--zed_iface <iface>` assigns the receiver IP `192.168.10.2/24` to that interface; the cameras are reached at the default `zed_host` `192.168.10.1`.
-      </Tab>
-      <Tab title="Shared router / switch">
-        ```bash
-        axol collect-data \
-            --repo_id myorg/pick-place \
-            --task "Pick the red cube and place it in the bin" \
-            --robot_config.zed_host 192.168.1.42
-        ```
+    Replace `192.168.1.42` with the ZED box's IP.
 
-        Replace `192.168.1.42` with the ZED box's address. Omit `--zed_iface` so the host keeps its network-assigned address.
-      </Tab>
-    </Tabs>
-
-    The robot is driven over VR (accept the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
+    The robot is driven over VR (authorize the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
   </Step>
 </Steps>
 
@@ -181,8 +141,12 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown. Press `Ctrl+C` in the `collect-data` terminal to finish.
 
 <Note>
-  The full controller bindings and headset state machine are maintained in the [axol-vr](https://github.com/almond-bot/axol-vr) interface repo.
+  The full controller bindings and headset state machine are documented in the [VR Interface](/guides/vr-interface) guide. The interface source lives in this repo under `web/`.
 </Note>
+
+<Tip>
+  Prefer a browser to juggling terminals? The [web control panel](/guides/control-panel) runs both clock-sync/streaming and `collect-data` from one page — connect the ZED box once and press **Start**.
+</Tip>
 
 ## Next steps
 

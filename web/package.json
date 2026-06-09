@@ -1,0 +1,14 @@
+{
+  "name": "almond-axol-vr",
+  "private": true,
+  "workspaces": [
+    "app",
+    "packages/*"
+  ],
+  "scripts": {
+    "format": "prettier --write \"**/*.{ts,tsx,json,css}\""
+  },
+  "devDependencies": {
+    "prettier": "^3.8.1"
+  }
+}

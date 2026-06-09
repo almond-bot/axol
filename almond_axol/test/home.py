@@ -1,9 +1,9 @@
 """Enable Axol and move all joints to zero.
 
 Run directly:
-    python -m almond_axol.test.home
-    python -m almond_axol.test.home --no-right
-    python -m almond_axol.test.home --no-left
+    uv run -m almond_axol.test.home
+    uv run -m almond_axol.test.home --no-right
+    uv run -m almond_axol.test.home --no-left
 """
 
 import argparse

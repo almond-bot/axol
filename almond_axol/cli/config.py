@@ -47,8 +47,8 @@ import mergedeep
 import numpy as np
 
 from ..robot.config import AxolConfig
-from ..shared import CAN_LEFT, CAN_RIGHT
 from ..teleop.config import VRTeleopConfig
+from ..utils.shared import CAN_LEFT, CAN_RIGHT
 
 T = TypeVar("T")
 
@@ -135,6 +135,28 @@ AggregateFn = _register_literal(
 # ----------------------------------------------------------------------
 
 
+def _strip_required_inputs(instance: Any, node: Any) -> None:
+    """Recursively drop ``required_input``-marked fields from the overlay.
+
+    A nested field can be made a *required user input* — no usable default,
+    even when its parent dataclass is reachable via a ``default_factory`` —
+    by marking it ``field(metadata={"required_input": True})``. Its owning
+    factory still supplies a placeholder so the default config is
+    constructible for encoding; removing the placeholder here keeps it out
+    of the overlay so draccus raises "missing required field" unless the
+    user supplies it (on the CLI or via ``--config_path``).
+    """
+    if not dataclasses.is_dataclass(instance) or not isinstance(node, dict):
+        return
+    for f in dataclasses.fields(instance):
+        if f.metadata.get("required_input"):
+            node.pop(f.name, None)
+            continue
+        value = getattr(instance, f.name, None)
+        if dataclasses.is_dataclass(value) and isinstance(node.get(f.name), dict):
+            _strip_required_inputs(value, node[f.name])
+
+
 def _default_overlay(config_class: type) -> dict[str, Any]:
     """Encode ``config_class``'s full default config into a nested dict.
 
@@ -142,7 +164,9 @@ def _default_overlay(config_class: type) -> dict[str, Any]:
     with ``None`` only so the instance can be constructed for encoding,
     then dropped from the overlay — the user must still supply them on the
     CLI or in ``--config_path`` (and draccus raises "missing required
-    field" if they don't).
+    field" if they don't). Nested fields marked
+    ``field(metadata={"required_input": True})`` are likewise dropped (see
+    :func:`_strip_required_inputs`).
     """
     sentinel_kwargs: dict[str, Any] = {}
     required: list[str] = []
@@ -154,6 +178,7 @@ def _default_overlay(config_class: type) -> dict[str, Any]:
     overlay = draccus.encode(instance)
     for name in required:
         overlay.pop(name, None)
+    _strip_required_inputs(instance, overlay)
     return overlay
 
 
@@ -248,7 +273,7 @@ _FIELD_HELP: dict[str, str] = {
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
     "max_speed": "Max gripper joint speed (rad/s).",
-    "zed_host": "Shared IP of the ZED streamer (used by cameras with no explicit host).",
+    "zed_host": "Required. Shared IP of the ZED streamer (used by cameras with no explicit host).",
 }
 
 # Substrings that mark draccus inline help as mis-extracted source code.

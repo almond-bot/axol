@@ -39,4 +39,4 @@ asyncio.run(main())
 | `fps` | `60` | Capture frame rate for all cameras |
 | `bitrate` | `8000` kbps | HEVC encoding bitrate |
 
-At least one serial number must be provided. The sender IP is `192.168.10.1/24`; set it automatically with `--setup-ip` via the CLI or by calling `setup_link_ip(iface, "192.168.10.1/24")` from `almond_axol.shared` before streaming.
+At least one serial number must be provided. The sender binds to the streaming NIC's current IP — configure the interface on each machine before launching.

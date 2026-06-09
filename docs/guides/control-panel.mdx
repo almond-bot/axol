@@ -1,0 +1,135 @@
+---
+title: "Web Control Panel"
+description: "Drive Axol from a browser — connect the Axol host, robot, and ZED box, then run any operation without touching the terminal."
+---
+
+The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors, the PTP clock sync, and the camera streams.
+
+It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
+
+{/* SCREENSHOT: control-panel-overview.png — full control panel (connections bar on top, an operation selected below) */}
+<img src="/assets/control-panel-overview.png" alt="Axol web control panel" />
+
+## Start the server
+
+On the **main host** (the upper computer wired to the robot):
+
+```bash
+axol serve
+```
+
+This prints a local and a LAN URL (HTTPS by default):
+
+```
+Axol control panel:
+  Local : https://localhost:8001
+  LAN   : https://192.168.1.50:8001
+```
+
+Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`.
+
+<Note>
+  The UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). If it isn't, `axol serve` still exposes the API but has no page to open — see [Installation](/installation#web-control-panel-optional).
+</Note>
+
+<Tip>
+  The nav bar's **Quickstart** button has copyable commands for installing the CLI and launching the server.
+</Tip>
+
+## Connections
+
+The top of the panel is a row of three connection tiles — **Axol Host**, **Axol**, and **ZED Box** — each with a colored status dot. Connect them left to right.
+
+{/* SCREENSHOT: control-panel-connections.png — close-up of the three connection tiles (Axol Host / Axol / ZED Box) */}
+<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, ZED Box" />
+
+### Axol Host
+
+The **Axol Host** is the machine running `axol serve`. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+
+### Axol
+
+Press **Connect** to bring up the robot. Under the hood this:
+
+- Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
+- Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
+
+If CAN bring-up needs `sudo` and passwordless sudo isn't configured, the panel prompts for your password (used once, never stored). While a task is running the 1 Hz polling pauses and the robot is handed to the task.
+
+### ZED Box
+
+Data collection and policy inference also need the **ZED Box** (the Jetson streaming the cameras), which runs its own `axol serve`. Press **Connect** to open the dialog.
+
+{/* SCREENSHOT: zed-connect-dialog.png — the "ZED Box" dialog with the address field and the three optional camera-serial fields */}
+<img src="/assets/zed-connect-dialog.png" alt="ZED Box dialog" />
+
+Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. Connecting then:
+
+1. Checks the box is reachable.
+2. Starts **PTP clock sync** between the two machines (the Axol host as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.
+3. Once the clocks **lock**, starts **streaming** the cameras whose serials you entered.
+
+The tile header shows two status lights — **CLOCK** and **STREAM** — that are **green** when healthy, **amber** while starting, and **red** on error (hover for the reason). The camera serials and box IP persist in your browser, so they're pre-filled next time.
+
+<Note>
+  PTP daemons need root. If passwordless `sudo` isn't available the **CLOCK** light turns amber ("needs sudo") and the panel prompts for a password, the same as Axol connect.
+</Note>
+
+When connected, the ZED tile shows **Restart** (re-run clock sync + streaming) and **Disconnect** buttons. If clock sync or streaming fails, an inline panel appears below the connections with the error and the full log streamed from the box, so you can see exactly which camera serial wasn't found or why the clocks didn't lock.
+
+<Warning>
+  Closing the browser tab does **not** stop anything — the robot link, clock sync, and camera streams live in the `serve` process and keep running. Use **Disconnect** (or stop `axol serve`) to tear them down.
+</Warning>
+
+## Operations
+
+Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown. Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
+
+{/* SCREENSHOT: control-panel-operation.png — an operation (e.g. Collect Data) showing the settings form, the "Before you can start" blockers, and the Start button */}
+<img src="/assets/control-panel-operation.png" alt="Operation settings and start blockers" />
+
+| Operation | Needs | Notes |
+|---|---|---|
+| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. |
+| **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
+| **Collect Data** | Axol + ZED box | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Run Policy** | Axol + ZED box | Run a trained policy via LeRobot async inference. |
+
+### Before you can start
+
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Connect the ZED box*, *Wait for clocks to lock*, *Wait for cameras to stream*, or *Set &lt;required field&gt;*. The ZED-dependent operations are gated on both the clocks locking **and** the cameras actually streaming.
+
+### Settings persistence & import/export
+
+Each operation's settings are saved to your browser automatically, so they reappear on reload. Use **Export** to download a settings JSON and **Import** to load one — handy for sharing a known-good configuration across machines. (Camera serials and the ZED box address live with the ZED connection, not in an operation's export.)
+
+### Running, logs, and stopping
+
+Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it; the robot link returns to idle 1 Hz polling and the ZED links stay up for the next run.
+
+## Run Policy episode controls
+
+While **Run Policy** is live, an **Episode control** box appears in the operation card with three buttons:
+
+| Button | Effect |
+|---|---|
+| **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
+| **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
+| **Discard** | Drop the current episode and return to the reset gate to redo it. |
+
+These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
+
+<Note>
+  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard, **B** to switch modes). See the [Data Collection quickstart](/quickstart/data-collection#controller-layout) for the controller layout.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="serve reference" icon="terminal" href="/cli/serve">
+    Flags, TLS, and what the server exposes.
+  </Card>
+  <Card title="VR interface" icon="vr-cardboard" href="/guides/vr-interface">
+    The in-repo WebXR app that drives teleop and recording.
+  </Card>
+</CardGroup>

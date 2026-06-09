@@ -24,7 +24,7 @@ import logging
 import time
 
 from ..robot import Axol
-from ..shared import ARM_JOINTS, Joint
+from ..utils.shared import ARM_JOINTS, Joint
 from .config import GravityCompCmdConfig, parse
 
 

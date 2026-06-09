@@ -22,7 +22,7 @@ Usage
         pos = await shoulder.get_position()  # radians
 """
 
-from ..shared import Joint
+from ..utils.shared import Joint
 from .bus import CanBus
 from .errors import MotorError
 from .motor import Motor, make_driver

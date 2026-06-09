@@ -38,7 +38,7 @@ with AxolRobot(config) as robot:
 | Field | Default | Description |
 |---|---|---|
 | `cameras` | `{}` | `ZedCameraConfig` instances keyed by name |
-| `zed_host` | `"192.168.10.1"` | Shared ZED streamer IP; fills every camera whose `host` is left unset (`None`). A camera with an explicit `host` keeps it. |
+| `zed_host` | _required_ | Shared ZED streamer IP (no default — must be supplied). Fills every camera whose `host` is left unset (`None`); a camera with an explicit `host` keeps it. |
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
 | `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
 | `observe_torques` | `False` | Include joint torques in `observation.state` |

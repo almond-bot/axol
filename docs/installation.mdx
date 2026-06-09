@@ -54,6 +54,25 @@ axol zed.install
 
 See [`zed.install`](/cli/zed-install) for details.
 
+## Web control panel (optional)
+
+To drive Axol from a browser instead of the terminal, build the web UI once. This produces the bundle that [`axol serve`](/cli/serve) hosts at `web/app/dist`:
+
+```bash
+cd web
+npm install
+npm run build --workspace=packages/axol-vr-client   # client package first
+npm run build --workspace=app                        # → web/app/dist
+```
+
+Then start the server and open the printed URL:
+
+```bash
+axol serve
+```
+
+The same build also serves the [VR interface](/guides/vr-interface). `axol serve` works without this step (the API is still available), but there's no page to open until the UI is built. See the [Web Control Panel guide](/guides/control-panel).
+
 ## First-run hardware setup
 
 Before using any motor or robot commands, initialize the CAN hardware:

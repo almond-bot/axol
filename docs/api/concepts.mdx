@@ -15,11 +15,14 @@ almond_axol/
 ├── vr/           WebSocket server that receives VR frames
 ├── zed/          ZED-X One camera streaming
 ├── motor/        Low-level async CAN motor interface
+├── serve/        Web control-panel server (FastAPI) behind `axol serve`
 └── lerobot/      LeRobot Robot / Teleoperator / Camera wrappers (requires lerobot extra)
     ├── robot/    AxolRobot — LeRobot Robot wrapping the async hardware driver
     ├── teleop/   AxolVRTeleop — LeRobot Teleoperator wrapping VRTeleop
     └── camera/   ZedCamera — LeRobot Camera wrapping a ZED stream receiver
 ```
+
+The browser front-ends live outside the Python package, in `web/`: the [VR teleop interface](/guides/vr-interface) and the [web control panel](/guides/control-panel), both built to `web/app/dist` and served by [`axol serve`](/cli/serve).
 
 End-to-end data flow for teleoperation:
 

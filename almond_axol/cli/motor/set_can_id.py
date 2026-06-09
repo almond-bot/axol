@@ -67,6 +67,8 @@ async def _run(args: argparse.Namespace) -> None:
         await motor.set_can_id(args.new_id)
         print(f"  done — new CAN ID is {args.new_id:#04x}")
 
+        await asyncio.sleep(1)
+
         print("  verifying ...")
         voltage = await motor.get_voltage()
         temperature = await motor.get_temperature()

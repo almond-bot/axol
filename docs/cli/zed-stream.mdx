@@ -3,7 +3,7 @@ title: "zed.stream"
 description: "Stream ZED-X One cameras over the local network with HEVC encoding."
 ---
 
-Streams ZED-X One cameras over the local network using HEVC encoding. At least one camera must be specified. Streams until `Ctrl+C`. Sender IP is `192.168.10.1/24`.
+Streams ZED-X One cameras over the local network using HEVC encoding. At least one camera must be specified. Streams until `Ctrl+C`. The sender binds to the streaming NIC's current IP — configure the interface before launching.
 
 | Flag | Description |
 |---|---|
@@ -13,7 +13,6 @@ Streams ZED-X One cameras over the local network using HEVC encoding. At least o
 | `--resolution {HD1080,HD1200,SVGA}` | Default: `SVGA` |
 | `--fps FPS` | Default: 60 |
 | `--bitrate KBPS` | HEVC bitrate in kbit/s (default: 8000) |
-| `--setup-ip IFACE` | Assign sender IP to a network interface before streaming (e.g. `eth0`); requires `sudo` |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash

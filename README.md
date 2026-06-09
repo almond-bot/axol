@@ -4,9 +4,11 @@
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
 
+The browser front-ends live under [`web/`](web/): a **VR teleoperation interface** (WebXR, hosted at [axol.almond.bot](https://axol.almond.bot)) and a **web control panel** that drives the robot from a browser via `axol serve`. See [`web/README.md`](web/README.md) for the front-end details.
+
 The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). The sources live under [`docs/`](docs/), and the pages below link to them.
 
-**New here?** See the [Teleoperation quickstart](https://docs.almond.bot/quickstart/teleop) to go from installation to a live teleoperation session.
+**New here?** See the [Teleoperation quickstart](https://docs.almond.bot/quickstart/teleop) to go from installation to a live teleoperation session, or the [Web Control Panel guide](https://docs.almond.bot/guides/control-panel) to drive Axol from a browser.
 
 ## Requirements
 
@@ -55,6 +57,15 @@ Before using any motor or robot commands, initialize the CAN hardware:
 axol can.setup
 ```
 
+To drive Axol from a browser instead of the terminal, build the web UI once (it's served by `axol serve`):
+
+```bash
+cd web
+npm install
+npm run build --workspace=packages/axol-vr-client   # client package first
+npm run build --workspace=app                        # → web/app/dist
+```
+
 See the [installation guide](https://docs.almond.bot/installation) for the full walkthrough.
 
 ## Sitemap
@@ -70,9 +81,15 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [Data Collection](https://docs.almond.bot/quickstart/data-collection) — two-machine workflow (main host + ZED box)
 - [Policy Inference](https://docs.almond.bot/quickstart/inference) — two-machine workflow (main host + ZED box)
 
+### Web Interfaces
+
+- [Web Control Panel](https://docs.almond.bot/guides/control-panel) — drive the robot from a browser via `axol serve`
+- [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
+
 ### CLI Reference
 
 - [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`
+- [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)

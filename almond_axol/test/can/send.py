@@ -1,11 +1,11 @@
 """Cycle one joint through its limits while holding all others at their start position.
 
 Run directly:
-    python -m almond_axol.test.can.send --l --joint shoulder_1
-    python -m almond_axol.test.can.send --r --joint elbow
-    python -m almond_axol.test.can.send --joint elbow        # both arms, log only
-    python -m almond_axol.test.can.send --l --joint wrist_2 --hz 50
-    python -m almond_axol.test.can.send --l --joint gripper --hz 100 --log-file can_send.log
+    uv run -m almond_axol.test.can.send --l --joint shoulder_1
+    uv run -m almond_axol.test.can.send --r --joint elbow
+    uv run -m almond_axol.test.can.send --joint elbow        # both arms, log only
+    uv run -m almond_axol.test.can.send --l --joint wrist_2 --hz 50
+    uv run -m almond_axol.test.can.send --l --joint gripper --hz 100 --log-file can_send.log
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import numpy as np
 from ...motor import CanBus
 from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
 from ...robot.config import AxolConfig
-from ...shared import CAN_LEFT, CAN_RIGHT, Joint
+from ...utils.shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi

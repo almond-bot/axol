@@ -21,7 +21,8 @@ Typical usage::
     from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
     from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
 
-    with AxolRobot(AxolRobotConfig()) as robot, AxolVRTeleop(AxolVRTeleopConfig()) as teleop:
+    robot_config = AxolRobotConfig(zed_host="192.168.1.10")
+    with AxolRobot(robot_config) as robot, AxolVRTeleop(AxolVRTeleopConfig()) as teleop:
         while True:
             obs = robot.get_observation()
             teleop.send_feedback(obs)
@@ -48,9 +49,9 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-from ...shared import Joint
 from ...teleop.filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from ...teleop.worker import run_ik_worker
+from ...utils.shared import Joint
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
 from .config_vr import AxolVRTeleopConfig

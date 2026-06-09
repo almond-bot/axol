@@ -1,0 +1,57 @@
+---
+title: "serve"
+description: "Run the Axol web control panel — drive the robot from a browser instead of the terminal."
+---
+
+Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, and policy inference — in-process.
+
+```bash
+axol serve                    # https://localhost:8001 (LAN-reachable)
+axol serve --port 9000
+axol serve --open             # also open a browser window on startup
+axol serve --host 127.0.0.1   # localhost only
+axol serve --no-tls           # plain HTTP instead of HTTPS
+```
+
+<Tip>
+  For a guided walkthrough of the control panel — connecting the Axol host, Axol, and ZED box, and running each operation — see the [Web Control Panel guide](/guides/control-panel).
+</Tip>
+
+| Flag | Description |
+|---|---|
+| `--host HOST` | Interface to bind. Default `0.0.0.0` (reachable on the LAN); use `127.0.0.1` for localhost only. |
+| `--port INT` | Port to listen on. Default `8001`. |
+| `--open` | Open a browser window on startup. Off by default. |
+| `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
+
+## TLS
+
+TLS is **on by default** so a browser on an HTTPS origin (e.g. the hosted VR app at `axol.almond.bot`) can reach this machine without mixed-content blocking. On first run a self-signed certificate is generated in `~/.almond/vr/certs/` — the **same** certificate the VR teleop WSS server uses, so accepting it once covers both the control panel and VR teleop.
+
+To connect from a browser on another machine, open the printed **LAN** URL once and accept the certificate warning. Pass `--no-tls` to disable TLS entirely (plain HTTP).
+
+## Building the web UI
+
+The server looks for the built web bundle at `web/app/dist`. If it isn't built, `axol serve` still runs and the **API is available**, but there's no UI to open. Build it once with:
+
+```bash
+cd web
+npm install
+npm run build --workspace=packages/axol-vr-client
+npm run build --workspace=app
+```
+
+See the [Installation](/installation#web-control-panel-optional) page for details.
+
+## What it serves
+
+| Path | Description |
+|---|---|
+| `/control` | The control panel UI (operations, connections, settings). |
+| `/vr` | The [VR teleop interface](/guides/vr-interface) (same build). |
+| `/` | Redirects by device — headset browsers to `/vr`, everything else to `/control`. |
+| `/api/*` | JSON + WebSocket API used by the UI. |
+
+<Note>
+  The operations launched from the panel run **in-process** inside the `serve` process — the same Python entry points as the [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), and [`run-policy`](/cli/run-policy) CLI commands. Anything those commands need on the host (CAN, the `lerobot`/`sim` extras, ZED access) is required here too.
+</Note>

@@ -31,9 +31,17 @@
         ]
       },
       {
+        "group": "Web Interfaces",
+        "pages": [
+          "guides/control-panel",
+          "guides/vr-interface"
+        ]
+      },
+      {
         "group": "CLI Reference",
         "pages": [
           "cli/configuration",
+          "cli/serve",
           "cli/can-setup",
           "cli/can-enable",
           "cli/motor-info",
@@ -69,8 +77,12 @@
   "navbar": {
     "links": [
       {
+        "label": "Control Panel",
+        "href": "https://axol.almond.bot/control"
+      },
+      {
         "label": "VR Teleop",
-        "href": "https://axol.almond.bot"
+        "href": "https://axol.almond.bot/vr"
       }
     ],
     "primary": {

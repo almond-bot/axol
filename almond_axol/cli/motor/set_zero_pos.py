@@ -23,7 +23,7 @@ from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
 from ...robot.axol import closer_end_stop
-from ...shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
+from ...utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]

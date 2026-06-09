@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 
+from . import serve as serve_cmd
 from .can import enable as can_enable
 from .can import setup as can_setup
 from .motor import info as motor_info
@@ -54,6 +55,7 @@ def main() -> None:
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
     repeatability.add_parser(subparsers)
+    serve_cmd.add_parser(subparsers)
 
     # Register the draccus commands as bare subparsers purely so they show
     # up in ``axol --help``; their real parsing happens in the interceptor

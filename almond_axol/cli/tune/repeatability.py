@@ -35,9 +35,9 @@ import numpy as np
 from ...kinematics.solver import KinematicsSolver
 from ...robot import Axol
 from ...robot.config import AxolConfig
-from ...shared import ARM_JOINTS, Joint
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
+from ...utils.shared import ARM_JOINTS, Joint
 
 _RATE_HZ = 100.0
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — joint-space speed for the planned trajectory

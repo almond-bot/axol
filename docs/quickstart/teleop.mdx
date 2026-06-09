@@ -50,13 +50,12 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
         You should see position, velocity, torque, temperature, and voltage. Any `DISABLED` or error status means power or CAN isn't reaching that motor.
       </Step>
 
-      <Step title="Accept the TLS certificate">
-        The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
+      <Step title="Authorize the TLS certificate">
+        The VR app connects over a self-signed HTTPS/WSS connection, so its certificate needs a one-time approval in the headset browser — otherwise the WebSocket handshake is silently rejected.
 
-        1. Start `axol teleop` briefly (see the next step) — it will print your hostname and IP.
-        2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
-        3. Proceed past the security warning.
-        4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
+        The easiest way is from the app itself: when you press **Connect** (next step) and the certificate hasn't been approved yet, the connection fails and an **Authorize certificate** button appears. Tap it, proceed past the warning in the popup, and the app reconnects automatically.
+
+        You only need to do this once per headset (the cert is cached in `~/.almond/vr/certs/` on the host). To approve it manually instead, open `https://<hostname>.local:8000` or `https://<local-ip>:8000` in the headset browser and proceed past the warning.
       </Step>
 
       <Step title="Teleop">
@@ -64,7 +63,7 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
         axol teleop
         ```
 
-        The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect.
+        The terminal will print the hostname and IP address. Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter either address to connect. (You can also self-host the app — see the [VR Interface](/guides/vr-interface) guide.)
       </Step>
     </Steps>
   </Tab>
@@ -88,13 +87,12 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
         </Note>
       </Step>
 
-      <Step title="Accept the TLS certificate">
-        The VR app connects over a self-signed HTTPS/WSS connection. Before opening the app, you must accept the certificate in the VR headset's browser — otherwise the WebSocket handshake will be silently rejected.
+      <Step title="Authorize the TLS certificate">
+        The VR app connects over a self-signed HTTPS/WSS connection, so its certificate needs a one-time approval in the headset browser — otherwise the WebSocket handshake is silently rejected.
 
-        1. Start `axol teleop --sim` briefly (see the next step) — it will print your hostname and IP.
-        2. In the VR headset browser, navigate to `https://<hostname>.local:8000` or `https://<local-ip>:8000`.
-        3. Proceed past the security warning.
-        4. You only need to do this once per machine (the cert is cached in `~/.almond/vr/certs/`).
+        The easiest way is from the app itself: when you press **Connect** (next step) and the certificate hasn't been approved yet, the connection fails and an **Authorize certificate** button appears. Tap it, proceed past the warning in the popup, and the app reconnects automatically.
+
+        You only need to do this once per headset (the cert is cached in `~/.almond/vr/certs/` on the host). To approve it manually instead, open `https://<hostname>.local:8000` or `https://<local-ip>:8000` in the headset browser and proceed past the warning.
       </Step>
 
       <Step title="Teleop in sim">
@@ -102,13 +100,17 @@ From a fresh clone to a live teleoperation session. Pick your path — drive the
         axol teleop --sim
         ```
 
-        Opens a browser visualizer at [http://localhost:8080](http://localhost:8080) and runs the same VR server on port 8000 — drive the simulated robot from the headset exactly like the real one. Great for verifying network connectivity and VR tracking before powering the robot.
+        Opens a browser visualizer at [http://localhost:8002](http://localhost:8002) and runs the same VR server on port 8000 — drive the simulated robot from the headset exactly like the real one. Great for verifying network connectivity and VR tracking before powering the robot.
       </Step>
     </Steps>
   </Tab>
 </Tabs>
 
 See the [`teleop`](/cli/teleop) CLI reference for the full flag list (stiffness, gripper limits, per-joint gains, config files).
+
+<Tip>
+  Prefer not to use the terminal? The [web control panel](/guides/control-panel) (`axol serve`) connects the robot and starts teleop from a browser.
+</Tip>
 
 ## Controller layout
 

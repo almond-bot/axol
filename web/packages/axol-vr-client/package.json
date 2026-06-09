@@ -1,0 +1,35 @@
+{
+  "name": "@almond/axol-vr-client",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  },
+  "peerDependencies": {
+    "@react-three/fiber": "^9.0.0",
+    "@react-three/xr": "^6.0.0",
+    "react": "^19.0.0",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "@react-three/fiber": "^9.5.0",
+    "@react-three/xr": "^6.6.29",
+    "@types/react": "^19.2.7",
+    "@types/three": "^0.182.0",
+    "react": "^19.2.0",
+    "three": "^0.182.0",
+    "tsup": "^8.0.0",
+    "typescript": "~5.9.3"
+  }
+}

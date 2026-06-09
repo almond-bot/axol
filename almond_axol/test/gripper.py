@@ -1,9 +1,9 @@
 """Open then close the gripper on each arm using impedance control for the arm joints and position-force control for the gripper.
 
 Run directly:
-    python -m almond_axol.test.gripper
-    python -m almond_axol.test.gripper --no-right
-    python -m almond_axol.test.gripper --no-left
+    uv run -m almond_axol.test.gripper
+    uv run -m almond_axol.test.gripper --no-right
+    uv run -m almond_axol.test.gripper --no-left
 """
 
 import argparse
@@ -14,7 +14,7 @@ import time
 import numpy as np
 
 from ..robot.axol import GRIPPER_TRAVEL, Axol
-from ..shared import Joint
+from ..utils.shared import Joint
 
 _SPEED = 0.2 * 2 * math.pi  # rad/s
 _RATE_HZ = 100.0

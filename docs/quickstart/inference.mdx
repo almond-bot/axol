@@ -30,20 +30,11 @@ flowchart LR
 
 ## Network setup
 
-The two machines must be able to reach each other over the network. Pick the topology that matches your wiring — it determines whether you let `axol` assign static IPs or you point it at an existing address. This is the same setup as the [Data Collection quickstart](/quickstart/data-collection#network-setup).
-
-<Tabs>
-  <Tab title="Direct ethernet">
-    A single cable between the two NICs, no router in between. Neither machine gets a DHCP address on that link, so `axol` assigns static IPs for you: the ZED box takes `192.168.10.1` (via `--setup-ip`) and the main host takes `192.168.10.2` (via `--zed_iface`). The receiver's default `zed_host` is already `192.168.10.1`, so no IP flag is needed on `run-policy`.
-  </Tab>
-  <Tab title="Shared router / switch">
-    Both machines plug into the same LAN and get their addresses from DHCP (or static config you manage). **Do not** pass `--setup-ip` / `--zed_iface` here — they would overwrite the address the network already assigned. Instead, find the ZED box's IP (e.g. `ip addr`) and point the receiver at it with `--robot_config.zed_host <zed-box-ip>`.
-  </Tab>
-</Tabs>
+The two machines must be able to reach each other over the network. Configure each NIC with an IP however you like — DHCP on a shared switch, or static IPs (e.g. `192.168.10.1/24` on the ZED box and `192.168.10.2/24` on the main host) over a direct ethernet cable. Find the ZED box's IP (`ip addr`) and pass it to the main host as `--robot_config.zed_host <zed-box-ip>`. This is the same setup as the [Data Collection quickstart](/quickstart/data-collection#network-setup).
 
 Interface names vary by machine — the link might be `eth0`, `enp3s0`, `eno1`, and so on. Run `ip link` (or `ip addr`) on each machine to find the interface carrying the link, and substitute it for `<iface>` in the commands below.
 
-In both cases PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
+PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
 
 ## Prerequisites
 
@@ -67,31 +58,14 @@ Open two terminals on the ZED box.
   </Step>
 
   <Step title="Stream the cameras">
-    <Tabs>
-      <Tab title="Direct ethernet">
-        ```bash
-        axol zed.stream \
-            --overhead 12345678 \
-            --left-arm 23456789 \
-            --right-arm 34567890 \
-            --setup-ip <iface>
-        ```
+    ```bash
+    axol zed.stream \
+        --overhead 12345678 \
+        --left-arm 23456789 \
+        --right-arm 34567890
+    ```
 
-        `--setup-ip <iface>` assigns the sender IP `192.168.10.1/24` to that interface before streaming.
-      </Tab>
-      <Tab title="Shared router / switch">
-        ```bash
-        axol zed.stream \
-            --overhead 12345678 \
-            --left-arm 23456789 \
-            --right-arm 34567890
-        ```
-
-        Drop `--setup-ip` so the box keeps its network-assigned address. Note that address (e.g. via `ip addr`) — you'll pass it to the main host as `--robot_config.zed_host`.
-      </Tab>
-    </Tabs>
-
-    Use the **same** `--resolution` and `--fps` the policy was trained on so the `ZedCamera` validation on the main host passes. See [`zed.stream`](/cli/zed-stream).
+    Streams from the NIC's current IP until `Ctrl+C`. Note that IP — you'll pass it to the main host as `--robot_config.zed_host`. Use the **same** `--resolution` and `--fps` the policy was trained on so the `ZedCamera` validation on the main host passes. See [`zed.stream`](/cli/zed-stream).
   </Step>
 </Steps>
 
@@ -109,30 +83,15 @@ Open two terminals on the main host.
   </Step>
 
   <Step title="Run the policy">
-    <Tabs>
-      <Tab title="Direct ethernet">
-        ```bash
-        axol run-policy \
-            --policy_path myorg/pick-place-policy \
-            --policy_type act \
-            --task "Pick the red cube" \
-            --zed_iface <iface>
-        ```
+    ```bash
+    axol run-policy \
+        --policy_path myorg/pick-place-policy \
+        --policy_type act \
+        --task "Pick the red cube" \
+        --robot_config.zed_host 192.168.1.42
+    ```
 
-        `--zed_iface <iface>` assigns the receiver IP `192.168.10.2/24` to that interface; the cameras are reached at the default `zed_host` `192.168.10.1`.
-      </Tab>
-      <Tab title="Shared router / switch">
-        ```bash
-        axol run-policy \
-            --policy_path myorg/pick-place-policy \
-            --policy_type act \
-            --task "Pick the red cube" \
-            --robot_config.zed_host 192.168.1.42
-        ```
-
-        Replace `192.168.1.42` with the ZED box's address. Omit `--zed_iface` so the host keeps its network-assigned address.
-      </Tab>
-    </Tabs>
+    Replace `192.168.1.42` with the ZED box's IP.
 
     A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. `--fps` must match the rate the policy was trained on. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields, and [Command configuration](/cli/configuration) for the draccus override syntax.
   </Step>
@@ -149,6 +108,10 @@ While `run-policy` runs, control the episode from stdin in the `run-policy` term
 | `q` | Discard and quit |
 
 `--episode_time_s` is a safety cap (default 120 s) that falls back to the same `[Enter]=save / r / q` prompt if no key is pressed. If `--repo_id` is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
+
+<Tip>
+  The [web control panel](/guides/control-panel) exposes these same controls as **Start episode** / **Save** / **Discard** buttons, so you can run a policy and manage rollouts from a browser.
+</Tip>
 
 ## Next steps
 

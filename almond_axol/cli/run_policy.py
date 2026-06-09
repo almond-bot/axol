@@ -33,7 +33,6 @@ from ..lerobot.rollout import (
     ActionPublisher,
     IKResetController,
     RolloutCaptureThread,
-    stdin_watcher,
 )
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
@@ -48,9 +47,10 @@ _logger = logging.getLogger(__name__)
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for inference: three ZED streams.
 
-    All three cameras share one host (``--robot_config.zed_host``); override
-    other fields from the CLI too, e.g.
-    ``--robot_config.zed_host 10.0.0.5`` or
+    All three cameras share one host, which is **required** — pass
+    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
+    stripped from the config overlay so draccus enforces the input). Other
+    fields are overridable too, e.g.
     ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
     used at data-collection time).
     """
@@ -60,6 +60,7 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(port=30002),
             "right_arm": ZedCameraConfig(port=30004),
         },
+        zed_host="",
     )
 
 
@@ -89,10 +90,153 @@ class RunPolicyConfig:
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
     temporal_ensemble_coeff: float = 0.01
-    zed_iface: str | None = None
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
+
+
+# ----------------------------------------------------------------------
+# Episode control: abstracts how start/save/rerecord/quit decisions arrive.
+#
+# The CLI reads them from stdin (``s`` / ``r`` / ``q`` + Enter prompts); the
+# web control panel pushes them through a queue from the API. ``_run`` is
+# agnostic — it only calls the small surface below.
+# ----------------------------------------------------------------------
+
+
+class _StdinPolicyControl:
+    """Terminal episode control: stdin keystrokes + Enter-to-continue prompts."""
+
+    def __init__(self) -> None:
+        self._stop: "threading.Event | None" = None
+        self._result: dict[str, str | None] = {"choice": None}
+        self._thread: "threading.Thread | None" = None
+
+    def await_continue(self, message: str) -> bool:
+        try:
+            input(message)
+            return True
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    def begin_episode(self) -> None:
+        from ..lerobot.rollout import stdin_watcher
+
+        self._stop = threading.Event()
+        self._result = {"choice": None}
+        self._thread = threading.Thread(
+            target=stdin_watcher,
+            args=(self._stop, self._result),
+            name="axol-stdin-watcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def poll_choice(self) -> str | None:
+        return self._result.get("choice")
+
+    def resolve_timeout(self, episode_time_s: int) -> str:
+        try:
+            raw = input(
+                f"Episode time cap ({episode_time_s}s) reached. "
+                "[Enter]=save, r=rerecord, q=quit: "
+            )
+        except (EOFError, KeyboardInterrupt):
+            return "q"
+        raw = raw.strip().lower()
+        return "q" if raw == "q" else ("r" if raw == "r" else "s")
+
+    def end_episode(self) -> None:
+        if self._stop is not None:
+            self._stop.set()
+
+    def close(self) -> None:
+        self.end_episode()
+
+
+class _QueuePolicyControl:
+    """Web episode control: decisions arrive as API-pushed queue commands.
+
+    Accepts ``s`` / ``r`` / ``q`` for the running episode and ``continue``
+    (alias ``start``) to advance through the between-episode "ready" gate.
+    """
+
+    def __init__(self, stop_event: "threading.Event") -> None:
+        import queue
+
+        self._q: "queue.Queue[str]" = queue.Queue()
+        self._stop = stop_event
+        self._choice: str | None = None
+
+    def push(self, command: str) -> None:
+        self._q.put(command)
+
+    def _drain(self) -> None:
+        import queue
+
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def await_continue(self, message: str) -> bool:
+        import queue
+
+        from lerobot.utils.utils import log_say
+
+        log_say(message)
+        while not self._stop.is_set():
+            try:
+                cmd = self._q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if cmd in ("continue", "start", "s"):
+                return True
+            if cmd == "q":
+                return False
+        return False
+
+    def begin_episode(self) -> None:
+        self._choice = None
+        self._drain()
+
+    def poll_choice(self) -> str | None:
+        import queue
+
+        if self._choice is not None:
+            return self._choice
+        try:
+            cmd = self._q.get_nowait()
+        except queue.Empty:
+            return None
+        if cmd in ("s", "r", "q"):
+            self._choice = cmd
+            return cmd
+        return None
+
+    def resolve_timeout(self, episode_time_s: int) -> str:
+        import queue
+
+        from lerobot.utils.utils import log_say
+
+        log_say(
+            f"Episode time cap ({episode_time_s}s) reached — choose save/rerecord/quit."
+        )
+        while not self._stop.is_set():
+            try:
+                cmd = self._q.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if cmd in ("s", "r", "q"):
+                return cmd
+        return "q"
+
+    def end_episode(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
 
 def main(argv: list[str]) -> None:
@@ -565,11 +709,20 @@ def _build_axol_robot_client(
 # ----------------------------------------------------------------------
 
 
-def _run(cfg: RunPolicyConfig) -> None:
+def _run(
+    cfg: RunPolicyConfig,
+    stop_event: "threading.Event | None" = None,
+    control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
+) -> None:
     """Drive the full run-policy session: spawn the policy server, connect the robot, and run episodes."""
     import multiprocessing as mp
     import shutil
     from pathlib import Path
+
+    if stop_event is None:
+        stop_event = threading.Event()
+    if control is None:
+        control = _StdinPolicyControl()
 
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -580,7 +733,6 @@ def _run(cfg: RunPolicyConfig) -> None:
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import AxolRobot
-    from ..shared import setup_link_ip
 
     policy_path = cfg.policy_path
     policy_type = cfg.policy_type
@@ -599,9 +751,6 @@ def _run(cfg: RunPolicyConfig) -> None:
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
-
-    if cfg.zed_iface:
-        setup_link_ip(cfg.zed_iface, "192.168.10.2/24")
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -733,12 +882,14 @@ def _run(cfg: RunPolicyConfig) -> None:
 
         log_say("Returning to rest pose.")
         reset_controller.return_to_rest(robot)
-        try:
-            input("Reset the scene, then press Enter to start the first episode.")
-        except (EOFError, KeyboardInterrupt):
+        if not control.await_continue(
+            "Reset the scene, then press Enter to start the first episode."
+        ):
             return
 
         while True:
+            if stop_event.is_set():
+                break
             log_say(f"Episode {episodes_recorded + 1}: starting in 1s.")
             time.sleep(1.0)
 
@@ -779,14 +930,7 @@ def _run(cfg: RunPolicyConfig) -> None:
                     rerun_ip=rerun_ip,
                 )
 
-            stdin_stop = threading.Event()
-            stdin_result: dict[str, str | None] = {"choice": None}
-            stdin_thread = threading.Thread(
-                target=stdin_watcher,
-                args=(stdin_stop, stdin_result),
-                name="axol-stdin-watcher",
-                daemon=True,
-            )
+            control.begin_episode()
 
             print(
                 f"  Press s=save+end, r=rerecord+end, q=quit "
@@ -799,14 +943,15 @@ def _run(cfg: RunPolicyConfig) -> None:
             obs_thread.start()
             if capture is not None:
                 capture.start()
-            stdin_thread.start()
 
             deadline = time.perf_counter() + episode_time_s
             timed_out = False
             interrupted = False
             try:
                 while True:
-                    if stdin_result["choice"] is not None:
+                    if stop_event.is_set():
+                        break
+                    if control.poll_choice() is not None:
                         break
                     if time.perf_counter() >= deadline:
                         timed_out = True
@@ -825,7 +970,7 @@ def _run(cfg: RunPolicyConfig) -> None:
                 interrupted = True
 
             # Tear down per-episode threads (server + client stay alive).
-            stdin_stop.set()
+            control.end_episode()
             client.shutdown_event.set()
             if capture is not None:
                 capture.stop_event.set()
@@ -833,26 +978,19 @@ def _run(cfg: RunPolicyConfig) -> None:
             control_thread.join(timeout=5.0)
             receiver_thread.join(timeout=5.0)
             obs_thread.join(timeout=5.0)
-            # ``stdin_thread`` wakes itself via ``select``; don't join.
 
-            if interrupted:
+            if interrupted or stop_event.is_set():
+                if dataset is not None:
+                    dataset.clear_episode_buffer()
                 break
             if client.fatal_error is not None:
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 break
 
-            choice = stdin_result["choice"]
+            choice = control.poll_choice()
             if timed_out:
-                try:
-                    raw = input(
-                        f"Episode time cap ({episode_time_s}s) reached. "
-                        "[Enter]=save, r=rerecord, q=quit: "
-                    )
-                except (EOFError, KeyboardInterrupt):
-                    break
-                raw = raw.strip().lower()
-                choice = "q" if raw == "q" else ("r" if raw == "r" else "s")
+                choice = control.resolve_timeout(episode_time_s)
 
             if choice == "q":
                 if dataset is not None:
@@ -865,9 +1003,9 @@ def _run(cfg: RunPolicyConfig) -> None:
                     dataset.clear_episode_buffer()
                 log_say("Returning to rest pose.")
                 reset_controller.return_to_rest(robot)
-                try:
-                    input("Reset the scene, then press Enter to start.")
-                except (EOFError, KeyboardInterrupt):
+                if not control.await_continue(
+                    "Reset the scene, then press Enter to start."
+                ):
                     break
                 continue
 
@@ -878,9 +1016,9 @@ def _run(cfg: RunPolicyConfig) -> None:
             log_say(f"Saved episode {episodes_recorded}.")
             log_say("Returning to rest pose.")
             reset_controller.return_to_rest(robot)
-            try:
-                input("Reset the scene, then press Enter to start the next episode.")
-            except (EOFError, KeyboardInterrupt):
+            if not control.await_continue(
+                "Reset the scene, then press Enter to start the next episode."
+            ):
                 break
 
         # Re-raise the control-loop fault so ``run()`` exits non-zero.
