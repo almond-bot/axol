@@ -7,8 +7,8 @@ restarts the ZED X daemon, opens the camera, and captures frames across a
 an exception; if it returns cleanly the cable is good.
 
 Usage:
-    python -m almond_axol.test.zed.cable
-    python -m almond_axol.test.zed.cable --output logs/cable_frame.png
+    uv run -m almond_axol.test.zed.cable
+    uv run -m almond_axol.test.zed.cable --output logs/cable_frame.png
 """
 
 from __future__ import annotations

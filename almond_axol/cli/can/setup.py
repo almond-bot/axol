@@ -14,8 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ...shared import CAN_LEFT, CAN_RIGHT
-from ...sudo import run_root
+from ...utils.shared import CAN_LEFT, CAN_RIGHT
+from ...utils.sudo import run_root
 
 _VID = "1d50"
 _PID = "606f"

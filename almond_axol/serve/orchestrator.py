@@ -34,19 +34,19 @@ import urllib.request
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
-from ..sudo import (
+from ..utils.sudo import (
     SUDO_BAD_PASSWORD_CODE as _SUDO_BAD_PASSWORD_CODE,
 )
-from ..sudo import (
+from ..utils.sudo import (
     SUDO_BAD_PASSWORD_MARKER as _SUDO_BAD_PASSWORD_MARKER,
 )
-from ..sudo import (
+from ..utils.sudo import (
     SUDO_PASSWORD_ENV as _SUDO_PASSWORD_ENV,
 )
-from ..sudo import (
+from ..utils.sudo import (
     SUDO_REQUIRED_CODE as _SUDO_REQUIRED_CODE,
 )
-from ..sudo import (
+from ..utils.sudo import (
     SUDO_REQUIRED_MARKER as _SUDO_REQUIRED_MARKER,
 )
 from .commands import build_argv

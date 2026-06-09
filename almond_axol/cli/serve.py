@@ -22,10 +22,10 @@ import time
 import webbrowser
 from pathlib import Path
 
-from ..certs import CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.certs import CERTFILE, KEYFILE, create_self_signed_cert
 
 # The VR server and this control-panel API share one self-signed certificate
-# (see ``almond_axol.certs``) so a single browser cert acceptance covers both.
+# (see ``almond_axol.utils.certs``) so a single browser cert acceptance covers both.
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]

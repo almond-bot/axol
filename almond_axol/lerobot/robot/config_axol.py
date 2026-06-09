@@ -8,7 +8,7 @@ from lerobot.cameras.configs import CameraConfig
 from lerobot.robots.config import RobotConfig
 
 from ...robot.config import AxolConfig
-from ...shared import CAN_LEFT, CAN_RIGHT
+from ...utils.shared import CAN_LEFT, CAN_RIGHT
 
 
 @RobotConfig.register_subclass("axol")

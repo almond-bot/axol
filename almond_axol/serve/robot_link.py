@@ -23,8 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from ..motor import CanBus, Joint, Motor, MotorError
-from ..shared import CAN_LEFT, CAN_RIGHT
-from ..sudo import SudoPasswordIncorrect, SudoPasswordRequired, run_root
+from ..utils.shared import CAN_LEFT, CAN_RIGHT
+from ..utils.sudo import SudoPasswordIncorrect, SudoPasswordRequired, run_root
 
 _logger = logging.getLogger(__name__)
 

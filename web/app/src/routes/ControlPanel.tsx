@@ -171,17 +171,28 @@ export default function ControlPanel() {
   // Poll the detached connections while online.
   useEffect(() => {
     if (conn.state !== "ok") return
+    // Guard against in-flight polls landing after a disconnect (which flips
+    // conn.state and tears this effect down): a late response must not
+    // repopulate the robot/ZED tiles while the host tile shows disconnected.
+    let active = true
     const t = setInterval(() => {
       fetchRobotStatus()
-        .then(setRobot)
+        .then((r) => {
+          if (active) setRobot(r)
+        })
         .catch(() => {})
       // Keep the ZED link (and its PTP clock-sync state) fresh so the badge
       // settles from "syncing" to "locked" after connecting the box.
       fetchZedStatus()
-        .then(setZedLink)
+        .then((z) => {
+          if (active) setZedLink(z)
+        })
         .catch(() => {})
     }, 2000)
-    return () => clearInterval(t)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
   }, [conn.state])
 
   function hostDisconnectClick() {

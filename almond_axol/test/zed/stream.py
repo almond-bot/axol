@@ -2,8 +2,8 @@
 Test script: connect to a ZED stream and save one frame as a PNG.
 
 Usage:
-    python -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000
-    python -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000 --output logs/frame.png
+    uv run -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000
+    uv run -m almond_axol.test.zed.stream --host 192.168.10.1 --port 30000 --output logs/frame.png
 """
 
 from __future__ import annotations

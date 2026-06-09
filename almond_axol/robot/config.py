@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 
-from ..shared import ARM_JOINTS
+from ..utils.shared import ARM_JOINTS
 
 
 @dataclass
@@ -349,7 +349,7 @@ def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
     """Coerce ``s`` to a 7-tuple of per-joint blend factors in ``[0, 1]``.
 
     Accepts a scalar (broadcast to all 7 joints) or a sequence of length
-    ``len(ARM_JOINTS)`` in :data:`almond_axol.shared.ARM_JOINTS` order.
+    ``len(ARM_JOINTS)`` in :data:`almond_axol.utils.shared.ARM_JOINTS` order.
     """
     if isinstance(s, (int, float)):
         if not 0.0 <= float(s) <= 1.0:
@@ -373,7 +373,7 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
     """Blend each of ``arm``'s 7 joints toward :data:`_STIFF_GAINS` by ``s``.
 
     ``s`` is either a scalar or a 7-tuple in
-    :data:`almond_axol.shared.ARM_JOINTS` order (see
+    :data:`almond_axol.utils.shared.ARM_JOINTS` order (see
     :func:`_normalize_stiffness`). An all-zero blend returns ``arm`` unchanged.
     """
     factors = _normalize_stiffness(s)
@@ -412,7 +412,7 @@ class AxolConfig:
         left_stiffness:  Compliance ↔ stiffness blend for the **left** arm
                          in ``[0, 1]``. Either a scalar (applied to every
                          joint) or 7 values in
-                         :data:`almond_axol.shared.ARM_JOINTS` order
+                         :data:`almond_axol.utils.shared.ARM_JOINTS` order
                          (gripper excluded). ``0`` keeps the per-joint
                          compliant gains; ``1`` restores the pre-tuning
                          industrial gains in :data:`_STIFF_GAINS`;

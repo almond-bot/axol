@@ -18,7 +18,7 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..shared import (
+from ..utils.shared import (
     URDF_PATH,
     Joint,
     urdf_arm_joint_names,
@@ -88,7 +88,7 @@ def _build_robot_collision(
 
 
 # Convenience aliases for URDF link / joint names. The single source of
-# truth for these strings lives in :mod:`almond_axol.shared`; the helpers
+# truth for these strings lives in :mod:`almond_axol.utils.shared`; the helpers
 # below just compose ``"left_*"`` / ``"right_*"`` from a side-agnostic
 # suffix table so renaming the URDF only requires editing one place.
 _LEFT_EE = urdf_body_name(Joint.GRIPPER, is_left=True)

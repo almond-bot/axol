@@ -39,7 +39,7 @@ from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...robot.axol import Axol
-from ...shared import Joint
+from ...utils.shared import Joint
 from .config_axol import AxolRobotConfig
 
 _logger = logging.getLogger(__name__)

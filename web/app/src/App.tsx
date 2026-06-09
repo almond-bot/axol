@@ -516,7 +516,7 @@ export default function App() {
               <div className="flex flex-col gap-2">
                 <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
                   Could not connect to <span className="font-mono">{hostname || "the server"}</span>
-                  . Check that <span className="font-mono">axol serve</span> is running, then
+                  . Check that <span className="font-mono">axol teleop</span> is running, then
                   authorize its self-signed certificate below.
                 </p>
                 {hostname.trim() && (

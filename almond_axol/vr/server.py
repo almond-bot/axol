@@ -38,7 +38,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-from ..certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from .config import VRServerConfig
 from .models import VRFrame
 

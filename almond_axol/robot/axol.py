@@ -21,7 +21,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
-from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_friction

@@ -20,8 +20,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from ..certs import ACCEPT_PAGE_HTML
-from ..sudo import SUDO_PASSWORD_ENV
+from ..utils.certs import ACCEPT_PAGE_HTML
+from ..utils.sudo import SUDO_PASSWORD_ENV
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces

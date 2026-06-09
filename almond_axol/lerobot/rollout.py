@@ -28,7 +28,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
-from ..shared import ARM_JOINTS
+from ..utils.shared import ARM_JOINTS
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -108,8 +108,8 @@ class IKResetController:
         """Plan and play a collision-aware trajectory to the rest pose."""
         import numpy as np
 
-        from ..shared import Joint
         from ..teleop.filter import ResetInterpolator
+        from ..utils.shared import Joint
 
         self.wait_ready()
         assert self._conn is not None

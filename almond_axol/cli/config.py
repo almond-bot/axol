@@ -47,8 +47,8 @@ import mergedeep
 import numpy as np
 
 from ..robot.config import AxolConfig
-from ..shared import CAN_LEFT, CAN_RIGHT
 from ..teleop.config import VRTeleopConfig
+from ..utils.shared import CAN_LEFT, CAN_RIGHT
 
 T = TypeVar("T")
 

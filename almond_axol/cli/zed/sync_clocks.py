@@ -31,7 +31,7 @@ import threading
 import time
 from pathlib import Path
 
-from ...sudo import (
+from ...utils.sudo import (
     SUDO_BAD_PASSWORD_CODE,
     SUDO_BAD_PASSWORD_MARKER,
     SUDO_REQUIRED_CODE,

@@ -7,7 +7,7 @@ import threading
 
 import numpy as np
 
-from ..shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..utils.shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
