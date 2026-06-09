@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 
 
 def _finish(
@@ -21,6 +22,29 @@ def _finish(
         detail = stderr[-1] if stderr else f"exit code {proc.returncode}"
         raise RuntimeError(f"`{cmd[0]}` failed: {detail}")
     return proc
+
+
+def prime_sudo() -> bool:
+    """Ensure subsequent ``sudo -n`` invocations will succeed.
+
+    Long-lived root processes (PTP daemons, daemon restarts) are spawned with
+    ``sudo -n`` so headless contexts (web control panel) fail fast instead of
+    blocking on a password prompt that can never be answered. Call this first
+    so interactive CLI use still works: when there is a tty and no cached
+    credentials, ``sudo -v`` prompts once and caches them for the ``sudo -n``
+    invocations that follow.
+
+    Returns True when ``sudo -n`` will work (root, passwordless/cached sudo,
+    or credentials just cached via the tty prompt); False when escalation is
+    impossible.
+    """
+    if os.geteuid() == 0:
+        return True
+    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode == 0:
+        return True
+    if sys.stdin is not None and sys.stdin.isatty():
+        return subprocess.run(["sudo", "-v"]).returncode == 0
+    return False
 
 
 def run_root(

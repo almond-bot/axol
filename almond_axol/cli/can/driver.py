@@ -63,38 +63,20 @@ def _build() -> Path:
     return _BUILD_DIR / "gs_usb.ko"
 
 
-def _install(
-    ko: Path, *, password: str | None = None, allow_prompt: bool = False
-) -> None:
+def _install(ko: Path) -> None:
     """Install the module, register it for boot, and load it (requires sudo)."""
     kver = os.uname().release
     dest = Path("/lib/modules") / kver / "updates" / "gs_usb.ko"
 
     print(f"Installing {dest} (requires sudo)...")
-    run_root(
-        ["install", "-D", "-m", "644", str(ko), str(dest)],
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
-    run_root(["depmod", "-a"], password=password, allow_prompt=allow_prompt, check=True)
-    run_root(
-        ["tee", str(_MODULES_LOAD_FILE)],
-        input_text="gs_usb\n",
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
-    run_root(
-        ["modprobe", "gs_usb"],
-        password=password,
-        allow_prompt=allow_prompt,
-        check=True,
-    )
+    run_root(["install", "-D", "-m", "644", str(ko), str(dest)], check=True)
+    run_root(["depmod", "-a"], check=True)
+    run_root(["tee", str(_MODULES_LOAD_FILE)], input_text="gs_usb\n", check=True)
+    run_root(["modprobe", "gs_usb"], check=True)
     print("  Done.")
 
 
-def ensure_driver(*, password: str | None = None, allow_prompt: bool = False) -> bool:
+def ensure_driver() -> bool:
     """Build and install gs_usb when the running kernel lacks it.
 
     Returns True when the driver was installed, False when it was already
@@ -104,7 +86,7 @@ def ensure_driver(*, password: str | None = None, allow_prompt: bool = False) ->
         return False
     print("Kernel does not ship the gs_usb driver — building it from source.")
     ko = _build()
-    _install(ko, password=password, allow_prompt=allow_prompt)
+    _install(ko)
     return True
 
 
@@ -119,7 +101,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 def run(_args: object = None) -> None:
     """Ensure the gs_usb driver is available, building it when needed."""
     try:
-        installed = ensure_driver(allow_prompt=True)
+        installed = ensure_driver()
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

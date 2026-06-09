@@ -12,6 +12,8 @@ import os
 import subprocess
 import time
 
+from ..utils.sudo import prime_sudo
+
 _logger = logging.getLogger(__name__)
 
 # Give the daemon time to enumerate the sensors on the GMSL links before a
@@ -31,8 +33,10 @@ def restart_zed_daemon() -> None:
     """
     cmd = ["systemctl", "restart", "zed_x_daemon"]
     if os.geteuid() != 0:
-        # `-n` so a headless session (web control panel) fails fast instead of
-        # blocking on a password prompt that can never be answered.
+        # Prompt once on a tty if needed; `-n` so a headless session (web
+        # control panel) fails fast instead of blocking on a password prompt
+        # that can never be answered.
+        prime_sudo()
         cmd = ["sudo", "-n", *cmd]
     _logger.info("Restarting zed_x_daemon...")
     result = subprocess.run(cmd, capture_output=True, text=True)

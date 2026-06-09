@@ -31,7 +31,7 @@ import threading
 import time
 from pathlib import Path
 
-from ...utils.sudo import run_root
+from ...utils.sudo import prime_sudo, run_root
 
 # The PTP daemons we manage. Named so teardown can kill them by name as a
 # safety net (they run as root, so a non-root signal can't reach them).
@@ -125,16 +125,17 @@ def _run(
     transport: str,
     timestamping: str,
 ) -> None:
-    _ensure_executable("ptp4l", required=True)
-    _ensure_executable("phc2sys", required=True)
-
     if not Path(f"/sys/class/net/{iface}").exists():
         raise SystemExit(
             f"error: interface {iface!r} not found in /sys/class/net. "
             f"Plug in the cable or check `ip link show`."
         )
 
+    # Prime sudo before anything that escalates: both the apt auto-install in
+    # `_ensure_executable` and the daemon spawns use non-prompting `sudo -n`.
     _check_sudo()
+    _ensure_executable("ptp4l", required=True)
+    _ensure_executable("phc2sys", required=True)
     # A prior `axol serve` that was killed (or a disconnect that couldn't reach
     # the root daemons) can leave ptp4l/phc2sys orphaned and still disciplining
     # the clock. Clear any strays so we don't stack duplicates fighting over
@@ -227,9 +228,7 @@ def _with_sudo(cmd: list[str]) -> list[str]:
 
 def _check_sudo() -> None:
     """Verify privilege escalation before launching the long-lived daemons."""
-    if os.geteuid() == 0:
-        return
-    if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+    if not prime_sudo():
         raise SystemExit(
             "error: the PTP daemons need root and passwordless sudo is "
             "unavailable. Run as root (the hosted install's systemd service "

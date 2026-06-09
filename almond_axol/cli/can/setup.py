@@ -252,7 +252,7 @@ def ensure_setup(*, serial: str | None = None) -> None:
     Each step is idempotent, so this is safe to call on a partially-configured
     machine.
     """
-    driver.ensure_driver(password=password, allow_prompt=allow_prompt)
+    driver.ensure_driver()
     serial = serial or _resolve_serial()
     _write_udev_rules(serial)
     _reload_udev()
@@ -264,7 +264,7 @@ def ensure_setup(*, serial: str | None = None) -> None:
 
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
-    driver.ensure_driver(allow_prompt=True)
+    driver.ensure_driver()
     serial = _find_serial()
     ensure_setup(serial=serial)
 
