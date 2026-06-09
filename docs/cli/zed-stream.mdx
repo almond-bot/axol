@@ -25,3 +25,7 @@ axol zed.stream --overhead 50026922 --overhead-stereo --left-arm 23456789   # st
 <Note>
   `zed.stream` runs on the ZED box (Jetson sender). The receiving process — [`collect-data`](/cli/collect-data) or [`run-policy`](/cli/run-policy) — runs on the main host. See the [Data Collection](/quickstart/data-collection) and [Policy Inference](/quickstart/inference) quickstarts for the full two-machine setup.
 </Note>
+
+<Note>
+  On startup the command restarts `zed_x_daemon` so cameras plugged in after boot enumerate. The restart needs root: under the quick install's systemd service this is automatic; run interactively from a terminal, you may be prompted for your `sudo` password once.
+</Note>
