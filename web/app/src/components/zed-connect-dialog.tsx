@@ -152,7 +152,23 @@ export function ZedConnectDialog({
             </div>
             {CAMERA_SLOTS.map((slot) => (
               <div key={slot.key} className="flex items-center justify-between gap-4">
-                <Label className="text-white/70">{slot.label}</Label>
+                <div className="flex items-center gap-3">
+                  <Label className="text-white/70">{slot.label}</Label>
+                  {slot.key === "overhead" && (
+                    <label
+                      className="flex cursor-pointer items-center gap-1.5 text-white/55"
+                      title="Stereo ZED X (both eyes on one stream)"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={overheadStereo}
+                        onChange={(e) => setOverheadStereo(e.target.checked)}
+                        className="size-3.5 accent-[#eff483]"
+                      />
+                      <span className="text-xs">Stereo</span>
+                    </label>
+                  )}
+                </div>
                 <Input
                   value={cameras[slot.key]}
                   inputMode="numeric"
@@ -165,15 +181,6 @@ export function ZedConnectDialog({
                 />
               </div>
             ))}
-            <label className="flex cursor-pointer items-center gap-2 text-white/70">
-              <input
-                type="checkbox"
-                checked={overheadStereo}
-                onChange={(e) => setOverheadStereo(e.target.checked)}
-                className="size-4 accent-[#eff483]"
-              />
-              <span className="text-sm">Overhead is stereo (ZED X)</span>
-            </label>
           </div>
         </div>
       </div>

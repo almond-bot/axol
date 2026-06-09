@@ -160,9 +160,7 @@ function PoseVisualizer() {
 // wrist, flick left toggles the left wrist, and flicking the same way again
 // returns to overhead.
 const FEED_DISTANCE = 1.3 // metres in front of the head-locked feed
-// Oversize the feed past the headset FOV so it fully wraps the operator's view
-// (immersive) rather than floating as a small panel.
-const FEED_FOV_MARGIN = 1.12
+const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
 const STICK_DEADZONE = 0.6
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
@@ -322,29 +320,13 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       return
     }
 
-    // Size the planes to fill the headset's field of view at FEED_DISTANCE so
-    // the feed is immersive, then crop each video to "cover" the plane (no
-    // letterboxing) by adjusting the texture UVs.
-    const pm = cam.projectionMatrix.elements
-    const tanY = pm[5] ? 1 / pm[5] : Math.tan((70 * Math.PI) / 180 / 2)
-    const tanX = pm[0] ? 1 / pm[0] : tanY * (16 / 9)
-    const planeH = 2 * FEED_DISTANCE * tanY * FEED_FOV_MARGIN
-    const planeW = 2 * FEED_DISTANCE * tanX * FEED_FOV_MARGIN
-    const planeAspect = planeW / planeH
-
-    const cover = (t: THREE.VideoTexture) => {
+    // Size each plane to a fixed height with width from the video's aspect, so
+    // the feed sits as a large head-locked panel (majority of the view) with
+    // the full image visible — no FOV-fill, no cropping.
+    const fit = (m: THREE.Mesh, t: THREE.VideoTexture) => {
       const v = t.image as HTMLVideoElement | undefined
-      if (!v || !v.videoWidth) return
-      const videoAspect = v.videoWidth / v.videoHeight
-      if (videoAspect > planeAspect) {
-        const r = planeAspect / videoAspect
-        t.repeat.set(r, 1)
-        t.offset.set((1 - r) / 2, 0)
-      } else {
-        const r = videoAspect / planeAspect
-        t.repeat.set(1, r)
-        t.offset.set(0, (1 - r) / 2)
-      }
+      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
+      m.scale.set(FEED_HEIGHT * aspect, FEED_HEIGHT, 1)
     }
 
     if (stereo && leftMesh && rightMesh && leftMat && rightMat) {
@@ -359,10 +341,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         rightMat.map = rTex
         rightMat.needsUpdate = true
       }
-      leftMesh.scale.set(planeW, planeH, 1)
-      rightMesh.scale.set(planeW, planeH, 1)
-      cover(lTex)
-      cover(rTex)
+      fit(leftMesh, lTex)
+      fit(rightMesh, rTex)
       leftMesh.visible = true
       rightMesh.visible = true
       // three.js shows layer-1 objects to the left eye and layer-2 to the right;
@@ -380,8 +360,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         mat.map = tex
         mat.needsUpdate = true
       }
-      mesh.scale.set(planeW, planeH, 1)
-      cover(tex)
+      fit(mesh, tex)
     }
   })
 
@@ -410,19 +389,6 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             depthWrite={false}
           />
         </mesh>
-        <Text
-          position={[0, -0.5, -FEED_DISTANCE]}
-          fontSize={0.05}
-          fontWeight="bold"
-          color="white"
-          anchorX="center"
-          anchorY="top"
-          renderOrder={2}
-          material-depthTest={false}
-          {...hudBg}
-        >
-          Camera
-        </Text>
       </group>
       <group ref={spinnerRef} visible={false}>
         {/* Spinning arc (a torus with a gap) shown while the cameras connect. */}
