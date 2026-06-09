@@ -161,9 +161,24 @@ export function ZedConnectDialog({
           </div>
 
           <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-            <div className="flex flex-col gap-0.5">
-              <Label>Camera Serials (optional)</Label>
-              <p className="text-xs text-white/35">Leave blank to skip camera streaming.</p>
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-col gap-0.5">
+                <Label>Camera Serials (optional)</Label>
+                <p className="text-xs text-white/35">Leave blank to skip camera streaming.</p>
+              </div>
+              <select
+                id="zed-resolution"
+                value={resolution}
+                onChange={(e) => setResolution(e.target.value)}
+                title="Capture resolution for all cameras"
+                className="h-9 w-full max-w-[180px] shrink-0 rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70"
+              >
+                {RESOLUTIONS.map((r) => (
+                  <option key={r.value} value={r.value} className="bg-[#1a1a1a]">
+                    {r.label}
+                  </option>
+                ))}
+              </select>
             </div>
             {CAMERA_SLOTS.map((slot) => (
               <div key={slot.key} className="flex items-center justify-between gap-4">
@@ -196,23 +211,6 @@ export function ZedConnectDialog({
                 />
               </div>
             ))}
-            <div className="flex items-center justify-between gap-4">
-              <Label className="text-white/70" htmlFor="zed-resolution">
-                Resolution
-              </Label>
-              <select
-                id="zed-resolution"
-                value={resolution}
-                onChange={(e) => setResolution(e.target.value)}
-                className="h-9 w-full max-w-[180px] rounded-md border border-input bg-white/[0.02] px-3 text-sm text-foreground outline-none focus-visible:border-ring/70"
-              >
-                {RESOLUTIONS.map((r) => (
-                  <option key={r.value} value={r.value} className="bg-[#1a1a1a]">
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-            </div>
           </div>
         </div>
       </div>
