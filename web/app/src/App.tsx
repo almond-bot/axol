@@ -158,8 +158,8 @@ function PoseVisualizer() {
 //
 // View modes (the right thumbstick is a latched 4-way picker — flick once, no
 // holding; flicking the *active* direction returns to the default):
-//   - "default":  passthrough with the two wrist cams as bottom-corner PiPs
-//                 (left wrist → bottom-left, right wrist → bottom-right)
+//   - "default":  passthrough with the two wrist cams as top-corner PiPs
+//                 (left wrist → top-left, right wrist → top-right)
 //   - "overhead": fullscreen overhead (per-eye stereo when both eyes stream)
 //   - "left":     fullscreen left wrist
 //   - "right":    fullscreen right wrist
@@ -174,10 +174,10 @@ const FEED_HEIGHT = 1.05 // fullscreen plane height in metres (width from aspect
 // rather than sitting high in view.
 const FEED_Y = -0.175
 const STICK_DEADZONE = 0.6
-// Bottom-corner picture-in-picture wrist cams shown in the default view.
-const PIP_WIDTH = 0.42 // metres (height derives from aspect)
-const PIP_X = 0.52 // horizontal offset of each corner PiP
-const PIP_Y = -0.4 // vertical offset (lower corners)
+// Top-corner picture-in-picture wrist cams shown in the default view.
+const PIP_WIDTH = 0.5 // metres (height derives from aspect)
+const PIP_X = 0.44 // horizontal offset of each corner PiP
+const PIP_Y = 0.3 // vertical offset (upper corners)
 // Side-by-side wrist cams in the split view.
 const SPLIT_WIDTH = 0.92 // metres per pane
 const SPLIT_X = 0.48 // horizontal offset of each pane from centre
@@ -411,7 +411,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       if (l) fitWidth(aMesh, aMat, l, SPLIT_WIDTH, -SPLIT_X, FEED_Y)
       if (r) fitWidth(bMesh, bMat, r, SPLIT_WIDTH, SPLIT_X, FEED_Y)
     } else {
-      // default: passthrough with the wrist cams pinned to the bottom corners.
+      // default: passthrough with the wrist cams pinned to the top corners.
       const l = liveTex("left_arm")
       const r = liveTex("right_arm")
       if (l) fitWidth(aMesh, aMat, l, PIP_WIDTH, -PIP_X, PIP_Y)
@@ -527,12 +527,12 @@ function ExitButton() {
 
   return (
     <Text
-      position={[-0.2, 0.1, -0.5]}
+      position={[-0.2, -0.32, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
       color={hovered ? "yellow" : "white"}
       anchorX="left"
-      anchorY="top"
+      anchorY="bottom"
       renderOrder={999}
       material-depthTest={false}
       {...hudBg}
@@ -565,12 +565,12 @@ function StateDisplay({
 
   return (
     <Text
-      position={[0.2, 0.1, -0.5]}
+      position={[0.2, -0.32, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
       color={color}
       anchorX="right"
-      anchorY="top"
+      anchorY="bottom"
       renderOrder={999}
       material-depthTest={false}
       {...hudBg}
@@ -586,7 +586,9 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
   const col = 0.07
 
   return (
-    <group position={[0, -0.038, 0]}>
+    // The help icon now sits at the bottom of the view, so open the panel
+    // upward (above the icon) instead of downward, where it would be clipped.
+    <group position={[0, 0.13, 0]}>
       {/* Large dismiss plane behind everything */}
       <mesh position={[0, 0, -0.002]} renderOrder={996} onClick={onDismiss}>
         <planeGeometry args={[2, 2]} />
@@ -658,7 +660,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Lock Camera`}
+        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View`}
       </Text>
     </group>
   )
@@ -668,13 +670,13 @@ function HelpIcon() {
   const [open, setOpen] = useState(false)
 
   return (
-    <group position={[0, 0.1, -0.5]}>
+    <group position={[0, -0.32, -0.5]}>
       <Text
         fontSize={0.02}
         fontWeight="bold"
         color={open ? "yellow" : "white"}
         anchorX="center"
-        anchorY="top"
+        anchorY="bottom"
         renderOrder={999}
         material-depthTest={false}
         {...hudBg}
