@@ -33,11 +33,11 @@ function Tile({
   headerRight?: ReactNode
 }) {
   return (
-    <div className="group relative flex min-w-0 flex-1 flex-col gap-2 rounded-xl border border-white/10 bg-white/[0.02] p-3">
+    <div className="group relative flex min-w-0 flex-1 flex-col gap-2 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-3">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
+        <div className="flex min-w-0 items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
           {icon}
-          <span className="font-mono">{title}</span>
+          <span className="truncate font-mono">{title}</span>
         </div>
         {headerRight}
       </div>
@@ -134,7 +134,7 @@ export function ConnectionsBar({
       : "Not connected"
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+    <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -297,7 +297,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
   const arms = ["left", "right"]
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
       {arms.map((arm) => (
         <div key={arm} className="flex items-center gap-1">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>

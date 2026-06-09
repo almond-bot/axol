@@ -22,11 +22,10 @@ import time
 import webbrowser
 from pathlib import Path
 
-# Share the VR server's self-signed certificate so a single cert acceptance
-# covers both the teleop WSS link and this control-panel API.
-_CERTS_DIR = os.path.join(os.path.expanduser("~"), ".almond", "vr", "certs")
-_CERTFILE = os.path.join(_CERTS_DIR, "cert.pem")
-_KEYFILE = os.path.join(_CERTS_DIR, "key.pem")
+from ..certs import CERTFILE, KEYFILE, create_self_signed_cert
+
+# The VR server and this control-panel API share one self-signed certificate
+# (see ``almond_axol.certs``) so a single browser cert acceptance covers both.
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -93,7 +92,7 @@ def run(args: argparse.Namespace) -> None:
     ssl_kwargs: dict[str, str] = {}
     if tls:
         _ensure_cert()
-        ssl_kwargs = {"ssl_certfile": _CERTFILE, "ssl_keyfile": _KEYFILE}
+        ssl_kwargs = {"ssl_certfile": CERTFILE, "ssl_keyfile": KEYFILE}
     scheme = "https" if tls else "http"
 
     local = f"{scheme}://localhost:{args.port}"
@@ -120,12 +119,10 @@ def run(args: argparse.Namespace) -> None:
 
 def _ensure_cert() -> None:
     """Generate the shared self-signed cert on first use (idempotent)."""
-    if os.path.isfile(_CERTFILE) and os.path.isfile(_KEYFILE):
+    if os.path.isfile(CERTFILE) and os.path.isfile(KEYFILE):
         return
-    from ..vr.certs import create_self_signed_cert
-
     print("Generating self-signed TLS certificate ...")
-    create_self_signed_cert(_CERTFILE, _KEYFILE)
+    create_self_signed_cert(CERTFILE, KEYFILE)
 
 
 def _open_browser_when_ready(url: str) -> None:

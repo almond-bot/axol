@@ -1,6 +1,6 @@
 ---
 title: "Web Control Panel"
-description: "Drive Axol from a browser — connect the workstation, robot, and ZED box, then run any operation without touching the terminal."
+description: "Drive Axol from a browser — connect the Axol host, robot, and ZED box, then run any operation without touching the terminal."
 ---
 
 The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors, the PTP clock sync, and the camera streams.
@@ -32,16 +32,20 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
   The UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces). If it isn't, `axol serve` still exposes the API but has no page to open — see [Installation](/installation#web-control-panel-optional).
 </Note>
 
+<Tip>
+  The nav bar's **Quickstart** button has copyable commands for installing the CLI and launching the server.
+</Tip>
+
 ## Connections
 
-The top of the panel is a row of three connection tiles — **Workstation**, **Axol**, and **ZED box** — each with a colored status dot. Connect them left to right.
+The top of the panel is a row of three connection tiles — **Axol Host**, **Axol**, and **ZED Box** — each with a colored status dot. Connect them left to right.
 
-{/* SCREENSHOT: control-panel-connections.png — close-up of the three connection tiles (Workstation / Axol / ZED box) */}
-<img src="/assets/control-panel-connections.png" alt="Connection tiles: Workstation, Axol, ZED box" />
+{/* SCREENSHOT: control-panel-connections.png — close-up of the three connection tiles (Axol Host / Axol / ZED Box) */}
+<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, ZED Box" />
 
-### Workstation
+### Axol Host
 
-The workstation is the host running `axol serve`. Press **Setup** to point the UI at a server address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve`. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
 
 ### Axol
 
@@ -52,17 +56,17 @@ Press **Connect** to bring up the robot. Under the hood this:
 
 If CAN bring-up needs `sudo` and passwordless sudo isn't configured, the panel prompts for your password (used once, never stored). While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
-### ZED box
+### ZED Box
 
-Data collection and policy inference also need the **ZED box** (the Jetson streaming the cameras), which runs its own `axol serve`. Press **Connect** to open the dialog.
+Data collection and policy inference also need the **ZED Box** (the Jetson streaming the cameras), which runs its own `axol serve`. Press **Connect** to open the dialog.
 
-{/* SCREENSHOT: zed-connect-dialog.png — the "Connect ZED box" dialog with the IP field and the three optional camera-serial fields */}
-<img src="/assets/zed-connect-dialog.png" alt="Connect ZED box dialog" />
+{/* SCREENSHOT: zed-connect-dialog.png — the "ZED Box" dialog with the address field and the three optional camera-serial fields */}
+<img src="/assets/zed-connect-dialog.png" alt="ZED Box dialog" />
 
 Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. Connecting then:
 
 1. Checks the box is reachable.
-2. Starts **PTP clock sync** between the two machines (the workstation as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.
+2. Starts **PTP clock sync** between the two machines (the Axol host as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.
 3. Once the clocks **lock**, starts **streaming** the cameras whose serials you entered.
 
 The tile header shows two status lights — **CLOCK** and **STREAM** — that are **green** when healthy, **amber** while starting, and **red** on error (hover for the reason). The camera serials and box IP persist in your browser, so they're pre-filled next time.
@@ -71,7 +75,7 @@ The tile header shows two status lights — **CLOCK** and **STREAM** — that ar
   PTP daemons need root. If passwordless `sudo` isn't available the **CLOCK** light turns amber ("needs sudo") and the panel prompts for a password, the same as Axol connect.
 </Note>
 
-Hover the ZED tile to reveal **Restart** (re-run clock sync + streaming) next to **Disconnect**. If clock sync or streaming fails, an inline panel appears below the connections with the error and the full log streamed from the box, so you can see exactly which camera serial wasn't found or why the clocks didn't lock.
+When connected, the ZED tile shows **Restart** (re-run clock sync + streaming) and **Disconnect** buttons. If clock sync or streaming fails, an inline panel appears below the connections with the error and the full log streamed from the box, so you can see exactly which camera serial wasn't found or why the clocks didn't lock.
 
 <Warning>
   Closing the browser tab does **not** stop anything — the robot link, clock sync, and camera streams live in the `serve` process and keep running. Use **Disconnect** (or stop `axol serve`) to tear them down.
@@ -79,7 +83,7 @@ Hover the ZED tile to reveal **Restart** (re-run clock sync + streaming) next to
 
 ## Operations
 
-Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown.
+Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown. Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
 
 {/* SCREENSHOT: control-panel-operation.png — an operation (e.g. Collect Data) showing the settings form, the "Before you can start" blockers, and the Start button */}
 <img src="/assets/control-panel-operation.png" alt="Operation settings and start blockers" />
@@ -93,7 +97,7 @@ Pick an operation from the selector. Each has its own settings form; required fi
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Connect the ZED box*, *Wait for PTP clock sync to lock*, *Wait for the ZED cameras to start streaming*, or *Set &lt;required field&gt;*. The ZED-dependent operations are gated on both the clocks locking **and** the cameras actually streaming.
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Connect the ZED box*, *Wait for clocks to lock*, *Wait for cameras to stream*, or *Set &lt;required field&gt;*. The ZED-dependent operations are gated on both the clocks locking **and** the cameras actually streaming.
 
 ### Settings persistence & import/export
 

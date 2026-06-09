@@ -1,9 +1,20 @@
-"""Self-signed TLS certificate generation for WSS."""
+"""Shared self-signed TLS certificate utilities.
+
+Used by both ``axol serve`` (the control-panel API) and the VR WebSocket server
+so a single certificate — and a single browser cert acceptance — covers both.
+"""
 
 from __future__ import annotations
 
 import os
 import subprocess
+
+# Shared cert location. Kept under ``vr/`` even though ``axol serve`` now uses it
+# too: renaming would force every existing install to regenerate (and re-accept)
+# its certificate, so the legacy path stays for backward compatibility.
+CERT_DIR = os.path.join(os.path.expanduser("~"), ".almond", "vr", "certs")
+CERTFILE = os.path.join(CERT_DIR, "cert.pem")
+KEYFILE = os.path.join(CERT_DIR, "key.pem")
 
 # A tiny page served at ``/__accept`` on both the VR (:8000) and control (:8001)
 # servers. The web UI opens it in a script-spawned popup so the user can approve
