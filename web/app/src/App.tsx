@@ -160,7 +160,11 @@ function PoseVisualizer() {
 // operator was looking when the session started, so the head can move freely
 // while the frames stay put. Pointing a controller at a screen and holding the
 // rear trigger grabs it — move the controller to reposition, release to drop.
-// Positions are remembered per view mode.
+// Positions are remembered per view mode. Because the trigger doubles as the
+// gripper control, grabbing is only allowed while robot tracking is
+// disengaged (we mirror the robot's grip-button toggle: both grips together
+// engage, either grip alone disengages). Clicking the right thumbstick
+// re-anchors all screens to the current gaze and resets dragged positions.
 //
 // View modes (the right thumbstick is a latched 4-way picker — flick once, no
 // holding; flicking the *active* direction returns to the default):
@@ -249,6 +253,15 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
   // Per-hand trigger state last frame, for rising-edge grab detection.
   const triggerPrevRef = useRef({ left: false, right: false })
+  // Mirror of the robot's tracking toggle (teleop.py): rising edge of BOTH
+  // grips together engages, rising edge of EITHER grip alone disengages.
+  // Screen grabbing is blocked while engaged, since the trigger drives the
+  // gripper.
+  const robotEngagedRef = useRef(false)
+  const prevBothGripsRef = useRef(false)
+  const prevEitherGripRef = useRef(false)
+  // Right-thumbstick click last frame, for rising-edge re-anchor detection.
+  const stickClickPrevRef = useRef(false)
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
   // textures whose stream has gone away.
@@ -362,6 +375,35 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       grabRef.current = null
     }
     rightStickActiveRef.current = stickActive
+
+    // Mirror the robot's tracking toggle from the grip buttons (buttons[1]),
+    // exactly as teleop.py does, so we know when the operator is controlling
+    // the robot (and the trigger is busy driving the gripper).
+    const gripPressed = (hand: "left" | "right") => {
+      const src = sources.find((s) => s.handedness === hand)
+      return (src?.gamepad?.buttons?.[1]?.value ?? 0) >= 1.0
+    }
+    const lGrip = gripPressed("left")
+    const rGrip = gripPressed("right")
+    const bothGrips = lGrip && rGrip
+    const eitherGrip = lGrip || rGrip
+    if (!robotEngagedRef.current) {
+      if (bothGrips && !prevBothGripsRef.current) robotEngagedRef.current = true
+    } else {
+      if (eitherGrip && !prevEitherGripRef.current) robotEngagedRef.current = false
+    }
+    prevBothGripsRef.current = bothGrips
+    prevEitherGripRef.current = eitherGrip
+
+    // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
+    // current gaze and resets any dragged positions.
+    const stickClicked = right?.gamepad?.buttons?.[3]?.pressed ?? false
+    if (stickClicked && !stickClickPrevRef.current) {
+      anchoredRef.current = false
+      grabRef.current = null
+      dragOffsetsRef.current = {}
+    }
+    stickClickPrevRef.current = stickClicked
 
     const mode = viewModeRef.current
 
@@ -489,12 +531,16 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // Grab handling: a rising-edge trigger press while pointing at a screen
     // grabs it at the hit distance; while held, the screen follows the ray
     // (offset from its layout base is remembered per `${mode}:${slot}`).
+    // Disabled while robot tracking is engaged — the trigger drives the
+    // gripper then, and a grab would fight the teleop.
+    if (robotEngagedRef.current) grabRef.current = null
     for (const src of sources) {
       const hand = src.handedness
       if (hand !== "left" && hand !== "right") continue
       const pressed = src.gamepad?.buttons?.[0]?.pressed ?? false
       const wasPressed = triggerPrevRef.current[hand]
       triggerPrevRef.current[hand] = pressed
+      if (robotEngagedRef.current) continue
 
       if (!pressed) {
         if (grabRef.current?.hand === hand) grabRef.current = null
@@ -706,7 +752,7 @@ function StateDisplay({
 
 function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
   const W = 0.3
-  const H = 0.112
+  const H = 0.133
   const col = 0.07
 
   return (
@@ -782,7 +828,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View\n[Trigger]  Move Screen`}
+        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View\n[Trigger]  Move Screen\n[Stick Click]  Reset Screens`}
       </Text>
     </group>
   )
