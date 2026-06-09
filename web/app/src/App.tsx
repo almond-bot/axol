@@ -156,6 +156,12 @@ function PoseVisualizer() {
 
 // Cameras streamed from the robot, shown immersively over passthrough.
 //
+// The screens behave like TVs: they are anchored in the world where the
+// operator was looking when the session started, so the head can move freely
+// while the frames stay put. Pointing a controller at a screen and holding the
+// rear trigger grabs it — move the controller to reposition, release to drop.
+// Positions are remembered per view mode.
+//
 // View modes (the right thumbstick is a latched 4-way picker — flick once, no
 // holding; flicking the *active* direction returns to the default):
 //   - "default":  passthrough with the two wrist cams as bottom-corner PiPs
@@ -168,7 +174,11 @@ function PoseVisualizer() {
 // left → left wrist, right → right wrist, down → split.
 type ViewMode = "default" | "overhead" | "left" | "right" | "split"
 
-const FEED_DISTANCE = 1 // metres in front of the head-locked feed
+// Which draggable screen a plane belongs to: the fullscreen/stereo plane
+// ("main") or one of the two wrist-cam planes ("a" = left, "b" = right).
+type GrabSlot = "main" | "a" | "b"
+
+const FEED_DISTANCE = 1 // metres from the anchor point to the screens
 const FEED_HEIGHT = 1.05 // fullscreen plane height in metres (width from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
 // rather than sitting high in view.
@@ -181,6 +191,16 @@ const PIP_Y = -0.44 // vertical offset (lower corners)
 // Side-by-side wrist cams in the split view.
 const SPLIT_WIDTH = 0.92 // metres per pane
 const SPLIT_X = 0.48 // horizontal offset of each pane from centre
+
+// Scratch objects for the per-frame grab raycast (avoid allocations).
+const _raycaster = new THREE.Raycaster()
+_raycaster.layers.enableAll() // the stereo eye planes live on layers 1/2
+const _rayMatrix = new THREE.Matrix4()
+const _rayOrigin = new THREE.Vector3()
+const _rayDir = new THREE.Vector3()
+const _grabTarget = new THREE.Vector3()
+const _yawFwd = new THREE.Vector3()
+const _yAxis = new THREE.Vector3(0, 1, 0)
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
   const { gl } = useThree()
@@ -215,6 +235,20 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const viewModeRef = useRef<ViewMode>("default")
   // Whether the right stick was deflected last frame, for rising-edge detection.
   const rightStickActiveRef = useRef(false)
+  // Whether the screen group has been world-anchored for this XR session.
+  const anchoredRef = useRef(false)
+  // Active screen grab (trigger held while pointing at a plane), if any.
+  const grabRef = useRef<{
+    hand: "left" | "right"
+    slot: GrabSlot
+    distance: number
+    mode: ViewMode
+  } | null>(null)
+  // User-dragged position offsets, keyed `${mode}:${slot}` so each view mode
+  // remembers its own arrangement.
+  const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
+  // Per-hand trigger state last frame, for rising-edge grab detection.
+  const triggerPrevRef = useRef({ left: false, right: false })
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
   // textures whose stream has gone away.
@@ -269,7 +303,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     rightMeshRef.current?.layers.set(2)
   }, [])
 
-  useFrame(() => {
+  useFrame((_state, _delta, frame) => {
     const group = groupRef.current
     const mesh = meshRef.current
     const mat = matRef.current
@@ -290,10 +324,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const cam = gl.xr.getCamera()
     const textures = texturesRef.current
 
-    // Head-lock both the feed and the loading spinner so they face the operator.
-    if (presenting) {
+    // World-anchor the screen group once per session: place it at the head
+    // with a yaw-only orientation. After that the screens stay put like TVs —
+    // the operator can look around freely. The loading spinner stays
+    // head-locked so it's always seen.
+    if (presenting && !anchoredRef.current) {
+      anchoredRef.current = true
+      grabRef.current = null
+      dragOffsetsRef.current = {}
       group.position.copy(cam.position)
-      group.quaternion.copy(cam.quaternion)
+      _yawFwd.set(0, 0, -1).applyQuaternion(cam.quaternion)
+      group.quaternion.setFromAxisAngle(_yAxis, Math.atan2(-_yawFwd.x, -_yawFwd.z))
+      group.updateMatrixWorld(true)
+    }
+    if (!presenting) anchoredRef.current = false
+    if (presenting) {
       spinner.position.copy(cam.position)
       spinner.quaternion.copy(cam.quaternion)
     }
@@ -314,6 +359,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       if (Math.abs(sy) > Math.abs(sx)) target = sy < 0 ? "overhead" : "split"
       else target = sx < 0 ? "left" : "right"
       viewModeRef.current = viewModeRef.current === target ? "default" : target
+      grabRef.current = null
     }
     rightStickActiveRef.current = stickActive
 
@@ -417,6 +463,84 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       if (l) fitWidth(aMesh, aMat, l, PIP_WIDTH, -PIP_X, PIP_Y)
       if (r) fitWidth(bMesh, bMat, r, PIP_WIDTH, PIP_X, PIP_Y)
     }
+
+    // The layout above set each visible plane's *base* (group-local) position;
+    // snapshot them before drag offsets are applied. The stereo eye planes are
+    // coincident, so "main" covers both.
+    const bases: Partial<Record<GrabSlot, THREE.Vector3>> = {}
+    if (mesh.visible) bases.main = mesh.position.clone()
+    if (leftMesh.visible) bases.main = leftMesh.position.clone()
+    if (aMesh.visible) bases.a = aMesh.position.clone()
+    if (bMesh.visible) bases.b = bMesh.position.clone()
+
+    // Build the controller's pointing ray (origin + forward) in world space.
+    const refSpace = gl.xr.getReferenceSpace()
+    const computeRay = (src: XRInputSource): boolean => {
+      if (!frame || !refSpace || !src.targetRaySpace) return false
+      const pose = frame.getPose(src.targetRaySpace, refSpace)
+      if (!pose) return false
+      _rayMatrix.fromArray(pose.transform.matrix)
+      _rayOrigin.setFromMatrixPosition(_rayMatrix)
+      const e = _rayMatrix.elements
+      _rayDir.set(-e[8], -e[9], -e[10]).normalize() // ray forward = -Z
+      return true
+    }
+
+    // Grab handling: a rising-edge trigger press while pointing at a screen
+    // grabs it at the hit distance; while held, the screen follows the ray
+    // (offset from its layout base is remembered per `${mode}:${slot}`).
+    for (const src of sources) {
+      const hand = src.handedness
+      if (hand !== "left" && hand !== "right") continue
+      const pressed = src.gamepad?.buttons?.[0]?.pressed ?? false
+      const wasPressed = triggerPrevRef.current[hand]
+      triggerPrevRef.current[hand] = pressed
+
+      if (!pressed) {
+        if (grabRef.current?.hand === hand) grabRef.current = null
+        continue
+      }
+      if (pressed && !wasPressed && !grabRef.current && computeRay(src)) {
+        const candidates: [THREE.Mesh, GrabSlot][] = []
+        if (mesh.visible) candidates.push([mesh, "main"])
+        if (leftMesh.visible) candidates.push([leftMesh, "main"])
+        if (aMesh.visible) candidates.push([aMesh, "a"])
+        if (bMesh.visible) candidates.push([bMesh, "b"])
+        _raycaster.set(_rayOrigin, _rayDir)
+        const hits = _raycaster.intersectObjects(
+          candidates.map((c) => c[0]),
+          false
+        )
+        const hit = hits[0]
+        if (hit) {
+          const slot = candidates.find((c) => c[0] === hit.object)?.[1]
+          if (slot) grabRef.current = { hand, slot, distance: hit.distance, mode }
+        }
+      }
+      const grab = grabRef.current
+      if (grab && grab.hand === hand && grab.mode === mode && computeRay(src)) {
+        const base = bases[grab.slot]
+        if (base) {
+          _grabTarget.copy(_rayOrigin).addScaledVector(_rayDir, grab.distance)
+          group.worldToLocal(_grabTarget)
+          dragOffsetsRef.current[`${mode}:${grab.slot}`] = _grabTarget.clone().sub(base)
+        }
+      }
+    }
+
+    // Apply any remembered drag offset, then turn each screen to face the
+    // operator's head (a world-anchored panel viewed edge-on is useless).
+    const orient = (m: THREE.Mesh, slot: GrabSlot) => {
+      if (!m.visible) return
+      const off = dragOffsetsRef.current[`${mode}:${slot}`]
+      if (off) m.position.add(off)
+      m.lookAt(cam.position)
+    }
+    orient(mesh, "main")
+    orient(leftMesh, "main")
+    orient(rightMesh, "main")
+    orient(aMesh, "a")
+    orient(bMesh, "b")
   })
 
   return (
@@ -582,7 +706,7 @@ function StateDisplay({
 
 function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
   const W = 0.3
-  const H = 0.092
+  const H = 0.112
   const col = 0.07
 
   return (
@@ -658,7 +782,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View`}
+        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View\n[Trigger]  Move Screen`}
       </Text>
     </group>
   )
