@@ -217,11 +217,21 @@ class ZedCamera(Camera):
         )
         self.thread.start()
 
-    def _stop_read_thread(self) -> None:
+    def _stop_read_thread(self) -> bool:
+        """Stop the read loop; return True if the thread actually exited.
+
+        When the stream is down, ``grab()`` can block in native code for a
+        long time. We must never call ``zed.close()`` while ``grab()`` is in
+        flight on another thread — that races inside the SDK and segfaults
+        the whole process — so callers use the return value to decide whether
+        closing is safe.
+        """
+        thread = self.thread
         if self.stop_event is not None:
             self.stop_event.set()
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        stopped = thread is None or not thread.is_alive()
         self.thread = None
         self.stop_event = None
         with self.frame_lock:
@@ -229,6 +239,7 @@ class ZedCamera(Camera):
             self.latest_capture_perf_ts = None
             self.latest_receive_perf_ts = None
             self.new_frame_event.clear()
+        return stopped
 
     def _read_loop(self) -> None:
         if self.stop_event is None or self.zed is None:
@@ -432,10 +443,21 @@ class ZedCamera(Camera):
                 f"Attempted to disconnect {self}, but it is already disconnected."
             )
 
-        self._stop_read_thread()
+        stopped = self._stop_read_thread()
 
         if self.zed is not None:
-            self.zed.close()
+            if stopped:
+                try:
+                    self.zed.close()
+                except Exception as exc:  # noqa: BLE001 - best-effort close
+                    _logger.warning(f"{self} close failed: {exc}")
+            else:
+                _logger.error(
+                    "%s read thread is stuck in grab() (stream down?); leaking "
+                    "the SDK handle instead of closing it concurrently, which "
+                    "would crash the process.",
+                    self,
+                )
             self.zed = None
 
         _logger.info(f"{self} disconnected.")
@@ -580,15 +602,23 @@ class ZedStereoCamera:
         )
         self.thread.start()
 
-    def _stop_read_thread(self) -> None:
+    def _stop_read_thread(self) -> bool:
+        """Stop the read loop; return True if the thread actually exited.
+
+        See :meth:`ZedCamera._stop_read_thread` — closing the SDK handle
+        while ``grab()`` is in flight on another thread segfaults.
+        """
+        thread = self.thread
         if self.stop_event is not None:
             self.stop_event.set()
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        stopped = thread is None or not thread.is_alive()
         self.thread = None
         self.stop_event = None
         self._left.clear()
         self._right.clear()
+        return stopped
 
     def _read_loop(self) -> None:
         if self.stop_event is None or self.zed is None:
@@ -657,9 +687,20 @@ class ZedStereoCamera:
         """Stop the grab thread and close the stereo stream."""
         if not self.is_connected and self.thread is None:
             return
-        self._stop_read_thread()
+        stopped = self._stop_read_thread()
         if self.zed is not None:
-            self.zed.close()
+            if stopped:
+                try:
+                    self.zed.close()
+                except Exception as exc:  # noqa: BLE001 - best-effort close
+                    _logger.warning(f"{self} close failed: {exc}")
+            else:
+                _logger.error(
+                    "%s read thread is stuck in grab() (stream down?); leaking "
+                    "the SDK handle instead of closing it concurrently, which "
+                    "would crash the process.",
+                    self,
+                )
             self.zed = None
         _logger.info(f"{self} disconnected.")
 
