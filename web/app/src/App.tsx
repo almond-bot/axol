@@ -441,7 +441,7 @@ export default function App() {
               <img src="/almond.svg" alt="Almond" className="h-12 w-12" />
               <div>
                 <h1 className="font-heading text-2xl font-bold tracking-tight">Almond Axol</h1>
-                <p className="text-sm text-white/40">VR teleoperation</p>
+                <p className="text-sm text-white/40">VR Teleoperation</p>
               </div>
             </div>
 
@@ -474,14 +474,14 @@ export default function App() {
                   htmlFor="vr-host"
                   className="text-xs font-medium tracking-widest text-white/40 uppercase"
                 >
-                  Server address
+                  Axol Host Address
                 </label>
                 <Input
                   id="vr-host"
                   type="text"
                   value={hostname}
                   onChange={(e) => setHostname(e.target.value)}
-                  placeholder="workstation.local"
+                  placeholder="axol-host.local"
                 />
                 <Button type="submit" className="w-full" disabled={!hostname.trim()}>
                   Connect
@@ -511,8 +511,8 @@ export default function App() {
             {status === AxolConnectionStatus.Failed && (
               <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
                 Could not connect to <span className="font-mono">{hostname || "the server"}</span>.
-                Check that <span className="font-mono">axol serve</span> is running on your
-                workstation.
+                Check that <span className="font-mono">axol serve</span> is running on your Axol
+                Host.
               </p>
             )}
           </Card>

@@ -80,7 +80,7 @@ export function ZedConnectDialog({
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <div className="flex items-center gap-2">
             <Camera className="size-4 text-[#eff483]" />
-            <span className="font-heading text-base font-semibold">Connect ZED box</span>
+            <span className="font-heading text-base font-semibold">ZED Box</span>
           </div>
           <button
             type="button"
@@ -94,13 +94,11 @@ export function ZedConnectDialog({
 
         <div className="flex flex-col gap-5 p-5">
           <p className="text-xs text-white/45">
-            The ZED box runs its own <span className="font-mono">axol serve</span>. Connecting
-            checks it&apos;s reachable and starts PTP clock sync between the two machines; camera
-            streaming starts when you record or run a policy.
+            Syncs clocks with the box, then streams the cameras below once locked.
           </p>
 
           <div className="flex flex-col gap-1.5">
-            <Label htmlFor="zed-box-url">ZED box IP</Label>
+            <Label htmlFor="zed-box-url">ZED Box Address</Label>
             <form
               className="flex gap-2"
               onSubmit={(e) => {
@@ -128,10 +126,6 @@ export function ZedConnectDialog({
                 Connect
               </Button>
             </form>
-            <p className="text-xs text-white/35">
-              Just the IP — port <span className="font-mono">8090</span> (
-              <span className="font-mono">axol serve</span>) is assumed.
-            </p>
             {error && (
               <p className="flex items-center gap-1.5 text-xs text-red-400">
                 <AlertTriangle className="size-3 shrink-0" />
@@ -142,11 +136,8 @@ export function ZedConnectDialog({
 
           <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
             <div className="flex flex-col gap-0.5">
-              <Label>Camera serials (optional)</Label>
-              <p className="text-xs text-white/35">
-                Serial of each wired ZED-X One. Any you enter start streaming once the clocks lock;
-                leave blank to skip. Saved for next time.
-              </p>
+              <Label>Camera Serials (optional)</Label>
+              <p className="text-xs text-white/35">Leave blank to skip camera streaming.</p>
             </div>
             {CAMERA_SLOTS.map((slot) => (
               <div key={slot.key} className="flex items-center justify-between gap-4">

@@ -1,6 +1,7 @@
 import type { ReactNode } from "react"
 import { ExternalLink } from "lucide-react"
 import { buttonVariants } from "@/components/ui/button"
+import { QuickstartButton } from "@/components/quickstart-dialog"
 import { cn } from "@/lib/utils"
 
 /**
@@ -35,6 +36,7 @@ export function SiteNav({ current, right }: { current: "control" | "vr"; right?:
             Docs
             <ExternalLink />
           </a>
+          {current === "control" && <QuickstartButton />}
           {current !== "control" && (
             <a href="/control" className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}>
               Control Panel

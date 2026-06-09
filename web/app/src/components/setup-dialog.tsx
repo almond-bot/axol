@@ -1,32 +1,17 @@
-import { useEffect, useState } from "react"
-import { AlertTriangle, Check, Copy, Loader2, Plug, Rocket, Server, X } from "lucide-react"
+import { useEffect } from "react"
+import { AlertTriangle, Loader2, Plug, Server, X } from "lucide-react"
 import { serverHttpBase } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 
-export type ConnState = "loading" | "ok" | "err"
-
-const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
-  {
-    label: "1. Install uv",
-    cmd: "curl -LsSf https://astral.sh/uv/install.sh | sh",
-  },
-  {
-    label: "2. Install the Axol CLI globally",
-    hint: "straight from GitHub",
-    cmd: 'uv tool install --python 3.13 "almond-axol[lerobot,sim] @ git+ssh://git@github.com/almond-bot/axol.git"',
-  },
-  {
-    label: "3. Launch this control panel",
-    cmd: "axol serve",
-  },
-]
+export type ConnState = "loading" | "ok" | "err" | "idle"
 
 /**
  * One-time setup, kept out of the main layout: connect to the machine running
- * `axol serve`, plus copyable install commands. Opened from the nav pill.
+ * `axol serve`. Opened from the nav pill. (Install commands live in the
+ * Quickstart dialog in the nav bar.)
  */
 export function SetupDialog({
   open,
@@ -60,7 +45,7 @@ export function SetupDialog({
         <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
           <div className="flex items-center gap-2">
             <Server className="size-4 text-[#eff483]" />
-            <span className="font-heading text-base font-semibold">Setup</span>
+            <span className="font-heading text-base font-semibold">Axol Host</span>
           </div>
           <button
             type="button"
@@ -75,14 +60,10 @@ export function SetupDialog({
         <div className="flex flex-col gap-6 p-5">
           <section className="flex flex-col gap-2">
             <div className="flex items-center justify-between gap-3">
-              <Label htmlFor="setup-server-host">Server IP</Label>
+              <Label htmlFor="setup-server-host">Axol Host Address</Label>
               <ConnBadge state={conn.state} />
             </div>
-            <p className="text-xs text-white/45">
-              The machine running <span className="font-mono">axol serve</span>. Every command and
-              the live logs are sent there. Just the IP — port{" "}
-              <span className="font-mono">8090</span> is assumed.
-            </p>
+            <p className="text-xs text-white/45">The host connected to Axol.</p>
             <form
               className="flex gap-2"
               onSubmit={(e) => {
@@ -133,23 +114,6 @@ export function SetupDialog({
               </div>
             )}
           </section>
-
-          <section className="flex flex-col gap-3 border-t border-white/10 pt-5">
-            <div className="flex items-center gap-2">
-              <Rocket className="size-4 text-[#eff483]" />
-              <span className="font-heading text-sm font-semibold">Quickstart</span>
-              <span className="text-xs text-white/40">install the CLI &amp; run the server</span>
-            </div>
-            {QUICKSTART.map((step) => (
-              <div key={step.label} className="flex flex-col gap-1.5">
-                <div className="flex items-baseline justify-between gap-3">
-                  <span className="text-sm font-medium text-white/80">{step.label}</span>
-                  {step.hint && <span className="shrink-0 text-xs text-white/35">{step.hint}</span>}
-                </div>
-                <CommandLine cmd={step.cmd} />
-              </div>
-            ))}
-          </section>
         </div>
       </div>
     </div>
@@ -159,37 +123,8 @@ export function SetupDialog({
 function ConnBadge({ state }: { state: ConnState }) {
   if (state === "ok") return <Badge variant="success">Connected</Badge>
   if (state === "err") return <Badge variant="destructive">Offline</Badge>
+  if (state === "idle") return <Badge variant="neutral">Disconnected</Badge>
   return <Badge variant="warning">Connecting…</Badge>
-}
-
-function CommandLine({ cmd }: { cmd: string }) {
-  const [copied, setCopied] = useState(false)
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(cmd)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // clipboard unavailable (e.g. non-secure context) — ignore.
-    }
-  }
-
-  return (
-    <div className="flex items-center gap-2 rounded-lg border border-white/10 bg-black/30 px-3 py-2">
-      <code className="flex-1 overflow-x-auto font-mono text-xs whitespace-pre text-white/80">
-        {cmd}
-      </code>
-      <button
-        type="button"
-        onClick={copy}
-        title="Copy"
-        className="shrink-0 text-white/40 transition-colors hover:text-white/80"
-      >
-        {copied ? <Check className="size-4 text-[#eff483]" /> : <Copy className="size-4" />}
-      </button>
-    </div>
-  )
 }
 
 /** Compact connection status button for the nav; opens the setup dialog. */

@@ -90,17 +90,17 @@ export function OperationPanel({
   // ZED frame timestamps are only valid once both machines' clocks are
   // PTP-locked, so collect-data / run-policy can't start until then.
   if (meta.requiresZed && zedOk && !zedLink?.ptp?.locked) {
-    if (zedLink?.ptp?.needsSudo) blockers.push("Enter the sudo password to start PTP clock sync")
-    else if (zedLink?.ptp?.error) blockers.push(`PTP clock sync failed: ${zedLink.ptp.error}`)
-    else blockers.push("Wait for PTP clock sync to lock")
+    if (zedLink?.ptp?.needsSudo) blockers.push("Enter sudo password for clock sync")
+    else if (zedLink?.ptp?.error) blockers.push(`Clock sync failed: ${zedLink.ptp.error}`)
+    else blockers.push("Wait for clocks to lock")
   }
   // Likewise the cameras must actually be streaming before a task can record /
   // run a policy — gate on the live stream the same way we gate on the clock.
   if (meta.requiresZed && camCount === 0) {
-    blockers.push("Add at least one camera serial in the ZED connection")
+    blockers.push("Add a camera serial in the ZED Box dialog")
   } else if (meta.requiresZed && zedOk && zedLink?.ptp?.locked && !zedLink?.stream?.ready) {
-    if (zedLink?.stream?.error) blockers.push(`ZED camera stream failed: ${zedLink.stream.error}`)
-    else blockers.push("Wait for the ZED cameras to start streaming")
+    if (zedLink?.stream?.error) blockers.push(`Camera stream failed: ${zedLink.stream.error}`)
+    else blockers.push("Wait for cameras to stream")
   }
   for (const f of allFields) {
     if (f.required) {

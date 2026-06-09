@@ -184,6 +184,16 @@ export default function ControlPanel() {
     return () => clearInterval(t)
   }, [conn.state])
 
+  function hostDisconnectClick() {
+    // Client-side disconnect: stop pointing the panel at the host. Any running
+    // op keeps going server-side; reconnecting via Connect refetches its state.
+    setConn({ state: "idle" })
+    setCommands([])
+    setRobot(null)
+    setZedLink(null)
+    setSession(null)
+  }
+
   function updateServerHost(value: string) {
     setServerHost(value)
     if (value.trim()) localStorage.setItem("axolServerHost", value.trim())
@@ -391,6 +401,7 @@ export default function ControlPanel() {
           host={serverHost}
           hostName={hostInfo?.hostname}
           onOpenSetup={() => setSetupOpen(true)}
+          onHostDisconnect={hostDisconnectClick}
           robot={robot}
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}
@@ -461,7 +472,7 @@ export default function ControlPanel() {
         onConnected={(status, url, cameras) => {
           setZedLink(status)
           // Remember the box address + camera serials (as typed) so they
-          // survive a server restart / browser reopen, like the workstation IP.
+          // survive a server restart / browser reopen, like the Axol Host Address.
           patchZed({ boxUrl: url, cameras })
           setZedSudoDismissed(false)
         }}
