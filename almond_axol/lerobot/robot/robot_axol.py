@@ -70,9 +70,36 @@ class AxolRobot(Robot):
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
-        self.cameras = make_cameras_from_configs(config.resolved_cameras())
+        self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
+
+    def _build_cameras(self) -> tuple[dict, list]:
+        """Build the camera set, expanding any stereo camera into two eyes.
+
+        Mono cameras are built via lerobot's registry. A stereo camera is
+        backed by a single ``ZedStereoCamera`` (one decode) whose left/right
+        views are registered under ``<name>_left`` / ``<name>_right`` so the
+        rest of the pipeline treats the two eyes as ordinary cameras.
+        """
+        obs_cams = self.config.observation_cameras()
+        mono = {key: cfg for key, (cfg, eye) in obs_cams.items() if eye is None}
+        cameras: dict = dict(make_cameras_from_configs(mono))
+
+        eyes = {key: (cfg, eye) for key, (cfg, eye) in obs_cams.items() if eye}
+        stereo_cameras: list = []
+        if eyes:
+            from ..camera.camera_zed import ZedStereoCamera
+
+            by_cfg: dict[int, ZedStereoCamera] = {}
+            for key, (cfg, eye) in eyes.items():
+                cam = by_cfg.get(id(cfg))
+                if cam is None:
+                    cam = ZedStereoCamera(cfg)
+                    by_cfg[id(cfg)] = cam
+                    stereo_cameras.append(cam)
+                cameras[key] = cam.left_view if eye == "left" else cam.right_view
+        return cameras, stereo_cameras
 
     # ------------------------------------------------------------------
     # Properties
@@ -88,17 +115,30 @@ class AxolRobot(Robot):
 
     @property
     def observation_features(self) -> dict:
-        if self._observation_features is None:
-            features: dict[str, type | tuple] = {
-                key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS
-            }
-            if self.config.observe_torques:
-                for key in _LEFT_TRQ_KEYS + _RIGHT_TRQ_KEYS:
-                    features[key] = float
-            for cam_name, cfg in self.config.cameras.items():
-                features[cam_name] = (cfg.height, cfg.width, 3)
+        if self._observation_features is not None:
+            return self._observation_features
+
+        features: dict[str, type | tuple] = {
+            key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS
+        }
+        if self.config.observe_torques:
+            for key in _LEFT_TRQ_KEYS + _RIGHT_TRQ_KEYS:
+                features[key] = float
+
+        # Use the live camera dimensions (auto-detected from the stream on
+        # connect) so stereo per-eye sizes are correct; cache only once every
+        # camera reports a size so a pre-connect read isn't frozen in.
+        complete = True
+        for cam_name, cam in self.cameras.items():
+            height = getattr(cam, "height", None)
+            width = getattr(cam, "width", None)
+            if height is None or width is None:
+                complete = False
+            features[cam_name] = (height, width, 3)
+
+        if complete:
             self._observation_features = features
-        return self._observation_features
+        return features
 
     @property
     def action_features(self) -> dict:

@@ -28,6 +28,11 @@ class ZedConfig:
         resolution:       Capture resolution for all cameras (default SVGA).
         fps:              Capture frame rate for all cameras (default 60).
         bitrate:          HEVC encoding bitrate in kbits/s (default 8000).
+        overhead_stereo:  Treat the overhead camera as a stereo ZED X
+                          (``sl.Camera``) instead of a mono ZED-X One
+                          (``sl.CameraOne``). The single stream then carries
+                          both eyes; receivers retrieve LEFT/RIGHT. The wrist
+                          cameras are always mono. Default False.
     """
 
     overhead_serial: int | None = None
@@ -39,6 +44,7 @@ class ZedConfig:
     resolution: sl.RESOLUTION = field(default_factory=lambda: sl.RESOLUTION.SVGA)
     fps: int = 60
     bitrate: int = 8000
+    overhead_stereo: bool = False
 
     def __post_init__(self) -> None:
         """Validate that at least one camera serial number has been provided.

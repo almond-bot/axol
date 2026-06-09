@@ -53,3 +53,21 @@ class AxolRobotConfig(RobotConfig):
             if getattr(cam, "host", "") is None:
                 cam.host = self.zed_host
         return self.cameras
+
+    def observation_cameras(self) -> dict[str, tuple[CameraConfig, str | None]]:
+        """Effective observation cameras keyed by dataset/obs name.
+
+        A mono camera ``X`` maps to ``X -> (cfg, None)``. A stereo camera
+        (``ZedCameraConfig.stereo``) expands into two eyes,
+        ``X_left -> (cfg, "left")`` and ``X_right -> (cfg, "right")``, sharing
+        the same config object (one decode). Used to build the camera set and
+        the dataset observation features so both agree on the keys.
+        """
+        out: dict[str, tuple[CameraConfig, str | None]] = {}
+        for name, cfg in self.resolved_cameras().items():
+            if getattr(cfg, "stereo", False):
+                out[f"{name}_left"] = (cfg, "left")
+                out[f"{name}_right"] = (cfg, "right")
+            else:
+                out[name] = (cfg, None)
+        return out

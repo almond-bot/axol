@@ -65,6 +65,7 @@ const DEFAULT_ZED: ZedSpec = {
   enabled: false,
   boxUrl: "",
   cameras: { overhead: "", left_arm: "", right_arm: "" },
+  overheadStereo: false,
 }
 
 function loadZed(): ZedSpec {
@@ -314,7 +315,7 @@ export default function ControlPanel() {
     setZedBusy(true)
     setError(null)
     try {
-      const next = await zedConnect(url, undefined, zedSettings.cameras)
+      const next = await zedConnect(url, undefined, zedSettings.cameras, zedSettings.overheadStereo)
       setZedLink(next)
       setZedSudoDismissed(false)
     } catch (e) {
@@ -340,7 +341,12 @@ export default function ControlPanel() {
   async function zedSudoSubmit(password: string) {
     setZedSudoBusy(true)
     try {
-      const next = await zedConnect(zedLink?.boxUrl ?? "", password, zedSettings.cameras)
+      const next = await zedConnect(
+        zedLink?.boxUrl ?? "",
+        password,
+        zedSettings.cameras,
+        zedSettings.overheadStereo
+      )
       setZedLink(next)
       // ptp4l validates the password asynchronously; close optimistically and
       // let polling reopen this with an error if the password was wrong.
@@ -480,11 +486,12 @@ export default function ControlPanel() {
         initial={zedLink}
         defaultUrl={zedSettings.boxUrl}
         defaultCameras={zedSettings.cameras}
-        onConnected={(status, url, cameras) => {
+        defaultOverheadStereo={zedSettings.overheadStereo}
+        onConnected={(status, url, cameras, overheadStereo) => {
           setZedLink(status)
-          // Remember the box address + camera serials (as typed) so they
-          // survive a server restart / browser reopen, like the Axol Host Address.
-          patchZed({ boxUrl: url, cameras })
+          // Remember the box address + camera serials (as typed) + stereo flag
+          // so they survive a server restart / browser reopen, like the host.
+          patchZed({ boxUrl: url, cameras, overheadStereo })
           setZedSudoDismissed(false)
         }}
       />

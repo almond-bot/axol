@@ -439,3 +439,323 @@ class ZedCamera(Camera):
             self.zed = None
 
         _logger.info(f"{self} disconnected.")
+
+
+class _EyeBuffer:
+    """Latest-frame slot for one eye of a stereo stream (thread-safe)."""
+
+    def __init__(self) -> None:
+        self.lock: Lock = Lock()
+        self.frame: NDArray[Any] | None = None
+        self.cap_ts: float | None = None
+        self.recv_ts: float | None = None
+        self.event: Event = Event()
+
+    def set(self, frame: NDArray[Any], cap_ts: float, recv_ts: float) -> None:
+        with self.lock:
+            self.frame = frame
+            self.cap_ts = cap_ts
+            self.recv_ts = recv_ts
+        self.event.set()
+
+    def clear(self) -> None:
+        with self.lock:
+            self.frame = None
+            self.cap_ts = None
+            self.recv_ts = None
+        self.event.clear()
+
+
+class ZedStereoCamera:
+    """Receiver for a stereo ZED X network stream with a single shared decode.
+
+    Opens one ``sl.Camera`` from the stream and, on every grab, retrieves both
+    eyes into separate :class:`_EyeBuffer` slots. The left/right eyes are
+    exposed as :class:`_StereoEyeView` objects (``left_view`` / ``right_view``)
+    that present the same read API as :class:`ZedCamera`, so collect-data /
+    run-policy / teleop can treat the two eyes as ordinary cameras while only
+    decoding the HEVC stream once.
+
+    Args:
+        config: Host, port, color mode, and warmup duration (``stereo`` set).
+    """
+
+    def __init__(self, config: ZedCameraConfig) -> None:
+        self.config = config
+        self.zed: sl.Camera | None = None
+        self.thread: Thread | None = None
+        self.stop_event: Event | None = None
+        self.fps: int = config.fps or 60
+        self.width: int | None = config.width
+        self.height: int | None = config.height
+        self._left = _EyeBuffer()
+        self._right = _EyeBuffer()
+        self.left_view = _StereoEyeView(self, self._left, "left")
+        self.right_view = _StereoEyeView(self, self._right, "right")
+
+    def __str__(self) -> str:
+        return f"ZedStereoCamera({self.config.host}:{self.config.port})"
+
+    @property
+    def is_connected(self) -> bool:
+        return self.zed is not None
+
+    def connect(self, warmup: bool = True) -> None:
+        """Open the stereo stream and start the shared grab thread."""
+        if self.is_connected:
+            return
+        if self.config.host is None:
+            raise ValueError(
+                f"{self} has no host set. Pass host= explicitly, or build the "
+                "camera via AxolRobot so it inherits AxolRobotConfig.zed_host."
+            )
+        zed = sl.Camera()
+        init_params = sl.InitParameters()
+        init_params.set_from_stream(self.config.host, self.config.port)
+        # We only need the rectified images; skip depth to save GPU.
+        init_params.depth_mode = sl.DEPTH_MODE.NONE
+        # See ZedCamera.connect for why async recovery matters on a flaky link.
+        init_params.async_grab_camera_recovery = True
+
+        err = zed.open(init_params)
+        if err != sl.ERROR_CODE.SUCCESS:
+            raise ConnectionError(
+                f"{self} failed to open stream at "
+                f"{self.config.host}:{self.config.port}: {err}"
+            )
+
+        self.zed = zed
+
+        info = zed.get_camera_information()
+        params = info.camera_configuration.resolution
+        stream_fps = int(info.camera_configuration.fps)
+        # For a stereo sl.Camera the SDK reports per-eye resolution, which is
+        # exactly what retrieve_image(LEFT/RIGHT) returns.
+        stream_width = int(params.width)
+        stream_height = int(params.height)
+
+        # Enforce config == stream (per eye) like the mono ZedCamera, so the
+        # dataset features built from config before connect stay valid.
+        mismatches = []
+        if self.config.fps is not None and stream_fps != self.config.fps:
+            mismatches.append(f"fps: expected {self.config.fps}, got {stream_fps}")
+        if self.config.width is not None and stream_width != self.config.width:
+            mismatches.append(
+                f"width: expected {self.config.width}, got {stream_width}"
+            )
+        if self.config.height is not None and stream_height != self.config.height:
+            mismatches.append(
+                f"height: expected {self.config.height}, got {stream_height}"
+            )
+        if mismatches:
+            zed.close()
+            self.zed = None
+            raise RuntimeError(
+                f"{self} stream parameters do not match config (per eye) — "
+                + ", ".join(mismatches)
+                + ". Update ZedCameraConfig or the sender settings."
+            )
+
+        self.fps = stream_fps
+        self.width = stream_width
+        self.height = stream_height
+
+        self._start_read_thread()
+
+        if warmup:
+            start = time.time()
+            while time.time() - start < self.config.warmup_s:
+                if self._left.event.wait(timeout=self.config.warmup_s):
+                    break
+
+        _logger.info(
+            f"{self} connected ({self.width}x{self.height} @ {self.fps}fps, stereo)."
+        )
+
+    def _start_read_thread(self) -> None:
+        self._stop_read_thread()
+        self.stop_event = Event()
+        self.thread = Thread(
+            target=self._read_loop, name=f"{self}_read_loop", daemon=True
+        )
+        self.thread.start()
+
+    def _stop_read_thread(self) -> None:
+        if self.stop_event is not None:
+            self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        self.thread = None
+        self.stop_event = None
+        self._left.clear()
+        self._right.clear()
+
+    def _read_loop(self) -> None:
+        if self.stop_event is None or self.zed is None:
+            return
+
+        left_mat = sl.Mat()
+        right_mat = sl.Mat()
+        grab_failure_streak = 0
+        last_grab_warning_perf = 0.0
+
+        while not self.stop_event.is_set():
+            try:
+                err = self.zed.grab()
+                if err != sl.ERROR_CODE.SUCCESS:
+                    grab_failure_streak += 1
+                    now = time.perf_counter()
+                    if now - last_grab_warning_perf >= 1.0:
+                        _logger.warning(
+                            "%s grab returned %s (%d consecutive failures); "
+                            "stream is recovering in the background.",
+                            self,
+                            err,
+                            grab_failure_streak,
+                        )
+                        last_grab_warning_perf = now
+                    if self.stop_event.wait(timeout=0.05):
+                        return
+                    continue
+
+                if grab_failure_streak > 0:
+                    _logger.info(
+                        "%s grab recovered after %d failed attempts.",
+                        self,
+                        grab_failure_streak,
+                    )
+                    grab_failure_streak = 0
+
+                self.zed.retrieve_image(left_mat, sl.VIEW.LEFT)
+                self.zed.retrieve_image(right_mat, sl.VIEW.RIGHT)
+
+                # One grab → both eyes share the same capture instant.
+                cap_wall = (
+                    self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
+                    * 1e-9
+                )
+                recv_wall = time.time()
+                recv_perf = time.perf_counter()
+                cap_perf = recv_perf - (recv_wall - cap_wall)
+
+                for mat, buf in ((left_mat, self._left), (right_mat, self._right)):
+                    raw = mat.get_data()  # BGRA uint8 (height, width, 4)
+                    if self.config.color_mode == ColorMode.RGB:
+                        frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGB)
+                    else:
+                        frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+                    buf.set(frame, cap_perf, recv_perf)
+
+            except DeviceNotConnectedError:
+                break
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                _logger.warning(f"{self} read loop error: {exc}")
+                if self.stop_event.wait(timeout=0.05):
+                    return
+
+    def disconnect(self) -> None:
+        """Stop the grab thread and close the stereo stream."""
+        if not self.is_connected and self.thread is None:
+            return
+        self._stop_read_thread()
+        if self.zed is not None:
+            self.zed.close()
+            self.zed = None
+        _logger.info(f"{self} disconnected.")
+
+
+class _StereoEyeView:
+    """One eye of a :class:`ZedStereoCamera`, presented as a camera.
+
+    Implements the subset of the :class:`ZedCamera` read API that the Axol
+    robot, collect-data, and teleop use (``read_latest`` / ``read_latest_with_ts``
+    / ``read_at_or_after`` plus ``fps`` / ``width`` / ``height``). ``connect`` /
+    ``disconnect`` defer to the shared parent so the stream is opened and closed
+    exactly once regardless of iteration order.
+    """
+
+    def __init__(self, parent: ZedStereoCamera, buf: _EyeBuffer, eye: str) -> None:
+        self._parent = parent
+        self._buf = buf
+        self._eye = eye
+
+    def __str__(self) -> str:
+        c = self._parent.config
+        return f"ZedStereoEye({self._eye}@{c.host}:{c.port})"
+
+    @property
+    def fps(self) -> int:
+        return self._parent.fps
+
+    @property
+    def width(self) -> int | None:
+        return self._parent.width
+
+    @property
+    def height(self) -> int | None:
+        return self._parent.height
+
+    @property
+    def is_connected(self) -> bool:
+        return self._parent.is_connected
+
+    def connect(self, warmup: bool = True) -> None:
+        if not self._parent.is_connected:
+            self._parent.connect(warmup=warmup)
+
+    def disconnect(self) -> None:
+        if self._parent.is_connected:
+            self._parent.disconnect()
+
+    def _running(self) -> bool:
+        return self._parent.thread is not None and self._parent.thread.is_alive()
+
+    def read_latest_with_ts(self) -> tuple[NDArray[Any], float, float]:
+        if not self._running():
+            raise RuntimeError(f"{self} read thread is not running.")
+        with self._buf.lock:
+            frame = self._buf.frame
+            cap_ts = self._buf.cap_ts
+            recv_ts = self._buf.recv_ts
+        if frame is None or cap_ts is None or recv_ts is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+        return frame, cap_ts, recv_ts
+
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
+        frame, _cap_ts, recv_ts = self.read_latest_with_ts()
+        age_ms = (time.perf_counter() - recv_ts) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"{self} latest frame is too old: {age_ms:.1f}ms (max {max_age_ms}ms)."
+            )
+        return frame
+
+    def read_at_or_after(
+        self,
+        target_capture_perf_ts: float,
+        timeout_ms: float = 500,
+    ) -> tuple[NDArray[Any], float, float]:
+        if not self._running():
+            raise RuntimeError(f"{self} read thread is not running.")
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while True:
+            self._buf.event.clear()
+            with self._buf.lock:
+                frame = self._buf.frame
+                cap_ts = self._buf.cap_ts
+                recv_ts = self._buf.recv_ts
+            if (
+                frame is not None
+                and cap_ts is not None
+                and recv_ts is not None
+                and cap_ts >= target_capture_perf_ts
+            ):
+                return frame, cap_ts, recv_ts
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self} timed out waiting for frame at "
+                    f"capture_perf_ts >= {target_capture_perf_ts:.6f} "
+                    f"after {timeout_ms:.1f}ms (latest cap_ts={cap_ts!r})."
+                )
+            self._buf.event.wait(timeout=remaining)

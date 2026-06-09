@@ -341,9 +341,12 @@ class OperationRunner:
             return
         cfg.zed_host = host
         cfg.zed_cameras = cameras
+        # Mirror the box's stereo overhead so teleop relays both eyes per-lens.
+        cfg.overhead_stereo = bool(getattr(stream, "overhead_stereo", False))
+        stereo_note = " (overhead stereo)" if cfg.overhead_stereo else ""
         session.emit(
             "[serve] teleop: relaying ZED cameras to the headset "
-            f"({', '.join(cameras)})"
+            f"({', '.join(cameras)}){stereo_note}"
         )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:
@@ -450,6 +453,14 @@ class OperationRunner:
 
         async def run_main(main_args: dict[str, Any]) -> int:
             cfg = self._build_config(op_id, main_args)
+            # A stereo overhead can't be expressed via flat argv (nested camera
+            # config), so mutate the built config — mirroring the zed_host
+            # injection the orchestrator does in _main_args.
+            if zed.get("overheadStereo"):
+                cams = getattr(cfg.robot_config, "cameras", {}) or {}
+                overhead = cams.get("overhead")
+                if overhead is not None:
+                    overhead.stereo = True
             if op_id == "collect-data":
                 from ..cli.collect_data import _run as core
 

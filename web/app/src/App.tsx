@@ -176,6 +176,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const groupRef = useRef<THREE.Group>(null)
   const meshRef = useRef<THREE.Mesh>(null)
   const matRef = useRef<THREE.MeshBasicMaterial>(null)
+  // Per-eye planes for a stereo overhead: left on layer 1 (left lens only),
+  // right on layer 2 (right lens only). Unused for mono feeds.
+  const leftMeshRef = useRef<THREE.Mesh>(null)
+  const leftMatRef = useRef<THREE.MeshBasicMaterial>(null)
+  const rightMeshRef = useRef<THREE.Mesh>(null)
+  const rightMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const spinnerRef = useRef<THREE.Group>(null)
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
@@ -232,6 +238,13 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     }
   }, [])
 
+  // Confine the stereo eye planes to their lens via three.js layers: an object
+  // on layer 1 renders to the left eye only, layer 2 to the right eye only.
+  useEffect(() => {
+    leftMeshRef.current?.layers.set(1)
+    rightMeshRef.current?.layers.set(2)
+  }, [])
+
   useFrame(() => {
     const group = groupRef.current
     const mesh = meshRef.current
@@ -269,12 +282,20 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       stickZoneRef.current = zone
     }
 
-    // Fall back to overhead, then to whatever stream exists.
-    let name = lockedRef.current
-    let tex = textures[name]
-    if (!tex) {
-      name = textures.overhead ? "overhead" : (Object.keys(textures)[0] ?? "overhead")
-      tex = textures[name]
+    // Stereo overhead: when locked on the overhead and both eyes are streaming,
+    // render a per-eye plane (left → layer 1, right → layer 2) so each lens sees
+    // its own image. Otherwise a single layer-0 plane is shared by both eyes.
+    const stereo =
+      lockedRef.current === "overhead" &&
+      !!textures["overhead_left"] &&
+      !!textures["overhead_right"]
+
+    // The "primary" texture drives live/spinner state and (in mono) the plane.
+    let tex: THREE.VideoTexture | undefined
+    if (stereo) {
+      tex = textures["overhead_left"]
+    } else {
+      tex = textures[lockedRef.current] ?? textures.overhead ?? Object.values(textures)[0]
     }
 
     // A feed is "live" only once its video has decoded real frames; until then
@@ -290,35 +311,77 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinnerMeshRef.current.rotation.z -= 0.12
     }
 
-    if (!group.visible || !tex) return
+    const leftMesh = leftMeshRef.current
+    const rightMesh = rightMeshRef.current
+    const leftMat = leftMatRef.current
+    const rightMat = rightMatRef.current
 
-    if (mat.map !== tex) {
-      mat.map = tex
-      mat.needsUpdate = true
+    if (!group.visible || !tex) {
+      if (leftMesh) leftMesh.visible = false
+      if (rightMesh) rightMesh.visible = false
+      return
     }
 
-    // Size the plane to fill the headset's field of view at FEED_DISTANCE so the
-    // feed is immersive, then crop the video to "cover" the plane (no
+    // Size the planes to fill the headset's field of view at FEED_DISTANCE so
+    // the feed is immersive, then crop each video to "cover" the plane (no
     // letterboxing) by adjusting the texture UVs.
     const pm = cam.projectionMatrix.elements
     const tanY = pm[5] ? 1 / pm[5] : Math.tan((70 * Math.PI) / 180 / 2)
     const tanX = pm[0] ? 1 / pm[0] : tanY * (16 / 9)
     const planeH = 2 * FEED_DISTANCE * tanY * FEED_FOV_MARGIN
     const planeW = 2 * FEED_DISTANCE * tanX * FEED_FOV_MARGIN
-    mesh.scale.set(planeW, planeH, 1)
+    const planeAspect = planeW / planeH
 
-    if (video && video.videoWidth) {
-      const planeAspect = planeW / planeH
-      const videoAspect = video.videoWidth / video.videoHeight
+    const cover = (t: THREE.VideoTexture) => {
+      const v = t.image as HTMLVideoElement | undefined
+      if (!v || !v.videoWidth) return
+      const videoAspect = v.videoWidth / v.videoHeight
       if (videoAspect > planeAspect) {
         const r = planeAspect / videoAspect
-        tex.repeat.set(r, 1)
-        tex.offset.set((1 - r) / 2, 0)
+        t.repeat.set(r, 1)
+        t.offset.set((1 - r) / 2, 0)
       } else {
         const r = videoAspect / planeAspect
-        tex.repeat.set(1, r)
-        tex.offset.set(0, (1 - r) / 2)
+        t.repeat.set(1, r)
+        t.offset.set(0, (1 - r) / 2)
       }
+    }
+
+    if (stereo && leftMesh && rightMesh && leftMat && rightMat) {
+      mesh.visible = false
+      const lTex = textures["overhead_left"]
+      const rTex = textures["overhead_right"]
+      if (leftMat.map !== lTex) {
+        leftMat.map = lTex
+        leftMat.needsUpdate = true
+      }
+      if (rightMat.map !== rTex) {
+        rightMat.map = rTex
+        rightMat.needsUpdate = true
+      }
+      leftMesh.scale.set(planeW, planeH, 1)
+      rightMesh.scale.set(planeW, planeH, 1)
+      cover(lTex)
+      cover(rTex)
+      leftMesh.visible = true
+      rightMesh.visible = true
+      // three.js shows layer-1 objects to the left eye and layer-2 to the right;
+      // enable explicitly in case the renderer hasn't done so this frame.
+      const eyes = (cam as THREE.ArrayCamera).cameras
+      if (eyes && eyes.length >= 2) {
+        eyes[0].layers.enable(1)
+        eyes[1].layers.enable(2)
+      }
+    } else {
+      mesh.visible = true
+      if (leftMesh) leftMesh.visible = false
+      if (rightMesh) rightMesh.visible = false
+      if (mat.map !== tex) {
+        mat.map = tex
+        mat.needsUpdate = true
+      }
+      mesh.scale.set(planeW, planeH, 1)
+      cover(tex)
     }
   })
 
@@ -328,6 +391,24 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         <mesh ref={meshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
+        </mesh>
+        <mesh ref={leftMeshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1} visible={false}>
+          <planeGeometry args={[1, 1]} />
+          <meshBasicMaterial
+            ref={leftMatRef}
+            toneMapped={false}
+            depthTest={false}
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh ref={rightMeshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1} visible={false}>
+          <planeGeometry args={[1, 1]} />
+          <meshBasicMaterial
+            ref={rightMatRef}
+            toneMapped={false}
+            depthTest={false}
+            depthWrite={false}
+          />
         </mesh>
         <Text
           position={[0, -0.5, -FEED_DISTANCE]}

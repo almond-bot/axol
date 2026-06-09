@@ -28,6 +28,7 @@ export function ZedConnectDialog({
   initial,
   defaultUrl,
   defaultCameras,
+  defaultOverheadStereo,
   onConnected,
 }: {
   open: boolean
@@ -37,10 +38,20 @@ export function ZedConnectDialog({
   defaultUrl?: string
   /** Persisted camera serials to prefill. */
   defaultCameras?: Cameras
-  onConnected: (status: ZedLinkStatus, url: string, cameras: Cameras) => void
+  /** Persisted "overhead is stereo" flag to prefill. */
+  defaultOverheadStereo?: boolean
+  onConnected: (
+    status: ZedLinkStatus,
+    url: string,
+    cameras: Cameras,
+    overheadStereo: boolean
+  ) => void
 }) {
   const [url, setUrl] = useState(initial?.boxUrl || defaultUrl || "")
   const [cameras, setCameras] = useState<Cameras>(defaultCameras ?? EMPTY_CAMERAS)
+  const [overheadStereo, setOverheadStereo] = useState(
+    initial?.overheadStereo ?? defaultOverheadStereo ?? false
+  )
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -63,8 +74,8 @@ export function ZedConnectDialog({
       right_arm: cameras.right_arm.trim(),
     }
     try {
-      const status = await zedConnect(url.trim(), undefined, trimmed)
-      onConnected(status, url.trim(), trimmed)
+      const status = await zedConnect(url.trim(), undefined, trimmed, overheadStereo)
+      onConnected(status, url.trim(), trimmed, overheadStereo)
       onClose()
     } catch (e) {
       setError(String(e).replace(/^Error:\s*/, ""))
@@ -154,6 +165,15 @@ export function ZedConnectDialog({
                 />
               </div>
             ))}
+            <label className="flex cursor-pointer items-center gap-2 text-white/70">
+              <input
+                type="checkbox"
+                checked={overheadStereo}
+                onChange={(e) => setOverheadStereo(e.target.checked)}
+                className="size-4 accent-[#eff483]"
+              />
+              <span className="text-sm">Overhead is stereo (ZED X)</span>
+            </label>
           </div>
         </div>
       </div>

@@ -28,6 +28,10 @@ class ZedCameraConfig(CameraConfig):
         height:     Expected frame height in pixels (default 600, SVGA).
         color_mode: Output color channel order (default RGB).
         warmup_s:   Seconds to read frames during connect() before returning.
+        stereo:     Treat the stream as a stereo ZED X carrying both eyes. The
+                    robot expands a stereo camera ``X`` into two observation
+                    keys ``X_left`` / ``X_right`` backed by a single decode.
+                    Default False (mono ZED-X One).
     """
 
     host: str | None = None
@@ -37,6 +41,7 @@ class ZedCameraConfig(CameraConfig):
     height: int | None = 600
     color_mode: ColorMode = ColorMode.RGB
     warmup_s: int = 1
+    stereo: bool = False
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)

@@ -1,9 +1,11 @@
 """
-ZED-X One camera streamer for the Axol robot.
+ZED camera streamer for the Axol robot.
 
-ZedStreamer opens up to three ZED-X One cameras (overhead, left_arm, right_arm)
-by serial number and streams each over HEVC on the local network using the ZED
-SDK's built-in streaming API.
+ZedStreamer opens up to three cameras (overhead, left_arm, right_arm) by serial
+number and streams each over HEVC on the local network using the ZED SDK's
+built-in streaming API. The wrist cameras are mono ZED-X One (``sl.CameraOne``);
+the overhead may optionally be a stereo ZED X (``sl.Camera``, both eyes on one
+stream) via ``ZedConfig.overhead_stereo``.
 
 Typical usage::
 
@@ -43,7 +45,7 @@ class _CameraState:
     name: str
     serial: int
     port: int
-    zed: sl.CameraOne
+    zed: sl.CameraOne | sl.Camera
     stop_event: threading.Event
     thread: threading.Thread | None = None
 
@@ -79,43 +81,54 @@ class ZedStreamer:
             return
 
         cfg = self._config
+        # The overhead may be a stereo ZED X (sl.Camera); the wrist cameras are
+        # always mono ZED-X One (sl.CameraOne).
         all_specs = [
-            ("overhead", cfg.overhead_serial, cfg.overhead_port),
-            ("left_arm", cfg.left_arm_serial, cfg.left_arm_port),
-            ("right_arm", cfg.right_arm_serial, cfg.right_arm_port),
+            ("overhead", cfg.overhead_serial, cfg.overhead_port, cfg.overhead_stereo),
+            ("left_arm", cfg.left_arm_serial, cfg.left_arm_port, False),
+            ("right_arm", cfg.right_arm_serial, cfg.right_arm_port, False),
         ]
         specs = [
-            (name, serial, port)
-            for name, serial, port in all_specs
+            (name, serial, port, stereo)
+            for name, serial, port, stereo in all_specs
             if serial is not None
         ]
 
-        devices = sl.CameraOne.get_device_list()
-        available_serials = {int(d.serial_number) for d in devices}
+        # Stereo (ZED X) and mono (ZED-X One) cameras live in separate device
+        # lists, so union both so either kind of serial validates.
+        mono_devices = sl.CameraOne.get_device_list()
+        stereo_devices = sl.Camera.get_device_list()
+        available_serials = {int(d.serial_number) for d in mono_devices} | {
+            int(d.serial_number) for d in stereo_devices
+        }
         _logger.info(
-            "Detected %d ZED-X One camera(s): %s",
-            len(devices),
-            ", ".join(str(int(d.serial_number)) for d in devices) or "<none>",
+            "Detected %d mono + %d stereo ZED camera(s): %s",
+            len(mono_devices),
+            len(stereo_devices),
+            ", ".join(
+                str(int(d.serial_number)) for d in (*mono_devices, *stereo_devices)
+            )
+            or "<none>",
         )
 
         failures: list[str] = []
-        resolved_specs: list[tuple[str, int, int]] = []
-        for name, serial, port in specs:
+        resolved_specs: list[tuple[str, int, int, bool]] = []
+        for name, serial, port, stereo in specs:
             if int(serial) not in available_serials:
                 _logger.error(
                     "Requested %s serial %d not found in device list.", name, serial
                 )
                 failures.append(f"{name} (serial {serial}): not connected")
                 continue
-            resolved_specs.append((name, serial, port))
+            resolved_specs.append((name, serial, port, stereo))
 
         # Open cameras sequentially: the ZED SDK's open() + enable_streaming()
         # path touches shared NVENC state on Jetson and isn't safe to call
-        # concurrently across sl.CameraOne instances.
+        # concurrently across camera instances.
         loop = asyncio.get_running_loop()
-        for name, serial, port in resolved_specs:
+        for name, serial, port, stereo in resolved_specs:
             state = await loop.run_in_executor(
-                None, self._open_camera, name, serial, port
+                None, self._open_camera, name, serial, port, stereo
             )
             if state is None:
                 failures.append(f"{name} (serial {serial}): failed to open")
@@ -163,10 +176,19 @@ class ZedStreamer:
     # Internal (runs in thread-pool executor)
     # ------------------------------------------------------------------
 
-    def _open_camera(self, name: str, serial: int, port: int) -> _CameraState | None:
-        zed = sl.CameraOne()
-
-        init_params = sl.InitParametersOne()
+    def _open_camera(
+        self, name: str, serial: int, port: int, stereo: bool = False
+    ) -> _CameraState | None:
+        # A stereo ZED X uses the full sl.Camera API; the mono ZED-X One uses
+        # the lighter sl.CameraOne API. Both expose open/enable_streaming/grab.
+        if stereo:
+            zed = sl.Camera()
+            init_params = sl.InitParameters()
+            # We only stream images, so skip depth to save Jetson compute.
+            init_params.depth_mode = sl.DEPTH_MODE.NONE
+        else:
+            zed = sl.CameraOne()
+            init_params = sl.InitParametersOne()
         init_params.camera_resolution = self._config.resolution
         init_params.camera_fps = self._config.fps
         init_params.set_from_serial_number(serial)

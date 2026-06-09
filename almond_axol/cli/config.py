@@ -404,6 +404,10 @@ class TeleopCmdConfig:
     slots to receive. Requires the cameras to already be streaming from
     the box (e.g. via ``axol zed.stream`` or a connected ZED box in the
     control panel) and the ``video`` extra installed locally.
+
+    Set ``--overhead_stereo`` when the overhead is a stereo ZED X: its two
+    eyes are relayed as ``overhead_left`` / ``overhead_right`` and rendered
+    per-lens in the headset for true stereo.
     """
 
     sim: bool = False
@@ -415,6 +419,7 @@ class TeleopCmdConfig:
     zed_cameras: list[str] = field(
         default_factory=lambda: ["overhead", "left_arm", "right_arm"]
     )
+    overhead_stereo: bool = False
     log_level: LogLevel = "INFO"
 
 

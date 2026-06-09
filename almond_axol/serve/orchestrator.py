@@ -418,6 +418,7 @@ class StreamLink:
         self._ptp = ptp
         self.box: str = ""
         self.cameras: dict[str, str] = {}
+        self.overhead_stereo: bool = False
         self.session: Session | None = None
         self._remote: _Remote | None = None
         self._tasks: list[asyncio.Task[Any]] = []
@@ -450,18 +451,22 @@ class StreamLink:
         box_url: str,
         cameras: dict[str, str],
         options: dict[str, Any] | None = None,
+        overhead_stereo: bool = False,
     ) -> dict[str, Any]:
         """(Re)start streaming the given camera serials. Idempotent.
 
         Waits for the PTP clocks to lock first (frames carry PTP timestamps),
         then asks the box to stream and waits for the ports to open. With no
-        serials it tears any prior stream down and stays idle.
+        serials it tears any prior stream down and stays idle. When
+        ``overhead_stereo`` is set the box streams the overhead as a stereo
+        ZED X (both eyes on one stream).
         """
         await self.stop()
         async with self._lock:
             self._stopping = False
             self._ready.clear()
             self.box = _normalize_url(box_url)
+            self.overhead_stereo = overhead_stereo
             self.cameras = {
                 slot: str(cameras.get(slot, "")).strip()
                 for slot in _CAMERA_PORTS
@@ -520,6 +525,8 @@ class StreamLink:
         for opt in ("resolution", "fps", "bitrate"):
             if options.get(opt) not in (None, ""):
                 payload[opt] = options[opt]
+        if self.overhead_stereo:
+            payload["overhead_stereo"] = True
         try:
             self._remote = await self._box_run("/api/zed/stream", payload)
         except OrchestrationError as exc:
@@ -734,6 +741,8 @@ class ZedOrchestrator:
             for opt in ("resolution", "fps", "bitrate"):
                 if self.zed.get(opt) not in (None, ""):
                     stream_args[opt] = self.zed[opt]
+            if self.zed.get("overheadStereo"):
+                stream_args["overhead_stereo"] = True
             stream = await self._box_run("/api/zed/stream", stream_args, label="stream")
             self._tail_remote(stream, self._watch_stream)
 

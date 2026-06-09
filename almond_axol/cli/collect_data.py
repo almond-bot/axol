@@ -63,19 +63,13 @@ def _default_robot_config() -> AxolRobotConfig:
     )
 
 
-# Cameras relayed to the headset over WebRTC. The overhead camera is the
-# operator's main immersive feed; the two wrist cameras are switched in with the
-# right thumbstick (see the VR app's ImmersiveCameraFeed).
-_HEADSET_CAMERAS = ("overhead", "left_arm", "right_arm")
-
-
 def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
     """Register the ZED cameras as WebRTC video sources for the headset.
 
-    Streams the overhead camera (the operator's main immersive feed) plus both
-    wrist cameras so the headset can switch between them. Best-effort: reads the
-    latest decoded frame ZedCamera already keeps, so it never blocks the capture
-    pipeline.
+    Relays every camera the robot exposes (overhead — or ``overhead_left`` /
+    ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
+    show them. Best-effort: reads the latest decoded frame each camera already
+    keeps, so it never blocks the capture pipeline.
     """
 
     def _make_source(cam: Any) -> Callable[[], Any]:
@@ -87,11 +81,9 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
         return _source
 
-    sources: dict[str, Callable[[], Any]] = {}
-    for name in _HEADSET_CAMERAS:
-        cam = robot.cameras.get(name)
-        if cam is not None:
-            sources[name] = _make_source(cam)
+    sources: dict[str, Callable[[], Any]] = {
+        name: _make_source(cam) for name, cam in robot.cameras.items()
+    }
 
     if not sources:
         return

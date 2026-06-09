@@ -88,7 +88,7 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
     if not cfg.zed_host:
         return []
     try:
-        from ..lerobot.camera.camera_zed import ZedCamera
+        from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
         from ..lerobot.camera.configuration_zed import ZedCameraConfig
     except Exception as exc:  # noqa: BLE001 - missing pyzed/SDK → no preview
         _logger.warning("ZED camera preview unavailable: %s", exc)
@@ -100,6 +100,22 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
         if port is None:
             _logger.warning("teleop: unknown ZED camera slot %r — skipping", name)
             continue
+
+        # A stereo overhead carries both eyes on one stream; expose them as
+        # overhead_left / overhead_right so the headset can render per-lens.
+        if name == "overhead" and cfg.overhead_stereo:
+            stereo = ZedStereoCamera(
+                ZedCameraConfig(host=cfg.zed_host, port=port, stereo=True)
+            )
+            try:
+                stereo.connect(warmup=False)
+            except Exception as exc:  # noqa: BLE001 - slot not streaming → skip it
+                _logger.info("teleop: overhead stereo camera not available (%s)", exc)
+                continue
+            cameras.append(("overhead_left", stereo.left_view))
+            cameras.append(("overhead_right", stereo.right_view))
+            continue
+
         cam = ZedCamera(ZedCameraConfig(host=cfg.zed_host, port=port))
         try:
             cam.connect(warmup=False)
