@@ -121,7 +121,7 @@ npm run dev --workspace=app
 ```
 
 - **VR**: open the printed localhost URL on your Quest browser, enter the hostname of the machine running the Almond Axol SDK, press **Connect**, then **Start** to enter the AR session.
-- **Control panel**: open `/control` in a normal browser. It talks to the `axol serve` API (default `https://localhost:8090`).
+- **Control panel**: open `/control` in a normal browser. It talks to the `axol serve` API (default `https://localhost:8001`).
 
 **Build**
 

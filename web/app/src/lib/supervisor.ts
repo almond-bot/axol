@@ -73,7 +73,7 @@ export function setServerBase(host: string): void {
 
 /**
  * Normalize a user-entered address to an `https://host:port` origin (or "").
- * Defaults to HTTPS + port 8090 since the local serve is TLS by default and an
+ * Defaults to HTTPS + port 8001 since the local serve is TLS by default and an
  * HTTPS page cannot call a plain-HTTP server (mixed content).
  */
 export function serverHttpBase(host: string): string {
@@ -82,7 +82,7 @@ export function serverHttpBase(host: string): string {
   const withScheme = /^https?:\/\//.test(h) ? h : `https://${h}`
   try {
     const u = new URL(withScheme)
-    if (!u.port) u.port = "8090"
+    if (!u.port) u.port = "8001"
     return u.origin
   } catch {
     return ""

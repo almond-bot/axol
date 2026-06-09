@@ -36,8 +36,9 @@ from collections.abc import Callable
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-from .certs import create_self_signed_cert
+from .certs import ACCEPT_PAGE_HTML, create_self_signed_cert
 from .config import VRServerConfig
 from .models import VRFrame
 
@@ -162,6 +163,11 @@ class VRServer:
     def _build_app(self) -> FastAPI:
         app = FastAPI()
         server = self
+
+        @app.get("/__accept")
+        async def _accept() -> HTMLResponse:
+            """Self-closing page the web UI opens to approve the self-signed cert."""
+            return HTMLResponse(ACCEPT_PAGE_HTML)
 
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:

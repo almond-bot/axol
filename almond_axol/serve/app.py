@@ -17,10 +17,11 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from ..sudo import SUDO_PASSWORD_ENV
+from ..vr.certs import ACCEPT_PAGE_HTML
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .netdetect import best_eth_iface, iface_owning, list_eth_ifaces
@@ -111,7 +112,7 @@ class StreamRequest(BaseModel):
 
 
 # Ports the launched commands expose on the serve host.
-_VIEWER_PORT = 8080  # viser sim 3D viewer
+_VIEWER_PORT = 8002  # viser sim 3D viewer
 _VR_PORT = 8000  # VR teleop WebSocket server
 
 
@@ -126,7 +127,7 @@ def _lan_ip() -> str:
 
 
 def _normalize_box_url(url: str) -> str:
-    """Add scheme + default control port (8090) to a bare ZED box address.
+    """Add scheme + default control port (8001) to a bare ZED box address.
 
     A bare IP defaults to ``https`` because ``axol serve`` is TLS by default
     (same as the workstation link); pass an explicit ``http://`` if the box was
@@ -139,7 +140,7 @@ def _normalize_box_url(url: str) -> str:
         base = f"https://{base}"
     parts = urlsplit(base)
     if parts.port is None and parts.hostname:
-        base = f"{parts.scheme}://{parts.hostname}:8090"
+        base = f"{parts.scheme}://{parts.hostname}:8001"
     return base
 
 
@@ -198,6 +199,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.get("/__accept")
+    async def accept_cert() -> HTMLResponse:
+        """Self-closing page the web UI opens to approve the self-signed cert.
+
+        Registered before the SPA catch-all (mounted last) so it isn't shadowed.
+        """
+        return HTMLResponse(ACCEPT_PAGE_HTML)
 
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:

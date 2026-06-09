@@ -6,7 +6,7 @@ robot can be driven from a browser instead of a terminal. It serves the built
 web UI (when present) and a JSON/WebSocket API that launches, streams, and
 stops ``axol`` commands as subprocesses.
 
-    axol serve                  # serve on http://localhost:8090
+    axol serve                  # serve on http://localhost:8001
     axol serve --port 9000
     axol serve --open           # also open a browser window on startup
     axol serve --host 127.0.0.1 # localhost only
@@ -43,8 +43,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--port",
         type=int,
-        default=8090,
-        help="Port to listen on (default: 8090).",
+        default=8001,
+        help="Port to listen on (default: 8001).",
     )
     parser.add_argument(
         "--open",

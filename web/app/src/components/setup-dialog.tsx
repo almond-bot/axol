@@ -1,6 +1,7 @@
 import { useEffect } from "react"
-import { AlertTriangle, Loader2, Plug, Server, X } from "lucide-react"
+import { AlertTriangle, Loader2, Plug, Server, ShieldCheck, X } from "lucide-react"
 import { serverHttpBase } from "@/lib/supervisor"
+import { authorizeCert } from "@/lib/cert-accept"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -92,24 +93,28 @@ export function SetupDialog({
               </Button>
             </form>
             {conn.state === "err" && (
-              <div className="flex flex-col gap-1 text-xs text-red-400">
+              <div className="flex flex-col gap-2 text-xs text-red-400">
                 <span className="flex items-center gap-1.5">
                   <AlertTriangle className="size-3" />
                   Can&apos;t reach {base || "the server"}.
                 </span>
                 {base && (
-                  <span className="text-white/45">
-                    If it&apos;s running, the TLS certificate may need a one-time approval — open{" "}
-                    <a
-                      href={base}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-[#eff483] underline underline-offset-2"
+                  <>
+                    <span className="text-white/45">
+                      If it&apos;s running, its self-signed TLS certificate needs a one-time
+                      approval. Authorize it, accept the warning in the popup, then it reconnects.
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="self-start"
+                      onClick={() => authorizeCert(base).then(onConnect)}
                     >
-                      {base}
-                    </a>{" "}
-                    in a new tab, accept the warning, then Connect again.
-                  </span>
+                      <ShieldCheck />
+                      Authorize certificate
+                    </Button>
+                  </>
                 )}
               </div>
             )}

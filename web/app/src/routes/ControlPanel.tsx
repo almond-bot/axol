@@ -91,7 +91,7 @@ export default function ControlPanel() {
     () => localStorage.getItem("axolServerHost") ?? ""
   )
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
-  const [viewerPort, setViewerPort] = useState(8080)
+  const [viewerPort, setViewerPort] = useState(8002)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)

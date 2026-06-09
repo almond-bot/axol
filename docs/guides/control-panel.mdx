@@ -22,8 +22,8 @@ This prints a local and a LAN URL (HTTPS by default):
 
 ```
 Axol control panel:
-  Local : https://localhost:8090
-  LAN   : https://192.168.1.50:8090
+  Local : https://localhost:8001
+  LAN   : https://192.168.1.50:8001
 ```
 
 Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`.
@@ -41,7 +41,7 @@ The top of the panel is a row of three connection tiles — **Workstation**, **A
 
 ### Workstation
 
-The workstation is the host running `axol serve`. Press **Setup** to point the UI at a server address (just the IP — port `8090` is assumed). When connected, the tile shows the host's name and a green dot. Teleop and gravity comp need only this connection.
+The workstation is the host running `axol serve`. Press **Setup** to point the UI at a server address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot. Teleop and gravity comp need only this connection.
 
 ### Axol
 
@@ -59,7 +59,7 @@ Data collection and policy inference also need the **ZED box** (the Jetson strea
 {/* SCREENSHOT: zed-connect-dialog.png — the "Connect ZED box" dialog with the IP field and the three optional camera-serial fields */}
 <img src="/assets/zed-connect-dialog.png" alt="Connect ZED box dialog" />
 
-Enter the box's IP (port `8090` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. Connecting then:
+Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. Connecting then:
 
 1. Checks the box is reachable.
 2. Starts **PTP clock sync** between the two machines (the workstation as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.

@@ -9,12 +9,16 @@ import {
   AxolState,
   useAxolVRClient,
 } from "@almond/axol-vr-client"
-import { Headset, Loader2 } from "lucide-react"
+import { Headset, Loader2, ShieldCheck } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { SiteNav } from "@/components/site-nav"
+import { authorizeCert } from "@/lib/cert-accept"
 import { cn } from "@/lib/utils"
+
+// The VR teleop WebSocket server runs on this port (see useAxolVRClient default).
+const VR_WS_PORT = 8000
 
 const store = createXRStore({
   handTracking: false,
@@ -509,11 +513,25 @@ export default function App() {
             )}
 
             {status === AxolConnectionStatus.Failed && (
-              <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
-                Could not connect to <span className="font-mono">{hostname || "the server"}</span>.
-                Check that <span className="font-mono">axol serve</span> is running on your Axol
-                Host.
-              </p>
+              <div className="flex flex-col gap-2">
+                <p className="rounded-lg border border-red-400/25 bg-red-400/10 p-3 text-xs text-red-300">
+                  Could not connect to <span className="font-mono">{hostname || "the server"}</span>
+                  . Check that <span className="font-mono">axol serve</span> is running, then
+                  authorize its self-signed certificate below.
+                </p>
+                {hostname.trim() && (
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={() =>
+                      authorizeCert(`https://${hostname.trim()}:${VR_WS_PORT}`).then(handleConnect)
+                    }
+                  >
+                    <ShieldCheck />
+                    Authorize certificate
+                  </Button>
+                )}
+              </div>
             )}
           </Card>
         </div>

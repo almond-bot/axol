@@ -47,7 +47,7 @@ class Sim(RobotBase):
         *,
         joint_names: list[str] | None = None,
         default_q: np.ndarray | None = None,
-        port: int = 8080,
+        port: int = 8002,
     ) -> None:
         """Construct the simulation.
 

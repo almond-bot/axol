@@ -6,7 +6,7 @@ description: "Run the Axol web control panel — drive the robot from a browser 
 Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, and policy inference — in-process.
 
 ```bash
-axol serve                    # https://localhost:8090 (LAN-reachable)
+axol serve                    # https://localhost:8001 (LAN-reachable)
 axol serve --port 9000
 axol serve --open             # also open a browser window on startup
 axol serve --host 127.0.0.1   # localhost only
@@ -20,7 +20,7 @@ axol serve --no-tls           # plain HTTP instead of HTTPS
 | Flag | Description |
 |---|---|
 | `--host HOST` | Interface to bind. Default `0.0.0.0` (reachable on the LAN); use `127.0.0.1` for localhost only. |
-| `--port INT` | Port to listen on. Default `8090`. |
+| `--port INT` | Port to listen on. Default `8001`. |
 | `--open` | Open a browser window on startup. Off by default. |
 | `--no-tls` | Serve plain HTTP instead of HTTPS. TLS is on by default. |
 
