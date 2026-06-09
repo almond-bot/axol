@@ -155,16 +155,19 @@ function PoseVisualizer() {
 }
 
 // Cameras streamed from the robot, shown immersively in front of the operator.
-// The overhead camera is the default/main feed; the right thumbstick swaps in
-// the wrist cameras (push left → left wrist, push right → right wrist, release →
-// back to overhead).
+// The overhead camera is the default/main feed. Flicking the right thumbstick
+// *locks* a camera in (it stays without holding): flick right toggles the right
+// wrist, flick left toggles the left wrist, and flicking the same way again
+// returns to overhead.
 const CAMERA_LABELS: Record<string, string> = {
   overhead: "Overhead",
   left_arm: "Left wrist",
   right_arm: "Right wrist",
 }
 const FEED_DISTANCE = 1.3 // metres in front of the head-locked feed
-const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
+// Oversize the feed past the headset FOV so it fully wraps the operator's view
+// (immersive) rather than floating as a small panel.
+const FEED_FOV_MARGIN = 1.12
 const STICK_DEADZONE = 0.6
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
@@ -179,6 +182,11 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
   const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
   const activeRef = useRef("overhead")
+  // The currently locked-in feed; only changes on a thumbstick flick (edge),
+  // so the operator doesn't have to hold the stick.
+  const lockedRef = useRef("overhead")
+  // Last thumbstick zone, for rising-edge detection.
+  const stickZoneRef = useRef<"neutral" | "left" | "right">("neutral")
   const [activeLabel, setActiveLabel] = useState("Overhead")
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
@@ -242,17 +250,26 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     group.position.copy(cam.position)
     group.quaternion.copy(cam.quaternion)
 
-    // Select the feed from the right thumbstick (axes[2] = stick X).
+    // Toggle the locked feed on a thumbstick flick (axes[2] = stick X). Only a
+    // rising edge (neutral → left/right) changes it, so it stays locked when
+    // the stick returns to centre.
     const xrSession = gl.xr.getSession()
     const right = xrSession
       ? Array.from(xrSession.inputSources).find((s) => s.handedness === "right")
       : undefined
     const x = right?.gamepad?.axes?.[2] ?? 0
-    let name = "overhead"
-    if (x < -STICK_DEADZONE) name = "left_arm"
-    else if (x > STICK_DEADZONE) name = "right_arm"
+    const zone = x < -STICK_DEADZONE ? "left" : x > STICK_DEADZONE ? "right" : "neutral"
+    if (zone !== stickZoneRef.current) {
+      if (zone === "right") {
+        lockedRef.current = lockedRef.current === "right_arm" ? "overhead" : "right_arm"
+      } else if (zone === "left") {
+        lockedRef.current = lockedRef.current === "left_arm" ? "overhead" : "left_arm"
+      }
+      stickZoneRef.current = zone
+    }
 
     // Fall back to overhead, then to whatever stream exists.
+    let name = lockedRef.current
     let tex = textures[name]
     if (!tex) {
       name = textures.overhead ? "overhead" : (Object.keys(textures)[0] ?? "overhead")
@@ -272,9 +289,30 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       mat.needsUpdate = true
     }
 
+    // Size the plane to fill the headset's field of view at FEED_DISTANCE so the
+    // feed is immersive, then crop the video to "cover" the plane (no
+    // letterboxing) by adjusting the texture UVs.
+    const pm = cam.projectionMatrix.elements
+    const tanY = pm[5] ? 1 / pm[5] : Math.tan((70 * Math.PI) / 180 / 2)
+    const tanX = pm[0] ? 1 / pm[0] : tanY * (16 / 9)
+    const planeH = 2 * FEED_DISTANCE * tanY * FEED_FOV_MARGIN
+    const planeW = 2 * FEED_DISTANCE * tanX * FEED_FOV_MARGIN
+    mesh.scale.set(planeW, planeH, 1)
+
     const video = tex.image as HTMLVideoElement
-    const aspect = video && video.videoWidth ? video.videoWidth / video.videoHeight : 16 / 9
-    mesh.scale.set(FEED_HEIGHT * aspect, FEED_HEIGHT, 1)
+    if (video && video.videoWidth) {
+      const planeAspect = planeW / planeH
+      const videoAspect = video.videoWidth / video.videoHeight
+      if (videoAspect > planeAspect) {
+        const r = planeAspect / videoAspect
+        tex.repeat.set(r, 1)
+        tex.offset.set((1 - r) / 2, 0)
+      } else {
+        const r = videoAspect / planeAspect
+        tex.repeat.set(1, r)
+        tex.offset.set(0, (1 - r) / 2)
+      }
+    }
   })
 
   return (
@@ -284,8 +322,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
       </mesh>
       <Text
-        position={[0, -FEED_HEIGHT / 2 - 0.06, -FEED_DISTANCE]}
-        fontSize={0.045}
+        position={[0, -0.5, -FEED_DISTANCE]}
+        fontSize={0.05}
         fontWeight="bold"
         color="white"
         anchorX="center"
@@ -460,7 +498,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch Camera`}
+        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Lock Camera`}
       </Text>
     </group>
   )
@@ -654,7 +692,7 @@ export default function App() {
                   rows={[
                     ["B", "Toggle mode"],
                     ["A", "Start / stop rec"],
-                    ["Stick", "Switch camera"],
+                    ["Stick", "Lock camera"],
                   ]}
                 />
               </div>
