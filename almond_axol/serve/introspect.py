@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import inspect
 import json
+import re
 from dataclasses import MISSING
 from typing import Any
 
@@ -72,6 +74,113 @@ def _humanize(key: str) -> str:
     return key.replace("_", " ")
 
 
+_SECTION_HEADERS = {"attributes", "args", "arguments", "parameters"}
+_DOC_FIELD_RE = re.compile(r"(\w+)\s*(?:\([^)]*\))?\s*:\s*(.*)$")
+_RST_ROLE_RE = re.compile(r":[a-z]+:`([^`]*)`")
+
+
+def _clean_doc(text: str) -> str:
+    """Strip reST roles / backticks and collapse whitespace for a tooltip."""
+    text = _RST_ROLE_RE.sub(r"\1", text)
+    text = text.replace("``", "").replace("`", "").replace("**", "")
+    return " ".join(text.split())
+
+
+def _parse_doc_fields(doc: str) -> dict[str, str]:
+    """Parse a Google/NumPy-style ``Attributes:`` / ``Args:`` block.
+
+    Returns ``{field_name: help}``. Entries start at a fixed indent as
+    ``name: text``; more-indented lines are continuations of the current field.
+    """
+    lines = doc.splitlines()
+    out: dict[str, str] = {}
+    i, n = 0, len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        if stripped.endswith(":") and stripped[:-1].lower() in _SECTION_HEADERS:
+            i += 1
+            entry_indent: int | None = None
+            name: str | None = None
+            parts: list[str] = []
+            while i < n:
+                line = lines[i]
+                if not line.strip():
+                    i += 1
+                    continue
+                indent = len(line) - len(line.lstrip())
+                if entry_indent is None:
+                    entry_indent = indent
+                if indent < entry_indent:
+                    break
+                match = _DOC_FIELD_RE.match(line.strip())
+                if indent == entry_indent and match:
+                    if name is not None:
+                        out[name] = _clean_doc(" ".join(parts))
+                    name = match.group(1)
+                    parts = [match.group(2)]
+                elif name is not None:
+                    parts.append(line.strip())
+                i += 1
+            if name is not None:
+                out[name] = _clean_doc(" ".join(parts))
+        else:
+            i += 1
+    return out
+
+
+# Curated leaf help and garbled-source markers mirror the CLI ``--help``
+# (see :mod:`almond_axol.cli.config`); reuse them so UI tooltips match it.
+_CURATED_FIELD_HELP: dict[str, str] = getattr(_config, "_FIELD_HELP", {})
+_GARBLED_HELP_MARKERS: tuple[str, ...] = getattr(
+    _config, "_GARBLED_HELP_MARKERS", ("field(", "default_factory", "def ", "lambda")
+)
+
+
+def _attribute_help(cls: type, name: str) -> str | None:
+    """Per-field help from draccus's attribute-docstring extraction.
+
+    Mirrors how the CLI sources nested-field help: an inline / preceding
+    comment or an attribute docstring. Mis-extracted source (draccus sometimes
+    dumps the ``field(...)`` literal) is dropped, matching ``--help``.
+    """
+    try:
+        from draccus.wrappers import docstring as _dd
+
+        ad = _dd.get_attribute_docstring(cls, name)
+    except Exception:  # noqa: BLE001 - help is cosmetic
+        return None
+    for cand in (ad.docstring_below, ad.comment_inline, ad.comment_above):
+        text = (cand or "").strip()
+        if text and not any(marker in text for marker in _GARBLED_HELP_MARKERS):
+            return _clean_doc(text)
+    return None
+
+
+def _field_docs(instance: Any) -> dict[str, str]:
+    """Per-field help for a dataclass, sourced like the CLI ``--help``.
+
+    Precedence (later wins): class ``Attributes:`` / ``Args:`` docstring →
+    draccus attribute docstrings (inline/preceding comments) → the CLI's
+    curated overrides.
+    """
+    if not dataclasses.is_dataclass(instance):
+        return {}
+    cls = type(instance)
+    out: dict[str, str] = {}
+    doc = inspect.getdoc(cls)
+    if doc:
+        out.update(_parse_doc_fields(doc))
+    for field in dataclasses.fields(cls):
+        if field.name not in out:
+            comment = _attribute_help(cls, field.name)
+            if comment:
+                out[field.name] = comment
+        curated = _CURATED_FIELD_HELP.get(field.name)
+        if curated:
+            out[field.name] = curated
+    return out
+
+
 def _leaf_type(value: Any) -> str:
     if isinstance(value, bool):
         return "boolean"
@@ -80,7 +189,28 @@ def _leaf_type(value: Any) -> str:
     return "text"
 
 
-def _make_node(prefix: str, key: str, value: Any, required: set[str]) -> dict[str, Any]:
+def _children(
+    prefix: str, values: dict[str, Any], instance: Any, required: set[str]
+) -> list[dict[str, Any]]:
+    """Build the child nodes for a group, pulling per-field help from ``instance``."""
+    docs = _field_docs(instance)
+    out: list[dict[str, Any]] = []
+    for key, value in values.items():
+        child = (
+            getattr(instance, key, None) if dataclasses.is_dataclass(instance) else None
+        )
+        out.append(_make_node(prefix, key, value, required, child, docs.get(key)))
+    return out
+
+
+def _make_node(
+    prefix: str,
+    key: str,
+    value: Any,
+    required: set[str],
+    instance: Any,
+    help_text: str | None,
+) -> dict[str, Any]:
     full = f"{prefix}.{key}" if prefix else key
 
     if isinstance(value, dict):
@@ -88,7 +218,8 @@ def _make_node(prefix: str, key: str, value: Any, required: set[str]) -> dict[st
             "kind": "group",
             "key": full,
             "label": _humanize(key),
-            "children": [_make_node(full, k, v, set()) for k, v in value.items()],
+            "help": help_text,
+            "children": _children(full, value, instance, set()),
         }
 
     is_required = bool(prefix == "" and key in required)
@@ -112,6 +243,7 @@ def _make_node(prefix: str, key: str, value: Any, required: set[str]) -> dict[st
         "default": None if is_required else default,
         "options": options,
         "required": is_required,
+        "help": help_text,
     }
 
 
@@ -141,7 +273,7 @@ def build_schema(config_class: type) -> Schema:
     if not isinstance(encoded, dict):  # pragma: no cover - configs are dataclasses
         raise TypeError(f"unexpected encoded config: {type(encoded)!r}")
 
-    nodes = [_make_node("", k, v, required) for k, v in encoded.items()]
+    nodes = _children("", encoded, instance, required)
     leaf_keys: set[str] = set()
     _collect_leaf_keys(nodes, leaf_keys)
     # Every draccus leaf is a dotted ``--key value`` override.

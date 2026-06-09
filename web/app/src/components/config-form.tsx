@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react"
-import { ChevronRight, RotateCcw, Search } from "lucide-react"
+import { useMemo, useRef, useState } from "react"
+import { createPortal } from "react-dom"
+import { ChevronRight, Info, RotateCcw, Search } from "lucide-react"
 import {
   defaultString,
   flattenFields,
@@ -180,6 +181,7 @@ function FieldRow({
         )}
       </Label>
       {field.required && <span className="text-xs text-[#eff483]">*</span>}
+      {field.help && <HelpTip text={field.help} />}
       {modified && <span className="size-1.5 rounded-full bg-[#eff483]" />}
       {modified && (
         <button
@@ -203,7 +205,6 @@ function FieldRow({
           {labelNode}
           <Switch checked={checked} disabled={disabled} onChange={(v) => onChange(field.key, v)} />
         </div>
-        {field.help && <FieldHelp text={field.help} />}
       </div>
     )
   }
@@ -238,13 +239,44 @@ function FieldRow({
           onChange={(e) => onChange(field.key, e.target.value)}
         />
       )}
-      {field.help && <FieldHelp text={field.help} />}
     </div>
   )
 }
 
-function FieldHelp({ text }: { text: string }) {
-  return <p className="text-xs leading-snug text-white/35">{text}</p>
+/**
+ * An info dot next to a field label. Hovering reveals the field's docs (pulled
+ * from the config dataclass / CLI help). Rendered through a portal so the popup
+ * is never clipped by the surrounding card / scroll container.
+ */
+function HelpTip({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement>(null)
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null)
+
+  function show() {
+    const rect = ref.current?.getBoundingClientRect()
+    if (rect) setPos({ x: rect.left + rect.width / 2, y: rect.bottom })
+  }
+
+  return (
+    <span
+      ref={ref}
+      onMouseEnter={show}
+      onMouseLeave={() => setPos(null)}
+      className="inline-flex shrink-0 cursor-help text-white/30 hover:text-white/70"
+    >
+      <Info className="size-3.5" />
+      {pos &&
+        createPortal(
+          <span
+            style={{ left: pos.x, top: pos.y + 6 }}
+            className="pointer-events-none fixed z-[60] w-72 max-w-[80vw] -translate-x-1/2 rounded-md border border-white/10 bg-[#1c1c1c] px-3 py-2 text-xs leading-snug text-white/75 shadow-xl"
+          >
+            {text}
+          </span>,
+          document.body
+        )}
+    </span>
+  )
 }
 
 function Switch({
