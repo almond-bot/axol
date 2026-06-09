@@ -3,7 +3,7 @@ title: "can.setup"
 description: "One-time CAN bus setup for the Almond Axol Hub."
 ---
 
-One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, and brings up the interfaces immediately.
+One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Installs the `gs_usb` kernel driver if the kernel lacks it (see [`can.driver`](/cli/can-driver) — needed on NVIDIA Jetson / ZED Box), writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, and brings up the interfaces immediately.
 
 - Left arm → `can_alm_axol_l`
 - Right arm → `can_alm_axol_r`

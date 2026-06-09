@@ -5,6 +5,7 @@ import importlib
 import sys
 
 from . import serve as serve_cmd
+from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
 from .motor import info as motor_info
@@ -46,6 +47,7 @@ def main() -> None:
 
     can_setup.add_parser(subparsers)
     can_enable.add_parser(subparsers)
+    can_driver.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)

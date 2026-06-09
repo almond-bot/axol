@@ -1,0 +1,20 @@
+---
+title: "can.driver"
+description: "Build and install the gs_usb kernel driver when the kernel lacks it."
+---
+
+Builds the `gs_usb` USB-CAN kernel driver from vendored source and installs it for the running kernel. Needed on NVIDIA Jetson / ZED Box machines, whose L4T (tegra) kernels ship without any USB-CAN drivers — the Axol Hub enumerates on USB but no `can*` network interfaces ever appear.
+
+```bash
+axol can.driver
+```
+
+On kernels whose stock `gs_usb` already works (any desktop Linux), this is a no-op.
+
+<Note>
+  [`can.setup`](/cli/can-setup) runs this check automatically, so you normally never need to invoke it directly.
+</Note>
+
+<Info>
+  The vendored driver is the upstream 5.15 `gs_usb` with two backports the Axol Hub requires: per-channel `dev_id` (to tell the left/right arms apart) and bulk endpoint discovery from the USB descriptor (the Hub firmware uses `EP1 IN`/`EP1 OUT`, while the stock 5.15 driver hardcodes `OUT 2`). The module is installed under `/lib/modules/$(uname -r)/updates/` and loads automatically on boot. Requires kernel headers and `build-essential`; both ship with JetPack.
+</Info>

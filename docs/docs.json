@@ -44,6 +44,7 @@
           "cli/serve",
           "cli/can-setup",
           "cli/can-enable",
+          "cli/can-driver",
           "cli/motor-info",
           "cli/motor-set-can-id",
           "cli/motor-set-zero-pos",

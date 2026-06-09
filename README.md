@@ -105,6 +105,7 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
+- [`can.driver`](https://docs.almond.bot/cli/can-driver)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
