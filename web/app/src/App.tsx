@@ -154,17 +154,33 @@ function PoseVisualizer() {
   )
 }
 
-// Cameras streamed from the robot, shown immersively in front of the operator.
-// The overhead camera is the default/main feed. Flicking a controller's
-// thumbstick *locks* a camera in (it stays without holding): the left stick
-// rotates between the left wrist and the overhead, the right stick rotates
-// between the right wrist and the overhead.
+// Cameras streamed from the robot, shown immersively over passthrough.
+//
+// View modes (the right thumbstick is a latched 4-way picker — flick once, no
+// holding; flicking the *active* direction returns to the default):
+//   - "default":  passthrough with the two wrist cams as bottom-corner PiPs
+//                 (left wrist → bottom-left, right wrist → bottom-right)
+//   - "overhead": fullscreen overhead (per-eye stereo when both eyes stream)
+//   - "left":     fullscreen left wrist
+//   - "right":    fullscreen right wrist
+//   - "split":    left + right wrists side-by-side, fullscreen
+// Stick directions map to where each camera roughly sits: up → overhead,
+// left → left wrist, right → right wrist, down → split.
+type ViewMode = "default" | "overhead" | "left" | "right" | "split"
+
 const FEED_DISTANCE = 1 // metres in front of the head-locked feed
-const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
+const FEED_HEIGHT = 1.05 // fullscreen plane height in metres (width from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
 // rather than sitting high in view.
-const FEED_Y = -0.2
+const FEED_Y = -0.175
 const STICK_DEADZONE = 0.6
+// Bottom-corner picture-in-picture wrist cams shown in the default view.
+const PIP_WIDTH = 0.42 // metres (height derives from aspect)
+const PIP_X = 0.52 // horizontal offset of each corner PiP
+const PIP_Y = -0.4 // vertical offset (lower corners)
+// Side-by-side wrist cams in the split view.
+const SPLIT_WIDTH = 0.92 // metres per pane
+const SPLIT_X = 0.48 // horizontal offset of each pane from centre
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
   const { gl } = useThree()
@@ -183,17 +199,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const leftMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const rightMeshRef = useRef<THREE.Mesh>(null)
   const rightMatRef = useRef<THREE.MeshBasicMaterial>(null)
+  // Two shared planes (layer 0) reused for the two wrist cams in both the split
+  // view (side-by-side) and the default view (bottom-corner PiPs); the two modes
+  // never render at once. A = left wrist, B = right wrist.
+  const dualAMeshRef = useRef<THREE.Mesh>(null)
+  const dualAMatRef = useRef<THREE.MeshBasicMaterial>(null)
+  const dualBMeshRef = useRef<THREE.Mesh>(null)
+  const dualBMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const spinnerRef = useRef<THREE.Group>(null)
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
   const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
-  // The currently locked-in feed; only changes on a thumbstick flick (edge),
-  // so the operator doesn't have to hold the stick.
-  const lockedRef = useRef("overhead")
-  // Whether each controller's stick was deflected last frame, for rising-edge
-  // detection (the left stick toggles left_arm/overhead, the right toggles
-  // right_arm/overhead).
-  const leftStickActiveRef = useRef(false)
+  // The current view mode; only changes on a thumbstick flick (edge), so the
+  // operator doesn't have to hold the stick.
+  const viewModeRef = useRef<ViewMode>("default")
+  // Whether the right stick was deflected last frame, for rising-edge detection.
   const rightStickActiveRef = useRef(false)
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
@@ -254,7 +274,17 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const mesh = meshRef.current
     const mat = matRef.current
     const spinner = spinnerRef.current
+    const leftMesh = leftMeshRef.current
+    const rightMesh = rightMeshRef.current
+    const leftMat = leftMatRef.current
+    const rightMat = rightMatRef.current
+    const aMesh = dualAMeshRef.current
+    const aMat = dualAMatRef.current
+    const bMesh = dualBMeshRef.current
+    const bMat = dualBMatRef.current
     if (!group || !mesh || !mat || !spinner) return
+    if (!leftMesh || !rightMesh || !leftMat || !rightMat) return
+    if (!aMesh || !aMat || !bMesh || !bMat) return
 
     const presenting = gl.xr.isPresenting
     const cam = gl.xr.getCamera()
@@ -268,51 +298,40 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinner.quaternion.copy(cam.quaternion)
     }
 
-    // Toggle the locked feed on a thumbstick flick (axes[2]/[0] = stick X). The
-    // left controller rotates between its wrist and the overhead; the right
-    // controller does the same for its wrist. Only a rising edge (neutral →
-    // deflected) toggles, so the feed stays locked when the stick recentres.
+    // Right thumbstick = latched 4-way view picker. axes[2]/[0] = X, axes[3]/[1]
+    // = Y (up is negative). The dominant axis picks a direction → target mode;
+    // only a rising edge (neutral → deflected) acts, so the view stays put when
+    // the stick recentres. Flicking the active direction returns to "default".
     const xrSession = gl.xr.getSession()
     const sources = xrSession ? Array.from(xrSession.inputSources) : []
-    const stickX = (hand: "left" | "right") => {
-      const src = sources.find((s) => s.handedness === hand)
-      const axes = src?.gamepad?.axes
-      // Prefer the standard thumbstick X (axes[2]); fall back to axes[0].
-      return axes?.[2] ?? axes?.[0] ?? 0
+    const right = sources.find((s) => s.handedness === "right")
+    const axes = right?.gamepad?.axes
+    const sx = axes?.[2] ?? axes?.[0] ?? 0
+    const sy = axes?.[3] ?? axes?.[1] ?? 0
+    const stickActive = Math.max(Math.abs(sx), Math.abs(sy)) > STICK_DEADZONE
+    if (stickActive && !rightStickActiveRef.current) {
+      let target: ViewMode
+      if (Math.abs(sy) > Math.abs(sx)) target = sy < 0 ? "overhead" : "split"
+      else target = sx < 0 ? "left" : "right"
+      viewModeRef.current = viewModeRef.current === target ? "default" : target
+    }
+    rightStickActiveRef.current = stickActive
+
+    const mode = viewModeRef.current
+
+    // A texture is usable only once its <video> has decoded real frames.
+    const liveTex = (name: string) => {
+      const t = textures[name]
+      const v = t?.image as HTMLVideoElement | undefined
+      return t && v && v.videoWidth ? t : undefined
     }
 
-    const leftActive = Math.abs(stickX("left")) > STICK_DEADZONE
-    if (leftActive && !leftStickActiveRef.current) {
-      lockedRef.current = lockedRef.current === "left_arm" ? "overhead" : "left_arm"
-    }
-    leftStickActiveRef.current = leftActive
-
-    const rightActive = Math.abs(stickX("right")) > STICK_DEADZONE
-    if (rightActive && !rightStickActiveRef.current) {
-      lockedRef.current = lockedRef.current === "right_arm" ? "overhead" : "right_arm"
-    }
-    rightStickActiveRef.current = rightActive
-
-    // Stereo overhead: when locked on the overhead and both eyes are streaming,
-    // render a per-eye plane (left → layer 1, right → layer 2) so each lens sees
-    // its own image. Otherwise a single layer-0 plane is shared by both eyes.
-    const stereo =
-      lockedRef.current === "overhead" &&
-      !!textures["overhead_left"] &&
-      !!textures["overhead_right"]
-
-    // The "primary" texture drives live/spinner state and (in mono) the plane.
-    let tex: THREE.VideoTexture | undefined
-    if (stereo) {
-      tex = textures["overhead_left"]
-    } else {
-      tex = textures[lockedRef.current] ?? textures.overhead ?? Object.values(textures)[0]
-    }
-
-    // A feed is "live" only once its video has decoded real frames; until then
-    // we show the spinner so the operator knows the cameras are coming.
-    const video = tex ? (tex.image as HTMLVideoElement) : null
-    const live = !!(tex && video && video.videoWidth)
+    // Which cams a mode needs to be considered "live" (vs showing the spinner).
+    let live: boolean
+    if (mode === "overhead") live = !!(liveTex("overhead_left") ?? liveTex("overhead"))
+    else if (mode === "left") live = !!liveTex("left_arm")
+    else if (mode === "right") live = !!liveTex("right_arm")
+    else live = !!(liveTex("left_arm") ?? liveTex("right_arm")) // default, split
 
     group.visible = presenting && live
     // Spinner: presenting, frames not yet flowing, and the server hasn't said
@@ -322,58 +341,81 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinnerMeshRef.current.rotation.z -= 0.12
     }
 
-    const leftMesh = leftMeshRef.current
-    const rightMesh = rightMeshRef.current
-    const leftMat = leftMatRef.current
-    const rightMat = rightMatRef.current
+    // Hide every plane up front; each mode re-enables only what it draws.
+    mesh.visible = false
+    leftMesh.visible = false
+    rightMesh.visible = false
+    aMesh.visible = false
+    bMesh.visible = false
+    if (!group.visible) return
 
-    if (!group.visible || !tex) {
-      if (leftMesh) leftMesh.visible = false
-      if (rightMesh) rightMesh.visible = false
-      return
-    }
-
-    // Size each plane to a fixed height with width from the video's aspect, so
-    // the feed sits as a large head-locked panel (majority of the view) with
-    // the full image visible — no FOV-fill, no cropping.
-    const fit = (m: THREE.Mesh, t: THREE.VideoTexture) => {
+    // Place a plane sized to a target height (width from the video aspect).
+    const fitHeight = (
+      m: THREE.Mesh,
+      mt: THREE.MeshBasicMaterial,
+      t: THREE.VideoTexture,
+      height: number,
+      x: number,
+      y: number
+    ) => {
       const v = t.image as HTMLVideoElement | undefined
       const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
-      m.scale.set(FEED_HEIGHT * aspect, FEED_HEIGHT, 1)
+      if (mt.map !== t) {
+        mt.map = t
+        mt.needsUpdate = true
+      }
+      m.scale.set(height * aspect, height, 1)
+      m.position.set(x, y, -FEED_DISTANCE)
+      m.visible = true
+    }
+    // Place a plane sized to a target width (height from the video aspect).
+    const fitWidth = (
+      m: THREE.Mesh,
+      mt: THREE.MeshBasicMaterial,
+      t: THREE.VideoTexture,
+      width: number,
+      x: number,
+      y: number
+    ) => {
+      const v = t.image as HTMLVideoElement | undefined
+      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
+      fitHeight(m, mt, t, width / aspect, x, y)
+      m.scale.x = width
     }
 
-    if (stereo && leftMesh && rightMesh && leftMat && rightMat) {
-      mesh.visible = false
-      const lTex = textures["overhead_left"]
-      const rTex = textures["overhead_right"]
-      if (leftMat.map !== lTex) {
-        leftMat.map = lTex
-        leftMat.needsUpdate = true
+    if (mode === "overhead") {
+      const oL = liveTex("overhead_left")
+      const oR = liveTex("overhead_right")
+      if (oL && oR) {
+        // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
+        fitHeight(leftMesh, leftMat, oL, FEED_HEIGHT, 0, FEED_Y)
+        fitHeight(rightMesh, rightMat, oR, FEED_HEIGHT, 0, FEED_Y)
+        const eyes = (cam as THREE.ArrayCamera).cameras
+        if (eyes && eyes.length >= 2) {
+          eyes[0].layers.enable(1)
+          eyes[1].layers.enable(2)
+        }
+      } else {
+        const o = oL ?? liveTex("overhead")
+        if (o) fitHeight(mesh, mat, o, FEED_HEIGHT, 0, FEED_Y)
       }
-      if (rightMat.map !== rTex) {
-        rightMat.map = rTex
-        rightMat.needsUpdate = true
-      }
-      fit(leftMesh, lTex)
-      fit(rightMesh, rTex)
-      leftMesh.visible = true
-      rightMesh.visible = true
-      // three.js shows layer-1 objects to the left eye and layer-2 to the right;
-      // enable explicitly in case the renderer hasn't done so this frame.
-      const eyes = (cam as THREE.ArrayCamera).cameras
-      if (eyes && eyes.length >= 2) {
-        eyes[0].layers.enable(1)
-        eyes[1].layers.enable(2)
-      }
+    } else if (mode === "left") {
+      const t = liveTex("left_arm")
+      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
+    } else if (mode === "right") {
+      const t = liveTex("right_arm")
+      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
+    } else if (mode === "split") {
+      const l = liveTex("left_arm")
+      const r = liveTex("right_arm")
+      if (l) fitWidth(aMesh, aMat, l, SPLIT_WIDTH, -SPLIT_X, FEED_Y)
+      if (r) fitWidth(bMesh, bMat, r, SPLIT_WIDTH, SPLIT_X, FEED_Y)
     } else {
-      mesh.visible = true
-      if (leftMesh) leftMesh.visible = false
-      if (rightMesh) rightMesh.visible = false
-      if (mat.map !== tex) {
-        mat.map = tex
-        mat.needsUpdate = true
-      }
-      fit(mesh, tex)
+      // default: passthrough with the wrist cams pinned to the bottom corners.
+      const l = liveTex("left_arm")
+      const r = liveTex("right_arm")
+      if (l) fitWidth(aMesh, aMat, l, PIP_WIDTH, -PIP_X, PIP_Y)
+      if (r) fitWidth(bMesh, bMat, r, PIP_WIDTH, PIP_X, PIP_Y)
     }
   })
 
@@ -407,6 +449,25 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={rightMatRef}
+            toneMapped={false}
+            depthTest={false}
+            depthWrite={false}
+          />
+        </mesh>
+        {/* Shared wrist-cam planes: split panes or default-view corner PiPs. */}
+        <mesh ref={dualAMeshRef} renderOrder={1} visible={false}>
+          <planeGeometry args={[1, 1]} />
+          <meshBasicMaterial
+            ref={dualAMatRef}
+            toneMapped={false}
+            depthTest={false}
+            depthWrite={false}
+          />
+        </mesh>
+        <mesh ref={dualBMeshRef} renderOrder={1} visible={false}>
+          <planeGeometry args={[1, 1]} />
+          <meshBasicMaterial
+            ref={dualBMatRef}
             toneMapped={false}
             depthTest={false}
             depthWrite={false}
