@@ -28,6 +28,7 @@ Or with custom components::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import multiprocessing.connection
@@ -151,6 +152,9 @@ class VRTeleop:
         self._vr_thread: threading.Thread | None = None
         self._vr_stop: threading.Event = threading.Event()
         self._vr_ready: threading.Event = threading.Event()
+        # Event loop of the VR server thread, captured so the IK thread can
+        # broadcast tracking-state changes to the headset.
+        self._vr_loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -164,6 +168,7 @@ class VRTeleop:
         """
 
         async def _serve() -> None:
+            self._vr_loop = asyncio.get_running_loop()
             await self._vr_server.enable()
             self._vr_ready.set()
             while not self._vr_stop.is_set():
@@ -171,6 +176,22 @@ class VRTeleop:
             await self._vr_server.disable()
 
         asyncio.run(_serve())
+
+    def _broadcast_tracking(self, enabled: bool) -> None:
+        """Push the engage-toggle state to the headset (fire-and-forget).
+
+        The VR app uses it to allow screen repositioning (trigger grabs) only
+        while the robot isn't being controlled. Safe to call from any thread.
+        """
+        if self._vr_loop is None:
+            return
+        text = json.dumps({"type": "tracking", "value": enabled})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._vr_loop
+            )
+        except RuntimeError:
+            pass  # VR loop already shut down
 
     async def enable(self) -> None:
         """Start the VR server, robot, and IK subprocess."""
@@ -471,6 +492,7 @@ class VRTeleop:
                 if both and not self._prev_both:
                     self._teleop_enabled = True
                     _logger.info("Teleop enabled")
+                    self._broadcast_tracking(True)
                     if self._at_rest:
                         self._smooth_left.max_vel = self._config.engage_max_vel
                         self._smooth_right.max_vel = self._config.engage_max_vel
@@ -480,6 +502,7 @@ class VRTeleop:
                 if either and not self._prev_either:
                     self._teleop_enabled = False
                     _logger.info("Teleop disabled")
+                    self._broadcast_tracking(False)
 
             self._prev_both = both
             self._prev_either = either
@@ -509,6 +532,7 @@ class VRTeleop:
                                     trajectory, self._l_grip, self._r_grip
                                 )
                                 self._teleop_enabled = False
+                                self._broadcast_tracking(False)
                                 self._prev_both = False
                                 self._prev_either = False
                                 self._engage_time = None

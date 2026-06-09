@@ -162,9 +162,10 @@ function PoseVisualizer() {
 // rear trigger grabs it — move the controller to reposition, release to drop.
 // Positions are remembered per view mode. Because the trigger doubles as the
 // gripper control, grabbing is only allowed while robot tracking is
-// disengaged (we mirror the robot's grip-button toggle: both grips together
-// engage, either grip alone disengages). Clicking the right thumbstick
-// re-anchors all screens to the current gaze and resets dragged positions.
+// disengaged — the teleop server broadcasts its engage toggle over the
+// WebSocket (`{"type": "tracking"}`), covering grips, X/reset, and saving.
+// Clicking the right thumbstick re-anchors all screens to the current gaze
+// and resets dragged positions.
 //
 // View modes (the right thumbstick is a latched 4-way picker — flick once, no
 // holding; flicking the *active* direction returns to the default):
@@ -253,13 +254,14 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
   // Per-hand trigger state last frame, for rising-edge grab detection.
   const triggerPrevRef = useRef({ left: false, right: false })
-  // Mirror of the robot's tracking toggle (teleop.py): rising edge of BOTH
-  // grips together engages, rising edge of EITHER grip alone disengages.
+  // Whether robot tracking is engaged, as reported by the server's
+  // `{"type": "tracking"}` pushes (the server owns the toggle — it also
+  // disengages on reset/save, which the headset can't infer from buttons).
   // Screen grabbing is blocked while engaged, since the trigger drives the
   // gripper.
   const robotEngagedRef = useRef(false)
-  const prevBothGripsRef = useRef(false)
-  const prevEitherGripRef = useRef(false)
+  // WebSocket we've attached the tracking listener to, to avoid re-attaching.
+  const trackingWsRef = useRef<WebSocket | null>(null)
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
   const stickClickPrevRef = useRef(false)
 
@@ -376,24 +378,23 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     }
     rightStickActiveRef.current = stickActive
 
-    // Mirror the robot's tracking toggle from the grip buttons (buttons[1]),
-    // exactly as teleop.py does, so we know when the operator is controlling
-    // the robot (and the trigger is busy driving the gripper).
-    const gripPressed = (hand: "left" | "right") => {
-      const src = sources.find((s) => s.handedness === hand)
-      return (src?.gamepad?.buttons?.[1]?.value ?? 0) >= 1.0
+    // Track whether the robot is engaged from the server's tracking pushes
+    // (added as an extra listener so AxolVRClient's onmessage keeps working).
+    // The server owns the engage toggle — grips, X/reset, and saving all flip
+    // it there — so this stays correct where a client-side mirror would drift.
+    const ws = wsRef.current
+    if (ws !== trackingWsRef.current) {
+      trackingWsRef.current = ws
+      robotEngagedRef.current = false
+      ws?.addEventListener("message", (event: MessageEvent) => {
+        try {
+          const msg = JSON.parse(event.data as string) as { type: string; value: unknown }
+          if (msg.type === "tracking") robotEngagedRef.current = !!msg.value
+        } catch {
+          // ignore malformed messages
+        }
+      })
     }
-    const lGrip = gripPressed("left")
-    const rGrip = gripPressed("right")
-    const bothGrips = lGrip && rGrip
-    const eitherGrip = lGrip || rGrip
-    if (!robotEngagedRef.current) {
-      if (bothGrips && !prevBothGripsRef.current) robotEngagedRef.current = true
-    } else {
-      if (eitherGrip && !prevEitherGripRef.current) robotEngagedRef.current = false
-    }
-    prevBothGripsRef.current = bothGrips
-    prevEitherGripRef.current = eitherGrip
 
     // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
     // current gaze and resets any dragged positions.
@@ -697,7 +698,7 @@ function ExitButton() {
 
   return (
     <Text
-      position={[-0.2, 0.14, -0.5]}
+      position={[-0.2, 0.1, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
       color={hovered ? "yellow" : "white"}
@@ -735,7 +736,7 @@ function StateDisplay({
 
   return (
     <Text
-      position={[0.2, 0.14, -0.5]}
+      position={[0.2, 0.1, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
       color={color}
@@ -751,9 +752,9 @@ function StateDisplay({
 }
 
 function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
-  const W = 0.3
+  const W = 0.44
   const H = 0.133
-  const col = 0.07
+  const col = 0.11
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -838,7 +839,7 @@ function HelpIcon() {
   const [open, setOpen] = useState(false)
 
   return (
-    <group position={[0, 0.14, -0.5]}>
+    <group position={[0, 0.1, -0.5]}>
       <Text
         fontSize={0.02}
         fontWeight="bold"

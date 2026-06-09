@@ -347,6 +347,22 @@ class AxolVRTeleop(Teleoperator):
         if self._vr_server is not None:
             self._vr_server.set_video_sources(sources)
 
+    def _broadcast_tracking(self, enabled: bool) -> None:
+        """Push the engage-toggle state to the headset (fire-and-forget).
+
+        The VR app uses it to allow screen repositioning (trigger grabs) only
+        while the robot isn't being controlled. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        text = json.dumps({"type": "tracking", "value": enabled})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
     def send_feedback_state(self, state: VRState) -> None:
         """Broadcast a state override to all connected VR clients.
 
@@ -522,6 +538,7 @@ class AxolVRTeleop(Teleoperator):
                                 trajectory, self._l_grip, self._r_grip
                             )
                             self._teleop_enabled = False
+                            self._broadcast_tracking(False)
                             self._prev_both = False
                             self._prev_either = False
                             self._engage_time = None
@@ -563,6 +580,7 @@ class AxolVRTeleop(Teleoperator):
                 if both and not self._prev_both:
                     self._teleop_enabled = True
                     _logger.info("Teleop enabled")
+                    self._broadcast_tracking(True)
                     if self._at_rest:
                         cfg = self.config.vr_teleop_config
                         self._smooth_left.max_vel = cfg.engage_max_vel
@@ -573,6 +591,7 @@ class AxolVRTeleop(Teleoperator):
                 if either and not self._prev_either:
                     self._teleop_enabled = False
                     _logger.info("Teleop disabled")
+                    self._broadcast_tracking(False)
             self._prev_both = both
             self._prev_either = either
 
