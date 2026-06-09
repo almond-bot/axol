@@ -159,11 +159,6 @@ function PoseVisualizer() {
 // *locks* a camera in (it stays without holding): flick right toggles the right
 // wrist, flick left toggles the left wrist, and flicking the same way again
 // returns to overhead.
-const CAMERA_LABELS: Record<string, string> = {
-  overhead: "Overhead",
-  left_arm: "Left wrist",
-  right_arm: "Right wrist",
-}
 const FEED_DISTANCE = 1.3 // metres in front of the head-locked feed
 // Oversize the feed past the headset FOV so it fully wraps the operator's view
 // (immersive) rather than floating as a small panel.
@@ -173,21 +168,23 @@ const STICK_DEADZONE = 0.6
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
   const { gl } = useThree()
   const session = useXR((s) => s.session)
-  // Only negotiate video while the headset is presenting.
-  const { streams } = useAxolVideo(wsRef, session != null)
+  // Only negotiate video while the headset is presenting. `available` is null
+  // until known, false when the server reports no video — used to decide
+  // whether to keep showing the loading spinner.
+  const { streams, available } = useAxolVideo(wsRef, session != null)
 
   const groupRef = useRef<THREE.Group>(null)
   const meshRef = useRef<THREE.Mesh>(null)
   const matRef = useRef<THREE.MeshBasicMaterial>(null)
+  const spinnerRef = useRef<THREE.Group>(null)
+  const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
   const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
-  const activeRef = useRef("overhead")
   // The currently locked-in feed; only changes on a thumbstick flick (edge),
   // so the operator doesn't have to hold the stick.
   const lockedRef = useRef("overhead")
   // Last thumbstick zone, for rising-edge detection.
   const stickZoneRef = useRef<"neutral" | "left" | "right">("neutral")
-  const [activeLabel, setActiveLabel] = useState("Overhead")
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
   // textures whose stream has gone away.
@@ -239,16 +236,20 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const group = groupRef.current
     const mesh = meshRef.current
     const mat = matRef.current
-    if (!group || !mesh || !mat) return
+    const spinner = spinnerRef.current
+    if (!group || !mesh || !mat || !spinner) return
 
-    const textures = texturesRef.current
-    group.visible = gl.xr.isPresenting && Object.keys(textures).length > 0
-    if (!group.visible) return
-
-    // Head-lock the feed so it always faces the operator.
+    const presenting = gl.xr.isPresenting
     const cam = gl.xr.getCamera()
-    group.position.copy(cam.position)
-    group.quaternion.copy(cam.quaternion)
+    const textures = texturesRef.current
+
+    // Head-lock both the feed and the loading spinner so they face the operator.
+    if (presenting) {
+      group.position.copy(cam.position)
+      group.quaternion.copy(cam.quaternion)
+      spinner.position.copy(cam.position)
+      spinner.quaternion.copy(cam.quaternion)
+    }
 
     // Toggle the locked feed on a thumbstick flick (axes[2] = stick X). Only a
     // rising edge (neutral → left/right) changes it, so it stays locked when
@@ -275,15 +276,22 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       name = textures.overhead ? "overhead" : (Object.keys(textures)[0] ?? "overhead")
       tex = textures[name]
     }
-    if (!tex) {
-      group.visible = false
-      return
+
+    // A feed is "live" only once its video has decoded real frames; until then
+    // we show the spinner so the operator knows the cameras are coming.
+    const video = tex ? (tex.image as HTMLVideoElement) : null
+    const live = !!(tex && video && video.videoWidth)
+
+    group.visible = presenting && live
+    // Spinner: presenting, frames not yet flowing, and the server hasn't said
+    // there's no video to expect.
+    spinner.visible = presenting && !live && available !== false
+    if (spinner.visible && spinnerMeshRef.current) {
+      spinnerMeshRef.current.rotation.z -= 0.12
     }
 
-    if (activeRef.current !== name) {
-      activeRef.current = name
-      setActiveLabel(CAMERA_LABELS[name] ?? name)
-    }
+    if (!group.visible || !tex) return
+
     if (mat.map !== tex) {
       mat.map = tex
       mat.needsUpdate = true
@@ -299,7 +307,6 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const planeW = 2 * FEED_DISTANCE * tanX * FEED_FOV_MARGIN
     mesh.scale.set(planeW, planeH, 1)
 
-    const video = tex.image as HTMLVideoElement
     if (video && video.videoWidth) {
       const planeAspect = planeW / planeH
       const videoAspect = video.videoWidth / video.videoHeight
@@ -316,25 +323,47 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   })
 
   return (
-    <group ref={groupRef} visible={false}>
-      <mesh ref={meshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1}>
-        <planeGeometry args={[1, 1]} />
-        <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
-      </mesh>
-      <Text
-        position={[0, -0.5, -FEED_DISTANCE]}
-        fontSize={0.05}
-        fontWeight="bold"
-        color="white"
-        anchorX="center"
-        anchorY="top"
-        renderOrder={2}
-        material-depthTest={false}
-        {...hudBg}
-      >
-        {activeLabel}
-      </Text>
-    </group>
+    <>
+      <group ref={groupRef} visible={false}>
+        <mesh ref={meshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1}>
+          <planeGeometry args={[1, 1]} />
+          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
+        </mesh>
+        <Text
+          position={[0, -0.5, -FEED_DISTANCE]}
+          fontSize={0.05}
+          fontWeight="bold"
+          color="white"
+          anchorX="center"
+          anchorY="top"
+          renderOrder={2}
+          material-depthTest={false}
+          {...hudBg}
+        >
+          Camera
+        </Text>
+      </group>
+      <group ref={spinnerRef} visible={false}>
+        {/* Spinning arc (a torus with a gap) shown while the cameras connect. */}
+        <mesh ref={spinnerMeshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={2}>
+          <torusGeometry args={[0.11, 0.014, 16, 48, Math.PI * 1.5]} />
+          <meshBasicMaterial color="#eff483" toneMapped={false} depthTest={false} />
+        </mesh>
+        <Text
+          position={[0, -0.22, -FEED_DISTANCE]}
+          fontSize={0.045}
+          fontWeight="bold"
+          color="white"
+          anchorX="center"
+          anchorY="top"
+          renderOrder={2}
+          material-depthTest={false}
+          {...hudBg}
+        >
+          Connecting camera…
+        </Text>
+      </group>
+    </>
   )
 }
 
