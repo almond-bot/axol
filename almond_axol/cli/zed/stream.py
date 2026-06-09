@@ -107,7 +107,11 @@ async def _run(
 ) -> None:
     import pyzed.sl as sl
 
-    from ...zed import ZedConfig, ZedStreamer
+    from ...zed import ZedConfig, ZedStreamer, restart_zed_daemon
+
+    # The ZED X daemon only sees cameras present when it started, and we don't
+    # know when they were plugged in — restart it so every camera enumerates.
+    await asyncio.to_thread(restart_zed_daemon)
 
     config = ZedConfig(
         overhead_serial=overhead,

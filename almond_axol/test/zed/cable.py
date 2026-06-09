@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import argparse
 import logging
-import subprocess
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from almond_axol.zed.daemon import restart_zed_daemon
 
 logging.basicConfig(level=logging.INFO)
 _logger = logging.getLogger(__name__)
@@ -32,9 +33,6 @@ _MIN_STD = 1.0
 _MIN_MEAN = 1.0
 _MAX_MEAN = 254.0
 
-# The ZED X daemon must be restarted before opening the camera; give it time to
-# enumerate the sensor on the GMSL link before we connect.
-_DAEMON_RESTART_WAIT_S = 5.0
 # How long to keep capturing and validating frames.
 _CAPTURE_DURATION_S = 5.0
 # Minimum fraction of the expected fps * duration frames we tolerate before
@@ -52,26 +50,6 @@ _MAX_DUPLICATE_FRAMES = 3
 
 class CableTestError(RuntimeError):
     """Raised when the ZED cable test fails at any step."""
-
-
-def _restart_zed_daemon() -> None:
-    """Restart the ZED X daemon and wait for it to come up.
-
-    Raises:
-        CableTestError: If the ``systemctl restart`` command fails.
-    """
-    _logger.info("Restarting zed_x_daemon...")
-    result = subprocess.run(
-        ["sudo", "systemctl", "restart", "zed_x_daemon"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise CableTestError(
-            f"Failed to restart zed_x_daemon: {result.stderr.strip() or result.stdout.strip()}"
-        )
-    _logger.info("Waiting %.0fs for daemon to settle...", _DAEMON_RESTART_WAIT_S)
-    time.sleep(_DAEMON_RESTART_WAIT_S)
 
 
 def _validate_frame(bgr: np.ndarray, expected_width: int, expected_height: int) -> None:
@@ -124,7 +102,10 @@ def run(output: str | None = None) -> None:
     """
     import pyzed.sl as sl
 
-    _restart_zed_daemon()
+    try:
+        restart_zed_daemon()
+    except RuntimeError as exc:
+        raise CableTestError(str(exc)) from exc
 
     zed = sl.CameraOne()
     init_params = sl.InitParametersOne()
