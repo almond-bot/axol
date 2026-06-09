@@ -155,10 +155,10 @@ function PoseVisualizer() {
 }
 
 // Cameras streamed from the robot, shown immersively in front of the operator.
-// The overhead camera is the default/main feed. Flicking the right thumbstick
-// *locks* a camera in (it stays without holding): flick right toggles the right
-// wrist, flick left toggles the left wrist, and flicking the same way again
-// returns to overhead.
+// The overhead camera is the default/main feed. Flicking a controller's
+// thumbstick *locks* a camera in (it stays without holding): the left stick
+// rotates between the left wrist and the overhead, the right stick rotates
+// between the right wrist and the overhead.
 const FEED_DISTANCE = 1.1 // metres in front of the head-locked feed
 const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
@@ -190,8 +190,11 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // The currently locked-in feed; only changes on a thumbstick flick (edge),
   // so the operator doesn't have to hold the stick.
   const lockedRef = useRef("overhead")
-  // Last thumbstick zone, for rising-edge detection.
-  const stickZoneRef = useRef<"neutral" | "left" | "right">("neutral")
+  // Whether each controller's stick was deflected last frame, for rising-edge
+  // detection (the left stick toggles left_arm/overhead, the right toggles
+  // right_arm/overhead).
+  const leftStickActiveRef = useRef(false)
+  const rightStickActiveRef = useRef(false)
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
   // textures whose stream has gone away.
@@ -265,23 +268,30 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinner.quaternion.copy(cam.quaternion)
     }
 
-    // Toggle the locked feed on a thumbstick flick (axes[2] = stick X). Only a
-    // rising edge (neutral → left/right) changes it, so it stays locked when
-    // the stick returns to centre.
+    // Toggle the locked feed on a thumbstick flick (axes[2]/[0] = stick X). The
+    // left controller rotates between its wrist and the overhead; the right
+    // controller does the same for its wrist. Only a rising edge (neutral →
+    // deflected) toggles, so the feed stays locked when the stick recentres.
     const xrSession = gl.xr.getSession()
-    const right = xrSession
-      ? Array.from(xrSession.inputSources).find((s) => s.handedness === "right")
-      : undefined
-    const x = right?.gamepad?.axes?.[2] ?? 0
-    const zone = x < -STICK_DEADZONE ? "left" : x > STICK_DEADZONE ? "right" : "neutral"
-    if (zone !== stickZoneRef.current) {
-      if (zone === "right") {
-        lockedRef.current = lockedRef.current === "right_arm" ? "overhead" : "right_arm"
-      } else if (zone === "left") {
-        lockedRef.current = lockedRef.current === "left_arm" ? "overhead" : "left_arm"
-      }
-      stickZoneRef.current = zone
+    const sources = xrSession ? Array.from(xrSession.inputSources) : []
+    const stickX = (hand: "left" | "right") => {
+      const src = sources.find((s) => s.handedness === hand)
+      const axes = src?.gamepad?.axes
+      // Prefer the standard thumbstick X (axes[2]); fall back to axes[0].
+      return axes?.[2] ?? axes?.[0] ?? 0
     }
+
+    const leftActive = Math.abs(stickX("left")) > STICK_DEADZONE
+    if (leftActive && !leftStickActiveRef.current) {
+      lockedRef.current = lockedRef.current === "left_arm" ? "overhead" : "left_arm"
+    }
+    leftStickActiveRef.current = leftActive
+
+    const rightActive = Math.abs(stickX("right")) > STICK_DEADZONE
+    if (rightActive && !rightStickActiveRef.current) {
+      lockedRef.current = lockedRef.current === "right_arm" ? "overhead" : "right_arm"
+    }
+    rightStickActiveRef.current = rightActive
 
     // Stereo overhead: when locked on the overhead and both eyes are streaming,
     // render a per-eye plane (left → layer 1, right → layer 2) so each lens sees
