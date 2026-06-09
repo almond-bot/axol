@@ -397,6 +397,13 @@ class TeleopCmdConfig:
     Disable an arm with ``--left_channel null`` / ``--right_channel null``.
     Teleop session parameters (e.g. the position multiplier) live on the
     nested ``teleop`` config — e.g. ``--teleop.position_multiplier 2.0``.
+
+    Set ``--zed_host`` to the ZED box address to also relay its camera
+    streams to the headset (overhead as the main feed, wrist cameras
+    switched with the right thumbstick); ``zed_cameras`` selects which
+    slots to receive. Requires the cameras to already be streaming from
+    the box (e.g. via ``axol zed.stream`` or a connected ZED box in the
+    control panel) and the ``video`` extra installed locally.
     """
 
     sim: bool = False
@@ -404,6 +411,10 @@ class TeleopCmdConfig:
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
+    zed_host: str | None = None
+    zed_cameras: list[str] = field(
+        default_factory=lambda: ["overhead", "left_arm", "right_arm"]
+    )
     log_level: LogLevel = "INFO"
 
 

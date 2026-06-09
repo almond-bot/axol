@@ -63,15 +63,20 @@ def _default_robot_config() -> AxolRobotConfig:
     )
 
 
-def _register_wrist_video(robot: "AxolRobot", teleop: Any) -> None:
-    """Register the wrist cameras as WebRTC video sources for the headset.
+# Cameras relayed to the headset over WebRTC. The overhead camera is the
+# operator's main immersive feed; the two wrist cameras are switched in with the
+# right thumbstick (see the VR app's ImmersiveCameraFeed).
+_HEADSET_CAMERAS = ("overhead", "left_arm", "right_arm")
 
-    Best-effort: reads the latest decoded frame ZedCamera already keeps, so it
-    never blocks the capture pipeline. Set ``AXOL_VR_VIDEO_TEST=1`` to fall back
-    to a synthetic test pattern for any wrist camera that is absent (useful for
-    exercising the path without ZED hardware).
+
+def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
+    """Register the ZED cameras as WebRTC video sources for the headset.
+
+    Streams the overhead camera (the operator's main immersive feed) plus both
+    wrist cameras so the headset can switch between them. Best-effort: reads the
+    latest decoded frame ZedCamera already keeps, so it never blocks the capture
+    pipeline.
     """
-    import os
 
     def _make_source(cam: Any) -> Callable[[], Any]:
         def _source() -> Any:
@@ -83,16 +88,10 @@ def _register_wrist_video(robot: "AxolRobot", teleop: Any) -> None:
         return _source
 
     sources: dict[str, Callable[[], Any]] = {}
-    for name in ("left_arm", "right_arm"):
+    for name in _HEADSET_CAMERAS:
         cam = robot.cameras.get(name)
         if cam is not None:
             sources[name] = _make_source(cam)
-
-    if os.environ.get("AXOL_VR_VIDEO_TEST"):
-        from ..vr.video import make_test_pattern_source
-
-        for name in ("left_arm", "right_arm"):
-            sources.setdefault(name, make_test_pattern_source())
 
     if not sources:
         return
@@ -100,7 +99,7 @@ def _register_wrist_video(robot: "AxolRobot", teleop: Any) -> None:
     try:
         teleop.set_video_sources(sources)
     except Exception as exc:
-        _logger.warning("failed to enable wrist video: %s", exc)
+        _logger.warning("failed to enable camera video: %s", exc)
 
 
 @dataclass
@@ -393,9 +392,9 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     pos_l, pos_r = robot.positions
     teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
 
-    # Relay the wrist cameras to the headset so the operator can see the
-    # grippers. Best-effort: reuses the frames ZedCamera already decodes.
-    _register_wrist_video(robot, teleop)
+    # Relay the overhead + wrist cameras to the headset so the operator can see
+    # the scene and grippers. Best-effort: reuses the frames ZedCamera decodes.
+    _register_camera_video(robot, teleop)
 
     teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 

@@ -18,7 +18,6 @@ requires it.
 from __future__ import annotations
 
 import logging
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -146,27 +145,3 @@ class WebRTCManager:
         """Close every active peer connection."""
         for client_id in list(self._pcs):
             await self.close(client_id)
-
-
-def make_test_pattern_source(width: int = 640, height: int = 480) -> FrameSource:
-    """Return a frame source rendering an animated test pattern.
-
-    Useful for exercising the WebRTC path without ZED hardware (e.g. in sim or
-    the cloud VM): ``AXOL_VR_VIDEO_TEST=1 uv run axol teleop --sim``. A moving
-    bar makes motion and latency visible.
-    """
-    start = time.monotonic()
-    xs = np.linspace(0, 255, width, dtype=np.uint8)
-    ys = np.linspace(0, 255, height, dtype=np.uint8)
-    base = np.zeros((height, width, 3), dtype=np.uint8)
-    base[..., 0] = xs[None, :]
-    base[..., 1] = ys[:, None]
-
-    def _source() -> NDArray[Any]:
-        t = time.monotonic() - start
-        frame = base.copy()
-        x = int((t * 120) % width)
-        frame[:, max(0, x - 3) : x + 3, 2] = 255
-        return frame
-
-    return _source

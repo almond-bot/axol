@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from "react"
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
 import { Canvas, useFrame, useThree } from "@react-three/fiber"
 import { Text } from "@react-three/drei"
 import { createXRStore, XR, useXR } from "@react-three/xr"
@@ -7,6 +7,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  useAxolVideo,
   useAxolVRClient,
 } from "@almond/axol-vr-client"
 import { Headset, Loader2, ShieldCheck } from "lucide-react"
@@ -153,6 +154,152 @@ function PoseVisualizer() {
   )
 }
 
+// Cameras streamed from the robot, shown immersively in front of the operator.
+// The overhead camera is the default/main feed; the right thumbstick swaps in
+// the wrist cameras (push left → left wrist, push right → right wrist, release →
+// back to overhead).
+const CAMERA_LABELS: Record<string, string> = {
+  overhead: "Overhead",
+  left_arm: "Left wrist",
+  right_arm: "Right wrist",
+}
+const FEED_DISTANCE = 1.3 // metres in front of the head-locked feed
+const FEED_HEIGHT = 1.05 // plane height in metres (width derives from aspect)
+const STICK_DEADZONE = 0.6
+
+function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+  const { gl } = useThree()
+  const session = useXR((s) => s.session)
+  // Only negotiate video while the headset is presenting.
+  const { streams } = useAxolVideo(wsRef, session != null)
+
+  const groupRef = useRef<THREE.Group>(null)
+  const meshRef = useRef<THREE.Mesh>(null)
+  const matRef = useRef<THREE.MeshBasicMaterial>(null)
+  const videosRef = useRef<Record<string, HTMLVideoElement>>({})
+  const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
+  const activeRef = useRef("overhead")
+  const [activeLabel, setActiveLabel] = useState("Overhead")
+
+  // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
+  // textures whose stream has gone away.
+  useEffect(() => {
+    const videos = videosRef.current
+    const textures = texturesRef.current
+    for (const [name, stream] of Object.entries(streams)) {
+      let video = videos[name]
+      if (!video) {
+        video = document.createElement("video")
+        video.muted = true
+        video.autoplay = true
+        video.playsInline = true
+        videos[name] = video
+      }
+      if (video.srcObject !== stream) {
+        video.srcObject = stream
+        void video.play().catch(() => {})
+      }
+      if (!textures[name]) {
+        const tex = new THREE.VideoTexture(video)
+        tex.colorSpace = THREE.SRGBColorSpace
+        textures[name] = tex
+      }
+    }
+    for (const name of Object.keys(textures)) {
+      if (streams[name]) continue
+      textures[name].dispose()
+      delete textures[name]
+      const video = videos[name]
+      if (video) {
+        video.srcObject = null
+        delete videos[name]
+      }
+    }
+  }, [streams])
+
+  // Release GPU textures / video elements when the feed unmounts.
+  useEffect(() => {
+    const videos = videosRef.current
+    const textures = texturesRef.current
+    return () => {
+      for (const tex of Object.values(textures)) tex.dispose()
+      for (const video of Object.values(videos)) video.srcObject = null
+    }
+  }, [])
+
+  useFrame(() => {
+    const group = groupRef.current
+    const mesh = meshRef.current
+    const mat = matRef.current
+    if (!group || !mesh || !mat) return
+
+    const textures = texturesRef.current
+    group.visible = gl.xr.isPresenting && Object.keys(textures).length > 0
+    if (!group.visible) return
+
+    // Head-lock the feed so it always faces the operator.
+    const cam = gl.xr.getCamera()
+    group.position.copy(cam.position)
+    group.quaternion.copy(cam.quaternion)
+
+    // Select the feed from the right thumbstick (axes[2] = stick X).
+    const xrSession = gl.xr.getSession()
+    const right = xrSession
+      ? Array.from(xrSession.inputSources).find((s) => s.handedness === "right")
+      : undefined
+    const x = right?.gamepad?.axes?.[2] ?? 0
+    let name = "overhead"
+    if (x < -STICK_DEADZONE) name = "left_arm"
+    else if (x > STICK_DEADZONE) name = "right_arm"
+
+    // Fall back to overhead, then to whatever stream exists.
+    let tex = textures[name]
+    if (!tex) {
+      name = textures.overhead ? "overhead" : (Object.keys(textures)[0] ?? "overhead")
+      tex = textures[name]
+    }
+    if (!tex) {
+      group.visible = false
+      return
+    }
+
+    if (activeRef.current !== name) {
+      activeRef.current = name
+      setActiveLabel(CAMERA_LABELS[name] ?? name)
+    }
+    if (mat.map !== tex) {
+      mat.map = tex
+      mat.needsUpdate = true
+    }
+
+    const video = tex.image as HTMLVideoElement
+    const aspect = video && video.videoWidth ? video.videoWidth / video.videoHeight : 16 / 9
+    mesh.scale.set(FEED_HEIGHT * aspect, FEED_HEIGHT, 1)
+  })
+
+  return (
+    <group ref={groupRef} visible={false}>
+      <mesh ref={meshRef} position={[0, 0, -FEED_DISTANCE]} renderOrder={1}>
+        <planeGeometry args={[1, 1]} />
+        <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
+      </mesh>
+      <Text
+        position={[0, -FEED_HEIGHT / 2 - 0.06, -FEED_DISTANCE]}
+        fontSize={0.045}
+        fontWeight="bold"
+        color="white"
+        anchorX="center"
+        anchorY="top"
+        renderOrder={2}
+        material-depthTest={false}
+        {...hudBg}
+      >
+        {activeLabel}
+      </Text>
+    </group>
+  )
+}
+
 const hudBg = { backgroundColor: "#000000", backgroundOpacity: 0.5, padding: 0.006 } as object
 
 function XRHud({ children }: { children: ReactNode }) {
@@ -237,7 +384,7 @@ function StateDisplay({
 
 function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
   const W = 0.3
-  const H = 0.075
+  const H = 0.092
   const col = 0.07
 
   return (
@@ -313,7 +460,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec`}
+        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch Camera`}
       </Text>
     </group>
   )
@@ -507,6 +654,7 @@ export default function App() {
                   rows={[
                     ["B", "Toggle mode"],
                     ["A", "Start / stop rec"],
+                    ["Stick", "Switch camera"],
                   ]}
                 />
               </div>
@@ -545,6 +693,7 @@ export default function App() {
             onPendingRecording={setRecordingPendingAt}
             onExit={() => store.getState().session?.end()}
           />
+          <ImmersiveCameraFeed wsRef={wsRef} />
           <XRHud>
             <ExitButton />
             <HelpIcon />

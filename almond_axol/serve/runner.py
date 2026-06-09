@@ -62,6 +62,14 @@ _IGNORED_LOGGER_PREFIXES = (
 _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 
+def _host_from_box_url(box: str) -> str:
+    """Strip scheme/port from a ``https://host:8001`` box URL → ``host``."""
+    if not box:
+        return ""
+    netloc = box.split("://", 1)[-1]
+    return netloc.split(":", 1)[0].split("/", 1)[0]
+
+
 class _StreamTee:
     """Mirror a stream to the original fd and emit each completed line."""
 
@@ -245,6 +253,11 @@ class OperationRunner:
         needs_robot = op_id in _HARDWARE_OPS and not is_sim
         log_level = self._log_level(args)
 
+        # Teleop isn't ZED-orchestrated, but if a ZED box is connected and
+        # streaming we relay its cameras to the headset (overhead + wrists).
+        if op_id == "teleop" and cfg is not None:
+            self._attach_zed_to_teleop(cfg, session)
+
         session.status = "running"
         session.emit(f"[serve] starting {op_id} (in-process)")
 
@@ -308,6 +321,30 @@ class OperationRunner:
             await asyncio.to_thread(self.stop)
 
     # -- config building ----------------------------------------------------
+
+    def _attach_zed_to_teleop(self, cfg: Any, session: Session) -> None:
+        """Point teleop's headset video at the connected ZED box, if any.
+
+        When a ZED box is connected and streaming, the in-process teleop relays
+        those camera feeds to the headset over WebRTC. We override the config's
+        ``zed_host`` with the live box address and limit ``zed_cameras`` to the
+        slots that are actually streaming so teleop doesn't wait on absent feeds.
+        """
+        stream = self._stream
+        if stream is None or not getattr(stream, "running", False):
+            return
+        cameras = sorted(getattr(stream, "cameras", {}) or {})
+        if not cameras:
+            return
+        host = _host_from_box_url(getattr(stream, "box", ""))
+        if not host:
+            return
+        cfg.zed_host = host
+        cfg.zed_cameras = cameras
+        session.emit(
+            "[serve] teleop: relaying ZED cameras to the headset "
+            f"({', '.join(cameras)})"
+        )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:
         from ..cli.config import parse

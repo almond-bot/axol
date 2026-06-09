@@ -1,4 +1,6 @@
 export { AxolVRClient } from "./AxolVRClient"
 export { useAxolVRClient } from "./useAxolVRClient"
+export { useAxolVideo } from "./useAxolVideo"
 export { AxolConnectionStatus, AxolState } from "./types"
 export type { AxolPoseData } from "./types"
+export type { CameraStreams } from "./useAxolVideo"

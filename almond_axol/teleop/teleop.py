@@ -32,7 +32,6 @@ import logging
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.context
-import os
 import threading
 import time
 
@@ -184,18 +183,6 @@ class VRTeleop:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._vr_ready.wait)
 
-        # Opt-in synthetic wrist video so the WebRTC path is testable without
-        # ZED hardware: AXOL_VR_VIDEO_TEST=1 uv run axol teleop --sim
-        if os.environ.get("AXOL_VR_VIDEO_TEST"):
-            from ..vr.video import make_test_pattern_source
-
-            self._vr_server.set_video_sources(
-                {
-                    "left_arm": make_test_pattern_source(),
-                    "right_arm": make_test_pattern_source(),
-                }
-            )
-
         await self._robot.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
@@ -284,6 +271,16 @@ class VRTeleop:
 
     async def __aexit__(self, *_: object) -> None:
         await self.disable()
+
+    def set_video_sources(self, sources: dict[str, object] | None) -> None:
+        """Stream camera frames to the headset via WebRTC.
+
+        Each source is a callable returning the latest RGB ``uint8`` numpy
+        frame ``(H, W, 3)`` or ``None``. Must be called after :meth:`enable`
+        (so the VR server exists). Safe to call from any thread. Requires the
+        ``video`` extra; without it video is silently disabled.
+        """
+        self._vr_server.set_video_sources(sources)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Main loop
