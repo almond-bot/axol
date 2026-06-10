@@ -344,10 +344,14 @@ class OperationRunner:
             return
         cfg.cameras = serials
         cfg.overhead_stereo = bool((cameras or {}).get("overheadStereo"))
+        resolution = str((cameras or {}).get("resolution") or "").strip()
+        if resolution:
+            cfg.resolution = resolution
         stereo_note = " (overhead stereo)" if cfg.overhead_stereo else ""
+        resolution_note = f" @ {resolution}" if resolution else ""
         session.emit(
             "[serve] teleop: streaming cameras to the headset "
-            f"({', '.join(sorted(serials))}){stereo_note}"
+            f"({', '.join(sorted(serials))}){stereo_note}{resolution_note}"
         )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:

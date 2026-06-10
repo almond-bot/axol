@@ -85,19 +85,38 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
         return []
     try:
         from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
-        from ..lerobot.camera.configuration_zed import ZedCameraConfig
+        from ..lerobot.camera.configuration_zed import (
+            ZED_RESOLUTION_DIMS,
+            ZedCameraConfig,
+        )
     except Exception as exc:  # noqa: BLE001 - missing pyzed/SDK → no preview
         _logger.warning("ZED camera preview unavailable: %s", exc)
         return []
 
+    # Capture at the requested resolution; without one, width/height of None
+    # adopt each camera's SDK default (HD1200 on GMSL) on connect.
+    width: int | None = None
+    height: int | None = None
+    if cfg.resolution:
+        dims = ZED_RESOLUTION_DIMS.get(cfg.resolution)
+        if dims is None:
+            _logger.warning(
+                "unknown ZED resolution %r (expected one of %s); "
+                "using the camera default",
+                cfg.resolution,
+                ", ".join(ZED_RESOLUTION_DIMS),
+            )
+        else:
+            width, height = dims
+
     cameras: list[tuple[str, Any]] = []
     for name, serial in cfg.cameras.items():
-        # Teleop only relays frames to the headset, so adapt to whatever the
-        # camera captures (fps/width/height of None skip the config-vs-camera
-        # mismatch check used for dataset features).
+        # Teleop only relays frames to the headset, so fps adapts to whatever
+        # the camera captures (None skips the config-vs-camera mismatch check
+        # used for dataset features).
         def _config(**kwargs: Any) -> "ZedCameraConfig":
             return ZedCameraConfig(
-                serial=serial, fps=None, width=None, height=None, **kwargs
+                serial=serial, fps=None, width=width, height=height, **kwargs
             )
 
         # A stereo overhead carries both eyes on one grab; expose them as

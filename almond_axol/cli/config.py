@@ -416,7 +416,9 @@ class TeleopCmdConfig:
 
     Set ``--overhead_stereo`` when the overhead is a stereo ZED X: its two
     eyes are relayed as ``overhead_left`` / ``overhead_right`` and rendered
-    per-lens in the headset for true stereo.
+    per-lens in the headset for true stereo. ``--resolution`` picks the
+    capture resolution for all cameras (``SVGA`` / ``HD1080`` / ``HD1200``);
+    ``null`` (the default) keeps each camera's SDK default.
     """
 
     sim: bool = False
@@ -426,6 +428,7 @@ class TeleopCmdConfig:
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
     overhead_stereo: bool = False
+    resolution: str | None = None
     log_level: LogLevel = "INFO"
 
 
