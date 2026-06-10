@@ -69,13 +69,19 @@ export function CamerasDialog({
     }
   }, [])
 
+  // Detect once when the dialog opens; after that it's manual (Refresh /
+  // Restart daemon). Keyed on `open` only — `onClose` is an inline prop that
+  // changes identity on every parent render, so it must not retrigger this.
+  useEffect(() => {
+    if (open) refresh()
+  }, [open, refresh])
+
   useEffect(() => {
     if (!open) return
-    refresh()
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose()
     window.addEventListener("keydown", onKey)
     return () => window.removeEventListener("keydown", onKey)
-  }, [open, onClose, refresh])
+  }, [open, onClose])
 
   if (!open) return null
 
