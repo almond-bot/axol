@@ -4,8 +4,9 @@
 #   curl https://axol.almond.bot/install -fsS | bash
 #
 # Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
-# except cuda/dev), and registers a root systemd service that keeps
-# `axol serve` running at boot and restarts it if it ever goes down.
+# except cuda/dev), installs the pyzed bindings when the ZED SDK is present,
+# and registers a root systemd service that keeps `axol serve` running at
+# boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
 
 set -euo pipefail
@@ -53,6 +54,17 @@ UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
 
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
+
+# -- pyzed --------------------------------------------------------------------
+
+# pyzed is not on PyPI, so it cannot be an extra; install it into the tool
+# environment whenever the ZED SDK is present on this machine.
+if [ -d /usr/local/zed ]; then
+    say "ZED SDK detected; installing the pyzed Python bindings..."
+    axol zed.install || say "WARNING: pyzed install failed; run axol zed.install manually."
+else
+    say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
+fi
 
 # -- systemd service ----------------------------------------------------------
 
