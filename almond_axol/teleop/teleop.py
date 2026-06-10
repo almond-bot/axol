@@ -303,6 +303,16 @@ class VRTeleop:
         """
         self._vr_server.set_video_sources(sources)  # type: ignore[arg-type]
 
+    def set_video_manager(self, manager: object | None) -> None:
+        """Stream camera video via a pre-built WebRTC manager.
+
+        Used with the out-of-process video relay
+        (:class:`almond_axol.vr.video_proc.VideoRelayProcess`) so encoding
+        and RTP traffic never contend with the teleop control loops. Must
+        be called after :meth:`enable`. Safe to call from any thread.
+        """
+        self._vr_server.set_video_manager(manager)
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------

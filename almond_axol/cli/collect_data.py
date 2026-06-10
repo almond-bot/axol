@@ -34,6 +34,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from ..utils.jetson import pin_engine_clocks
 from .config import LogLevel, parse
 
 if TYPE_CHECKING:
@@ -70,21 +71,14 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
     Relays every camera the robot exposes (overhead — or ``overhead_left`` /
     ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
-    show them. Best-effort: reads the latest decoded frame each camera already
-    keeps, so it never blocks the capture pipeline.
+    show them. Frame-driven (see ``_ZedFrameSource``): each relayed frame is
+    encoded as soon as it's captured. Reads only consume the latest frame each
+    camera already keeps, so the dataset capture pipeline is never blocked.
     """
-
-    def _make_source(cam: Any) -> Callable[[], Any]:
-        def _source() -> Any:
-            try:
-                return cam.read_latest(max_age_ms=1000)
-            except Exception:
-                return None
-
-        return _source
+    from .teleop import _ZedFrameSource
 
     sources: dict[str, Callable[[], Any]] = {
-        name: _make_source(cam) for name, cam in robot.cameras.items()
+        name: _ZedFrameSource(cam) for name, cam in robot.cameras.items()
     }
 
     if not sources:
@@ -297,6 +291,13 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every log_say() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+
+    if getattr(cfg.robot_config, "cameras", None):
+        # The cameras stream to the headset through the Jetson hardware
+        # encoder; pin its engine clocks now, while a sudo prompt can still
+        # reach the tty (mid-session escalation is non-interactive).
+        pin_engine_clocks(interactive=True)
+
     _run(cfg)
 
 

@@ -36,11 +36,14 @@ import select
 import shutil
 import subprocess
 import threading
+from collections.abc import Callable
 from typing import Any
 
 import av
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
+
+from ..utils.jetson import pin_engine_clocks
 
 _logger = logging.getLogger(__name__)
 
@@ -51,7 +54,15 @@ _FPS = 30
 # the final NAL of the current access unit (the encoder writes a whole AU
 # per frame, then idles ~33 ms until the next one). Flushing on idle avoids
 # waiting for the next AU's delimiter, saving a frame of framing latency.
-_IDLE_FLUSH_S = 0.005
+# Buffers belonging to one frame arrive back-to-back (<1 ms apart), so a
+# 2 ms quiet window is decisively past the end of the AU; encode() blocks
+# on this flush every frame, so it's direct glass-to-glass latency.
+_IDLE_FLUSH_S = 0.002
+
+# How long encode() waits for the current frame's AU before skipping it.
+# Steady-state NVENC latency is ~10 ms; anything past this is a hiccup and
+# the late AU gets drained on the next call.
+_AU_TIMEOUT_S = 0.1
 
 _NAL_TYPE_AUD = 9
 
@@ -62,20 +73,28 @@ def _bitrate_for(width: int, height: int, fps: int) -> int:
 
 
 def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
-    """``gst-launch-1.0`` argv: RGBA on stdin -> H.264 byte stream on stdout.
+    """``gst-launch-1.0`` argv: RGB24 on stdin -> H.264 byte stream on stdout.
 
-    ``nvvidconv`` does the RGBA->NV12 colorspace conversion on the GPU and
-    ``nvv4l2h264enc`` is the Jetson hardware encoder. ``insert-aud=true``
-    delimits access units so the reader can frame the byte stream;
-    ``idrinterval`` bounds keyframe spacing to 1 s since ``gst-launch``
-    offers no runtime keyframe control (PLI recovery worst case).
+    The input is RGB24 (not RGBA): the relay's frames are already ``rgb24``
+    numpy arrays, so this makes the Python-side handoff a plain buffer copy
+    and the pipe carry 25% less data. ``videoconvert`` expands to RGBA on
+    the pipeline side (multi-threaded, overlapped with the next frame's
+    write — measured faster end-to-end than converting in Python), since
+    ``nvvidconv`` accepts RGBA but not RGB24. ``nvvidconv`` then converts to
+    NV12 on the VIC and ``nvv4l2h264enc`` is the hardware encoder.
+    ``insert-aud=true`` delimits access units so the reader can frame the
+    byte stream; ``idrinterval`` bounds keyframe spacing to 1 s since
+    ``gst-launch`` offers no runtime keyframe control (PLI recovery worst
+    case).
     """
     pipeline = [
-        f"fdsrc fd=0 blocksize={width * height * 4}",
+        f"fdsrc fd=0 blocksize={width * height * 3}",
         (
-            "rawvideoparse use-sink-caps=false format=rgba "
+            "rawvideoparse use-sink-caps=false format=rgb "
             f"width={width} height={height} framerate={fps}/1"
         ),
+        "videoconvert n-threads=4",
+        "video/x-raw,format=RGBA",
         "nvvidconv",
         "video/x-raw(memory:NVMM),format=NV12",
         (
@@ -130,6 +149,7 @@ class _GstH264Pipeline:
     def __init__(self, width: int, height: int, fps: int = _FPS) -> None:
         self.width = width
         self.height = height
+        self.frames_written = 0
         bitrate = _bitrate_for(width, height, fps)
         self._proc = subprocess.Popen(
             _gst_argv(width, height, fps, bitrate),
@@ -156,21 +176,32 @@ class _GstH264Pipeline:
     def alive(self) -> bool:
         return self._proc.poll() is None
 
-    def write_frame(self, rgba: bytes) -> None:
-        """Feed one RGBA frame; raises if the pipeline has died."""
+    def write_frame(self, rgb: bytes | memoryview) -> None:
+        """Feed one packed RGB24 frame; raises if the pipeline has died."""
         assert self._proc.stdin is not None
-        self._proc.stdin.write(rgba)
+        self._proc.stdin.write(rgb)
+        self.frames_written += 1
 
-    def pop_au(self) -> list[bytes] | None:
-        """Oldest completed access unit (list of NALs), or ``None``."""
+    def pop_au(self, timeout: float | None = None) -> list[bytes] | None:
+        """Oldest completed access unit (list of NALs), or ``None``.
+
+        With a ``timeout`` (seconds), blocks up to that long for one to
+        arrive; otherwise returns immediately.
+        """
         try:
-            return self._aus.get_nowait()
+            if timeout is None:
+                return self._aus.get_nowait()
+            return self._aus.get(timeout=timeout)
         except queue.Empty:
             return None
 
     def close(self) -> None:
         if self._proc.poll() is None:
             self._proc.kill()
+            try:
+                self._proc.wait(timeout=2.0)  # reap — no zombies
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
         for stream in (self._proc.stdin, self._proc.stdout):
             if stream is not None:
                 try:
@@ -186,51 +217,67 @@ class _GstH264Pipeline:
     def _read_loop(self) -> None:
         """Split stdout's Annex-B byte stream into NALs and queue AUs."""
         assert self._proc.stdout is not None
-        fd = self._proc.stdout.fileno()
-        buf = bytearray()
-        current_au: list[bytes] = []
+        read_annexb_aus(self._proc.stdout.fileno(), self._aus.put, lambda: self.alive)
 
-        def emit_nal(nal: bytes) -> None:
-            nonlocal current_au
-            if not nal:
-                return
-            if (nal[0] & 0x1F) == _NAL_TYPE_AUD and current_au:
-                self._aus.put(current_au)
-                current_au = []
-            current_au.append(nal)
 
-        def flush_au() -> None:
-            nonlocal current_au
-            if current_au:
-                self._aus.put(current_au)
-                current_au = []
+def read_annexb_aus(
+    fd: int,
+    emit_au: Callable[[list[bytes]], None],
+    alive: Callable[[], bool],
+) -> None:
+    """Blocking loop: frame ``fd``'s Annex-B byte stream into access units.
 
-        while True:
-            try:
-                ready, _, _ = select.select([fd], [], [], _IDLE_FLUSH_S)
-                chunk = os.read(fd, 1 << 20) if ready else None
-            except OSError:  # close() closed the fd under us — clean teardown
+    Each completed AU — a list of NALs with start codes stripped, delimited
+    by the AUD NALs the encoder is told to insert or by the idle-flush
+    heuristic (see ``_IDLE_FLUSH_S``) — is passed to ``emit_au``. Returns on
+    EOF, on the fd being closed, or once ``alive()`` goes false while idle.
+    Shared by the frame-fed NVENC pipeline here and the camera-native
+    pipelines in ``gst_zed``.
+    """
+    buf = bytearray()
+    current_au: list[bytes] = []
+
+    def emit_nal(nal: bytes) -> None:
+        nonlocal current_au
+        if not nal:
+            return
+        if (nal[0] & 0x1F) == _NAL_TYPE_AUD and current_au:
+            emit_au(current_au)
+            current_au = []
+        current_au.append(nal)
+
+    def flush_au() -> None:
+        nonlocal current_au
+        if current_au:
+            emit_au(current_au)
+            current_au = []
+
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], _IDLE_FLUSH_S)
+            chunk = os.read(fd, 1 << 20) if ready else None
+        except (OSError, ValueError):  # fd closed under us — clean teardown
+            return
+        if chunk is None:
+            # Encoder is idle between frames: the buffered tail (if any)
+            # is the last NAL of the current AU — emit and flush.
+            tail = _strip_start_code(bytes(buf))
+            if tail is not None:
+                emit_nal(tail)
+                buf.clear()
+            flush_au()
+            if not alive():
                 return
-            if chunk is None:
-                # Encoder is idle between frames: the buffered tail (if any)
-                # is the last NAL of the current AU — emit and flush.
-                tail = _strip_start_code(bytes(buf))
-                if tail is not None:
-                    emit_nal(tail)
-                    buf.clear()
-                flush_au()
-                if not self.alive:
-                    return
-                continue
-            if not chunk:  # EOF — pipeline exited
-                tail = _strip_start_code(bytes(buf))
-                if tail is not None:
-                    emit_nal(tail)
-                flush_au()
-                return
-            buf.extend(chunk)
-            for nal in _drain_complete_nals(buf):
-                emit_nal(nal)
+            continue
+        if not chunk:  # EOF — pipeline exited
+            tail = _strip_start_code(bytes(buf))
+            if tail is not None:
+                emit_nal(tail)
+            flush_au()
+            return
+        buf.extend(chunk)
+        for nal in _drain_complete_nals(buf):
+            emit_nal(nal)
 
 
 def _strip_start_code(data: bytes) -> bytes | None:
@@ -277,6 +324,7 @@ class JetsonH264Encoder:
     def __init__(self) -> None:
         self._pipeline: _GstH264Pipeline | None = None
         self._fallback: H264Encoder | None = None
+        self._packer: H264Encoder | None = None
         self._target_bitrate = 0  # informational only; NVENC bitrate is fixed
 
     def encode(
@@ -312,20 +360,46 @@ class JetsonH264Encoder:
         if self._pipeline is None:
             self._pipeline = _GstH264Pipeline(frame.width, frame.height)
 
-        # nvvidconv converts RGBA -> NV12 on the GPU; PyAV's swscale does the
-        # cheap RGB -> RGBA expansion here.
-        self._pipeline.write_frame(frame.to_ndarray(format="rgba").tobytes())
+        # The track's frames are already rgb24, so this is a plain unpadded
+        # copy (no colorspace work); the ndarray is written via the buffer
+        # protocol to skip a tobytes() round trip.
+        pipeline = self._pipeline
+        first_frame = not pipeline.frames_written
+        pipeline.write_frame(frame.to_ndarray(format="rgb24"))
 
-        # The pipeline runs ~a frame behind the track: nothing queued yet is
-        # normal (aiortc treats an empty payload list as "no packet").
-        au = self._pipeline.pop_au()
+        # Encode synchronously, like aiortc's software encoder: block until
+        # *this* frame's AU is out (NVENC delivers in ~10 ms; pipeline
+        # startup makes the first one slower). Never returning early keeps
+        # the queue empty — returning [] here would let a backlog build that
+        # never drains, showing up as a permanent multi-frame latency.
+        au = pipeline.pop_au(timeout=2.0 if first_frame else _AU_TIMEOUT_S)
         if au is None:
+            if not pipeline.alive:
+                raise RuntimeError("gst pipeline exited")
+            # Transient encoder hiccup: skip this frame; the late AU is
+            # drained (below) on the next call, so latency still can't build.
+            _logger.debug("hw encoder missed the AU deadline; skipping a frame")
             return [], timestamp
-        return H264Encoder._packetize(au), timestamp
+        payloads = H264Encoder._packetize(au)
+        # Drain anything else queued (startup burst, recovered hiccup) so
+        # queued latency never persists; extra AUs ride along under this
+        # frame's timestamp, which momentarily speeds up playback rather
+        # than lagging it.
+        while (extra := pipeline.pop_au()) is not None:
+            payloads += H264Encoder._packetize(extra)
+        return payloads, timestamp
 
     def pack(self, packet: Any) -> tuple[list[bytes], int]:
-        """Pre-encoded passthrough — unused by the camera tracks."""
-        return H264Encoder().pack(packet)
+        """Pre-encoded passthrough — used by ``PrecodedVideoTrack`` senders.
+
+        The gst-native camera path (``gst_zed``) delivers already-encoded
+        access units; aiortc routes them here for RTP packetization. Reuses
+        one software encoder instance purely as a packetizer (it never
+        encodes).
+        """
+        if self._packer is None:
+            self._packer = H264Encoder()
+        return self._packer.pack(packet)
 
     @property
     def target_bitrate(self) -> int:
@@ -353,6 +427,9 @@ def install_hw_encoder() -> bool:
         return False
     global _installed
     with _install_lock:
+        # Re-check the clocks on every install (they reset at reboot, and a
+        # long-lived serve process spans teleop sessions).
+        pin_engine_clocks()
         if _installed:
             return True
         import aiortc.codecs

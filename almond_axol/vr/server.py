@@ -119,6 +119,19 @@ class VRServer:
         self._webrtc = WebRTCManager(sources)
         _logger.info("wrist video enabled for: %s", ", ".join(sources))
 
+    def set_video_manager(self, manager: Any | None) -> None:
+        """Register a pre-built WebRTC manager (e.g. an out-of-process relay).
+
+        ``manager`` must implement the ``WebRTCManager`` signaling interface
+        (``create_offer`` / ``set_answer`` / ``close`` / ``close_all``).
+        Used by teleop to keep all video encoding and RTP traffic in a
+        separate process (``almond_axol.vr.video_proc``) so it cannot
+        contend with the control loops. Pass ``None`` to disable video.
+        """
+        self._webrtc = manager
+        if manager is not None:
+            _logger.info("wrist video enabled (external manager)")
+
     @property
     def connected(self) -> bool:
         """True if at least one VR client is currently connected."""

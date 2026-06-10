@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from ..utils.certs import ACCEPT_PAGE_HTML
+from ..utils.jetson import pin_engine_clocks
 from .commands import command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
@@ -90,6 +91,12 @@ def _detect_cameras() -> dict[str, Any]:
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="axol serve")
+
+    # On Jetson, pin the NVENC/VIC clocks the camera relay's hardware encoder
+    # needs (they reset at reboot; the hosted install runs serve as root at
+    # boot, so this makes the pin effectively persistent). No-op elsewhere.
+    pin_engine_clocks()
+
     manager = SessionManager()
     robot = RobotLink()
     runner = OperationRunner(robot)
