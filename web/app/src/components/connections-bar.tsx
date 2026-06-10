@@ -46,7 +46,9 @@ function Tile({
           <span
             className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
           />
-          <span className="truncate text-white/75">{label}</span>
+          <span className="truncate text-white/75" title={label}>
+            {label}
+          </span>
         </span>
         {children}
       </div>

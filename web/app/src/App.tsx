@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
+import { Suspense, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
 import { Canvas, useFrame, useThree } from "@react-three/fiber"
 import { Text } from "@react-three/drei"
 import { createXRStore, XR, useXR } from "@react-three/xr"
@@ -1093,22 +1093,29 @@ export default function App() {
       </div>
 
       <Canvas>
-        <XR store={store}>
-          <AxolVRClient
-            wsRef={wsRef}
-            onStateChange={setVrState}
-            onPendingRecording={setRecordingPendingAt}
-            onExit={() => store.getState().session?.end()}
-          />
-          <ImmersiveCameraFeed wsRef={wsRef} />
-          <XRHud>
-            <ExitButton />
-            <HelpIcon />
-            <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
-            <CountdownDisplay recordingPendingAt={recordingPendingAt} />
-          </XRHud>
-          <PoseVisualizer />
-        </XR>
+        {/* Boundary so in-canvas suspense (drei <Text> preloading its font)
+            never bubbles up to the route-level Suspense — without it, the
+            whole page flashes back to the loading spinner shortly after
+            first paint. The text is only visible in-headset, so an empty
+            fallback is fine. */}
+        <Suspense fallback={null}>
+          <XR store={store}>
+            <AxolVRClient
+              wsRef={wsRef}
+              onStateChange={setVrState}
+              onPendingRecording={setRecordingPendingAt}
+              onExit={() => store.getState().session?.end()}
+            />
+            <ImmersiveCameraFeed wsRef={wsRef} />
+            <XRHud>
+              <ExitButton />
+              <HelpIcon />
+              <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
+              <CountdownDisplay recordingPendingAt={recordingPendingAt} />
+            </XRHud>
+            <PoseVisualizer />
+          </XR>
+        </Suspense>
       </Canvas>
     </>
   )

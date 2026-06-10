@@ -67,7 +67,8 @@ Wants=network-online.target
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3
-Environment=PATH=${BIN_DIR}:/usr/bin:/bin
+# Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
+Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

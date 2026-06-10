@@ -28,9 +28,25 @@ _BUILD_DIR = Path.home() / ".almond" / "can" / "gs_usb-build"
 _MODULES_LOAD_FILE = Path("/etc/modules-load.d/gs_usb.conf")
 
 
+def _find_modinfo() -> str | None:
+    """Locate ``modinfo``, including the sbin dirs minimal PATHs often omit."""
+    found = shutil.which("modinfo")
+    if found:
+        return found
+    for candidate in ("/usr/sbin/modinfo", "/sbin/modinfo"):
+        if Path(candidate).exists():
+            return candidate
+    return None
+
+
 def is_driver_available() -> bool:
     """True when the running kernel can already load ``gs_usb``."""
-    return subprocess.run(["modinfo", "gs_usb"], capture_output=True).returncode == 0
+    modinfo = _find_modinfo()
+    if modinfo is None:
+        raise RuntimeError(
+            "`modinfo` not found. Install kmod first (`sudo apt install kmod`)."
+        )
+    return subprocess.run([modinfo, "gs_usb"], capture_output=True).returncode == 0
 
 
 def _build() -> Path:

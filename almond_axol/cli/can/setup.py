@@ -87,14 +87,8 @@ def _resolve_serial() -> str:
     if len(unique) == 1:
         return unique[0]
     if not unique:
-        raise RuntimeError(
-            "No Almond Axol CAN adapter detected. Plug it in, or run "
-            "`axol can.setup` in a terminal to enter the serial manually."
-        )
-    raise RuntimeError(
-        "Multiple CAN adapters detected; run `axol can.setup` in a terminal "
-        "to choose which one to configure."
-    )
+        raise RuntimeError("Robot not detected")
+    raise RuntimeError("Multiple CAN adapters")
 
 
 def _find_serial() -> str:

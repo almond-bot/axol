@@ -47,6 +47,21 @@ STATE_ERROR = "error"
 _IFF_UP = 0x1
 
 
+def _format_error(exc: BaseException) -> str:
+    """Short, human-readable error for the UI status pill.
+
+    ``RuntimeError``s raised by the bring-up path are already written for
+    humans ("Robot not detected"), so show them as-is; anything else keeps
+    the exception type as context. Multi-line errors (e.g. a driver build
+    failure dumping compiler output) are reduced to their first line.
+    """
+    if isinstance(exc, RuntimeError) and str(exc):
+        text = str(exc)
+    else:
+        text = f"{type(exc).__name__}: {exc}"
+    return text.strip().splitlines()[0] if text.strip() else type(exc).__name__
+
+
 class _ArmLink:
     """One arm's CAN bus plus its eight motors, kept open for pinging."""
 
@@ -135,16 +150,16 @@ class RobotLink:
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
             with self._lock:
                 self._state = STATE_ERROR
-                self._error = f"{type(exc).__name__}: {exc}"
-            _logger.warning("robot connect failed: %s", self._error)
+                self._error = _format_error(exc)
+            _logger.warning("robot connect failed: %s", exc)
             return self.status()
         try:
             self._submit(self._open_and_start())
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
             with self._lock:
                 self._state = STATE_ERROR
-                self._error = f"{type(exc).__name__}: {exc}"
-            _logger.warning("robot connect failed: %s", self._error)
+                self._error = _format_error(exc)
+            _logger.warning("robot connect failed: %s", exc)
             return self.status()
         with self._lock:
             self._state = STATE_CONNECTED
@@ -189,8 +204,8 @@ class RobotLink:
         except Exception as exc:  # noqa: BLE001
             with self._lock:
                 self._state = STATE_ERROR
-                self._error = f"{type(exc).__name__}: {exc}"
-            _logger.warning("robot reacquire failed: %s", self._error)
+                self._error = _format_error(exc)
+            _logger.warning("robot reacquire failed: %s", exc)
             return
         with self._lock:
             self._state = STATE_CONNECTED
