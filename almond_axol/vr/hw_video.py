@@ -99,9 +99,12 @@ def hw_h264_available() -> bool:
     if not inspect or not shutil.which("gst-launch-1.0"):
         return False
     try:
+        # A full inspect, not `--exists`: nvvideo4linux2 registers its
+        # elements by probing the V4L2 device when the plugin loads, so the
+        # registry-cache-only `--exists` check misses them on some JetPacks.
         ok = (
             subprocess.run(
-                [inspect, "--exists", "nvv4l2h264enc"],
+                [inspect, "nvv4l2h264enc"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=10,
@@ -203,8 +206,12 @@ class _GstH264Pipeline:
                 current_au = []
 
         while True:
-            ready, _, _ = select.select([fd], [], [], _IDLE_FLUSH_S)
-            if not ready:
+            try:
+                ready, _, _ = select.select([fd], [], [], _IDLE_FLUSH_S)
+                chunk = os.read(fd, 1 << 20) if ready else None
+            except OSError:  # close() closed the fd under us — clean teardown
+                return
+            if chunk is None:
                 # Encoder is idle between frames: the buffered tail (if any)
                 # is the last NAL of the current AU — emit and flush.
                 tail = _strip_start_code(bytes(buf))
@@ -215,7 +222,6 @@ class _GstH264Pipeline:
                 if not self.alive:
                     return
                 continue
-            chunk = os.read(fd, 1 << 20)
             if not chunk:  # EOF — pipeline exited
                 tail = _strip_start_code(bytes(buf))
                 if tail is not None:
