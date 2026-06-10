@@ -22,9 +22,16 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from aiortc import (
+    RTCPeerConnection,
+    RTCRtpSender,
+    RTCSessionDescription,
+    VideoStreamTrack,
+)
 from av import VideoFrame
 from numpy.typing import NDArray
+
+from .hw_video import install_hw_encoder
 
 _logger = logging.getLogger(__name__)
 
@@ -112,6 +119,19 @@ class WebRTCManager:
             track = CameraVideoTrack(source)
             pc.addTrack(track)
             track_names[id(track)] = name
+
+        # On Jetson, route encoding through NVENC (software VP8/H264 can't
+        # keep up at high resolutions) and pin H.264 in the SDP so the
+        # hardware path is what actually gets negotiated.
+        if install_hw_encoder():
+            h264 = [
+                c
+                for c in RTCRtpSender.getCapabilities("video").codecs
+                if c.mimeType.lower() == "video/h264"
+            ]
+            if h264:
+                for transceiver in pc.getTransceivers():
+                    transceiver.setCodecPreferences(h264)
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)

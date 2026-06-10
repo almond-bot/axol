@@ -58,6 +58,8 @@ axol teleop --config_path my_teleop.json          # whole-config file
 
 With `--cameras` set, teleop opens the locally attached ZED cameras by serial number and relays them to the headset over WebRTC, so the operator sees the robot's cameras instead of (or alongside) passthrough. The right thumbstick switches views — see the [VR Interface guide](/guides/vr-interface#camera-views) for the view system and controls. Requires `pyzed` ([`zed.install`](/cli/zed-install)) and the `video` extra (`uv sync --extra video`).
 
+On a Jetson, the relay automatically encodes with the **hardware H.264 encoder** (NVENC via GStreamer's `nvv4l2h264enc`) instead of aiortc's software codec, keeping latency low even at `HD1200`. If the GStreamer element isn't installed, the relay falls back to software encoding — `SVGA` is then the recommended resolution.
+
 <Note>
   This command takes its config via draccus, not fixed `argparse` flags. Field names use underscores, nested fields are dot-separated, `None` is `null`, and lists use `[a,b,c]` — see [Command configuration](/cli/configuration) for the full model.
 </Note>
