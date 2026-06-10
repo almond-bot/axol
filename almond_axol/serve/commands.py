@@ -11,6 +11,7 @@ unavailable so the rest of the catalog still loads.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from .introspect import Schema, build_argparse_schema, build_schema
@@ -85,7 +86,7 @@ def _argparse_loader(module: str, attr: str = "add_parser") -> Callable[[], Any]
         import importlib
 
         # ``module`` is relative to this package (``almond_axol.serve``); e.g.
-        # ``..cli.zed.stream`` resolves to ``almond_axol.cli.zed.stream``.
+        # ``..cli.zed.install`` resolves to ``almond_axol.cli.zed.install``.
         mod = importlib.import_module(module, __package__)
         return getattr(mod, attr)
 
@@ -119,7 +120,7 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
+        "Record teleoperation episodes to a LeRobot dataset with the local ZED cameras.",
         "Operate",
         "draccus",
         _collect_data,
@@ -136,26 +137,6 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
     ),
     # -- Cameras ------------------------------------------------------------
-    "zed.stream": CommandDef(
-        "zed.stream",
-        "zed.stream",
-        "Stream cameras",
-        "Stream the ZED-X One cameras over the network (run on the ZED box).",
-        "Cameras",
-        "argparse",
-        _argparse_loader("..cli.zed.stream"),
-        requires_hardware=True,
-    ),
-    "zed.sync-clocks": CommandDef(
-        "zed.sync-clocks",
-        "zed.sync-clocks",
-        "Sync clocks",
-        "PTP-sync this machine's clock with the ZED box for accurate timestamps.",
-        "Cameras",
-        "argparse",
-        _argparse_loader("..cli.zed.sync_clocks"),
-        requires_hardware=True,
-    ),
     "zed.install": CommandDef(
         "zed.install",
         "zed.install",
@@ -319,8 +300,10 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
 
     Each key is emitted per its schema recipe (see :class:`Schema`): dotted
     draccus options, argparse flags/options/lists, choice switches, and
-    positionals. Keys not present in the schema are ignored so the UI cannot
-    inject arbitrary arguments.
+    positionals. Leaves inside a dict-typed draccus field (``dictleaf``) are
+    folded back into one inline ``--root {…}`` value, since draccus has no
+    per-leaf options for dicts. Keys not present in the schema are ignored so
+    the UI cannot inject arbitrary arguments.
     """
     if command_id not in COMMANDS:
         raise KeyError(command_id)
@@ -328,6 +311,8 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
 
     options: list[str] = []
     positionals: list[str] = []
+    # ``root`` -> nested value tree assembled from its submitted leaves.
+    dict_values: dict[str, dict[str, Any]] = {}
     for key, raw in args.items():
         spec = emit.get(key)
         if spec is None:
@@ -351,8 +336,20 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
             token = _format_value(raw)
             if token is not None:
                 positionals.append(token)
+        elif kind == "dictleaf":
+            if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+                continue
+            node = dict_values.setdefault(spec["root"], {})
+            parts = spec["sub"].split(".")
+            for part in parts[:-1]:
+                node = node.setdefault(part, {})
+            node[parts[-1]] = raw
         else:  # "opt"
             token = _format_value(raw)
             if token is not None:
                 options.extend([spec["flag"], token])
+    for root, tree in dict_values.items():
+        # JSON is valid YAML, so draccus's value parser loads it as a dict and
+        # deep-merges it over the dict field's defaults.
+        options.extend([f"--{root}", json.dumps(tree)])
     return [*options, *positionals]

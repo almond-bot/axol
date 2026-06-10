@@ -13,13 +13,13 @@ almond_axol/
 ├── kinematics/   Bimanual IK solver (JAX + pyroki)
 ├── teleop/       VR headset → IK → robot control loop
 ├── vr/           WebSocket server that receives VR frames
-├── zed/          ZED-X One camera streaming
+├── zed/          Local ZED camera enumeration + daemon control
 ├── motor/        Low-level async CAN motor interface
 ├── serve/        Web control-panel server (FastAPI) behind `axol serve`
 └── lerobot/      LeRobot Robot / Teleoperator / Camera wrappers (requires lerobot extra)
     ├── robot/    AxolRobot — LeRobot Robot wrapping the async hardware driver
     ├── teleop/   AxolVRTeleop — LeRobot Teleoperator wrapping VRTeleop
-    └── camera/   ZedCamera — LeRobot Camera wrapping a ZED stream receiver
+    └── camera/   ZedCamera — LeRobot Camera for a locally attached ZED
 ```
 
 The browser front-ends live outside the Python package, in `web/`: the [VR teleop interface](/guides/vr-interface) and the [web control panel](/guides/control-panel), both built to `web/app/dist` and served by [`axol serve`](/cli/serve).
@@ -41,7 +41,7 @@ VR headset → AxolVRTeleop.get_action() → AxolRobot.send_action() → motors
 
 ## Async context managers
 
-`Axol`, `Sim`, `VRTeleop`, `VRServer`, and `ZedStreamer` all open and close hardware resources in `__aenter__` / `__aexit__`. Always use them with `async with`.
+`Axol`, `Sim`, `VRTeleop`, and `VRServer` all open and close hardware resources in `__aenter__` / `__aexit__`. Always use them with `async with`.
 
 ## Joint arrays
 

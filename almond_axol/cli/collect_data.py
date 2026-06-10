@@ -16,7 +16,7 @@ The teleop loop runs at ``--teleop_hz`` and publishes the latest
 ``(joint_obs, action)`` to a single-slot ``_SnapshotPublisher``. A separate
 ``_CaptureThread`` ticks at ``--fps`` and, for each tick, blocks on
 ``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame
-shares the sender-clock instant ``T_n`` with the joint sample, then writes
+shares the capture instant ``T_n`` with the joint sample, then writes
 the dataset row off the hot control loop.
 """
 
@@ -46,20 +46,22 @@ _logger = logging.getLogger(__name__)
 
 
 def _default_robot_config() -> AxolRobotConfig:
-    """Default Axol robot config for data collection: three ZED streams.
+    """Default Axol robot config for data collection: three local ZED cameras.
 
-    All three cameras share one host, which is **required** — pass
-    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
-    stripped from the config overlay so draccus enforces the input). Other
-    fields are overridable too, e.g. ``--robot_config.axol_config.left.elbow.kp 60``.
+    Each camera's serial number is **required** — draccus takes dict
+    fields as one inline YAML/JSON value, so pass
+    ``--robot_config.cameras "{overhead: {serial: 41234567}, left_arm:
+    {serial: 41234568}, right_arm: {serial: 41234569}}"`` (the zero
+    placeholders below are stripped from the config overlay so draccus
+    enforces the input). Other fields are overridable too, e.g.
+    ``--robot_config.axol_config.left.elbow.kp 60``.
     """
     return AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(port=30000),
-            "left_arm": ZedCameraConfig(port=30002),
-            "right_arm": ZedCameraConfig(port=30004),
+            "overhead": ZedCameraConfig(serial=0),
+            "left_arm": ZedCameraConfig(serial=0),
+            "right_arm": ZedCameraConfig(serial=0),
         },
-        zed_host="",
     )
 
 
@@ -99,7 +101,7 @@ class CollectDataConfig:
     """Config for ``axol collect-data``.
 
     ``robot_config`` and ``teleop_config`` are the full lerobot subsystem
-    configs (camera streams, per-joint gains, IK, VR server); nest into
+    configs (cameras, per-joint gains, IK, VR server); nest into
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
     """
@@ -352,8 +354,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     if rerun_ip:
         init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
 
-    # Connect first — cameras auto-detect resolution and FPS from the stream,
-    # which is then used to define the dataset observation features.
+    # Connect first — cameras auto-detect resolution and FPS on open, which
+    # is then used to define the dataset observation features.
     robot.connect()
 
     if is_complete:

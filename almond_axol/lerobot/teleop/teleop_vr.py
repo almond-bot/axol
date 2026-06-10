@@ -21,7 +21,7 @@ Typical usage::
     from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
     from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
 
-    robot_config = AxolRobotConfig(zed_host="192.168.1.10")
+    robot_config = AxolRobotConfig()
     with AxolRobot(robot_config) as robot, AxolVRTeleop(AxolVRTeleopConfig()) as teleop:
         while True:
             obs = robot.get_observation()

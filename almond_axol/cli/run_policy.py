@@ -2,13 +2,17 @@
 axol run-policy
 
 Run a trained policy on the Axol robot with three ZED cameras using
-LeRobot's async inference (``lerobot.async_inference``). A ``PolicyServer``
-is auto-launched in a child process on localhost and the parent drives an
-``AxolRobotClient`` (a thin ``RobotClient`` subclass) that streams
-observations to it and consumes the returned action chunks. Cameras and
-joints are sampled via ``ZedCamera.read_at_or_after(now)`` so every
-inference observation is global-timestamp aligned the same way the
-training data is (see ``AxolRobot.get_observation``).
+LeRobot's async inference (``lerobot.async_inference``). By default a
+``PolicyServer`` is auto-launched in a child process on localhost; pass
+``--server_host`` to use a remote inference server started with
+``axol inference-server`` on a more powerful machine instead (joint
+positions + camera frames are streamed to it over gRPC and it returns
+action chunks). Either way the parent drives an ``AxolRobotClient`` (a
+thin ``RobotClient`` subclass) that streams observations to the server
+and consumes the returned action chunks. Cameras and joints are sampled
+via ``ZedCamera.read_at_or_after(now)`` so every inference observation is
+timestamp-aligned the same way the training data is (see
+``AxolRobot.get_observation``).
 
 Each episode runs until the operator types ``s`` (save), ``r`` (rerecord
 + discard), or ``q`` (quit + discard) on stdin. ``--episode_time_s`` is a
@@ -45,22 +49,23 @@ _logger = logging.getLogger(__name__)
 
 
 def _default_robot_config() -> AxolRobotConfig:
-    """Default Axol robot config for inference: three ZED streams.
+    """Default Axol robot config for inference: three local ZED cameras.
 
-    All three cameras share one host, which is **required** — pass
-    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
-    stripped from the config overlay so draccus enforces the input). Other
-    fields are overridable too, e.g.
+    Each camera's serial number is **required** — draccus takes dict
+    fields as one inline YAML/JSON value, so pass
+    ``--robot_config.cameras "{overhead: {serial: 41234567}, left_arm:
+    {serial: 41234568}, right_arm: {serial: 41234569}}"`` (the zero
+    placeholders below are stripped from the config overlay so draccus
+    enforces the input). Other fields are overridable too, e.g.
     ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
     used at data-collection time).
     """
     return AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(port=30000),
-            "left_arm": ZedCameraConfig(port=30002),
-            "right_arm": ZedCameraConfig(port=30004),
+            "overhead": ZedCameraConfig(serial=0),
+            "left_arm": ZedCameraConfig(serial=0),
+            "right_arm": ZedCameraConfig(serial=0),
         },
-        zed_host="",
     )
 
 
@@ -68,11 +73,18 @@ def _default_robot_config() -> AxolRobotConfig:
 class RunPolicyConfig:
     """Config for ``axol run-policy``.
 
-    ``robot_config`` is the full Axol robot config (camera streams,
-    per-joint gains); nest into it from the CLI (e.g.
+    ``robot_config`` is the full Axol robot config (cameras, per-joint
+    gains); nest into it from the CLI (e.g.
     ``--robot_config.axol_config.left_stiffness 0.8``) or pass a
     whole-config file with ``--config_path``. The compliance/stiffness
     blend should match the values used at data-collection time.
+
+    Inference runs on this machine by default (a ``PolicyServer`` child
+    process on ``localhost:server_port``). To offload it, start ``axol
+    inference-server`` on a GPU machine and pass its address via
+    ``--server_host`` — ``policy_path`` / ``policy_type`` / ``device``
+    then apply to that server (it downloads the policy itself, so the
+    path must be reachable from it, e.g. a HF Hub repo id).
     """
 
     policy_path: str
@@ -85,6 +97,7 @@ class RunPolicyConfig:
     root: str | None = None
     push_to_hub: bool = False
     device: str = "cuda"
+    server_host: str | None = None
     server_port: int = 8765
     actions_per_chunk: int = 50
     chunk_size_threshold: float = 0.9
@@ -743,6 +756,7 @@ def _run(
     root = cfg.root
     push_to_hub = cfg.push_to_hub
     device = cfg.device
+    server_host = cfg.server_host
     server_port = cfg.server_port
     actions_per_chunk = cfg.actions_per_chunk
     chunk_size_threshold = cfg.chunk_size_threshold
@@ -828,23 +842,32 @@ def _run(
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
 
-    # Spawn the policy server and load the policy BEFORE connecting cameras:
-    # the model download + CUDA load is a ~15 s network + GPU spike that can
-    # disrupt already-open ZED streams.
-    server_cfg_dict = {
-        "host": "127.0.0.1",
-        "port": server_port,
-        "fps": fps,
-    }
-    ctx = mp.get_context("spawn")
-    server_proc = ctx.Process(
-        target=_serve_policy_server,
-        args=(server_cfg_dict,),
-        name="axol-policy-server",
-        daemon=True,
-    )
-    server_proc.start()
-    log_say(f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid}).")
+    # Local inference (default): spawn the policy server and load the policy
+    # BEFORE connecting cameras — the model download + CUDA load is a ~15 s
+    # network + GPU spike that can disrupt already-open camera pipelines.
+    # Remote inference (--server_host): the server is already running via
+    # ``axol inference-server`` on another machine; just point at it.
+    server_proc = None
+    if server_host is None:
+        server_host = "127.0.0.1"
+        server_cfg_dict = {
+            "host": "127.0.0.1",
+            "port": server_port,
+            "fps": fps,
+        }
+        ctx = mp.get_context("spawn")
+        server_proc = ctx.Process(
+            target=_serve_policy_server,
+            args=(server_cfg_dict,),
+            name="axol-policy-server",
+            daemon=True,
+        )
+        server_proc.start()
+        log_say(
+            f"Started PolicyServer on 127.0.0.1:{server_port} (pid={server_proc.pid})."
+        )
+    else:
+        log_say(f"Using remote inference server at {server_host}:{server_port}.")
 
     # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
     reset_controller = IKResetController()
@@ -854,7 +877,7 @@ def _run(
     client = None
     episodes_recorded = 0
     try:
-        _wait_for_port("127.0.0.1", server_port, timeout=30.0)
+        _wait_for_port(server_host, server_port, timeout=30.0)
 
         # ``RobotClientConfig`` requires a name from upstream's registry;
         # ``temporal_ensemble`` is handled in our override so pass a
@@ -872,7 +895,7 @@ def _run(
             pretrained_name_or_path=policy_path,
             actions_per_chunk=actions_per_chunk,
             task=task,
-            server_address=f"127.0.0.1:{server_port}",
+            server_address=f"{server_host}:{server_port}",
             policy_device=device,
             client_device="cpu",
             chunk_size_threshold=chunk_size_threshold,
@@ -1073,7 +1096,7 @@ def _run(
         except Exception:  # noqa: BLE001
             pass
 
-        if server_proc.is_alive():
+        if server_proc is not None and server_proc.is_alive():
             server_proc.terminate()
             server_proc.join(timeout=5.0)
             if server_proc.is_alive():

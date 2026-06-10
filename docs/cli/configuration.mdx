@@ -1,9 +1,9 @@
 ---
 title: "Command configuration"
-description: "How the teleop, gravity-comp, collect-data, and run-policy commands are configured with draccus."
+description: "How the teleop, gravity-comp, collect-data, run-policy, and inference-server commands are configured with draccus."
 ---
 
-Four commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), and [`run-policy`](/cli/run-policy) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+Five commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
 
 The remaining commands (`can.*`, `motor.*`, `zed.*`, `tune.*`) still use plain `argparse` flags and are unaffected by anything on this page.
 
@@ -27,7 +27,7 @@ axol teleop --axol.left_stiffness 0.8
 axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
 axol collect-data --repo_id myorg/pick --task "pick" \
     --robot_config.axol_config.left_stiffness 0.8 \
-    --robot_config.zed_host 10.0.0.5
+    --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
 ```
 
 Any field you don't override keeps its default — overriding `--axol.left.elbow.kp` leaves every other per-joint gain at its tuned default.
@@ -49,6 +49,7 @@ Precedence is **defaults → `--config_path` file → CLI flags** (later wins), 
 | Nested fields are **dot-separated** | `--a.b.c` | `--axol.left.gripper.torque_limit 0.7` |
 | `None` is written `null` | `--field null` | `--left_channel null` (disable the left arm) |
 | Lists use bracket syntax | `[a,b,c]` | `--free_joints [SHOULDER_1,WRIST_3]` |
+| Dict fields take **one inline YAML/JSON value** (dotted paths can't reach inside a dict) | `--field "{k: v}"` | `--cameras "{overhead: 41234567}"` (teleop); `--robot_config.cameras "{overhead: {serial: 41234567}}"` (collect-data / run-policy) |
 | Booleans take an explicit value | `--flag true` | `--push_to_hub true` |
 
 <Note>

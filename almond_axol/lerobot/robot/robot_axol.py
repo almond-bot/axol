@@ -13,11 +13,10 @@ Typical usage::
 
     config = AxolRobotConfig(
         id="axol_01",
-        zed_host="192.168.1.10",  # shared by all cameras below
         cameras={
-            "overhead": ZedCameraConfig(port=30000),
-            "left_arm": ZedCameraConfig(port=30002),
-            "right_arm": ZedCameraConfig(port=30004),
+            "overhead": ZedCameraConfig(serial=41234567, stereo=True),
+            "left_arm": ZedCameraConfig(serial=41234568),
+            "right_arm": ZedCameraConfig(serial=41234569),
         },
     )
     with AxolRobot(config) as robot:
@@ -125,7 +124,7 @@ class AxolRobot(Robot):
             for key in _LEFT_TRQ_KEYS + _RIGHT_TRQ_KEYS:
                 features[key] = float
 
-        # Use the live camera dimensions (auto-detected from the stream on
+        # Use the live camera dimensions (auto-detected from the camera on
         # connect) so stereo per-eye sizes are correct; cache only once every
         # camera reports a size so a pre-connect read isn't frozen in.
         complete = True
@@ -269,10 +268,10 @@ class AxolRobot(Robot):
 
         Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
         shared ``time.perf_counter()`` target so every frame in the
-        observation shares the sender-clock instant — matching the alignment
+        observation shares the same capture instant — matching the alignment
         guarantee that ``collect-data`` writes into the training dataset. If a
         camera fails to produce a qualifying frame within ``timeout_ms``, we
-        fall back to ``read_latest()`` so a single stale stream doesn't stall
+        fall back to ``read_latest()`` so a single stale camera doesn't stall
         inference.
         """
         assert self._axol is not None

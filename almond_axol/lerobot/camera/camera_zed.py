@@ -1,30 +1,32 @@
 """
-ZED stream receiver camera for LeRobot.
+Local ZED camera for LeRobot.
 
-ZedCamera connects to a single ZED video stream produced by ZedStreamer and
-exposes it as a standard LeRobot Camera. One instance per camera — instantiate
-three to cover overhead, left_arm, and right_arm.
+ZedCamera opens a GMSL-attached ZED camera by serial number via the ZED SDK
+and exposes it as a standard LeRobot Camera. One instance per camera —
+instantiate three to cover overhead, left_arm, and right_arm.
 
-Each grabbed frame carries two timestamps, both on the receiver's
-``time.perf_counter`` clock:
+Each grabbed frame carries two timestamps, both on ``time.perf_counter``:
 
-* ``capture_perf_ts`` — when the sender exposed the frame, derived from
-  the SDK's ``TIME_REFERENCE.IMAGE`` (sender wall clock) plus a per-frame
+* ``capture_perf_ts`` — when the sensor exposed the frame, derived from the
+  SDK's ``TIME_REFERENCE.IMAGE`` wall-clock timestamp plus a per-frame
   wall→perf offset. Used by ``collect_data`` so dataset rows record the
-  moment of capture, not the moment of decode. Requires the two machines'
-  ``CLOCK_REALTIME`` to be aligned — see ``axol zed.sync-clocks``.
-* ``receive_perf_ts`` — when this process decoded the frame.
+  moment of capture, not the moment of decode.
+* ``receive_perf_ts`` — when this process retrieved the frame.
+
+The ZED X daemon only enumerates GMSL cameras when it starts, so a camera
+plugged in after boot is invisible until the daemon restarts — see
+``almond_axol.zed.restart_zed_daemon``.
 
 Typical usage::
 
-    from almond_axol.lerobot.zed import ZedCamera, ZedCameraConfig
+    from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
 
-    overhead  = ZedCamera(ZedCameraConfig(host="192.168.1.10", port=30000))
-    left_arm  = ZedCamera(ZedCameraConfig(host="192.168.1.10", port=30002))
-    right_arm = ZedCamera(ZedCameraConfig(host="192.168.1.10", port=30004))
+    overhead  = ZedCamera(ZedCameraConfig(serial=41234567))
+    left_arm  = ZedCamera(ZedCameraConfig(serial=41234568))
+    right_arm = ZedCamera(ZedCameraConfig(serial=41234569))
 
     with overhead, left_arm, right_arm:
-        frame = overhead.read()  # uint8 numpy array (1080, 1920, 3) RGB
+        frame = overhead.read()  # uint8 numpy array (600, 960, 3) RGB
 """
 
 from __future__ import annotations
@@ -48,14 +50,14 @@ _logger = logging.getLogger(__name__)
 
 
 class ZedCamera(Camera):
-    """LeRobot camera that receives a ZED video stream over the local network.
+    """LeRobot camera that captures from a locally connected ZED camera.
 
-    Connects to a stream started by ZedStreamer using the ZED SDK's local
-    streaming API. A background thread continuously calls grab() and stores the
-    latest frame so read() and async_read() never block on the network.
+    Opens the camera by serial number via the ZED SDK. A background thread
+    continuously calls grab() and stores the latest frame so read() and
+    async_read() never block on the sensor.
 
     Args:
-        config: Host, port, color mode, and warmup duration.
+        config: Serial, resolution, fps, color mode, and warmup duration.
     """
 
     def __init__(self, config: ZedCameraConfig) -> None:
@@ -73,7 +75,7 @@ class ZedCamera(Camera):
         self.new_frame_event: Event = Event()
 
     def __str__(self) -> str:
-        return f"ZedCamera({self.config.host}:{self.config.port})"
+        return f"ZedCamera(serial={self.config.serial})"
 
     @property
     def is_connected(self) -> bool:
@@ -81,32 +83,34 @@ class ZedCamera(Camera):
 
     @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
-        """Stream receivers do not enumerate hardware — returns empty list."""
-        return []
+        """Enumerate locally connected mono ZED cameras."""
+        return [
+            {"serial": int(d.serial_number), "model": str(d.camera_model)}
+            for d in sl.CameraOne.get_device_list()
+        ]
 
     @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
-        """Connect to the ZED stream and start the background grab thread.
+        """Open the ZED camera and start the background grab thread.
 
         Args:
             warmup: If True, reads frames for `config.warmup_s` seconds before
                     returning so the frame buffer is primed.
 
         Raises:
-            ConnectionError: If the stream cannot be opened.
+            ConnectionError: If the camera cannot be opened.
         """
-        if self.config.host is None:
-            raise ValueError(
-                f"{self} has no host set. Pass host= explicitly, or build the "
-                "camera via AxolRobot so it inherits AxolRobotConfig.zed_host."
-            )
         zed = sl.CameraOne()
         init_params = sl.InitParametersOne()
-        init_params.set_from_stream(self.config.host, self.config.port)
-        # Without async recovery, a briefly disrupted stream (e.g. transient
-        # packet loss while another process loads a model onto CUDA) makes
-        # ``grab()`` block indefinitely until the connection is restored,
-        # which silently freezes ``latest_*_perf_ts``. With async recovery
+        init_params.set_from_serial_number(self.config.serial)
+        resolution = self.config.resolution_name()
+        if resolution is not None:
+            init_params.camera_resolution = getattr(sl.RESOLUTION, resolution)
+        if self.config.fps is not None:
+            init_params.camera_fps = self.config.fps
+        # Without async recovery, a briefly disrupted GMSL link makes
+        # ``grab()`` block indefinitely until the camera recovers, which
+        # silently freezes ``latest_*_perf_ts``. With async recovery
         # ``grab()`` returns CAMERA_REBOOTING quickly and the SDK reconnects
         # in the background, so our read loop can keep retrying.
         init_params.async_grab_camera_recovery = True
@@ -114,39 +118,48 @@ class ZedCamera(Camera):
         err = zed.open(init_params)
         if err != sl.ERROR_CODE.SUCCESS:
             raise ConnectionError(
-                f"{self} failed to open stream at {self.config.host}:{self.config.port}: {err}"
+                f"{self} failed to open camera: {err}. Is the camera connected "
+                "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+            )
+
+        info = zed.get_camera_information()
+        opened_serial = int(info.serial_number)
+        if opened_serial != self.config.serial:
+            zed.close()
+            raise ConnectionError(
+                f"{self} requested serial {self.config.serial} but the SDK "
+                f"opened serial {opened_serial}."
             )
 
         self.zed = zed
 
-        info = zed.get_camera_information()
         params = info.camera_configuration.resolution
-        stream_fps = int(info.camera_configuration.fps)
-        stream_width = int(params.width)
-        stream_height = int(params.height)
+        live_fps = int(info.camera_configuration.fps)
+        live_width = int(params.width)
+        live_height = int(params.height)
 
         mismatches = []
-        if self.config.fps is not None and stream_fps != self.config.fps:
-            mismatches.append(f"fps: expected {self.config.fps}, got {stream_fps}")
-        if self.config.width is not None and stream_width != self.config.width:
+        if self.config.fps is not None and live_fps != self.config.fps:
+            mismatches.append(f"fps: expected {self.config.fps}, got {live_fps}")
+        if self.config.width is not None and live_width != self.config.width:
+            mismatches.append(f"width: expected {self.config.width}, got {live_width}")
+        if self.config.height is not None and live_height != self.config.height:
             mismatches.append(
-                f"width: expected {self.config.width}, got {stream_width}"
-            )
-        if self.config.height is not None and stream_height != self.config.height:
-            mismatches.append(
-                f"height: expected {self.config.height}, got {stream_height}"
+                f"height: expected {self.config.height}, got {live_height}"
             )
         if mismatches:
             zed.close()
+            self.zed = None
             raise RuntimeError(
-                f"{self} stream parameters do not match config — "
+                f"{self} live camera parameters do not match config — "
                 + ", ".join(mismatches)
-                + ". Update ZedCameraConfig or the sender settings."
+                + ". Update ZedCameraConfig (the camera may not support the "
+                "requested resolution/fps combination)."
             )
 
-        self.fps = stream_fps
-        self.width = stream_width
-        self.height = stream_height
+        self.fps = live_fps
+        self.width = live_width
+        self.height = live_height
 
         self._start_read_thread()
 
@@ -166,8 +179,9 @@ class ZedCamera(Camera):
     def _log_pipeline_latency(self, num_samples: int = 30) -> None:
         """Log mean/max ``receive_perf_ts - capture_perf_ts`` over ~N frames.
 
-        Acts as a startup canary for PTP: if the sender and receiver wall
-        clocks are out of sync the latency looks wildly negative or huge.
+        Acts as a startup canary for the capture pipeline: a healthy camera
+        delivers frames within a few milliseconds of exposure, so a large or
+        negative latency points at a wedged daemon or a flaky GMSL link.
         """
         samples: list[float] = []
         deadline = time.perf_counter() + 5.0
@@ -185,7 +199,7 @@ class ZedCamera(Camera):
         if not samples:
             _logger.warning(
                 "%s: no frames captured during pipeline-latency probe; "
-                "skipping startup PTP check.",
+                "skipping startup latency check.",
                 self,
             )
             return
@@ -203,8 +217,8 @@ class ZedCamera(Camera):
         if mean_ms < 0.0 or mean_ms > 200.0:
             _logger.warning(
                 "%s pipeline latency looks unhealthy (mean=%.1fms). "
-                "Looks like the sender/receiver wall-clocks aren't synced — "
-                "is `axol zed.sync-clocks` running on both machines?",
+                "The capture pipeline may be stalled — check the GMSL cable "
+                "and try restarting zed_x_daemon.",
                 self,
                 mean_ms,
             )
@@ -220,7 +234,7 @@ class ZedCamera(Camera):
     def _stop_read_thread(self) -> bool:
         """Stop the read loop; return True if the thread actually exited.
 
-        When the stream is down, ``grab()`` can block in native code for a
+        When the camera is down, ``grab()`` can block in native code for a
         long time. We must never call ``zed.close()`` while ``grab()`` is in
         flight on another thread — that races inside the SDK and segfaults
         the whole process — so callers use the return value to decide whether
@@ -260,7 +274,7 @@ class ZedCamera(Camera):
                     if now - last_grab_warning_perf >= 1.0:
                         _logger.warning(
                             "%s grab returned %s (%d consecutive failures); "
-                            "stream is recovering in the background.",
+                            "camera is recovering in the background.",
                             self,
                             err,
                             grab_failure_streak,
@@ -291,8 +305,8 @@ class ZedCamera(Camera):
                     self.zed.get_timestamp(sl.TIME_REFERENCE.IMAGE).get_nanoseconds()
                     * 1e-9
                 )
-                # Recompute the wall→perf offset per frame so PTP step
-                # adjustments don't accumulate as silent skew.
+                # Recompute the wall→perf offset per frame so wall-clock step
+                # adjustments (NTP) don't accumulate as silent skew.
                 recv_wall = time.time()
                 recv_perf = time.perf_counter()
                 cap_perf = recv_perf - (recv_wall - cap_wall)
@@ -394,7 +408,7 @@ class ZedCamera(Camera):
         """Block until a frame with ``capture_perf_ts >= target`` is available.
 
         Used by ``collect-data`` so every camera and the joint sample share
-        the same sender-side timeline.
+        the same capture timeline.
 
         Args:
             target_capture_perf_ts: Earliest acceptable ``capture_perf_ts``.
@@ -437,7 +451,7 @@ class ZedCamera(Camera):
             self.new_frame_event.wait(timeout=remaining)
 
     def disconnect(self) -> None:
-        """Stop the grab thread and close the ZED stream."""
+        """Stop the grab thread and close the ZED camera."""
         if not self.is_connected and self.thread is None:
             raise DeviceNotConnectedError(
                 f"Attempted to disconnect {self}, but it is already disconnected."
@@ -453,7 +467,7 @@ class ZedCamera(Camera):
                     _logger.warning(f"{self} close failed: {exc}")
             else:
                 _logger.error(
-                    "%s read thread is stuck in grab() (stream down?); leaking "
+                    "%s read thread is stuck in grab() (camera down?); leaking "
                     "the SDK handle instead of closing it concurrently, which "
                     "would crash the process.",
                     self,
@@ -464,7 +478,7 @@ class ZedCamera(Camera):
 
 
 class _EyeBuffer:
-    """Latest-frame slot for one eye of a stereo stream (thread-safe)."""
+    """Latest-frame slot for one eye of a stereo camera (thread-safe)."""
 
     def __init__(self) -> None:
         self.lock: Lock = Lock()
@@ -489,17 +503,18 @@ class _EyeBuffer:
 
 
 class ZedStereoCamera:
-    """Receiver for a stereo ZED X network stream with a single shared decode.
+    """Local stereo ZED X camera with a single shared grab.
 
-    Opens one ``sl.Camera`` from the stream and, on every grab, retrieves both
-    eyes into separate :class:`_EyeBuffer` slots. The left/right eyes are
+    Opens one ``sl.Camera`` by serial number and, on every grab, retrieves
+    both eyes into separate :class:`_EyeBuffer` slots. The left/right eyes are
     exposed as :class:`_StereoEyeView` objects (``left_view`` / ``right_view``)
     that present the same read API as :class:`ZedCamera`, so collect-data /
     run-policy / teleop can treat the two eyes as ordinary cameras while only
-    decoding the HEVC stream once.
+    grabbing the sensor once.
 
     Args:
-        config: Host, port, color mode, and warmup duration (``stereo`` set).
+        config: Serial, resolution, fps, color mode, and warmup duration
+            (``stereo`` set).
     """
 
     def __init__(self, config: ZedCameraConfig) -> None:
@@ -516,24 +531,24 @@ class ZedStereoCamera:
         self.right_view = _StereoEyeView(self, self._right, "right")
 
     def __str__(self) -> str:
-        return f"ZedStereoCamera({self.config.host}:{self.config.port})"
+        return f"ZedStereoCamera(serial={self.config.serial})"
 
     @property
     def is_connected(self) -> bool:
         return self.zed is not None
 
     def connect(self, warmup: bool = True) -> None:
-        """Open the stereo stream and start the shared grab thread."""
+        """Open the stereo camera and start the shared grab thread."""
         if self.is_connected:
             return
-        if self.config.host is None:
-            raise ValueError(
-                f"{self} has no host set. Pass host= explicitly, or build the "
-                "camera via AxolRobot so it inherits AxolRobotConfig.zed_host."
-            )
         zed = sl.Camera()
         init_params = sl.InitParameters()
-        init_params.set_from_stream(self.config.host, self.config.port)
+        init_params.set_from_serial_number(self.config.serial)
+        resolution = self.config.resolution_name()
+        if resolution is not None:
+            init_params.camera_resolution = getattr(sl.RESOLUTION, resolution)
+        if self.config.fps is not None:
+            init_params.camera_fps = self.config.fps
         # We only need the rectified images; skip depth to save GPU.
         init_params.depth_mode = sl.DEPTH_MODE.NONE
         # See ZedCamera.connect for why async recovery matters on a flaky link.
@@ -542,45 +557,52 @@ class ZedStereoCamera:
         err = zed.open(init_params)
         if err != sl.ERROR_CODE.SUCCESS:
             raise ConnectionError(
-                f"{self} failed to open stream at "
-                f"{self.config.host}:{self.config.port}: {err}"
+                f"{self} failed to open camera: {err}. Is the camera connected "
+                "(a camera plugged in after boot needs a zed_x_daemon restart)?"
+            )
+
+        info = zed.get_camera_information()
+        opened_serial = int(info.serial_number)
+        if opened_serial != self.config.serial:
+            zed.close()
+            raise ConnectionError(
+                f"{self} requested serial {self.config.serial} but the SDK "
+                f"opened serial {opened_serial}."
             )
 
         self.zed = zed
 
-        info = zed.get_camera_information()
         params = info.camera_configuration.resolution
-        stream_fps = int(info.camera_configuration.fps)
+        live_fps = int(info.camera_configuration.fps)
         # For a stereo sl.Camera the SDK reports per-eye resolution, which is
         # exactly what retrieve_image(LEFT/RIGHT) returns.
-        stream_width = int(params.width)
-        stream_height = int(params.height)
+        live_width = int(params.width)
+        live_height = int(params.height)
 
-        # Enforce config == stream (per eye) like the mono ZedCamera, so the
-        # dataset features built from config before connect stay valid.
+        # Enforce config == live camera (per eye) like the mono ZedCamera, so
+        # the dataset features built from config before connect stay valid.
         mismatches = []
-        if self.config.fps is not None and stream_fps != self.config.fps:
-            mismatches.append(f"fps: expected {self.config.fps}, got {stream_fps}")
-        if self.config.width is not None and stream_width != self.config.width:
+        if self.config.fps is not None and live_fps != self.config.fps:
+            mismatches.append(f"fps: expected {self.config.fps}, got {live_fps}")
+        if self.config.width is not None and live_width != self.config.width:
+            mismatches.append(f"width: expected {self.config.width}, got {live_width}")
+        if self.config.height is not None and live_height != self.config.height:
             mismatches.append(
-                f"width: expected {self.config.width}, got {stream_width}"
-            )
-        if self.config.height is not None and stream_height != self.config.height:
-            mismatches.append(
-                f"height: expected {self.config.height}, got {stream_height}"
+                f"height: expected {self.config.height}, got {live_height}"
             )
         if mismatches:
             zed.close()
             self.zed = None
             raise RuntimeError(
-                f"{self} stream parameters do not match config (per eye) — "
+                f"{self} live camera parameters do not match config (per eye) — "
                 + ", ".join(mismatches)
-                + ". Update ZedCameraConfig or the sender settings."
+                + ". Update ZedCameraConfig (the camera may not support the "
+                "requested resolution/fps combination)."
             )
 
-        self.fps = stream_fps
-        self.width = stream_width
-        self.height = stream_height
+        self.fps = live_fps
+        self.width = live_width
+        self.height = live_height
 
         self._start_read_thread()
 
@@ -638,7 +660,7 @@ class ZedStereoCamera:
                     if now - last_grab_warning_perf >= 1.0:
                         _logger.warning(
                             "%s grab returned %s (%d consecutive failures); "
-                            "stream is recovering in the background.",
+                            "camera is recovering in the background.",
                             self,
                             err,
                             grab_failure_streak,
@@ -684,7 +706,7 @@ class ZedStereoCamera:
                     return
 
     def disconnect(self) -> None:
-        """Stop the grab thread and close the stereo stream."""
+        """Stop the grab thread and close the stereo camera."""
         if not self.is_connected and self.thread is None:
             return
         stopped = self._stop_read_thread()
@@ -696,7 +718,7 @@ class ZedStereoCamera:
                     _logger.warning(f"{self} close failed: {exc}")
             else:
                 _logger.error(
-                    "%s read thread is stuck in grab() (stream down?); leaking "
+                    "%s read thread is stuck in grab() (camera down?); leaking "
                     "the SDK handle instead of closing it concurrently, which "
                     "would crash the process.",
                     self,
@@ -711,7 +733,7 @@ class _StereoEyeView:
     Implements the subset of the :class:`ZedCamera` read API that the Axol
     robot, collect-data, and teleop use (``read_latest`` / ``read_latest_with_ts``
     / ``read_at_or_after`` plus ``fps`` / ``width`` / ``height``). ``connect`` /
-    ``disconnect`` defer to the shared parent so the stream is opened and closed
+    ``disconnect`` defer to the shared parent so the camera is opened and closed
     exactly once regardless of iteration order.
     """
 
@@ -722,7 +744,7 @@ class _StereoEyeView:
 
     def __str__(self) -> str:
         c = self._parent.config
-        return f"ZedStereoEye({self._eye}@{c.host}:{c.port})"
+        return f"ZedStereoEye({self._eye}@serial={c.serial})"
 
     @property
     def fps(self) -> int:

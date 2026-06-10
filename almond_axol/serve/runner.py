@@ -61,13 +61,8 @@ _IGNORED_LOGGER_PREFIXES = (
 # go to the actual terminal don't also pollute the op's session log.
 _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
-
-def _host_from_box_url(box: str) -> str:
-    """Strip scheme/port from a ``https://host:8001`` box URL → ``host``."""
-    if not box:
-        return ""
-    netloc = box.split("://", 1)[-1]
-    return netloc.split(":", 1)[0].split("/", 1)[0]
+# The camera slots the control panel can configure serials for.
+_CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
 
 
 class _StreamTee:
@@ -164,17 +159,8 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(
-        self, robot_link: Any = None, ptp: Any = None, stream: Any = None
-    ) -> None:
+    def __init__(self, robot_link: Any = None) -> None:
         self._robot_link = robot_link
-        # Long-lived PTP link (started at ZED box connect); reused by the
-        # orchestrated collect-data / run-policy path so PTP need not be brought
-        # up per task.
-        self._ptp = ptp
-        # Long-lived camera streams (started at ZED box connect); reused by the
-        # orchestrated path so streaming need not be started per task.
-        self._stream = stream
         self._lock = threading.Lock()
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
@@ -184,8 +170,6 @@ class OperationRunner:
         self._async_task: asyncio.Task[Any] | None = None
         # run-policy episode control (set while run-policy runs).
         self._policy_control: Any = None
-        # ZED orchestrator (set while an orchestrated collect/policy run runs).
-        self._orch: Any = None
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -214,7 +198,7 @@ class OperationRunner:
         self,
         op_id: str,
         args: dict[str, Any],
-        zed: dict[str, Any] | None = None,
+        cameras: dict[str, Any] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> Session:
         if op_id not in _OP_IDS:
@@ -229,34 +213,29 @@ class OperationRunner:
             self._session = session
             self._stop_event = threading.Event()
 
-        orchestrate = (
-            zed is not None
-            and bool(zed.get("enabled"))
-            and op_id in ("collect-data", "run-policy")
-        )
+        # Fold the camera spec into the argv-style args for collect-data /
+        # run-policy (their camera serials are required draccus inputs).
+        if cameras and op_id in ("collect-data", "run-policy"):
+            args = self._merge_camera_args(args, cameras)
 
-        # Build the config up front for the non-orchestrated path so config
-        # errors surface synchronously; the orchestrated path builds it inside
-        # the worker (args are augmented with ZED network flags first).
-        cfg: Any = None
-        if not orchestrate:
-            try:
-                cfg = self._build_config(op_id, args)
-            except Exception as exc:  # noqa: BLE001 - surface config errors to UI
-                session.status = "error"
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.emit(f"[serve] config error: {session.error}")
-                session.close_stream()
-                return session
+        # Build the config up front so config errors surface synchronously.
+        try:
+            cfg = self._build_config(op_id, args)
+        except Exception as exc:  # noqa: BLE001 - surface config errors to UI
+            session.status = "error"
+            session.error = f"{type(exc).__name__}: {exc}"
+            session.emit(f"[serve] config error: {session.error}")
+            session.close_stream()
+            return session
 
         is_sim = op_id == "teleop" and bool(args.get("sim"))
         needs_robot = op_id in _HARDWARE_OPS and not is_sim
         log_level = self._log_level(args)
 
-        # Teleop isn't ZED-orchestrated, but if a ZED box is connected and
-        # streaming we relay its cameras to the headset (overhead + wrists).
-        if op_id == "teleop" and cfg is not None:
-            self._attach_zed_to_teleop(cfg, session)
+        # Teleop relays the local ZED cameras to the headset when serials are
+        # configured (its ``cameras`` dict isn't reachable via flat argv).
+        if op_id == "teleop":
+            self._attach_cameras_to_teleop(cfg, cameras, session)
 
         session.status = "running"
         session.emit(f"[serve] starting {op_id} (in-process)")
@@ -268,15 +247,11 @@ class OperationRunner:
             except Exception as exc:  # noqa: BLE001
                 session.emit(f"[serve] robot release warning: {exc}")
 
-        if orchestrate:
-            target = self._run_orchestrated
-            run_args = (session, op_id, args, zed, log_level, needs_robot)
-        elif op_id in _ASYNC_OPS:
+        if op_id in _ASYNC_OPS:
             target = self._run_async
-            run_args = (session, op_id, cfg, log_level, needs_robot)
         else:
             target = self._run_thread
-            run_args = (session, op_id, cfg, log_level, needs_robot)
+        run_args = (session, op_id, cfg, log_level, needs_robot)
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
         )
@@ -293,14 +268,6 @@ class OperationRunner:
         if loop is not None and task is not None:
             try:
                 loop.call_soon_threadsafe(task.cancel)
-            except RuntimeError:
-                pass
-        # Orchestrated run: tear down the ZED pipeline (covers a stop pressed
-        # while still bringing PTP/streaming up, before the task starts).
-        orch, orch_loop = self._orch, self._async_loop
-        if orch is not None and orch_loop is not None:
-            try:
-                asyncio.run_coroutine_threadsafe(orch.stop(), orch_loop)
             except RuntimeError:
                 pass
         thread = self._thread
@@ -322,31 +289,65 @@ class OperationRunner:
 
     # -- config building ----------------------------------------------------
 
-    def _attach_zed_to_teleop(self, cfg: Any, session: Session) -> None:
-        """Point teleop's headset video at the connected ZED box, if any.
+    @staticmethod
+    def _camera_serials(cameras: dict[str, Any] | None) -> dict[str, int]:
+        """Valid ``slot -> serial`` pairs from a camera spec (empty if none)."""
+        serials: dict[str, int] = {}
+        for slot, raw in ((cameras or {}).get("serials") or {}).items():
+            if slot not in _CAMERA_SLOTS:
+                continue
+            try:
+                serial = int(str(raw).strip())
+            except (TypeError, ValueError):
+                continue
+            if serial > 0:
+                serials[slot] = serial
+        return serials
 
-        When a ZED box is connected and streaming, the in-process teleop relays
-        those camera feeds to the headset over WebRTC. We override the config's
-        ``zed_host`` with the live box address and limit ``zed_cameras`` to the
-        slots that are actually streaming so teleop doesn't wait on absent feeds.
+    def _merge_camera_args(
+        self, args: dict[str, Any], cameras: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Fold a camera spec into collect-data / run-policy form args.
+
+        Serials, the stereo overhead flag, and the capture resolution all map
+        to dotted ``robot_config.cameras.*`` keys that the command schema
+        already emits, so the resulting argv is parsed like any CLI override.
         """
-        stream = self._stream
-        if stream is None or not getattr(stream, "running", False):
+        merged = dict(args)
+        serials = self._camera_serials(cameras)
+        for slot, serial in serials.items():
+            merged[f"robot_config.cameras.{slot}.serial"] = serial
+        if cameras.get("overheadStereo"):
+            merged["robot_config.cameras.overhead.stereo"] = True
+        resolution = str(cameras.get("resolution") or "").strip()
+        if resolution:
+            from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+
+            dims = ZED_RESOLUTION_DIMS.get(resolution)
+            if dims is None:
+                raise ValueError(f"unknown ZED resolution {resolution!r}")
+            for slot in serials or _CAMERA_SLOTS:
+                merged[f"robot_config.cameras.{slot}.width"] = dims[0]
+                merged[f"robot_config.cameras.{slot}.height"] = dims[1]
+        return merged
+
+    def _attach_cameras_to_teleop(
+        self, cfg: Any, cameras: dict[str, Any] | None, session: Session
+    ) -> None:
+        """Point teleop's headset video at the configured local ZED cameras.
+
+        Teleop's ``cameras`` field is a dict (not reachable via flat argv), so
+        the configured serials are written onto the built config directly.
+        """
+        serials = self._camera_serials(cameras)
+        if not serials:
             return
-        cameras = sorted(getattr(stream, "cameras", {}) or {})
-        if not cameras:
-            return
-        host = _host_from_box_url(getattr(stream, "box", ""))
-        if not host:
-            return
-        cfg.zed_host = host
-        cfg.zed_cameras = cameras
-        # Mirror the box's stereo overhead so teleop relays both eyes per-lens.
-        cfg.overhead_stereo = bool(getattr(stream, "overhead_stereo", False))
+        cfg.cameras = serials
+        cfg.overhead_stereo = bool((cameras or {}).get("overheadStereo"))
         stereo_note = " (overhead stereo)" if cfg.overhead_stereo else ""
         session.emit(
-            "[serve] teleop: relaying ZED cameras to the headset "
-            f"({', '.join(cameras)}){stereo_note}"
+            "[serve] teleop: streaming cameras to the headset "
+            f"({', '.join(sorted(serials))}){stereo_note}"
         )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:
@@ -432,87 +433,6 @@ class OperationRunner:
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 self._policy_control = None
-        self._finish(session, needs_robot)
-
-    # -- orchestrated ops (collect-data / run-policy + ZED box) -------------
-
-    def _run_orchestrated(
-        self,
-        session: Session,
-        op_id: str,
-        args: dict[str, Any],
-        zed: dict[str, Any],
-        log_level: int,
-        needs_robot: bool,
-    ) -> None:
-        from .orchestrator import ZedOrchestrator
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._async_loop = loop
-
-        async def run_main(main_args: dict[str, Any]) -> int:
-            cfg = self._build_config(op_id, main_args)
-            # A stereo overhead can't be expressed via flat argv (nested camera
-            # config), so mutate the built config — mirroring the zed_host
-            # injection the orchestrator does in _main_args.
-            if zed.get("overheadStereo"):
-                cams = getattr(cfg.robot_config, "cameras", {}) or {}
-                overhead = cams.get("overhead")
-                if overhead is not None:
-                    overhead.stereo = True
-            # The receiver enforces config dims == live stream, so when the box
-            # streams at a non-default resolution the camera configs (and the
-            # dataset features built from them) must match.
-            resolution = str(zed.get("resolution") or "").strip()
-            if resolution:
-                from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
-
-                dims = ZED_RESOLUTION_DIMS.get(resolution)
-                if dims is None:
-                    raise ValueError(f"unknown ZED resolution {resolution!r}")
-                for cam in (getattr(cfg.robot_config, "cameras", {}) or {}).values():
-                    cam.width, cam.height = dims
-            if op_id == "collect-data":
-                from ..cli.collect_data import _run as core
-
-                await asyncio.to_thread(core, cfg, self._stop_event)
-            else:
-                from ..cli.run_policy import _QueuePolicyControl
-                from ..cli.run_policy import _run as core
-
-                control = _QueuePolicyControl(self._stop_event)
-                self._policy_control = control
-                await asyncio.to_thread(core, cfg, self._stop_event, control)
-            return 0
-
-        orch = ZedOrchestrator(
-            session,
-            op_id,
-            args,
-            zed,
-            run_main=run_main,
-            ptp=self._ptp,
-            stream=self._stream,
-        )
-        self._orch = orch
-
-        with _Capture(session, log_level):
-            try:
-                loop.run_until_complete(orch.run())
-            except Exception as exc:  # noqa: BLE001
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.status = "error"
-                session.emit(f"[serve] error: {session.error}")
-            finally:
-                try:
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                except Exception:  # noqa: BLE001
-                    pass
-                loop.close()
-                self._async_loop = None
-                self._policy_control = None
-                self._orch = None
         self._finish(session, needs_robot)
 
     # -- shared teardown ----------------------------------------------------

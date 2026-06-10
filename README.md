@@ -14,7 +14,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 - **Linux**
 - **Python 3.13+**
-- **(Optional) NVIDIA Jetson** — if ZED cameras are used.
+- **(Optional) NVIDIA Jetson** (e.g. a ZED Box) — required for the GMSL-attached ZED cameras (data collection / policy inference).
 
 ## Installation
 
@@ -48,7 +48,7 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --zed_host`, `collect-data`) |
+| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --cameras`, `collect-data`) |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
@@ -91,8 +91,8 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 ### Quickstart
 
 - [Teleoperation](https://docs.almond.bot/quickstart/teleop)
-- [Data Collection](https://docs.almond.bot/quickstart/data-collection) — two-machine workflow (main host + ZED box)
-- [Policy Inference](https://docs.almond.bot/quickstart/inference) — two-machine workflow (main host + ZED box)
+- [Data Collection](https://docs.almond.bot/quickstart/data-collection)
+- [Policy Inference](https://docs.almond.bot/quickstart/inference) — local or remote inference server
 
 ### Web Interfaces
 
@@ -101,7 +101,7 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -112,9 +112,8 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
-- [`zed.stream`](https://docs.almond.bot/cli/zed-stream)
+- [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
-- [`zed.sync-clocks`](https://docs.almond.bot/cli/zed-sync-clocks)
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)

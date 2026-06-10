@@ -1,7 +1,6 @@
 """Public re-exports for almond_axol.zed."""
 
-from .config import ZedConfig
 from .daemon import restart_zed_daemon
-from .streamer import ZedStreamer
+from .devices import ZedDevice, list_zed_devices
 
-__all__ = ["ZedConfig", "ZedStreamer", "restart_zed_daemon"]
+__all__ = ["ZedDevice", "list_zed_devices", "restart_zed_daemon"]

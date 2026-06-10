@@ -11,17 +11,17 @@ import {
   Upload,
 } from "lucide-react"
 import {
+  cameraCount,
   filterSchema,
   flattenFields,
   isModified,
+  type CameraSpec,
   type CommandSpec,
   type FormValue,
   type OperationMeta,
   type RobotStatus,
   type SchemaNode,
   type SessionInfo,
-  type ZedLinkStatus,
-  type ZedSpec,
 } from "@/lib/supervisor"
 import { ConfigForm, CuratedForm } from "@/components/config-form"
 import { Card, CardContent } from "@/components/ui/card"
@@ -38,8 +38,7 @@ export function OperationPanel({
   onResetAll,
   onExport,
   onImport,
-  zedSettings,
-  zedLink,
+  cameras,
   robot,
   live,
   busy,
@@ -58,8 +57,7 @@ export function OperationPanel({
   onResetAll: () => void
   onExport: () => void
   onImport: (text: string) => void
-  zedSettings: ZedSpec
-  zedLink: ZedLinkStatus | null
+  cameras: CameraSpec
   robot: RobotStatus | null
   live: boolean
   busy: boolean
@@ -81,25 +79,14 @@ export function OperationPanel({
 
   const isSim = meta.id === "teleop" && Boolean(settings.sim)
   const robotOk = robot?.state === "connected"
-  const zedOk = Boolean(zedLink?.connected)
-  const camCount = Object.values(zedSettings.cameras).filter((s) => s.trim()).length
+  const camCount = cameraCount(cameras)
 
   const blockers: string[] = []
   if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
-  if (meta.requiresZed && !zedOk) blockers.push("Connect the ZED box")
-  // ZED frame timestamps are only valid once both machines' clocks are
-  // PTP-locked, so collect-data / run-policy can't start until then.
-  if (meta.requiresZed && zedOk && !zedLink?.ptp?.locked) {
-    if (zedLink?.ptp?.error) blockers.push(`Clock sync failed: ${zedLink.ptp.error}`)
-    else blockers.push("Wait for clocks to lock")
-  }
-  // Likewise the cameras must actually be streaming before a task can record /
-  // run a policy — gate on the live stream the same way we gate on the clock.
-  if (meta.requiresZed && camCount === 0) {
-    blockers.push("Add a camera serial in the ZED Box dialog")
-  } else if (meta.requiresZed && zedOk && zedLink?.ptp?.locked && !zedLink?.stream?.ready) {
-    if (zedLink?.stream?.error) blockers.push(`Camera stream failed: ${zedLink.stream.error}`)
-    else blockers.push("Wait for cameras to stream")
+  // Collect-data / run-policy build their dataset/observation features from
+  // all three camera slots, so every serial must be assigned before starting.
+  if (meta.requiresCameras && camCount < 3) {
+    blockers.push("Assign all three camera serials in the Cameras dialog")
   }
   for (const f of allFields) {
     if (f.required) {

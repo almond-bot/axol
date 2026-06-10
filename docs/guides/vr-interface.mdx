@@ -62,7 +62,7 @@ The hosted app is built on Vercel; `vercel.json` builds the client package first
 
 ## Camera views
 
-When the host has camera video enabled ([`axol teleop --zed_host`](/cli/teleop), [`collect-data`](/cli/collect-data), or the [control panel](/guides/control-panel) with a connected ZED box), the robot's camera feeds stream to the headset over WebRTC and render as screens over passthrough.
+When the host has camera video enabled ([`axol teleop --cameras`](/cli/teleop), [`collect-data`](/cli/collect-data), or the [control panel](/guides/control-panel) with camera slots assigned), the robot's camera feeds stream to the headset over WebRTC and render as screens over passthrough.
 
 The screens are **world-anchored** — like TVs placed where you were looking when the session started, so you can move your head freely while they stay put. While arm tracking is disengaged, point a controller at a screen and hold the trigger to grab and reposition it (positions are remembered per view). Click the right thumbstick to re-anchor everything to your current gaze and reset moved screens.
 

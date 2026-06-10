@@ -29,9 +29,9 @@ _STOP_GRACE_S = 6.0
 async def spawn_proc(argv_tail: list[str]) -> asyncio.subprocess.Process:
     """Spawn ``python -m almond_axol <argv_tail>`` with merged, streamed stdout.
 
-    Shared by plain sessions and the ZED orchestrator. Runs in its own session
-    (process group) so the whole tree can be signalled on teardown, and uses the
-    serving interpreter so ``axol`` need not be on PATH.
+    Runs in its own session (process group) so the whole tree can be signalled
+    on teardown, and uses the serving interpreter so ``axol`` need not be on
+    PATH.
     """
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -57,7 +57,7 @@ async def pump_into(
     """Stream ``proc`` stdout into ``session`` (optionally tagged) until EOF.
 
     Returns the process exit code. ``on_line`` receives each raw (untagged)
-    line so callers can watch for readiness markers (e.g. PTP lock).
+    line so callers can watch for readiness markers.
     """
     assert proc.stdout is not None
     tag = f"[{prefix}] " if prefix else ""
@@ -90,7 +90,7 @@ class Session:
         self.total_emitted = 0
         self.subscribers: set[asyncio.Queue[str | None]] = set()
         # When set, the manager calls this instead of the default process-group
-        # signal on stop() — the ZED orchestrator uses it to unwind every step.
+        # signal on stop() — for sessions that need custom unwinding.
         self.teardown: Callable[[], Awaitable[None]] | None = None
         # Server event loop. When emit/close_stream run off-loop (the in-process
         # operation runner emits from worker threads), subscriber wakeups are
@@ -159,19 +159,6 @@ class SessionManager:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    def new_session(
-        self, command_id: str, args: dict[str, Any] | None = None
-    ) -> Session:
-        """Create and register a tracked session with no subprocess of its own.
-
-        For aggregators that drive their own processes/tails and emit into the
-        session manually (e.g. the long-lived PTP clock-sync link). It shows up
-        in ``list()`` and is tailable through the normal log endpoints.
-        """
-        session = Session(command_id, args or {})
-        self._sessions[session.id] = session
-        return session
-
     async def start(self, command_id: str, args: dict[str, Any]) -> Session:
         if command_id not in COMMANDS:
             raise KeyError(command_id)
@@ -189,9 +176,7 @@ class SessionManager:
     ) -> Session:
         """Spawn an arbitrary ``axol`` invocation as a tracked session.
 
-        ``argv_tail`` is the full CLI tail (subcommand + flags). Used both for
-        schema-validated commands and the ZED helper endpoints the orchestrator
-        drives remotely (``zed.sync-clocks`` / ``zed.stream``).
+        ``argv_tail`` is the full CLI tail (subcommand + flags).
         """
         session = Session(command_id, args or {})
         self._sessions[session.id] = session
@@ -207,25 +192,6 @@ class SessionManager:
         session.status = "running"
         session.emit(f"[serve] $ axol {' '.join(argv_tail)}".rstrip())
         asyncio.create_task(self._pump(session))
-        return session
-
-    async def start_orchestrated(
-        self, command_id: str, args: dict[str, Any], zed: dict[str, Any]
-    ) -> Session:
-        """Start a ZED-orchestrated ``collect-data`` / ``run-policy`` session.
-
-        The session's logs aggregate every orchestration step (clock sync,
-        camera streaming, the main command); ``stop`` unwinds them all.
-        """
-        from .orchestrator import ZedOrchestrator
-
-        if command_id not in COMMANDS:
-            raise KeyError(command_id)
-        session = Session(command_id, args)
-        self._sessions[session.id] = session
-        orch = ZedOrchestrator(session, command_id, args, zed)
-        session.teardown = orch.stop
-        asyncio.create_task(orch.run())
         return session
 
     async def _pump(self, session: Session) -> None:

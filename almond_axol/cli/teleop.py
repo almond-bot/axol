@@ -26,10 +26,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Each camera slot and the TCP port ``zed.stream`` serves it on (matching the
-# collect-data defaults: overhead 30000, left_arm 30002, right_arm 30004).
-_CAMERA_PORTS = {"overhead": 30000, "left_arm": 30002, "right_arm": 30004}
-
 
 def _get_local_ip() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
@@ -78,14 +74,14 @@ def main(argv: list[str]) -> None:
 
 
 def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
-    """Connect to the ZED streams selected by ``cfg`` → ``(slot, camera)`` pairs.
+    """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
-    One :class:`ZedCamera` per requested slot that is actually streaming;
-    slots whose stream is absent are skipped (best-effort preview). Returns an
-    empty list when no host is set or the ``video`` extra is unavailable.
+    One :class:`ZedCamera` per configured slot that actually opens; slots
+    whose camera is absent are skipped (best-effort preview). Returns an
+    empty list when no cameras are configured or the SDK is unavailable.
     Runs synchronously (blocks on the SDK), so call it off the event loop.
     """
-    if not cfg.zed_host:
+    if not cfg.cameras:
         return []
     try:
         from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
@@ -95,37 +91,32 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
         return []
 
     cameras: list[tuple[str, Any]] = []
-    for name in cfg.zed_cameras:
-        port = _CAMERA_PORTS.get(name)
-        if port is None:
-            _logger.warning("teleop: unknown ZED camera slot %r — skipping", name)
-            continue
-
+    for name, serial in cfg.cameras.items():
         # Teleop only relays frames to the headset, so adapt to whatever the
-        # sender streams (fps/width/height of None skip the receiver's
-        # config-vs-stream mismatch check used for dataset features).
+        # camera captures (fps/width/height of None skip the config-vs-camera
+        # mismatch check used for dataset features).
         def _config(**kwargs: Any) -> "ZedCameraConfig":
             return ZedCameraConfig(
-                host=cfg.zed_host, fps=None, width=None, height=None, **kwargs
+                serial=serial, fps=None, width=None, height=None, **kwargs
             )
 
-        # A stereo overhead carries both eyes on one stream; expose them as
+        # A stereo overhead carries both eyes on one grab; expose them as
         # overhead_left / overhead_right so the headset can render per-lens.
         if name == "overhead" and cfg.overhead_stereo:
-            stereo = ZedStereoCamera(_config(port=port, stereo=True))
+            stereo = ZedStereoCamera(_config(stereo=True))
             try:
                 stereo.connect(warmup=False)
-            except Exception as exc:  # noqa: BLE001 - slot not streaming → skip it
+            except Exception as exc:  # noqa: BLE001 - camera absent → skip it
                 _logger.info("teleop: overhead stereo camera not available (%s)", exc)
                 continue
             cameras.append(("overhead_left", stereo.left_view))
             cameras.append(("overhead_right", stereo.right_view))
             continue
 
-        cam = ZedCamera(_config(port=port))
+        cam = ZedCamera(_config())
         try:
             cam.connect(warmup=False)
-        except Exception as exc:  # noqa: BLE001 - slot not streaming → skip it
+        except Exception as exc:  # noqa: BLE001 - camera absent → skip it
             _logger.info("teleop: %s camera not available (%s)", name, exc)
             continue
         cameras.append((name, cam))
