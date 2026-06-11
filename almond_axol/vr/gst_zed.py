@@ -56,6 +56,13 @@ _SUBSCRIBER_QUEUE_DEPTH = 4
 # (the daemon handshake plus sensor start is a few seconds).
 _READY_TIMEOUT_S = 15.0
 
+# Cap on auto-exposure time (µs). Exposure happens before the frame exists,
+# so it is pure glass-to-glass latency: the SDK default lets auto-exposure
+# run to 66.7 ms (4 frame intervals at 60 fps!) in dim light. 8 ms keeps
+# capture latency bounded; auto analog/digital gain stays enabled and
+# compensates the brightness (at the cost of some noise in dim scenes).
+_MAX_AUTO_EXPOSURE_US = 8000
+
 
 @functools.cache
 def zed_gst_available() -> bool:
@@ -100,6 +107,7 @@ def _gst_argv(serial: int, resolution: str, fps: int, bitrate: int) -> list[str]
         f"camera-resolution={_RESOLUTION_ENUM[resolution]}",
         f"camera-fps={fps}",
         "stream-type=1",
+        f"ctrl-auto-exposure-range-max={_MAX_AUTO_EXPOSURE_US}",
         "!",
         "video/x-raw(memory:NVMM),format=NV12",
         "!",
