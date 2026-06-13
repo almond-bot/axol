@@ -5,7 +5,7 @@ Range of motion test for the Axol robot. Sweeps every joint through its full
 range while checking each waypoint for self-collision via pyroki.
 
 Pass --robot to select the backend:
-  - sim: launches a viser visualizer at http://localhost:8080 and runs the
+  - sim: launches a viser visualizer at http://localhost:8002 and runs the
          sweep once. Collisions are skipped with a warning.
   - axol: enables motors after a 5 s safety countdown, opens/closes the
           grippers (torque-monitored) as a pre-check, then loops the sweep
@@ -13,8 +13,8 @@ Pass --robot to select the backend:
           the robot home.
 
 Run:
-    python -m almond_axol.test.rom_test --robot sim
-    python -m almond_axol.test.rom_test --robot axol
+    uv run -m almond_axol.test.rom_test --robot sim
+    uv run -m almond_axol.test.rom_test --robot axol
 """
 
 import argparse
@@ -33,12 +33,13 @@ from ..robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
     LIMITS,
+    SHOULDER_1_LEFT_LIMITS,
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
 )
 from ..robot.sim import Sim
-from ..shared import URDF_PATH, Joint
+from ..utils.shared import URDF_PATH, Joint
 
 CONTROL_RATE_HZ = 100.0  # Hz
 
@@ -57,7 +58,10 @@ CYCLE_PAUSE = 2.0  # seconds
 WRIST_TEST_ELBOW_ANGLE = math.pi / 2  # rad
 SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 
-GRIPPER_TORQUE_THRESHOLD = 0.6  # Nm
+# Must stay below ArmConfig.gripper.torque_limit (0.5 Nm default) — the
+# POSITION_FORCE controller caps gripper output there, so a higher threshold
+# would never be reached and the torque-catch loops would spin forever.
+GRIPPER_TORQUE_THRESHOLD = 0.45  # Nm
 GRIPPER_STEP = 0.005  # normalized [0, 1] per iteration
 GRIPPER_STEP_DELAY = 0.01  # seconds between steps
 GRIPPER_OSC_SPEED = 0.5  # normalized [0, 1] per second — oscillation speed
@@ -418,20 +422,25 @@ async def run_rom_cycle(
     abort_on_collision: bool,
     shoulder3_mirror: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    low, high = LIMITS[Joint.SHOULDER_1]
-    left_q, right_q = await sweep_joint_range(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        Joint.SHOULDER_1,
-        "both",
-        [high, low],
-        "SHOULDER_1  (both)",
-        speed,
-        pause,
-        abort_on_collision,
+    # Shoulder_1 limits are mirrored across arms: the right arm's range is the
+    # negation of the left's, so sweep both arms simultaneously in mirror.
+    s1_left_low, s1_left_high = SHOULDER_1_LEFT_LIMITS
+    print(
+        f"  SHOULDER_1  (both, mirrored)  "
+        f"[{round(s1_left_high, 3)}, {round(s1_left_low, 3)}] → 0"
     )
+    for value in (s1_left_high, s1_left_low, 0.0):
+        left_q, right_q = await sweep_to_target(
+            robot,
+            checker,
+            left_q,
+            right_q,
+            with_joint(left_q, Joint.SHOULDER_1, value),
+            with_joint(right_q, Joint.SHOULDER_1, -value),
+            speed,
+            pause,
+            abort_on_collision,
+        )
 
     _, right_high = SHOULDER_2_RIGHT_LIMITS
     left_low, _ = SHOULDER_2_LEFT_LIMITS
@@ -630,7 +639,7 @@ async def run_sim() -> None:
     await sim.enable()
     try:
         print("=== ROM TEST — simulation ===")
-        print("Viser server running at  http://localhost:8080")
+        print("Viser server running at  http://localhost:8002")
         print("Open that URL in a browser, then come back here.\n")
         await asyncio.to_thread(input, "Press Enter to start the ROM sweep ...")
 
