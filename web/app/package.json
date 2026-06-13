@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@almond/axol-vr-client": "*",
+    "@fontsource/inter": "^5.2.8",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
     "@react-three/xr": "^6.6.29",
@@ -22,7 +23,8 @@
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.17.0",
     "tailwind-merge": "^3.6.0",
-    "three": "^0.182.0"
+    "three": "^0.182.0",
+    "troika-three-text": "^0.52.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

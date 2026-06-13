@@ -11,12 +11,22 @@ import {
   useAxolVRClient,
 } from "@almond/axol-vr-client"
 import { Headset, Loader2, ShieldCheck } from "lucide-react"
+import { configureTextBuilder } from "troika-three-text"
+import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff2"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { SiteNav } from "@/components/site-nav"
 import { authorizeCert } from "@/lib/cert-accept"
 import { cn } from "@/lib/utils"
+
+// Pin drei's <Text> (troika) to a locally-bundled font. By default troika
+// fetches its font from a jsdelivr CDN, which hangs forever on an offline LAN
+// and — because every in-headset <Text> suspends until the font loads, and the
+// whole XR scene (camera feed included) sits under one <Suspense> — leaves the
+// headset showing nothing. Serving the font from the same origin makes VR
+// teleop work with no internet. Must run before the first <Text> renders.
+configureTextBuilder({ defaultFontURL: interFontUrl })
 
 // The VR teleop WebSocket server runs on this port (see useAxolVRClient default).
 const VR_WS_PORT = 8000
@@ -753,11 +763,11 @@ function ExitButton() {
 }
 
 const STATUS_DISPLAY: Partial<Record<AxolState | "pending", { color: string; label: string }>> = {
-  pending: { color: "yellow", label: "● Starting…" },
-  [AxolState.Error]: { color: "#f87171", label: "● Error" },
-  [AxolState.Recording]: { color: "red", label: "● Recording" },
-  [AxolState.Saving]: { color: "orange", label: "● Saving…" },
-  [AxolState.DataCollection]: { color: "blue", label: "● Data Collection" },
+  pending: { color: "yellow", label: "• Starting…" },
+  [AxolState.Error]: { color: "#f87171", label: "• Error" },
+  [AxolState.Recording]: { color: "red", label: "• Recording" },
+  [AxolState.Saving]: { color: "orange", label: "• Saving…" },
+  [AxolState.DataCollection]: { color: "blue", label: "• Data Collection" },
 }
 
 function StateDisplay({
@@ -768,7 +778,7 @@ function StateDisplay({
   isRecordingPending: boolean
 }) {
   const displayState: AxolState | "pending" = isRecordingPending ? "pending" : state
-  const { color, label } = STATUS_DISPLAY[displayState] ?? { color: "white", label: "● Teleop" }
+  const { color, label } = STATUS_DISPLAY[displayState] ?? { color: "white", label: "• Teleop" }
 
   return (
     <Text
