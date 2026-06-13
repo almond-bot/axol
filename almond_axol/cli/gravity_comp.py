@@ -21,40 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import math
 
 from ..robot import Axol
 from ..utils.shared import ARM_JOINTS, Joint
 from .config import GravityCompCmdConfig, parse
-
-
-def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
-    """Convert a list of joint names into a set of arm ``Joint`` enums.
-
-    Names are case-insensitive and must name one of the seven arm joints
-    (``GRIPPER`` is rejected — gravity comp only applies to arm joints).
-    ``None`` means "all seven arm joints" and is passed through unchanged.
-    """
-    if names is None:
-        return None
-    valid_names = [j.name for j in ARM_JOINTS]
-    out: set[Joint] = set()
-    for raw in names:
-        name = raw.strip().upper()
-        if not name:
-            continue
-        try:
-            j = Joint[name]
-        except KeyError:
-            raise SystemExit(f"unknown joint {name!r}; valid: {', '.join(valid_names)}")
-        if j not in ARM_JOINTS:
-            raise SystemExit(
-                f"{name!r} cannot be gravity-compensated; valid: {', '.join(valid_names)}"
-            )
-        out.add(j)
-    if not out:
-        raise SystemExit("free_joints is empty")
-    return out
 
 
 def main(argv: list[str]) -> None:
@@ -74,33 +45,42 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
     if cfg.left_channel is None and cfg.right_channel is None:
         raise SystemExit("Both arms disabled — nothing to do.")
 
-    free_joints = _resolve_free_joints(cfg.free_joints)
-    free_str = (
-        "all 7 joints"
-        if free_joints is None
-        else ", ".join(j.name for j in ARM_JOINTS if j in free_joints)
-    )
     print(
-        f"Gravity comp: free={free_str}; kd={cfg.kd:.2f} Nm·s/rad, "
-        f"rate={cfg.rate_hz:.0f} Hz (telemetry={cfg.telemetry_hz:.0f} Hz). "
+        f"Gravity comp READ-ONLY: no torque commanded — move the joints by hand. "
+        f"Logging shoulder_2 every 0.5 s (telemetry={cfg.telemetry_hz:.0f} Hz). "
         f"Press Ctrl-C to exit."
     )
 
     async with Axol(
         left_channel=cfg.left_channel, right_channel=cfg.right_channel
     ) as axol:
-        # ``enable()`` (called by ``__aenter__``) leaves arm joints in IMPEDANCE
-        # and the gripper in POSITION_FORCE — both of which are the modes
-        # ``gravity_compensate`` expects, so we don't touch control modes here.
-        await axol.start_telemetry(cfg.telemetry_hz)
+        # ``enable()`` (called by ``__aenter__``) releases the brakes but sends
+        # no motion command, so with no ``gravity_compensate`` call below the
+        # motors apply no torque and the joints are free to move by hand.
+        # torque=True so we can log the measured shoulder_2 torque alongside
+        # the model's gravity feedforward.
+        await axol.start_telemetry(cfg.telemetry_hz, torque=True)
         # Motors may still be rebooting from set_control_mode(); block until
-        # every motor has answered at least one telemetry poll before driving.
+        # every motor has answered at least one telemetry poll before reading.
         await axol.wait_for_telemetry()
 
-        dt = 1.0 / cfg.rate_hz
+        # Diagnostic: every 0.5 s, log shoulder_2's joint angle, the gravity
+        # feedforward the model *would* command at that pose (computed, not
+        # sent), and the measured motor torque. Prefer the left arm; fall back
+        # to the right.
+        arm = axol.left if axol.left is not None else axol.right
+        s2_i = ARM_JOINTS.index(Joint.SHOULDER_2)
+
         while True:
-            loop_start = time.monotonic()
-            await axol.gravity_compensate(kd=cfg.kd, free_joints=free_joints)
-            spent = time.monotonic() - loop_start
-            if spent < dt:
-                await asyncio.sleep(dt - spent)
+            arm_q = arm.positions[: len(ARM_JOINTS)]
+            grav_ff = float(
+                arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)[s2_i]
+            )
+            pos = float(arm_q[s2_i])
+            meas = float(arm.torques[s2_i])
+            print(
+                f"shoulder_2  pos={math.degrees(pos):+7.2f}° ({pos:+.4f} rad)  "
+                f"grav_ff={grav_ff:+.3f} Nm  meas={meas:+.3f} Nm",
+                flush=True,
+            )
+            await asyncio.sleep(0.5)
