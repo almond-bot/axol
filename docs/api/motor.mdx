@@ -1,0 +1,77 @@
+---
+title: "almond_axol.motor"
+description: "Low-level async SocketCAN interface for individual motors."
+---
+
+Low-level async SocketCAN interface for individual motors. Most users work through `Axol` — this layer is exposed for diagnostics, custom control modes, and bench testing individual motors.
+
+```python
+from almond_axol.motor import CanBus, Motor, ControlMode, MotorStatus, MotorGains, Joint
+```
+
+```python
+import asyncio
+from almond_axol.motor import CanBus, Motor, ControlMode, Joint
+
+async def main():
+    async with CanBus("can_alm_axol_l") as bus:
+        elbow = Motor(bus, Joint.ELBOW)
+        await elbow.enable()
+        await elbow.set_control_mode(ControlMode.IMPEDANCE)
+
+        pos = await elbow.get_position()  # rad
+        print("elbow position:", pos)
+
+        await elbow.set_impedance(p_des=pos, v_des=0.0, kp=100.0, kd=2.0, t_ff=0.0)
+        await elbow.disable()
+
+asyncio.run(main())
+```
+
+## `Motor` methods
+
+| Method | Description |
+|---|---|
+| `enable()` / `disable()` | Enable motor / engage brake |
+| `clear_errors()` | Clear latched error flags |
+| `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
+| `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |
+| `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
+| `get_position()` | Shaft position (rad); raises if telemetry is active |
+| `get_velocity()` | Shaft velocity (rad/s) |
+| `get_torque()` | Torque estimate (Nm); raises if telemetry is active |
+| `get_temperature()` | Motor temperature (°C) |
+| `get_voltage()` | Bus voltage (V) |
+| `get_error_code()` | `MotorStatus` |
+| `get_gains()` / `set_gains(gains)` | Read/write PID gains (persisted to flash) |
+| `set_impedance(p_des, v_des, kp, kd, t_ff)` | MIT impedance command; requires `IMPEDANCE` mode |
+| `set_position_velocity(position, max_speed)` | Built-in position controller; requires `POSITION_VELOCITY` mode |
+| `set_velocity(velocity)` | Built-in speed controller; requires `VELOCITY` mode |
+| `set_position_force(position, max_speed, max_torque)` | Damiao only; requires `POSITION_FORCE` mode |
+| `set_acceleration(acceleration, deceleration)` | Acceleration ramp (rad/s²) |
+| `set_can_id(can_id)` | Change CAN ID (persisted to flash) |
+| `start_telemetry(hz, torque=False)` / `stop_telemetry()` | Background polling loop |
+| `motor.position` | Cached position (rad); populated by telemetry or `set_impedance` responses |
+| `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
+
+## `ControlMode` values
+
+| Value | Description |
+|---|---|
+| `IMPEDANCE` | MIT impedance control (arm joints) |
+| `POSITION_VELOCITY` | Motor built-in position controller |
+| `VELOCITY` | Motor built-in speed controller |
+| `POSITION_FORCE` | Position with hard torque cap; Damiao only (gripper) |
+
+## `MotorStatus` values
+
+`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `UNKNOWN`
+
+\* MyActuator only
+
+## Joint → driver mapping
+
+| Joint | Driver | CAN ID |
+|---|---|---|
+| `SHOULDER_1` – `WRIST_1` | MyActuator | `0x01` – `0x05` |
+| `WRIST_2`, `WRIST_3`, `GRIPPER` | Damiao | `0x06` – `0x08` |

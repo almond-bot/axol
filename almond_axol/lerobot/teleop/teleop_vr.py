@@ -21,7 +21,8 @@ Typical usage::
     from almond_axol.lerobot.robot import AxolRobot, AxolRobotConfig
     from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
 
-    with AxolRobot(AxolRobotConfig()) as robot, AxolVRTeleop(AxolVRTeleopConfig()) as teleop:
+    robot_config = AxolRobotConfig(zed_host="192.168.1.10")
+    with AxolRobot(robot_config) as robot, AxolVRTeleop(AxolVRTeleopConfig()) as teleop:
         while True:
             obs = robot.get_observation()
             teleop.send_feedback(obs)
@@ -39,6 +40,7 @@ import multiprocessing.connection
 import multiprocessing.context
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -47,9 +49,9 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
-from ...shared import Joint
 from ...teleop.filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 from ...teleop.worker import run_ik_worker
+from ...utils.shared import Joint
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
 from .config_vr import AxolVRTeleopConfig
@@ -125,7 +127,7 @@ class AxolVRTeleop(Teleoperator):
         self._prev_reset: bool = False
         self._reset_latched: bool = False
 
-        # Deadman toggle (mirrors native VRTeleop behaviour):
+        # Engage toggle (mirrors native VRTeleop behaviour):
         #   both grips rising edge → enable, either grip rising edge → disable
         self._teleop_enabled: bool = False
         self._prev_both: bool = False
@@ -334,6 +336,33 @@ class AxolVRTeleop(Teleoperator):
         """Accept robot observation. Currently a no-op — IK worker maintains its own state."""
         pass
 
+    def set_video_sources(self, sources: dict[str, Callable[[], Any]] | None) -> None:
+        """Stream wrist-camera frames to the headset via WebRTC.
+
+        Each source is a callable returning the latest RGB ``uint8`` numpy frame
+        ``(H, W, 3)`` or ``None``. Must be called after :meth:`connect` (so the
+        VR server exists). Safe to call from any thread. Requires the ``video``
+        extra; without it video is silently disabled.
+        """
+        if self._vr_server is not None:
+            self._vr_server.set_video_sources(sources)
+
+    def _broadcast_tracking(self, enabled: bool) -> None:
+        """Push the engage-toggle state to the headset (fire-and-forget).
+
+        The VR app uses it to allow screen repositioning (trigger grabs) only
+        while the robot isn't being controlled. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        text = json.dumps({"type": "tracking", "value": enabled})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
     def send_feedback_state(self, state: VRState) -> None:
         """Broadcast a state override to all connected VR clients.
 
@@ -439,18 +468,32 @@ class AxolVRTeleop(Teleoperator):
         if q is None:
             return self._q_out
 
-        l_grip = self._l_grip
-        r_grip = self._r_grip
-
         if self._reset_interp.is_active():
             new_q, l_grip, r_grip, done = self._reset_interp.step()
-            if new_q is not None:
-                q = np.asarray(new_q, dtype=np.float32)
-                if done:
-                    self._q = q.copy()
-                    self._l_grip = l_grip
-                    self._r_grip = r_grip
-                    self._at_rest = True
+            if new_q is None:
+                return self._q_out
+            q = np.asarray(new_q, dtype=np.float32)
+            if done:
+                self._q = q.copy()
+                self._l_grip = l_grip
+                self._r_grip = r_grip
+                self._at_rest = True
+                seed_l = np.append(q[self._left_indices], l_grip)
+                seed_r = np.append(q[self._right_indices], r_grip)
+                self._ema_left.reset(seed=seed_l)
+                self._ema_right.reset(seed=seed_r)
+                self._smooth_left.reset(seed=q[self._left_indices])
+                self._smooth_right.reset(seed=q[self._right_indices])
+
+            out = np.empty(16, dtype=np.float32)
+            out[:7] = q[self._left_indices]
+            out[7] = l_grip
+            out[8:15] = q[self._right_indices]
+            out[15] = r_grip
+            return out
+
+        l_grip = self._l_grip
+        r_grip = self._r_grip
 
         ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
         ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
@@ -480,11 +523,6 @@ class AxolVRTeleop(Teleoperator):
         while True:
             t0 = time.perf_counter()
 
-            # Process a pending reset before checking for VR frames so it fires
-            # even without a live headset.  _reset_latched is cleared only in the
-            # finally block — after the IK subprocess responds and the trajectory is
-            # armed — so is_resetting() stays True throughout the async IK call and
-            # the collect_data reset loop cannot exit prematurely.
             if (
                 self._reset_latched
                 and not self._reset_interp.is_active()
@@ -499,13 +537,11 @@ class AxolVRTeleop(Teleoperator):
                             self._reset_interp.set_trajectory(
                                 trajectory, self._l_grip, self._r_grip
                             )
-                            self._ema_left.reset()
-                            self._ema_right.reset()
-                            self._smooth_left.reset()
-                            self._smooth_right.reset()
                             self._teleop_enabled = False
+                            self._broadcast_tracking(False)
                             self._prev_both = False
                             self._prev_either = False
+                            self._engage_time = None
                             self._at_rest = True
                         self._q = np.asarray(q_default, dtype=np.float32)
                 except Exception as e:
@@ -535,7 +571,7 @@ class AxolVRTeleop(Teleoperator):
 
             last_frame = frame
 
-            # Deadman toggle — mirrors native VRTeleop._ik_loop logic:
+            # Engage toggle — mirrors native VRTeleop._ik_loop logic:
             #   rising edge of BOTH grips pressed together → enable tracking
             #   rising edge of EITHER grip pressed alone   → disable tracking
             both = frame.l_lock and frame.r_lock
@@ -544,6 +580,7 @@ class AxolVRTeleop(Teleoperator):
                 if both and not self._prev_both:
                     self._teleop_enabled = True
                     _logger.info("Teleop enabled")
+                    self._broadcast_tracking(True)
                     if self._at_rest:
                         cfg = self.config.vr_teleop_config
                         self._smooth_left.max_vel = cfg.engage_max_vel
@@ -554,11 +591,12 @@ class AxolVRTeleop(Teleoperator):
                 if either and not self._prev_either:
                     self._teleop_enabled = False
                     _logger.info("Teleop disabled")
+                    self._broadcast_tracking(False)
             self._prev_both = both
             self._prev_either = either
 
             # Only track gripper position when arm movement is also enabled so
-            # that the gripper cannot be actuated independently of the deadman.
+            # that the gripper cannot be actuated independently of the toggle.
             if self._teleop_enabled:
                 self._l_grip = frame.l_grip
                 self._r_grip = frame.r_grip

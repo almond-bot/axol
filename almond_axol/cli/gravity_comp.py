@@ -7,168 +7,99 @@ kp=0, kd=KD, t_ff=gravity)`` at the configured rate; joints not in the free
 set are held rigidly at their current position with their configured
 ``ArmConfig`` gains; the gripper is held softly at its current position.
 
-Examples:
+Every field is reachable from the CLI (draccus-style) or a JSON/YAML file:
+
     axol gravity-comp
-    axol gravity-comp --no-right
+    axol gravity-comp --right_channel null
     axol gravity-comp --kd 1.0
-    axol gravity-comp --joints WRIST_3
-    axol gravity-comp --no-right --joints SHOULDER_1,WRIST_3
+    axol gravity-comp --free_joints [WRIST_3]
+    axol gravity-comp --right_channel null --free_joints [SHOULDER_1,WRIST_3]
+    axol gravity-comp --config_path my_gravity.json
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import logging
 import time
 
 from ..robot import Axol
-from ..shared import ARM_JOINTS, Joint
+from ..utils.shared import ARM_JOINTS, Joint
+from .config import GravityCompCmdConfig, parse
 
 
-def _parse_joints(spec: str) -> set[Joint]:
-    """Parse a comma-separated joint name list into a set of ``Joint`` enums.
+def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
+    """Convert a list of joint names into a set of arm ``Joint`` enums.
 
-    Names are case-insensitive and match the ``Joint`` enum members
-    (``SHOULDER_1``, ``SHOULDER_2``, ``SHOULDER_3``, ``ELBOW``, ``WRIST_1``,
-    ``WRIST_2``, ``WRIST_3``). ``GRIPPER`` is rejected — gravity comp only
-    applies to the 7 arm joints.
+    Names are case-insensitive and must name one of the seven arm joints
+    (``GRIPPER`` is rejected — gravity comp only applies to arm joints).
+    ``None`` means "all seven arm joints" and is passed through unchanged.
     """
+    if names is None:
+        return None
     valid_names = [j.name for j in ARM_JOINTS]
     out: set[Joint] = set()
-    for raw in spec.split(","):
+    for raw in names:
         name = raw.strip().upper()
         if not name:
             continue
         try:
             j = Joint[name]
         except KeyError:
-            raise argparse.ArgumentTypeError(
-                f"unknown joint {name!r}; valid: {', '.join(valid_names)}"
-            )
+            raise SystemExit(f"unknown joint {name!r}; valid: {', '.join(valid_names)}")
         if j not in ARM_JOINTS:
-            raise argparse.ArgumentTypeError(
+            raise SystemExit(
                 f"{name!r} cannot be gravity-compensated; valid: {', '.join(valid_names)}"
             )
         out.add(j)
     if not out:
-        raise argparse.ArgumentTypeError("--joints is empty")
+        raise SystemExit("free_joints is empty")
     return out
 
 
-def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
-    p = subparsers.add_parser(
-        "gravity-comp",
-        help="Hold the Axol in gravity-compensation mode (move by hand).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__,
-    )
-    p.add_argument(
-        "--no-left",
-        action="store_true",
-        help="Disable the left arm.",
-    )
-    p.add_argument(
-        "--no-right",
-        action="store_true",
-        help="Disable the right arm.",
-    )
-    p.add_argument(
-        "--joints",
-        type=_parse_joints,
-        default=None,
-        metavar="J1,J2,...",
-        help=(
-            "Comma-separated list of joints to gravity-compensate "
-            "(e.g. WRIST_3 or SHOULDER_1,ELBOW). All other arm joints are "
-            "held rigidly at their current position using their configured "
-            "kp/kd. Default: all 7 arm joints free."
-        ),
-    )
-    p.add_argument(
-        "--kd",
-        type=float,
-        default=0.5,
-        help="Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.5.",
-    )
-    p.add_argument(
-        "--rate",
-        type=float,
-        default=100.0,
-        help="Control loop rate in Hz (default: 100).",
-    )
-    p.add_argument(
-        "--telemetry-rate",
-        type=float,
-        default=500.0,
-        help="Joint telemetry poll rate in Hz (default: 500).",
-    )
-    p.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO).",
-    )
-    p.set_defaults(func=run)
-
-
-def run(args: argparse.Namespace) -> None:
-    logging.basicConfig(level=getattr(logging, args.log_level))
+def main(argv: list[str]) -> None:
+    """Parse the CLI config and run gravity-compensation mode."""
+    cfg = parse(GravityCompCmdConfig, argv)
+    # force=True: a dependency imported before this point may install a root
+    # handler (leaving the level at WARNING), which would make this a no-op
+    # and silently drop log_say() / INFO status lines.
+    logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
     try:
-        asyncio.run(
-            _run(
-                no_left=args.no_left,
-                no_right=args.no_right,
-                free_joints=args.joints,
-                kd=args.kd,
-                rate_hz=args.rate,
-                telemetry_hz=args.telemetry_rate,
-            )
-        )
+        asyncio.run(_run(cfg))
     except KeyboardInterrupt:
         print("\nExiting gravity comp ...")
 
 
-async def _run(
-    *,
-    no_left: bool,
-    no_right: bool,
-    free_joints: set[Joint] | None,
-    kd: float,
-    rate_hz: float,
-    telemetry_hz: float,
-) -> None:
-    if no_left and no_right:
+async def _run(cfg: GravityCompCmdConfig) -> None:
+    if cfg.left_channel is None and cfg.right_channel is None:
         raise SystemExit("Both arms disabled — nothing to do.")
 
-    kwargs: dict = {}
-    if no_left:
-        kwargs["left_channel"] = None
-    if no_right:
-        kwargs["right_channel"] = None
-
+    free_joints = _resolve_free_joints(cfg.free_joints)
     free_str = (
         "all 7 joints"
         if free_joints is None
         else ", ".join(j.name for j in ARM_JOINTS if j in free_joints)
     )
     print(
-        f"Gravity comp: free={free_str}; kd={kd:.2f} Nm·s/rad, rate={rate_hz:.0f} Hz "
-        f"(telemetry={telemetry_hz:.0f} Hz). Press Ctrl-C to exit."
+        f"Gravity comp: free={free_str}; kd={cfg.kd:.2f} Nm·s/rad, "
+        f"rate={cfg.rate_hz:.0f} Hz (telemetry={cfg.telemetry_hz:.0f} Hz). "
+        f"Press Ctrl-C to exit."
     )
 
-    async with Axol(**kwargs) as axol:
+    async with Axol(
+        left_channel=cfg.left_channel, right_channel=cfg.right_channel
+    ) as axol:
         # ``enable()`` (called by ``__aenter__``) leaves arm joints in IMPEDANCE
         # and the gripper in POSITION_FORCE — both of which are the modes
         # ``gravity_compensate`` expects, so we don't touch control modes here.
-        await axol.start_telemetry(telemetry_hz)
+        await axol.start_telemetry(cfg.telemetry_hz)
         # Settle a few cycles so positions cache is populated before we drive.
-        await asyncio.sleep(max(0.05, 5.0 / telemetry_hz))
+        await asyncio.sleep(max(0.05, 5.0 / cfg.telemetry_hz))
 
-        dt = 1.0 / rate_hz
+        dt = 1.0 / cfg.rate_hz
         while True:
             loop_start = time.monotonic()
-            await axol.gravity_compensate(kd=kd, free_joints=free_joints)
+            await axol.gravity_compensate(kd=cfg.kd, free_joints=free_joints)
             spent = time.monotonic() - loop_start
             if spent < dt:
                 await asyncio.sleep(dt - spent)

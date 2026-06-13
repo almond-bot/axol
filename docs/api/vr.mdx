@@ -1,0 +1,81 @@
+---
+title: "almond_axol.vr"
+description: "Secure WebSocket server that receives VRFrame messages from the VR app."
+---
+
+Secure WebSocket server (WSS) that receives `VRFrame` JSON messages from the VR app. A self-signed TLS certificate is auto-generated in `~/.almond/vr/certs/` on first use. This module can be used standalone to read raw VR data without full teleoperation — useful for custom control loops or data collection.
+
+```python
+from almond_axol.vr import VRServer, VRServerConfig
+```
+
+```python
+import asyncio
+from almond_axol.vr import VRServer, VRServerConfig
+
+async def main():
+    async with VRServer(VRServerConfig(port=8000)) as vr:
+        while True:
+            frame = vr.get_frame()
+            if frame is not None:
+                print(frame.l_ee, frame.r_ee)
+            await asyncio.sleep(0.01)
+
+asyncio.run(main())
+```
+
+Or use a callback instead of polling:
+
+```python
+def on_frame(frame):
+    print(frame.l_grip, frame.r_grip)
+
+async with VRServer() as vr:
+    vr.set_on_frame(on_frame)
+    await asyncio.sleep(float("inf"))
+```
+
+## `VRFrame` fields
+
+| Field | Type | Description |
+|---|---|---|
+| `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position + quaternion) |
+| `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions |
+| `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
+| `l_lock` / `r_lock` | `bool` | Grip toggles (engage/disengage tracking) |
+| `reset` | `bool` | Rising edge triggers a reset move |
+| `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
+
+## Server → headset feedback
+
+The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. `{"type": "state", "value": "error"}` shows an error indicator in the headset UI. `{"type": "state", "value": "data_collection"}` re-enables controls after saving. The `AxolVRTeleop.send_feedback_state(state)` helper wraps this for all `VRState` values.
+
+Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning the camera screens (a trigger gesture) while tracking is disengaged.
+
+## Camera video to the headset
+
+The server can stream camera frames to the headset over **WebRTC**. Register per-camera frame sources with `set_video_sources()` — each source is a callable returning the latest RGB `uint8` numpy frame `(H, W, 3)` or `None`:
+
+```python
+vr.set_video_sources({
+    "overhead":  lambda: overhead_cam.read_latest(max_age_ms=1000),
+    "left_arm":  lambda: left_cam.read_latest(max_age_ms=1000),
+    "right_arm": lambda: right_cam.read_latest(max_age_ms=1000),
+})
+```
+
+The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead is registered as two sources, `overhead_left` / `overhead_right`, which the VR app renders per-lens.
+
+Requires the `video` extra (`uv sync --extra video`, which installs `aiortc`); without it `set_video_sources()` logs a warning and video stays disabled. Pass `None` or `{}` to turn video off. [`axol teleop --zed_host`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
+
+## `VRServerConfig` fields
+
+| Field | Default | Description |
+|---|---|---|
+| `port` | `8000` | WSS listen port |
+| `certfile` | auto | Path to TLS certificate; `None` uses the auto-generated cert |
+| `keyfile` | auto | Path to TLS private key |
+
+<Warning>
+  Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.
+</Warning>

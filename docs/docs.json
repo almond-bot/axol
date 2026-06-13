@@ -1,0 +1,95 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Docs",
+  "description": "Command-line interface and Python SDK for the Almond Axol dual-arm robot.",
+  "colors": {
+    "primary": "#c79760",
+    "light": "#eff483",
+    "dark": "#c79760"
+  },
+  "favicon": "/assets/logo.png",
+  "logo": {
+    "light": "/assets/logo.png",
+    "dark": "/assets/logo.png"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get Started",
+        "pages": [
+          "index",
+          "installation"
+        ]
+      },
+      {
+        "group": "Quickstart",
+        "pages": [
+          "quickstart/teleop",
+          "quickstart/data-collection",
+          "quickstart/inference"
+        ]
+      },
+      {
+        "group": "Web Interfaces",
+        "pages": [
+          "guides/control-panel",
+          "guides/vr-interface"
+        ]
+      },
+      {
+        "group": "CLI Reference",
+        "pages": [
+          "cli/configuration",
+          "cli/serve",
+          "cli/can-setup",
+          "cli/can-enable",
+          "cli/can-driver",
+          "cli/motor-info",
+          "cli/motor-set-can-id",
+          "cli/motor-set-zero-pos",
+          "cli/teleop",
+          "cli/collect-data",
+          "cli/run-policy",
+          "cli/zed-stream",
+          "cli/zed-install",
+          "cli/zed-sync-clocks",
+          "cli/tune-pid",
+          "cli/tune-friction",
+          "cli/tune-repeatability",
+          "cli/gravity-comp"
+        ]
+      },
+      {
+        "group": "Python API",
+        "pages": [
+          "api/concepts",
+          "api/robot",
+          "api/kinematics",
+          "api/teleop",
+          "api/vr",
+          "api/zed",
+          "api/motor",
+          "api/lerobot"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Control Panel",
+        "href": "https://axol.almond.bot/control"
+      },
+      {
+        "label": "VR Teleop",
+        "href": "https://axol.almond.bot/vr"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Get Axol",
+      "href": "https://almond.bot"
+    }
+  }
+}

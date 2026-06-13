@@ -1,0 +1,64 @@
+---
+title: "almond_axol.teleop"
+description: "Connect a VR headset to the robot (or simulator) for teleoperation."
+---
+
+Connects a VR headset to the robot (or simulator) for teleoperation. IK runs in a dedicated subprocess to keep JAX off the asyncio event loop. The pipeline is: VR frames → One Euro filtering → IK solve → EMA smoothing → trapezoidal velocity profiling → `motion_control()`.
+
+```python
+from almond_axol.teleop import VRTeleop, VRTeleopConfig
+```
+
+```python
+import asyncio
+from almond_axol.robot import Axol
+from almond_axol.teleop import VRTeleop
+
+async def main():
+    async with VRTeleop(Axol()) as teleop:
+        await teleop.run()  # blocking; Ctrl+C to exit
+
+asyncio.run(main())
+```
+
+Use `step()` instead of `run()` to integrate teleoperation into your own control loop:
+
+```python
+async with VRTeleop(axol) as teleop:
+    while True:
+        left_q, right_q = teleop.step()  # returns latest smoothed (8,) arrays
+        # ... custom logic ...
+        await asyncio.sleep(1 / 120)
+```
+
+To show camera feeds in the headset, register frame sources after the session is enabled — `VRTeleop.set_video_sources()` forwards them to the VR server's WebRTC relay (requires the `video` extra; see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset)):
+
+```python
+async with VRTeleop(axol) as teleop:
+    teleop.set_video_sources({"overhead": lambda: cam.read_latest(max_age_ms=1000)})
+    await teleop.run()
+```
+
+See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entry point (`--zed_host` wires the ZED cameras up automatically).
+
+## `VRTeleopConfig` fields
+
+| Field | Default | Description |
+|---|---|---|
+| `frequency` | `120` Hz | Control loop rate used by `run()` and reset trajectory density |
+| `teleop_max_vel` | `1.0 rev/s` | Trapezoidal filter velocity cap during normal teleoperation |
+| `teleop_max_accel` | `3.5 rev/s²` | Trapezoidal filter acceleration cap |
+| `engage_max_vel` | `0.1 rev/s` | Slower velocity limit when teleop is first engaged after a reset |
+| `engage_duration` | `1.0` s | How long `engage_max_vel` is held before restoring `teleop_max_vel` |
+| `ik_alpha` | `0.5` | EMA blend factor on IK output; `1.0` disables smoothing |
+| `pose_min_cutoff` | `1.5` Hz | One Euro Filter tremor cutoff for raw VR poses |
+| `pose_beta` | `5.0` | One Euro Filter speed coefficient (raises cutoff during fast moves) |
+| `position_multiplier` | `1.0` | Scale on hand **position** (not orientation): the EE target moves this many times as far as the hand. `>1` extends reach when the arm is longer than the operator's |
+| `rotation_multiplier` | `1.0` | Scale on hand **orientation** (not position): the EE target rotates this many times as far as the hand. `>1` rotates the arm further than the wrist |
+| `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |
+| `reset_min_duration` | `1.5` s | Floor on return-to-rest duration so near-rest starts don't snap home |
+| `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
+
+<Note>
+  **Engage toggle behaviour.** Grip is a toggle, not a hold. Press both grip buttons together to enable arm movement; press either grip alone to freeze the arms. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.
+</Note>

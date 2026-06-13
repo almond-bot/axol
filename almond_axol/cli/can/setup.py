@@ -14,7 +14,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ...shared import CAN_LEFT, CAN_RIGHT
+from ...utils.shared import CAN_LEFT, CAN_RIGHT
+from ...utils.sudo import run_root
+from . import driver
 
 _VID = "1d50"
 _PID = "606f"
@@ -33,9 +35,8 @@ def _die(msg: str) -> None:
     sys.exit(1)
 
 
-def _find_serial() -> str:
-    print(f"Scanning for Almond Axol CAN adapter ({_VID}:{_PID})...")
-
+def _detect_serials() -> list[str]:
+    """Return the serials of every attached Almond Axol CAN adapter (no prompts)."""
     serials: list[str] = []
     for iface_path in Path("/sys/class/net").glob("can*"):
         info = subprocess.run(
@@ -73,7 +74,27 @@ def _find_serial() -> str:
             if serial:
                 serials.append(serial)
 
-    unique = list(dict.fromkeys(serials))
+    return list(dict.fromkeys(serials))
+
+
+def _resolve_serial() -> str:
+    """Pick the adapter serial without prompting (for headless ``ensure_setup``).
+
+    Raises ``RuntimeError`` when zero or several adapters are present, since
+    that needs the interactive ``axol can.setup`` flow to disambiguate.
+    """
+    unique = _detect_serials()
+    if len(unique) == 1:
+        return unique[0]
+    if not unique:
+        raise RuntimeError("Robot not detected")
+    raise RuntimeError("Multiple CAN adapters")
+
+
+def _find_serial() -> str:
+    print(f"Scanning for Almond Axol CAN adapter ({_VID}:{_PID})...")
+
+    unique = _detect_serials()
 
     if not unique:
         print(
@@ -105,20 +126,14 @@ def _write_udev_rules(serial: str) -> None:
         f"# Channel 1 -> right arm\n"
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
     )
-    subprocess.run(
-        ["sudo", "tee", str(_UDEV_RULES_FILE)],
-        input=content,
-        text=True,
-        check=True,
-        stdout=subprocess.DEVNULL,
-    )
+    run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
     print("  Done.")
 
 
 def _reload_udev() -> None:
     print("Reloading udev rules (requires sudo)...")
-    subprocess.run(["sudo", "udevadm", "control", "--reload-rules"], check=True)
-    subprocess.run(["sudo", "systemctl", "restart", "systemd-udevd"], check=True)
+    run_root(["udevadm", "control", "--reload-rules"], check=True)
+    run_root(["systemctl", "restart", "systemd-udevd"], check=True)
     print("  Done.")
 
 
@@ -164,10 +179,8 @@ def _rename_interfaces(serial: str) -> None:
             continue
 
         print(f"  {iface} -> {new_name}")
-        subprocess.run(["sudo", "ip", "link", "set", iface, "down"], check=True)
-        subprocess.run(
-            ["sudo", "ip", "link", "set", iface, "name", new_name], check=True
-        )
+        run_root(["ip", "link", "set", iface, "down"], check=True)
+        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
 
     print("  Done.")
 
@@ -193,20 +206,17 @@ def _write_cron_script() -> None:
 def _register_cron() -> None:
     print("Registering @reboot cron entry in root crontab (requires sudo)...")
     cron_entry = f"@reboot {_CRON_SCRIPT}"
-    existing = subprocess.run(
-        ["sudo", "crontab", "-l"], capture_output=True, text=True
-    ).stdout
+    existing = run_root(["crontab", "-l"]).stdout or ""
     if str(_CRON_SCRIPT) in existing:
         print("  Entry already present — skipping.")
     else:
         new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
-        subprocess.run(
-            ["sudo", "crontab", "-"], input=new_crontab, text=True, check=True
-        )
+        run_root(["crontab", "-"], input_text=new_crontab, check=True)
         print(f"  Added: {cron_entry}")
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``can.setup`` subcommand."""
     subparsers.add_parser(
         "can.setup",
         help="Configure CAN interfaces for the Axol arm.",
@@ -215,18 +225,42 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 def _bring_up_can() -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
-    subprocess.run(["sudo", "bash", str(_CRON_SCRIPT)], check=True)
+    run_root(["bash", str(_CRON_SCRIPT)], check=True)
     print("  Done.")
 
 
-def run(_args: object = None) -> None:
-    serial = _find_serial()
+def is_configured() -> bool:
+    """True when persistent CAN config has been written by a prior setup.
+
+    Used by the control panel to decide whether connecting needs to run the
+    full :func:`ensure_setup` (first time on a machine) or can just bring the
+    already-named interfaces up.
+    """
+    return _UDEV_RULES_FILE.exists() and _CRON_SCRIPT.exists()
+
+
+def ensure_setup(*, serial: str | None = None) -> None:
+    """Run the full CAN configuration non-interactively (for the control panel).
+
+    Mirrors :func:`run` but resolves the adapter serial without prompting.
+    Each step is idempotent, so this is safe to call on a partially-configured
+    machine.
+    """
+    driver.ensure_driver()
+    serial = serial or _resolve_serial()
     _write_udev_rules(serial)
     _reload_udev()
     _rename_interfaces(serial)
     _write_cron_script()
     _register_cron()
     _bring_up_can()
+
+
+def run(_args: object = None) -> None:
+    """Configure persistent CAN interfaces and a @reboot bring-up entry."""
+    driver.ensure_driver()
+    serial = _find_serial()
+    ensure_setup(serial=serial)
 
     print()
     print("Setup complete.")

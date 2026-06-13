@@ -1,0 +1,49 @@
+---
+title: "Almond Axol"
+description: "Command-line interface and Python SDK for the Almond Axol dual-arm robot."
+---
+
+<img src="/assets/axol.png" width="400" alt="Axol dual-arm robot" />
+
+The Axol SDK is a Python CLI and SDK for the Almond Axol dual-arm robot. The CLI is invoked as `axol <command> [flags]`; the SDK is importable directly from `almond_axol`.
+
+<Note>
+  **New here?** Start with the [Teleoperation quickstart](/quickstart/teleop) to go from a fresh install to a live VR teleoperation session.
+</Note>
+
+## Quickstarts
+
+<CardGroup cols={3}>
+  <Card title="Teleoperation" icon="gamepad" href="/quickstart/teleop">
+    Drive the robot live from a VR headset.
+  </Card>
+  <Card title="Data Collection" icon="record-vinyl" href="/quickstart/data-collection">
+    Record teleoperation episodes to a LeRobot dataset across two machines.
+  </Card>
+  <Card title="Policy Inference" icon="robot" href="/quickstart/inference">
+    Run a trained policy autonomously across two machines.
+  </Card>
+</CardGroup>
+
+## Explore
+
+<CardGroup cols={2}>
+  <Card title="Web Control Panel" icon="display" href="/guides/control-panel">
+    Drive Axol from a browser with `axol serve` — no terminal required.
+  </Card>
+  <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
+    The in-repo WebXR app that streams Quest pose to the SDK.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    The one-line quick install, the `uv sync` development path, optional extras, and first-run setup.
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/teleop">
+    Every `axol` command, flag, and example — one page per command.
+  </Card>
+  <Card title="Python API" icon="code" href="/api/concepts">
+    `Axol`, `KinematicsSolver`, `VRTeleop`, and the LeRobot wrappers.
+  </Card>
+  <Card title="Tuning" icon="sliders" href="/cli/tune-pid">
+    PID, friction, repeatability, and gravity-compensation tools.
+  </Card>
+</CardGroup>

@@ -1,0 +1,43 @@
+---
+title: "almond_axol.zed"
+description: "Stream up to three ZED-X One cameras over the local network with HEVC encoding."
+---
+
+Streams up to three ZED-X One cameras over the local network using HEVC (H.265) encoding via the ZED SDK. Requires `pyzed` — install it with `axol zed.install` (see [`zed.install`](/cli/zed-install)).
+
+```python
+from almond_axol.zed import ZedStreamer, ZedConfig
+```
+
+```python
+import asyncio
+from almond_axol.zed import ZedStreamer, ZedConfig
+
+async def main():
+    config = ZedConfig(
+        overhead_serial=12345678,
+        left_arm_serial=23456789,
+        right_arm_serial=34567890,
+    )
+    async with ZedStreamer(config):
+        await asyncio.sleep(float("inf"))
+
+asyncio.run(main())
+```
+
+## `ZedConfig` fields
+
+| Field | Default | Description |
+|---|---|---|
+| `overhead_serial` | `None` | Serial number of the overhead camera |
+| `left_arm_serial` | `None` | Serial number of the left-arm camera |
+| `right_arm_serial` | `None` | Serial number of the right-arm camera |
+| `overhead_port` | `30000` | Streaming port for the overhead camera |
+| `left_arm_port` | `30002` | Streaming port for the left-arm camera |
+| `right_arm_port` | `30004` | Streaming port for the right-arm camera |
+| `resolution` | `SVGA` | `sl.RESOLUTION`: `HD1200`, `HD1080`, or `SVGA` |
+| `fps` | `60` | Capture frame rate for all cameras |
+| `bitrate` | `None` (auto) | HEVC encoding bitrate in kbps; `None` picks a recommended value from the resolution (SVGA 8000, HD1080 12500, HD1200 14000; ×1.5 for the stereo overhead) |
+| `overhead_stereo` | `False` | Treat the overhead camera as a stereo ZED X (`sl.Camera`) instead of a mono ZED-X One (`sl.CameraOne`). The single stream then carries both eyes; receivers retrieve the LEFT/RIGHT views. The wrist cameras are always mono |
+
+At least one serial number must be provided. The sender binds to the streaming NIC's current IP — configure the interface on each machine before launching.

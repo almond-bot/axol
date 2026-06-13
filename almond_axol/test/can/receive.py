@@ -1,11 +1,11 @@
 """Live terminal display of all motor positions.
 
 Run directly:
-    python -m almond_axol.test.can.receive --l
-    python -m almond_axol.test.can.receive --r
-    python -m almond_axol.test.can.receive            # both arms, log only
-    python -m almond_axol.test.can.receive --l --hz 50
-    python -m almond_axol.test.can.receive --l --hz 250 --log-file can_diag.log
+    uv run -m almond_axol.test.can.receive --l
+    uv run -m almond_axol.test.can.receive --r
+    uv run -m almond_axol.test.can.receive            # both arms, log only
+    uv run -m almond_axol.test.can.receive --l --hz 50
+    uv run -m almond_axol.test.can.receive --l --hz 250 --log-file can_diag.log
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import numpy as np
 from ...motor import CanBus
 from ...robot.axol import AxolArm, arm_limits
 from ...robot.config import AxolConfig
-from ...shared import CAN_LEFT, CAN_RIGHT, Joint
+from ...utils.shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi
@@ -41,6 +41,8 @@ _logger = logging.getLogger(__name__)
 
 @dataclass
 class _ArmSnapshot:
+    """Latest per-arm state shared with the side-by-side display renderer."""
+
     side: str
     hz: int
     log_file: str
@@ -206,7 +208,10 @@ async def _run(
 
     try:
         async with CanBus(channel) as bus:
-            cfg = AxolConfig()
+            # ``resolved()`` applies the default stiffness blend (done at the
+            # ``Axol`` construction boundary) so this directly-built arm gets
+            # the same gains Axol would.
+            cfg = AxolConfig().resolved()
             arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
 
             stats_task = asyncio.create_task(
@@ -332,6 +337,7 @@ async def _run(
 
 
 def main() -> None:
+    """Parse CLI arguments and run the live position display for one or both arms."""
     parser = argparse.ArgumentParser(description="Live motor position display")
     side = parser.add_mutually_exclusive_group()
     side.add_argument("--l", action="store_true", help="Monitor left arm")

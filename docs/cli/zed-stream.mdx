@@ -1,0 +1,31 @@
+---
+title: "zed.stream"
+description: "Stream ZED-X One cameras over the local network with HEVC encoding."
+---
+
+Streams ZED-X One cameras over the local network using HEVC encoding. At least one camera must be specified. Streams until `Ctrl+C`. The sender binds to the streaming NIC's current IP — configure the interface before launching.
+
+| Flag | Description |
+|---|---|
+| `--overhead SERIAL` | Serial number of the overhead camera |
+| `--overhead-stereo` | Treat the overhead camera as a stereo ZED X instead of a mono ZED-X One. Both eyes are carried on the single overhead stream; receivers retrieve the left/right views. The wrist cameras are always mono. |
+| `--left-arm SERIAL` | Serial number of the left-arm camera |
+| `--right-arm SERIAL` | Serial number of the right-arm camera |
+| `--resolution {HD1080,HD1200,SVGA}` | Default: `SVGA` |
+| `--fps FPS` | Default: 60 |
+| `--bitrate KBPS` | HEVC bitrate in kbit/s (default: auto from resolution) |
+| `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+```bash
+axol zed.stream --overhead 12345678 --left-arm 23456789 --right-arm 34567890
+axol zed.stream --overhead 12345678 --resolution SVGA --fps 30 --bitrate 4000
+axol zed.stream --overhead 50026922 --overhead-stereo --left-arm 23456789   # stereo ZED X overhead
+```
+
+<Note>
+  `zed.stream` runs on the ZED box (Jetson sender). The receiving process — [`collect-data`](/cli/collect-data) or [`run-policy`](/cli/run-policy) — runs on the main host. See the [Data Collection](/quickstart/data-collection) and [Policy Inference](/quickstart/inference) quickstarts for the full two-machine setup.
+</Note>
+
+<Note>
+  On startup the command restarts `zed_x_daemon` so cameras plugged in after boot enumerate. The restart needs root: under the quick install's systemd service this is automatic; run interactively from a terminal, you may be prompted for your `sudo` password once.
+</Note>

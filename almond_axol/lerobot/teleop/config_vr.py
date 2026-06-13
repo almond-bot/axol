@@ -1,3 +1,5 @@
+"""Configuration dataclass for the VR-based Axol teleoperator."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

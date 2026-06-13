@@ -1,0 +1,10 @@
+---
+title: "can.enable"
+description: "Bring the CAN interfaces back up after re-plugging the Axol Hub."
+---
+
+Re-runs the CAN startup script to bring interfaces up after plugging in the Axol without a system restart. ([`can.setup`](/cli/can-setup) registers a `@reboot` cron hook, so this is only needed when the Axol Hub is re-plugged mid-session.) Requires [`can.setup`](/cli/can-setup) to have been run first.
+
+```bash
+axol can.enable
+```

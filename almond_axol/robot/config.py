@@ -25,7 +25,10 @@ via :func:`dataclasses.replace`::
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+
+from ..utils.shared import ARM_JOINTS
 
 
 @dataclass
@@ -124,6 +127,11 @@ class ArmConfig:
     place against measured joint torques — typically lower than the CAD
     values because Onshape often over-assigns aluminum-class densities to
     parts that are hollow / 3D-printed.
+
+    These ``kp`` / ``kd`` are the fully-compliant (``s=0``) endpoint of the
+    :attr:`AxolConfig.left_stiffness` / :attr:`AxolConfig.right_stiffness`
+    blend; the production default (``s=0.5``) interpolates them toward the
+    stiffer :data:`_STIFF_GAINS`.
     """
 
     shoulder_1: JointConfig = field(
@@ -131,11 +139,9 @@ class ArmConfig:
             kp=40.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
-            mass=2.00,
+            mass=1.8,
             com=(0.0652231, 0.0, 0.0),
-            # Identified from step response (ζ ≈ 0.35 at kp=40, kd=5 → J ≈ 1.27).
             j_eff=1.27,
-            # Doubles effective kd past the firmware's 5 cap (ζ ≈ 0.35 → 0.70).
             kd_soft=5.0,
         )
     )
@@ -146,7 +152,6 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
-            # Identified from step response (ζ ≈ 0.36 at kp=50, kd=5 → J ≈ 0.91).
             j_eff=0.91,
             kd_soft=5.0,
         )
@@ -156,7 +161,7 @@ class ArmConfig:
             kp=45.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=3.50,
+            mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
         )
     )
@@ -165,7 +170,7 @@ class ArmConfig:
             kp=40.0,
             kd=3.0,
             friction=_ZERO_FRICTION,
-            mass=0.9,
+            mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
         )
     )
@@ -174,7 +179,7 @@ class ArmConfig:
             kp=30.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=0.1,
+            mass=0.25,
             com=(0.0, 0.0, -0.0614121),
         )
     )
@@ -183,8 +188,7 @@ class ArmConfig:
             kp=25.0,
             kd=1.0,
             friction=_ZERO_FRICTION,
-            mass=0.60,
-            # left_w1 CoM (right side has y sign-flipped — done by mirror_to_right).
+            mass=0.65,
             com=(0.0, 0.0285, -0.0285),
         )
     )
@@ -193,15 +197,12 @@ class ArmConfig:
             kp=25.0,
             kd=0.5,
             friction=_ZERO_FRICTION,
-            mass=0.65,
-            # left_w2 lumps wrist-3 segment with the gripper assembly (fixed
-            # joint): merged CAD inertial is 1.267 kg @ (-0.0285, 0, -0.08945);
-            # the mass is tuned in place.
+            mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
         )
     )
     gripper: PositionForceConfig = field(
-        default_factory=lambda: PositionForceConfig(torque_limit=1.0, max_speed=10.0)
+        default_factory=lambda: PositionForceConfig(torque_limit=0.5, max_speed=10.0)
     )
 
     def mirror_to_right(self) -> "ArmConfig":
@@ -313,7 +314,8 @@ class _ArmGains:
 
 
 # Pre-compliance-tuning gains — the high-``kp`` "industrial robot" defaults
-# used as the ``stiffness=1.0`` endpoint of :attr:`AxolConfig.stiffness`.
+# used as the ``s=1.0`` endpoint of :attr:`AxolConfig.left_stiffness` and
+# :attr:`AxolConfig.right_stiffness`.
 _STIFF_GAINS = _ArmGains(
     shoulder_1=(500.0, 5.0),
     shoulder_2=(500.0, 5.0),
@@ -343,21 +345,49 @@ def _blend_joint(
     )
 
 
-def _apply_stiffness(arm: ArmConfig, s: float) -> ArmConfig:
-    """Return ``arm`` with all 7 joints blended toward :data:`_STIFF_GAINS`
-    by factor ``s`` ∈ ``[0, 1]``. ``s=0`` returns ``arm`` unchanged.
+def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
+    """Coerce ``s`` to a 7-tuple of per-joint blend factors in ``[0, 1]``.
+
+    Accepts a scalar (broadcast to all 7 joints) or a sequence of length
+    ``len(ARM_JOINTS)`` in :data:`almond_axol.utils.shared.ARM_JOINTS` order.
     """
-    if s == 0.0:
+    if isinstance(s, (int, float)):
+        if not 0.0 <= float(s) <= 1.0:
+            raise ValueError(f"stiffness must be in [0, 1], got {s}")
+        return (float(s),) * len(ARM_JOINTS)
+    seq = tuple(float(x) for x in s)
+    if len(seq) != len(ARM_JOINTS):
+        raise ValueError(
+            f"per-joint stiffness must have {len(ARM_JOINTS)} values (one "
+            f"per joint, excluding the gripper), got {len(seq)}"
+        )
+    for i, x in enumerate(seq):
+        if not 0.0 <= x <= 1.0:
+            raise ValueError(
+                f"stiffness[{i}] ({ARM_JOINTS[i].value}) must be in [0, 1], got {x}"
+            )
+    return seq
+
+
+def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
+    """Blend each of ``arm``'s 7 joints toward :data:`_STIFF_GAINS` by ``s``.
+
+    ``s`` is either a scalar or a 7-tuple in
+    :data:`almond_axol.utils.shared.ARM_JOINTS` order (see
+    :func:`_normalize_stiffness`). An all-zero blend returns ``arm`` unchanged.
+    """
+    factors = _normalize_stiffness(s)
+    if all(f == 0.0 for f in factors):
         return arm
     return replace(
         arm,
-        shoulder_1=_blend_joint(arm.shoulder_1, *_STIFF_GAINS.shoulder_1, s),
-        shoulder_2=_blend_joint(arm.shoulder_2, *_STIFF_GAINS.shoulder_2, s),
-        shoulder_3=_blend_joint(arm.shoulder_3, *_STIFF_GAINS.shoulder_3, s),
-        elbow=_blend_joint(arm.elbow, *_STIFF_GAINS.elbow, s),
-        wrist_1=_blend_joint(arm.wrist_1, *_STIFF_GAINS.wrist_1, s),
-        wrist_2=_blend_joint(arm.wrist_2, *_STIFF_GAINS.wrist_2, s),
-        wrist_3=_blend_joint(arm.wrist_3, *_STIFF_GAINS.wrist_3, s),
+        shoulder_1=_blend_joint(arm.shoulder_1, *_STIFF_GAINS.shoulder_1, factors[0]),
+        shoulder_2=_blend_joint(arm.shoulder_2, *_STIFF_GAINS.shoulder_2, factors[1]),
+        shoulder_3=_blend_joint(arm.shoulder_3, *_STIFF_GAINS.shoulder_3, factors[2]),
+        elbow=_blend_joint(arm.elbow, *_STIFF_GAINS.elbow, factors[3]),
+        wrist_1=_blend_joint(arm.wrist_1, *_STIFF_GAINS.wrist_1, factors[4]),
+        wrist_2=_blend_joint(arm.wrist_2, *_STIFF_GAINS.wrist_2, factors[5]),
+        wrist_3=_blend_joint(arm.wrist_3, *_STIFF_GAINS.wrist_3, factors[6]),
     )
 
 
@@ -373,21 +403,31 @@ class AxolConfig:
     bypass either default.
 
     Attributes:
-        left:         Per-joint config for the left arm.
-        right:        Per-joint config for the right arm.
-        max_step_rad: Maximum allowed change in any arm joint (rad) between
-                      consecutive ``motion_control`` calls. Commands that
-                      exceed this are dropped and a warning is logged. Set
-                      to ``float('inf')`` to disable.
-        stiffness:    Compliance ↔ stiffness blend in ``[0, 1]``. ``0``
-                      (default) keeps the per-joint compliant gains; ``1``
-                      restores the pre-tuning industrial gains in
-                      :data:`_STIFF_GAINS`. ``kp`` / ``kd`` interpolate
-                      geometrically (log-space); ``j_eff`` / ``kd_soft``
-                      scale linearly to 0 at ``s=1``. The blend is baked
-                      into ``left`` / ``right`` at construction time —
-                      mutate ``stiffness`` after the fact has no effect,
-                      and ``replace()`` would re-apply it (don't).
+        left:            Per-joint config for the left arm.
+        right:           Per-joint config for the right arm.
+        max_step_rad:    Maximum allowed change in any arm joint (rad)
+                         between consecutive ``motion_control`` calls.
+                         Commands that exceed this are dropped and a warning
+                         is logged. Set to ``float('inf')`` to disable.
+        left_stiffness:  Compliance ↔ stiffness blend for the **left** arm
+                         in ``[0, 1]``. Either a scalar (applied to every
+                         joint) or 7 values in
+                         :data:`almond_axol.utils.shared.ARM_JOINTS` order
+                         (gripper excluded). ``0`` keeps the per-joint
+                         compliant gains; ``1`` restores the pre-tuning
+                         industrial gains in :data:`_STIFF_GAINS`;
+                         ``0.5`` (default) is the geometric mean of the
+                         two. ``kp`` / ``kd`` interpolate geometrically
+                         (log-space); ``j_eff`` / ``kd_soft`` scale
+                         linearly to 0 at ``s=1``. The blend is baked into
+                         the ``left`` / ``right`` gains by :meth:`resolved`,
+                         which is called once at the robot-construction
+                         boundary (``Axol.__init__``). The stiffness fields
+                         are left untouched on the config itself, so a
+                         serialized :class:`AxolConfig` round-trips cleanly
+                         (loading a dumped config and resolving it again is
+                         idempotent).
+        right_stiffness: Same, for the **right** arm.
     """
 
     left: ArmConfig = field(
@@ -397,11 +437,24 @@ class AxolConfig:
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
     max_step_rad: float = 0.5
-    stiffness: float = 0.0
+    left_stiffness: float | list[float] = 0.5
+    right_stiffness: float | list[float] = 0.5
 
-    def __post_init__(self) -> None:
-        if not 0.0 <= self.stiffness <= 1.0:
-            raise ValueError(f"stiffness must be in [0, 1], got {self.stiffness}")
-        if self.stiffness > 0.0:
-            self.left = _apply_stiffness(self.left, self.stiffness)
-            self.right = _apply_stiffness(self.right, self.stiffness)
+    def resolved(self) -> "AxolConfig":
+        """Return a copy with stiffness baked into the ``left``/``right`` gains.
+
+        Blends each arm toward :data:`_STIFF_GAINS` by its stiffness factor
+        (see :func:`_apply_stiffness`) and resets ``left_stiffness`` /
+        ``right_stiffness`` to ``0.0`` so the result is **idempotent** —
+        calling :meth:`resolved` again is a no-op. This is applied once at
+        the single robot-construction boundary (``Axol.__init__``) so every
+        consumer sees consistent gains while the unresolved config stays
+        safe to serialize and reload.
+        """
+        return replace(
+            self,
+            left=_apply_stiffness(self.left, self.left_stiffness),
+            right=_apply_stiffness(self.right, self.right_stiffness),
+            left_stiffness=0.0,
+            right_stiffness=0.0,
+        )

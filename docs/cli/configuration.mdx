@@ -1,0 +1,62 @@
+---
+title: "Command configuration"
+description: "How the teleop, gravity-comp, collect-data, and run-policy commands are configured with draccus."
+---
+
+Four commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), and [`run-policy`](/cli/run-policy) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+
+The remaining commands (`can.*`, `motor.*`, `zed.*`, `tune.*`) still use plain `argparse` flags and are unaffected by anything on this page.
+
+## Two ways to set any field
+
+<CardGroup cols={2}>
+  <Card title="Dotted CLI overrides" icon="terminal">
+    Override any nested field with `--dotted.path VALUE`, e.g. `--axol.left.elbow.kp 60`.
+  </Card>
+  <Card title="Whole-config file" icon="file-code">
+    Load a complete JSON/YAML config with `--config_path run.json`, then layer CLI overrides on top.
+  </Card>
+</CardGroup>
+
+### Dotted overrides
+
+Each command is backed by a config dataclass (for example `TeleopCmdConfig` wraps the full [`AxolConfig`](/api/robot)). Nest into it with dots:
+
+```bash
+axol teleop --axol.left_stiffness 0.8
+axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+axol collect-data --repo_id myorg/pick --task "pick" \
+    --robot_config.axol_config.left_stiffness 0.8 \
+    --robot_config.zed_host 10.0.0.5
+```
+
+Any field you don't override keeps its default — overriding `--axol.left.elbow.kp` leaves every other per-joint gain at its tuned default.
+
+### Config files
+
+```bash
+axol teleop --config_path my_teleop.json
+axol run-policy --config_path rollout.yaml --device cpu   # file, then override
+```
+
+Precedence is **defaults → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the built-in defaults.
+
+## Field-name conventions
+
+| Convention | Form | Example |
+|---|---|---|
+| Field names use **underscores**, not dashes | `--field_name` | `--log_level DEBUG`, `--teleop_hz 120` |
+| Nested fields are **dot-separated** | `--a.b.c` | `--axol.left.gripper.torque_limit 0.7` |
+| `None` is written `null` | `--field null` | `--left_channel null` (disable the left arm) |
+| Lists use bracket syntax | `[a,b,c]` | `--free_joints [SHOULDER_1,WRIST_3]` |
+| Booleans take an explicit value | `--flag true` | `--push_to_hub true` |
+
+<Note>
+  Booleans are value-taking under draccus (`--push_to_hub true`, not a bare `--push_to_hub`). The one exception is `teleop`'s `--sim`, which is normalized so a bare `--sim` works as well as `--sim true`.
+</Note>
+
+## Validation
+
+Choice fields (e.g. `--log_level`, `--policy_type`, `--aggregate_fn`) are validated against their allowed values, and missing required fields or type mismatches are reported as a clean usage error rather than a traceback.
+
+`axol <command> --help` lists only the **common** fields (top-level options plus stiffness and gripper limits) to keep the output readable — the deeply-nested per-joint gains are hidden but remain fully overridable with their dotted paths (e.g. `--axol.left.elbow.kp`). This page is the complete reference for the override syntax.

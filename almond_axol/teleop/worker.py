@@ -8,23 +8,21 @@ All intermediate computations stay in NumPy; the single JAX boundary is the
 
 from __future__ import annotations
 
-import functools
+import math
 import multiprocessing
 import multiprocessing.connection
 import os
 
-import jax
 import jax.numpy as jnp
 import jaxlie
-import jaxls
 import numpy as np
-import pyroki as pk
 
 from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
 from .filter import OneEuroFilter
+from .trajectory import plan_collision_aware_trajectory
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -32,6 +30,7 @@ from .filter import OneEuroFilter
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    """Convert an ``(x, y, z, w)`` quaternion to a 3x3 rotation matrix (float32)."""
     x, y, z, w = float(qx), float(qy), float(qz), float(qw)
     xx, yy, zz = x * x, y * y, z * z
     xy, xz, yz = x * y, x * z, y * z
@@ -65,6 +64,38 @@ def _vr_to_flu_np(
     return pos, rot
 
 
+def _scale_rotation_np(R: np.ndarray, scale: float) -> np.ndarray:
+    """Scale the angle of a rotation matrix by ``scale`` (a power in SO(3)).
+
+    Converts ``R`` to axis-angle, multiplies the angle by ``scale``, and maps
+    back via Rodrigues' formula.  ``scale == 1.0`` and near-identity rotations
+    are short-circuited.
+    """
+    if scale == 1.0:
+        return R
+    cos_theta = max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) * 0.5))
+    theta = math.acos(cos_theta)
+    if theta < 1e-6:
+        return R
+    axis = np.array(
+        (R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]),
+        dtype=np.float64,
+    ) / (2.0 * math.sin(theta))
+    new_theta = theta * scale
+    k = np.array(
+        (
+            (0.0, -axis[2], axis[1]),
+            (axis[2], 0.0, -axis[0]),
+            (-axis[1], axis[0], 0.0),
+        ),
+        dtype=np.float64,
+    )
+    r_scaled = (
+        np.eye(3) + math.sin(new_theta) * k + (1.0 - math.cos(new_theta)) * (k @ k)
+    )
+    return r_scaled.astype(np.float32)
+
+
 def _relative_target_np(
     pos_curr: np.ndarray,
     rot_curr: np.ndarray,
@@ -72,9 +103,16 @@ def _relative_target_np(
     rot_snap_ctrl: np.ndarray,
     pos_snap_fk: np.ndarray,
     rot_snap_fk: np.ndarray,
+    position_multiplier: float = 1.0,
+    rotation_multiplier: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3)."""
-    d = rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)
+    """Compute absolute EE target from controller delta. Returns (pos_3, rot_3x3).
+
+    ``position_multiplier`` scales only the translational displacement of the
+    controller relative to its engage snapshot; ``rotation_multiplier`` scales
+    only the angle of its orientation displacement.
+    """
+    d = (rot_snap_ctrl.T @ (pos_curr - pos_snap_ctrl)) * position_multiplier
     new_t = (
         pos_snap_fk
         + rot_snap_fk[:, 0] * d[2]
@@ -86,56 +124,8 @@ def _relative_target_np(
     R_delta[0, :] = (A[2, 2], -A[2, 1], A[2, 0])
     R_delta[1, :] = (-A[1, 2], A[1, 1], -A[1, 0])
     R_delta[2, :] = (A[0, 2], -A[0, 1], A[0, 0])
+    R_delta = _scale_rotation_np(R_delta, rotation_multiplier)
     return new_t.astype(np.float32), (rot_snap_fk @ R_delta).astype(np.float32)
-
-
-# ---------------------------------------------------------------------------
-# JIT-compiled reset step
-# ---------------------------------------------------------------------------
-
-
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
-def _solve_reset_step(
-    robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
-    q_interp: jax.Array,
-    q_current: jax.Array,
-    rest_weight: float,
-    limit_weight: float,
-    collision_margin: float,
-    collision_weight: float,
-    max_iterations: int,
-) -> jax.Array:
-    """One IK step toward ``q_interp`` with limit and self-collision costs only."""
-    JointVar = robot.joint_var_cls
-    costs = [
-        pk.costs.rest_cost(JointVar(0), rest_pose=q_interp, weight=rest_weight),
-        pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight),
-        pk.costs.self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            margin=collision_margin,
-            weight=collision_weight,
-        ),
-    ]
-    var_joints = JointVar(jnp.array([0]))
-    initial_vals = jaxls.VarValues.make(
-        [var_joints.with_value(q_current[jnp.newaxis, :])]
-    )
-    problem = jaxls.LeastSquaresProblem(costs, [var_joints])
-    analyzed = problem.analyze()
-    solution_vals = analyzed.solve(
-        initial_vals=initial_vals,
-        verbose=False,
-        linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(),
-        termination=jaxls.TerminationConfig(
-            max_iterations=max_iterations,
-            cost_tolerance=1e-2,
-        ),
-    )
-    return solution_vals[var_joints][0]
 
 
 # ---------------------------------------------------------------------------
@@ -223,14 +213,14 @@ class IKWorker:
 
     def step(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
         """Process one VRFrame. Returns updated full (N,) q in radians."""
-        deadman = frame.l_lock and frame.r_lock
-        if not deadman:
+        enabled = frame.l_lock and frame.r_lock
+        if not enabled:
             self._active = False
             return q_current
 
         if not self._active:
             # OneEuroFilter ``_x_prev`` froze at the controller pose held when
-            # the deadman was last released; reset so the engage-snap uses the
+            # the toggle was last disabled; reset so the engage-snap uses the
             # actual current pose instead of biasing toward stale state and
             # sweeping the IK target as the filter catches up.
             self._reset_pose_filters()
@@ -275,7 +265,6 @@ class IKWorker:
         )
         rq = rq / np.linalg.norm(rq)
 
-        # Convert filtered poses to FLU — pure numpy
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
         right_pos, right_rot = _vr_to_flu_np(*rp, *rq)
 
@@ -295,22 +284,29 @@ class IKWorker:
             )
             return q_current
 
-        # Relative targets — pure numpy
+        pos_mult = self._config.position_multiplier
+        rot_mult = self._config.rotation_multiplier
         tl_pos, tl_rot = _relative_target_np(
             left_pos,
             left_rot,
             *self._snap_ctrl["left"],
             *self._snap_fk["left"],
+            position_multiplier=pos_mult,
+            rotation_multiplier=rot_mult,
         )
         tr_pos, tr_rot = _relative_target_np(
             right_pos,
             right_rot,
             *self._snap_ctrl["right"],
             *self._snap_fk["right"],
+            position_multiplier=pos_mult,
+            rotation_multiplier=rot_mult,
         )
 
-        elbow_l = self._snap_elbow_fk["left"] + (left_e - self._snap_elbow_ctrl["left"])
-        elbow_r = self._snap_elbow_fk["right"] + (
+        elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
+            left_e - self._snap_elbow_ctrl["left"]
+        )
+        elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
             right_e - self._snap_elbow_ctrl["right"]
         )
 
@@ -327,34 +323,25 @@ class IKWorker:
     ) -> list[np.ndarray]:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
-        max_dist_rad = float(np.max(np.abs(q_current - q_target)))
-        duration = max_dist_rad / cfg.reset_speed
-        n_steps = max(1, round(duration * cfg.frequency))
-        trajectory: list[np.ndarray] = []
-        q = np.array(q_current, dtype=np.float32)
-        for i in range(n_steps):
-            t = (i + 1) / n_steps
-            alpha = t * t * (3.0 - 2.0 * t)
-            q_interp = (q_current * (1.0 - alpha) + q_target * alpha).astype(np.float32)
-            result = _solve_reset_step(
-                self._solver.robot,
-                self._solver.robot_coll,
-                jnp.asarray(q_interp),
-                jnp.asarray(q),
-                cfg.reset_rest_weight,
-                cfg.reset_limit_weight,
-                cfg.reset_collision_margin,
-                cfg.reset_collision_weight,
-                cfg.reset_max_iterations,
-            )
-            q = np.array(result, dtype=np.float32)
-            trajectory.append(q.copy())
-        return trajectory
+        return plan_collision_aware_trajectory(
+            self._solver.robot,
+            self._solver.robot_coll,
+            q_current,
+            q_target,
+            speed=cfg.reset_speed,
+            rate=cfg.frequency,
+            min_duration=cfg.reset_min_duration,
+            rest_weight=cfg.reset_rest_weight,
+            limit_weight=cfg.reset_limit_weight,
+            collision_margin=cfg.reset_collision_margin,
+            collision_weight=cfg.reset_collision_weight,
+            max_iterations=cfg.reset_max_iterations,
+        )
 
     def reset(self) -> None:
-        """Deactivate the deadman-switch state and clear snap poses and filter state.
+        """Deactivate the engage-toggle state and clear snap poses and filter state.
 
-        Call this before replaying a reset trajectory so the next deadman press
+        Call this before replaying a reset trajectory so the next engage
         performs a fresh engage-snap from the current IK pose.
         """
         self._active = False
@@ -432,6 +419,11 @@ class IKWorker:
         right_e: np.ndarray,
         q_current: np.ndarray,
     ) -> None:
+        """Snapshot controller and FK poses at toggle engage.
+
+        These snapshots become the origin against which subsequent controller
+        motion is measured to build relative EE and elbow targets in :meth:`step`.
+        """
         fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
 
         def _fk_pos_rot(idx: int) -> tuple[np.ndarray, np.ndarray]:

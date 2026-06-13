@@ -1,0 +1,114 @@
+---
+title: "Installation"
+description: "Install the Axol CLI and SDK, optional dependency extras, and first-run hardware setup."
+---
+
+## Requirements
+
+- **Linux**
+- **Python 3.13+** (the quick install below provides it automatically)
+- **(Optional) NVIDIA Jetson** — if ZED cameras are used.
+
+## Quick install (recommended)
+
+One command installs everything and starts the web control panel:
+
+```bash
+curl https://axol.almond.bot/install -fsS | bash
+```
+
+This:
+
+- Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already installed.
+- Installs the `axol` CLI from GitHub as a `uv` tool (Python 3.13 included), with every dependency extra except `cuda` and `dev`.
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup and restarts it automatically if it ever goes down.
+
+When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — no terminal needed from then on. The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. (Re-running the install command also upgrades.)
+
+```bash
+journalctl -u axol -f        # service logs
+systemctl restart axol       # manual restart
+```
+
+<Note>
+  The service runs as root, so privileged steps (CAN bring-up, PTP clock-sync daemons) need no sudo password.
+</Note>
+
+## Development install
+
+For working on Axol itself, install from a clone using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and resolved automatically:
+
+```bash
+uv sync
+```
+
+Then activate the virtual environment so the `axol` CLI is on your path:
+
+```bash
+source .venv/bin/activate
+```
+
+<Tip>
+  You need to activate the environment in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+</Tip>
+
+### Optional extras
+
+Install optional dependency groups as needed (the quick install above includes all of them except `cuda` and `dev`):
+
+| Extra | Contents | When to use |
+|---|---|---|
+| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `sim` | viser | `teleop --sim` |
+| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --zed_host`, `collect-data`) — see [Camera views](/guides/vr-interface#camera-views) |
+| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
+| `dev` | OpenCV (headless) | Development / debugging |
+
+```bash
+uv sync --extra lerobot --extra sim --extra video   # teleoperation + data collection
+uv sync --extra lerobot --extra cuda                # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra video --extra cuda   # everything
+```
+
+## ZED Python bindings
+
+The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
+
+```bash
+axol zed.install
+```
+
+See [`zed.install`](/cli/zed-install) for details.
+
+## Web control panel (optional)
+
+With the quick install, the control panel is already running — just open [axol.almond.bot](https://axol.almond.bot) and connect to the machine.
+
+For a development install, you can build and serve the UI locally instead. This produces the bundle that [`axol serve`](/cli/serve) hosts at `web/app/dist`:
+
+```bash
+cd web
+npm install
+npm run build --workspace=packages/axol-vr-client   # client package first
+npm run build --workspace=app                        # → web/app/dist
+```
+
+Then start the server and open the printed URL:
+
+```bash
+axol serve
+```
+
+The same build also serves the [VR interface](/guides/vr-interface). `axol serve` works without this step (the API is still available) — the hosted UI at [axol.almond.bot](https://axol.almond.bot) connects to it directly. See the [Web Control Panel guide](/guides/control-panel).
+
+## First-run hardware setup
+
+Before using any motor or robot commands, initialize the CAN hardware:
+
+```bash
+axol can.setup
+```
+
+<Note>
+  Run directly in a terminal, `sudo` is invoked automatically where required (with the quick install, the control panel runs this for you as root on first connect). See [`can.setup`](/cli/can-setup) for what it configures.
+</Note>

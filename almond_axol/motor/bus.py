@@ -91,10 +91,9 @@ class CanBus:
                                     "CAN listener %s error: %s", listener.__name__, e
                                 )
                     else:
-                        # No data — sleep until the socket is readable instead of
-                        # polling on a fixed 1ms timer.  This wakes up immediately
-                        # when the next CAN frame arrives, cutting response latency
-                        # by up to 1ms per round-trip.
+                        # No data — wait until the socket is readable instead of
+                        # polling on a fixed 1ms timer, cutting up to 1ms of
+                        # response latency per round-trip.
                         readable.clear()
                         await readable.wait()
                 except asyncio.CancelledError:

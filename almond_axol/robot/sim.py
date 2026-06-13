@@ -7,7 +7,7 @@ import threading
 
 import numpy as np
 
-from ..shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..utils.shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
@@ -47,7 +47,7 @@ class Sim(RobotBase):
         *,
         joint_names: list[str] | None = None,
         default_q: np.ndarray | None = None,
-        port: int = 8080,
+        port: int = 8002,
     ) -> None:
         """Construct the simulation.
 

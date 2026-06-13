@@ -10,12 +10,11 @@ import argparse
 import asyncio
 import logging
 
-_SENDER_IP = "192.168.10.1/24"
-
 _VALID_RESOLUTIONS = ["HD1080", "HD1200", "SVGA"]
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
+    """Register the ``zed.stream`` subcommand."""
     p = subparsers.add_parser(
         "zed.stream", help="Stream ZED-X One cameras over the local network."
     )
@@ -25,6 +24,11 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         default=None,
         metavar="SERIAL",
         help="Serial number of the overhead camera.",
+    )
+    p.add_argument(
+        "--overhead-stereo",
+        action="store_true",
+        help="Treat the overhead camera as a stereo ZED X (streams both eyes).",
     )
     p.add_argument(
         "--left-arm",
@@ -56,15 +60,9 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     p.add_argument(
         "--bitrate",
         type=int,
-        default=8000,
-        metavar="KBPS",
-        help="HEVC encoding bitrate in kbits/s (default: 8000).",
-    )
-    p.add_argument(
-        "--setup-ip",
-        metavar="IFACE",
         default=None,
-        help=f"Assign the sender IP ({_SENDER_IP}) to IFACE before streaming (e.g. eth0). Requires sudo.",
+        metavar="KBPS",
+        help="HEVC encoding bitrate in kbits/s (default: auto from resolution).",
     )
     p.add_argument(
         "--log-level",
@@ -76,15 +74,12 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 
 def run(args: argparse.Namespace) -> None:
+    """Validate the camera selection and stream the chosen ZED cameras."""
     if args.overhead is None and args.left_arm is None and args.right_arm is None:
         raise SystemExit(
             "error: at least one of --overhead, --left-arm, --right-arm must be provided"
         )
     logging.basicConfig(level=getattr(logging, args.log_level))
-    if args.setup_ip:
-        from ...shared import setup_link_ip
-
-        setup_link_ip(args.setup_ip, _SENDER_IP)
     try:
         asyncio.run(
             _run(
@@ -94,6 +89,7 @@ def run(args: argparse.Namespace) -> None:
                 args.resolution,
                 args.fps,
                 args.bitrate,
+                args.overhead_stereo,
             )
         )
     except KeyboardInterrupt:
@@ -106,11 +102,16 @@ async def _run(
     right_arm: int | None,
     resolution: str,
     fps: int,
-    bitrate: int,
+    bitrate: int | None,
+    overhead_stereo: bool = False,
 ) -> None:
     import pyzed.sl as sl
 
-    from ...zed import ZedConfig, ZedStreamer
+    from ...zed import ZedConfig, ZedStreamer, restart_zed_daemon
+
+    # The ZED X daemon only sees cameras present when it started, and we don't
+    # know when they were plugged in — restart it so every camera enumerates.
+    await asyncio.to_thread(restart_zed_daemon)
 
     config = ZedConfig(
         overhead_serial=overhead,
@@ -119,6 +120,7 @@ async def _run(
         resolution=getattr(sl.RESOLUTION, resolution),
         fps=fps,
         bitrate=bitrate,
+        overhead_stereo=overhead_stereo,
     )
     async with ZedStreamer(config):
         await asyncio.sleep(float("inf"))

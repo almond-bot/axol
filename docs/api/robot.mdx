@@ -1,0 +1,185 @@
+---
+title: "almond_axol.robot"
+description: "Hardware controller (Axol), simulator (Sim), configuration, and gravity compensation."
+---
+
+Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
+
+```python
+from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointConfig, FrictionParams, Sim
+```
+
+## `Axol`
+
+```python
+Axol(
+    config: AxolConfig = AxolConfig(),
+    left_channel: str | None = "can_alm_axol_l",
+    right_channel: str | None = "can_alm_axol_r",
+)
+```
+
+Pass `left_channel=None` or `right_channel=None` to operate a single arm. Both arms are brought up concurrently on `__aenter__`.
+
+```python
+import asyncio
+import numpy as np
+from almond_axol.robot import Axol
+
+async def main():
+    async with Axol() as axol:
+        await axol.start_telemetry(500)   # 500 Hz background polling
+
+        # non-blocking cached reads (after telemetry warms up)
+        print("left positions (rad):", axol.left.positions)
+        print("left torques (Nm):", axol.left.torques)
+
+        # primary control: impedance for arm joints, position-force for gripper
+        q = np.zeros(8, dtype=np.float32)
+        q[7] = 1.0  # open gripper
+        await axol.motion_control(left=q, right=q)
+
+asyncio.run(main())
+```
+
+### Lifecycle methods
+
+| Method | Description |
+|---|---|
+| `enable()` | Start CAN buses, enable all motors, calibrate grippers |
+| `disable()` | Disable all motors and close CAN buses |
+| `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
+| `stop_telemetry()` | Stop background polling |
+| `clear_errors()` | Clear latched error flags on all motors |
+| `set_control_mode(mode)` | Set `ControlMode` on all motors |
+
+### State reads
+
+Each returns `(left_array, right_array)` where the absent arm is `None`.
+
+| Method | Units |
+|---|---|
+| `get_positions()` | rad (gripper: `[0, 1]`) |
+| `get_velocities()` | rad/s |
+| `get_torques()` | Nm (Damiao) / A (MyActuator) |
+| `get_temperatures()` | °C |
+| `get_voltages()` | V |
+| `get_error_codes()` | `list[MotorStatus]` |
+| `get_gains()` | `list[MotorGains]` |
+
+### State writes
+
+| Method | Description |
+|---|---|
+| `motion_control(left, right)` | Impedance (arm) + position-force (gripper); primary control method |
+| `set_positions_velocity(left, right, max_speed)` | Motor built-in position controller |
+| `set_velocity(left, right)` | Motor built-in speed controller |
+| `set_gains(left, right)` | Write PID gains; persisted to flash |
+| `set_zero_position(left, right)` | Save current shaft position as encoder zero (calibrated at a mechanical end stop, not the rest position) |
+| `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
+
+Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.
+
+## `Sim`
+
+`Sim` implements the same interface as `Axol`. Use it to visualise motion without hardware. Requires the `sim` extra.
+
+```python
+import asyncio
+import numpy as np
+from almond_axol.robot import Sim
+
+async def main():
+    async with Sim(port=8002) as sim:
+        q = np.zeros(8, dtype=np.float32)
+        await sim.motion_control(left=q)
+        await asyncio.sleep(float("inf"))  # keep the viser server alive
+
+asyncio.run(main())
+```
+
+Open `http://localhost:8002` in a browser to view the robot.
+
+## Configuration — `AxolConfig`, `ArmConfig`, `JointConfig`
+
+Each arm joint is configured with a single `JointConfig` carrying its impedance gains, friction-comp model, and the inertial of the body it drives:
+
+```python
+from almond_axol.robot import Axol, AxolConfig, FrictionParams
+
+config = AxolConfig()
+config.left.elbow.kp = 200
+config.left.elbow.mass = 0.6
+config.left.elbow.com = (-0.025, 0.0, -0.07)
+config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
+async with Axol(config=config) as axol: ...
+```
+
+Or build a fully custom arm with `dataclasses.replace` (start from the `AxolConfig` defaults so you keep the per-side friction values that get injected at construction):
+
+```python
+from dataclasses import replace
+from almond_axol.robot import AxolConfig, JointConfig, FrictionParams
+
+left = replace(
+    AxolConfig().left,
+    shoulder_1=JointConfig(
+        kp=35.0, kd=1.2,
+        friction=FrictionParams(fc=0.0, k=0.0, fv=0.0, fo=0.0),
+        mass=2.0, com=(0.065, 0.0, 0.0),
+    ),
+)
+```
+
+### `JointConfig` fields
+
+| Field | Type | Description |
+|---|---|---|
+| `kp` | `float` (`[0, 500]`) | Impedance position stiffness |
+| `kd` | `float` (`[0, 5]`) | Impedance velocity damping. Hardware-capped by the motor firmware at 5; use `kd_soft` to augment. |
+| `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(0.1·k·v) + fv·v + fo` (see `compute_friction` in `robot/control.py`) |
+| `mass` | `float` | Mass of the URDF body this joint drives (kg). For `wrist_3` this includes the gripper. |
+| `com` | `tuple[float, float, float]` | Centre-of-mass of the same body in its URDF link frame (m). Used by gravity comp. |
+| `j_eff` | `float` (default `0.0`) | Effective scalar inertia (kg·m²) for acceleration feedforward `τ = j_eff · q̈_des`. |
+| `kd_soft` | `float` (default `0.0`) | Extra software velocity damping (Nm·s/rad) applied as `τ = kd_soft · (v_des − v_meas)`. Equivalent to raising `kd` past the firmware's 5 cap. |
+
+Gravity feedforward is computed centrally from the URDF — see [Gravity compensation](#gravity-compensation) — and uses the per-joint `mass` and `com` directly.
+
+`ArmConfig.gripper` is a `PositionForceConfig` with `torque_limit` (Nm) and `max_speed` (rad/s); the gripper's mass is already lumped into `wrist_3.mass` (the gripper joint is fixed).
+
+`AxolConfig` also exposes top-level parameters:
+
+| Field | Default | Description |
+|---|---|---|
+| `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
+| `left_stiffness` | `0.5` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`); the default `0.5` is the geometric mean (e.g. `shoulder_1` `kp` ≈ 141). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
+| `right_stiffness` | `0.5` | Same, for the **right** arm. |
+
+```python
+config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)   # both arms, stiff industrial feel
+config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
+config = AxolConfig(                                           # per-joint, left only
+    left_stiffness=[0.8, 0.8, 0.5, 0.5, 0.2, 0.2, 0.0],
+)
+```
+
+Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
+
+## Gravity compensation
+
+`almond_axol.robot.gravity.GravityCompensator` builds a MuJoCo model from the bundled URDF and computes per-joint gravity torques as `qfrc_bias` with `qvel=0` (Coriolis terms vanish). Because the URDF is the full kinematic chain, each parent joint's gravity load includes the contribution of every child link — this is the main improvement over the previous per-joint `ga·cos(q) + gb·sin(q)` model, which silently ignored child-link mass.
+
+Per-link masses are not taken from the bundled URDF — the Onshape exporter leaves placeholder sub-gram values that produce essentially zero gravity. Real per-link mass and CoM live on each `JointConfig.mass` / `JointConfig.com` in `almond_axol/robot/config.py` (CoMs come from the CAD inertial origins; masses are tuned in place against measured joint torques and are typically lower than the CAD values, since Onshape often over-assigns aluminum-class densities to parts that are hollow / 3D-printed).
+
+If the arms sag or push back in gravity-comp mode, tune the relevant joint's `mass` and `com` on `AxolConfig` and pass it to `Axol`:
+
+```python
+from almond_axol.robot import AxolConfig, Axol
+
+config = AxolConfig()
+config.left.elbow.mass = 0.6
+config.left.elbow.com = (-0.025, 0.0, -0.07)
+async with Axol(config=config) as axol: ...
+```
+
+See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.

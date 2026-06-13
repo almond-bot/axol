@@ -14,34 +14,34 @@ touch.
 Useful for measuring how reliably the grippers return to the same
 physical contact point after a long sequence of motions.
 
+The arms always run at maximum stiffness (the pre-tuning industrial gains
+in :data:`_STIFF_GAINS`) — repeatability is meaningless under the compliant
+gains used for teleop.
+
 Examples:
-    axol tune.repeatability                    # forever, max compliance
-    axol tune.repeatability --stiffness 0.5    # blend partway to stiff gains
-    axol tune.repeatability --cycles 5         # five touch-and-return cycles
+    axol tune.repeatability               # forever
+    axol tune.repeatability --cycles 5    # five touch-and-return cycles
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import functools
 import logging
 import time
 
-import jax
-import jax.numpy as jnp
-import jaxls
 import numpy as np
-import pyroki as pk
 
 from ...kinematics.solver import KinematicsSolver
 from ...robot import Axol
 from ...robot.config import AxolConfig
-from ...shared import ARM_JOINTS, Joint
 from ...teleop.config import VRTeleopConfig
+from ...teleop.trajectory import plan_collision_aware_trajectory
+from ...utils.shared import ARM_JOINTS, Joint
 
 _RATE_HZ = 100.0
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — joint-space speed for the planned trajectory
+_PLAN_MIN_DURATION = 0.5  # seconds — floor on planned trajectory duration
 
 
 # ---------------------------------------------------------------------------
@@ -86,55 +86,6 @@ def _build_q_touch(solver: KinematicsSolver) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-@functools.partial(jax.jit, static_argnames=("max_iterations",))
-def _solve_path_step(
-    robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
-    q_interp: jax.Array,
-    q_current: jax.Array,
-    rest_weight: float,
-    limit_weight: float,
-    collision_margin: float,
-    collision_weight: float,
-    max_iterations: int,
-) -> jax.Array:
-    """One IK step toward ``q_interp`` with limit + self-collision costs.
-
-    Mirrors :func:`almond_axol.teleop.worker._solve_reset_step` — the
-    trajectory here is generated the same way (smoothstep slerp through
-    pyroki) but as a one-shot offline plan rather than a live feedback
-    loop.
-    """
-    JointVar = robot.joint_var_cls
-    costs = [
-        pk.costs.rest_cost(JointVar(0), rest_pose=q_interp, weight=rest_weight),
-        pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight),
-        pk.costs.self_collision_cost(
-            robot,
-            robot_coll,
-            JointVar(0),
-            margin=collision_margin,
-            weight=collision_weight,
-        ),
-    ]
-    var_joints = JointVar(jnp.array([0]))
-    initial_vals = jaxls.VarValues.make(
-        [var_joints.with_value(q_current[jnp.newaxis, :])]
-    )
-    problem = jaxls.LeastSquaresProblem(costs, [var_joints])
-    solution_vals = problem.analyze().solve(
-        initial_vals=initial_vals,
-        verbose=False,
-        linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(),
-        termination=jaxls.TerminationConfig(
-            max_iterations=max_iterations,
-            cost_tolerance=1e-2,
-        ),
-    )
-    return solution_vals[var_joints][0]
-
-
 def _plan_trajectory(
     solver: KinematicsSolver,
     q_from: np.ndarray,
@@ -144,41 +95,22 @@ def _plan_trajectory(
 ) -> list[np.ndarray]:
     """Collision-aware joint-space slerp from ``q_from`` to ``q_to``.
 
-    Smoothsteps a linear interpolation in joint space and projects each
-    waypoint with limit + self-collision costs so the body never clips
-    the torso during the arc. Returns one full ``(N,)`` joint vector per
-    control tick at ``rate_hz``.
+    Thin wrapper around :func:`plan_collision_aware_trajectory` — the
+    single source of truth shared with the live reset path. Smoothsteps
+    a linear interpolation in joint space and projects each waypoint
+    with limit + self-collision costs so the body never clips the torso
+    during the arc. Returns one full ``(N,)`` joint vector per control
+    tick at ``rate_hz``.
     """
-    max_dist = float(np.max(np.abs(q_from - q_to)))
-    duration = max(max_dist / speed_rad_s, 0.5)
-    n_steps = max(2, round(duration * rate_hz))
-
-    rest_weight = 50.0
-    limit_weight = 100.0
-    collision_margin = 0.025
-    collision_weight = 100.0
-    max_iters = 10
-
-    traj: list[np.ndarray] = []
-    q = q_from.astype(np.float32).copy()
-    for i in range(n_steps):
-        t = (i + 1) / n_steps
-        alpha = t * t * (3.0 - 2.0 * t)
-        q_interp = (q_from * (1.0 - alpha) + q_to * alpha).astype(np.float32)
-        q_jax = _solve_path_step(
-            solver.robot,
-            solver.robot_coll,
-            jnp.asarray(q_interp),
-            jnp.asarray(q),
-            rest_weight,
-            limit_weight,
-            collision_margin,
-            collision_weight,
-            max_iters,
-        )
-        q = np.asarray(q_jax, dtype=np.float32)
-        traj.append(q.copy())
-    return traj
+    return plan_collision_aware_trajectory(
+        solver.robot,
+        solver.robot_coll,
+        q_from,
+        q_to,
+        speed=speed_rad_s,
+        rate=rate_hz,
+        min_duration=_PLAN_MIN_DURATION,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,21 +181,12 @@ async def _execute(
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``tune.repeatability`` subcommand."""
     p = subparsers.add_parser(
         "tune.repeatability",
         help="Drive between rest pose and a crossed-arms tips-touching pose.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
-    )
-    p.add_argument(
-        "--stiffness",
-        type=float,
-        default=0.0,
-        help=(
-            "Compliance ↔ stiffness blend in [0, 1]. 0 (default) is fully "
-            "compliant; 1 restores the pre-tuning industrial gains. See "
-            "AxolConfig.stiffness."
-        ),
     )
     p.add_argument(
         "--cycles",
@@ -312,6 +235,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def run(args: argparse.Namespace) -> None:
+    """Run the repeatability test (rest ↔ touch cycles)."""
     logging.basicConfig(level=getattr(logging, args.log_level))
     try:
         asyncio.run(_run(args))
@@ -325,8 +249,6 @@ def run(args: argparse.Namespace) -> None:
 async def _run(args: argparse.Namespace) -> None:
     if args.no_left and args.no_right:
         raise SystemExit("Both arms disabled — nothing to test.")
-    if not 0.0 <= args.stiffness <= 1.0:
-        raise SystemExit(f"--stiffness must be in [0, 1], got {args.stiffness}")
 
     rest_cfg = VRTeleopConfig()
 
@@ -373,12 +295,12 @@ async def _run(args: argparse.Namespace) -> None:
         axol_kwargs["left_channel"] = None
     if args.no_right:
         axol_kwargs["right_channel"] = None
-    axol_config = AxolConfig(stiffness=args.stiffness)
+    axol_config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
     axol_config.left.gripper.torque_limit = args.gripper_torque_limit
     axol_config.right.gripper.torque_limit = args.gripper_torque_limit
 
     print(
-        f"Repeatability run: stiffness={args.stiffness:.2f}, "
+        f"Repeatability run: "
         f"{'∞' if args.cycles == 0 else args.cycles} cycle(s), "
         f"rate={args.rate:.0f} Hz. Press Ctrl-C to stop."
     )

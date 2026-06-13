@@ -1,0 +1,32 @@
+---
+title: "gravity-comp"
+description: "Hold both arms in gravity-compensation mode so you can move them by hand."
+---
+
+Holds both arms in gravity-compensation mode so you can move them by hand. Each *free* arm joint is sent `set_impedance` with `kp=0`, `kd=KD`, and a feedforward torque equal to the URDF-modelled gravity. Joints not in the free set are held rigidly at their current position with their configured `ArmConfig` `kp`/`kd` (still gravity-compensated). The grippers are softly held at their current positions.
+
+This command is configured via draccus — see [Command configuration](/cli/configuration).
+
+| Flag | Description |
+|---|---|
+| `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
+| `--free_joints [J1,J2,...]` | List of joints to gravity-compensate (e.g. `[WRIST_3]` or `[SHOULDER_1,ELBOW]`). Other arm joints are held in place. Default `null` = all 7 joints free. |
+| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.25 |
+| `--rate_hz FLOAT` | Control loop rate in Hz (default: 250) |
+| `--telemetry_hz FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
+
+```bash
+axol gravity-comp                                 # all 7 joints free, both arms
+axol gravity-comp --right_channel null            # left arm only, all joints free
+axol gravity-comp --kd 1.0                        # heavier damping
+axol gravity-comp --free_joints [WRIST_3]         # only WRIST_3 free; everything else held rigid
+axol gravity-comp --right_channel null --free_joints [SHOULDER_1,WRIST_3]   # one-arm, two-joint isolation
+```
+
+Use `--free_joints` to test gravity comp on a single joint at a time: only the named joints float freely, while the rest of the arm holds its pose so you can isolate the effect.
+
+<Tip>
+  If the arm sags or pushes back, tune the per-joint `mass` and `com` fields on `AxolConfig` (each `JointConfig` carries the inertial of the URDF body it drives) — see [Gravity compensation](/api/robot#gravity-compensation).
+</Tip>

@@ -19,6 +19,8 @@ from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _DamiaoStatus(Enum):
+    """Raw Damiao status/error codes (feedback frame byte 0, high nibble)."""
+
     DISABLED = 0x0
     ENABLED = 0x1
     OVER_VOLTAGE = 0x8
@@ -32,6 +34,8 @@ class _DamiaoStatus(Enum):
 
 @dataclass
 class _MotorFeedback:
+    """Decoded fields from a single Damiao feedback frame."""
+
     status: _DamiaoStatus
     position: float  # rad (motor internal)
     velocity: float  # rad/s
@@ -84,11 +88,13 @@ _DM_STATUS_MAP: dict[_DamiaoStatus, MotorStatus] = {
 
 
 def _float_to_uint(x: float, x_min: float, x_max: float, bits: int) -> int:
+    """Encode a clamped float into a fixed-point uint for the MIT protocol byte layout."""
     x = max(x_min, min(x_max, x))
     return int((x - x_min) * ((1 << bits) - 1) / (x_max - x_min))
 
 
 def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
+    """Decode a fixed-point uint from the MIT protocol byte layout back into a float."""
     return float(x_int) * (x_max - x_min) / ((1 << bits) - 1) + x_min
 
 
@@ -96,6 +102,14 @@ class DamiaoMotor(MotorDriver):
     """MotorDriver implementation for Damiao motors using the MIT/position-force protocol."""
 
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int, kt: float) -> None:
+        """Construct a Damiao driver.
+
+        Args:
+            bus:         Shared CAN bus.
+            motor_id:    CAN ID the motor receives commands on (ESC_ID).
+            feedback_id: CAN ID the motor sends feedback frames on (MST_ID).
+            kt:          Torque constant (Nm/A) used to convert current to torque.
+        """
         self._bus = bus
         self._motor_id = motor_id
         self._feedback_id = feedback_id

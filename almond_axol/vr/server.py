@@ -30,20 +30,24 @@ Or with an on_frame callback::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
-from .certs import create_self_signed_cert
+from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from .config import VRServerConfig
 from .models import VRFrame
 
-_logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from .video import FrameSource, WebRTCManager
 
-_CERTS_DIR = os.path.join(os.path.expanduser("~"), ".almond", "vr", "certs")
+_logger = logging.getLogger(__name__)
 
 
 class VRServer:
@@ -65,14 +69,15 @@ class VRServer:
         """
         self._port = config.port
         self._on_frame: Callable[[VRFrame], None] | None = None
-        self._certfile = config.certfile or os.path.join(_CERTS_DIR, "cert.pem")
-        self._keyfile = config.keyfile or os.path.join(_CERTS_DIR, "key.pem")
+        self._certfile = config.certfile or CERTFILE
+        self._keyfile = config.keyfile or KEYFILE
 
         self._latest_frame: VRFrame | None = None
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
+        self._webrtc: WebRTCManager | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -85,6 +90,34 @@ class VRServer:
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
+
+    def set_video_sources(self, sources: dict[str, FrameSource] | None) -> None:
+        """Register per-camera RGB frame sources to stream to the headset.
+
+        Each source is a callable returning the latest RGB ``uint8`` numpy frame
+        ``(H, W, 3)`` or ``None`` if no frame is available yet. The headset
+        negotiates a WebRTC connection over the existing ``/ws`` channel and
+        receives one video track per source.
+
+        Pass ``None`` or an empty dict to disable video. Requires the ``video``
+        extra (aiortc); if it is unavailable this logs a warning and leaves
+        video disabled. Safe to call before or after :meth:`enable`.
+        """
+        if not sources:
+            self._webrtc = None
+            return
+        try:
+            from .video import WebRTCManager
+        except ImportError as exc:
+            _logger.warning(
+                "wrist video requested but aiortc is unavailable (%s); install "
+                "the 'video' extra. Continuing without wrist video.",
+                exc,
+            )
+            self._webrtc = None
+            return
+        self._webrtc = WebRTCManager(sources)
+        _logger.info("wrist video enabled for: %s", ", ".join(sources))
 
     @property
     def connected(self) -> bool:
@@ -123,6 +156,9 @@ class VRServer:
 
     async def disable(self) -> None:
         """Gracefully shut down the WSS server."""
+        if self._webrtc is not None:
+            await self._webrtc.close_all()
+
         if self._uvicorn_server is not None:
             try:
                 await self._uvicorn_server.shutdown()
@@ -159,9 +195,70 @@ class VRServer:
     # Internal
     # ------------------------------------------------------------------
 
+    async def _handle_message(
+        self, websocket: WebSocket, client_id: int, data: str
+    ) -> None:
+        """Dispatch one inbound text message.
+
+        Signaling messages carry a ``type`` field; pose frames do not.
+        """
+        try:
+            obj = json.loads(data)
+        except Exception as exc:
+            _logger.warning("invalid json: %s", exc)
+            return
+
+        if isinstance(obj, dict) and "type" in obj:
+            await self._handle_signaling(websocket, client_id, obj)
+            return
+
+        try:
+            frame = VRFrame.model_validate(obj)
+            self._latest_frame = frame
+            if self._on_frame is not None:
+                self._on_frame(frame)
+        except Exception as exc:
+            _logger.warning("invalid frame: %s", exc)
+
+    async def _handle_signaling(
+        self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
+    ) -> None:
+        """Handle a WebRTC signaling message from the headset."""
+        msg_type = obj.get("type")
+
+        if self._webrtc is None:
+            if msg_type == "webrtc-request":
+                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+            return
+
+        if msg_type == "webrtc-request":
+            try:
+                sdp, tracks = await self._webrtc.create_offer(client_id)
+            except Exception as exc:
+                _logger.error("failed to create webrtc offer: %s", exc)
+                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                return
+            await websocket.send_text(
+                json.dumps({"type": "webrtc-offer", "sdp": sdp, "tracks": tracks})
+            )
+        elif msg_type == "webrtc-answer":
+            sdp = obj.get("sdp")
+            if isinstance(sdp, str):
+                try:
+                    await self._webrtc.set_answer(client_id, sdp)
+                except Exception as exc:
+                    _logger.error("failed to apply webrtc answer: %s", exc)
+        else:
+            _logger.debug("ignoring unknown signaling type: %s", msg_type)
+
     def _build_app(self) -> FastAPI:
         app = FastAPI()
         server = self
+
+        @app.get("/__accept")
+        async def _accept() -> HTMLResponse:
+            """Self-closing page the web UI opens to approve the self-signed cert."""
+            return HTMLResponse(ACCEPT_PAGE_HTML)
 
         @app.websocket("/ws")
         async def _ws(websocket: WebSocket) -> None:
@@ -169,16 +266,11 @@ class VRServer:
             _logger.info("client connected %s", websocket.client)
             server._client_count += 1
             server._active_clients.add(websocket)
+            client_id = id(websocket)
             try:
                 while True:
                     data = await websocket.receive_text()
-                    try:
-                        frame = VRFrame.model_validate_json(data)
-                        server._latest_frame = frame
-                        if server._on_frame is not None:
-                            server._on_frame(frame)
-                    except Exception as exc:
-                        _logger.warning("invalid frame: %s", exc)
+                    await server._handle_message(websocket, client_id, data)
             except WebSocketDisconnect:
                 _logger.info("client disconnected %s", websocket.client)
             except Exception as exc:
@@ -190,5 +282,7 @@ class VRServer:
             finally:
                 server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
+                if server._webrtc is not None:
+                    await server._webrtc.close(client_id)
 
         return app

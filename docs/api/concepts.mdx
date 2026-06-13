@@ -1,0 +1,52 @@
+---
+title: "Core Concepts"
+description: "Async context managers, joint arrays, and telemetry — shared conventions across the Axol SDK."
+---
+
+Install the package with `uv sync` (see [Installation](/installation)), then import from its submodules (e.g. `almond_axol.robot`, `almond_axol.teleop`).
+
+The Axol SDK is organized into focused modules:
+
+```
+almond_axol/
+├── robot/        Axol (hardware) and Sim (visualizer) — start here
+├── kinematics/   Bimanual IK solver (JAX + pyroki)
+├── teleop/       VR headset → IK → robot control loop
+├── vr/           WebSocket server that receives VR frames
+├── zed/          ZED-X One camera streaming
+├── motor/        Low-level async CAN motor interface
+├── serve/        Web control-panel server (FastAPI) behind `axol serve`
+└── lerobot/      LeRobot Robot / Teleoperator / Camera wrappers (requires lerobot extra)
+    ├── robot/    AxolRobot — LeRobot Robot wrapping the async hardware driver
+    ├── teleop/   AxolVRTeleop — LeRobot Teleoperator wrapping VRTeleop
+    └── camera/   ZedCamera — LeRobot Camera wrapping a ZED stream receiver
+```
+
+The browser front-ends live outside the Python package, in `web/`: the [VR teleop interface](/guides/vr-interface) and the [web control panel](/guides/control-panel), both built to `web/app/dist` and served by [`axol serve`](/cli/serve).
+
+End-to-end data flow for teleoperation:
+
+```
+VR headset → VRServer (WSS) → VRTeleop → KinematicsSolver → Axol → motors
+```
+
+End-to-end data flow for LeRobot data collection:
+
+```
+VR headset → AxolVRTeleop.get_action() → AxolRobot.send_action() → motors
+                                                 ↑
+                                  AxolRobot.get_observation() → dataset
+                                  (joints from telemetry, cameras from ZedCamera)
+```
+
+## Async context managers
+
+`Axol`, `Sim`, `VRTeleop`, `VRServer`, and `ZedStreamer` all open and close hardware resources in `__aenter__` / `__aexit__`. Always use them with `async with`.
+
+## Joint arrays
+
+Every method that reads or writes joint state uses `np.ndarray` of shape `(8,)` in `Joint` enum order: `SHOULDER_1`, `SHOULDER_2`, `SHOULDER_3`, `ELBOW`, `WRIST_1`, `WRIST_2`, `WRIST_3`, `GRIPPER`. Arm joints are in radians; the gripper is normalized to `[0.0 = closed, 1.0 = fully open]`.
+
+## Telemetry vs. one-shot reads
+
+`start_telemetry(hz)` launches a background polling loop and populates `.positions` and `.torques` as non-blocking cached properties — read them in a tight control loop without `await`. Direct calls like `await get_positions()` issue individual CAN reads and are suitable for diagnostics but too slow for real-time control. `start_telemetry` is not required if you are already running a `motion_control` loop — every impedance command sent to the arm motors returns a position and torque reading, which is used to populate the same cache automatically.

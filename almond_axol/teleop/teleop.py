@@ -28,6 +28,7 @@ Or with custom components::
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import multiprocessing
 import multiprocessing.connection
@@ -137,7 +138,6 @@ class VRTeleop:
         self._prev_either: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
-        self._startup_complete: bool = False
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -152,6 +152,9 @@ class VRTeleop:
         self._vr_thread: threading.Thread | None = None
         self._vr_stop: threading.Event = threading.Event()
         self._vr_ready: threading.Event = threading.Event()
+        # Event loop of the VR server thread, captured so the IK thread can
+        # broadcast tracking-state changes to the headset.
+        self._vr_loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -165,6 +168,7 @@ class VRTeleop:
         """
 
         async def _serve() -> None:
+            self._vr_loop = asyncio.get_running_loop()
             await self._vr_server.enable()
             self._vr_ready.set()
             while not self._vr_stop.is_set():
@@ -172,6 +176,22 @@ class VRTeleop:
             await self._vr_server.disable()
 
         asyncio.run(_serve())
+
+    def _broadcast_tracking(self, enabled: bool) -> None:
+        """Push the engage-toggle state to the headset (fire-and-forget).
+
+        The VR app uses it to allow screen repositioning (trigger grabs) only
+        while the robot isn't being controlled. Safe to call from any thread.
+        """
+        if self._vr_loop is None:
+            return
+        text = json.dumps({"type": "tracking", "value": enabled})
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(text), self._vr_loop
+            )
+        except RuntimeError:
+            pass  # VR loop already shut down
 
     async def enable(self) -> None:
         """Start the VR server, robot, and IK subprocess."""
@@ -211,7 +231,6 @@ class VRTeleop:
         child_conn.close()
         self._ik_process = process
 
-        # Receive ready message: (q_init, left_indices, right_indices, startup_traj)
         loop = asyncio.get_running_loop()
         msg = await loop.run_in_executor(None, parent_conn.recv)
         assert isinstance(msg, tuple) and msg[0] == "ready"
@@ -231,8 +250,6 @@ class VRTeleop:
             self._smooth_right.reset(seed=seed_r[:7])
 
         if startup_traj:
-            self._smooth_left.max_accel = self._config.startup_max_accel
-            self._smooth_right.max_accel = self._config.startup_max_accel
             self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
 
         self._ik_stop.clear()
@@ -275,6 +292,16 @@ class VRTeleop:
 
     async def __aexit__(self, *_: object) -> None:
         await self.disable()
+
+    def set_video_sources(self, sources: dict[str, object] | None) -> None:
+        """Stream camera frames to the headset via WebRTC.
+
+        Each source is a callable returning the latest RGB ``uint8`` numpy
+        frame ``(H, W, 3)`` or ``None``. Must be called after :meth:`enable`
+        (so the VR server exists). Safe to call from any thread. Requires the
+        ``video`` extra; without it video is silently disabled.
+        """
+        self._vr_server.set_video_sources(sources)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Main loop
@@ -362,24 +389,34 @@ class VRTeleop:
         if self._q is None:
             return None, None
 
-        q = self._q
-
-        l_grip = self._l_grip
-        r_grip = self._r_grip
-
         if self._reset_interp.is_active():
             new_q, l_grip, r_grip, done = self._reset_interp.step()
-            if new_q is not None:
-                q = np.asarray(new_q, dtype=np.float32)
-                if done:
-                    self._q = q.copy()
-                    self._l_grip = l_grip
-                    self._r_grip = r_grip
-                    self._at_rest = True
-                    if not self._startup_complete:
-                        self._startup_complete = True
-                        self._smooth_left.max_accel = self._config.teleop_max_accel
-                        self._smooth_right.max_accel = self._config.teleop_max_accel
+            if new_q is None:
+                return None, None
+            q = np.asarray(new_q, dtype=np.float32)
+            if done:
+                self._q = q.copy()
+                self._l_grip = l_grip
+                self._r_grip = r_grip
+                self._at_rest = True
+                seed_l = np.append(q[self._left_indices], l_grip)
+                seed_r = np.append(q[self._right_indices], r_grip)
+                self._ema_left.reset(seed=seed_l)
+                self._ema_right.reset(seed=seed_r)
+                self._smooth_left.reset(seed=q[self._left_indices])
+                self._smooth_right.reset(seed=q[self._right_indices])
+
+            left = np.empty(8, dtype=np.float32)
+            left[:7] = q[self._left_indices]
+            left[7] = l_grip
+            right = np.empty(8, dtype=np.float32)
+            right[:7] = q[self._right_indices]
+            right[7] = r_grip
+            return left, right
+
+        q = self._q
+        l_grip = self._l_grip
+        r_grip = self._r_grip
 
         ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
         ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
@@ -455,6 +492,7 @@ class VRTeleop:
                 if both and not self._prev_both:
                     self._teleop_enabled = True
                     _logger.info("Teleop enabled")
+                    self._broadcast_tracking(True)
                     if self._at_rest:
                         self._smooth_left.max_vel = self._config.engage_max_vel
                         self._smooth_right.max_vel = self._config.engage_max_vel
@@ -464,12 +502,13 @@ class VRTeleop:
                 if either and not self._prev_either:
                     self._teleop_enabled = False
                     _logger.info("Teleop disabled")
+                    self._broadcast_tracking(False)
 
             self._prev_both = both
             self._prev_either = either
 
             # Only track gripper position when arm movement is also enabled so
-            # that the gripper cannot be actuated independently of the deadman.
+            # that the gripper cannot be actuated independently of the toggle.
             if self._teleop_enabled:
                 self._l_grip = frame.l_grip
                 self._r_grip = frame.r_grip
@@ -485,16 +524,18 @@ class VRTeleop:
                         if isinstance(result, tuple) and result[0] == "reset_traj":
                             _, q_default, trajectory = result
                             if trajectory:
+                                # Reset trajectory playback in step() bypasses
+                                # the EMA and trapezoidal filters and reseeds
+                                # them on completion, so there's no filter
+                                # state to clear here.
                                 self._reset_interp.set_trajectory(
                                     trajectory, self._l_grip, self._r_grip
                                 )
-                                self._ema_left.reset()
-                                self._ema_right.reset()
-                                self._smooth_left.reset()
-                                self._smooth_right.reset()
                                 self._teleop_enabled = False
+                                self._broadcast_tracking(False)
                                 self._prev_both = False
                                 self._prev_either = False
+                                self._engage_time = None
                             self._q = np.asarray(q_default, dtype=np.float32)
                     except Exception as e:
                         _logger.error("Reset error: %s", e)

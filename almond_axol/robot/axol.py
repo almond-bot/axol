@@ -21,7 +21,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
-from ..shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_friction
@@ -395,6 +395,10 @@ class AxolArm:
     async def set_zero_position(self, joints: list[Joint]) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
 
+        The encoder zero is calibrated at the joint's mechanical end stop, not
+        at the rest position; ``AxolArm`` applies a per-joint offset so the
+        public API stays in joint frame (``0`` = rest).
+
         Args:
             joints: List of joints to zero.
         """
@@ -711,6 +715,11 @@ class Axol(RobotBase):
                 "At least one of left_channel or right_channel must be specified."
             )
 
+        # Bake stiffness into the per-joint gains exactly once, here at the
+        # single robot-construction boundary. ``resolved()`` is idempotent,
+        # so this is safe even if the caller already resolved the config.
+        config = config.resolved()
+
         self._gravity_comp = GravityCompensator(config)
 
         if left_channel is not None:
@@ -728,13 +737,6 @@ class Axol(RobotBase):
             )
         else:
             self.right = None
-
-    async def __aenter__(self) -> Axol:
-        await self.enable()
-        return self
-
-    async def __aexit__(self, *_) -> None:
-        await self.disable()
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -939,6 +941,10 @@ class Axol(RobotBase):
         right: list[Joint] | None = None,
     ) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
+
+        The encoder zero is calibrated at each joint's mechanical end stop, not
+        at the rest position; per-joint offsets keep the public API in joint
+        frame (``0`` = rest).
 
         Args:
             left:  Joints on the left arm to zero. ``None`` skips the arm.
