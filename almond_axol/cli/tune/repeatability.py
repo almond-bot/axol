@@ -308,7 +308,7 @@ async def _run(args: argparse.Namespace) -> None:
     async with Axol(config=axol_config, **axol_kwargs) as axol:
         await axol.start_telemetry(500)
         # Settle the telemetry cache before driving (mirrors gravity_comp).
-        await asyncio.sleep(0.05)
+        await axol.wait_for_telemetry()
 
         # Always begin from the planned rest pose. If the operator parked the
         # arms anywhere else, sneak there with a one-off collision-aware plan
