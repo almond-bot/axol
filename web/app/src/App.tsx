@@ -1,4 +1,12 @@
-import { Suspense, useEffect, useRef, useState, type ReactNode, type RefObject } from "react"
+import {
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+  type RefObject,
+} from "react"
 import { Canvas, useFrame, useThree } from "@react-three/fiber"
 import { Text } from "@react-three/drei"
 import { createXRStore, XR, useXR } from "@react-three/xr"
@@ -30,6 +38,67 @@ import { cn } from "@/lib/utils"
 // (brotli), so a .woff2 fails with "woff2 fonts not supported" and no HUD
 // text renders.
 configureTextBuilder({ defaultFontURL: interFontUrl })
+
+// Code-point ranges the bundled Inter .woff above actually contains — the
+// "latin" subset from @fontsource/inter (its unicode.json). Any character
+// outside this set isn't in our font, so troika hands it to its unicode-font
+// fallback, which fetches descriptors + font files from a jsdelivr CDN *inside
+// a web worker* (so a main-thread fetch override can't stop it, and pointing it
+// at a bad URL just makes it retry the CDN). On an offline LAN that fetch never
+// resolves and the <Text> hangs forever, blanking the whole XR scene. We avoid
+// it entirely by never feeding <Text> a glyph we can't draw: see HudText.
+const INTER_LATIN_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x0000, 0x00ff],
+  [0x0131, 0x0131],
+  [0x0152, 0x0153],
+  [0x02bb, 0x02bc],
+  [0x02c6, 0x02c6],
+  [0x02da, 0x02da],
+  [0x02dc, 0x02dc],
+  [0x0304, 0x0304],
+  [0x0308, 0x0308],
+  [0x0329, 0x0329],
+  [0x2000, 0x206f],
+  [0x20ac, 0x20ac],
+  [0x2122, 0x2122],
+  [0x2191, 0x2191],
+  [0x2193, 0x2193],
+  [0x2212, 0x2212],
+  [0x2215, 0x2215],
+  [0xfeff, 0xfeff],
+  [0xfffd, 0xfffd],
+]
+
+function interCovers(codePoint: number): boolean {
+  for (const [lo, hi] of INTER_LATIN_RANGES) {
+    if (codePoint >= lo && codePoint <= hi) return true
+  }
+  return false
+}
+
+// Replace any glyph the bundled font can't draw with U+FFFD ("□", itself in the
+// latin subset) so unsupported text degrades to a visible placeholder instead
+// of triggering the offline-hanging CDN fallback described above.
+function sanitizeHudText(text: string): string {
+  let out = ""
+  for (const ch of text) {
+    out += interCovers(ch.codePointAt(0)!) ? ch : "\uFFFD"
+  }
+  return out
+}
+
+// Drop-in replacement for drei's <Text> for anything rendered in-headset: it
+// strips its string children to glyphs the bundled font can actually draw, so
+// the troika unicode fallback (and its CDN fetch) can never fire. Use this
+// instead of <Text> for HUD content, especially anything dynamic.
+function HudText({ children, ...props }: ComponentProps<typeof Text>) {
+  const safe = Array.isArray(children)
+    ? children.map((c) => (typeof c === "string" ? sanitizeHudText(c) : c))
+    : typeof children === "string"
+      ? sanitizeHudText(children)
+      : children
+  return <Text {...props}>{safe}</Text>
+}
 
 // The VR teleop WebSocket server runs on this port (see useAxolVRClient default).
 const VR_WS_PORT = 8000
@@ -718,7 +787,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           <torusGeometry args={[0.11, 0.014, 16, 48, Math.PI * 1.5]} />
           <meshBasicMaterial color="#eff483" toneMapped={false} depthTest={false} />
         </mesh>
-        <Text
+        <HudText
           position={[0, -0.22, -FEED_DISTANCE]}
           fontSize={0.045}
           fontWeight="bold"
@@ -730,7 +799,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           {...hudBg}
         >
           Connecting camera…
-        </Text>
+        </HudText>
       </group>
     </>
   )
@@ -764,7 +833,7 @@ function ExitButton() {
   const [hovered, setHovered] = useState(false)
 
   return (
-    <Text
+    <HudText
       position={[-0.2, 0.1, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
@@ -779,7 +848,7 @@ function ExitButton() {
       onClick={() => store.getState().session?.end()}
     >
       Exit
-    </Text>
+    </HudText>
   )
 }
 
@@ -802,7 +871,7 @@ function StateDisplay({
   const { color, label } = STATUS_DISPLAY[displayState] ?? { color: "white", label: "• Teleop" }
 
   return (
-    <Text
+    <HudText
       position={[0.2, 0.1, -0.5]}
       fontSize={0.02}
       fontWeight="bold"
@@ -814,7 +883,7 @@ function StateDisplay({
       {...hudBg}
     >
       {label}
-    </Text>
+    </HudText>
   )
 }
 
@@ -847,7 +916,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         <meshBasicMaterial color="white" depthTest={false} side={THREE.DoubleSide} />
       </mesh>
       {/* LEFT header */}
-      <Text
+      <HudText
         position={[-col, -0.004, 0]}
         fontSize={0.013}
         color="white"
@@ -858,9 +927,9 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
       >
         LEFT
-      </Text>
+      </HudText>
       {/* RIGHT header */}
-      <Text
+      <HudText
         position={[col, -0.004, 0]}
         fontSize={0.013}
         color="white"
@@ -871,9 +940,9 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
       >
         RIGHT
-      </Text>
+      </HudText>
       {/* Left buttons */}
-      <Text
+      <HudText
         position={[-col, -0.022, 0]}
         fontSize={0.013}
         color="white"
@@ -884,9 +953,9 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         lineHeight={1.6}
       >
         {`[Y]  Exit VR\n[X]  Reset Pose`}
-      </Text>
+      </HudText>
       {/* Right buttons */}
-      <Text
+      <HudText
         position={[col, -0.022, 0]}
         fontSize={0.013}
         color="white"
@@ -897,7 +966,7 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         lineHeight={1.6}
       >
         {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View\n[Trigger]  Move Screen\n[Stick Click]  Reset Screens`}
-      </Text>
+      </HudText>
     </group>
   )
 }
@@ -907,7 +976,7 @@ function HelpIcon() {
 
   return (
     <group position={[0, 0.1, -0.5]}>
-      <Text
+      <HudText
         fontSize={0.02}
         fontWeight="bold"
         color={open ? "yellow" : "white"}
@@ -919,7 +988,7 @@ function HelpIcon() {
         onClick={() => setOpen((v) => !v)}
       >
         ?
-      </Text>
+      </HudText>
       {open && <HelpPanel onDismiss={() => setOpen(false)} />}
     </group>
   )
@@ -942,7 +1011,7 @@ function CountdownDisplay({ recordingPendingAt }: { recordingPendingAt: number |
   if (recordingPendingAt === null) return null
 
   return (
-    <Text
+    <HudText
       position={[0, 0, -0.5]}
       fontSize={0.1}
       fontWeight="bold"
@@ -953,7 +1022,7 @@ function CountdownDisplay({ recordingPendingAt }: { recordingPendingAt: number |
       material-depthTest={false}
     >
       {String(count)}
-    </Text>
+    </HudText>
   )
 }
 
