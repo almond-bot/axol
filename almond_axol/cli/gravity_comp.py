@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 from ..robot import Axol
@@ -92,14 +93,39 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
         # ``enable()`` (called by ``__aenter__``) leaves arm joints in IMPEDANCE
         # and the gripper in POSITION_FORCE — both of which are the modes
         # ``gravity_compensate`` expects, so we don't touch control modes here.
-        await axol.start_telemetry(cfg.telemetry_hz)
-        # Settle a few cycles so positions cache is populated before we drive.
-        await asyncio.sleep(max(0.05, 5.0 / cfg.telemetry_hz))
+        # torque=True so we can log the measured shoulder_2 torque alongside
+        # the commanded gravity feedforward.
+        await axol.start_telemetry(cfg.telemetry_hz, torque=True)
+        # Motors may still be rebooting from set_control_mode(); block until
+        # every motor has answered at least one telemetry poll before driving.
+        await axol.wait_for_telemetry()
+
+        # Diagnostic: every 0.5 s, log shoulder_2's joint angle, the commanded
+        # gravity feedforward (the torque gravity_compensate sends), and the
+        # measured motor torque. Prefer the left arm; fall back to the right.
+        arm = axol.left if axol.left is not None else axol.right
+        s2_i = ARM_JOINTS.index(Joint.SHOULDER_2)
 
         dt = 1.0 / cfg.rate_hz
+        last_log = 0.0
         while True:
             loop_start = time.monotonic()
             await axol.gravity_compensate(kd=cfg.kd, free_joints=free_joints)
+
+            if loop_start - last_log >= 0.5:
+                last_log = loop_start
+                arm_q = arm.positions[: len(ARM_JOINTS)]
+                grav_ff = float(
+                    arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)[s2_i]
+                )
+                pos = float(arm_q[s2_i])
+                meas = float(arm.torques[s2_i])
+                print(
+                    f"shoulder_2  pos={math.degrees(pos):+7.2f}° ({pos:+.4f} rad)  "
+                    f"grav_ff={grav_ff:+.3f} Nm  meas={meas:+.3f} Nm",
+                    flush=True,
+                )
+
             spent = time.monotonic() - loop_start
             if spent < dt:
                 await asyncio.sleep(dt - spent)

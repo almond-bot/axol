@@ -213,6 +213,11 @@ class Motor:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     @property
+    def has_position(self) -> bool:
+        """True once a position has been cached by telemetry or a set_impedance() response."""
+        return self._position is not None
+
+    @property
     def position(self) -> float:
         """Latest cached shaft position (rad).
 

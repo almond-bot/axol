@@ -43,6 +43,10 @@ _MA_WRITE_GAINS_ROM = (
 )
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
 
+# Seconds to wait after a 0x76 system reset before the motor answers again.
+# Measured reboot time is ~1.12s; 2.0s leaves margin across motors/temperature.
+_MA_RESET_SETTLE_S = 2.0
+
 # AccelerationType enum values from acceleration_type.hpp
 _MA_ACC_POS_PLAN = 0x00  # position planning acceleration
 _MA_DEC_POS_PLAN = 0x01  # position planning deceleration
@@ -178,7 +182,7 @@ class MyActuatorMotor(MotorDriver):
         # determined by which command is sent. Reset the motor to clear internal
         # state so it comes back ready for the next command type.
         await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(1)
+        await asyncio.sleep(_MA_RESET_SETTLE_S)
 
     async def clear_errors(self) -> None:
         pass  # MyActuator has no clear-errors command
@@ -186,7 +190,7 @@ class MyActuatorMotor(MotorDriver):
     async def set_zero_position(self) -> None:
         await self._request(self._cmd(_MA_SET_ENCODER_ZERO))
         await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(_MA_RESET_SETTLE_S)
 
     async def get_position(self) -> float:
         resp = await self._request(self._cmd(_MA_MULTI_TURN_ANGLE))
@@ -332,7 +336,7 @@ class MyActuatorMotor(MotorDriver):
         await self._bus._send(_MA_REQ + self._motor_id, data)
         await asyncio.sleep(0.1)
         await self._bus._send(_MA_REQ + self._motor_id, self._cmd(_MA_RESET))
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(_MA_RESET_SETTLE_S)
         self._motor_id = can_id
 
     async def set_can_baud_rate(self, baud_rate: int) -> None:
