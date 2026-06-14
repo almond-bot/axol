@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Generated at build time from @webxr-input-profiles/assets (see
+# app/scripts/sync-webxr-profiles.mjs).
+app/public/webxr-profiles/
+
 # SSL certificates
 .cert
 

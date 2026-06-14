@@ -2,6 +2,10 @@ import { lazy, StrictMode, Suspense } from "react"
 import { createRoot } from "react-dom/client"
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom"
 import { Loader2 } from "lucide-react"
+// Self-host the UI fonts (Inter + Geist) so first paint and in-headset text
+// never reach out to Google Fonts — the app has to run on an offline LAN.
+import "@fontsource-variable/inter/index.css"
+import "@fontsource-variable/geist/index.css"
 import "./index.css"
 import { isHeadsetBrowser } from "./lib/headset"
 

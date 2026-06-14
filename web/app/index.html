@@ -16,6 +16,7 @@
         background-color: #121212;
         color: #fafafa;
         font-family:
+          "Inter Variable",
           "Inter",
           system-ui,
           -apple-system,
@@ -46,21 +47,9 @@
       }
     </style>
 
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <!-- Load fonts without blocking first paint; fall back to system fonts. -->
-    <link
-      rel="stylesheet"
-      href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Inter:wght@400..700&display=swap"
-      media="print"
-      onload="this.media='all'"
-    />
-    <noscript>
-      <link
-        rel="stylesheet"
-        href="https://fonts.googleapis.com/css2?family=Geist:wght@400..700&family=Inter:wght@400..700&display=swap"
-      />
-    </noscript>
+    <!-- Inter + Geist are self-hosted via @fontsource (bundled by Vite and
+         imported in main.tsx), so the app pulls no fonts from Google's CDN —
+         required for running on an offline LAN. -->
 
     <title>Almond Axol</title>
   </head>

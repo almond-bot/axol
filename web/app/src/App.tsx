@@ -12,7 +12,7 @@ import {
 } from "@almond/axol-vr-client"
 import { Headset, Loader2, ShieldCheck } from "lucide-react"
 import { configureTextBuilder } from "troika-three-text"
-import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff2"
+import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
@@ -26,6 +26,9 @@ import { cn } from "@/lib/utils"
 // whole XR scene (camera feed included) sits under one <Suspense> — leaves the
 // headset showing nothing. Serving the font from the same origin makes VR
 // teleop work with no internet. Must run before the first <Text> renders.
+// Must be .woff (or .ttf/.otf) — troika's font parser can't decode .woff2
+// (brotli), so a .woff2 fails with "woff2 fonts not supported" and no HUD
+// text renders.
 configureTextBuilder({ defaultFontURL: interFontUrl })
 
 // The VR teleop WebSocket server runs on this port (see useAxolVRClient default).
@@ -35,6 +38,24 @@ const store = createXRStore({
   handTracking: false,
   bodyTracking: true,
   controller: { model: false },
+  // Resolve controller (and hand) input profiles from our own origin instead
+  // of the default jsdelivr CDN. @react-three/xr always fetches
+  // profilesList.json + <profile>/profile.json to map the gamepad layout (even
+  // with the 3D model disabled), which hangs forever on an offline LAN. The
+  // descriptors are bundled into /webxr-profiles/ at build time (see
+  // app/scripts/sync-webxr-profiles.mjs). Must be an absolute URL — the loader
+  // resolves paths against it with `new URL(...)`, which rejects bare paths —
+  // so anchor it to the current origin to stay same-origin on any host.
+  baseAssetPath: new URL("/webxr-profiles/", window.location.href).href,
+  // Desktop-only: @react-three/xr falls back to its bundled iwer emulator when
+  // there's no native WebXR (i.e. on localhost in a normal browser). Its
+  // synthetic "room" environment renders each frame with an older three.js API
+  // (material.onBuild) that our three version removed, which throws every frame
+  // ("onBuild is not a function") and blanks the scene. Disabling it keeps the
+  // emulated device + controller panels working over a transparent background
+  // (fine for this passthrough app). Ignored entirely on a real headset, where
+  // native WebXR is used and the emulator never activates.
+  emulate: { syntheticEnvironment: false },
 })
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint

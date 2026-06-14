@@ -4,13 +4,18 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "sync-webxr-profiles": "node scripts/sync-webxr-profiles.mjs",
+    "predev": "node scripts/sync-webxr-profiles.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/sync-webxr-profiles.mjs",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview"
   },
   "dependencies": {
     "@almond/axol-vr-client": "*",
+    "@fontsource-variable/geist": "^5.2.9",
+    "@fontsource-variable/inter": "^5.2.8",
     "@fontsource/inter": "^5.2.8",
     "@react-three/drei": "^10.7.7",
     "@react-three/fiber": "^9.5.0",
@@ -34,6 +39,7 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-basic-ssl": "^2.1.4",
     "@vitejs/plugin-react-swc": "^4.2.2",
+    "@webxr-input-profiles/assets": "^1.0.20",
     "eslint": "^9.39.1",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
