@@ -15,6 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  useAxolTracking,
   useAxolVideo,
   useAxolVRClient,
 } from "@almond/axol-vr-client"
@@ -354,23 +355,10 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
   // Per-hand trigger state last frame, for rising-edge grab detection.
   const triggerPrevRef = useRef({ left: false, right: false })
-  // Whether robot tracking is engaged, as reported by the server's
-  // `{"type": "tracking"}` pushes (the server owns the toggle — it also
-  // disengages on reset/save, which the headset can't infer from buttons).
-  // Screen grabbing is blocked while engaged, since the trigger drives the
-  // gripper.
-  const robotEngagedRef = useRef(false)
-  // True once a tracking push has arrived on this connection; until then we
-  // fall back to mirroring the grip toggle locally (covers servers that don't
-  // broadcast tracking yet).
-  const serverTrackingSeenRef = useRef(false)
-  // Local fallback mirror of the engage toggle (both grips together engage,
-  // either grip alone disengages) plus its edge-detection state.
-  const mirrorEngagedRef = useRef(false)
-  const prevBothGripsRef = useRef(false)
-  const prevEitherGripRef = useRef(false)
-  // WebSocket we've attached the tracking listener to, to avoid re-attaching.
-  const trackingWsRef = useRef<WebSocket | null>(null)
+  // Whether robot tracking is engaged (the server owns this toggle and pushes
+  // it over the WebSocket). Screen grabbing is blocked while engaged, since the
+  // trigger drives the gripper then.
+  const robotEngagedRef = useAxolTracking(wsRef)
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
   const stickClickPrevRef = useRef(false)
 
@@ -486,51 +474,6 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       grabRef.current = null
     }
     rightStickActiveRef.current = stickActive
-
-    // Track whether the robot is engaged from the server's tracking pushes
-    // (added as an extra listener so AxolVRClient's onmessage keeps working).
-    // The server owns the engage toggle — grips, X/reset, and saving all flip
-    // it there — so this stays correct where a client-side mirror would drift.
-    const ws = wsRef.current
-    if (ws !== trackingWsRef.current) {
-      trackingWsRef.current = ws
-      robotEngagedRef.current = false
-      serverTrackingSeenRef.current = false
-      mirrorEngagedRef.current = false
-      ws?.addEventListener("message", (event: MessageEvent) => {
-        try {
-          const msg = JSON.parse(event.data as string) as { type: string; value: unknown }
-          if (msg.type === "tracking") {
-            serverTrackingSeenRef.current = true
-            robotEngagedRef.current = !!msg.value
-          }
-        } catch {
-          // ignore malformed messages
-        }
-      })
-    }
-
-    // Until the server has pushed tracking state at least once, mirror the
-    // grip toggle locally (same edges as teleop.py) so the trigger never
-    // drags screens mid-teleop even against an older backend.
-    const gripPressed = (hand: "left" | "right") => {
-      const src = sources.find((s) => s.handedness === hand)
-      return (src?.gamepad?.buttons?.[1]?.value ?? 0) >= 1.0
-    }
-    const lGrip = gripPressed("left")
-    const rGrip = gripPressed("right")
-    const bothGrips = lGrip && rGrip
-    const eitherGrip = lGrip || rGrip
-    if (!mirrorEngagedRef.current) {
-      if (bothGrips && !prevBothGripsRef.current) mirrorEngagedRef.current = true
-    } else {
-      if (eitherGrip && !prevEitherGripRef.current) mirrorEngagedRef.current = false
-    }
-    prevBothGripsRef.current = bothGrips
-    prevEitherGripRef.current = eitherGrip
-    if (!serverTrackingSeenRef.current) {
-      robotEngagedRef.current = mirrorEngagedRef.current
-    }
 
     // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
     // current gaze and resets any dragged positions.
