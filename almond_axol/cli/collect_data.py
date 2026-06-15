@@ -34,7 +34,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
-from ..utils.jetson import pin_engine_clocks
+from ..utils.jetson import pin_realtime_clocks
 from .config import LogLevel, parse
 
 if TYPE_CHECKING:
@@ -292,11 +292,11 @@ def main(argv: list[str]) -> None:
     # no-op and silently drop every log_say() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    if getattr(cfg.robot_config, "cameras", None):
-        # The cameras stream to the headset through the Jetson hardware
-        # encoder; pin its engine clocks now, while a sudo prompt can still
-        # reach the tty (mid-session escalation is non-interactive).
-        pin_engine_clocks(interactive=True)
+    # Pin the Jetson clocks now, while a sudo prompt can still reach the tty
+    # (mid-session escalation is non-interactive): the CPU governor for the
+    # IK loop rate, and — when cameras stream — the NVENC/VIC engines for
+    # encode latency.
+    pin_realtime_clocks(interactive=True)
 
     _run(cfg)
 

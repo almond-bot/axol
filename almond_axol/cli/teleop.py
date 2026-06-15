@@ -19,7 +19,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
-from ..utils.jetson import pin_engine_clocks
+from ..utils.jetson import pin_realtime_clocks
 from .config import TeleopCmdConfig, parse
 
 if TYPE_CHECKING:
@@ -65,11 +65,11 @@ def main(argv: list[str]) -> None:
     # and silently drop log_say() / INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    if cfg.cameras:
-        # Cameras will stream to the headset through the Jetson hardware
-        # encoder; pin its engine clocks now, while a sudo prompt can still
-        # reach the tty (mid-session escalation is non-interactive).
-        pin_engine_clocks(interactive=True)
+    # Pin the Jetson clocks now, while a sudo prompt can still reach the tty
+    # (mid-session escalation is non-interactive): the CPU governor for the
+    # IK loop rate, and — when cameras stream — the NVENC/VIC engines for
+    # encode latency.
+    pin_realtime_clocks(interactive=True)
 
     hostname = socket.gethostname()
     local_ip = _get_local_ip()
