@@ -48,28 +48,45 @@ def _relay_main(
     """Relay subprocess entry point: open cameras, serve signaling requests."""
     logging.basicConfig(level=log_level)
 
-    from .gst_zed import ZedXOneGstStream
+    from .gst_zed import ZedXOneGstStream, ZedXStereoGstStream
     from .video import WebRTCManager
 
-    streams: dict[str, ZedXOneGstStream] = {}
+    # Keep the stream objects alive for the relay's lifetime; ``sources``
+    # maps the per-track names the headset sees to the eye/camera channels.
+    owned: list[ZedXOneGstStream | ZedXStereoGstStream] = []
+    sources: dict[str, object] = {}
     for name, spec in cameras.items():
+        resolution = spec.get("resolution", "HD1200")
+        fps = spec.get("fps", 60)
         try:
-            stream = ZedXOneGstStream(
-                spec["serial"],
-                resolution=spec.get("resolution", "HD1200"),
-                fps=spec.get("fps", 60),
-            )
+            if spec.get("stereo"):
+                # One camera, two encoded eyes -> overhead_left / overhead_right.
+                stereo = ZedXStereoGstStream(spec["serial"], resolution, fps)
+                if not stereo.wait_ready():
+                    _logger.warning(
+                        "video relay: %s stereo produced no frames; skipping", name
+                    )
+                    stereo.close()
+                    continue
+                owned.append(stereo)
+                sources[f"{name}_left"] = stereo.left_view
+                sources[f"{name}_right"] = stereo.right_view
+            else:
+                mono = ZedXOneGstStream(spec["serial"], resolution, fps)
+                if not mono.wait_ready():
+                    _logger.warning(
+                        "video relay: %s produced no frames; skipping", name
+                    )
+                    mono.close()
+                    continue
+                owned.append(mono)
+                sources[name] = mono
         except Exception as exc:  # noqa: BLE001 - bad spec / spawn failure
             _logger.warning("video relay: %s failed to start (%s)", name, exc)
             continue
-        if not stream.wait_ready():
-            _logger.warning("video relay: %s produced no frames; skipping", name)
-            stream.close()
-            continue
-        streams[name] = stream
 
-    manager = WebRTCManager(dict(streams))
-    conn.send(("ready", sorted(streams)))
+    manager = WebRTCManager(sources)
+    conn.send(("ready", sorted(sources)))
 
     async def serve() -> None:
         loop = asyncio.get_running_loop()
@@ -105,7 +122,7 @@ def _relay_main(
     try:
         asyncio.run(serve())
     finally:
-        for stream in streams.values():
+        for stream in owned:
             stream.close()
 
 

@@ -86,28 +86,46 @@ def _start_video_relay(cfg: TeleopCmdConfig) -> Any | None:
     The relay subprocess owns the gst-native camera pipelines and all
     WebRTC sending, so video traffic can't contend with the teleop control
     loops for the GIL (in-process sending measurably halves the IK rate).
-    Returns ``None`` when not applicable — no cameras, stereo overhead
-    (SDK-only), or plugins missing — in which case the caller uses the
-    in-process path.
+    A stereo overhead streams through ``zedsrc`` (both eyes encoded on the
+    GPU) when the stereo plugin is present; otherwise it stays on the SDK
+    path. Returns ``None`` when no camera can use the relay (no cameras,
+    plugins missing, or only an SDK-bound stereo overhead), in which case
+    the caller uses the in-process path.
     """
     if not cfg.cameras:
         return None
-    if cfg.overhead_stereo and "overhead" in cfg.cameras:
-        return None  # stereo needs the SDK; mixed relay+SDK isn't supported
     try:
-        from ..vr.gst_zed import zed_gst_available
+        from ..vr.gst_zed import zed_gst_available, zed_stereo_gst_available
         from ..vr.video_proc import VideoRelayProcess
     except Exception as exc:  # noqa: BLE001 - video extra missing
         _logger.debug("video relay unavailable: %s", exc)
         return None
-    if not zed_gst_available():
+
+    stereo_ok = zed_stereo_gst_available()
+    mono_ok = zed_gst_available()
+    resolution = cfg.resolution or "HD1200"
+
+    specs: dict[str, dict[str, Any]] = {}
+    for name, serial in cfg.cameras.items():
+        is_stereo = name == "overhead" and cfg.overhead_stereo
+        if is_stereo and not stereo_ok:
+            continue  # falls back to the SDK path for the whole session
+        if not is_stereo and not mono_ok:
+            continue
+        spec: dict[str, Any] = {"serial": serial, "resolution": resolution}
+        if is_stereo:
+            spec["stereo"] = True
+        specs[name] = spec
+
+    # If a stereo overhead is configured but the stereo plugin is missing,
+    # we can't relay it; fall back entirely so the SDK path renders it
+    # (the relay and SDK can't share the VR manager).
+    if cfg.overhead_stereo and "overhead" in cfg.cameras and not stereo_ok:
         return None
-    relay = VideoRelayProcess(
-        {
-            name: {"serial": serial, "resolution": cfg.resolution or "HD1200"}
-            for name, serial in cfg.cameras.items()
-        }
-    )
+    if not specs:
+        return None
+
+    relay = VideoRelayProcess(specs)
     if not relay.has_sources:
         relay.shutdown()
         return None
