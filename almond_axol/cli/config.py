@@ -47,6 +47,7 @@ import draccus
 import mergedeep
 import numpy as np
 
+from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..utils.shared import CAN_LEFT, CAN_RIGHT
@@ -407,6 +408,8 @@ class TeleopCmdConfig:
     Disable an arm with ``--left_channel null`` / ``--right_channel null``.
     Teleop session parameters (e.g. the position multiplier) live on the
     nested ``teleop`` config — e.g. ``--teleop.position_multiplier 2.0``.
+    IK solver cost weights live on the nested ``kinematics`` config — e.g.
+    ``--kinematics.pos_weight 100`` or ``--kinematics.max_joint_delta 0.02``.
 
     Map camera slots to local ZED serial numbers via ``--cameras`` to also
     stream them to the headset (overhead as the main feed, wrist cameras
@@ -424,6 +427,7 @@ class TeleopCmdConfig:
     sim: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
+    kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
