@@ -316,7 +316,10 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             right_channel=cfg.right_channel,
         )
     async with VRTeleop(
-        robot, config=cfg.teleop, kinematics_config=cfg.kinematics
+        robot,
+        config=cfg.teleop,
+        kinematics_config=cfg.kinematics,
+        vr_server_config=cfg.vr_server,
     ) as teleop:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to

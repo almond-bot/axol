@@ -51,6 +51,7 @@ from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..utils.shared import CAN_LEFT, CAN_RIGHT
+from ..vr.config import VRServerConfig
 
 T = TypeVar("T")
 
@@ -422,12 +423,16 @@ class TeleopCmdConfig:
     per-lens in the headset for true stereo. ``--resolution`` picks the
     capture resolution for all cameras (``SVGA`` / ``HD1080`` / ``HD1200``);
     ``null`` (the default) keeps each camera's SDK default.
+
+    The VR WebSocket server (port, TLS certs) lives on the nested
+    ``vr_server`` config — e.g. ``--vr_server.port 9000``.
     """
 
     sim: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
+    vr_server: VRServerConfig = field(default_factory=VRServerConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
@@ -444,8 +449,14 @@ class GravityCompCmdConfig:
     ``[WRIST_3, ELBOW]``) to gravity-compensate; ``null`` (the default)
     frees all seven arm joints. Disable an arm with ``--left_channel
     null`` / ``--right_channel null``.
+
+    The gravity feed-forward torque (per-joint mass / centre-of-mass) and
+    the impedance gains used to hold non-free joints both come from the
+    nested ``axol`` config — override them via e.g.
+    ``--axol.left.elbow.kp 60`` or ``--axol.left_stiffness 0.8``.
     """
 
+    axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None
