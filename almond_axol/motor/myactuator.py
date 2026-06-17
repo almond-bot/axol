@@ -80,9 +80,9 @@ _MA_T_MAX_LEGACY = 24.0  # Nm — fixed range for both t_ff and feedback torque
 _MA_P_MAX_V44 = 12.566  # rad
 _MA_KD_MAX_V44 = 50.0
 
-# Motor max torque (Nm) keyed by model series — the leading "X<n>" token of the
-# 0xB5 model string (e.g. "X8S2V" -> 8). Used as the V4.4 t_ff range and to
-# decode feedback torque. Extend as new series are introduced.
+# Motor max torque (Nm) keyed by model series — the "X<n>" token found in the
+# 0xB5 model string (e.g. "RMD-X8-P20" -> 8). Used as the V4.4 t_ff range and
+# to decode feedback torque. Extend as new series are introduced.
 _MA_SERIES_MAX_TORQUE: dict[int, float] = {
     6: 60.0,
     8: 129.0,
@@ -137,12 +137,12 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
 def _model_max_torque(model: str | None) -> float:
     """Return the motor's max torque (Nm) inferred from its 0xB5 model string.
 
-    The model string starts with an ``X<n>`` series token (e.g. ``"X8S2V"`` ->
+    The model string contains an ``X<n>`` series token (e.g. ``"RMD-X8-P20"`` ->
     ``8``); ``n`` selects the rated max torque from ``_MA_SERIES_MAX_TORQUE``.
     Falls back to ``_MA_DEFAULT_MAX_TORQUE`` for unknown or unreadable models.
     """
     if model:
-        match = re.match(r"X(\d+)", model.strip().upper())
+        match = re.search(r"X(\d+)", model.strip().upper())
         if match is not None:
             return _MA_SERIES_MAX_TORQUE.get(
                 int(match.group(1)), _MA_DEFAULT_MAX_TORQUE
@@ -231,15 +231,16 @@ class MyActuatorMotor(MotorDriver):
         return int(struct.unpack_from("<I", resp, 4)[0])
 
     async def _read_model(self) -> str:
-        """Read the first 5 characters of the motor model string via 0xB5.
+        """Read the first 10 characters of the motor model string via 0xB5.
 
-        The full model is up to 15 characters (read 5 at a time by index), but
-        the leading ``X<series>`` token in the first 5 is enough to identify the
-        motor series and thus its rated torque.
+        The full model is up to 15 characters (read 5 at a time by index).
+        Two blocks are read so that the ``X<series>`` digit (e.g. ``"X6"`` in
+        ``"RMD-X6-P20"``) is always captured regardless of its position.
         """
-        data = bytes([_MA_READ_MODEL, 0x01, 0x01, 0, 0, 0, 0, 0])
-        resp = await self._request(data)
-        chars = bytes(resp[3:8]).split(b"\x00", 1)[0]
+        block1 = await self._request(bytes([_MA_READ_MODEL, 0x01, 0x01, 0, 0, 0, 0, 0]))
+        block2 = await self._request(bytes([_MA_READ_MODEL, 0x01, 0x02, 0, 0, 0, 0, 0]))
+        raw = bytes(block1[3:8]) + bytes(block2[3:8])
+        chars = raw.split(b"\x00", 1)[0]
         return chars.decode("ascii", errors="ignore")
 
     async def _detect_capabilities(self) -> None:
