@@ -256,8 +256,19 @@ export default function ControlPanel() {
   }
 
   // -- operation lifecycle --
+  // Liveness comes from two sources that can briefly disagree about the same
+  // session: `session` (the REST start/stop responses) and `status` (the logs
+  // WebSocket). On Stop the REST response is authoritative and immediately
+  // reports "exited", but the WebSocket's final "exited" frame can be missed
+  // (dropped sentinel on a full subscriber queue, or a flaky link to a remote
+  // serve host), leaving its last-seen status stuck at "running". So treat the
+  // op as live only when a source reports it active AND neither source reports
+  // it finished — a terminal state from either side flips the button to Start.
   const effectiveStatus = status ?? session
-  const isLive = effectiveStatus?.status === "running" || effectiveStatus?.status === "starting"
+  const sources = [status, session].filter((s): s is SessionInfo => s != null)
+  const isLive =
+    sources.some((s) => s.status === "running" || s.status === "starting") &&
+    !sources.some((s) => s.status === "exited" || s.status === "error")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
   const selectedLive = isLive && runningOp === selectedOp
 
