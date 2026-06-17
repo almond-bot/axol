@@ -39,9 +39,9 @@ class OpStartRequest(BaseModel):
 
     ``cameras`` (optional) carries the local ZED camera setup for teleop /
     collect-data / run-policy: ``{"serials": {"overhead": 41234567, ...},
-    "overheadStereo": bool, "resolution": "SVGA" | None}``. The runner folds
-    it into the operation's config (per-camera serials, stereo overhead,
-    capture resolution).
+    "resolution": "SVGA" | None}``. The runner folds it into the operation's
+    config (per-camera serials, capture resolution); whether the overhead is
+    stereo is auto-detected from its serial, not passed in.
     """
 
     op: str

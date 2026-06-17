@@ -80,7 +80,22 @@ def main(argv: list[str]) -> None:
     asyncio.run(_run(cfg))
 
 
-def _start_video_relay(cfg: TeleopCmdConfig) -> Any | None:
+def _overhead_is_stereo(cfg: TeleopCmdConfig) -> bool:
+    """Whether the configured overhead camera is a stereo ZED X.
+
+    Auto-detected from the overhead serial's device kind (see
+    :func:`almond_axol.zed.stereo_serials`) so operators never flag stereo by
+    hand. Best-effort: any enumeration failure treats the overhead as mono.
+    """
+    serial = cfg.cameras.get("overhead")
+    if serial is None:
+        return False
+    from ..zed import stereo_serials
+
+    return int(serial) in stereo_serials()
+
+
+def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
     The relay subprocess owns the gst-native camera pipelines and all
@@ -107,7 +122,7 @@ def _start_video_relay(cfg: TeleopCmdConfig) -> Any | None:
 
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
-        is_stereo = name == "overhead" and cfg.overhead_stereo
+        is_stereo = name == "overhead" and overhead_stereo
         if is_stereo and not stereo_ok:
             continue  # falls back to the SDK path for the whole session
         if not is_stereo and not mono_ok:
@@ -120,7 +135,7 @@ def _start_video_relay(cfg: TeleopCmdConfig) -> Any | None:
     # If a stereo overhead is configured but the stereo plugin is missing,
     # we can't relay it; fall back entirely so the SDK path renders it
     # (the relay and SDK can't share the VR manager).
-    if cfg.overhead_stereo and "overhead" in cfg.cameras and not stereo_ok:
+    if overhead_stereo and "overhead" in cfg.cameras and not stereo_ok:
         return None
     if not specs:
         return None
@@ -162,7 +177,9 @@ def _open_gst_stream(name: str, serial: int, resolution: str | None) -> Any | No
     return stream
 
 
-def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
+def _connect_zed_cameras(
+    cfg: TeleopCmdConfig, overhead_stereo: bool
+) -> list[tuple[str, Any]]:
     """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
     Mono cameras prefer the gst-native pre-encoded pipeline (see
@@ -238,7 +255,7 @@ def _connect_zed_cameras(cfg: TeleopCmdConfig) -> list[tuple[str, Any]]:
         # A stereo overhead carries both eyes on one grab; expose them as
         # overhead_left / overhead_right so the headset can render per-lens.
         # (The gst-native path is mono-only, so stereo stays on the SDK.)
-        if name == "overhead" and cfg.overhead_stereo:
+        if name == "overhead" and overhead_stereo:
             stereo = _connect(name, serial, stereo=True)
             if stereo is None:
                 continue
@@ -324,7 +341,8 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
         # in-process sources when it isn't applicable.
-        relay = await asyncio.to_thread(_start_video_relay, cfg)
+        overhead_stereo = await asyncio.to_thread(_overhead_is_stereo, cfg)
+        relay = await asyncio.to_thread(_start_video_relay, cfg, overhead_stereo)
         cameras: list[tuple[str, Any]] = []
         if relay is not None:
             teleop.set_video_manager(relay)
@@ -333,7 +351,9 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 ", ".join(relay.sources),
             )
         else:
-            cameras = await asyncio.to_thread(_connect_zed_cameras, cfg)
+            cameras = await asyncio.to_thread(
+                _connect_zed_cameras, cfg, overhead_stereo
+            )
             _register_zed_video(teleop, cameras)
         try:
             await teleop.run()

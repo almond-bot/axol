@@ -1,8 +1,12 @@
 """Configuration dataclass for the local ZED camera."""
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.cameras.configs import CameraConfig, ColorMode
+
+# Which eye(s) of a stereo ZED X to expose as observations.
+StereoEyes = Literal["both", "left", "right"]
 
 # Frame dimensions (width, height) for each ZED capture resolution name.
 # For a stereo ZED X these are per eye.
@@ -51,9 +55,12 @@ class ZedCameraConfig(CameraConfig):
         color_mode: Output color channel order (default RGB).
         warmup_s:   Seconds to read frames during connect() before returning.
         stereo:     Open the camera as a stereo ZED X. The robot expands a
-                    stereo camera ``X`` into two observation keys ``X_left``
-                    / ``X_right`` backed by a single grab. Default False
-                    (mono ZED-X One).
+                    stereo camera ``X`` into observation keys backed by a
+                    single grab (see ``eyes``). Default False (mono ZED-X One).
+        eyes:       Which eye(s) of a stereo camera to expose as observations.
+                    ``"both"`` (default) yields ``X_left`` and ``X_right``;
+                    ``"left"`` yields only ``X_left``; ``"right"`` yields only
+                    ``X_right``. Ignored when ``stereo`` is False.
     """
 
     # Required: no default. The CLI/serve config overlay (see
@@ -66,9 +73,14 @@ class ZedCameraConfig(CameraConfig):
     color_mode: ColorMode = ColorMode.RGB
     warmup_s: int = 1
     stereo: bool = False
+    eyes: StereoEyes = "both"
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
+        if self.eyes not in ("both", "left", "right"):
+            raise ValueError(
+                f"eyes must be one of 'both', 'left', 'right'; got {self.eyes!r}."
+            )
 
     def resolution_name(self) -> str | None:
         """Resolution name for the configured dims (``None`` = auto-detect)."""

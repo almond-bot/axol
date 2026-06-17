@@ -53,3 +53,18 @@ def list_zed_devices() -> list[ZedDevice]:
         ", ".join(str(d["serial"]) for d in out) or "<none>",
     )
     return out
+
+
+def stereo_serials() -> set[int]:
+    """Serials of locally connected stereo (ZED X) cameras.
+
+    Best-effort companion to :func:`list_zed_devices` used to auto-detect
+    whether a configured camera is stereo from its serial, so operators never
+    have to flag it manually. Any enumeration failure (pyzed missing, daemon
+    down) returns an empty set, in which case callers treat cameras as mono.
+    """
+    try:
+        return {d["serial"] for d in list_zed_devices() if d["kind"] == "stereo"}
+    except Exception:  # noqa: BLE001 - detection is best-effort
+        _logger.debug("stereo_serials: ZED enumeration failed", exc_info=True)
+        return set()

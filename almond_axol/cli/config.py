@@ -418,11 +418,11 @@ class TeleopCmdConfig:
     41234567, left_arm: 41234568}"``. Requires the ZED SDK and pyzed
     (``axol zed.install``) plus the ``video`` extra installed locally.
 
-    Set ``--overhead_stereo`` when the overhead is a stereo ZED X: its two
-    eyes are relayed as ``overhead_left`` / ``overhead_right`` and rendered
-    per-lens in the headset for true stereo. ``--resolution`` picks the
-    capture resolution for all cameras (``SVGA`` / ``HD1080`` / ``HD1200``);
-    ``null`` (the default) keeps each camera's SDK default.
+    A stereo ZED X overhead is detected automatically from its serial: its
+    two eyes are relayed as ``overhead_left`` / ``overhead_right`` and
+    rendered per-lens in the headset for true stereo. ``--resolution`` picks
+    the capture resolution for all cameras (``SVGA`` / ``HD1080`` /
+    ``HD1200``); ``null`` (the default) keeps each camera's SDK default.
 
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
@@ -436,7 +436,6 @@ class TeleopCmdConfig:
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
-    overhead_stereo: bool = False
     resolution: str | None = None
     log_level: LogLevel = "INFO"
 

@@ -31,6 +31,7 @@ import sys
 import threading
 from typing import Any
 
+from ..zed import stereo_serials
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -309,15 +310,18 @@ class OperationRunner:
     ) -> dict[str, Any]:
         """Fold a camera spec into collect-data / run-policy form args.
 
-        Serials, the stereo overhead flag, and the capture resolution all map
-        to dotted ``robot_config.cameras.*`` keys that the command schema
-        already emits, so the resulting argv is parsed like any CLI override.
+        Serials and the capture resolution map to dotted
+        ``robot_config.cameras.*`` keys that the command schema already emits,
+        so the resulting argv is parsed like any CLI override. Whether the
+        overhead is stereo is auto-detected from its serial (see
+        :func:`almond_axol.zed.stereo_serials`) rather than flagged by hand.
         """
         merged = dict(args)
         serials = self._camera_serials(cameras)
         for slot, serial in serials.items():
             merged[f"robot_config.cameras.{slot}.serial"] = serial
-        if cameras.get("overheadStereo"):
+        overhead = serials.get("overhead")
+        if overhead is not None and overhead in stereo_serials():
             merged["robot_config.cameras.overhead.stereo"] = True
         resolution = str(cameras.get("resolution") or "").strip()
         if resolution:
@@ -343,11 +347,12 @@ class OperationRunner:
         if not serials:
             return
         cfg.cameras = serials
-        cfg.overhead_stereo = bool((cameras or {}).get("overheadStereo"))
+        overhead = serials.get("overhead")
+        is_stereo = overhead is not None and overhead in stereo_serials()
         resolution = str((cameras or {}).get("resolution") or "").strip()
         if resolution:
             cfg.resolution = resolution
-        stereo_note = " (overhead stereo)" if cfg.overhead_stereo else ""
+        stereo_note = " (overhead stereo)" if is_stereo else ""
         resolution_note = f" @ {resolution}" if resolution else ""
         session.emit(
             "[serve] teleop: streaming cameras to the headset "

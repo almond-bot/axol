@@ -123,10 +123,7 @@ export function ConnectionsBar({
   // -- cameras --
   const camCount = cameraCount(cameras)
   const camDot: Dot = camCount === 3 ? "ok" : camCount > 0 ? "warn" : "idle"
-  const camLabel =
-    camCount === 0
-      ? "Not configured"
-      : `${camCount}/3 configured${cameras.overheadStereo ? " · stereo" : ""}`
+  const camLabel = camCount === 0 ? "Not configured" : `${camCount}/3 configured`
 
   return (
     <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">

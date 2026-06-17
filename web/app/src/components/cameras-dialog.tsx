@@ -47,7 +47,6 @@ export function CamerasDialog({
   onSave: (spec: CameraSpec) => void
 }) {
   const [serials, setSerials] = useState<Serials>(initial.serials ?? EMPTY_SERIALS)
-  const [overheadStereo, setOverheadStereo] = useState(initial.overheadStereo ?? false)
   const [resolution, setResolution] = useState(initial.resolution || DEFAULT_RESOLUTION)
 
   const [devices, setDevices] = useState<CameraDevice[] | null>(null)
@@ -105,7 +104,6 @@ export function CamerasDialog({
         left_arm: serials.left_arm.trim(),
         right_arm: serials.right_arm.trim(),
       },
-      overheadStereo,
       resolution,
     })
     onClose()
@@ -116,6 +114,10 @@ export function CamerasDialog({
       .map((s) => s.trim())
       .filter(Boolean)
   )
+
+  // Stereo vs mono is determined from the detected device, so the operator
+  // never flags it: surface the detected kind next to each assigned slot.
+  const kindBySerial = new Map((devices ?? []).map((d) => [String(d.serial), d.kind]))
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:p-8">
@@ -216,37 +218,38 @@ export function CamerasDialog({
                 ))}
               </select>
             </div>
-            {CAMERA_SLOTS.map((slot) => (
-              <div key={slot.key} className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <Label className="text-white/70">{slot.label}</Label>
-                  {slot.key === "overhead" && (
-                    <label
-                      className="flex cursor-pointer items-center gap-1.5 text-white/55"
-                      title="Stereo ZED X (both eyes from one grab)"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={overheadStereo}
-                        onChange={(e) => setOverheadStereo(e.target.checked)}
-                        className="size-3.5 accent-[#eff483]"
-                      />
-                      <span className="text-xs">Stereo</span>
-                    </label>
-                  )}
+            {CAMERA_SLOTS.map((slot) => {
+              const kind = kindBySerial.get(serials[slot.key].trim())
+              return (
+                <div key={slot.key} className="flex items-center justify-between gap-4">
+                  <div className="flex items-center gap-2">
+                    <Label className="text-white/70">{slot.label}</Label>
+                    {kind && (
+                      <span
+                        className="rounded border border-white/15 bg-white/[0.03] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/45"
+                        title={
+                          kind === "stereo"
+                            ? "Stereo ZED X (both eyes from one grab) — detected automatically"
+                            : "Mono ZED-X One — detected automatically"
+                        }
+                      >
+                        {kind}
+                      </span>
+                    )}
+                  </div>
+                  <Input
+                    value={serials[slot.key]}
+                    inputMode="numeric"
+                    spellCheck={false}
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    onChange={(e) => setSerials((c) => ({ ...c, [slot.key]: e.target.value }))}
+                    placeholder="serial"
+                    className="max-w-[180px]"
+                  />
                 </div>
-                <Input
-                  value={serials[slot.key]}
-                  inputMode="numeric"
-                  spellCheck={false}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  onChange={(e) => setSerials((c) => ({ ...c, [slot.key]: e.target.value }))}
-                  placeholder="serial"
-                  className="max-w-[180px]"
-                />
-              </div>
-            ))}
+              )
+            })}
           </div>
 
           <div className="flex justify-end border-t border-white/10 pt-4">

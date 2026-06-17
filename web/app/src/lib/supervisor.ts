@@ -228,8 +228,6 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
  */
 export interface CameraSpec {
   serials: { overhead: string; left_arm: string; right_arm: string }
-  /** Treat the overhead as a stereo ZED X (both eyes from one grab). */
-  overheadStereo?: boolean
   resolution?: string
 }
 

@@ -41,16 +41,21 @@ class AxolRobotConfig(RobotConfig):
         """Effective observation cameras keyed by dataset/obs name.
 
         A mono camera ``X`` maps to ``X -> (cfg, None)``. A stereo camera
-        (``ZedCameraConfig.stereo``) expands into two eyes,
-        ``X_left -> (cfg, "left")`` and ``X_right -> (cfg, "right")``, sharing
-        the same config object (one decode). Used to build the camera set and
-        the dataset observation features so both agree on the keys.
+        (``ZedCameraConfig.stereo``) expands into one or both eyes depending on
+        ``ZedCameraConfig.eyes``: ``"both"`` -> ``X_left`` and ``X_right``,
+        ``"left"`` -> ``X_left`` only, ``"right"`` -> ``X_right`` only. Eyes of
+        the same camera share the same config object (one decode). Used to build
+        the camera set and the dataset observation features so both agree on the
+        keys.
         """
         out: dict[str, tuple[CameraConfig, str | None]] = {}
         for name, cfg in self.cameras.items():
             if getattr(cfg, "stereo", False):
-                out[f"{name}_left"] = (cfg, "left")
-                out[f"{name}_right"] = (cfg, "right")
+                eyes = getattr(cfg, "eyes", "both")
+                if eyes in ("both", "left"):
+                    out[f"{name}_left"] = (cfg, "left")
+                if eyes in ("both", "right"):
+                    out[f"{name}_right"] = (cfg, "right")
             else:
                 out[name] = (cfg, None)
         return out

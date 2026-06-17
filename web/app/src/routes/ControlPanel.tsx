@@ -38,7 +38,6 @@ type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
-  overheadStereo: false,
   resolution: "SVGA",
 }
 
