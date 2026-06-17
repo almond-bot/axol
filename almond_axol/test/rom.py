@@ -1,5 +1,5 @@
 """
-rom_test
+rom
 
 Range of motion test for the Axol robot. Sweeps every joint through its full
 range while checking each waypoint for self-collision via pyroki.
@@ -7,14 +7,14 @@ range while checking each waypoint for self-collision via pyroki.
 Pass --robot to select the backend:
   - sim: launches a viser visualizer at http://localhost:8002 and runs the
          sweep once. Collisions are skipped with a warning.
-  - axol: enables motors after a 5 s safety countdown, opens/closes the
-          grippers (torque-monitored) as a pre-check, then loops the sweep
-          for one hour. Any predicted collision aborts the run and returns
-          the robot home.
+  - axol: enables the motors, eases to home, then prompts to close each
+          gripper onto the item and loops the sweep for two hours. Any
+          predicted collision aborts the run and returns the robot home;
+          Ctrl-C returns home, opens the grippers, and disables the motors.
 
 Run:
-    uv run -m almond_axol.test.rom_test --robot sim
-    uv run -m almond_axol.test.rom_test --robot axol
+    uv run -m almond_axol.test.rom --robot sim
+    uv run -m almond_axol.test.rom --robot axol
 """
 
 import argparse
@@ -38,6 +38,7 @@ from ..robot.axol import (
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
 )
+from ..robot.config import AxolConfig
 from ..robot.sim import Sim
 from ..utils.shared import URDF_PATH, Joint
 
@@ -49,22 +50,25 @@ SIM_WAYPOINT_PAUSE = 0.5  # seconds
 
 AXOL_SPEED = 1.0  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
-AXOL_GRIPPER_SPEED = 0.1  # rad/s
+# Return-to-home speed, matching teleop's VRTeleopConfig.reset_speed so the
+# end-of-soak homing feels identical to a teleop return-to-rest.
+AXOL_HOME_SPEED = 0.1 * 2 * math.pi  # rad/s
 AXOL_WAYPOINT_PAUSE = 1.0  # seconds
-SAFETY_COUNTDOWN = 5  # seconds
-SOAK_DURATION = 3600  # seconds
+SOAK_DURATION = 7200  # seconds (2 hours)
 CYCLE_PAUSE = 2.0  # seconds
 
 WRIST_TEST_ELBOW_ANGLE = math.pi / 2  # rad
 SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 
-# Must stay below ArmConfig.gripper.torque_limit (0.5 Nm default) — the
-# POSITION_FORCE controller caps gripper output there, so a higher threshold
-# would never be reached and the torque-catch loops would spin forever.
-GRIPPER_TORQUE_THRESHOLD = 0.45  # Nm
-GRIPPER_STEP = 0.005  # normalized [0, 1] per iteration
-GRIPPER_STEP_DELAY = 0.01  # seconds between steps
-GRIPPER_OSC_SPEED = 0.5  # normalized [0, 1] per second — oscillation speed
+# The gripper is pure position control (like teleop): we command a normalized
+# [0, 1] target and the POSITION_FORCE controller tracks it, capping force at
+# ArmConfig.gripper.torque_limit. A closed grasp (target 0) therefore simply
+# holds at this torque — so GRIPPER_TORQUE_LIMIT *is* the grasp force. The
+# default config cap (0.5 Nm) is raised to this value for the test (see
+# run_axol).
+GRIPPER_TORQUE_LIMIT = 2.0  # Nm — POSITION_FORCE grasp force (output cap)
+GRIPPER_SPEED = 1.0  # normalized [0, 1] per second — open/close speed
+GRIPPER_RELEASE_SPEED = 0.1  # normalized [0, 1] per second — slow final release
 
 JOINT_INDEX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
 NUM_JOINTS = len(list(Joint))
@@ -124,145 +128,41 @@ def home_pose() -> np.ndarray:
     return np.zeros(NUM_JOINTS, dtype=np.float32)
 
 
-async def countdown(seconds: int) -> None:
-    for i in range(seconds, 0, -1):
-        print(f"  Enabling in {i}s ...", end="\r", flush=True)
-        await asyncio.sleep(1.0)
-    print()
-
-
-async def oscillate_grippers_until_caught(
-    axol: Axol,
+async def move_grippers(
+    robot: Axol | Sim,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
-    torque_threshold: float,  # Nm
+    left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
+    right_grip: float,  # normalized [0, 1] — 0 closed, 1 open
+    speed: float,  # normalized [0, 1] per second
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Oscillate both grippers open↔closed; each side holds when |torque| ≥ threshold during a close pass.
+    """Smoothly drive each gripper to a normalized target, same as teleop.
 
-    Returns once both grippers are holding. Each gripper acts independently.
-    Torque is only checked while closing — during opening the gripper is
-    allowed to reach the open hard-stop without triggering a hold.
+    The gripper is pure position control: we just command the [0, 1] target and
+    let the POSITION_FORCE controller track it, capping force at the gripper's
+    ``torque_limit`` (so a closed grasp simply holds at that torque). This
+    smoothsteps the command from its current value to the target so the motion
+    is gradual; the arm joints are held at ``left_q`` / ``right_q``.
     """
     gripper_index = JOINT_INDEX[Joint.GRIPPER]
-    left_motor = axol.left.motors[Joint.GRIPPER]
-    right_motor = axol.right.motors[Joint.GRIPPER]
-
     left = left_q.copy()
     right = right_q.copy()
-    left[gripper_index] = 0.0
-    right[gripper_index] = 0.0
+    l0 = float(left[gripper_index])
+    r0 = float(right[gripper_index])
 
-    left_direction = +1  # +1 opening, -1 closing
-    right_direction = +1
-    left_holding = False
-    right_holding = False
-
-    dt = GRIPPER_STEP_DELAY  # seconds per iteration
-
-    while not (left_holding and right_holding):
-        if not left_holding:
-            new_pos = left[gripper_index] + left_direction * GRIPPER_OSC_SPEED * dt
-            if new_pos >= 1.0:
-                new_pos = 1.0
-                left_direction = -1
-            elif new_pos <= 0.0:
-                new_pos = 0.0
-                left_direction = +1
-            left[gripper_index] = new_pos
-        if not right_holding:
-            new_pos = right[gripper_index] + right_direction * GRIPPER_OSC_SPEED * dt
-            if new_pos >= 1.0:
-                new_pos = 1.0
-                right_direction = -1
-            elif new_pos <= 0.0:
-                new_pos = 0.0
-                right_direction = +1
-            right[gripper_index] = new_pos
-
-        await axol.motion_control(left=left, right=right)
+    max_delta = max(abs(left_grip - l0), abs(right_grip - r0))
+    duration = max(max_delta / speed, 0.1)  # seconds
+    dt = 1.0 / CONTROL_RATE_HZ  # seconds
+    start_time = time.monotonic()
+    while True:
+        progress = min((time.monotonic() - start_time) / duration, 1.0)
+        smooth = progress * progress * (3.0 - 2.0 * progress)
+        left[gripper_index] = l0 + (left_grip - l0) * smooth
+        right[gripper_index] = r0 + (right_grip - r0) * smooth
+        await robot.motion_control(left=left, right=right)
+        if progress >= 1.0:
+            break
         await asyncio.sleep(dt)
-
-        if not left_holding and left_direction == -1:
-            left_torque = await left_motor.get_torque()
-            if abs(left_torque) >= torque_threshold:
-                print(
-                    f"  LEFT gripper: |torque| {abs(left_torque):.3f} Nm ≥ "
-                    f"{torque_threshold} Nm — holding at {left[gripper_index]:.3f}"
-                )
-                left_holding = True
-        if not right_holding and right_direction == -1:
-            right_torque = await right_motor.get_torque()
-            if abs(right_torque) >= torque_threshold:
-                print(
-                    f"  RIGHT gripper: |torque| {abs(right_torque):.3f} Nm ≥ "
-                    f"{torque_threshold} Nm — holding at {right[gripper_index]:.3f}"
-                )
-                right_holding = True
-
-    return left, right
-
-
-async def drive_grippers_to_torque(
-    axol: Axol,
-    left_q: np.ndarray,  # rad
-    right_q: np.ndarray,  # rad
-    left_direction: int,  # +1 to open, -1 to close, 0 to hold
-    right_direction: int,  # +1 to open, -1 to close, 0 to hold
-    torque_threshold: float,  # Nm
-) -> tuple[np.ndarray, np.ndarray]:
-    """Step each gripper toward open/close until torque crosses threshold or limit reached.
-
-    Returns the final (left_q, right_q) with gripper positions captured at the
-    point each side stopped. Callers hold this position for the rest of the
-    test by re-using these joint vectors.
-    """
-    gripper_index = JOINT_INDEX[Joint.GRIPPER]
-    left_motor = axol.left.motors[Joint.GRIPPER]
-    right_motor = axol.right.motors[Joint.GRIPPER]
-
-    left = left_q.copy()
-    right = right_q.copy()
-    left_done = left_direction == 0
-    right_done = right_direction == 0
-
-    while not (left_done and right_done):
-        if not left_done:
-            new_pos = max(
-                0.0, min(1.0, left[gripper_index] + left_direction * GRIPPER_STEP)
-            )
-            left[gripper_index] = new_pos
-            if new_pos in (0.0, 1.0):
-                print(f"  LEFT gripper: position bound {new_pos:.2f} reached")
-                left_done = True
-        if not right_done:
-            new_pos = max(
-                0.0, min(1.0, right[gripper_index] + right_direction * GRIPPER_STEP)
-            )
-            right[gripper_index] = new_pos
-            if new_pos in (0.0, 1.0):
-                print(f"  RIGHT gripper: position bound {new_pos:.2f} reached")
-                right_done = True
-
-        await axol.motion_control(left=left, right=right)
-        await asyncio.sleep(GRIPPER_STEP_DELAY)
-
-        if not left_done:
-            left_torque = await left_motor.get_torque()
-            if abs(left_torque) >= torque_threshold:
-                print(
-                    f"  LEFT gripper: |torque| {abs(left_torque):.3f} Nm ≥ "
-                    f"{torque_threshold} Nm — holding at {left[gripper_index]:.3f}"
-                )
-                left_done = True
-        if not right_done:
-            right_torque = await right_motor.get_torque()
-            if abs(right_torque) >= torque_threshold:
-                print(
-                    f"  RIGHT gripper: |torque| {abs(right_torque):.3f} Nm ≥ "
-                    f"{torque_threshold} Nm — holding at {right[gripper_index]:.3f}"
-                )
-                right_done = True
-
     return left, right
 
 
@@ -669,16 +569,36 @@ async def run_sim() -> None:
         await sim.disable()
 
 
+async def return_home_and_open(robot: Axol) -> None:
+    """Ease the arms back to home from their current pose, then open the grippers.
+
+    Used for a graceful Ctrl-C shutdown: bring everything to a safe home
+    position and release the item before the motors are disabled.
+    """
+    gripper_i = JOINT_INDEX[Joint.GRIPPER]
+    cur_left, cur_right = await robot.get_positions()
+    home_left = home_pose()
+    home_right = home_pose()
+    home_left[gripper_i] = cur_left[gripper_i]
+    home_right[gripper_i] = cur_right[gripper_i]
+    print("Returning home ...")
+    await sweep_unchecked(
+        robot, cur_left, cur_right, home_left, home_right, speed=AXOL_HOME_SPEED
+    )
+    print("Opening grippers ...")
+    await move_grippers(robot, home_left, home_right, 1.0, 1.0, GRIPPER_SPEED)
+
+
 async def run_axol() -> None:
     checker = CollisionChecker()
 
     print("=== ROM TEST — PHYSICAL ROBOT ===")
-    print("Make sure the robot is in home position and the area is clear.\n")
-    await asyncio.to_thread(input, "Press Enter to begin the safety countdown ...")
+    print("Make sure the area is clear.\n")
 
-    await countdown(SAFETY_COUNTDOWN)
-
-    axol = Axol()
+    config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
+    config.left.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
+    config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
+    axol = Axol(config=config)
     await axol.enable()
     print("Motors enabled.")
     await asyncio.sleep(2.0)
@@ -692,13 +612,34 @@ async def run_axol() -> None:
 
     try:
         home = home_pose()
+        gripper_i = JOINT_INDEX[Joint.GRIPPER]
 
-        print("Oscillating grippers until each one catches torque ≥ threshold ...")
-        left_q, right_q = await oscillate_grippers_until_caught(
-            axol, home, home, GRIPPER_TORQUE_THRESHOLD
+        # Ease the arms from wherever they actually are to home before anything
+        # else, with the grippers open (1.0). The first motion_control would
+        # otherwise command home as a single stiff (s=1) impedance setpoint and
+        # snap the arms there; sweep_unchecked ramps them in with a smoothstep
+        # trajectory instead.
+        cur_left, cur_right = await axol.get_positions()
+        ready_left = home.copy()
+        ready_right = home.copy()
+        ready_left[gripper_i] = 1.0
+        ready_right[gripper_i] = 1.0
+        print("Easing to home position (grippers open) ...")
+        await sweep_unchecked(
+            axol, cur_left, cur_right, ready_left, ready_right, speed=AXOL_HOME_SPEED
         )
-        print("Both grippers held. Waiting 10 s ...")
-        await asyncio.sleep(10.0)
+        left_q, right_q = ready_left, ready_right
+
+        await asyncio.to_thread(input, "Press Enter to close the RIGHT gripper ...")
+        left_q, right_q = await move_grippers(
+            axol, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
+        )
+
+        await asyncio.to_thread(input, "Press Enter to close the LEFT gripper ...")
+        left_q, right_q = await move_grippers(
+            axol, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
+        )
+        print("Both grippers closed.")
 
         closed_left_q = left_q.copy()
         closed_right_q = right_q.copy()
@@ -730,20 +671,28 @@ async def run_axol() -> None:
                 print(f"Waiting {CYCLE_PAUSE}s ...")
                 await asyncio.sleep(CYCLE_PAUSE)
 
-        print(f"\n1-hour soak complete — {cycle} cycle(s) finished.")
+        print(f"\n2-hour soak complete — {cycle} cycle(s) finished.")
 
-        print("Opening right gripper")
-        await asyncio.sleep(2.0)
-        left_q, right_q = await drive_grippers_to_torque(
-            axol, left_q, right_q, 0, +1, GRIPPER_TORQUE_THRESHOLD
+        print("Returning to home position ...")
+        home_left, home_right = home_with_grippers_closed()
+        left_q, right_q = await sweep_to_target(
+            axol,
+            checker,
+            left_q,
+            right_q,
+            home_left,
+            home_right,
+            AXOL_HOME_SPEED,
+            AXOL_WAYPOINT_PAUSE,
+            abort_on_collision=True,
         )
 
-        print("Opening left gripper")
+        print("Slowly releasing grippers to drop the item ...")
         await asyncio.sleep(2.0)
-        left_q, right_q = await drive_grippers_to_torque(
-            axol, left_q, right_q, +1, 0, GRIPPER_TORQUE_THRESHOLD
+        left_q, right_q = await move_grippers(
+            axol, left_q, right_q, 1.0, 1.0, GRIPPER_RELEASE_SPEED
         )
-        print("Grippers open.")
+        print("Grippers open — item released.")
 
     except CollisionAbort as e:
         print(f"\n⚠  COLLISION ABORT: {e}")
@@ -753,6 +702,10 @@ async def run_axol() -> None:
             axol, e.left_q, e.right_q, safe_left, safe_right, speed=AXOL_SPEED
         )
         print("Home reached.")
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        print("\nInterrupted — returning home and opening grippers ...")
+        await return_home_and_open(axol)
 
     finally:
         await axol.disable()
