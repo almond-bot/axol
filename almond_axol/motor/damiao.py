@@ -367,11 +367,10 @@ class DamiaoMotor(MotorDriver):
     async def set_position_force(
         self, position: float, max_speed: float, max_torque: float
     ) -> None:
-        # Convert Nm → A via kt, then normalise to [0, 1] fraction of rated current
-        # (i_rated = t_max / kt, so the kt terms cancel: current_A / i_rated = max_torque / t_max).
-        current_limit = min(
-            1.0, max(0.0, (max_torque / self._kt) / (self._t_max / self._kt))
-        )
+        # Express the torque limit as a [0, 1] fraction of rated torque. The motor
+        # commands current as a fraction of its rated current, and since rated current
+        # is t_max / kt, the kt terms cancel and this reduces to max_torque / t_max.
+        current_limit = min(1.0, max(0.0, max_torque / self._t_max))
         await self._send_cmd(
             target_position=position,
             velocity_limit=max_speed,

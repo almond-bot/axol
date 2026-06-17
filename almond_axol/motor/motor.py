@@ -34,20 +34,20 @@ class _JointConfig:
 
     kind: _MotorType
     motor_id: int
-    kt: float
+    kt: float = 0
 
 
 _ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
 
 _JOINT_CONFIG: dict[Joint, _JointConfig] = {
-    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01, kt=2.4),
-    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02, kt=2.4),
-    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=2.1),
-    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=2.1),
-    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=2.1),
-    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06, kt=0.945),
-    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07, kt=0.945),
-    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08, kt=0.945),
+    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01, kt=2),
+    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02, kt=2),
+    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=1.5),
+    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=1.5),
+    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=1.5),
+    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06),
+    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
+    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
 }
 
 
