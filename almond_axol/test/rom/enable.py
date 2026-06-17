@@ -1,5 +1,5 @@
 """
-rom
+rom.enable
 
 Range of motion test for the Axol robot. Sweeps every joint through its full
 range while checking each waypoint for self-collision via pyroki.
@@ -8,13 +8,16 @@ Pass --robot to select the backend:
   - sim: launches a viser visualizer at http://localhost:8002 and runs the
          sweep once. Collisions are skipped with a warning.
   - axol: enables the motors, eases to home, then prompts to close each
-          gripper onto the item and loops the sweep for two hours. Any
-          predicted collision aborts the run and returns the robot home;
-          Ctrl-C returns home, opens the grippers, and disables the motors.
+          gripper onto the item and loops the sweep for two hours. When the
+          soak finishes (or on Ctrl-C) the robot returns home but keeps
+          holding the item with the motors left enabled — run
+          ``almond_axol.test.rom.disable`` afterwards to open the grippers
+          and retrieve the item. A predicted collision aborts the run, returns
+          the robot home, and disables the motors.
 
 Run:
-    uv run -m almond_axol.test.rom --robot sim
-    uv run -m almond_axol.test.rom --robot axol
+    uv run -m almond_axol.test.rom.enable --robot sim
+    uv run -m almond_axol.test.rom.enable --robot axol
 """
 
 import argparse
@@ -28,8 +31,8 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
-from ..robot.axol import (
+from ...kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
+from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
     LIMITS,
@@ -38,9 +41,9 @@ from ..robot.axol import (
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
 )
-from ..robot.config import AxolConfig
-from ..robot.sim import Sim
-from ..utils.shared import URDF_PATH, Joint
+from ...robot.config import AxolConfig
+from ...robot.sim import Sim
+from ...utils.shared import URDF_PATH, Joint
 
 CONTROL_RATE_HZ = 100.0  # Hz
 
@@ -68,7 +71,6 @@ SHOULDER_PRE_POSE_ANGLE = -25 * math.pi / 180  # rad
 # run_axol).
 GRIPPER_TORQUE_LIMIT = 2.0  # Nm — POSITION_FORCE grasp force (output cap)
 GRIPPER_SPEED = 1.0  # normalized [0, 1] per second — open/close speed
-GRIPPER_RELEASE_SPEED = 0.1  # normalized [0, 1] per second — slow final release
 
 JOINT_INDEX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
 NUM_JOINTS = len(list(Joint))
@@ -569,11 +571,12 @@ async def run_sim() -> None:
         await sim.disable()
 
 
-async def return_home_and_open(robot: Axol) -> None:
-    """Ease the arms back to home from their current pose, then open the grippers.
+async def return_home(robot: Axol) -> None:
+    """Ease the arms back to home from their current pose, keeping the grippers shut.
 
-    Used for a graceful Ctrl-C shutdown: bring everything to a safe home
-    position and release the item before the motors are disabled.
+    Used to bring the robot to a safe home position while it stays clamped on
+    the item. The grippers are left exactly where they are (still grasping) and
+    the motors stay enabled; ``rom.disable`` releases the item afterwards.
     """
     gripper_i = JOINT_INDEX[Joint.GRIPPER]
     cur_left, cur_right = await robot.get_positions()
@@ -581,12 +584,26 @@ async def return_home_and_open(robot: Axol) -> None:
     home_right = home_pose()
     home_left[gripper_i] = cur_left[gripper_i]
     home_right[gripper_i] = cur_right[gripper_i]
-    print("Returning home ...")
+    print("Returning home (still holding the item) ...")
     await sweep_unchecked(
         robot, cur_left, cur_right, home_left, home_right, speed=AXOL_HOME_SPEED
     )
-    print("Opening grippers ...")
-    await move_grippers(robot, home_left, home_right, 1.0, 1.0, GRIPPER_SPEED)
+
+
+async def close_buses(robot: Axol) -> None:
+    """Close the CAN buses without disabling the motors.
+
+    Stops the reader loops and shuts the sockets so the process can exit
+    cleanly, but sends no shutdown command — every motor keeps holding its last
+    command (arms at home, grippers clamped on the item) so ``rom.disable`` can
+    attach later and release it.
+    """
+    buses = []
+    if robot.left is not None:
+        buses.append(robot._left_bus)
+    if robot.right is not None:
+        buses.append(robot._right_bus)
+    await asyncio.gather(*(bus.close() for bus in buses))
 
 
 async def run_axol() -> None:
@@ -609,6 +626,11 @@ async def run_axol() -> None:
     def home_with_grippers_closed() -> tuple[np.ndarray, np.ndarray]:
         assert closed_left_q is not None and closed_right_q is not None
         return closed_left_q.copy(), closed_right_q.copy()
+
+    # When True (normal soak completion or Ctrl-C) the motors are left enabled
+    # and the item stays gripped; otherwise (collision / unexpected error) the
+    # motors are disabled in the finally block.
+    keep_enabled = False
 
     try:
         home = home_pose()
@@ -643,6 +665,9 @@ async def run_axol() -> None:
 
         closed_left_q = left_q.copy()
         closed_right_q = right_q.copy()
+
+        print("Starting ROM test in 5 s ...")
+        await asyncio.sleep(5.0)
 
         deadline = time.monotonic() + SOAK_DURATION
         cycle = 0
@@ -687,12 +712,9 @@ async def run_axol() -> None:
             abort_on_collision=True,
         )
 
-        print("Slowly releasing grippers to drop the item ...")
-        await asyncio.sleep(2.0)
-        left_q, right_q = await move_grippers(
-            axol, left_q, right_q, 1.0, 1.0, GRIPPER_RELEASE_SPEED
-        )
-        print("Grippers open — item released.")
+        # Leave the robot holding the item with the motors enabled. The operator
+        # runs rom.disable to open the grippers and retrieve the item.
+        keep_enabled = True
 
     except CollisionAbort as e:
         print(f"\n⚠  COLLISION ABORT: {e}")
@@ -704,12 +726,21 @@ async def run_axol() -> None:
         print("Home reached.")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\nInterrupted — returning home and opening grippers ...")
-        await return_home_and_open(axol)
+        print("\nInterrupted — returning home, keeping the item gripped ...")
+        await return_home(axol)
+        keep_enabled = True
 
     finally:
-        await axol.disable()
-        print("Motors disabled.")
+        if keep_enabled:
+            await close_buses(axol)
+            print(
+                "\nMotors left enabled — robot is holding the item.\n"
+                "Run `uv run -m almond_axol.test.rom.disable` to open the "
+                "grippers and retrieve it."
+            )
+        else:
+            await axol.disable()
+            print("Motors disabled.")
 
 
 def main() -> None:
