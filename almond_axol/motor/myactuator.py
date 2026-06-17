@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import struct
 from typing import Callable
 
@@ -29,6 +30,8 @@ _MA_SHUTDOWN = 0x80
 _MA_RELEASE_BRAKE = 0x77
 _MA_RESET = 0x76  # system reset; no response — motor restarts immediately
 _MA_READ_STATUS1 = 0x9A  # temperature, voltage, error flags
+_MA_READ_VERSION = 0xB2  # system software VersionDate (uint32, e.g. 2026042402)
+_MA_READ_MODEL = 0xB5  # motor model string (5 ASCII chars per index)
 _MA_MULTI_TURN_ANGLE = 0x92
 _MA_MOTOR_STATUS_2 = 0x9C  # temperature, current, velocity, encoder
 _MA_SET_ENCODER_ZERO = 0x64
@@ -36,7 +39,6 @@ _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
 _MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
 _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
-_MA_SET_CAN_BAUD = 0xB4  # change CAN baud rate; no response — motor restarts
 _MA_READ_GAINS = 0x30  # read all PID gains (uint8, bulk)
 _MA_WRITE_GAINS_ROM = (
     0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
@@ -53,31 +55,61 @@ _MA_DEC_POS_PLAN = 0x01  # position planning deceleration
 _MA_ACC_VEL_PLAN = 0x02  # velocity planning acceleration
 _MA_DEC_VEL_PLAN = 0x03  # velocity planning deceleration
 
-_MA_P_MIN, _MA_P_MAX = -12.5, 12.5  # rad
-_MA_V_MIN, _MA_V_MAX = -45.0, 45.0  # rad/s
-_MA_T_MIN, _MA_T_MAX = -24.0, 24.0  # Nm
-_MA_KP_MIN, _MA_KP_MAX = 0.0, 500.0
-_MA_KD_MIN, _MA_KD_MAX = 0.0, 5.0
+# MIT / motion-control (0x400) parameter ranges.
+#
+# MyActuator firmware dated 2026042402 (VersionDate) and later implements
+# protocol V4.4, which widened several MIT-command ranges. The motor scales the
+# fixed-point command/feedback fields against whichever range its firmware uses,
+# so the host MUST match the motor's firmware or the applied torque/damping is
+# silently wrong — e.g. a t_ff encoded for the legacy ±24 Nm range decodes to
+# ~2.5x on V4.4 firmware (±60 Nm on an X6). The active firmware is detected
+# per-motor in enable() via the 0xB2 version read.
+_MA_FW_V44_VERSION = 2026042402
 
-_MA_BAUD_MAP: dict[int, int] = {
-    500_000: 0,
-    1_000_000: 1,
+# Unchanged across firmware versions.
+_MA_V_MAX = 45.0  # rad/s
+_MA_KP_MAX = 500.0
+
+# Legacy firmware (< V4.4).
+_MA_P_MAX_LEGACY = 12.5  # rad
+_MA_KD_MAX_LEGACY = 5.0
+_MA_T_MAX_LEGACY = 24.0  # Nm — fixed range for both t_ff and feedback torque
+
+# V4.4 firmware (>= _MA_FW_V44_VERSION). p_des and kd widened; the t_ff /
+# feedback-torque range becomes ±(motor max torque) read from the model.
+_MA_P_MAX_V44 = 12.566  # rad
+_MA_KD_MAX_V44 = 50.0
+
+# Motor max torque (Nm) keyed by model series — the leading "X<n>" token of the
+# 0xB5 model string (e.g. "X8S2V" -> 8). Used as the V4.4 t_ff range and to
+# decode feedback torque. Extend as new series are introduced.
+_MA_SERIES_MAX_TORQUE: dict[int, float] = {
+    6: 60.0,
+    8: 129.0,
 }
+
+# Fallback when the model can't be read or its series isn't in the table above.
+_MA_DEFAULT_MAX_TORQUE = 24.0
 
 # Acceleration range in dps/s²; [100, 60000] — 0 disables ramping.
 _MA_ACC_MIN_DPS_S2 = 100
 _MA_ACC_MAX_DPS_S2 = 60000
 
-# Error bitmask → MotorStatus, ordered by severity (first match wins).
+# Status-1 (0x9A) error bitmask → MotorStatus, ordered by severity (first match
+# wins). Bit definitions per protocol V4.4 §2.13: level-1 (non-recoverable)
+# faults are listed first so they win over recoverable level-2 faults.
 _MA_ERROR_MAP: list[tuple[int, MotorStatus]] = [
-    (0x0002, MotorStatus.MOTOR_STALL),
-    (0x0004, MotorStatus.UNDER_VOLTAGE),
-    (0x0008, MotorStatus.OVER_VOLTAGE),
-    (0x0010, MotorStatus.OVER_CURRENT),
-    (0x0040, MotorStatus.POWER_OVERRUN),
-    (0x0100, MotorStatus.SPEEDING),
-    (0x1000, MotorStatus.OVER_TEMPERATURE),
-    (0x2000, MotorStatus.ENCODER_ERROR),
+    (0x0010, MotorStatus.OVER_CURRENT),  # phase overcurrent (L1)
+    (0x0002, MotorStatus.MOTOR_STALL),  # (L1)
+    (0x0080, MotorStatus.CALIBRATION_ERROR),  # calibration parameter write error (L1)
+    (0x2000, MotorStatus.ENCODER_ERROR),  # encoder calibration error (L1)
+    (0x4000, MotorStatus.ENCODER_ERROR),  # encoder data abnormal (L1)
+    (0x0800, MotorStatus.OVER_TEMPERATURE),  # component (PCB) overtemp (L2)
+    (0x1000, MotorStatus.OVER_TEMPERATURE),  # motor overtemp (L2)
+    (0x0008, MotorStatus.OVER_VOLTAGE),  # (L2)
+    (0x0004, MotorStatus.UNDER_VOLTAGE),  # (L2)
+    (0x0040, MotorStatus.POWER_OVERRUN),  # (L2)
+    (0x0100, MotorStatus.SPEEDING),  # overspeed (L2)
 ]
 
 
@@ -102,6 +134,22 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
     return MotorStatus.UNKNOWN
 
 
+def _model_max_torque(model: str | None) -> float:
+    """Return the motor's max torque (Nm) inferred from its 0xB5 model string.
+
+    The model string starts with an ``X<n>`` series token (e.g. ``"X8S2V"`` ->
+    ``8``); ``n`` selects the rated max torque from ``_MA_SERIES_MAX_TORQUE``.
+    Falls back to ``_MA_DEFAULT_MAX_TORQUE`` for unknown or unreadable models.
+    """
+    if model:
+        match = re.match(r"X(\d+)", model.strip().upper())
+        if match is not None:
+            return _MA_SERIES_MAX_TORQUE.get(
+                int(match.group(1)), _MA_DEFAULT_MAX_TORQUE
+            )
+    return _MA_DEFAULT_MAX_TORQUE
+
+
 class MyActuatorMotor(MotorDriver):
     """MotorDriver implementation for MyActuator RMD motors using the 0x140-series protocol."""
 
@@ -119,6 +167,16 @@ class MyActuatorMotor(MotorDriver):
         self._kt = kt
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
         self._on_feedback: Callable[[float, float], None] | None = None
+
+        # Firmware-dependent MIT-command ranges. Default to the conservative
+        # legacy ranges until enable() reads the firmware version and model.
+        self._fw_version: int | None = None
+        self._model: str | None = None
+        self._p_max = _MA_P_MAX_LEGACY
+        self._kd_max = _MA_KD_MAX_LEGACY
+        self._t_max = _MA_T_MAX_LEGACY  # range for t_ff and feedback torque
+        self._max_torque = _MA_DEFAULT_MAX_TORQUE  # motor's rated max torque (Nm)
+
         bus._add_listener(self._on_message)
 
     # ------------------------------------------------------------------ #
@@ -132,8 +190,8 @@ class MyActuatorMotor(MotorDriver):
                 data = bytes(msg.data)
                 pos_int = (data[1] << 8) | data[2]
                 torq_int = ((data[4] & 0x0F) << 8) | data[5]
-                position = _uint_to_float(pos_int, _MA_P_MIN, _MA_P_MAX, 16)
-                torque = _uint_to_float(torq_int, _MA_T_MIN, _MA_T_MAX, 12)
+                position = _uint_to_float(pos_int, -self._p_max, self._p_max, 16)
+                torque = _uint_to_float(torq_int, -self._t_max, self._t_max, 12)
                 self._on_feedback(position, torque)
             return
         key = (msg.arbitration_id, msg.data[0])
@@ -167,12 +225,64 @@ class MyActuatorMotor(MotorDriver):
         """Request status frame 2 (temperature, current, velocity, encoder)."""
         return await self._request(self._cmd(_MA_MOTOR_STATUS_2))
 
+    async def _read_firmware_version(self) -> int:
+        """Read the firmware VersionDate (uint32, e.g. 2026042402) via 0xB2."""
+        resp = await self._request(self._cmd(_MA_READ_VERSION))
+        return int(struct.unpack_from("<I", resp, 4)[0])
+
+    async def _read_model(self) -> str:
+        """Read the first 5 characters of the motor model string via 0xB5.
+
+        The full model is up to 15 characters (read 5 at a time by index), but
+        the leading ``X<series>`` token in the first 5 is enough to identify the
+        motor series and thus its rated torque.
+        """
+        data = bytes([_MA_READ_MODEL, 0x01, 0x01, 0, 0, 0, 0, 0])
+        resp = await self._request(data)
+        chars = bytes(resp[3:8]).split(b"\x00", 1)[0]
+        return chars.decode("ascii", errors="ignore")
+
+    async def _detect_capabilities(self) -> None:
+        """Read firmware version + model once and configure MIT-command ranges.
+
+        Cached after the first success; raises MotorError if the motor doesn't
+        answer (callers fall back to the conservative legacy ranges).
+        """
+        if self._fw_version is not None:
+            return
+        version = await self._read_firmware_version()
+        model = await self._read_model()
+        self._fw_version = version
+        self._model = model
+        self._max_torque = _model_max_torque(model)
+        if version >= _MA_FW_V44_VERSION:
+            self._p_max = _MA_P_MAX_V44
+            self._kd_max = _MA_KD_MAX_V44
+            self._t_max = self._max_torque
+        else:
+            self._p_max = _MA_P_MAX_LEGACY
+            self._kd_max = _MA_KD_MAX_LEGACY
+            self._t_max = _MA_T_MAX_LEGACY
+
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
     # ------------------------------------------------------------------ #
 
     async def enable(self) -> None:
+        # Detect firmware version + model so the MIT command and feedback decode
+        # use the ranges this motor's firmware actually implements. If the motor
+        # doesn't answer, keep the conservative legacy ranges set in __init__.
+        try:
+            await self._detect_capabilities()
+        except MotorError:
+            pass
         await self._request(self._cmd(_MA_RELEASE_BRAKE))
+
+    async def get_firmware_version(self) -> int | None:
+        return await self._read_firmware_version()
+
+    async def get_model(self) -> str | None:
+        return await self._read_model()
 
     async def disable(self) -> None:
         await self._request(self._cmd(_MA_SHUTDOWN))
@@ -339,15 +449,6 @@ class MyActuatorMotor(MotorDriver):
         await asyncio.sleep(_MA_RESET_SETTLE_S)
         self._motor_id = can_id
 
-    async def set_can_baud_rate(self, baud_rate: int) -> None:
-        code = _MA_BAUD_MAP.get(baud_rate)
-        if code is None:
-            raise MotorError(
-                f"Unsupported baud rate {baud_rate}. Supported: {sorted(_MA_BAUD_MAP)}"
-            )
-        data = bytes([_MA_SET_CAN_BAUD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, code])
-        await self._bus._send(_MA_REQ + self._motor_id, data)
-
     async def set_impedance(
         self,
         p_des: float,
@@ -356,11 +457,11 @@ class MyActuatorMotor(MotorDriver):
         kd: float,
         t_ff: float,
     ) -> None:
-        p_u = _float_to_uint(p_des, _MA_P_MIN, _MA_P_MAX, 16)
-        v_u = _float_to_uint(v_des, _MA_V_MIN, _MA_V_MAX, 12)
-        kp_u = _float_to_uint(kp, _MA_KP_MIN, _MA_KP_MAX, 12)
-        kd_u = _float_to_uint(kd, _MA_KD_MIN, _MA_KD_MAX, 12)
-        t_u = _float_to_uint(t_ff, _MA_T_MIN, _MA_T_MAX, 12)
+        p_u = _float_to_uint(p_des, -self._p_max, self._p_max, 16)
+        v_u = _float_to_uint(v_des, -_MA_V_MAX, _MA_V_MAX, 12)
+        kp_u = _float_to_uint(kp, 0.0, _MA_KP_MAX, 12)
+        kd_u = _float_to_uint(kd, 0.0, self._kd_max, 12)
+        t_u = _float_to_uint(t_ff, -self._t_max, self._t_max, 12)
 
         data = bytes(
             [

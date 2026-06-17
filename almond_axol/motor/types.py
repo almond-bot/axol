@@ -33,6 +33,7 @@ class MotorStatus(Enum):
     OVERLOAD = "overload"
     MOTOR_STALL = "motor_stall"  # MyActuator only
     ENCODER_ERROR = "encoder_error"  # MyActuator only
+    CALIBRATION_ERROR = "calibration_error"  # MyActuator only
     POWER_OVERRUN = "power_overrun"  # MyActuator only
     SPEEDING = "speeding"  # MyActuator only
     UNKNOWN = "unknown"

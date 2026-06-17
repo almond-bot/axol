@@ -155,6 +155,22 @@ class Motor:
         """
         return await self._driver.get_control_mode()
 
+    async def get_firmware_version(self) -> int | None:
+        """Return the motor firmware version, or None if unsupported.
+
+        MyActuator: the VersionDate (uint32, e.g. ``2026042402``) read via 0xB2.
+        Damiao: None — not exposed by the protocol.
+        """
+        return await self._driver.get_firmware_version()
+
+    async def get_model(self) -> str | None:
+        """Return the motor model string, or None if unsupported.
+
+        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``).
+        Damiao: None — not exposed by the protocol.
+        """
+        return await self._driver.get_model()
+
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
         if self._telemetry_task is not None:
@@ -346,20 +362,6 @@ class Motor:
             can_id: New CAN ID for the motor.
         """
         await self._driver.set_can_id(can_id)
-
-    async def set_can_baud_rate(self, baud_rate: int) -> None:
-        """Change the motor's CAN baud rate and persist it to flash.
-
-        The motor must be power-cycled for the new baud rate to take effect.
-
-        Args:
-            baud_rate: Baud rate in bps. Supported values:
-                       MyActuator — 500_000, 1_000_000
-                       Damiao     — 125_000, 200_000, 250_000, 500_000,
-                                    1_000_000, 2_000_000, 2_500_000,
-                                    3_200_000, 4_000_000, 5_000_000
-        """
-        await self._driver.set_can_baud_rate(baud_rate)
 
     async def set_impedance(
         self,
