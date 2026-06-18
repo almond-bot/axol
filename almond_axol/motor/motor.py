@@ -34,20 +34,20 @@ class _JointConfig:
 
     kind: _MotorType
     motor_id: int
-    kt: float
+    kt: float = 0
 
 
 _ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
 
 _JOINT_CONFIG: dict[Joint, _JointConfig] = {
-    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01, kt=2.4),
-    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02, kt=2.4),
-    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=2.1),
-    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=2.1),
-    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=2.1),
-    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06, kt=0.945),
-    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07, kt=0.945),
-    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08, kt=0.945),
+    Joint.SHOULDER_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x01, kt=2),
+    Joint.SHOULDER_2: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x02, kt=2),
+    Joint.SHOULDER_3: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x03, kt=1.5),
+    Joint.ELBOW: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x04, kt=1.5),
+    Joint.WRIST_1: _JointConfig(_MotorType.MYACTUATOR, motor_id=0x05, kt=1.5),
+    Joint.WRIST_2: _JointConfig(_MotorType.DAMIAO, motor_id=0x06),
+    Joint.WRIST_3: _JointConfig(_MotorType.DAMIAO, motor_id=0x07),
+    Joint.GRIPPER: _JointConfig(_MotorType.DAMIAO, motor_id=0x08),
 }
 
 
@@ -155,6 +155,22 @@ class Motor:
         """
         return await self._driver.get_control_mode()
 
+    async def get_firmware_version(self) -> int | None:
+        """Return the motor firmware version, or None if unsupported.
+
+        MyActuator: the VersionDate (uint32, e.g. ``2026042402``) read via 0xB2.
+        Damiao: None — not exposed by the protocol.
+        """
+        return await self._driver.get_firmware_version()
+
+    async def get_model(self) -> str | None:
+        """Return the motor model string, or None if unsupported.
+
+        MyActuator: the model string read via 0xB5 (e.g. ``"X8S2V"``).
+        Damiao: None — not exposed by the protocol.
+        """
+        return await self._driver.get_model()
+
     async def get_position(self) -> float:
         """Return current shaft position in radians."""
         if self._telemetry_task is not None:
@@ -211,6 +227,11 @@ class Motor:
                 pass  # Dropped CAN frames are normal on physical buses; skip cycle
             elapsed = asyncio.get_event_loop().time() - start
             await asyncio.sleep(max(0.0, interval - elapsed))
+
+    @property
+    def has_position(self) -> bool:
+        """True once a position has been cached by telemetry or a set_impedance() response."""
+        return self._position is not None
 
     @property
     def position(self) -> float:
@@ -341,20 +362,6 @@ class Motor:
             can_id: New CAN ID for the motor.
         """
         await self._driver.set_can_id(can_id)
-
-    async def set_can_baud_rate(self, baud_rate: int) -> None:
-        """Change the motor's CAN baud rate and persist it to flash.
-
-        The motor must be power-cycled for the new baud rate to take effect.
-
-        Args:
-            baud_rate: Baud rate in bps. Supported values:
-                       MyActuator — 500_000, 1_000_000
-                       Damiao     — 125_000, 200_000, 250_000, 500_000,
-                                    1_000_000, 2_000_000, 2_500_000,
-                                    3_200_000, 4_000_000, 5_000_000
-        """
-        await self._driver.set_can_baud_rate(baud_rate)
 
     async def set_impedance(
         self,

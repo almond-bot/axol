@@ -65,11 +65,17 @@ async def _run(args: argparse.Namespace) -> None:
             voltage = await motor.get_voltage()
             status = await motor.get_error_code()
             control_mode = await motor.get_control_mode()
+            firmware = await motor.get_firmware_version()
+            model = await motor.get_model()
         except Exception as e:
             print(f"  ERROR: could not read motor — {e}")
             print("  Check that the motor is powered and the CAN ID is correct.")
             return
 
+        if model is not None:
+            print(f"  model       {model}")
+        if firmware is not None:
+            print(f"  firmware    {firmware}")
         print(f"  status      {status.value}")
         if control_mode is not None:
             print(f"  mode        {control_mode.name}")
