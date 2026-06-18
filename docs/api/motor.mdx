@@ -37,6 +37,8 @@ asyncio.run(main())
 | `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
 | `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
+| `get_model()` | Motor model string, e.g. `"X8S2V"` (`None` for Damiao) |
+| `get_firmware_version()` | Firmware VersionDate `int`, e.g. `2026042402` (`None` for Damiao) |
 | `get_position()` | Shaft position (rad); raises if telemetry is active |
 | `get_velocity()` | Shaft velocity (rad/s) |
 | `get_torque()` | Torque estimate (Nm); raises if telemetry is active |
@@ -52,6 +54,7 @@ asyncio.run(main())
 | `set_can_id(can_id)` | Change CAN ID (persisted to flash) |
 | `start_telemetry(hz, torque=False)` / `stop_telemetry()` | Background polling loop |
 | `motor.position` | Cached position (rad); populated by telemetry or `set_impedance` responses |
+| `motor.has_position` | `True` once a position has been cached (i.e. telemetry has warmed up) |
 | `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
 
 ## `ControlMode` values
@@ -65,7 +68,7 @@ asyncio.run(main())
 
 ## `MotorStatus` values
 
-`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `UNKNOWN`
+`OK`, `DISABLED`, `OVER_VOLTAGE`, `UNDER_VOLTAGE`, `OVER_CURRENT`, `OVER_TEMPERATURE`, `MOS_OVER_TEMP`, `ROTOR_OVER_TEMP`, `LOST_COMM`, `OVERLOAD`, `MOTOR_STALL`\*, `ENCODER_ERROR`\*, `CALIBRATION_ERROR`\*, `POWER_OVERRUN`\*, `SPEEDING`\*, `UNKNOWN`
 
 \* MyActuator only
 

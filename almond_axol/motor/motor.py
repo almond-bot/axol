@@ -30,11 +30,15 @@ class _MotorType(Enum):
 
 @dataclass(frozen=True)
 class _JointConfig:
-    """Per-joint motor configuration: vendor type, default CAN ID, and torque constant."""
+    """Per-joint motor configuration: vendor type, default CAN ID, and torque constant.
+
+    ``kt`` is the MyActuator current→torque constant (Nm/A); Damiao joints leave
+    it at the default because they report torque directly in feedback frames.
+    """
 
     kind: _MotorType
     motor_id: int
-    kt: float = 0
+    kt: float = 0.0
 
 
 _ID_TO_TYPE: dict[int, _MotorType] = {}  # populated after _JOINT_CONFIG is defined
@@ -55,13 +59,15 @@ _ID_TO_TYPE = {cfg.motor_id: cfg.kind for cfg in _JOINT_CONFIG.values()}
 
 
 def make_driver(
-    bus: CanBus, motor_id: int, kt: float, motor_type: str | None = None
+    bus: CanBus, motor_id: int, kt: float = 0.0, motor_type: str | None = None
 ) -> MotorDriver:
     """Return the correct MotorDriver for *motor_id*.
 
     Args:
-        kt:         Torque constant (Nm/A). Used by ``get_torque()`` to convert
-                    raw current readings to Nm.
+        kt:         Torque constant (Nm/A). MyActuator only — used by
+                    ``get_torque()`` to convert its raw current readings to Nm.
+                    Ignored for Damiao, which reports torque directly, so it can
+                    be omitted when building a Damiao driver.
         motor_type: ``"myactuator"`` or ``"damiao"`` to override inference.
                     If ``None``, the type is inferred from *motor_id*.
     """
@@ -77,7 +83,7 @@ def make_driver(
     if kind == _MotorType.MYACTUATOR:
         return MyActuatorMotor(bus, motor_id, kt=kt)
     elif kind == _MotorType.DAMIAO:
-        return DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id, kt=kt)
+        return DamiaoMotor(bus, motor_id, feedback_id=0x10 + motor_id)
     else:
         raise ValueError(f"Unknown motor type {kind}")
 

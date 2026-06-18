@@ -49,6 +49,7 @@ asyncio.run(main())
 | `enable()` | Start CAN buses, enable all motors, calibrate grippers |
 | `disable()` | Disable all motors and close CAN buses |
 | `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
+| `wait_for_telemetry(timeout=5.0)` | Block until every motor has reported a position; call after `start_telemetry` before the first cached `positions` read |
 | `stop_telemetry()` | Stop background polling |
 | `clear_errors()` | Clear latched error flags on all motors |
 | `set_control_mode(mode)` | Set `ControlMode` on all motors |
