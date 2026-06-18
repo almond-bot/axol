@@ -101,10 +101,11 @@ class VRServer:
         receives one video track per source; frames are encoded on NVENC and
         sent entirely from gstreamer (``webrtcbin``).
 
-        Pass ``None`` or an empty dict to disable video. Requires the ``video``
-        extra (PyGObject) plus ``webrtcbin`` and NVENC; if unavailable this
-        logs a warning and leaves video disabled. Safe to call before or after
-        :meth:`enable`.
+        Pass ``None`` or an empty dict to disable video. Requires the
+        gstreamer WebRTC stack (PyGObject + ``webrtcbin`` + libnice + NVENC),
+        installed by ``axol gst.install`` (run once by the host installer); if
+        it is unavailable this logs a warning and leaves video disabled. Safe
+        to call before or after :meth:`enable`.
         """
         if not sources:
             self._webrtc = None
@@ -118,8 +119,8 @@ class VRServer:
         except Exception as exc:  # noqa: BLE001 - bindings missing
             _logger.warning(
                 "wrist video requested but the gstreamer WebRTC stack is "
-                "unavailable (%s); install the 'video' extra and webrtcbin. "
-                "Continuing without wrist video.",
+                "unavailable (%s); install it with `axol gst.install` (the "
+                "host installer runs this). Continuing without wrist video.",
                 exc,
             )
             self._webrtc = None

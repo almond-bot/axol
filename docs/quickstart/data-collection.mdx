@@ -7,7 +7,7 @@ Data collection runs entirely on **one machine** — the computer wired to the r
 
 ## Prerequisites
 
-- The `lerobot` and `video` extras installed. The [quick install](/installation#quick-install-recommended) includes both; on a development install run `uv sync --extra lerobot --extra video` (see [Installation](/installation)).
+- The `lerobot` extra installed and the GStreamer WebRTC stack (for relaying the cameras to the headset). The [quick install](/installation#quick-install-recommended) sets up both; on a development install run `uv sync --extra lerobot` and [`axol gst.install`](/cli/gst-install) (see [Installation](/installation)).
 - CAN set up ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
 - `pyzed` installed ([`zed.install`](/cli/zed-install)) and the three ZED cameras connected over GMSL, with their serial numbers on hand.
 
@@ -57,7 +57,7 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 | — | Right thumbstick | Flick to **switch camera view** (overhead / wrists / split); click to reset the screens — see [Camera views](/guides/vr-interface#camera-views) |
 
 <Note>
-  The camera feeds are relayed to the headset during collection (requires the `video` extra), so you can line up takes from the robot's point of view.
+  The camera feeds are relayed to the headset during collection (requires the GStreamer WebRTC stack, [`gst.install`](/cli/gst-install)), so you can line up takes from the robot's point of view.
 </Note>
 
 ## Recording an episode

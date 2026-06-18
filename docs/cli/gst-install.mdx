@@ -1,0 +1,18 @@
+---
+title: "gst.install"
+description: "Install the GStreamer-native WebRTC stack used to stream cameras to the headset."
+---
+
+Installs the GStreamer-native WebRTC stack that relays the ZED cameras to the headset during [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data): the system GStreamer plugins (`webrtcbin` from `gstreamer1.0-plugins-bad`, the `gstreamer1.0-nice` ICE plugin, the GObject-introspection typelibs) plus the **PyGObject** bindings.
+
+```bash
+axol gst.install
+```
+
+PyGObject is not a usable PyPI wheel — it builds against the system `gobject-introspection` and loads the system typelibs — so it can't be a normal dependency extra. This command `apt`-installs the system packages and then builds PyGObject into the interpreter running the CLI (the `uv` tool environment), the same way [`zed.install`](/cli/zed-install) installs `pyzed`. PyGObject is pinned to `>=3.50,<3.52`, the last series that targets the `girepository-1.0` ABI shipped on the Jetson's Ubuntu (newer releases require GLib ≥ 2.80).
+
+The [quick install](/installation#quick-install-recommended) runs this for you. It is **not** run at `teleop` / `serve` startup — those entry points just run; install (and the Jetson clock setup, [`jetson.setup`](/cli/jetson-setup)) is owned by the installer.
+
+<Note>
+  Best-effort and idempotent: it skips when the stack is already present, and is a no-op on machines without `apt-get` or the Jetson NVENC encoder (`nvv4l2h264enc`, which ships with the L4T BSP). The `apt` step needs root — run as root, or it prints the manual `apt-get install` command.
+</Note>

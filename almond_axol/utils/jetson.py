@@ -15,7 +15,8 @@ Two Tegra defaults trade latency for power/throughput and hurt us:
   matching ~30% (measured 79 Hz vs 113 Hz pinned).
 
 Pinning both to max fixes the latency / rate. Best-effort and cleared on
-reboot, so it runs at every relevant startup.
+reboot, so ``axol jetson.setup`` (which calls :func:`pin_realtime_clocks`) is
+run at boot from the host installer's systemd unit — not from teleop / serve.
 """
 
 from __future__ import annotations
@@ -142,8 +143,8 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     Pins NVENC/VIC (encode latency) and switches the CPUs to the
     ``performance`` governor (IK rate). Same best-effort / ``interactive``
     escalation semantics as :func:`pin_engine_clocks`; sudo is primed at
-    most once across both. Use from teleop / collect-data / serve startup,
-    where both the encoder and the control loops run.
+    most once across both. Invoked via ``axol jetson.setup`` (host installer +
+    boot service), not from the teleop / collect-data / serve entry points.
     """
     writer = _SysfsWriter(interactive=interactive)
     _pin_engines(writer)

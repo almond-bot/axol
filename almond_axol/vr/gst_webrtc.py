@@ -28,8 +28,9 @@ aiortc ``WebRTCManager`` (``create_offer`` / ``set_answer`` / ``close`` /
 out-of-process relay (``video_proc``).
 
 Requires PyGObject and the GStreamer ``webrtcbin`` (gst-plugins-bad), libnice
-(``gstreamer1.0-nice``), and the Jetson ``nvv4l2h264enc`` element; see
-:func:`almond_axol.utils.gst_webrtc_install.ensure_gst_webrtc` and
+(``gstreamer1.0-nice``), and the Jetson ``nvv4l2h264enc`` element. These are
+installed by ``axol gst.install`` (:mod:`almond_axol.cli.gst.install`), run
+once by the host installer — not at teleop/serve startup; see
 :func:`gst_webrtc_available`.
 """
 
@@ -38,8 +39,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
@@ -48,6 +51,29 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 _logger = logging.getLogger(__name__)
+
+# Where apt drops the GObject-introspection typelibs. PyGObject is installed
+# into the (uv tool) venv but loads these system typelibs; on most systems the
+# default search path already covers them, but we prepend defensively so the
+# import works regardless of how the venv interpreter was built. This is pure
+# process-local config (no privilege), not installation — see ``axol
+# gst.install`` (almond_axol.cli.gst.install) for the actual package install.
+_TYPELIB_DIRS = (
+    "/usr/lib/girepository-1.0",
+    f"/usr/lib/{os.uname().machine}-linux-gnu/girepository-1.0",
+    "/usr/lib/aarch64-linux-gnu/girepository-1.0",
+)
+
+
+def _set_typelib_path() -> None:
+    """Prepend the system typelib dirs to ``GI_TYPELIB_PATH`` for this process."""
+    existing = os.environ.get("GI_TYPELIB_PATH", "")
+    dirs = [d for d in _TYPELIB_DIRS if Path(d).is_dir()]
+    if not dirs:
+        return
+    parts = dirs + ([existing] if existing else [])
+    os.environ["GI_TYPELIB_PATH"] = os.pathsep.join(parts)
+
 
 # GStreamer modules are imported lazily (PyGObject may be installed on first
 # use); _ensure_init() populates these globals.
@@ -93,6 +119,7 @@ def _ensure_init() -> None:
     with _init_lock:
         if _initialized:
             return
+        _set_typelib_path()
         import gi
 
         gi.require_version("Gst", "1.0")

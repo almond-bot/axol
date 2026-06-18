@@ -13,7 +13,10 @@ set -euo pipefail
 
 INSTALL_URL="https://axol.almond.bot/install"
 REPO="git+https://github.com/almond-bot/axol"
-EXTRAS="lerobot,sim,video"
+# `video` is intentionally omitted: headset-video support is system-level
+# (GStreamer webrtcbin/libnice/NVENC + PyGObject), installed below by
+# `axol gst.install`, not via a PyPI extra (see pyproject.toml).
+EXTRAS="lerobot,sim"
 PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
@@ -66,38 +69,25 @@ else
     say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
 fi
 
-# -- zed-gstreamer ------------------------------------------------------------
+# -- GStreamer WebRTC (headset video) -----------------------------------------
 
-# Teleop streams cameras to the headset through Stereolabs' zed-gstreamer
-# plugins when they are present: frames stay in GPU memory from camera grab
-# through NVENC, cutting ~20 ms/frame versus the SDK relay. Jetson-only
-# (the pipeline uses the hardware encoder), and best-effort — without the
-# plugins teleop falls back to the SDK relay path.
-if [ -d /usr/local/zed ] && [ -e /etc/nv_tegra_release ]; then
-    if gst-inspect-1.0 zedxonesrc >/dev/null 2>&1; then
-        say "zed-gstreamer plugins already installed."
-    else
-        say "Building the zed-gstreamer camera plugins (GPU-resident relay)..."
-        if (
-            set -e
-            apt-get update -qq
-            apt-get install -y -qq git cmake build-essential \
-                libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-                gstreamer1.0-tools
-            rm -rf /tmp/zed-gstreamer
-            git clone --depth 1 https://github.com/stereolabs/zed-gstreamer.git /tmp/zed-gstreamer
-            cmake -S /tmp/zed-gstreamer -B /tmp/zed-gstreamer/build -DCMAKE_BUILD_TYPE=Release
-            make -C /tmp/zed-gstreamer/build install
-            rm -rf /tmp/zed-gstreamer
-        ); then
-            say "zed-gstreamer plugins installed."
-        else
-            say "WARNING: zed-gstreamer build failed; teleop will use the (slower) SDK relay."
-        fi
-    fi
-else
-    say "Not a Jetson with the ZED SDK; skipping the zed-gstreamer plugins."
-fi
+# Teleop and collect-data relay the ZED cameras to the headset over WebRTC:
+# frames are grabbed with the ZED SDK, encoded on the Jetson's NVENC, and sent
+# straight from GStreamer (webrtcbin) — no encoded frames return to Python.
+# `axol gst.install` apt-installs the webrtcbin / libnice / introspection
+# packages and builds PyGObject into the axol environment. (NVENC's
+# nvv4l2h264enc ships with the Jetson L4T BSP.)
+say "Installing the GStreamer WebRTC stack (headset video)..."
+axol gst.install || say "WARNING: gst.install failed; headset video may be unavailable. Re-run 'axol gst.install'."
+
+# -- Jetson clocks ------------------------------------------------------------
+
+# Pin the NVENC/VIC engine clocks (encode latency) and the CPU governor (IK
+# loop rate). These reset on reboot, so the systemd unit below re-pins them at
+# every boot via ExecStartPre; do it once now too so it takes effect without a
+# reboot. No-op off a Jetson.
+say "Pinning Jetson clocks for the real-time loops..."
+axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
 
 # -- systemd service ----------------------------------------------------------
 
@@ -109,6 +99,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
+# '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
+ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3

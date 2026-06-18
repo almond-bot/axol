@@ -19,7 +19,6 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
-from ..utils.jetson import pin_realtime_clocks
 from .config import TeleopCmdConfig, parse
 
 if TYPE_CHECKING:
@@ -65,18 +64,9 @@ def main(argv: list[str]) -> None:
     # and silently drop log_say() / INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    # Pin the Jetson clocks now, while a sudo prompt can still reach the tty
-    # (mid-session escalation is non-interactive): the CPU governor for the
-    # IK loop rate, and — when cameras stream — the NVENC/VIC engines for
-    # encode latency.
-    pin_realtime_clocks(interactive=True)
-
-    # Ensure the gstreamer WebRTC bindings (PyGObject + webrtcbin) are present
-    # so the headset video relay can run; best-effort install if missing.
-    if cfg.cameras:
-        from ..utils.gst_webrtc_install import ensure_gst_webrtc
-
-        ensure_gst_webrtc()
+    # System setup (Jetson clock pinning, GStreamer WebRTC install) is handled
+    # by the host installer + its boot service, not here — see
+    # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
     hostname = socket.gethostname()
     local_ip = _get_local_ip()

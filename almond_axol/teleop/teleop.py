@@ -296,10 +296,12 @@ class VRTeleop:
     def set_video_sources(self, sources: dict[str, object] | None) -> None:
         """Stream camera frames to the headset via WebRTC.
 
-        Each source is a callable returning the latest RGB ``uint8`` numpy
-        frame ``(H, W, 3)`` or ``None``. Must be called after :meth:`enable`
-        (so the VR server exists). Safe to call from any thread. Requires the
-        ``video`` extra; without it video is silently disabled.
+        Each source is a connected camera matching the ``FrameSource``
+        protocol (``width`` / ``height`` / ``fps`` / ``wait_next``); see
+        :meth:`almond_axol.vr.server.VRServer.set_video_sources`. Must be
+        called after :meth:`enable` (so the VR server exists). Safe to call
+        from any thread. Requires the GStreamer WebRTC stack (``axol
+        gst.install``); without it video is silently disabled.
         """
         self._vr_server.set_video_sources(sources)  # type: ignore[arg-type]
 

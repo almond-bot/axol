@@ -48,20 +48,26 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --cameras`, `collect-data`) |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
-uv sync --extra lerobot --extra sim --extra video   # teleoperation + data collection
-uv sync --extra lerobot --extra cuda                # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra video --extra cuda   # everything
+uv sync --extra lerobot --extra sim          # teleoperation + data collection
+uv sync --extra lerobot --extra cuda         # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra cuda   # everything
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
 
 ```bash
 axol zed.install
+```
+
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) uses a GStreamer-native WebRTC pipeline (system GStreamer plugins + PyGObject), so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+
+```bash
+axol gst.install
+axol jetson.setup   # Jetson only; no-op elsewhere
 ```
 
 Before using any motor or robot commands, initialize the CAN hardware:
@@ -114,6 +120,8 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
+- [`gst.install`](https://docs.almond.bot/cli/gst-install)
+- [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)

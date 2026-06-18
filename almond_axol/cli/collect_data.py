@@ -34,7 +34,6 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
-from ..utils.jetson import pin_realtime_clocks
 from .config import LogLevel, parse
 
 if TYPE_CHECKING:
@@ -292,17 +291,9 @@ def main(argv: list[str]) -> None:
     # no-op and silently drop every log_say() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    # Pin the Jetson clocks now, while a sudo prompt can still reach the tty
-    # (mid-session escalation is non-interactive): the CPU governor for the
-    # IK loop rate, and — when cameras stream — the NVENC/VIC engines for
-    # encode latency.
-    pin_realtime_clocks(interactive=True)
-
-    # Ensure the gstreamer WebRTC bindings (PyGObject + webrtcbin) are present
-    # for the headset preview; best-effort install if missing.
-    from ..utils.gst_webrtc_install import ensure_gst_webrtc
-
-    ensure_gst_webrtc()
+    # System setup (Jetson clock pinning, GStreamer WebRTC install) is handled
+    # by the host installer + its boot service, not here — see
+    # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
     _run(cfg)
 

@@ -21,7 +21,8 @@ This:
 
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already installed.
 - Installs the `axol` CLI from GitHub as a `uv` tool (Python 3.13 included), with every dependency extra except `cuda` and `dev`.
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup and restarts it automatically if it ever goes down.
+- Sets up the headset-video stack ([`gst.install`](/cli/gst-install)) and, on a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)).
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup (re-pinning the Jetson clocks first) and restarts it automatically if it ever goes down.
 
 When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — no terminal needed from then on. The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. (Re-running the install command also upgrades.)
 
@@ -60,15 +61,18 @@ Install optional dependency groups as needed (the quick install above includes a
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `video` | aiortc | Streaming the ZED camera feeds to the headset over WebRTC (`teleop --cameras`, `collect-data`) — see [Camera views](/guides/vr-interface#camera-views) |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 | `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
-uv sync --extra lerobot --extra sim --extra video   # teleoperation + data collection
-uv sync --extra lerobot --extra cuda                # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra video --extra cuda   # everything
+uv sync --extra lerobot --extra sim          # teleoperation + data collection
+uv sync --extra lerobot --extra cuda         # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra cuda   # everything
 ```
+
+<Note>
+  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs system GStreamer plugins plus PyGObject. Install it with [`axol gst.install`](/cli/gst-install); see [Headset video](#headset-video-gstreamer-webrtc) below.
+</Note>
 
 ## ZED Python bindings
 
@@ -79,6 +83,22 @@ axol zed.install
 ```
 
 See [`zed.install`](/cli/zed-install) for details.
+
+## Headset video (GStreamer WebRTC)
+
+Relaying the ZED cameras to the headset (`teleop --cameras`, `collect-data`) uses a GStreamer-native WebRTC pipeline — frames are grabbed with the ZED SDK, encoded on the Jetson's NVENC, and sent straight from GStreamer. This needs system GStreamer plugins (`webrtcbin`, libnice) and **PyGObject**, which builds against the system libraries and so can't be a normal PyPI extra. Install it once:
+
+```bash
+axol gst.install
+```
+
+On a Jetson, also pin the NVENC/VIC clocks for low-latency encode (the quick install does this at boot via systemd):
+
+```bash
+axol jetson.setup
+```
+
+The quick install runs both for you. See [`gst.install`](/cli/gst-install) and [`jetson.setup`](/cli/jetson-setup).
 
 ## Web control panel (optional)
 
