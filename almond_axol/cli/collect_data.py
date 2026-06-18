@@ -298,6 +298,12 @@ def main(argv: list[str]) -> None:
     # encode latency.
     pin_realtime_clocks(interactive=True)
 
+    # Ensure the gstreamer WebRTC bindings (PyGObject + webrtcbin) are present
+    # for the headset preview; best-effort install if missing.
+    from ..utils.gst_webrtc_install import ensure_gst_webrtc
+
+    ensure_gst_webrtc()
+
     _run(cfg)
 
 

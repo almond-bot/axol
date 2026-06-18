@@ -1,19 +1,22 @@
-"""Out-of-process WebRTC video relay (Jetson gst-native cameras).
+"""Out-of-process WebRTC video relay (ZED SDK grab + gstreamer webrtcbin).
 
 Sending video from inside the teleop process measurably starves the
-control loops: aiortc pushes thousands of RTP packets per second through
-Python (packetize, SRTP, sendto), and that GIL traffic stretches the IK
-round-trip from ~9 ms to ~23 ms the moment a headset connects. The same
-isolation pattern used for the IK solver applies here — video runs in a
-dedicated subprocess and the control process never touches it.
+control loops: pushing thousands of RTP packets per second plus encoding
+is real CPU/GIL work, and it stretches the IK round-trip the moment a
+headset connects. The same isolation pattern used for the IK solver
+applies here — video runs in a dedicated subprocess and the control
+process never touches it.
 
-The subprocess owns the gst-native camera pipelines (``gst_zed``) and a
-``WebRTCManager``; WebRTC media flows over its own UDP sockets, so the
-only traffic crossing the process boundary is SDP signaling (a few
-messages per headset connection) over a ``multiprocessing`` pipe.
+The subprocess owns the ZED cameras (opened with the Python SDK, exactly
+like data collection), grabs frames on per-camera threads, and pushes them
+into a :class:`~almond_axol.vr.gst_webrtc.GstWebRTCManager` that encodes on
+NVENC and sends WebRTC entirely from gstreamer (``webrtcbin``). WebRTC
+media flows over the subprocess's own UDP sockets, so the only traffic
+crossing the process boundary is SDP signaling (a few messages per headset
+connection) over a ``multiprocessing`` pipe.
 
 :class:`VideoRelayProcess` is the parent-side handle. It implements the
-same async interface as ``WebRTCManager`` (``create_offer`` /
+same async interface as ``GstWebRTCManager`` (``create_offer`` /
 ``set_answer`` / ``close`` / ``close_all`` / ``has_sources``), so
 ``VRServer.set_video_manager`` can use it as a drop-in.
 """
@@ -40,6 +43,43 @@ _REQUEST_TIMEOUT_S = 15.0
 # ---------------------------------------------------------------------------
 
 
+def _open_sdk_camera(name: str, spec: dict) -> object | None:
+    """Open one ZED camera with the Python SDK, preferring 60 fps capture.
+
+    Returns the connected ``ZedCamera`` / ``ZedStereoCamera`` (or ``None`` if
+    the camera is absent). 60 fps halves frame staleness vs the GMSL 30 fps
+    default; cameras that reject it fall back to their default rate.
+    """
+    from ..lerobot.camera.camera_zed import ZedCamera, ZedStereoCamera
+    from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS, ZedCameraConfig
+
+    serial = spec["serial"]
+    resolution = spec.get("resolution") or "HD1200"
+    stereo = bool(spec.get("stereo"))
+    dims = ZED_RESOLUTION_DIMS.get(resolution)
+    width, height = dims if dims is not None else (None, None)
+    cls = ZedStereoCamera if stereo else ZedCamera
+    for fps in (spec.get("fps", 60), None):
+        cam = cls(
+            ZedCameraConfig(
+                serial=serial,
+                fps=fps,
+                width=width,
+                height=height,
+                stereo=stereo,
+            )
+        )
+        try:
+            cam.connect(warmup=False)
+            return cam
+        except RuntimeError as exc:  # live-param mismatch (e.g. 60 fps) → retry
+            _logger.info("video relay: %s rejected %s fps (%s)", name, fps, exc)
+        except Exception as exc:  # noqa: BLE001 - camera absent → skip it
+            _logger.warning("video relay: %s failed to open (%s)", name, exc)
+            return None
+    return None
+
+
 def _relay_main(
     conn: multiprocessing.connection.Connection,
     cameras: dict[str, dict],
@@ -48,45 +88,29 @@ def _relay_main(
     """Relay subprocess entry point: open cameras, serve signaling requests."""
     logging.basicConfig(level=log_level)
 
-    from .gst_zed import ZedXOneGstStream, ZedXStereoGstStream
-    from .video import WebRTCManager
+    from ..cli.teleop import _ZedFrameSource
+    from .gst_webrtc import GstWebRTCManager
 
-    # Keep the stream objects alive for the relay's lifetime; ``sources``
-    # maps the per-track names the headset sees to the eye/camera channels.
-    owned: list[ZedXOneGstStream | ZedXStereoGstStream] = []
+    # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
+    # the per-track names the headset sees to a frame source per camera/eye.
+    owned: list[object] = []
     sources: dict[str, object] = {}
     for name, spec in cameras.items():
-        resolution = spec.get("resolution", "HD1200")
-        fps = spec.get("fps", 60)
-        try:
-            if spec.get("stereo"):
-                # One camera, two encoded eyes -> overhead_left / overhead_right.
-                stereo = ZedXStereoGstStream(spec["serial"], resolution, fps)
-                if not stereo.wait_ready():
-                    _logger.warning(
-                        "video relay: %s stereo produced no frames; skipping", name
-                    )
-                    stereo.close()
-                    continue
-                owned.append(stereo)
-                sources[f"{name}_left"] = stereo.left_view
-                sources[f"{name}_right"] = stereo.right_view
-            else:
-                mono = ZedXOneGstStream(spec["serial"], resolution, fps)
-                if not mono.wait_ready():
-                    _logger.warning(
-                        "video relay: %s produced no frames; skipping", name
-                    )
-                    mono.close()
-                    continue
-                owned.append(mono)
-                sources[name] = mono
-        except Exception as exc:  # noqa: BLE001 - bad spec / spawn failure
-            _logger.warning("video relay: %s failed to start (%s)", name, exc)
+        cam = _open_sdk_camera(name, spec)
+        if cam is None:
             continue
+        owned.append(cam)
+        if spec.get("stereo"):
+            # One camera, two eyes -> overhead_left / overhead_right.
+            sources[f"{name}_left"] = _ZedFrameSource(cam.left_view)
+            sources[f"{name}_right"] = _ZedFrameSource(cam.right_view)
+        else:
+            sources[name] = _ZedFrameSource(cam)
 
-    manager = WebRTCManager(sources)
+    manager = GstWebRTCManager(sources) if sources else None
     conn.send(("ready", sorted(sources)))
+    if manager is None:
+        _logger.warning("video relay opened no cameras; nothing to stream")
 
     async def serve() -> None:
         loop = asyncio.get_running_loop()
@@ -101,29 +125,38 @@ def _relay_main(
             try:
                 if kind == "offer":
                     _, client_id = msg
+                    if manager is None:
+                        conn.send(("offer_err", client_id, "no cameras"))
+                        continue
                     try:
                         sdp, tracks = await manager.create_offer(client_id)
                         conn.send(("offer_ok", client_id, sdp, tracks))
                     except Exception as exc:  # noqa: BLE001 - report upstream
                         _logger.error("video relay: offer failed: %s", exc)
                         conn.send(("offer_err", client_id, str(exc)))
-                elif kind == "answer":
+                elif kind == "answer" and manager is not None:
                     _, client_id, sdp = msg
                     await manager.set_answer(client_id, sdp)
-                elif kind == "close":
+                elif kind == "close" and manager is not None:
                     _, client_id = msg
                     await manager.close(client_id)
-                elif kind == "close_all":
+                elif kind == "close_all" and manager is not None:
                     await manager.close_all()
             except Exception as exc:  # noqa: BLE001 - keep serving
                 _logger.error("video relay: error handling %s: %s", kind, exc)
-        await manager.close_all()
+        if manager is not None:
+            await manager.close_all()
 
     try:
         asyncio.run(serve())
     finally:
-        for stream in owned:
-            stream.close()
+        if manager is not None:
+            manager.shutdown()
+        for cam in owned:
+            try:
+                cam.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
 
 
 # ---------------------------------------------------------------------------

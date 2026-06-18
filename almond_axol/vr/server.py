@@ -45,7 +45,7 @@ from .config import VRServerConfig
 from .models import VRFrame
 
 if TYPE_CHECKING:
-    from .video import FrameSource, WebRTCManager
+    from .gst_webrtc import FrameSource, GstWebRTCManager
 
 _logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class VRServer:
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
-        self._webrtc: WebRTCManager | None = None
+        self._webrtc: GstWebRTCManager | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -94,29 +94,36 @@ class VRServer:
     def set_video_sources(self, sources: dict[str, FrameSource] | None) -> None:
         """Register per-camera RGB frame sources to stream to the headset.
 
-        Each source is a callable returning the latest RGB ``uint8`` numpy frame
-        ``(H, W, 3)`` or ``None`` if no frame is available yet. The headset
+        Each source is a connected camera (or stereo eye) exposing fixed
+        ``width`` / ``height`` / ``fps`` and ``wait_next`` (see
+        :class:`~almond_axol.vr.gst_webrtc.FrameSource`). The headset
         negotiates a WebRTC connection over the existing ``/ws`` channel and
-        receives one video track per source.
+        receives one video track per source; frames are encoded on NVENC and
+        sent entirely from gstreamer (``webrtcbin``).
 
         Pass ``None`` or an empty dict to disable video. Requires the ``video``
-        extra (aiortc); if it is unavailable this logs a warning and leaves
-        video disabled. Safe to call before or after :meth:`enable`.
+        extra (PyGObject) plus ``webrtcbin`` and NVENC; if unavailable this
+        logs a warning and leaves video disabled. Safe to call before or after
+        :meth:`enable`.
         """
         if not sources:
             self._webrtc = None
             return
         try:
-            from .video import WebRTCManager
-        except ImportError as exc:
+            from .gst_webrtc import GstWebRTCManager, gst_webrtc_available
+
+            if not gst_webrtc_available():
+                raise RuntimeError("webrtcbin / NVENC / PyGObject unavailable")
+            self._webrtc = GstWebRTCManager(sources)
+        except Exception as exc:  # noqa: BLE001 - bindings missing
             _logger.warning(
-                "wrist video requested but aiortc is unavailable (%s); install "
-                "the 'video' extra. Continuing without wrist video.",
+                "wrist video requested but the gstreamer WebRTC stack is "
+                "unavailable (%s); install the 'video' extra and webrtcbin. "
+                "Continuing without wrist video.",
                 exc,
             )
             self._webrtc = None
             return
-        self._webrtc = WebRTCManager(sources)
         _logger.info("wrist video enabled for: %s", ", ".join(sources))
 
     def set_video_manager(self, manager: Any | None) -> None:

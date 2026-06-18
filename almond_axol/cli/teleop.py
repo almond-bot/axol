@@ -71,6 +71,13 @@ def main(argv: list[str]) -> None:
     # encode latency.
     pin_realtime_clocks(interactive=True)
 
+    # Ensure the gstreamer WebRTC bindings (PyGObject + webrtcbin) are present
+    # so the headset video relay can run; best-effort install if missing.
+    if cfg.cameras:
+        from ..utils.gst_webrtc_install import ensure_gst_webrtc
+
+        ensure_gst_webrtc()
+
     hostname = socket.gethostname()
     local_ip = _get_local_ip()
     print("Connect the VR app (https://axol.almond.bot) to this machine:")
@@ -98,47 +105,33 @@ def _overhead_is_stereo(cfg: TeleopCmdConfig) -> bool:
 def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
-    The relay subprocess owns the gst-native camera pipelines and all
-    WebRTC sending, so video traffic can't contend with the teleop control
-    loops for the GIL (in-process sending measurably halves the IK rate).
-    A stereo overhead streams through ``zedsrc`` (both eyes encoded on the
-    GPU) when the stereo plugin is present; otherwise it stays on the SDK
-    path. Returns ``None`` when no camera can use the relay (no cameras,
-    plugins missing, or only an SDK-bound stereo overhead), in which case
-    the caller uses the in-process path.
+    The relay subprocess opens the ZED cameras with the Python SDK (exactly
+    like data collection), grabs frames on per-camera threads, and encodes
+    + sends WebRTC entirely from gstreamer (``webrtcbin``), so video traffic
+    can't contend with the teleop control loops (in-process sending
+    measurably halves the IK rate). Returns ``None`` when the relay can't be
+    used (no cameras, or the gstreamer WebRTC bindings are missing), in
+    which case the caller uses the in-process path.
     """
     if not cfg.cameras:
         return None
     try:
-        from ..vr.gst_zed import zed_gst_available, zed_stereo_gst_available
+        from ..vr.gst_webrtc import gst_webrtc_available
         from ..vr.video_proc import VideoRelayProcess
     except Exception as exc:  # noqa: BLE001 - video extra missing
         _logger.debug("video relay unavailable: %s", exc)
         return None
 
-    stereo_ok = zed_stereo_gst_available()
-    mono_ok = zed_gst_available()
-    resolution = cfg.resolution or "HD1200"
+    if not gst_webrtc_available():
+        return None
 
+    resolution = cfg.resolution or "HD1200"
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
-        is_stereo = name == "overhead" and overhead_stereo
-        if is_stereo and not stereo_ok:
-            continue  # falls back to the SDK path for the whole session
-        if not is_stereo and not mono_ok:
-            continue
-        spec: dict[str, Any] = {"serial": serial, "resolution": resolution}
-        if is_stereo:
+        spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
+        if name == "overhead" and overhead_stereo:
             spec["stereo"] = True
         specs[name] = spec
-
-    # If a stereo overhead is configured but the stereo plugin is missing,
-    # we can't relay it; fall back entirely so the SDK path renders it
-    # (the relay and SDK can't share the VR manager).
-    if overhead_stereo and "overhead" in cfg.cameras and not stereo_ok:
-        return None
-    if not specs:
-        return None
 
     relay = VideoRelayProcess(specs)
     if not relay.has_sources:
@@ -147,47 +140,18 @@ def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | Non
     return relay
 
 
-def _open_gst_stream(name: str, serial: int, resolution: str | None) -> Any | None:
-    """Open a camera through the GPU-resident gst-native pipeline, or None.
-
-    The zed-gstreamer path keeps frames on the GPU end to end (grab ->
-    NVENC, ~5 ms) and hands Python pre-encoded H.264, instead of the SDK
-    grab -> numpy -> pipe -> NVENC relay (~26 ms). Returns ``None`` when
-    the plugins are missing or the camera doesn't start, in which case the
-    caller falls back to the SDK path.
-    """
-    try:
-        from ..vr.gst_zed import ZedXOneGstStream, zed_gst_available
-    except Exception as exc:  # noqa: BLE001 - vr extras missing
-        _logger.debug("gst-native camera path unavailable: %s", exc)
-        return None
-    if not zed_gst_available():
-        return None
-    try:
-        stream = ZedXOneGstStream(serial, resolution=resolution or "HD1200")
-    except Exception as exc:  # noqa: BLE001 - bad resolution / spawn failure
-        _logger.info("teleop: %s gst pipeline failed to start (%s)", name, exc)
-        return None
-    if not stream.wait_ready():
-        _logger.info(
-            "teleop: %s gst pipeline produced no frames; trying the SDK path", name
-        )
-        stream.close()
-        return None
-    return stream
-
-
 def _connect_zed_cameras(
     cfg: TeleopCmdConfig, overhead_stereo: bool
 ) -> list[tuple[str, Any]]:
     """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
-    Mono cameras prefer the gst-native pre-encoded pipeline (see
-    :func:`_open_gst_stream`); stereo and fallback cases open a
-    :class:`ZedCamera` through the SDK. Slots whose camera is absent are
-    skipped (best-effort preview). Returns an empty list when no cameras
-    are configured or no backend is available. Runs synchronously (blocks
-    on camera startup), so call it off the event loop.
+    Opens each camera through the ZED Python SDK (:class:`ZedCamera`, or
+    :class:`ZedStereoCamera` for a stereo overhead). Used for the in-process
+    fallback when the relay subprocess can't run; the frames are encoded +
+    sent by an in-process :class:`GstWebRTCManager`. Slots whose camera is
+    absent are skipped (best-effort preview). Returns an empty list when no
+    cameras are configured or no backend is available. Runs synchronously
+    (blocks on camera startup), so call it off the event loop.
     """
     if not cfg.cameras:
         return []
@@ -254,7 +218,6 @@ def _connect_zed_cameras(
     for name, serial in cfg.cameras.items():
         # A stereo overhead carries both eyes on one grab; expose them as
         # overhead_left / overhead_right so the headset can render per-lens.
-        # (The gst-native path is mono-only, so stereo stays on the SDK.)
         if name == "overhead" and overhead_stereo:
             stereo = _connect(name, serial, stereo=True)
             if stereo is None:
@@ -263,7 +226,7 @@ def _connect_zed_cameras(
             cameras.append(("overhead_right", stereo.right_view))
             continue
 
-        cam = _open_gst_stream(name, serial, cfg.resolution) or _connect(name, serial)
+        cam = _connect(name, serial)
         if cam is None:
             continue
         cameras.append((name, cam))
@@ -284,6 +247,18 @@ class _ZedFrameSource:
 
     def __init__(self, cam: Any) -> None:
         self._cam = cam
+
+    @property
+    def width(self) -> int:
+        return int(self._cam.width or 0)
+
+    @property
+    def height(self) -> int:
+        return int(self._cam.height or 0)
+
+    @property
+    def fps(self) -> int:
+        return int(self._cam.fps or 30)
 
     def __call__(self) -> Any:
         try:
@@ -307,12 +282,9 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
     if not cameras:
         return
 
-    # gst-native streams (pre-encoded; expose subscribe()) go straight to
-    # the WebRTC manager; SDK cameras are wrapped as frame-driven sources.
-    sources = {
-        name: cam if hasattr(cam, "subscribe") else _ZedFrameSource(cam)
-        for name, cam in cameras
-    }
+    # SDK cameras are wrapped as frame-driven sources for the in-process
+    # GstWebRTCManager (NVENC encode + webrtcbin send).
+    sources = {name: _ZedFrameSource(cam) for name, cam in cameras}
     try:
         teleop.set_video_sources(sources)
         _logger.info("teleop: streaming cameras to headset: %s", ", ".join(sources))
