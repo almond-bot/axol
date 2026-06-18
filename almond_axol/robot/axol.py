@@ -215,6 +215,30 @@ class AxolArm:
         """Stop the background telemetry polling loop on all motors."""
         await asyncio.gather(*[m.stop_telemetry() for m in self.motors.values()])
 
+    async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
+        """Block until every motor has reported at least one position.
+
+        Call after :meth:`start_telemetry` and before the first read of
+        :attr:`positions`. Motors can take a while to answer their first
+        poll (MyActuator motors reboot during ``set_control_mode`` and may
+        still be coming back up), so a fixed sleep is not reliable.
+
+        Args:
+            timeout: Maximum time to wait (s) before raising MotorError.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while True:
+            missing = [j.name for j, m in self.motors.items() if not m.has_position]
+            if not missing:
+                return
+            if loop.time() >= deadline:
+                raise MotorError(
+                    f"No telemetry from {', '.join(missing)} after {timeout:.1f}s — "
+                    f"check power and CAN wiring"
+                )
+            await asyncio.sleep(0.01)
+
     @property
     def positions(self) -> np.ndarray:
         """Latest cached joint positions. Requires start_telemetry().
@@ -763,6 +787,22 @@ class Axol(RobotBase):
             tasks.append(self.left.stop_telemetry())
         if self.right is not None:
             tasks.append(self.right.stop_telemetry())
+        await asyncio.gather(*tasks)
+
+    async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
+        """Block until every motor on both arms has reported at least one position.
+
+        Call after :meth:`start_telemetry` and before the first read of the
+        cached ``positions``.
+
+        Args:
+            timeout: Maximum time to wait (s) before raising MotorError.
+        """
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.wait_for_telemetry(timeout))
+        if self.right is not None:
+            tasks.append(self.right.wait_for_telemetry(timeout))
         await asyncio.gather(*tasks)
 
     # ------------------------------------------------------------------ #

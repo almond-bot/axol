@@ -93,8 +93,9 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
         # and the gripper in POSITION_FORCE — both of which are the modes
         # ``gravity_compensate`` expects, so we don't touch control modes here.
         await axol.start_telemetry(cfg.telemetry_hz)
-        # Settle a few cycles so positions cache is populated before we drive.
-        await asyncio.sleep(max(0.05, 5.0 / cfg.telemetry_hz))
+        # Motors may still be rebooting from set_control_mode(); block until
+        # every motor has answered at least one telemetry poll before driving.
+        await axol.wait_for_telemetry()
 
         dt = 1.0 / cfg.rate_hz
         while True:
