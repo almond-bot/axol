@@ -20,7 +20,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### Quick install (recommended)
 
-One command installs `uv`, the `axol` CLI (from GitHub, with every extra except `cuda`/`dev`), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from GitHub, with every extra except `cuda`), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash

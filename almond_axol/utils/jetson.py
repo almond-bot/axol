@@ -36,6 +36,21 @@ _ENGINE_CLOCK_GLOBS = ("*.nvenc", "*.vic")
 # still caps the ceiling, so MAXN is assumed for the full benefit.
 _CPU_GOVERNOR = "performance"
 
+# Canonical L4T marker present on every Jetson. CPU-governor pinning is gated
+# on Jetson detection so ``jetson.setup`` on a non-Tegra Linux host never
+# touches that machine's system-wide cpufreq governor (engine pinning is
+# already implicitly Jetson-only — its devfreq globs are empty elsewhere).
+_JETSON_RELEASE = Path("/etc/nv_tegra_release")
+
+
+def _is_jetson() -> bool:
+    """True on NVIDIA Jetson (L4T) hardware, False on any other host."""
+    if _JETSON_RELEASE.exists():
+        return True
+    # Fallback: the encode engines we pin only exist on Tegra, so their
+    # presence also identifies a Jetson even if the release file is missing.
+    return any(Path("/sys/class/devfreq").glob(pattern) for pattern in _ENGINE_CLOCK_GLOBS)
+
 
 class _SysfsWriter:
     """Writes sysfs values, escalating to ``sudo`` once if needed.
@@ -95,7 +110,15 @@ def _pin_engines(writer: _SysfsWriter) -> None:
 
 
 def _pin_cpu(writer: _SysfsWriter) -> None:
-    """Switch every online CPU to the ``performance`` cpufreq governor."""
+    """Switch every online CPU to the ``performance`` cpufreq governor.
+
+    Jetson-only: gated on :func:`_is_jetson` so running ``jetson.setup`` on a
+    non-Tegra Linux host (which may also expose cpufreq) never changes that
+    machine's system-wide governor.
+    """
+    if not _is_jetson():
+        _logger.debug("not a Jetson; leaving the CPU cpufreq governor unchanged")
+        return
     pinned = 0
     failed: Path | None = None
     for cpu in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*")):
@@ -141,10 +164,13 @@ def pin_realtime_clocks(*, interactive: bool = False) -> None:
     """Pin engine **and** CPU clocks for the real-time control loops.
 
     Pins NVENC/VIC (encode latency) and switches the CPUs to the
-    ``performance`` governor (IK rate). Same best-effort / ``interactive``
-    escalation semantics as :func:`pin_engine_clocks`; sudo is primed at
-    most once across both. Invoked via ``axol jetson.setup`` (host installer +
-    boot service), not from the teleop / collect-data / serve entry points.
+    ``performance`` governor (IK rate). Both are Jetson-only: engine pinning
+    is a no-op without the Tegra devfreq nodes, and CPU-governor pinning is
+    gated on :func:`_is_jetson` so it never alters a non-Tegra host's
+    system-wide governor. Same best-effort / ``interactive`` escalation
+    semantics as :func:`pin_engine_clocks`; sudo is primed at most once across
+    both. Invoked via ``axol jetson.setup`` (host installer + boot service),
+    not from the teleop / collect-data / serve entry points.
     """
     writer = _SysfsWriter(interactive=interactive)
     _pin_engines(writer)

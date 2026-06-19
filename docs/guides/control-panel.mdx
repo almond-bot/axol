@@ -62,7 +62,7 @@ The server runs as root under the quick install's systemd service, so CAN bring-
 
 Data collection and policy inference also need the three ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
 
-The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. If the overhead is a **stereo ZED X**, tick the **Stereo** checkbox next to it — both eyes are then captured (and recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`).
+The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually; a stereo camera captures both eyes from one grab (recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`).
 
 The assignments persist in your browser and are sent along when you start an operation — collect data and run policy need all three slots; teleop streams whichever are assigned to the headset.
 
