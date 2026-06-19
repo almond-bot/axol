@@ -4,7 +4,7 @@
 #   curl https://axol.almond.bot/install -fsS | bash
 #
 # Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
-# except cuda/dev), installs the pyzed bindings when the ZED SDK is present,
+# except cuda), installs the pyzed bindings when the ZED SDK is present,
 # and registers a root systemd service that keeps `axol serve` running at
 # boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
