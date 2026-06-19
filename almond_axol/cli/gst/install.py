@@ -39,9 +39,10 @@ _logger = logging.getLogger(__name__)
 # cannot build here. Pin to the last 3.5x that targets girepository-1.0.
 _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
-# GStreamer elements the gst_zed pipeline relies on. zedxonesrc / zedsrc ship
-# with the zed-gstreamer plugins; nvvidconv / nvv4l2h264enc ship with the
-# Jetson L4T BSP (none of these are apt-installable here — verified + warned).
+# GStreamer elements the gst_zed pipeline relies on. zedxonesrc / zedsrc are
+# built + installed by ``axol gst.build-zed`` (patched for sensor-accurate
+# PTS); nvvidconv / nvv4l2h264enc ship with the Jetson L4T BSP (none of these
+# are apt-installable here — verified + warned).
 _REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc")
 
 # System packages: GStreamer introspection typelibs (Gst + GstApp/appsink) and

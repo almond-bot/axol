@@ -69,16 +69,27 @@ else
     say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
 fi
 
-# -- GStreamer NVENC (headset video) ------------------------------------------
+# -- GStreamer ZED camera pipeline (headset video + collection) ---------------
 
-# Teleop and collect-data relay the ZED cameras to the headset: frames are
-# grabbed with the ZED SDK, encoded on the Jetson's NVENC via GStreamer, and
-# sent over WebRTC with aiortc (a normal Python dependency). `axol gst.install`
-# apt-installs the GStreamer CLI tools + rawvideoparse (gst-plugins-bad) that
-# the encode subprocess drives. (NVENC's nvvidconv / nvv4l2h264enc ship with
-# the Jetson L4T BSP.)
-say "Installing the GStreamer NVENC stack (headset video)..."
+# Teleop and collect-data share one GPU-resident camera path: the zed-gstreamer
+# zedxonesrc/zedsrc elements grab straight into NVMM, NVENC encodes on the
+# Jetson, and aiortc (a normal Python dependency) forwards the pre-encoded
+# H.264 over WebRTC. `axol gst.install` apt-installs the GStreamer CLI tools and
+# PyGObject (the in-process appsink reader); NVENC's nvvidconv / nvv4l2h264enc
+# ship with the Jetson L4T BSP.
+say "Installing the GStreamer stack (PyGObject + NVENC)..."
 axol gst.install || say "WARNING: gst.install failed; headset video may be unavailable. Re-run 'axol gst.install'."
+
+# Build + install our patched zedxonesrc/zedsrc. A fresh Jetson has no
+# zed-gstreamer plugins (so the camera path would fall back to the slower ZED
+# SDK grab), and the stock plugins stamp each frame's PTS at host-receive time
+# rather than the true sensor-exposure instant (TIME_REFERENCE::IMAGE) -- which
+# is what lets collected image frames line up with joint samples. The patch
+# fixes both. Needs the ZED SDK + Jetson toolchain; a quick no-op otherwise.
+if [ -d /usr/local/zed ]; then
+    say "Building the patched zed-gstreamer plugins (sensor-accurate timestamps)..."
+    axol gst.build-zed || say "WARNING: gst.build-zed failed; the GPU camera path may be unavailable or use host-receive timestamps. Re-run 'axol gst.build-zed'."
+fi
 
 # -- Jetson clocks ------------------------------------------------------------
 

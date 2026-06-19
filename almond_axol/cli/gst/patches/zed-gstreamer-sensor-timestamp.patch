@@ -1,0 +1,167 @@
+diff --git a/gst-zed-src/gstzedsrc.cpp b/gst-zed-src/gstzedsrc.cpp
+index f3bad2c..8c9e416 100644
+--- a/gst-zed-src/gstzedsrc.cpp
++++ b/gst-zed-src/gstzedsrc.cpp
+@@ -3626,7 +3626,8 @@ static void gst_zedsrc_setup_runtime_parameters(GstZedSrc *src,
+     }
+ }
+ 
+-static void gst_zedsrc_attach_metadata(GstZedSrc *src, GstBuffer *buf, GstClockTime clock_time) {
++static void gst_zedsrc_attach_metadata(GstZedSrc *src, GstBuffer *buf, GstClockTime clock_time,
++                                       guint64 frame_age_ns) {
+     ZedInfo info;
+     ZedPose pose;
+     ZedSensors sens;
+@@ -3927,8 +3928,15 @@ static void gst_zedsrc_attach_metadata(GstZedSrc *src, GstBuffer *buf, GstClockT
+     // <---- Body Tracking metadata
+ 
+     // ----> Timestamp meta-data
+-    GST_BUFFER_TIMESTAMP(buf) =
+-        GST_CLOCK_DIFF(gst_element_get_base_time(GST_ELEMENT(src)), clock_time);
++    // Stamp at the sensor-capture instant: pipeline running-time at grab minus
++    // the frame's age since exposure (parity with the ZED SDK
++    // TIME_REFERENCE::IMAGE path) so image frames align with joint samples.
++    {
++        GstClockTime run_now =
++            GST_CLOCK_DIFF(gst_element_get_base_time(GST_ELEMENT(src)), clock_time);
++        GstClockTime age = (frame_age_ns > run_now) ? run_now : frame_age_ns;
++        GST_BUFFER_TIMESTAMP(buf) = run_now - age;
++    }
+     GST_BUFFER_DTS(buf) = GST_BUFFER_TIMESTAMP(buf);
+     GST_BUFFER_OFFSET(buf) = src->buffer_index++;
+     // <---- Timestamp meta-data
+@@ -3949,6 +3957,7 @@ static GstFlowReturn gst_zedsrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+     GstMapInfo minfo;
+     GstClock *clock = nullptr;
+     GstClockTime clock_time = GST_CLOCK_TIME_NONE;
++    guint64 frame_age_ns = 0;  // now - exposure (ZED clock), co-sampled below
+ 
+     gboolean mapped = FALSE;
+     GstFlowReturn flow_ret = GST_FLOW_OK;
+@@ -4039,6 +4048,11 @@ static GstFlowReturn gst_zedsrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+         clock_time = gst_clock_get_time(clock);
+         gst_object_unref(clock);
+         clock = nullptr;
++        sl::Timestamp cur_ts = src->zed.getTimestamp(sl::TIME_REFERENCE::CURRENT);
++        sl::Timestamp img_ts = src->zed.getTimestamp(sl::TIME_REFERENCE::IMAGE);
++        if (cur_ts.getNanoseconds() > img_ts.getNanoseconds()) {
++            frame_age_ns = cur_ts.getNanoseconds() - img_ts.getNanoseconds();
++        }
+     }
+     // <---- Clock update
+ 
+@@ -4097,7 +4111,7 @@ static GstFlowReturn gst_zedsrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+     }
+     // <---- Memory copy
+ 
+-    gst_zedsrc_attach_metadata(src, buf, clock_time);
++    gst_zedsrc_attach_metadata(src, buf, clock_time, frame_age_ns);
+ 
+ out:
+     if (mapped)
+@@ -4219,10 +4233,16 @@ static GstFlowReturn gst_zedsrc_create(GstPushSrc *psrc, GstBuffer **outbuf) {
+     }
+ 
+     // Get clock for timestamp
++    guint64 frame_age_ns = 0;  // now - exposure (ZED clock), co-sampled below
+     clock = gst_element_get_clock(GST_ELEMENT(src));
+     if (clock) {
+         clock_time = gst_clock_get_time(clock);
+         gst_object_unref(clock);
++        sl::Timestamp cur_ts = src->zed.getTimestamp(sl::TIME_REFERENCE::CURRENT);
++        sl::Timestamp img_ts = src->zed.getTimestamp(sl::TIME_REFERENCE::IMAGE);
++        if (cur_ts.getNanoseconds() > img_ts.getNanoseconds()) {
++            frame_age_ns = cur_ts.getNanoseconds() - img_ts.getNanoseconds();
++        }
+     }
+ 
+     // Retrieve RawBuffer - allocate on heap for GstBuffer lifecycle
+@@ -4471,7 +4491,7 @@ static GstFlowReturn gst_zedsrc_create(GstPushSrc *psrc, GstBuffer **outbuf) {
+     }
+ 
+     // Attach Unified Metadata
+-    gst_zedsrc_attach_metadata(src, buf, clock_time);
++    gst_zedsrc_attach_metadata(src, buf, clock_time, frame_age_ns);
+ 
+     cuCtxPopCurrent_v2(NULL);
+ 
+diff --git a/gst-zedxone-src/gstzedxonesrc.cpp b/gst-zedxone-src/gstzedxonesrc.cpp
+index bae049c..38bfe72 100644
+--- a/gst-zedxone-src/gstzedxonesrc.cpp
++++ b/gst-zedxone-src/gstzedxonesrc.cpp
+@@ -1848,6 +1848,7 @@ static GstFlowReturn gst_zedxonesrc_create(GstPushSrc *psrc, GstBuffer **outbuf)
+     sl::ERROR_CODE ret;
+     GstClock *clock = nullptr;
+     GstClockTime clock_time = GST_CLOCK_TIME_NONE;
++    guint64 frame_age_ns = 0;  // now - exposure (ZED clock); set below
+ 
+     // Acquisition start time
+     if (!src->_isStarted) {
+@@ -1874,6 +1875,14 @@ static GstFlowReturn gst_zedxonesrc_create(GstPushSrc *psrc, GstBuffer **outbuf)
+     if (clock) {
+         clock_time = gst_clock_get_time(clock);
+         gst_object_unref(clock);
++        // Co-sample the frame age (now - exposure) from the ZED clock, in the
++        // same instant as the pipeline clock, so the buffer can be stamped at
++        // the true sensor-capture time below.
++        sl::Timestamp cur_ts = src->_zed->getTimestamp(sl::TIME_REFERENCE::CURRENT);
++        sl::Timestamp img_ts = src->_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE);
++        if (cur_ts.getNanoseconds() > img_ts.getNanoseconds()) {
++            frame_age_ns = cur_ts.getNanoseconds() - img_ts.getNanoseconds();
++        }
+     }
+ 
+     // Retrieve RawBuffer - allocate on heap for GstBuffer lifecycle
+@@ -1955,8 +1964,14 @@ static GstFlowReturn gst_zedxonesrc_create(GstPushSrc *psrc, GstBuffer **outbuf)
+ 
+     // ----> Timestamp meta-data
+     if (GST_CLOCK_TIME_IS_VALID(clock_time)) {
+-        GST_BUFFER_TIMESTAMP(buf) =
++        // Stamp at the sensor-capture instant: pipeline running-time at grab
++        // minus the frame's age since exposure. Downstream maps this PTS back
++        // onto perf_counter so image frames align with joint samples (parity
++        // with the ZED SDK TIME_REFERENCE::IMAGE path).
++        GstClockTime run_now =
+             GST_CLOCK_DIFF(gst_element_get_base_time(GST_ELEMENT(src)), clock_time);
++        GstClockTime age = (frame_age_ns > run_now) ? run_now : frame_age_ns;
++        GST_BUFFER_TIMESTAMP(buf) = run_now - age;
+         GST_BUFFER_DTS(buf) = GST_BUFFER_TIMESTAMP(buf);
+     } else {
+         GST_WARNING_OBJECT(src, "No pipeline clock available, buffer will have no timestamp");
+@@ -1987,6 +2002,7 @@ static GstFlowReturn gst_zedxonesrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+     GstMapInfo minfo;
+     GstClock *clock;
+     GstClockTime clock_time;
++    guint64 frame_age_ns = 0;  // now - exposure (ZED clock); set below
+ 
+     if (!src->_isStarted) {
+         GstClock *start_clock = gst_element_get_clock(GST_ELEMENT(src));
+@@ -2018,6 +2034,13 @@ static GstFlowReturn gst_zedxonesrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+     if (clock) {
+         clock_time = gst_clock_get_time(clock);
+         gst_object_unref(clock);
++        // Co-sample the frame age (now - exposure) from the ZED clock so the
++        // buffer can be stamped at the true sensor-capture time below.
++        sl::Timestamp cur_ts = src->_zed->getTimestamp(sl::TIME_REFERENCE::CURRENT);
++        sl::Timestamp img_ts = src->_zed->getTimestamp(sl::TIME_REFERENCE::IMAGE);
++        if (cur_ts.getNanoseconds() > img_ts.getNanoseconds()) {
++            frame_age_ns = cur_ts.getNanoseconds() - img_ts.getNanoseconds();
++        }
+     } else {
+         clock_time = GST_CLOCK_TIME_NONE;
+     }
+@@ -2122,8 +2145,13 @@ static GstFlowReturn gst_zedxonesrc_fill(GstPushSrc *psrc, GstBuffer *buf) {
+     // ----> Timestamp meta-data
+     GST_TRACE("Timestamp meta-data");
+     if (GST_CLOCK_TIME_IS_VALID(clock_time)) {
+-        GST_BUFFER_TIMESTAMP(buf) =
++        // Stamp at the sensor-capture instant: pipeline running-time at grab
++        // minus the frame's age since exposure (parity with the ZED SDK
++        // TIME_REFERENCE::IMAGE path) so image frames align with joint samples.
++        GstClockTime run_now =
+             GST_CLOCK_DIFF(gst_element_get_base_time(GST_ELEMENT(src)), clock_time);
++        GstClockTime age = (frame_age_ns > run_now) ? run_now : frame_age_ns;
++        GST_BUFFER_TIMESTAMP(buf) = run_now - age;
+         GST_BUFFER_DTS(buf) = GST_BUFFER_TIMESTAMP(buf);
+     } else {
+         GST_WARNING_OBJECT(src, "No pipeline clock available, buffer will have no timestamp");

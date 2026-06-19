@@ -12,10 +12,14 @@ buffer to two consumers:
   both teleop and data collection.
 * **raw branch** — ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Only built when
   raw frames are needed (data collection's dataset, policy inference). Each
-  frame carries a ``capture_perf_ts`` derived from the buffer PTS (the
-  ``do-timestamp`` running-time mapped onto ``time.perf_counter`` via the
-  pipeline clock), so dataset rows align image capture with the joint sample
-  exactly like the SDK path did — without the SDK's ~26 ms host round trip.
+  frame carries a ``capture_perf_ts`` derived from the buffer PTS. We run a
+  patched ``zedxonesrc``/``zedsrc`` (``do-timestamp=false``) that stamps the
+  PTS at the true sensor-exposure instant (``TIME_REFERENCE::IMAGE``) instead
+  of host-receive time; :meth:`_cap_perf_from_pts` maps that running-time onto
+  ``time.perf_counter``, so dataset rows align image capture with the joint
+  sample on the same exposure clock as the SDK ``ZedCamera`` path — without the
+  SDK's host round trip. (The stock plugin stamps host-receive time, which lags
+  exposure by the camera delivery latency; see ``scripts``/zed-gstreamer patch.)
 
 :class:`ZedGstCamera` (mono ``zedxonesrc``) and :class:`ZedGstStereoCamera`
 (stereo ``zedsrc``, per-eye crop) are drop-in replacements for
@@ -386,10 +390,14 @@ class _GstPipelineBase:
     def _cap_perf_from_pts(self, pts: int, recv_perf: float) -> float:
         """Map a buffer running-time PTS onto ``time.perf_counter`` seconds.
 
-        ``pts`` is the source's ``do-timestamp`` running time; the in-pipeline
-        latency ``(clock_now_running - pts)`` is a duration, so subtracting it
-        from the receive ``perf_counter`` yields a capture timestamp on the
-        ``perf_counter`` timeline (validated to settle to ~0.15 ms).
+        With our patched ``zedxonesrc``/``zedsrc`` (and ``do-timestamp=false``),
+        ``pts`` is the pipeline running-time of the true sensor-exposure instant
+        (``TIME_REFERENCE::IMAGE``), not host-receive time. The remaining
+        ``(clock_now_running - pts)`` is the glass-to-pull latency, a duration,
+        so subtracting it from the receive ``perf_counter`` yields the
+        sensor-capture timestamp on the ``perf_counter`` timeline -- parity with
+        the ZED SDK ``ZedCamera`` path, so image frames align with joint
+        samples.
         """
         if pts == self._gst.CLOCK_TIME_NONE or self._clock is None:
             return recv_perf
@@ -541,7 +549,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         src = (
             f"zedxonesrc camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
-            f"camera-fps={self.fps} stream-type=1 do-timestamp=true "
+            f"camera-fps={self.fps} stream-type=1 do-timestamp=false "
             f"ctrl-auto-exposure-range-max={_MAX_AUTO_EXPOSURE_US} "
             "! video/x-raw(memory:NVMM),format=NV12"
         )
@@ -693,7 +701,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         src = (
             f"zedsrc camera-sn={self.serial} "
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
-            f"camera-fps={self.fps} stream-type=7 do-timestamp=true "
+            f"camera-fps={self.fps} stream-type=7 do-timestamp=false "
             "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
         return (
