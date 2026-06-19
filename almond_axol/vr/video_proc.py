@@ -137,8 +137,7 @@ def _relay_main(
     """Relay subprocess entry point: open cameras, serve signaling requests."""
     logging.basicConfig(level=log_level)
 
-    from ..cli.teleop import _ZedFrameSource
-    from .video import WebRTCManager
+    from .video import WebRTCManager, ZedFrameSource
 
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
     # the per-track names the headset sees to a frame source per camera/eye.
@@ -158,10 +157,10 @@ def _relay_main(
         owned.append(cam)
         if spec.get("stereo"):
             # One camera, two eyes -> overhead_left / overhead_right.
-            sources[f"{name}_left"] = _ZedFrameSource(cam.left_view)
-            sources[f"{name}_right"] = _ZedFrameSource(cam.right_view)
+            sources[f"{name}_left"] = ZedFrameSource(cam.left_view)
+            sources[f"{name}_right"] = ZedFrameSource(cam.right_view)
         else:
-            sources[name] = _ZedFrameSource(cam)
+            sources[name] = ZedFrameSource(cam)
 
     manager = WebRTCManager(sources) if sources else None
     conn.send(("ready", sorted(sources)))

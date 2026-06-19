@@ -1,1 +1,1 @@
-"""ZED camera CLI commands (wheel install, streaming, clock sync)."""
+"""ZED camera CLI commands (pyzed wheel install)."""

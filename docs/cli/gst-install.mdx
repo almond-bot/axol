@@ -13,9 +13,9 @@ This command:
 
 - `apt`-installs the GStreamer tools/plugins and the GObject-introspection typelibs + build deps (`gstreamer1.0-tools`, `gstreamer1.0-plugins-bad`, `gir1.2-gstreamer-1.0`, `gir1.2-gst-plugins-base-1.0`, `libgirepository1.0-dev`, `gobject-introspection`, `libcairo2-dev`, `pkg-config`).
 - Builds **PyGObject** (`pygobject>=3.50,<3.52`) into the axol environment so the in-process pipeline can read `appsink` buffers. PyGObject is not a usable PyPI wheel (it builds against the system gobject-introspection), so it can't be a normal dependency — the same reason [`zed.install`](/installation) builds `pyzed` here.
-- Verifies the `zedxonesrc` grab element and the NVENC elements (`nvvidconv`, `nvv4l2h264enc`) are present. These ship with the zed-gstreamer plugins and the Jetson L4T BSP respectively and are not `apt`-installable — the command warns if they're missing.
+- Verifies the `zedxonesrc` grab element and the NVENC elements (`nvvidconv`, `nvv4l2h264enc`) are present, warning if any are missing. Neither is `apt`-installable: the zed-gstreamer source elements (`zedxonesrc` / `zedsrc`) are built separately by [`gst.build-zed`](/cli/gst-build-zed) — which the quick install runs right after this command — and the NVENC elements ship with the Jetson L4T BSP.
 
-The [quick install](/installation#quick-install-recommended) runs this for you. It is **not** run at `teleop` / `serve` startup — those entry points just run; install (and the Jetson clock setup, [`jetson.setup`](/cli/jetson-setup)) is owned by the installer.
+The [quick install](/installation#quick-install-recommended) runs this for you. It is **not** run at `teleop` / `serve` startup — those entry points just run; install (the source-plugin build [`gst.build-zed`](/cli/gst-build-zed) and the Jetson clock setup [`jetson.setup`](/cli/jetson-setup)) is owned by the installer.
 
 <Note>
   Best-effort and idempotent: it skips when the stack is already present, and is a no-op on machines without `apt-get`. When the gst stack is unavailable the cameras fall back to the ZED Python SDK grab path (higher latency).

@@ -86,19 +86,20 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
 class DamiaoMotor(MotorDriver):
     """MotorDriver implementation for Damiao motors using the MIT/position-force protocol."""
 
-    def __init__(self, bus: CanBus, motor_id: int, feedback_id: int, kt: float) -> None:
+    def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
         """Construct a Damiao driver.
+
+        Damiao motors report torque directly in their feedback frames, so —
+        unlike MyActuator — no torque constant (kt) is needed.
 
         Args:
             bus:         Shared CAN bus.
             motor_id:    CAN ID the motor receives commands on (ESC_ID).
             feedback_id: CAN ID the motor sends feedback frames on (MST_ID).
-            kt:          Torque constant (Nm/A) used to convert current to torque.
         """
         self._bus = bus
         self._motor_id = motor_id
         self._feedback_id = feedback_id
-        self._kt = kt
 
         self._feedback: _MotorFeedback | None = None
         self._registers: dict[int, float | int] = {}

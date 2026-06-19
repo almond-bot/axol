@@ -7,7 +7,7 @@ The browser front-ends for the Almond Axol robot. This directory lives inside th
 
 The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`.
 
-> Docs: [Web Control Panel](https://almond.bot/docs/guides/control-panel) · [VR Interface](https://almond.bot/docs/guides/vr-interface). The `serve` backend (FastAPI) that the control panel talks to lives in `almond_axol/serve/`.
+> Docs: [Web Control Panel](https://docs.almond.bot/guides/control-panel) · [VR Interface](https://docs.almond.bot/guides/vr-interface). The `serve` backend (FastAPI) that the control panel talks to lives in `almond_axol/serve/`.
 
 ## Structure
 
@@ -34,9 +34,11 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over WebSocket |
 | `useAxolVRClient` | Hook — manages WebSocket lifecycle (connect, disconnect, auto-retry) |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
+| `useAxolTracking` | Hook — returns a frame-readable `ref` reflecting whether the robot is currently engaged (mirroring the operator), driven by the server's `{"type":"tracking"}` pushes with a local grip-toggle fallback. Used to gate camera-screen repositioning to when the robot isn't being controlled |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
+| `CameraStreams` | Type — `Record<string, MediaStream>`, the camera-name → stream map returned by `useAxolVideo` |
 
 **`AxolVRClient` props**
 

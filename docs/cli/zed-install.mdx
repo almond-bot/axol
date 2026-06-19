@@ -3,8 +3,12 @@ title: "zed.install"
 description: "Install the pyzed Python wheel matching the installed ZED SDK version."
 ---
 
-Downloads and installs the `pyzed` Python wheel matching the installed ZED SDK version. Caches the wheel in `~/.almond/wheels/`.
+Downloads and installs the `pyzed` Python wheel matching the installed ZED SDK version. `pyzed` is not on PyPI, so this command fetches the matching wheel from Stereolabs and installs it straight into the interpreter running the `axol` CLI (the `uv` tool environment). The wheel is cached in `~/.almond/wheels/`.
 
 ```bash
 axol zed.install
 ```
+
+<Note>
+  Requires the **ZED SDK** to be installed at `/usr/local/zed` first — the command reads the SDK version from its headers to pick the right wheel, and exits with an error pointing to the [Stereolabs download page](https://www.stereolabs.com/developers/release) when it's missing. The [quick install](/installation#quick-install-recommended) runs this automatically whenever the SDK is present.
+</Note>

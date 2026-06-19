@@ -3,8 +3,10 @@ axol serve
 
 Run the Axol web control panel: a small local server that wraps the CLI so the
 robot can be driven from a browser instead of a terminal. It serves the built
-web UI (when present) and a JSON/WebSocket API that launches, streams, and
-stops ``axol`` commands as subprocesses.
+web UI (when present) and a JSON/WebSocket API that launches robot operations,
+streams their output, and stops them. The four core operations (teleop,
+gravity-comp, collect-data, run-policy) run in-process so they share one robot
+connection; the setup/calibration commands run as ``axol`` subprocesses.
 
     axol serve                  # serve on http://localhost:8001
     axol serve --port 9000

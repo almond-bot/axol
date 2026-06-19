@@ -54,6 +54,7 @@
           "cli/inference-server",
           "cli/zed-install",
           "cli/gst-install",
+          "cli/gst-build-zed",
           "cli/jetson-setup",
           "cli/tune-pid",
           "cli/tune-friction",

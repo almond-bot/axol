@@ -26,6 +26,7 @@ import numpy as np
 from ...motor import CanBus
 from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
 from ...robot.config import AxolConfig
+from ...robot.gravity import GravityCompensator
 from ...utils.shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
@@ -243,7 +244,7 @@ async def _run(
             # ``Axol`` construction boundary) so this directly-built arm gets
             # the same gains Axol would.
             cfg = AxolConfig().resolved()
-            arm = AxolArm(bus, cfg.left if is_left else cfg.right, is_left=is_left)
+            arm = AxolArm(bus, cfg, GravityCompensator(cfg), is_left=is_left)
 
             stats_task = asyncio.create_task(
                 _stats_monitor(channel, arm, log), name="can_stats_monitor"
