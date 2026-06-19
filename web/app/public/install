@@ -13,9 +13,10 @@ set -euo pipefail
 
 INSTALL_URL="https://axol.almond.bot/install"
 REPO="git+https://github.com/almond-bot/axol"
-# `video` is intentionally omitted: headset-video support is system-level
-# (GStreamer webrtcbin/libnice/NVENC + PyGObject), installed below by
-# `axol gst.install`, not via a PyPI extra (see pyproject.toml).
+# Headset-video support (the zed-gstreamer NVENC pipeline + PyGObject) is
+# system-level, not a PyPI extra: it's installed below by `axol gst.install`
+# and `axol gst.build-zed` (see pyproject.toml). WebRTC transport itself is
+# aiortc, a normal core dependency.
 EXTRAS="lerobot,sim"
 PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
