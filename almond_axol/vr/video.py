@@ -1,30 +1,34 @@
 """aiortc WebRTC relay for streaming ZED camera video to the VR headset.
 
-The cameras are grabbed with the ZED **Python SDK** (``ZedCamera``) exactly
-like data collection; this module re-encodes those frames as a low-latency
-WebRTC stream the Quest WebXR app renders directly, so the teleoperator can
-see the grippers/scene.
+Each registered source becomes one WebRTC video track the Quest WebXR app
+renders directly, so the teleoperator can see the grippers/scene.
+:func:`_track_for_source` adapts whatever the caller hands in: a connected ZED
+**Python SDK** camera (``ZedCamera`` / stereo eye, grabbed exactly like data
+collection) is re-encoded here, while a GPU-resident ``gst_zed`` camera's
+pre-encoded H.264 is forwarded with no second encode.
 
 Why aiortc (and not gstreamer ``webrtcbin``): aiortc owns the ICE / DTLS /
 SRTP transport in Python, which connects reliably on this multi-homed LAN
 (Tailscale + IPv6 link-local + two LAN NICs) where ``webrtcbin``'s libnice
-stalls in ICE "checking". Encoding still runs on the Jetson's hardware
-NVENC via :mod:`almond_axol.vr.hw_video` (a ``gst-launch`` subprocess), so
-aiortc never encodes in software — it only packetizes and ships RTP.
+stalls in ICE "checking". On the SDK path, encoding still runs on the Jetson's
+hardware NVENC via :mod:`almond_axol.vr.hw_video` (a ``gst-launch``
+subprocess); pre-encoded sources skip it. Either way aiortc never encodes in
+software — it only packetizes and ships RTP.
 
-Frames are handed in as the SDK's native **BGRA** (4-channel), so the NVENC
-pipeline feeds the hardware VIC directly (BGRx -> NV12) with no CPU
-colorspace conversion — the same efficiency that keeps the 120 Hz IK loop
-healthy while three 1920x1200@60 streams encode.
+On the SDK re-encode path, frames are handed in as the SDK's native **BGRA**
+(4-channel), so the NVENC pipeline feeds the hardware VIC directly (BGRx ->
+NV12) with no CPU colorspace conversion — the same efficiency that keeps the
+120 Hz IK loop healthy while three 1920x1200@60 streams encode.
 
 The existing VR WebSocket (``/ws``) is reused purely for SDP signaling — no
 new ports. aiortc gathers ICE candidates during ``setLocalDescription`` and
 embeds them in the SDP (non-trickle), so on a LAN no separate candidate
 exchange is needed.
 
-``aiortc`` is a normal wheel dependency; ``av`` comes with it. The hardware
-encoder additionally needs the system GStreamer NVENC stack (installed by
-``axol gst.install``); without it, aiortc falls back to software H.264.
+``aiortc`` is a normal wheel dependency; ``av`` comes with it. The in-Python
+NVENC re-encode additionally needs the Jetson's ``nvv4l2h264enc`` (L4T BSP)
+plus the host GStreamer tools from ``axol gst.install``; without them, aiortc
+falls back to software H.264.
 """
 
 from __future__ import annotations

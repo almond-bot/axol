@@ -137,11 +137,12 @@ def _relay_main(
     """Relay subprocess entry point: open cameras, serve signaling requests."""
     logging.basicConfig(level=log_level)
 
-    from .video import WebRTCManager, ZedFrameSource
+    from .video import WebRTCManager
 
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
-    # the per-track names the headset sees to a frame source per camera/eye.
-    # Prefer the GPU-resident gst pipeline; fall back to SDK grab + NVENC.
+    # the per-track names the headset sees to a video source per camera/eye.
+    # Prefer the GPU-resident gst pipeline; fall back to the SDK grab — a bare
+    # ZedCamera/eye, which WebRTCManager adapts to a frame-driven NVENC source.
     owned: list[object] = []
     sources: dict[str, object] = {}
     for name, spec in cameras.items():
@@ -157,10 +158,10 @@ def _relay_main(
         owned.append(cam)
         if spec.get("stereo"):
             # One camera, two eyes -> overhead_left / overhead_right.
-            sources[f"{name}_left"] = ZedFrameSource(cam.left_view)
-            sources[f"{name}_right"] = ZedFrameSource(cam.right_view)
+            sources[f"{name}_left"] = cam.left_view
+            sources[f"{name}_right"] = cam.right_view
         else:
-            sources[name] = ZedFrameSource(cam)
+            sources[name] = cam
 
     manager = WebRTCManager(sources) if sources else None
     conn.send(("ready", sorted(sources)))
