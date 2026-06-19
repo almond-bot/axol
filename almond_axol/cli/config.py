@@ -1,8 +1,8 @@
 """Shared draccus plumbing for the rich-config CLI commands.
 
-The ``teleop``, ``gravity-comp``, ``collect-data``, and ``run-policy``
-commands expose their full configuration via draccus, so every nested
-field is reachable two ways:
+The ``teleop``, ``gravity-comp``, ``collect-data``, ``run-policy``, and
+``inference-server`` commands expose their full configuration via draccus,
+so every (possibly nested) field is reachable two ways:
 
 - Dotted CLI overrides, lerobot-style: ``--axol.left.elbow.kp 200``.
   Dict-typed fields take one inline YAML/JSON value instead:
@@ -10,7 +10,7 @@ field is reachable two ways:
 - A whole-config file: ``--config_path run.json`` (JSON or YAML), with
   CLI overrides layered on top.
 
-This module provides the pieces shared by all four commands:
+This module provides the pieces shared by all five commands:
 
 - :func:`parse`, a thin wrapper around :class:`draccus.ArgumentParser`
   that injects the *full* default config as the lowest-priority layer of
@@ -28,7 +28,8 @@ This module provides the pieces shared by all four commands:
   command configs that do not touch ``lerobot`` (kept here so importing
   them stays cheap on the sim/teleop-only path). The ``collect-data`` and
   ``run-policy`` configs live in their own command modules where the
-  ``lerobot`` imports already belong.
+  ``lerobot`` imports already belong; ``inference-server``'s flat config
+  lives in its module too.
 
 This module intentionally imports no ``lerobot`` code so ``axol teleop
 --sim`` keeps working in environments without the ``lerobot`` extra

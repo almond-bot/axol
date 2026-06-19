@@ -21,7 +21,7 @@ This:
 
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already installed.
 - Installs the `axol` CLI from GitHub as a `uv` tool (Python 3.13 included), with every dependency extra except `cuda`.
-- Sets up the headset-video stack ([`gst.install`](/cli/gst-install)) and, on a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)).
+- Sets up the headset-video stack ([`gst.install`](/cli/gst-install) plus the patched ZED source plugins, [`gst.build-zed`](/cli/gst-build-zed)) and, on a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)).
 - Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup (re-pinning the Jetson clocks first) and restarts it automatically if it ever goes down.
 
 When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — no terminal needed from then on. The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. (Re-running the install command also upgrades.)
@@ -91,13 +91,19 @@ Relaying the ZED cameras to the headset (`teleop --cameras`, `collect-data`) gra
 axol gst.install
 ```
 
+The ZED source elements (`zedxonesrc` / `zedsrc`) aren't part of that stack — build the patched versions (sensor-accurate frame timestamps) once, with the ZED SDK present:
+
+```bash
+axol gst.build-zed
+```
+
 On a Jetson, also pin the NVENC/VIC clocks for low-latency encode (the quick install does this at boot via systemd):
 
 ```bash
 axol jetson.setup
 ```
 
-The quick install runs both for you. See [`gst.install`](/cli/gst-install) and [`jetson.setup`](/cli/jetson-setup).
+The quick install runs all three for you. See [`gst.install`](/cli/gst-install), [`gst.build-zed`](/cli/gst-build-zed), and [`jetson.setup`](/cli/jetson-setup).
 
 ## Web control panel (optional)
 

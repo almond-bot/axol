@@ -62,11 +62,12 @@ The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separate
 axol zed.install
 ```
 
-Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools plus the patched ZED source plugins, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
 
 ```bash
 axol gst.install
-axol jetson.setup   # Jetson only; no-op elsewhere
+axol gst.build-zed   # build the patched ZED source plugins (needs the ZED SDK)
+axol jetson.setup    # Jetson only; no-op elsewhere
 ```
 
 Before using any motor or robot commands, initialize the CAN hardware:
@@ -120,6 +121,7 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
+- [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
 - [`jetson.setup`](https://docs.almond.bot/cli/jetson-setup)
 - [`tune.pid`](https://docs.almond.bot/cli/tune-pid)
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)

@@ -6,7 +6,7 @@ description: "Enumerate locally connected ZED cameras and manage the ZED X daemo
 Helpers for the ZED cameras attached to the host machine over GMSL. Requires `pyzed` — install it with `axol zed.install` (see [`zed.install`](/cli/zed-install)). The cameras themselves are opened by the LeRobot wrappers in [`almond_axol.lerobot.camera`](/api/lerobot#zedcamera).
 
 ```python
-from almond_axol.zed import ZedDevice, list_zed_devices, restart_zed_daemon
+from almond_axol.zed import ZedDevice, list_zed_devices, restart_zed_daemon, stereo_serials
 ```
 
 ## `list_zed_devices()`
@@ -28,6 +28,19 @@ for dev in list_zed_devices():
 | `serial` | `int` | Camera serial number — what you pass to `ZedCameraConfig(serial=...)` |
 | `model` | `str` | SDK model name (e.g. `ZED XM`, `ZED X`) |
 | `kind` | `str` | `"mono"` (ZED-X One) or `"stereo"` (ZED X) |
+
+## `stereo_serials()`
+
+Returns the serial numbers of the connected **stereo** (ZED X) cameras as a `set[int]`. This is how the SDK auto-detects whether a configured camera is stereo from its serial alone — so teleop and the [control panel](/guides/control-panel#cameras) never make the operator flag it by hand:
+
+```python
+from almond_axol.zed import stereo_serials
+
+if 41234569 in stereo_serials():
+    ...  # open it as a stereo ZED X (both eyes)
+```
+
+Best-effort: any enumeration failure (`pyzed` missing, daemon down) returns an empty set, in which case callers treat every camera as mono.
 
 ## `restart_zed_daemon()`
 

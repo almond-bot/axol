@@ -42,6 +42,7 @@ with AxolRobot(config) as robot:
 | `observe_torques` | `False` | Include joint torques in `observation.state` |
 | `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |
 | `right_channel` | `"can_alm_axol_r"` | SocketCAN interface for the right arm |
+| `video_backend` | `"auto"` | Camera capture backend: `"gst"` (GPU-resident zed-gstreamer pipeline, low latency), `"sdk"` (ZED Python SDK), or `"auto"` (prefer `gst` when its stack is installed, else fall back to the SDK). [`run-policy`](/cli/run-policy) overrides this to `"sdk"` since it streams no headset video. |
 
 ### Key methods
 
@@ -134,3 +135,4 @@ When an `AxolRobot` camera config has `stereo=True`, the robot expands camera `X
 | `color_mode` | `RGB` | Output color channel order. |
 | `warmup_s` | `1` | Seconds to read frames during `connect()` before returning |
 | `stereo` | `False` | Open the camera as a stereo ZED X carrying both eyes. The robot expands camera `X` into observation keys `X_left` / `X_right` backed by a single grab. |
+| `eyes` | `"both"` | Which eye(s) of a stereo camera to expose as observations: `"both"` → `X_left` and `X_right`, `"left"` / `"right"` → only that eye. Ignored when `stereo=False`. |

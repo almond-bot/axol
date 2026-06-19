@@ -41,6 +41,10 @@ async with VRTeleop(axol) as teleop:
 
 See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entry point (`--cameras` wires the ZED cameras up automatically).
 
+<Note>
+  `set_video_sources()` runs the WebRTC relay in-process. The CLI instead prefers `VRTeleop.set_video_manager()`, which hands the camera grab/encode and WebRTC off to a dedicated subprocess (`almond_axol.vr.video_proc.VideoRelayProcess`) so it can't perturb the control loops. Both deliver the same headset video — see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset).
+</Note>
+
 ## `VRTeleopConfig` fields
 
 | Field | Default | Description |
