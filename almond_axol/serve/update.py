@@ -6,9 +6,20 @@ a systemd service with ``Restart=always``. This module keeps that install in
 sync with ``main``: whenever the control panel talks to the server, a debounced
 background task runs ``uv tool upgrade almond-axol``, and if the installed git
 commit changed *and* nothing is running, the process exits so systemd restarts
-it on the new code. Because the upgrade rebuilds the tool environment, pyzed
-(not on PyPI, installed by ``axol zed.install``) is reinstalled first when the
-ZED SDK is present.
+it on the new code.
+
+Because ``uv tool upgrade`` rebuilds the tool environment, anything that isn't a
+declared PyPI dependency is dropped and must be reinstalled before we restart
+onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
+plugins. Rather than enumerate those steps here, this just shells out to ``axol
+provision`` — the single provisioning path the hosted installer also runs, so
+the two can't drift. Every step there is idempotent and self-gating.
+
+``axol provision`` runs both after an upgrade *and* once at startup. The startup
+run matters for a host that upgraded *into* the GStreamer-pipeline build from an
+older ``main``: that upgrade was performed by the *old* code, which knew nothing
+about ``axol provision`` — so the new code self-heals on its first control-panel
+contact after the restart.
 
 Dev checkouts (``uv run axol serve`` from a clone) are untouched: the package
 metadata then points at a local directory, not a git URL, and the updater
@@ -24,13 +35,11 @@ import os
 import shutil
 import time
 from importlib.metadata import PackageNotFoundError, distribution
-from pathlib import Path
 from typing import Callable
 
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
-_ZED_SDK_DIR = Path("/usr/local/zed")
 # Minimum seconds between upgrade attempts; the check is triggered by polled
 # API endpoints, so without this every status poll would spawn a uv process.
 _DEBOUNCE_S = 5 * 60.0
@@ -76,6 +85,11 @@ class SelfUpdater:
         # Set when an upgrade landed but the server was busy; restart at the
         # next idle opportunity without waiting out the debounce again.
         self._restart_pending = False
+        # The GStreamer camera stack is provisioned once per process (covers a
+        # host that upgraded into this build from an older main); serialized so
+        # the startup heal and a post-upgrade reinstall never race.
+        self._provision_started = False
+        self._provision_lock = asyncio.Lock()
 
     @property
     def commit(self) -> str | None:
@@ -88,6 +102,7 @@ class SelfUpdater:
 
     def poke(self) -> None:
         """Request an update check; debounced and never blocks the caller."""
+        self._ensure_provision_once()
         if self._restart_pending:
             self._maybe_restart()
             return
@@ -136,44 +151,59 @@ class SelfUpdater:
             self._commit,
             new_commit,
         )
-        await self._reinstall_pyzed()
+        await self._provision()
         self._restart_pending = True
         self._maybe_restart()
 
-    async def _reinstall_pyzed(self) -> None:
-        """Reinstall pyzed after an upgrade rebuilt the tool environment.
+    def _ensure_provision_once(self) -> None:
+        """Provision system deps once per process, in the background.
 
-        pyzed is not on PyPI and thus not a declared dependency, so
-        ``uv tool upgrade`` drops it whenever it re-syncs the environment.
-        Running ``axol zed.install`` (the *upgraded* entry point) puts the
-        wheel back into the new environment before we restart into it.
+        ``uv tool upgrade`` is performed by the *old* code, so a host that
+        upgraded *into* this build never ran ``axol provision`` for it. Run it
+        on the first control-panel contact after we (re)start onto code that
+        needs it; ``axol provision`` is idempotent, so it's a cheap no-op once
+        satisfied. Gated to real (git) tool installs, like the updater itself.
         """
-        if not _ZED_SDK_DIR.exists():
+        if self._provision_started or not self.enabled:
             return
+        self._provision_started = True
+        asyncio.create_task(self._provision())
+
+    async def _provision(self) -> None:
+        """Run ``axol provision`` in the background (the single provisioning path).
+
+        ``uv tool upgrade`` rebuilds the tool env and drops everything that
+        isn't a PyPI dependency (pyzed, PyGObject); ``axol provision`` reinstalls
+        them and (re)builds the patched zedxonesrc/zedsrc plugins. It is the
+        exact command the hosted installer runs, so the two can't drift, and it
+        is idempotent + self-gating (a no-op without the ZED SDK / apt / NVENC).
+        Serialized so the startup heal and a post-upgrade run can't overlap.
+        """
         axol = shutil.which("axol")
         if axol is None:
-            _logger.warning("self-update: axol not on PATH; cannot reinstall pyzed")
+            _logger.warning("self-update: axol not on PATH; cannot provision")
             return
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                axol,
-                "zed.install",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            out, _ = await proc.communicate()
-        except OSError as exc:
-            _logger.warning("self-update: could not run axol zed.install: %s", exc)
-            return
+        async with self._provision_lock:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    axol,
+                    "provision",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await proc.communicate()
+            except OSError as exc:
+                _logger.warning("self-update: could not run axol provision: %s", exc)
+                return
         if proc.returncode != 0:
             tail = out.decode("utf-8", "replace").strip().splitlines()
             _logger.warning(
-                "self-update: pyzed reinstall failed (%s): %s",
+                "self-update: `axol provision` failed (%s): %s",
                 proc.returncode,
                 tail[-1] if tail else "no output",
             )
         else:
-            _logger.info("self-update: reinstalled pyzed into the upgraded environment")
+            _logger.info("self-update: provisioning complete")
 
     def _maybe_restart(self) -> None:
         if not self._is_idle():

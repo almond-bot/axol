@@ -14,8 +14,8 @@ set -euo pipefail
 INSTALL_URL="https://axol.almond.bot/install"
 REPO="git+https://github.com/almond-bot/axol"
 # `video` is intentionally omitted: headset-video support is system-level
-# (GStreamer webrtcbin/libnice/NVENC + PyGObject), installed below by
-# `axol gst.install`, not via a PyPI extra (see pyproject.toml).
+# (GStreamer NVENC + PyGObject), provisioned below by `axol provision`, not via
+# a PyPI extra (see pyproject.toml).
 EXTRAS="lerobot,sim"
 PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
@@ -58,38 +58,19 @@ UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- pyzed --------------------------------------------------------------------
+# -- System provisioning (pyzed + GStreamer camera stack) ---------------------
 
-# pyzed is not on PyPI, so it cannot be an extra; install it into the tool
-# environment whenever the ZED SDK is present on this machine.
-if [ -d /usr/local/zed ]; then
-    say "ZED SDK detected; installing the pyzed Python bindings..."
-    axol zed.install || say "WARNING: pyzed install failed; run axol zed.install manually."
-else
-    say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
-fi
-
-# -- GStreamer ZED camera pipeline (headset video + collection) ---------------
-
-# Teleop and collect-data share one GPU-resident camera path: the zed-gstreamer
-# zedxonesrc/zedsrc elements grab straight into NVMM, NVENC encodes on the
-# Jetson, and aiortc (a normal Python dependency) forwards the pre-encoded
-# H.264 over WebRTC. `axol gst.install` apt-installs the GStreamer CLI tools and
-# PyGObject (the in-process appsink reader); NVENC's nvvidconv / nvv4l2h264enc
-# ship with the Jetson L4T BSP.
-say "Installing the GStreamer stack (PyGObject + NVENC)..."
-axol gst.install || say "WARNING: gst.install failed; headset video may be unavailable. Re-run 'axol gst.install'."
-
-# Build + install our patched zedxonesrc/zedsrc. A fresh Jetson has no
-# zed-gstreamer plugins (so the camera path would fall back to the slower ZED
-# SDK grab), and the stock plugins stamp each frame's PTS at host-receive time
-# rather than the true sensor-exposure instant (TIME_REFERENCE::IMAGE) -- which
-# is what lets collected image frames line up with joint samples. The patch
-# fixes both. Needs the ZED SDK + Jetson toolchain; a quick no-op otherwise.
-if [ -d /usr/local/zed ]; then
-    say "Building the patched zed-gstreamer plugins (sensor-accurate timestamps)..."
-    axol gst.build-zed || say "WARNING: gst.build-zed failed; the GPU camera path may be unavailable or use host-receive timestamps. Re-run 'axol gst.build-zed'."
-fi
+# `uv tool install` handles the Python package + PyPI deps, but a few pieces it
+# can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
+# reader for the GPU-resident zedxonesrc/zedsrc camera path, built against the
+# system gobject-introspection), and our patched zedxonesrc/zedsrc plugins
+# (which stamp each frame at the true sensor-exposure instant so collected
+# images line up with joint samples). `axol provision` installs all of them
+# idempotently -- the same command the `axol serve` self-updater runs after an
+# upgrade, so there is exactly one provisioning path. Each step self-gates
+# (a no-op without the ZED SDK / apt / NVENC).
+say "Provisioning system dependencies (pyzed + GStreamer camera stack)..."
+axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
 
 # -- Jetson clocks ------------------------------------------------------------
 

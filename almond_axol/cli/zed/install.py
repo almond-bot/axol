@@ -12,11 +12,28 @@ import re
 import subprocess
 import sys
 import urllib.request
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 from pathlib import Path
 
 _ZED_INCLUDE = Path("/usr/local/zed/include")
 _CACHE_DIR = Path.home() / ".almond" / "wheels"
 _BASE_URL = "https://download.stereolabs.com/zedsdk"
+
+
+def _pyzed_installed(major: str, minor: str) -> bool:
+    """True when pyzed for this SDK ``major.minor`` is already installed.
+
+    Read from the package metadata of the interpreter running this CLI (the uv
+    tool env). ``uv tool upgrade`` rebuilds that env and drops pyzed (not a PyPI
+    dependency), so this correctly returns False right after an upgrade and lets
+    ``axol provision`` skip a redundant reinstall otherwise.
+    """
+    try:
+        installed = _pkg_version("pyzed")
+    except PackageNotFoundError:
+        return False
+    return installed.split(".")[:2] == [major, minor]
 
 
 def _sdk_version() -> tuple[str, str]:
@@ -41,10 +58,16 @@ def _sdk_version() -> tuple[str, str]:
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``zed.install`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "zed.install",
         help="Download the pyzed wheel for the installed ZED SDK version.",
-    ).set_defaults(func=run)
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reinstall pyzed even when the matching version is already present.",
+    )
+    parser.set_defaults(func=run)
 
 
 def run(_args: object = None) -> None:
@@ -58,6 +81,10 @@ def run(_args: object = None) -> None:
         sys.exit(1)
 
     major, minor = _sdk_version()
+
+    if not getattr(_args, "force", False) and _pyzed_installed(major, minor):
+        print(f"pyzed {major}.{minor} already installed.")
+        return
     py = f"{sys.version_info.major}{sys.version_info.minor}"
     arch = platform.machine().lower()
     sdk_ver = f"{major}.{minor}"
