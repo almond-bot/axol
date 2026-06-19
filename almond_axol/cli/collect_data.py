@@ -70,26 +70,20 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
     Relays every camera the robot exposes (overhead — or ``overhead_left`` /
     ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
-    show them. gst cameras already produce GPU-encoded H.264 access units, so
-    they are registered directly (their ``subscribe()`` feeds a pre-encoded
-    WebRTC track — the same one grab/encode serves the dataset). SDK cameras
-    are wrapped frame-driven (see ``ZedFrameSource``): each relayed frame is
-    encoded as soon as it's captured. Reads only consume the latest frame each
-    camera already keeps, so the dataset capture pipeline is never blocked.
+    show them. Each camera is registered bare and the relay picks the right
+    WebRTC track per source (see :func:`almond_axol.vr.video._track_for_source`):
+    a gst camera/eye already produces GPU-encoded H.264 access units (its
+    ``subscribe()`` feeds a pre-encoded track — the same grab/encode serves the
+    dataset), while an SDK camera is adapted to a frame-driven source that
+    encodes each frame as soon as it's captured. Reads only consume the latest
+    frame each camera already keeps, so the dataset capture pipeline is never
+    blocked.
     """
-    from ..vr.video import ZedFrameSource
-
-    sources: dict[str, Any] = {}
-    for name, cam in robot.cameras.items():
-        # A gst camera/eye exposes subscribe(); hand it to the manager as-is so
-        # its pre-encoded AUs go straight to RTP. Everything else is raw.
-        sources[name] = cam if hasattr(cam, "subscribe") else ZedFrameSource(cam)
-
-    if not sources:
+    if not robot.cameras:
         return
 
     try:
-        teleop.set_video_sources(sources)
+        teleop.set_video_sources(dict(robot.cameras))
     except Exception as exc:
         _logger.warning("failed to enable camera video: %s", exc)
 

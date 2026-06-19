@@ -226,15 +226,16 @@ def _connect_zed_cameras(
 
 
 def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> None:
-    """Register connected ZED cameras as WebRTC sources for the headset."""
+    """Register connected ZED cameras as WebRTC sources for the headset.
+
+    The bare ``ZedCamera`` / stereo eyes are registered directly; the in-process
+    aiortc relay adapts each one to a frame-driven source (NVENC encode + aiortc
+    RTP send) — see :func:`almond_axol.vr.video._track_for_source`.
+    """
     if not cameras:
         return
 
-    # SDK cameras are wrapped as frame-driven sources for the in-process
-    # aiortc WebRTCManager (NVENC encode + aiortc RTP send).
-    from ..vr.video import ZedFrameSource
-
-    sources = {name: ZedFrameSource(cam) for name, cam in cameras}
+    sources = dict(cameras)
     try:
         teleop.set_video_sources(sources)
         _logger.info("teleop: streaming cameras to headset: %s", ", ".join(sources))

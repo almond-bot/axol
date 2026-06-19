@@ -25,9 +25,10 @@ runtime control), so the pipeline sets a 1-second IDR interval instead —
 a lost-packet (PLI) recovery worst case of ~1 s on an otherwise reliable
 LAN link.
 
-The system GStreamer NVENC stack (``nvv4l2h264enc`` / ``nvvidconv``) is
-installed by ``axol gst.install``; engine clocks are pinned by
-``axol jetson.setup`` (this module does not change system state).
+The NVENC elements (``nvv4l2h264enc`` / ``nvvidconv``) ship with the Jetson
+L4T BSP; ``axol gst.install`` installs the host GStreamer tools that drive
+them and ``axol jetson.setup`` pins the engine clocks (this module does not
+change system state).
 """
 
 from __future__ import annotations
