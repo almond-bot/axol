@@ -190,7 +190,10 @@ class MotorDriver(ABC):
             p_des: Desired position (rad)
             v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
-            kd:    Velocity damping   [0, 5]
+            kd:    Velocity damping. The motor clamps this to its firmware's
+                   range: [0, 5] on Damiao and legacy MyActuator, [0, 50] on
+                   newer (V4.4+) MyActuator firmware. MyActuator detects this
+                   on enable() and scales the command to match.
             t_ff:  Feedforward torque (Nm)
         """
         ...

@@ -64,9 +64,11 @@ class JointConfig:
 
     Attributes:
         kp:       Position stiffness for impedance control [0, 500].
-        kd:       Velocity damping for impedance control [0, 5]. Hardware-
-                  capped by the motor firmware at 5; use ``kd_soft`` to
-                  augment.
+        kd:       Velocity damping for impedance control. The motor clamps
+                  this to its firmware's range — 5 on Damiao and legacy
+                  MyActuator, up to 50 on newer (V4.4+) MyActuator firmware
+                  (auto-detected on ``enable()``). Use ``kd_soft`` to add
+                  damping beyond a motor's cap.
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
@@ -78,7 +80,8 @@ class JointConfig:
                   so inertia is not driven through tracking error.
         kd_soft:  Extra software velocity damping (Nm·s/rad) applied as
                   ``τ = kd_soft · (v_des − v_meas)``; mathematically
-                  equivalent to raising ``kd`` past the firmware's 5 cap.
+                  equivalent to raising ``kd`` past the motor's firmware cap
+                  (e.g. past 5 on Damiao or legacy MyActuator firmware).
     """
 
     kp: float
