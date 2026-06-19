@@ -16,7 +16,7 @@ The teleop loop runs at ``--teleop_hz`` and publishes the latest
 ``(joint_obs, action)`` to a single-slot ``_SnapshotPublisher``. A separate
 ``_CaptureThread`` ticks at ``--fps`` and, for each tick, blocks on
 ``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame
-shares the sender-clock instant ``T_n`` with the joint sample, then writes
+shares the capture instant ``T_n`` with the joint sample, then writes
 the dataset row off the hot control loop.
 """
 
@@ -46,20 +46,22 @@ _logger = logging.getLogger(__name__)
 
 
 def _default_robot_config() -> AxolRobotConfig:
-    """Default Axol robot config for data collection: three ZED streams.
+    """Default Axol robot config for data collection: three local ZED cameras.
 
-    All three cameras share one host, which is **required** — pass
-    ``--robot_config.zed_host 10.0.0.5`` (the empty placeholder below is
-    stripped from the config overlay so draccus enforces the input). Other
-    fields are overridable too, e.g. ``--robot_config.axol_config.left.elbow.kp 60``.
+    Each camera's serial number is **required** — draccus takes dict
+    fields as one inline YAML/JSON value, so pass
+    ``--robot_config.cameras "{overhead: {serial: 41234567}, left_arm:
+    {serial: 41234568}, right_arm: {serial: 41234569}}"`` (the zero
+    placeholders below are stripped from the config overlay so draccus
+    enforces the input). Other fields are overridable too, e.g.
+    ``--robot_config.axol_config.left.elbow.kp 60``.
     """
     return AxolRobotConfig(
         cameras={
-            "overhead": ZedCameraConfig(port=30000),
-            "left_arm": ZedCameraConfig(port=30002),
-            "right_arm": ZedCameraConfig(port=30004),
+            "overhead": ZedCameraConfig(serial=0),
+            "left_arm": ZedCameraConfig(serial=0),
+            "right_arm": ZedCameraConfig(serial=0),
         },
-        zed_host="",
     )
 
 
@@ -68,22 +70,20 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
     Relays every camera the robot exposes (overhead — or ``overhead_left`` /
     ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
-    show them. Best-effort: reads the latest decoded frame each camera already
-    keeps, so it never blocks the capture pipeline.
+    show them. gst cameras already produce GPU-encoded H.264 access units, so
+    they are registered directly (their ``subscribe()`` feeds a pre-encoded
+    WebRTC track — the same one grab/encode serves the dataset). SDK cameras
+    are wrapped frame-driven (see ``_ZedFrameSource``): each relayed frame is
+    encoded as soon as it's captured. Reads only consume the latest frame each
+    camera already keeps, so the dataset capture pipeline is never blocked.
     """
+    from .teleop import _ZedFrameSource
 
-    def _make_source(cam: Any) -> Callable[[], Any]:
-        def _source() -> Any:
-            try:
-                return cam.read_latest(max_age_ms=1000)
-            except Exception:
-                return None
-
-        return _source
-
-    sources: dict[str, Callable[[], Any]] = {
-        name: _make_source(cam) for name, cam in robot.cameras.items()
-    }
+    sources: dict[str, Any] = {}
+    for name, cam in robot.cameras.items():
+        # A gst camera/eye exposes subscribe(); hand it to the manager as-is so
+        # its pre-encoded AUs go straight to RTP. Everything else is raw.
+        sources[name] = cam if hasattr(cam, "subscribe") else _ZedFrameSource(cam)
 
     if not sources:
         return
@@ -99,7 +99,7 @@ class CollectDataConfig:
     """Config for ``axol collect-data``.
 
     ``robot_config`` and ``teleop_config`` are the full lerobot subsystem
-    configs (camera streams, per-joint gains, IK, VR server); nest into
+    configs (cameras, per-joint gains, IK, VR server); nest into
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
     """
@@ -295,6 +295,11 @@ def main(argv: list[str]) -> None:
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every log_say() status line.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
+
+    # System setup (Jetson clock pinning, GStreamer WebRTC install) is handled
+    # by the host installer + its boot service, not here — see
+    # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
+
     _run(cfg)
 
 
@@ -352,8 +357,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     if rerun_ip:
         init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
 
-    # Connect first — cameras auto-detect resolution and FPS from the stream,
-    # which is then used to define the dataset observation features.
+    # Connect first — cameras auto-detect resolution and FPS on open, which
+    # is then used to define the dataset observation features.
     robot.connect()
 
     if is_complete:

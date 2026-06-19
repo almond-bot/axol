@@ -4,8 +4,9 @@ The ``teleop``, ``gravity-comp``, ``collect-data``, and ``run-policy``
 commands expose their full configuration via draccus, so every nested
 field is reachable two ways:
 
-- Dotted CLI overrides, lerobot-style: ``--axol.left.elbow.kp 200``,
-  ``--robot_config.zed_host 10.0.0.5``.
+- Dotted CLI overrides, lerobot-style: ``--axol.left.elbow.kp 200``.
+  Dict-typed fields take one inline YAML/JSON value instead:
+  ``--robot_config.cameras "{overhead: {serial: 41234567}}"``.
 - A whole-config file: ``--config_path run.json`` (JSON or YAML), with
   CLI overrides layered on top.
 
@@ -46,9 +47,11 @@ import draccus
 import mergedeep
 import numpy as np
 
+from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..utils.shared import CAN_LEFT, CAN_RIGHT
+from ..vr.config import VRServerConfig
 
 T = TypeVar("T")
 
@@ -155,6 +158,15 @@ def _strip_required_inputs(instance: Any, node: Any) -> None:
         value = getattr(instance, f.name, None)
         if dataclasses.is_dataclass(value) and isinstance(node.get(f.name), dict):
             _strip_required_inputs(value, node[f.name])
+        elif isinstance(value, dict) and isinstance(node.get(f.name), dict):
+            # Dicts of dataclasses (e.g. AxolRobotConfig.cameras) — recurse
+            # into each entry so per-camera required fields (serial) are
+            # stripped from the overlay too.
+            for key, item in value.items():
+                if dataclasses.is_dataclass(item) and isinstance(
+                    node[f.name].get(key), dict
+                ):
+                    _strip_required_inputs(item, node[f.name][key])
 
 
 def _default_overlay(config_class: type) -> dict[str, Any]:
@@ -273,7 +285,7 @@ _FIELD_HELP: dict[str, str] = {
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
     "max_speed": "Max gripper joint speed (rad/s).",
-    "zed_host": "Required. Shared IP of the ZED streamer (used by cameras with no explicit host).",
+    "serial": "Required. Serial number of the ZED camera to open.",
 }
 
 # Substrings that mark draccus inline help as mis-extracted source code.
@@ -397,29 +409,35 @@ class TeleopCmdConfig:
     Disable an arm with ``--left_channel null`` / ``--right_channel null``.
     Teleop session parameters (e.g. the position multiplier) live on the
     nested ``teleop`` config — e.g. ``--teleop.position_multiplier 2.0``.
+    IK solver cost weights live on the nested ``kinematics`` config — e.g.
+    ``--kinematics.pos_weight 100`` or ``--kinematics.max_joint_delta 0.02``.
 
-    Set ``--zed_host`` to the ZED box address to also relay its camera
-    streams to the headset (overhead as the main feed, wrist cameras
-    switched with the right thumbstick); ``zed_cameras`` selects which
-    slots to receive. Requires the cameras to already be streaming from
-    the box (e.g. via ``axol zed.stream`` or a connected ZED box in the
-    control panel) and the ``video`` extra installed locally.
+    Map camera slots to local ZED serial numbers via ``--cameras`` to also
+    stream them to the headset (overhead as the main feed, wrist cameras
+    switched with the right thumbstick) — e.g. ``--cameras "{overhead:
+    41234567, left_arm: 41234568}"``. Requires the ZED SDK and pyzed
+    (``axol zed.install``) plus the GStreamer NVENC stack (``axol
+    gst.install``) installed locally.
 
-    Set ``--overhead_stereo`` when the overhead is a stereo ZED X: its two
-    eyes are relayed as ``overhead_left`` / ``overhead_right`` and rendered
-    per-lens in the headset for true stereo.
+    A stereo ZED X overhead is detected automatically from its serial: its
+    two eyes are relayed as ``overhead_left`` / ``overhead_right`` and
+    rendered per-lens in the headset for true stereo. ``--resolution`` picks
+    the capture resolution for all cameras (``SVGA`` / ``HD1080`` /
+    ``HD1200``); ``null`` (the default) keeps each camera's SDK default.
+
+    The VR WebSocket server (port, TLS certs) lives on the nested
+    ``vr_server`` config — e.g. ``--vr_server.port 9000``.
     """
 
     sim: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
+    kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
+    vr_server: VRServerConfig = field(default_factory=VRServerConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
-    zed_host: str | None = None
-    zed_cameras: list[str] = field(
-        default_factory=lambda: ["overhead", "left_arm", "right_arm"]
-    )
-    overhead_stereo: bool = False
+    cameras: dict[str, int] = field(default_factory=dict)
+    resolution: str | None = None
     log_level: LogLevel = "INFO"
 
 
@@ -431,8 +449,14 @@ class GravityCompCmdConfig:
     ``[WRIST_3, ELBOW]``) to gravity-compensate; ``null`` (the default)
     frees all seven arm joints. Disable an arm with ``--left_channel
     null`` / ``--right_channel null``.
+
+    The gravity feed-forward torque (per-joint mass / centre-of-mass) and
+    the impedance gains used to hold non-free joints both come from the
+    nested ``axol`` config — override them via e.g.
+    ``--axol.left.elbow.kp 60`` or ``--axol.left_stiffness 0.8``.
     """
 
+    axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None

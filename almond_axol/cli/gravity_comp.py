@@ -87,7 +87,9 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
     )
 
     async with Axol(
-        left_channel=cfg.left_channel, right_channel=cfg.right_channel
+        config=cfg.axol,
+        left_channel=cfg.left_channel,
+        right_channel=cfg.right_channel,
     ) as axol:
         # ``enable()`` (called by ``__aenter__``) leaves arm joints in IMPEDANCE
         # and the gripper in POSITION_FORCE — both of which are the modes

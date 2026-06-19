@@ -1,7 +1,7 @@
 """Shared privilege-escalation helper.
 
 A handful of Axol operations need root for system commands (CAN bring-up, the
-persistent ``can.setup`` configuration, PTP clock-sync daemons). The hosted
+persistent ``can.setup`` configuration, ZED daemon restarts). The hosted
 install runs ``axol serve`` as root under systemd, so those commands run
 directly; interactive CLI use from a terminal escalates via ``sudo``, which
 prompts on the tty as usual.
@@ -27,7 +27,7 @@ def _finish(
 def prime_sudo() -> bool:
     """Ensure subsequent ``sudo -n`` invocations will succeed.
 
-    Long-lived root processes (PTP daemons, daemon restarts) are spawned with
+    Root processes (e.g. ZED daemon restarts) are spawned with
     ``sudo -n`` so headless contexts (web control panel) fail fast instead of
     blocking on a password prompt that can never be answered. Call this first
     so interactive CLI use still works: when there is a tty and no cached

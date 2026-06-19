@@ -1,99 +1,71 @@
 ---
 title: "Policy Inference Quickstart"
-description: "Run a trained policy autonomously across the main host and ZED box."
+description: "Run a trained policy autonomously — locally, or with an optional remote inference server."
 ---
 
-Policy inference runs across **two machines** on the same network, exactly like [data collection](/quickstart/data-collection):
+Policy inference runs on the same machine as [data collection](/quickstart/data-collection) — the computer wired to the robot with the three ZED cameras attached. By default, inference also runs there: `run-policy` spawns a local `PolicyServer` child process and streams observations to it.
 
-- **Main host** (the upper computer) — runs the policy server and the autonomous control loop.
-- **ZED box** (the Jetson sender) — streams the three ZED-X One cameras.
-
-Both machines must agree on the time (via PTP) so the camera observations fed to the policy are aligned with the joint state. Each machine runs **two long-lived processes**, each in its own terminal, that stay up for the entire rollout session.
+Optionally, inference can be **offloaded to a more powerful machine** on the network (e.g. a desktop with a discrete GPU). The robot machine sends joint positions + camera frames over gRPC and receives action chunks back:
 
 ```mermaid
 flowchart LR
-  subgraph zedbox [ZED box / Jetson]
-    slave["zed.sync-clocks --role slave"]
-    stream["zed.stream (3 cameras)"]
-  end
-  subgraph mainhost [Main host / upper computer]
-    master["zed.sync-clocks --role master"]
+  subgraph robot [Robot machine]
     proc["run-policy"]
   end
-  slave -->|PTP over the link| master
-  stream -->|HEVC video| proc
+  subgraph server [Inference server - optional]
+    infer["inference-server"]
+  end
+  proc -->|joints + camera frames| infer
+  infer -->|action chunks| proc
 ```
-
-<Warning>
-  Start the clock-sync daemon on **both** machines before launching `run-policy`. If PTP isn't running, the receiver's capture/decode skew check in `ZedCamera.connect()` warns and the observations sent to the policy will not be time-aligned with joint state. See [`zed.sync-clocks`](/cli/zed-sync-clocks).
-</Warning>
-
-## Network setup
-
-The two machines must be able to reach each other over the network. Configure each NIC with an IP however you like — DHCP on a shared switch, or static IPs (e.g. `192.168.10.1/24` on the ZED box and `192.168.10.2/24` on the main host) over a direct ethernet cable. Find the ZED box's IP (`ip addr`) and pass it to the main host as `--robot_config.zed_host <zed-box-ip>`. This is the same setup as the [Data Collection quickstart](/quickstart/data-collection#network-setup).
-
-Interface names vary by machine — the link might be `eth0`, `enp3s0`, `eno1`, and so on. Run `ip link` (or `ip addr`) on each machine to find the interface carrying the link, and substitute it for `<iface>` in the commands below.
-
-PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
 
 ## Prerequisites
 
-- The `lerobot` extra installed on the main host — the [quick install](/installation#quick-install-recommended) includes it. For GPU inference the `cuda` extra is also needed, which the quick install does **not** include: on a development install run `uv sync --extra lerobot --extra cuda` (see [Installation](/installation)).
+- The `lerobot` extra installed — the [quick install](/installation#quick-install-recommended) includes it. For local GPU inference the `cuda` extra is also needed, which the quick install does **not** include: on a development install run `uv sync --extra lerobot --extra cuda` (see [Installation](/installation)).
 - A trained checkpoint (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …).
-- CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
-- `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.
-- A network link between the two machines — either a direct ethernet cable or a shared router/switch (see [Network setup](#network-setup)).
+- CAN set up ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
+- `pyzed` installed ([`zed.install`](/cli/zed-install)) and the three ZED cameras connected, with their serial numbers on hand.
 
-## ZED box (Jetson)
+## Run the policy (local inference)
 
-Open two terminals on the ZED box.
+```bash
+axol run-policy \
+    --policy_path myorg/pick-place-policy \
+    --policy_type act \
+    --task "Pick the red cube" \
+    --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+```
 
-<Steps>
-  <Step title="Start clock sync (slave)">
-    ```bash
-    axol zed.sync-clocks --role slave --iface <iface>
-    ```
+Replace the serials with your cameras' (the `cameras` dict is one inline YAML value — see [Command configuration](/cli/configuration#field-name-conventions)). Use the **same** camera resolution, stereo setting, and `--fps` the policy was trained on.
 
-    Replace `<iface>` with the ZED box's link interface (find it with `ip link`). Leave this running for the whole session.
-  </Step>
+A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields, and [Command configuration](/cli/configuration) for the draccus override syntax.
 
-  <Step title="Stream the cameras">
-    ```bash
-    axol zed.stream \
-        --overhead 12345678 \
-        --left-arm 23456789 \
-        --right-arm 34567890
-    ```
-
-    Streams from the NIC's current IP until `Ctrl+C`. Note that IP — you'll pass it to the main host as `--robot_config.zed_host`. Use the **same** `--resolution` and `--fps` the policy was trained on so the `ZedCamera` validation on the main host passes. See [`zed.stream`](/cli/zed-stream).
-  </Step>
-</Steps>
-
-## Main host (upper computer)
-
-Open two terminals on the main host.
+## Offload inference to a remote server (optional)
 
 <Steps>
-  <Step title="Start clock sync (master)">
+  <Step title="Start the inference server">
+    On the GPU machine (with the `lerobot` + `cuda` extras installed):
+
     ```bash
-    axol zed.sync-clocks --role master --iface <iface>
+    axol inference-server
     ```
 
-    Replace `<iface>` with the main host's link interface (find it with `ip link`). Leave it running for the whole session.
+    Listens on `0.0.0.0:8765` until `Ctrl+C`. See [`inference-server`](/cli/inference-server).
   </Step>
 
-  <Step title="Run the policy">
+  <Step title="Point run-policy at it">
+    On the robot machine, add `--server_host`:
+
     ```bash
     axol run-policy \
         --policy_path myorg/pick-place-policy \
         --policy_type act \
         --task "Pick the red cube" \
-        --robot_config.zed_host 192.168.1.42
+        --server_host 192.168.1.99 \
+        --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Replace `192.168.1.42` with the ZED box's IP.
-
-    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. `--fps` must match the rate the policy was trained on. For CPU inference add `--device cpu`. See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields, and [Command configuration](/cli/configuration) for the draccus override syntax.
+    The server downloads the policy itself, so `--policy_path` must be reachable from it (e.g. a HuggingFace Hub repo ID).
   </Step>
 </Steps>
 

@@ -1,0 +1,19 @@
+---
+title: "jetson.setup"
+description: "Pin the Jetson NVENC/VIC and CPU clocks for the real-time loops."
+---
+
+Pins the Jetson clocks the real-time loops depend on:
+
+- the **NVENC / VIC engine** devfreq nodes, so the camera relay's hardware H.264 encode stays low-latency (the default devfreq governor scales them for throughput, which roughly triples per-frame encode time), and
+- the **CPU governor**, so the bursty IK loop isn't underclocked.
+
+```bash
+axol jetson.setup
+```
+
+These pins reset on every reboot, so the [quick install](/installation#quick-install-recommended) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
+
+<Note>
+  Best-effort and a no-op on non-Jetson machines. Pinning needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.
+</Note>

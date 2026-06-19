@@ -4,15 +4,19 @@
 #   curl https://axol.almond.bot/install -fsS | bash
 #
 # Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
-# except cuda/dev), and registers a root systemd service that keeps
-# `axol serve` running at boot and restarts it if it ever goes down.
+# except cuda), installs the pyzed bindings when the ZED SDK is present,
+# and registers a root systemd service that keeps `axol serve` running at
+# boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
 
 set -euo pipefail
 
 INSTALL_URL="https://axol.almond.bot/install"
 REPO="git+https://github.com/almond-bot/axol"
-EXTRAS="lerobot,sim,video"
+# `video` is intentionally omitted: headset-video support is system-level
+# (GStreamer webrtcbin/libnice/NVENC + PyGObject), installed below by
+# `axol gst.install`, not via a PyPI extra (see pyproject.toml).
+EXTRAS="lerobot,sim"
 PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
@@ -54,6 +58,48 @@ UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
+# -- pyzed --------------------------------------------------------------------
+
+# pyzed is not on PyPI, so it cannot be an extra; install it into the tool
+# environment whenever the ZED SDK is present on this machine.
+if [ -d /usr/local/zed ]; then
+    say "ZED SDK detected; installing the pyzed Python bindings..."
+    axol zed.install || say "WARNING: pyzed install failed; run axol zed.install manually."
+else
+    say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
+fi
+
+# -- GStreamer ZED camera pipeline (headset video + collection) ---------------
+
+# Teleop and collect-data share one GPU-resident camera path: the zed-gstreamer
+# zedxonesrc/zedsrc elements grab straight into NVMM, NVENC encodes on the
+# Jetson, and aiortc (a normal Python dependency) forwards the pre-encoded
+# H.264 over WebRTC. `axol gst.install` apt-installs the GStreamer CLI tools and
+# PyGObject (the in-process appsink reader); NVENC's nvvidconv / nvv4l2h264enc
+# ship with the Jetson L4T BSP.
+say "Installing the GStreamer stack (PyGObject + NVENC)..."
+axol gst.install || say "WARNING: gst.install failed; headset video may be unavailable. Re-run 'axol gst.install'."
+
+# Build + install our patched zedxonesrc/zedsrc. A fresh Jetson has no
+# zed-gstreamer plugins (so the camera path would fall back to the slower ZED
+# SDK grab), and the stock plugins stamp each frame's PTS at host-receive time
+# rather than the true sensor-exposure instant (TIME_REFERENCE::IMAGE) -- which
+# is what lets collected image frames line up with joint samples. The patch
+# fixes both. Needs the ZED SDK + Jetson toolchain; a quick no-op otherwise.
+if [ -d /usr/local/zed ]; then
+    say "Building the patched zed-gstreamer plugins (sensor-accurate timestamps)..."
+    axol gst.build-zed || say "WARNING: gst.build-zed failed; the GPU camera path may be unavailable or use host-receive timestamps. Re-run 'axol gst.build-zed'."
+fi
+
+# -- Jetson clocks ------------------------------------------------------------
+
+# Pin the NVENC/VIC engine clocks (encode latency) and the CPU governor (IK
+# loop rate). These reset on reboot, so the systemd unit below re-pins them at
+# every boot via ExecStartPre; do it once now too so it takes effect without a
+# reboot. No-op off a Jetson.
+say "Pinning Jetson clocks for the real-time loops..."
+axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
+
 # -- systemd service ----------------------------------------------------------
 
 say "Writing ${SERVICE_FILE}..."
@@ -64,6 +110,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
+# '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
+ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3

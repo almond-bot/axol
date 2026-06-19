@@ -1,4 +1,4 @@
-"""Control of the ZED X daemon (``zed_x_daemon``) on the ZED box.
+"""Control of the ZED X daemon (``zed_x_daemon``) on the host machine.
 
 The daemon only enumerates GMSL cameras when it starts, so a camera plugged in
 after boot stays invisible to the SDK until the daemon restarts. Restart it

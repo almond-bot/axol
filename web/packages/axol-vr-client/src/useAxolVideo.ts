@@ -67,6 +67,19 @@ export function useAxolVideo(
       // its camera name from the server's map.
       const acc: CameraStreams = {}
       pc.ontrack = (e: RTCTrackEvent) => {
+        // Ask the receiver to render with minimal buffering: this is a live
+        // LAN teleop feed, so trade jitter resilience for latency (Chromium
+        // jitter buffers can otherwise hold frames for tens of ms).
+        const receiver = e.receiver as RTCRtpReceiver & {
+          playoutDelayHint?: number
+          jitterBufferTarget?: number | null
+        }
+        try {
+          receiver.jitterBufferTarget = 0 // standard, milliseconds
+          receiver.playoutDelayHint = 0 // legacy Chromium, seconds
+        } catch {
+          // best-effort; older browsers may reject the setters
+        }
         const mid = e.transceiver?.mid ?? null
         const name = mid != null ? trackMap[mid] : undefined
         if (!name) return

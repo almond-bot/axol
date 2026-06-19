@@ -3,13 +3,13 @@ title: "collect-data"
 description: "Record teleoperation episodes to a LeRobot-format dataset."
 ---
 
-Records teleoperation episodes using VR controller inputs and three ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
+Records teleoperation episodes using VR controller inputs and three locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
 
 <Tip>
-  Data collection runs across two machines (main host + ZED box). For the end-to-end two-machine workflow, see the [Data Collection quickstart](/quickstart/data-collection).
+  For the end-to-end workflow, see the [Data Collection quickstart](/quickstart/data-collection).
 </Tip>
 
-This command is configured via draccus. The robot and teleop subsystems are exposed as the nested `robot_config` / `teleop_config` configs (camera streams, per-joint gains, IK, VR server) — nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
+This command is configured via draccus. The robot and teleop subsystems are exposed as the nested `robot_config` / `teleop_config` configs (cameras, per-joint gains, IK, VR server) — nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
 
 | Flag | Description |
 |---|---|
@@ -19,8 +19,8 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--teleop_hz INT` | Motor command rate in Hz; decoupled from `--fps` for smooth control (default: 120) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push to HuggingFace Hub when done |
-| `--robot_config.zed_host IP` | Shared IP of the ZED streamer for all three cameras (cameras use ports 30000/30002/30004). Override a single camera with `--robot_config.cameras.<name>.host IP` (`<name>` ∈ `overhead`/`left_arm`/`right_arm`). |
-| `--robot_config.cameras.overhead.stereo true` | The overhead is a stereo ZED X (streamed with [`zed.stream --overhead-stereo`](/cli/zed-stream)). The dataset then records two observation keys, `overhead_left` and `overhead_right`, backed by a single decoded stream. |
+| `--robot_config.cameras DICT` | The three camera slots (`overhead` / `left_arm` / `right_arm`) with each ZED camera's serial number, as one inline YAML/JSON value: `--robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"`. **Required** — each slot's `serial` has no default. |
+| ↳ `stereo: true` on `overhead` | The overhead is a stereo ZED X. The dataset then records two observation keys, `overhead_left` and `overhead_right`, backed by a single grab. |
 | `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper in POSITION_FORCE mode (default: 0.5); `<side>` is `left`/`right` |
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--teleop_config.vr_teleop_config.position_multiplier FLOAT` | Scale factor on hand **position** (not orientation): the end-effector target moves this many times as far as your hand. `1.0` (default) is 1:1; `2.0` moves the arm twice as far, helping cover the robot's full reach when the arm is longer than the operator's. |
@@ -31,16 +31,16 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 
 ```bash
-axol collect-data --repo_id myorg/pick-place --task "Pick the red cube and place it in the bin"
+axol collect-data --repo_id myorg/pick-place --task "Pick the red cube and place it in the bin" \
+    --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
 axol collect-data --repo_id myorg/pick-place --task "Pick the red cube" --fps 30 \
-    --robot_config.zed_host 192.168.1.42
-axol collect-data --repo_id myorg/pick-place --task "Pick the red cube" \
+    --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}" \
     --robot_config.axol_config.left_stiffness 1.0 --robot_config.axol_config.right_stiffness 1.0
 ```
 
 ## Headset camera views
 
-During collection the camera feeds are also relayed to the headset over WebRTC (requires the `video` extra), so the operator sees the overhead and wrist views while recording — switched with the right thumbstick, same as teleop. See the [VR Interface guide](/guides/vr-interface#camera-views).
+During collection the camera feeds are also relayed to the headset over WebRTC (requires the zed-gstreamer + NVENC stack, [`gst.install`](/cli/gst-install)), so the operator sees the overhead and wrist views while recording — switched with the right thumbstick, same as teleop. Collection uses the same GPU-resident `gst_zed` pipeline teleop does, but a **single grab per camera** serves both the dataset (raw frames, timestamped from the buffer PTS to align with joint samples) and the headset (encoded H.264) — no second capture. See the [VR Interface guide](/guides/vr-interface#camera-views).
 
 ## VR controller controls
 
@@ -55,5 +55,5 @@ Episodes are driven from the Quest controllers. For the full controller layout a
 After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off; conversely, if no episodes were saved before exit the empty dataset directory is removed on shutdown so an aborted session does not leave a half-initialized dataset on disk.
 
 <Info>
-  Dataset frame capture runs on a dedicated thread decoupled from the teleop control loop. Teleop ticks at `--teleop_hz` and only ever touches joint state; the capture thread ticks at `--fps`, blocks on `ZedCamera.read_at_or_after(T_n)` per camera so every recorded frame is sender-clock-aligned with the joint sample taken at `T_n`, and writes the dataset row. This keeps camera reads, image conversion, and `dataset.add_frame()` off the hot control loop, and produces datasets whose camera/joint pairing matches the sender's exposure timeline rather than the receiver's decode timeline. Both clocks must agree — make sure [`zed.sync-clocks`](/cli/zed-sync-clocks) is running on both machines.
+  Dataset frame capture runs on a dedicated thread decoupled from the teleop control loop. Teleop ticks at `--teleop_hz` and only ever touches joint state; the capture thread ticks at `--fps`, blocks on `ZedCamera.read_at_or_after(T_n)` per camera so every recorded frame is capture-aligned with the joint sample taken at `T_n`, and writes the dataset row. This keeps camera reads, image conversion, and `dataset.add_frame()` off the hot control loop, and produces datasets whose camera/joint pairing matches the cameras' exposure timeline. Since the cameras are captured locally, frames and joint samples share a single clock — no cross-machine time sync needed.
 </Info>

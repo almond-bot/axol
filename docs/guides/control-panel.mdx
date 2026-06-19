@@ -1,9 +1,9 @@
 ---
 title: "Web Control Panel"
-description: "Drive Axol from a browser — connect the Axol host, robot, and ZED box, then run any operation without touching the terminal."
+description: "Drive Axol from a browser — connect the Axol host and robot, assign the cameras, then run any operation without touching the terminal."
 ---
 
-The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors, the PTP clock sync, and the camera streams.
+The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors and the camera setup.
 
 It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
 
@@ -12,7 +12,7 @@ It's served by [`axol serve`](/cli/serve) and runs each operation **in-process**
 
 ## Start the server
 
-With the [quick install](/installation#quick-install-recommended), the server is already running on the **main host** (the upper computer wired to the robot) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+With the [quick install](/installation#quick-install-recommended), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
 
 On a development install, start it yourself:
 
@@ -40,14 +40,14 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 
 ## Connections
 
-The top of the panel is a row of three connection tiles — **Axol Host**, **Axol**, and **ZED Box** — each with a colored status dot. Connect them left to right.
+The top of the panel is a row of three tiles — **Axol Host**, **Axol**, and **Cameras** — each with a colored status dot.
 
-{/* SCREENSHOT: control-panel-connections.png — close-up of the three connection tiles (Axol Host / Axol / ZED Box) */}
-<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, ZED Box" />
+{/* SCREENSHOT: control-panel-connections.png — close-up of the three tiles (Axol Host / Axol / Cameras) */}
+<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras" />
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve`. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
 
 ### Axol
 
@@ -58,29 +58,16 @@ Press **Connect** to bring up the robot. Under the hood this:
 
 The server runs as root under the quick install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
-### ZED Box
+### Cameras
 
-Data collection and policy inference also need the **ZED Box** (the Jetson streaming the cameras), which runs its own `axol serve`. Press **Connect** to open the dialog.
+Data collection and policy inference also need the three ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
 
-{/* SCREENSHOT: zed-connect-dialog.png — the "ZED Box" dialog with the address field and the three optional camera-serial fields */}
-<img src="/assets/zed-connect-dialog.png" alt="ZED Box dialog" />
+The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually; a stereo camera captures both eyes from one grab (recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`).
 
-Enter the box's IP (port `8001` assumed) and, optionally, the serial numbers of the overhead / left-arm / right-arm cameras. If the overhead is a **stereo ZED X**, tick the **Stereo** checkbox next to it — both eyes are then streamed (and recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`); the streaming bitrate is picked automatically from it. Connecting then:
-
-1. Checks the box is reachable.
-2. Starts **PTP clock sync** between the two machines (the Axol host as master, the box as slave) so camera frames and joint samples share a clock. The network interfaces are auto-derived from the box IP — you don't pick them.
-3. Once the clocks **lock**, starts **streaming** the cameras whose serials you entered.
-
-The tile header shows two status lights — **CLOCK** and **STREAM** — that are **green** when healthy, **amber** while starting, and **red** on error (hover for the reason). The camera serials and box IP persist in your browser, so they're pre-filled next time.
-
-<Note>
-  PTP daemons need root. Both machines' `axol serve` run as root under the quick install's systemd service, so this is automatic; on a development install run the server as root or configure passwordless `sudo`.
-</Note>
-
-When connected, the ZED tile shows **Restart** (re-run clock sync + streaming) and **Disconnect** buttons. If clock sync or streaming fails, an inline panel appears below the connections with the error and the full log streamed from the box, so you can see exactly which camera serial wasn't found or why the clocks didn't lock.
+The assignments persist in your browser and are sent along when you start an operation — collect data and run policy need all three slots; teleop streams whichever are assigned to the headset.
 
 <Warning>
-  Closing the browser tab does **not** stop anything — the robot link, clock sync, and camera streams live in the `serve` process and keep running. Use **Disconnect** (or stop `axol serve`) to tear them down.
+  Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
 </Warning>
 
 ## Operations
@@ -92,22 +79,22 @@ Pick an operation from the selector. Each has its own settings form; required fi
 
 | Operation | Needs | Notes |
 |---|---|---|
-| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If the ZED box is connected and streaming, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
+| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
 | **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
-| **Collect Data** | Axol + ZED box | Record VR teleop episodes to a LeRobot dataset with the cameras. |
-| **Run Policy** | Axol + ZED box | Run a trained policy via LeRobot async inference. |
+| **Collect Data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Run Policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Connect the ZED box*, *Wait for clocks to lock*, *Wait for cameras to stream*, or *Set &lt;required field&gt;*. The ZED-dependent operations are gated on both the clocks locking **and** the cameras actually streaming.
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Assign all three camera serials in the Cameras dialog*, or *Set &lt;required field&gt;*.
 
 ### Settings persistence & import/export
 
-Each operation's settings are saved to your browser automatically, so they reappear on reload. Use **Export** to download a settings JSON and **Import** to load one — handy for sharing a known-good configuration across machines. (Camera serials and the ZED box address live with the ZED connection, not in an operation's export.)
+Each operation's settings are saved to your browser automatically, so they reappear on reload. Use **Export** to download a settings JSON and **Import** to load one — handy for sharing a known-good configuration across machines. (Camera assignments live with the Cameras dialog, not in an operation's export.)
 
 ### Running, logs, and stopping
 
-Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it; the robot link returns to idle 1 Hz polling and the ZED links stay up for the next run.
+Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it; the robot link returns to idle 1 Hz polling.
 
 ## Run Policy episode controls
 

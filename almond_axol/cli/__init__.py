@@ -8,12 +8,13 @@ from . import serve as serve_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
+from .gst import build_zed as gst_build_zed
+from .gst import install as gst_install
+from .jetson import setup as jetson_setup
 from .motor import info as motor_info
 from .motor import set_can_id, set_zero_pos
 from .tune import friction, pid, repeatability
 from .zed import install as zed_install
-from .zed import stream as zed_stream
-from .zed import sync_clocks as zed_sync_clocks
 
 # Commands that parse their config with draccus instead of argparse. Their
 # dotted ``--section.field`` overrides aren't compatible with argparse
@@ -26,6 +27,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "run-policy": ("run_policy", "Run a trained policy on the robot."),
+    "inference-server": (
+        "inference_server",
+        "Serve policy inference for run-policy --server_host.",
+    ),
 }
 
 
@@ -51,9 +56,10 @@ def main() -> None:
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
-    zed_stream.add_parser(subparsers)
-    zed_sync_clocks.add_parser(subparsers)
     zed_install.add_parser(subparsers)
+    gst_install.add_parser(subparsers)
+    gst_build_zed.add_parser(subparsers)
+    jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
     repeatability.add_parser(subparsers)

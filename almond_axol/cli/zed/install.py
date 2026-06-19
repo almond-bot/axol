@@ -78,5 +78,10 @@ def run(_args: object = None) -> None:
         print(f"Saved to {dest}")
 
     print(f"Installing {whl_name}...")
-    subprocess.check_call(["uv", "pip", "install", str(dest)])
+    # Pin the target to the interpreter running this CLI: a bare `uv pip
+    # install` resolves the environment from VIRTUAL_ENV/cwd, which is wrong
+    # when axol is installed as a uv tool.
+    subprocess.check_call(
+        ["uv", "pip", "install", "--python", sys.executable, str(dest)]
+    )
     print("Done. pyzed is installed.")

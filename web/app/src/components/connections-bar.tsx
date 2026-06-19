@@ -1,7 +1,7 @@
-import { Cpu, Loader2, Plug, Camera, RotateCw, Server, Power } from "lucide-react"
+import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import type { PtpStatus, RobotStatus, StreamStatus, ZedLinkStatus } from "@/lib/supervisor"
+import { cameraCount, type CameraSpec, type RobotStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -66,11 +66,8 @@ export function ConnectionsBar({
   robotBusy,
   onRobotConnect,
   onRobotDisconnect,
-  zed,
-  zedBusy,
-  onZedConnect,
-  onZedDisconnect,
-  onZedRestart,
+  cameras,
+  onConfigureCameras,
 }: {
   conn: ConnState
   host: string
@@ -81,11 +78,8 @@ export function ConnectionsBar({
   robotBusy: boolean
   onRobotConnect: () => void
   onRobotDisconnect: () => void
-  zed: ZedLinkStatus | null
-  zedBusy: boolean
-  onZedConnect: () => void
-  onZedDisconnect: () => void
-  onZedRestart: () => void
+  cameras: CameraSpec
+  onConfigureCameras: () => void
 }) {
   const online = conn === "ok"
 
@@ -126,14 +120,10 @@ export function ConnectionsBar({
             ? robot?.error || "Error"
             : "Disconnected"
 
-  // -- zed --
-  const zedConnected = !!zed?.connected
-  const zedDot: Dot = zedBusy ? "busy" : zedConnected ? "ok" : zed?.error ? "err" : "idle"
-  const zedLabel = zedConnected
-    ? zed?.info?.hostname || zed?.boxUrl || "Connected"
-    : zed?.error
-      ? "Unreachable"
-      : "Not connected"
+  // -- cameras --
+  const camCount = cameraCount(cameras)
+  const camDot: Dot = camCount === 3 ? "ok" : camCount > 0 ? "warn" : "idle"
+  const camLabel = camCount === 0 ? "Not configured" : `${camCount}/3 configured`
 
   return (
     <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
@@ -177,7 +167,7 @@ export function ConnectionsBar({
             variant="outline"
             size="icon"
             onClick={onRobotDisconnect}
-            disabled={robotBusy || rs === "busy"}
+            disabled={robotBusy}
             aria-label="Disconnect Axol"
             className="size-8"
           >
@@ -196,96 +186,14 @@ export function ConnectionsBar({
         )}
       </Tile>
 
-      <Tile
-        icon={<Camera className="size-3.5" />}
-        title="ZED box"
-        dot={zedDot}
-        label={zedLabel}
-        headerRight={
-          zedConnected ? (
-            <div className="flex items-center gap-2">
-              <PtpBadge ptp={zed?.ptp} />
-              <StreamBadge stream={zed?.stream} />
-            </div>
-          ) : undefined
-        }
-      >
-        {zedConnected ? (
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={onZedRestart}
-              disabled={zedBusy}
-              aria-label="Restart PTP clock sync and camera streams"
-              className="size-8"
-            >
-              {zedBusy ? <Loader2 className="animate-spin" /> : <RotateCw />}
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={onZedDisconnect}
-              disabled={zedBusy}
-              aria-label="Disconnect the ZED box"
-              className="size-8"
-            >
-              {zedBusy ? <Loader2 className="animate-spin" /> : <Power />}
-            </Button>
-          </div>
-        ) : (
-          <Button variant="outline" size="sm" onClick={onZedConnect} disabled={!online}>
-            <Plug />
-            Connect
-          </Button>
-        )}
+      <Tile icon={<Camera className="size-3.5" />} title="Cameras" dot={camDot} label={camLabel}>
+        <Button variant="outline" size="sm" onClick={onConfigureCameras} disabled={!online}>
+          <Settings2 />
+          Configure
+        </Button>
       </Tile>
     </div>
   )
-}
-
-/**
- * A labelled status light: short name + tiny dot, so the ZED box header stays
- * compact and never crowds the title.
- * Green = good, amber (pulsing) = loading/starting, red = error.
- */
-function StatusDot({ name, dot, pulse }: { name: string; dot: Dot; pulse?: boolean }) {
-  return (
-    <span className="flex items-center gap-1.5 text-[0.6rem] tracking-wide text-white/35 uppercase">
-      <span>{name}</span>
-      <span className={cn("size-2 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")} />
-    </span>
-  )
-}
-
-/**
- * PTP clock-sync light for the ZED box header. The link comes up on connect, so
- * it settles (syncing → locked) before any task.
- */
-function PtpBadge({ ptp }: { ptp?: PtpStatus }) {
-  if (!ptp) return null
-  const [dot, pulse] = ptp.locked
-    ? (["ok", false] as const)
-    : ptp.error
-      ? (["err", false] as const)
-      : (["warn", true] as const)
-  return <StatusDot name="clock" dot={dot} pulse={pulse} />
-}
-
-/**
- * Camera-stream light for the ZED box header. Streaming starts after the clocks
- * lock for whatever serials were entered on connect; hidden when no cameras are
- * configured.
- */
-function StreamBadge({ stream }: { stream?: StreamStatus }) {
-  if (!stream) return null
-  if (!stream.streaming && stream.cameras.length === 0 && !stream.error) return null
-  const [dot, pulse] = stream.ready
-    ? (["ok", false] as const)
-    : stream.error
-      ? (["err", false] as const)
-      : (["warn", true] as const)
-  return <StatusDot name="stream" dot={dot} pulse={pulse} />
 }
 
 /**

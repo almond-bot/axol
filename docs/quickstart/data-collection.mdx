@@ -1,99 +1,42 @@
 ---
 title: "Data Collection Quickstart"
-description: "Record teleoperation episodes to a LeRobot dataset across the main host and ZED box."
+description: "Record teleoperation episodes to a LeRobot dataset — everything runs on one machine."
 ---
 
-Data collection runs across **two machines** on the same network:
-
-- **Main host** (the upper computer) — owns the dataset, runs teleop and the recording loop.
-- **ZED box** (the Jetson sender) — streams the three ZED-X One cameras.
-
-Both machines must agree on the time (via PTP) so each recorded camera frame is aligned with the joint sample taken at the same instant. Each machine therefore runs **two long-lived processes**, each in its own terminal, that stay up for the entire session.
-
-```mermaid
-flowchart LR
-  subgraph zedbox [ZED box / Jetson]
-    slave["zed.sync-clocks --role slave"]
-    stream["zed.stream (3 cameras)"]
-  end
-  subgraph mainhost [Main host / upper computer]
-    master["zed.sync-clocks --role master"]
-    proc["collect-data"]
-  end
-  slave -->|PTP over the link| master
-  stream -->|HEVC video| proc
-```
-
-<Warning>
-  Start the clock-sync daemon on **both** machines before launching `collect-data`. If PTP isn't running, the receiver's capture/decode skew check in `ZedCamera.connect()` warns and recorded camera/joint pairs will not be time-aligned. See [`zed.sync-clocks`](/cli/zed-sync-clocks) for the PTP canary details.
-</Warning>
-
-## Network setup
-
-The two machines must be able to reach each other over the network. Configure each NIC with an IP however you like — DHCP on a shared switch, or static IPs (e.g. `192.168.10.1/24` on the ZED box and `192.168.10.2/24` on the main host) over a direct ethernet cable. Find the ZED box's IP (`ip addr`) and pass it to the main host as `--robot_config.zed_host <zed-box-ip>`.
-
-Interface names vary by machine — the link might be `eth0`, `enp3s0`, `eno1`, and so on. Run `ip link` (or `ip addr`) on each machine to find the interface carrying the link, and substitute it for `<iface>` in the commands below.
-
-PTP runs over whichever interface carries the link (`zed.sync-clocks --iface`). If the two machines are not on the same L2 segment (e.g. separated by a router rather than a switch), add `--transport udpv4` to the clock-sync commands.
+Data collection runs entirely on **one machine** — the computer wired to the robot with the three ZED cameras attached (typically an NVIDIA Jetson / ZED Box). It owns the dataset, runs teleop and the recording loop, and captures the cameras locally, so every recorded frame and joint sample shares the same clock — no time sync to set up.
 
 ## Prerequisites
 
-- The `lerobot` and `video` extras installed on the main host. The [quick install](/installation#quick-install-recommended) includes both; on a development install run `uv sync --extra lerobot --extra video` (see [Installation](/installation)).
-- CAN set up on the main host ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
-- `pyzed` installed on the ZED box ([`zed.install`](/cli/zed-install)) and the three camera serial numbers on hand.
-- A network link between the two machines — either a direct ethernet cable or a shared router/switch (see [Network setup](#network-setup)).
+- The `lerobot` extra installed and the GStreamer NVENC stack (for relaying the cameras to the headset). The [quick install](/installation#quick-install-recommended) sets up both; on a development install run `uv sync --extra lerobot` and [`axol gst.install`](/cli/gst-install) (see [Installation](/installation)).
+- CAN set up ([`can.setup`](/cli/can-setup)) and motors verified ([`motor.info`](/cli/motor-info)).
+- `pyzed` installed ([`zed.install`](/cli/zed-install)) and the three ZED cameras connected over GMSL, with their serial numbers on hand.
 
-## ZED box (Jetson)
+<Tip>
+  Camera serials are printed on the camera body, or list the connected cameras from Python:
 
-Open two terminals on the ZED box.
+  ```bash
+  python -c "from almond_axol.zed import list_zed_devices; print(list_zed_devices())"
+  ```
 
-<Steps>
-  <Step title="Start clock sync (slave)">
-    ```bash
-    axol zed.sync-clocks --role slave --iface <iface>
-    ```
+  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`).
+</Tip>
 
-    Replace `<iface>` with the ZED box's link interface (find it with `ip link`). Leave this running for the whole session. See [`zed.sync-clocks`](/cli/zed-sync-clocks) for transport and timestamping options.
-  </Step>
+## Run data collection
 
-  <Step title="Stream the cameras">
-    ```bash
-    axol zed.stream \
-        --overhead 12345678 \
-        --left-arm 23456789 \
-        --right-arm 34567890
-    ```
+```bash
+axol collect-data \
+    --repo_id myorg/pick-place \
+    --task "Pick the red cube and place it in the bin" \
+    --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+```
 
-    Streams from the NIC's current IP until `Ctrl+C`. Note that IP — you'll pass it to the main host as `--robot_config.zed_host`. If the overhead is a stereo ZED X, add `--overhead-stereo` (and set `--robot_config.cameras.overhead.stereo true` on the main host — the dataset then records `overhead_left` / `overhead_right`). See [`zed.stream`](/cli/zed-stream) for resolution, fps, and bitrate flags.
-  </Step>
-</Steps>
+Replace the serials with your cameras'. The `cameras` dict is passed as one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). If the overhead is a stereo ZED X, add `stereo: true` to its entry — the dataset then records `overhead_left` / `overhead_right`:
 
-## Main host (upper computer)
+```bash
+    --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+```
 
-Open two terminals on the main host.
-
-<Steps>
-  <Step title="Start clock sync (master)">
-    ```bash
-    axol zed.sync-clocks --role master --iface <iface>
-    ```
-
-    Replace `<iface>` with the main host's link interface (find it with `ip link`). The `master` role runs on the long-lived upper computer that owns the dataset. Leave it running for the whole session.
-  </Step>
-
-  <Step title="Run data collection">
-    ```bash
-    axol collect-data \
-        --repo_id myorg/pick-place \
-        --task "Pick the red cube and place it in the bin" \
-        --robot_config.zed_host 192.168.1.42
-    ```
-
-    Replace `192.168.1.42` with the ZED box's IP.
-
-    The robot is driven over VR (authorize the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
-  </Step>
-</Steps>
+The robot is driven over VR (authorize the TLS certificate first — see the [Teleoperation quickstart](/quickstart/teleop)). See [`collect-data`](/cli/collect-data) for the full field list, including `--fps`, `--teleop_hz`, stiffness, and `--push_to_hub`, and [Command configuration](/cli/configuration) for the draccus override syntax.
 
 ## Controller layout
 
@@ -114,7 +57,7 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 | — | Right thumbstick | Flick to **switch camera view** (overhead / wrists / split); click to reset the screens — see [Camera views](/guides/vr-interface#camera-views) |
 
 <Note>
-  The camera feeds are relayed to the headset during collection (requires the `video` extra on the main host), so you can line up takes from the robot's point of view.
+  The camera feeds are relayed to the headset during collection (requires the GStreamer NVENC stack, [`gst.install`](/cli/gst-install)), so you can line up takes from the robot's point of view.
 </Note>
 
 ## Recording an episode
@@ -150,14 +93,14 @@ Collection resumes from an existing dataset at `--root`; an aborted session that
 </Note>
 
 <Tip>
-  Prefer a browser to juggling terminals? The [web control panel](/guides/control-panel) runs both clock-sync/streaming and `collect-data` from one page — connect the ZED box once and press **Start**.
+  Prefer a browser to a terminal? The [web control panel](/guides/control-panel) runs `collect-data` from one page — assign the camera serials once in the **Cameras** dialog and press **Start**.
 </Tip>
 
 ## Next steps
 
 <CardGroup cols={2}>
   <Card title="Policy Inference" icon="robot" href="/quickstart/inference">
-    Run a trained policy autonomously across the same two machines.
+    Run a trained policy autonomously on the same machine.
   </Card>
   <Card title="collect-data reference" icon="terminal" href="/cli/collect-data">
     Every flag and the dataset capture internals.

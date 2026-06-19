@@ -6,6 +6,7 @@
     "packages/*"
   ],
   "scripts": {
+    "build": "npm run build -w @almond/axol-vr-client && npm run build -w axol-vr-app",
     "format": "prettier --write \"**/*.{ts,tsx,json,css}\""
   },
   "devDependencies": {

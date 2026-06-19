@@ -54,19 +54,30 @@ Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whene
 
 ## Camera video to the headset
 
-The server can stream camera frames to the headset over **WebRTC**. Register per-camera frame sources with `set_video_sources()` — each source is a callable returning the latest RGB `uint8` numpy frame `(H, W, 3)` or `None`:
+The server can stream camera frames to the headset over **WebRTC**. Register per-camera sources with `set_video_sources()`. A source is either a **pre-encoded** camera (the GPU-resident `gst_zed` pipeline, exposing `subscribe()` / `alive` — its H.264 access units go straight to RTP with no Python encode) or a **raw frame** source exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)` (the `FrameSource` protocol — a `ZedCamera` satisfies it directly). The manager picks the right WebRTC track per source automatically:
 
 ```python
 vr.set_video_sources({
-    "overhead":  lambda: overhead_cam.read_latest(max_age_ms=1000),
-    "left_arm":  lambda: left_cam.read_latest(max_age_ms=1000),
-    "right_arm": lambda: right_cam.read_latest(max_age_ms=1000),
+    "overhead":  overhead_cam,
+    "left_arm":  left_cam,
+    "right_arm": right_cam,
 })
 ```
 
 The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead is registered as two sources, `overhead_left` / `overhead_right`, which the VR app renders per-lens.
 
-Requires the `video` extra (`uv sync --extra video`, which installs `aiortc`); without it `set_video_sources()` logs a warning and video stays disabled. Pass `None` or `{}` to turn video off. [`axol teleop --zed_host`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
+Pass `None` or `{}` to turn video off. [`axol teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
+
+### Pipeline
+
+Teleop and data collection share one **GPU-resident** camera path (`almond_axol.vr.gst_zed`). The zed-gstreamer source elements (`zedxonesrc` mono / `zedsrc` stereo) grab frames straight into NVMM (GPU) memory, and a single in-process GStreamer pipeline tees that one zero-copy buffer to two consumers:
+
+- an **encoded** branch — `nvv4l2h264enc` (NVENC) → `appsink` — so the whole grab→encode chain stays on the GPU (~5–10 ms) and Python only ever sees the H.264 access units, which **aiortc** forwards as pre-encoded packets (`encoder.pack`, no Python encode);
+- a **raw** branch — `nvvidconv` → RGBA `appsink` → numpy — built only when raw frames are needed (the dataset, policy inference). Each frame carries a `capture_perf_ts` derived from the buffer PTS (the `do-timestamp` running time mapped onto `time.perf_counter`), so dataset rows align image capture with the joint sample — without the ZED SDK's ~26 ms host round trip.
+
+For **teleop** the relay runs in a **dedicated subprocess** (`almond_axol.vr.video_proc.VideoRelayProcess`, registered via `set_video_manager()`) with the raw branch off (encoded only): isolating the camera grab/encode pump keeps the control loops at full rate, and only SDP signaling crosses the process boundary. For **data collection** the robot owns the cameras (one grab serves both the dataset's raw frames and the headset's encoded view), registered in-process via `set_video_sources()`. aiortc handles the WebRTC transport (RTP/SRTP/ICE) and SDP signaling in both cases. When the gst stack is unavailable, both paths fall back to the ZED Python SDK grab (`ZedCamera`) plus in-Python NVENC (`almond_axol.vr.hw_video`).
+
+Requires the zed-gstreamer + NVENC + PyGObject stack installed once by [`axol gst.install`](/cli/gst-install) (the host installer runs it). The NVENC/VIC engine clocks must also be pinned to their maximum for low-latency encode ([`axol jetson.setup`](/cli/jetson-setup), run at boot by the installer's systemd unit); the default Jetson devfreq governor scales them for throughput, which otherwise roughly triples per-frame encode latency.
 
 ## `VRServerConfig` fields
 

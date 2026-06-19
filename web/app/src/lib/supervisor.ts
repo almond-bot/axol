@@ -106,21 +106,12 @@ export interface ServerInfo {
   lanIp: string
   viewerPort: number
   vrPort: number
-  /** Best-guess wired ZED-link interface on the serve host (Linux only). */
-  ethIface: string | null
-  /** All plausible wired interfaces, best candidate first. */
-  ethIfaces: string[]
   /** Installed git commit of the serve host (null for dev checkouts). */
   commit?: string | null
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
   return json(await fetch(apiUrl("/api/info")))
-}
-
-/** Reach the ZED box's own `axol serve` (proxied) to validate + list ifaces. */
-export async function fetchBoxInfo(url: string): Promise<ServerInfo> {
-  return json(await fetch(apiUrl(`/api/zed/box-info?url=${encodeURIComponent(url)}`)))
 }
 
 // ---------------------------------------------------------------------------
@@ -159,66 +150,29 @@ export async function robotDisconnect(): Promise<RobotStatus> {
 }
 
 // ---------------------------------------------------------------------------
-// ZED box link (detached, lightweight reachability check)
+// Local ZED cameras (attached to the serve machine)
 // ---------------------------------------------------------------------------
 
-export interface PtpStatus {
-  running: boolean
-  locked: boolean
-  offsetNs: number | null
-  sessionId: string | null
-  error?: string | null
+/** One ZED camera detected on the serve machine. */
+export interface CameraDevice {
+  serial: number
+  model: string
+  /** "mono" (ZED-X One) | "stereo" (ZED X). */
+  kind: string
 }
 
-export interface StreamStatus {
-  streaming: boolean
-  ready: boolean
-  cameras: string[]
-  sessionId: string | null
-  error?: string | null
-}
-
-export interface ZedLinkStatus {
-  connected: boolean
-  boxUrl: string | null
-  info: ServerInfo | null
+export interface CameraDetectResult {
+  devices: CameraDevice[]
+  /** Why detection failed (e.g. pyzed not installed); null when it worked. */
   error: string | null
-  overheadStereo?: boolean
-  resolution?: string | null
-  ptp?: PtpStatus
-  stream?: StreamStatus
 }
 
-export async function fetchZedStatus(): Promise<ZedLinkStatus> {
-  return json(await fetch(apiUrl("/api/zed/status")))
+export async function detectCameras(): Promise<CameraDetectResult> {
+  return json(await fetch(apiUrl("/api/cameras/detect")))
 }
 
-export async function zedConnect(
-  url: string,
-  cameras?: ZedSpec["cameras"],
-  overheadStereo?: boolean,
-  resolution?: string
-): Promise<ZedLinkStatus> {
-  const body: {
-    url: string
-    cameras?: ZedSpec["cameras"]
-    overhead_stereo?: boolean
-    resolution?: string
-  } = { url }
-  if (cameras) body.cameras = cameras
-  if (overheadStereo) body.overhead_stereo = overheadStereo
-  if (resolution) body.resolution = resolution
-  return json(
-    await fetch(apiUrl("/api/zed/connect"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    })
-  )
-}
-
-export async function zedDisconnect(): Promise<ZedLinkStatus> {
-  return json(await fetch(apiUrl("/api/zed/disconnect"), { method: "POST" }))
+export async function restartCameraDaemon(): Promise<{ ok: boolean; error: string | null }> {
+  return json(await fetch(apiUrl("/api/cameras/restart-daemon"), { method: "POST" }))
 }
 
 // ---------------------------------------------------------------------------
@@ -239,13 +193,13 @@ export async function fetchOpStatus(): Promise<OpStatus> {
 export async function startOperation(
   op: OperationId,
   args: Record<string, FormValue>,
-  zed?: ZedSpec
+  cameras?: CameraSpec
 ): Promise<SessionInfo> {
   return json(
     await fetch(apiUrl("/api/op/start"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ op, args, zed: zed ?? null }),
+      body: JSON.stringify({ op, args, cameras: cameras ?? null }),
     })
   )
 }
@@ -265,22 +219,16 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
-/** Serve-side orchestration spec for collect-data / run-policy (see orchestrator.py).
+/** Local camera setup forwarded with op starts (see serve/runner.py).
  *
- * The cameras stream from, and the clocks are PTP-synced over, the same ZED box
- * address ``axol serve`` is reachable on; the PTP interfaces on both machines
- * are auto-derived from it server-side. Network addressing between this host
- * and the box is the operator's job.
+ * The serials map camera slots to the ZED cameras attached to the serve
+ * machine; the runner folds them into the operation's config (collect-data /
+ * run-policy require all three, teleop streams whichever are set to the
+ * headset).
  */
-export interface ZedSpec {
-  enabled: boolean
-  boxUrl: string
-  cameras: { overhead: string; left_arm: string; right_arm: string }
-  /** Treat the overhead as a stereo ZED X (both eyes on one stream). */
-  overheadStereo?: boolean
+export interface CameraSpec {
+  serials: { overhead: string; left_arm: string; right_arm: string }
   resolution?: string
-  fps?: number
-  bitrate?: number
 }
 
 export async function fetchCommands(): Promise<CommandSpec[]> {
@@ -293,14 +241,13 @@ export async function fetchSessions(): Promise<SessionInfo[]> {
 
 export async function runCommand(
   command: string,
-  args: Record<string, FormValue>,
-  zed?: ZedSpec
+  args: Record<string, FormValue>
 ): Promise<SessionInfo> {
   return json(
     await fetch(apiUrl("/api/run"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ command, args, zed: zed ?? null }),
+      body: JSON.stringify({ command, args }),
     })
   )
 }
@@ -309,17 +256,8 @@ export async function stopSession(id: string): Promise<SessionInfo> {
   return json(await fetch(apiUrl(`/api/sessions/${id}/stop`), { method: "POST" }))
 }
 
-export function zedCameraCount(spec: ZedSpec): number {
-  return Object.values(spec.cameras).filter((s) => s.trim()).length
-}
-
-/** Human-readable list of ZED fields blocking Start (empty = ready). */
-export function zedMissing(spec: ZedSpec): string[] {
-  if (!spec.enabled) return []
-  const missing: string[] = []
-  if (!spec.boxUrl.trim()) missing.push("ZED box address")
-  if (zedCameraCount(spec) === 0) missing.push("at least one camera serial")
-  return missing
+export function cameraCount(spec: CameraSpec): number {
+  return Object.values(spec.serials).filter((s) => s.trim()).length
 }
 
 // ---------------------------------------------------------------------------
@@ -413,8 +351,8 @@ export interface OperationMeta {
   fields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
-  /** Needs the ZED box link (collect-data / run-policy). */
-  requiresZed: boolean
+  /** Needs all three camera serials configured (collect-data / run-policy). */
+  requiresCameras: boolean
   /** Can run in sim (no hardware) — only teleop today. */
   simCapable: boolean
 }
@@ -426,7 +364,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Drive the Axol from a VR headset. Enable sim to preview in the browser.",
     fields: ["sim", "teleop.frequency", "axol.left_stiffness", "axol.right_stiffness"],
     requiresRobot: true,
-    requiresZed: false,
+    requiresCameras: false,
     simCapable: true,
   },
   {
@@ -435,7 +373,7 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["kd", "rate_hz", "free_joints"],
     requiresRobot: true,
-    requiresZed: false,
+    requiresCameras: false,
     simCapable: false,
   },
   {
@@ -444,16 +382,17 @@ export const OPERATIONS: OperationMeta[] = [
     description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
     fields: ["repo_id", "task", "fps", "push_to_hub"],
     requiresRobot: true,
-    requiresZed: true,
+    requiresCameras: true,
     simCapable: false,
   },
   {
     id: "run-policy",
     label: "Run Policy",
-    description: "Run a trained policy on Axol via LeRobot async inference.",
-    fields: ["policy_path", "repo_id", "task", "episode_time_s", "server_port"],
+    description:
+      "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
+    fields: ["policy_path", "repo_id", "task", "episode_time_s", "server_host", "server_port"],
     requiresRobot: true,
-    requiresZed: true,
+    requiresCameras: true,
     simCapable: false,
   },
 ]

@@ -45,7 +45,7 @@ from .config import VRServerConfig
 from .models import VRFrame
 
 if TYPE_CHECKING:
-    from .video import FrameSource, WebRTCManager
+    from .video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class VRServer:
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
-        self._webrtc: WebRTCManager | None = None
+        self._webrtc: WebRTCManager | Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,33 +91,56 @@ class VRServer:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
 
-    def set_video_sources(self, sources: dict[str, FrameSource] | None) -> None:
-        """Register per-camera RGB frame sources to stream to the headset.
+    def set_video_sources(self, sources: dict[str, Any] | None) -> None:
+        """Register per-camera frame sources to stream to the headset.
 
-        Each source is a callable returning the latest RGB ``uint8`` numpy frame
-        ``(H, W, 3)`` or ``None`` if no frame is available yet. The headset
-        negotiates a WebRTC connection over the existing ``/ws`` channel and
-        receives one video track per source.
+        Each source is a connected camera (or stereo eye) exposing fixed
+        ``width`` / ``height`` / ``fps`` and ``wait_next`` (returning the
+        SDK's native BGRA). The headset negotiates a WebRTC connection over
+        the existing ``/ws`` channel and receives one video track per source;
+        frames are encoded on the Jetson's hardware NVENC and shipped by
+        aiortc (see :mod:`almond_axol.vr.video`).
 
-        Pass ``None`` or an empty dict to disable video. Requires the ``video``
-        extra (aiortc); if it is unavailable this logs a warning and leaves
-        video disabled. Safe to call before or after :meth:`enable`.
+        This is the in-process fallback; teleop normally runs the relay in a
+        dedicated subprocess via :meth:`set_video_manager`. Pass ``None`` or an
+        empty dict to disable video. Requires ``aiortc`` (a normal dependency);
+        hardware NVENC additionally needs the system GStreamer stack from
+        ``axol gst.install``. If aiortc is unavailable this logs a warning and
+        leaves video disabled. Safe to call before or after :meth:`enable`.
         """
         if not sources:
             self._webrtc = None
             return
         try:
-            from .video import WebRTCManager
-        except ImportError as exc:
+            from .video import WebRTCManager, webrtc_available
+
+            if not webrtc_available():
+                raise RuntimeError("aiortc unavailable")
+            self._webrtc = WebRTCManager(sources)
+        except Exception as exc:  # noqa: BLE001 - aiortc missing
             _logger.warning(
-                "wrist video requested but aiortc is unavailable (%s); install "
-                "the 'video' extra. Continuing without wrist video.",
+                "wrist video requested but the WebRTC stack (aiortc) is "
+                "unavailable (%s); install the project dependencies (and "
+                "`axol gst.install` for hardware NVENC). Continuing without "
+                "wrist video.",
                 exc,
             )
             self._webrtc = None
             return
-        self._webrtc = WebRTCManager(sources)
         _logger.info("wrist video enabled for: %s", ", ".join(sources))
+
+    def set_video_manager(self, manager: Any | None) -> None:
+        """Register a pre-built WebRTC manager (e.g. an out-of-process relay).
+
+        ``manager`` must implement the ``WebRTCManager`` signaling interface
+        (``create_offer`` / ``set_answer`` / ``close`` / ``close_all``).
+        Used by teleop to keep all video encoding and RTP traffic in a
+        separate process (``almond_axol.vr.video_proc``) so it cannot
+        contend with the control loops. Pass ``None`` to disable video.
+        """
+        self._webrtc = manager
+        if manager is not None:
+            _logger.info("wrist video enabled (external manager)")
 
     @property
     def connected(self) -> bool:

@@ -1,0 +1,31 @@
+---
+title: "inference-server"
+description: "Serve policy inference on a separate, more powerful machine for run-policy."
+---
+
+Runs LeRobot's async-inference `PolicyServer` in the foreground, so [`run-policy`](/cli/run-policy) can offload inference to a more powerful machine (e.g. a desktop with a discrete GPU) on the same network as the robot. The robot streams joint positions + camera frames to it over gRPC and receives action chunks back.
+
+The policy itself (`--policy_path` / `--policy_type` / `--device`) is selected by the **client** (`run-policy`), not the server — so one server can serve different policies across sessions without restarting. The server downloads the policy itself, so the path must be reachable from it (e.g. a HuggingFace Hub repo ID, or a local path that exists on the server machine).
+
+```bash
+axol inference-server                 # listen on 0.0.0.0:8765
+axol inference-server --port 9000
+```
+
+Then, on the robot:
+
+```bash
+axol run-policy --server_host <server-ip> --policy_path myorg/pick-place-policy \
+    --policy_type act --task "Pick the red cube" ...
+```
+
+| Flag | Description |
+|---|---|
+| `--host HOST` | Interface to bind the gRPC server to. Default `0.0.0.0` (accepts connections from the whole network). |
+| `--port INT` | gRPC port (default: 8765). Must match `run-policy`'s `--server_port`. |
+| `--fps INT` | Action chunk rate (default: 60). Must match `run-policy`'s `--fps`. |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+
+<Note>
+  Requires the `lerobot` extra and, for GPU inference, the `cuda` extra plus a CUDA-capable PyTorch install on the server machine. Without `--server_host`, `run-policy` spawns its own local `PolicyServer` child process — this command is only needed when inference runs on a different machine.
+</Note>

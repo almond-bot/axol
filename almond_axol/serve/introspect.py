@@ -30,6 +30,7 @@ from ..cli import config as _config  # noqa: F401
 # of the dotted path, so they render as dropdowns instead of free text.
 _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
+    "eyes": ["both", "left", "right"],
     "policy_type": [
         "act",
         "smolvla",
@@ -190,16 +191,26 @@ def _leaf_type(value: Any) -> str:
 
 
 def _children(
-    prefix: str, values: dict[str, Any], instance: Any, required: set[str]
+    prefix: str,
+    values: dict[str, Any],
+    instance: Any,
+    required: set[str],
+    dict_roots: set[str],
 ) -> list[dict[str, Any]]:
     """Build the child nodes for a group, pulling per-field help from ``instance``."""
     docs = _field_docs(instance)
     out: list[dict[str, Any]] = []
+    is_dc = dataclasses.is_dataclass(instance)
     for key, value in values.items():
-        child = (
-            getattr(instance, key, None) if dataclasses.is_dataclass(instance) else None
+        if is_dc:
+            child = getattr(instance, key, None)
+        elif isinstance(instance, dict):
+            child = instance.get(key)
+        else:
+            child = None
+        out.append(
+            _make_node(prefix, key, value, required, child, docs.get(key), dict_roots)
         )
-        out.append(_make_node(prefix, key, value, required, child, docs.get(key)))
     return out
 
 
@@ -210,16 +221,24 @@ def _make_node(
     required: set[str],
     instance: Any,
     help_text: str | None,
+    dict_roots: set[str],
 ) -> dict[str, Any]:
     full = f"{prefix}.{key}" if prefix else key
 
     if isinstance(value, dict):
+        # A dict-typed field (e.g. AxolRobotConfig.cameras) has no per-leaf
+        # draccus options — its leaves must be folded back into one inline
+        # ``--<root> {…}`` value. Record the outermost dict boundary.
+        if isinstance(instance, dict) and not any(
+            full == r or full.startswith(r + ".") for r in dict_roots
+        ):
+            dict_roots.add(full)
         return {
             "kind": "group",
             "key": full,
             "label": _humanize(key),
             "help": help_text,
-            "children": _children(full, value, instance, set()),
+            "children": _children(full, value, instance, set(), dict_roots),
         }
 
     is_required = bool(prefix == "" and key in required)
@@ -273,11 +292,25 @@ def build_schema(config_class: type) -> Schema:
     if not isinstance(encoded, dict):  # pragma: no cover - configs are dataclasses
         raise TypeError(f"unexpected encoded config: {type(encoded)!r}")
 
-    nodes = _children("", encoded, instance, required)
+    dict_roots: set[str] = set()
+    nodes = _children("", encoded, instance, required, dict_roots)
     leaf_keys: set[str] = set()
     _collect_leaf_keys(nodes, leaf_keys)
-    # Every draccus leaf is a dotted ``--key value`` override.
-    emit = {key: {"t": "opt", "flag": f"--{key}"} for key in leaf_keys}
+    # A leaf is a dotted ``--key value`` override — except inside dict-typed
+    # fields, where draccus only accepts a single inline value for the whole
+    # dict; those leaves are folded back together at argv-build time.
+    emit: dict[str, dict[str, Any]] = {}
+    for key in leaf_keys:
+        root = next((r for r in dict_roots if key.startswith(r + ".")), None)
+        if root is not None:
+            emit[key] = {
+                "t": "dictleaf",
+                "flag": f"--{root}",
+                "root": root,
+                "sub": key[len(root) + 1 :],
+            }
+        else:
+            emit[key] = {"t": "opt", "flag": f"--{key}"}
     return Schema(nodes=nodes, required=sorted(required), emit=emit)
 
 

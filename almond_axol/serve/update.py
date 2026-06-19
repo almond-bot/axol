@@ -6,7 +6,9 @@ a systemd service with ``Restart=always``. This module keeps that install in
 sync with ``main``: whenever the control panel talks to the server, a debounced
 background task runs ``uv tool upgrade almond-axol``, and if the installed git
 commit changed *and* nothing is running, the process exits so systemd restarts
-it on the new code.
+it on the new code. Because the upgrade rebuilds the tool environment, pyzed
+(not on PyPI, installed by ``axol zed.install``) is reinstalled first when the
+ZED SDK is present.
 
 Dev checkouts (``uv run axol serve`` from a clone) are untouched: the package
 metadata then points at a local directory, not a git URL, and the updater
@@ -22,11 +24,13 @@ import os
 import shutil
 import time
 from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
 from typing import Callable
 
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
+_ZED_SDK_DIR = Path("/usr/local/zed")
 # Minimum seconds between upgrade attempts; the check is triggered by polled
 # API endpoints, so without this every status poll would spawn a uv process.
 _DEBOUNCE_S = 5 * 60.0
@@ -132,8 +136,44 @@ class SelfUpdater:
             self._commit,
             new_commit,
         )
+        await self._reinstall_pyzed()
         self._restart_pending = True
         self._maybe_restart()
+
+    async def _reinstall_pyzed(self) -> None:
+        """Reinstall pyzed after an upgrade rebuilt the tool environment.
+
+        pyzed is not on PyPI and thus not a declared dependency, so
+        ``uv tool upgrade`` drops it whenever it re-syncs the environment.
+        Running ``axol zed.install`` (the *upgraded* entry point) puts the
+        wheel back into the new environment before we restart into it.
+        """
+        if not _ZED_SDK_DIR.exists():
+            return
+        axol = shutil.which("axol")
+        if axol is None:
+            _logger.warning("self-update: axol not on PATH; cannot reinstall pyzed")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                axol,
+                "zed.install",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await proc.communicate()
+        except OSError as exc:
+            _logger.warning("self-update: could not run axol zed.install: %s", exc)
+            return
+        if proc.returncode != 0:
+            tail = out.decode("utf-8", "replace").strip().splitlines()
+            _logger.warning(
+                "self-update: pyzed reinstall failed (%s): %s",
+                proc.returncode,
+                tail[-1] if tail else "no output",
+            )
+        else:
+            _logger.info("self-update: reinstalled pyzed into the upgraded environment")
 
     def _maybe_restart(self) -> None:
         if not self._is_idle():

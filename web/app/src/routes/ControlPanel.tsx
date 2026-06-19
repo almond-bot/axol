@@ -2,12 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
+  cameraCount,
   exportOpSettings,
   fetchCommands,
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
-  fetchZedStatus,
   loadOpSettings,
   operationMeta,
   parseImportedSettings,
@@ -19,63 +19,43 @@ import {
   startOperation,
   stopOperation,
   useSessionLogs,
-  zedConnect,
-  zedDisconnect,
+  type CameraSpec,
   type CommandSpec,
   type FormValue,
   type OperationId,
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
-  type ZedLinkStatus,
-  type ZedSpec,
 } from "@/lib/supervisor"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
-import { ZedConnectDialog } from "@/components/zed-connect-dialog"
+import { CamerasDialog } from "@/components/cameras-dialog"
 import { SiteNav } from "@/components/site-nav"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
-/** Inline error + log surface for a detached ZED link (clock sync / camera stream). */
-function ZedErrorPanel({
-  label,
-  error,
-  lines,
-}: {
-  label: string
-  error: string | null
-  lines: string[]
-}) {
-  if (!error) return null
-  return (
-    <div className="flex flex-col gap-2 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3">
-      <p className="text-xs text-red-300">
-        <span className="font-medium">{label}:</span> {error}
-      </p>
-      {lines.length > 0 && <LogConsole lines={lines} />}
-    </div>
-  )
-}
-
-const DEFAULT_ZED: ZedSpec = {
-  enabled: false,
-  boxUrl: "",
-  cameras: { overhead: "", left_arm: "", right_arm: "" },
-  overheadStereo: false,
+const DEFAULT_CAMERAS: CameraSpec = {
+  serials: { overhead: "", left_arm: "", right_arm: "" },
   resolution: "SVGA",
 }
 
-function loadZed(): ZedSpec {
+function loadCameras(): CameraSpec {
   try {
-    const raw = localStorage.getItem("axolZedSpec")
-    if (raw) return { ...DEFAULT_ZED, ...JSON.parse(raw) }
+    const raw = localStorage.getItem("axolCameraSpec")
+    if (raw) {
+      const parsed = JSON.parse(raw)
+      return {
+        ...DEFAULT_CAMERAS,
+        ...parsed,
+        serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
+      }
+    }
   } catch {
     // ignore malformed storage
   }
-  return DEFAULT_ZED
+  return DEFAULT_CAMERAS
 }
 
 function loadAllOpSettings(): OpSettings {
@@ -96,9 +76,7 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
-  const [zedLink, setZedLink] = useState<ZedLinkStatus | null>(null)
-  const [zedSettings, setZedSettings] = useState<ZedSpec>(() => loadZed())
-  const [zedBusy, setZedBusy] = useState(false)
+  const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -109,17 +87,9 @@ export default function ControlPanel() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
-  const [zedDialogOpen, setZedDialogOpen] = useState(false)
+  const [camerasDialogOpen, setCamerasDialogOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
-  // The ZED camera-stream link runs detached from any op session, so tail its
-  // own log to surface the box's failure reason (e.g. a camera that won't open).
-  const zedStreamLog = useSessionLogs(zedLink?.stream?.sessionId ?? null)
-  const zedPtpLog = useSessionLogs(zedLink?.ptp?.sessionId ?? null)
-  const zedPtpError = zedLink?.ptp?.error ?? null
-  // When the clocks fail, the stream link's own error is just the downstream
-  // "cameras not started" — show the clock panel (the root cause) instead.
-  const zedStreamError = zedPtpError ? null : (zedLink?.stream?.error ?? null)
 
   const loadServer = useCallback(async (host: string) => {
     setServerBase(host)
@@ -144,9 +114,6 @@ export default function ControlPanel() {
     fetchRobotStatus()
       .then(setRobot)
       .catch(() => {})
-    fetchZedStatus()
-      .then(setZedLink)
-      .catch(() => {})
     fetchOpStatus()
       .then((op) => {
         if (op.running && op.session) {
@@ -164,24 +131,17 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Poll the detached connections while online.
+  // Poll the robot connection while online.
   useEffect(() => {
     if (conn.state !== "ok") return
     // Guard against in-flight polls landing after a disconnect (which flips
     // conn.state and tears this effect down): a late response must not
-    // repopulate the robot/ZED tiles while the host tile shows disconnected.
+    // repopulate the robot tile while the host tile shows disconnected.
     let active = true
     const t = setInterval(() => {
       fetchRobotStatus()
         .then((r) => {
           if (active) setRobot(r)
-        })
-        .catch(() => {})
-      // Keep the ZED link (and its PTP clock-sync state) fresh so the badge
-      // settles from "syncing" to "locked" after connecting the box.
-      fetchZedStatus()
-        .then((z) => {
-          if (active) setZedLink(z)
         })
         .catch(() => {})
     }, 2000)
@@ -209,13 +169,23 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, robot, robotBusy])
 
-  function hostDisconnectClick() {
-    // Client-side disconnect: stop pointing the panel at the host. Any running
-    // op keeps going server-side; reconnecting via Connect refetches its state.
+  async function hostDisconnectClick() {
+    // Kill any running task and wait for it to exit before dropping the host,
+    // so disconnecting never leaves an orphaned op running server-side. Only
+    // then tear down the (client-side) host connection.
+    setBusy(true)
+    setError(null)
+    try {
+      await stopRunningOp()
+    } catch (e) {
+      setError(String(e))
+      setBusy(false)
+      return
+    }
+    setBusy(false)
     setConn({ state: "idle" })
     setCommands([])
     setRobot(null)
-    setZedLink(null)
     setSession(null)
     autoRobotRef.current = false
   }
@@ -226,16 +196,13 @@ export default function ControlPanel() {
     else localStorage.removeItem("axolServerHost")
   }
 
-  function patchZed(patch: Partial<ZedSpec>) {
-    setZedSettings((prev) => {
-      const next = { ...prev, ...patch }
-      try {
-        localStorage.setItem("axolZedSpec", JSON.stringify(next))
-      } catch {
-        // ignore storage failures
-      }
-      return next
-    })
+  function saveCameras(spec: CameraSpec) {
+    setCameras(spec)
+    try {
+      localStorage.setItem("axolCameraSpec", JSON.stringify(spec))
+    } catch {
+      // ignore storage failures
+    }
   }
 
   function selectOp(op: OperationId) {
@@ -289,7 +256,11 @@ export default function ControlPanel() {
 
   async function robotDisconnectClick() {
     setRobotBusy(true)
+    setError(null)
     try {
+      // Kill any running task and wait for it to exit before releasing the
+      // robot connection out from under it, then disconnect.
+      await stopRunningOp()
       setRobot(await robotDisconnect())
     } catch (e) {
       setError(String(e))
@@ -298,42 +269,20 @@ export default function ControlPanel() {
     }
   }
 
-  async function zedDisconnectClick() {
-    setZedBusy(true)
-    try {
-      setZedLink(await zedDisconnect())
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setZedBusy(false)
-    }
-  }
-
-  // Re-establish the box link: restarts PTP clock sync and (if serials are
-  // configured) camera streaming, reusing the saved box address + cameras.
-  async function zedRestartClick() {
-    const url = zedLink?.boxUrl ?? zedSettings.boxUrl
-    if (!url) return
-    setZedBusy(true)
-    setError(null)
-    try {
-      const next = await zedConnect(
-        url,
-        zedSettings.cameras,
-        zedSettings.overheadStereo,
-        zedSettings.resolution
-      )
-      setZedLink(next)
-    } catch (e) {
-      setError(String(e))
-    } finally {
-      setZedBusy(false)
-    }
-  }
-
   // -- operation lifecycle --
+  // Liveness comes from two sources that can briefly disagree about the same
+  // session: `session` (the REST start/stop responses) and `status` (the logs
+  // WebSocket). On Stop the REST response is authoritative and immediately
+  // reports "exited", but the WebSocket's final "exited" frame can be missed
+  // (dropped sentinel on a full subscriber queue, or a flaky link to a remote
+  // serve host), leaving its last-seen status stuck at "running". So treat the
+  // op as live only when a source reports it active AND neither source reports
+  // it finished — a terminal state from either side flips the button to Start.
   const effectiveStatus = status ?? session
-  const isLive = effectiveStatus?.status === "running" || effectiveStatus?.status === "starting"
+  const sources = [status, session].filter((s): s is SessionInfo => s != null)
+  const isLive =
+    sources.some((s) => s.status === "running" || s.status === "starting") &&
+    !sources.some((s) => s.status === "exited" || s.status === "error")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
   const selectedLive = isLive && runningOp === selectedOp
 
@@ -343,20 +292,23 @@ export default function ControlPanel() {
     [commands, selectedOp]
   )
 
-  function buildZedSpec(): ZedSpec {
-    return {
-      ...zedSettings,
-      enabled: true,
-      boxUrl: zedLink?.boxUrl ?? zedSettings.boxUrl,
-    }
+  // Stop the running task (if any) and wait for it to actually exit. The
+  // server-side stop joins the task thread before responding, so awaiting this
+  // guarantees the op is gone before a disconnect tears its connection down.
+  async function stopRunningOp() {
+    if (!isLive) return
+    setSession(await stopOperation())
   }
 
   async function handleStart() {
     setBusy(true)
     setError(null)
     try {
-      const zed = meta.requiresZed ? buildZedSpec() : undefined
-      const result = await startOperation(selectedOp, settings, zed)
+      // Send the camera spec whenever any serial is assigned — collect-data /
+      // run-policy need all three, while teleop streams whichever are set to
+      // the headset (and runs fine with none in sim).
+      const spec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
+      const result = await startOperation(selectedOp, settings, spec)
       setSession(result)
     } catch (e) {
       setError(String(e))
@@ -396,18 +348,8 @@ export default function ControlPanel() {
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
-          zed={zedLink}
-          zedBusy={zedBusy}
-          onZedConnect={() => setZedDialogOpen(true)}
-          onZedDisconnect={zedDisconnectClick}
-          onZedRestart={zedRestartClick}
-        />
-
-        <ZedErrorPanel label="Clock sync failed" error={zedPtpError} lines={zedPtpLog.lines} />
-        <ZedErrorPanel
-          label="ZED camera stream failed"
-          error={zedStreamError}
-          lines={zedStreamLog.lines}
+          cameras={cameras}
+          onConfigureCameras={() => setCamerasDialogOpen(true)}
         />
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
@@ -429,8 +371,7 @@ export default function ControlPanel() {
           onResetAll={resetAll}
           onExport={() => exportOpSettings(selectedOp, settings)}
           onImport={importSettings}
-          zedSettings={zedSettings}
-          zedLink={zedLink}
+          cameras={cameras}
           robot={robot}
           live={selectedLive}
           busy={busy}
@@ -453,20 +394,11 @@ export default function ControlPanel() {
         conn={conn}
         onConnect={() => loadServer(serverHost)}
       />
-      <ZedConnectDialog
-        open={zedDialogOpen}
-        onClose={() => setZedDialogOpen(false)}
-        initial={zedLink}
-        defaultUrl={zedSettings.boxUrl}
-        defaultCameras={zedSettings.cameras}
-        defaultOverheadStereo={zedSettings.overheadStereo}
-        defaultResolution={zedSettings.resolution}
-        onConnected={(status, url, cameras, overheadStereo, resolution) => {
-          setZedLink(status)
-          // Remember the box address + camera serials (as typed) + stereo flag
-          // + resolution so they survive a server restart / browser reopen.
-          patchZed({ boxUrl: url, cameras, overheadStereo, resolution })
-        }}
+      <CamerasDialog
+        open={camerasDialogOpen}
+        onClose={() => setCamerasDialogOpen(false)}
+        initial={cameras}
+        onSave={saveCameras}
       />
     </div>
   )
@@ -505,7 +437,7 @@ function OperationSelector({
               {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
             </div>
             <span className="text-xs text-white/40">
-              {op.requiresZed ? "Axol + ZED" : op.simCapable ? "Axol or Sim" : "Axol"}
+              {op.requiresCameras ? "Axol + Cameras" : op.simCapable ? "Axol or Sim" : "Axol"}
             </span>
           </button>
         )
