@@ -64,7 +64,7 @@ def main(argv: list[str]) -> None:
     # and silently drop log_say() / INFO status lines.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    # System setup (Jetson clock pinning, GStreamer WebRTC install) is handled
+    # System setup (Jetson clock pinning, the GStreamer NVENC stack) is handled
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 

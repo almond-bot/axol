@@ -91,7 +91,7 @@ def _detect_cameras() -> dict[str, Any]:
 def create_app(static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="axol serve")
 
-    # System setup (Jetson clock pinning, GStreamer WebRTC install) is owned by
+    # System setup (Jetson clock pinning, the GStreamer NVENC stack) is owned by
     # the host installer and its boot service (`axol jetson.setup` runs as an
     # ExecStartPre on axol.service; `axol gst.install` runs once at install
     # time) — not by this process. serve just runs.

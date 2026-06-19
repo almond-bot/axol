@@ -19,7 +19,8 @@ buffer to two consumers:
   ``time.perf_counter``, so dataset rows align image capture with the joint
   sample on the same exposure clock as the SDK ``ZedCamera`` path — without the
   SDK's host round trip. (The stock plugin stamps host-receive time, which lags
-  exposure by the camera delivery latency; see ``scripts``/zed-gstreamer patch.)
+  exposure by the camera delivery latency; the sensor-timestamp patch
+  ``axol gst.build-zed`` applies is what enables ``TIME_REFERENCE::IMAGE``.)
 
 :class:`ZedGstCamera` (mono ``zedxonesrc``) and :class:`ZedGstStereoCamera`
 (stereo ``zedsrc``, per-eye crop) are drop-in replacements for

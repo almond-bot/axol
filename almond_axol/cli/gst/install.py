@@ -1,12 +1,14 @@
 """
 axol gst.install
 
-Install the GStreamer stack the unified ZED camera pipeline needs
-(``teleop --cameras`` / ``collect-data``): the zed-gstreamer elements
-(``zedxonesrc`` / ``zedsrc``), the Jetson NVENC encoder (``nvv4l2h264enc`` /
-``nvvidconv``), and **PyGObject** so the in-process pipeline
-(:mod:`almond_axol.vr.gst_zed`) can pull encoded + raw frames from an
-``appsink``.
+Install the host-side GStreamer support the unified ZED camera pipeline needs
+(``teleop --cameras`` / ``collect-data``): the GStreamer introspection typelibs
+and **PyGObject**, so the in-process pipeline (:mod:`almond_axol.vr.gst_zed`)
+can pull encoded + raw frames from an ``appsink``. The NVENC encoder
+(``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP, and the
+patched zed-gstreamer source elements (``zedxonesrc`` / ``zedsrc``) are built
+separately by ``axol gst.build-zed`` — this command only verifies those are
+present.
 
 PyGObject is not a usable PyPI wheel — it builds against the system
 gobject-introspection and loads the system typelibs — so it can't be a normal

@@ -1,12 +1,15 @@
-"""Every ``axol`` CLI command the web control panel can launch.
+"""The curated catalog of ``axol`` CLI commands the web control panel exposes.
 
-Each command maps to a real ``axol <cli>`` invocation. Its configuration surface
-is introspected on demand (see :mod:`.introspect`): draccus commands expose their
+Each command maps to a real ``axol <cli>`` invocation, grouped for the UI
+(Operate / Cameras / Calibrate / Setup). Its configuration surface is
+introspected on demand (see :mod:`.introspect`): draccus commands expose their
 nested config dataclass; argparse commands expose their flags/options. Commands
 whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
-``serve`` itself is intentionally absent — it is the server hosting this UI.
+Install-time commands (``gst.*``, ``jetson.setup``, ``can.driver``), the remote
+``inference-server``, and ``serve`` itself (the server hosting this UI) are
+intentionally absent — the host installer owns those.
 """
 
 from __future__ import annotations
