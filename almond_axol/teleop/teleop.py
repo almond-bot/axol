@@ -296,8 +296,9 @@ class VRTeleop:
     def set_video_sources(self, sources: dict[str, object] | None) -> None:
         """Stream camera frames to the headset via WebRTC.
 
-        Each source is a connected camera matching the ``FrameSource``
-        protocol (``width`` / ``height`` / ``fps`` / ``wait_next``); see
+        Each value is a connected ``ZedCamera`` / stereo eye (registered
+        directly) or any raw-frame source exposing ``width`` / ``height`` /
+        ``fps`` + ``wait_next``; see
         :meth:`almond_axol.vr.server.VRServer.set_video_sources`. Must be
         called after :meth:`enable` (so the VR server exists). Safe to call
         from any thread. Requires the GStreamer NVENC stack (``axol

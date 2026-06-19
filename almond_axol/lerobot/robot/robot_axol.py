@@ -94,21 +94,36 @@ class AxolRobot(Robot):
         return self._build_sdk_cameras()
 
     def _use_gst_cameras(self) -> bool:
-        """Whether to open cameras via the gst pipeline for the chosen backend."""
+        """Whether to open cameras via the gst pipeline for the chosen backend.
+
+        Checks the plugin each configured camera actually needs — mono cameras
+        use ``zedxonesrc`` (:func:`zed_gst_available`), stereo cameras use
+        ``zedsrc`` (:func:`zed_stereo_gst_available`) — so the decision matches
+        what :meth:`_build_gst_cameras` will open (and the teleop relay's
+        per-camera gating). ``auto`` takes the gst path only when every camera's
+        plugin is present; ``gst`` warns and falls back to the SDK if anything
+        is missing; ``sdk`` always uses the SDK.
+        """
         backend = getattr(self.config, "video_backend", "auto")
         if backend == "sdk":
             return False
         try:
-            from ...vr.gst_zed import zed_gst_available
+            from ...vr.gst_zed import zed_gst_available, zed_stereo_gst_available
         except Exception:  # noqa: BLE001 - gst module import failed
             if backend == "gst":
                 _logger.warning("video_backend='gst' but gst_zed is unimportable")
             return False
-        available = zed_gst_available()
+        cams = self.config.observation_cameras().values()
+        needs_mono = any(eye is None for _, eye in cams)
+        needs_stereo = any(eye is not None for _, eye in cams)
+        available = (not needs_mono or zed_gst_available()) and (
+            not needs_stereo or zed_stereo_gst_available()
+        )
         if backend == "gst" and not available:
             _logger.warning(
-                "video_backend='gst' requested but the gst stack is unavailable; "
-                "run `axol gst.install`. Falling back to the SDK camera path."
+                "video_backend='gst' requested but the required zed-gstreamer "
+                "plugins are unavailable; run `axol gst.install` + "
+                "`axol gst.build-zed`. Falling back to the SDK camera path."
             )
             return False
         return available

@@ -73,7 +73,12 @@ async def pump_into(
 
 
 class Session:
-    """A single running (or finished) CLI subprocess."""
+    """A single running (or finished) operation and its captured log stream.
+
+    Backs both launch paths: a CLI subprocess (``SessionManager``) and an
+    in-process op (``OperationRunner``, which leaves ``proc`` unset and sets
+    ``loop`` so worker-thread log emits marshal back to the server loop).
+    """
 
     def __init__(self, command_id: str, args: dict[str, Any]) -> None:
         self.id = uuid.uuid4().hex[:12]
