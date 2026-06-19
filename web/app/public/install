@@ -69,15 +69,15 @@ else
     say "No ZED SDK at /usr/local/zed; skipping pyzed (run axol zed.install after installing the SDK)."
 fi
 
-# -- GStreamer WebRTC (headset video) -----------------------------------------
+# -- GStreamer NVENC (headset video) ------------------------------------------
 
-# Teleop and collect-data relay the ZED cameras to the headset over WebRTC:
-# frames are grabbed with the ZED SDK, encoded on the Jetson's NVENC, and sent
-# straight from GStreamer (webrtcbin) — no encoded frames return to Python.
-# `axol gst.install` apt-installs the webrtcbin / libnice / introspection
-# packages and builds PyGObject into the axol environment. (NVENC's
-# nvv4l2h264enc ships with the Jetson L4T BSP.)
-say "Installing the GStreamer WebRTC stack (headset video)..."
+# Teleop and collect-data relay the ZED cameras to the headset: frames are
+# grabbed with the ZED SDK, encoded on the Jetson's NVENC via GStreamer, and
+# sent over WebRTC with aiortc (a normal Python dependency). `axol gst.install`
+# apt-installs the GStreamer CLI tools + rawvideoparse (gst-plugins-bad) that
+# the encode subprocess drives. (NVENC's nvvidconv / nvv4l2h264enc ship with
+# the Jetson L4T BSP.)
+say "Installing the GStreamer NVENC stack (headset video)..."
 axol gst.install || say "WARNING: gst.install failed; headset video may be unavailable. Re-run 'axol gst.install'."
 
 # -- Jetson clocks ------------------------------------------------------------

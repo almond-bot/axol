@@ -1,4 +1,4 @@
-"""Out-of-process WebRTC video relay (ZED SDK grab + gstreamer webrtcbin).
+"""Out-of-process WebRTC video relay (GPU-resident gst grab + aiortc).
 
 Sending video from inside the teleop process measurably starves the
 control loops: pushing thousands of RTP packets per second plus encoding
@@ -7,16 +7,20 @@ headset connects. The same isolation pattern used for the IK solver
 applies here — video runs in a dedicated subprocess and the control
 process never touches it.
 
-The subprocess owns the ZED cameras (opened with the Python SDK, exactly
-like data collection), grabs frames on per-camera threads, and pushes them
-into a :class:`~almond_axol.vr.gst_webrtc.GstWebRTCManager` that encodes on
-NVENC and sends WebRTC entirely from gstreamer (``webrtcbin``). WebRTC
-media flows over the subprocess's own UDP sockets, so the only traffic
-crossing the process boundary is SDP signaling (a few messages per headset
-connection) over a ``multiprocessing`` pipe.
+The subprocess owns the ZED cameras through :mod:`almond_axol.vr.gst_zed`:
+the ``zedxonesrc`` / ``zedsrc`` GStreamer elements grab and NVENC-encode
+entirely on the GPU, and Python only ever sees the encoded H.264 access
+units, which aiortc forwards as pre-encoded packets (no Python encode step).
+If the gst stack is unavailable the relay falls back to the ZED SDK grab +
+in-Python NVENC path (``hw_video``). Either way aiortc owns the ICE / DTLS /
+SRTP transport, which connects reliably on this multi-homed LAN where
+gstreamer ``webrtcbin``'s libnice stalls. WebRTC media flows over the
+subprocess's own UDP sockets, so the only traffic crossing the process
+boundary is SDP signaling (a few messages per headset connection) over a
+``multiprocessing`` pipe.
 
 :class:`VideoRelayProcess` is the parent-side handle. It implements the
-same async interface as ``GstWebRTCManager`` (``create_offer`` /
+same async interface as ``WebRTCManager`` (``create_offer`` /
 ``set_answer`` / ``close`` / ``close_all`` / ``has_sources``), so
 ``VRServer.set_video_manager`` can use it as a drop-in.
 """
@@ -80,6 +84,51 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
+def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] | None:
+    """Open one camera via the GPU-resident gst pipeline (encoded only).
+
+    Returns ``(owned_camera, {track_name: source})`` where each source exposes
+    ``subscribe()`` so the WebRTC manager forwards its pre-encoded H.264 AUs
+    directly. The relay never needs raw frames, so the raw branch is omitted
+    (lowest cost). Returns ``None`` when the gst stack or camera is unavailable
+    so the caller can fall back to the SDK path.
+    """
+    from .gst_zed import (
+        ZedGstCamera,
+        ZedGstStereoCamera,
+        zed_gst_available,
+        zed_stereo_gst_available,
+    )
+
+    serial = int(spec["serial"])
+    resolution = spec.get("resolution") or "HD1200"
+    stereo = bool(spec.get("stereo"))
+    if stereo and not zed_stereo_gst_available():
+        return None
+    if not stereo and not zed_gst_available():
+        return None
+
+    for fps in (int(spec.get("fps", 60)), 30):
+        try:
+            if stereo:
+                cam: object = ZedGstStereoCamera(
+                    serial, resolution, fps, want_encoded=True, want_raw=False
+                )
+                cam.connect()
+                return cam, {
+                    f"{name}_left": cam.left_view,
+                    f"{name}_right": cam.right_view,
+                }
+            cam = ZedGstCamera(
+                serial, resolution, fps, want_encoded=True, want_raw=False
+            )
+            cam.connect()
+            return cam, {name: cam}
+        except Exception as exc:  # noqa: BLE001 - try lower fps, then SDK
+            _logger.info("video relay: gst %s @ %s fps failed (%s)", name, fps, exc)
+    return None
+
+
 def _relay_main(
     conn: multiprocessing.connection.Connection,
     cameras: dict[str, dict],
@@ -89,13 +138,20 @@ def _relay_main(
     logging.basicConfig(level=log_level)
 
     from ..cli.teleop import _ZedFrameSource
-    from .gst_webrtc import GstWebRTCManager
+    from .video import WebRTCManager
 
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
     # the per-track names the headset sees to a frame source per camera/eye.
+    # Prefer the GPU-resident gst pipeline; fall back to SDK grab + NVENC.
     owned: list[object] = []
     sources: dict[str, object] = {}
     for name, spec in cameras.items():
+        gst = _open_gst_camera(name, spec)
+        if gst is not None:
+            cam, gst_sources = gst
+            owned.append(cam)
+            sources.update(gst_sources)
+            continue
         cam = _open_sdk_camera(name, spec)
         if cam is None:
             continue
@@ -107,7 +163,7 @@ def _relay_main(
         else:
             sources[name] = _ZedFrameSource(cam)
 
-    manager = GstWebRTCManager(sources) if sources else None
+    manager = WebRTCManager(sources) if sources else None
     conn.send(("ready", sorted(sources)))
     if manager is None:
         _logger.warning("video relay opened no cameras; nothing to stream")

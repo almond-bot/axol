@@ -45,7 +45,7 @@ from .config import VRServerConfig
 from .models import VRFrame
 
 if TYPE_CHECKING:
-    from .gst_webrtc import FrameSource, GstWebRTCManager
+    from .video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class VRServer:
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
-        self._webrtc: GstWebRTCManager | None = None
+        self._webrtc: WebRTCManager | Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -91,36 +91,38 @@ class VRServer:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
 
-    def set_video_sources(self, sources: dict[str, FrameSource] | None) -> None:
-        """Register per-camera RGB frame sources to stream to the headset.
+    def set_video_sources(self, sources: dict[str, Any] | None) -> None:
+        """Register per-camera frame sources to stream to the headset.
 
         Each source is a connected camera (or stereo eye) exposing fixed
-        ``width`` / ``height`` / ``fps`` and ``wait_next`` (see
-        :class:`~almond_axol.vr.gst_webrtc.FrameSource`). The headset
-        negotiates a WebRTC connection over the existing ``/ws`` channel and
-        receives one video track per source; frames are encoded on NVENC and
-        sent entirely from gstreamer (``webrtcbin``).
+        ``width`` / ``height`` / ``fps`` and ``wait_next`` (returning the
+        SDK's native BGRA). The headset negotiates a WebRTC connection over
+        the existing ``/ws`` channel and receives one video track per source;
+        frames are encoded on the Jetson's hardware NVENC and shipped by
+        aiortc (see :mod:`almond_axol.vr.video`).
 
-        Pass ``None`` or an empty dict to disable video. Requires the
-        gstreamer WebRTC stack (PyGObject + ``webrtcbin`` + libnice + NVENC),
-        installed by ``axol gst.install`` (run once by the host installer); if
-        it is unavailable this logs a warning and leaves video disabled. Safe
-        to call before or after :meth:`enable`.
+        This is the in-process fallback; teleop normally runs the relay in a
+        dedicated subprocess via :meth:`set_video_manager`. Pass ``None`` or an
+        empty dict to disable video. Requires ``aiortc`` (a normal dependency);
+        hardware NVENC additionally needs the system GStreamer stack from
+        ``axol gst.install``. If aiortc is unavailable this logs a warning and
+        leaves video disabled. Safe to call before or after :meth:`enable`.
         """
         if not sources:
             self._webrtc = None
             return
         try:
-            from .gst_webrtc import GstWebRTCManager, gst_webrtc_available
+            from .video import WebRTCManager, webrtc_available
 
-            if not gst_webrtc_available():
-                raise RuntimeError("webrtcbin / NVENC / PyGObject unavailable")
-            self._webrtc = GstWebRTCManager(sources)
-        except Exception as exc:  # noqa: BLE001 - bindings missing
+            if not webrtc_available():
+                raise RuntimeError("aiortc unavailable")
+            self._webrtc = WebRTCManager(sources)
+        except Exception as exc:  # noqa: BLE001 - aiortc missing
             _logger.warning(
-                "wrist video requested but the gstreamer WebRTC stack is "
-                "unavailable (%s); install it with `axol gst.install` (the "
-                "host installer runs this). Continuing without wrist video.",
+                "wrist video requested but the WebRTC stack (aiortc) is "
+                "unavailable (%s); install the project dependencies (and "
+                "`axol gst.install` for hardware NVENC). Continuing without "
+                "wrist video.",
                 exc,
             )
             self._webrtc = None

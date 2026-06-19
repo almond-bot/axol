@@ -95,24 +95,24 @@ def _overhead_is_stereo(cfg: TeleopCmdConfig) -> bool:
 def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
-    The relay subprocess opens the ZED cameras with the Python SDK (exactly
-    like data collection), grabs frames on per-camera threads, and encodes
-    + sends WebRTC entirely from gstreamer (``webrtcbin``), so video traffic
-    can't contend with the teleop control loops (in-process sending
-    measurably halves the IK rate). Returns ``None`` when the relay can't be
-    used (no cameras, or the gstreamer WebRTC bindings are missing), in
-    which case the caller uses the in-process path.
+    The relay subprocess opens the ZED cameras through the GPU-resident gst
+    pipeline (``gst_zed``: ``zedxonesrc`` grab + NVENC encode on the GPU),
+    falling back to the ZED SDK grab + in-Python NVENC path when the gst stack
+    is unavailable, and ships WebRTC with aiortc — so video traffic can't
+    contend with the teleop control loops (in-process sending measurably halves
+    the IK rate). Returns ``None`` when the relay can't be used (no cameras, or
+    aiortc isn't installed), in which case the caller uses the in-process path.
     """
     if not cfg.cameras:
         return None
     try:
-        from ..vr.gst_webrtc import gst_webrtc_available
+        from ..vr.video import webrtc_available
         from ..vr.video_proc import VideoRelayProcess
-    except Exception as exc:  # noqa: BLE001 - video extra missing
+    except Exception as exc:  # noqa: BLE001 - aiortc missing
         _logger.debug("video relay unavailable: %s", exc)
         return None
 
-    if not gst_webrtc_available():
+    if not webrtc_available():
         return None
 
     resolution = cfg.resolution or "HD1200"
@@ -138,7 +138,7 @@ def _connect_zed_cameras(
     Opens each camera through the ZED Python SDK (:class:`ZedCamera`, or
     :class:`ZedStereoCamera` for a stereo overhead). Used for the in-process
     fallback when the relay subprocess can't run; the frames are encoded +
-    sent by an in-process :class:`GstWebRTCManager`. Slots whose camera is
+    sent by an in-process aiortc :class:`WebRTCManager`. Slots whose camera is
     absent are skipped (best-effort preview). Returns an empty list when no
     cameras are configured or no backend is available. Runs synchronously
     (blocks on camera startup), so call it off the event loop.
@@ -228,11 +228,11 @@ def _connect_zed_cameras(
 class _ZedFrameSource:
     """Frame-driven relay source for a connected ZED camera (or stereo eye).
 
-    Exposes both the pull interface (``__call__``, compatibility) and
-    ``wait_next``, which the WebRTC track prefers: it blocks until the camera
-    produces a frame newer than the last one sent, so every relayed frame is
-    encoded the instant it's captured instead of waiting to be sampled by a
-    fixed-rate timer.
+    ``wait_next`` blocks until the camera produces a frame newer than the last
+    one sent, so every relayed frame is encoded the instant it's captured
+    instead of waiting to be sampled by a fixed-rate timer. It returns the
+    SDK's **native BGRA** (4-channel) so the GStreamer pipeline can hand it
+    straight to NVENC via ``nvvidconv`` — no CPU colorspace conversion.
     """
 
     def __init__(self, cam: Any) -> None:
@@ -259,7 +259,7 @@ class _ZedFrameSource:
     def wait_next(self, after_ts: float | None, timeout_ms: float) -> Any:
         target = after_ts + 1e-6 if after_ts is not None else 0.0
         try:
-            frame, cap_ts, _recv_ts = self._cam.read_at_or_after(
+            frame, cap_ts, _recv_ts = self._cam.read_bgra_at_or_after(
                 target, timeout_ms=timeout_ms
             )
             return frame, cap_ts
@@ -273,7 +273,7 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
         return
 
     # SDK cameras are wrapped as frame-driven sources for the in-process
-    # GstWebRTCManager (NVENC encode + webrtcbin send).
+    # aiortc WebRTCManager (NVENC encode + aiortc RTP send).
     sources = {name: _ZedFrameSource(cam) for name, cam in cameras}
     try:
         teleop.set_video_sources(sources)

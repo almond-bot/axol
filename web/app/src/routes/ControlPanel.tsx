@@ -169,9 +169,20 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, robot, robotBusy])
 
-  function hostDisconnectClick() {
-    // Client-side disconnect: stop pointing the panel at the host. Any running
-    // op keeps going server-side; reconnecting via Connect refetches its state.
+  async function hostDisconnectClick() {
+    // Kill any running task and wait for it to exit before dropping the host,
+    // so disconnecting never leaves an orphaned op running server-side. Only
+    // then tear down the (client-side) host connection.
+    setBusy(true)
+    setError(null)
+    try {
+      await stopRunningOp()
+    } catch (e) {
+      setError(String(e))
+      setBusy(false)
+      return
+    }
+    setBusy(false)
     setConn({ state: "idle" })
     setCommands([])
     setRobot(null)
@@ -245,7 +256,11 @@ export default function ControlPanel() {
 
   async function robotDisconnectClick() {
     setRobotBusy(true)
+    setError(null)
     try {
+      // Kill any running task and wait for it to exit before releasing the
+      // robot connection out from under it, then disconnect.
+      await stopRunningOp()
       setRobot(await robotDisconnect())
     } catch (e) {
       setError(String(e))
@@ -276,6 +291,14 @@ export default function ControlPanel() {
     () => commands.find((c) => c.id === selectedOp) ?? null,
     [commands, selectedOp]
   )
+
+  // Stop the running task (if any) and wait for it to actually exit. The
+  // server-side stop joins the task thread before responding, so awaiting this
+  // guarantees the op is gone before a disconnect tears its connection down.
+  async function stopRunningOp() {
+    if (!isLive) return
+    setSession(await stopOperation())
+  }
 
   async function handleStart() {
     setBusy(true)

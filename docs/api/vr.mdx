@@ -54,7 +54,7 @@ Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whene
 
 ## Camera video to the headset
 
-The server can stream camera frames to the headset over **WebRTC**. Register per-camera frame sources with `set_video_sources()` — each source is a connected camera (or stereo eye) exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)`, which blocks until a frame newer than `after_ts` is captured (the `FrameSource` protocol, mirroring the subset of `ZedCamera` the relay uses). A `ZedCamera` satisfies it directly:
+The server can stream camera frames to the headset over **WebRTC**. Register per-camera sources with `set_video_sources()`. A source is either a **pre-encoded** camera (the GPU-resident `gst_zed` pipeline, exposing `subscribe()` / `alive` — its H.264 access units go straight to RTP with no Python encode) or a **raw frame** source exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)` (the `FrameSource` protocol — a `ZedCamera` satisfies it directly). The manager picks the right WebRTC track per source automatically:
 
 ```python
 vr.set_video_sources({
@@ -70,11 +70,14 @@ Pass `None` or `{}` to turn video off. [`axol teleop --cameras`](/cli/teleop) an
 
 ### Pipeline
 
-Both teleop and data collection grab ZED frames with the **Python SDK** (`ZedCamera` → RGB numpy) and hand them to a single GStreamer-native manager (`almond_axol.vr.gst_webrtc.GstWebRTCManager`). For each connected headset it builds one self-contained GStreamer pipeline — an `appsrc` per camera, `nvvidconv` → `nvv4l2h264enc` (the Jetson **NVENC** hardware encoder), and one `webrtcbin`. The relay pulls each source's `wait_next` so a frame is encoded the instant it's captured (no fixed-rate sampling staleness), then **WebRTC is sent entirely from GStreamer** — RTP/SRTP/ICE all run in C inside `webrtcbin`, so **no encoded frames ever return to Python** and the control loops never pay for video traffic. ICE is non-trickle (host candidates only) so gathering completes in milliseconds on a LAN; the gathered candidates are spliced into the offer SDP before it's sent.
+Teleop and data collection share one **GPU-resident** camera path (`almond_axol.vr.gst_zed`). The zed-gstreamer source elements (`zedxonesrc` mono / `zedsrc` stereo) grab frames straight into NVMM (GPU) memory, and a single in-process GStreamer pipeline tees that one zero-copy buffer to two consumers:
 
-The whole relay runs in a **dedicated subprocess** (`almond_axol.vr.video_proc.VideoRelayProcess`, registered via `set_video_manager()`): even though sending happens in C, isolating the camera grab/encode pump keeps the teleop control loops at full rate. Only SDP signaling crosses the process boundary.
+- an **encoded** branch — `nvv4l2h264enc` (NVENC) → `appsink` — so the whole grab→encode chain stays on the GPU (~5–10 ms) and Python only ever sees the H.264 access units, which **aiortc** forwards as pre-encoded packets (`encoder.pack`, no Python encode);
+- a **raw** branch — `nvvidconv` → RGBA `appsink` → numpy — built only when raw frames are needed (the dataset, policy inference). Each frame carries a `capture_perf_ts` derived from the buffer PTS (the `do-timestamp` running time mapped onto `time.perf_counter`), so dataset rows align image capture with the joint sample — without the ZED SDK's ~26 ms host round trip.
 
-Requires the GStreamer WebRTC stack — PyGObject, `webrtcbin` (`gstreamer1.0-plugins-bad`), libnice (`gstreamer1.0-nice`), and the Jetson `nvv4l2h264enc` element — installed once by [`axol gst.install`](/cli/gst-install) (the host installer runs it). If it's unavailable, `set_video_sources()` logs a warning and leaves video disabled. The NVENC/VIC engine clocks must also be pinned to their maximum for low-latency encode ([`axol jetson.setup`](/cli/jetson-setup), run at boot by the installer's systemd unit); the default Jetson devfreq governor scales them for throughput, which otherwise roughly triples per-frame encode latency.
+For **teleop** the relay runs in a **dedicated subprocess** (`almond_axol.vr.video_proc.VideoRelayProcess`, registered via `set_video_manager()`) with the raw branch off (encoded only): isolating the camera grab/encode pump keeps the control loops at full rate, and only SDP signaling crosses the process boundary. For **data collection** the robot owns the cameras (one grab serves both the dataset's raw frames and the headset's encoded view), registered in-process via `set_video_sources()`. aiortc handles the WebRTC transport (RTP/SRTP/ICE) and SDP signaling in both cases. When the gst stack is unavailable, both paths fall back to the ZED Python SDK grab (`ZedCamera`) plus in-Python NVENC (`almond_axol.vr.hw_video`).
+
+Requires the zed-gstreamer + NVENC + PyGObject stack installed once by [`axol gst.install`](/cli/gst-install) (the host installer runs it). The NVENC/VIC engine clocks must also be pinned to their maximum for low-latency encode ([`axol jetson.setup`](/cli/jetson-setup), run at boot by the installer's systemd unit); the default Jetson devfreq governor scales them for throughput, which otherwise roughly triples per-frame encode latency.
 
 ## `VRServerConfig` fields
 

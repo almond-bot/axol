@@ -71,7 +71,7 @@ uv sync --extra lerobot --extra sim --extra cuda   # everything
 ```
 
 <Note>
-  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs system GStreamer plugins plus PyGObject. Install it with [`axol gst.install`](/cli/gst-install); see [Headset video](#headset-video-gstreamer-webrtc) below.
+  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer NVENC tools. Install them with [`axol gst.install`](/cli/gst-install); see [Headset video](#headset-video-nvenc) below.
 </Note>
 
 ## ZED Python bindings
@@ -84,9 +84,9 @@ axol zed.install
 
 See [`zed.install`](/cli/zed-install) for details.
 
-## Headset video (GStreamer WebRTC)
+## Headset video (NVENC)
 
-Relaying the ZED cameras to the headset (`teleop --cameras`, `collect-data`) uses a GStreamer-native WebRTC pipeline — frames are grabbed with the ZED SDK, encoded on the Jetson's NVENC, and sent straight from GStreamer. This needs system GStreamer plugins (`webrtcbin`, libnice) and **PyGObject**, which builds against the system libraries and so can't be a normal PyPI extra. Install it once:
+Relaying the ZED cameras to the headset (`teleop --cameras`, `collect-data`) grabs and **NVENC**-encodes frames entirely on the GPU via the zed-gstreamer pipeline (`zedxonesrc` / `zedsrc`), and sends them over WebRTC with **aiortc** (a normal Python dependency). This path needs the system GStreamer + GObject-introspection packages and **PyGObject** (built into the axol environment, like `pyzed`), which aren't a PyPI extra. Install them once:
 
 ```bash
 axol gst.install

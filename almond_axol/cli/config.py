@@ -416,7 +416,7 @@ class TeleopCmdConfig:
     stream them to the headset (overhead as the main feed, wrist cameras
     switched with the right thumbstick) — e.g. ``--cameras "{overhead:
     41234567, left_arm: 41234568}"``. Requires the ZED SDK and pyzed
-    (``axol zed.install``) plus the GStreamer WebRTC stack (``axol
+    (``axol zed.install``) plus the GStreamer NVENC stack (``axol
     gst.install``) installed locally.
 
     A stereo ZED X overhead is detected automatically from its serial: its

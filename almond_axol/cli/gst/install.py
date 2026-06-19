@@ -1,18 +1,24 @@
 """
 axol gst.install
 
-Install the GStreamer-native WebRTC stack that relays the ZED cameras to the
-headset (``teleop --cameras`` / ``collect-data``): the system GStreamer plugins
-(``webrtcbin`` from gst-plugins-bad, the ``libnice`` ICE plugin, NVENC
-introspection) plus the PyGObject bindings.
+Install the GStreamer stack the unified ZED camera pipeline needs
+(``teleop --cameras`` / ``collect-data``): the zed-gstreamer elements
+(``zedxonesrc`` / ``zedsrc``), the Jetson NVENC encoder (``nvv4l2h264enc`` /
+``nvvidconv``), and **PyGObject** so the in-process pipeline
+(:mod:`almond_axol.vr.gst_zed`) can pull encoded + raw frames from an
+``appsink``.
 
 PyGObject is not a usable PyPI wheel — it builds against the system
 gobject-introspection and loads the system typelibs — so it can't be a normal
 dependency. This command apt-installs the system packages and then builds
 PyGObject into the interpreter running the CLI (the uv tool environment),
-mirroring ``axol zed.install``. The hosted installer
-(``web/app/public/install``) runs it once; it is not run at teleop/serve
-startup. Best-effort: a no-op on machines without ``apt-get``/NVENC.
+mirroring ``axol zed.install``. PyGObject is only used here to read GStreamer
+``appsink`` buffers (frames + PTS); WebRTC transport stays on aiortc, so this
+does not reintroduce the ``webrtcbin``/libnice ICE path.
+
+The hosted installer (``web/app/public/install``) runs it once; it is not run
+at teleop/serve startup. Best-effort: a no-op on machines without
+``apt-get``/NVENC (callers then fall back to the SDK ``ZedCamera``).
 """
 
 from __future__ import annotations
@@ -33,13 +39,18 @@ _logger = logging.getLogger(__name__)
 # cannot build here. Pin to the last 3.5x that targets girepository-1.0.
 _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
-# System packages: GStreamer webrtc + ICE + NVENC introspection, plus the build
-# deps PyGObject needs to compile against gobject-introspection.
+# GStreamer elements the gst_zed pipeline relies on. zedxonesrc / zedsrc ship
+# with the zed-gstreamer plugins; nvvidconv / nvv4l2h264enc ship with the
+# Jetson L4T BSP (none of these are apt-installable here — verified + warned).
+_REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc")
+
+# System packages: GStreamer introspection typelibs (Gst + GstApp/appsink) and
+# the build deps PyGObject needs to compile against gobject-introspection.
 _APT_PACKAGES = (
-    "gir1.2-gstreamer-1.0",
-    "gir1.2-gst-plugins-bad-1.0",
+    "gstreamer1.0-tools",
     "gstreamer1.0-plugins-bad",
-    "gstreamer1.0-nice",
+    "gir1.2-gstreamer-1.0",
+    "gir1.2-gst-plugins-base-1.0",
     "libgirepository1.0-dev",
     "gobject-introspection",
     "libcairo2-dev",
@@ -51,7 +62,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``gst.install`` subcommand."""
     subparsers.add_parser(
         "gst.install",
-        help="Install the GStreamer WebRTC stack (webrtcbin + libnice + PyGObject).",
+        help="Install the zed-gstreamer + NVENC + PyGObject stack for video.",
     ).set_defaults(func=run)
 
 
@@ -72,23 +83,24 @@ def _run(cmd: list[str]) -> bool:
     return True
 
 
-def _gi_ok() -> bool:
-    """True when a clean subprocess can import gi and find webrtcbin + NVENC.
+def _gst_ok() -> bool:
+    """True when a clean subprocess can import gi and find the gst elements.
 
     Checked in a subprocess so the result reflects a PyGObject that was just
     installed (importing it in this process would hit a stale import state).
     """
-    from ...vr.gst_webrtc import _set_typelib_path
+    from ...vr.gst_zed import _set_typelib_path
 
     _set_typelib_path()  # ensure the child inherits the typelib search path
+    elements = ",".join(repr(e) for e in (*_REQUIRED_ELEMENTS, "zedxonesrc"))
     code = (
         "import gi;"
         "gi.require_version('Gst','1.0');"
-        "gi.require_version('GstWebRTC','1.0');"
-        "gi.require_version('GstSdp','1.0');"
-        "from gi.repository import Gst; Gst.init(None);"
+        "gi.require_version('GstApp','1.0');"
+        "from gi.repository import Gst, GstApp;"  # GstApp registers AppSink
+        "Gst.init(None);"
         "import sys;"
-        "els=('webrtcbin','nvv4l2h264enc','rtph264pay');"
+        f"els=({elements},);"
         "sys.exit(0 if all(Gst.ElementFactory.find(e) for e in els) else 1)"
     )
     try:
@@ -136,22 +148,24 @@ def _pip_install_pygobject() -> bool:
 
 
 def run(_args: object = None) -> None:
-    """Install the GStreamer WebRTC system packages and PyGObject bindings."""
-    if _gi_ok():
-        print("GStreamer WebRTC stack already available.")
+    """Install the zed-gstreamer + NVENC system packages and PyGObject."""
+    if _gst_ok():
+        print("GStreamer ZED camera stack already available.")
         return
 
-    print("Installing GStreamer WebRTC system packages (apt)...")
+    print("Installing GStreamer system packages (apt)...")
     _apt_install()
     print(f"Installing PyGObject ({_PYGOBJECT_SPEC}) into the axol environment...")
     _pip_install_pygobject()
 
-    if _gi_ok():
-        print("GStreamer WebRTC stack installed.")
+    if _gst_ok():
+        print("GStreamer ZED camera stack installed.")
     else:
         print(
-            "WARNING: GStreamer WebRTC stack is still unavailable. Ensure "
-            "webrtcbin (gstreamer1.0-plugins-bad), gstreamer1.0-nice, the "
-            "Jetson NVENC plugin, and PyGObject are installed.",
+            "WARNING: the GStreamer ZED camera stack is still unavailable. "
+            "Ensure PyGObject, the zed-gstreamer elements (zedxonesrc / zedsrc), "
+            "and the Jetson NVENC elements (nvvidconv / nvv4l2h264enc) are "
+            "installed. Camera video will fall back to the ZED SDK path "
+            "(higher latency) until then.",
             file=sys.stderr,
         )

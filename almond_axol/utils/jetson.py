@@ -3,7 +3,7 @@
 Two Tegra defaults trade latency for power/throughput and hurt us:
 
 * **Engine devfreq** — the camera relay's hardware encode path
-  (``almond_axol.vr.gst_webrtc``) depends on NVENC (the H.264 encoder) and
+  (``almond_axol.vr.hw_video``) depends on NVENC (the H.264 encoder) and
   the VIC (``nvvidconv``'s colorspace conversion). The default
   ``tegra_wmark`` governor grants just enough clock to keep up with the
   frame rate, so each frame takes nearly a full frame-time to encode

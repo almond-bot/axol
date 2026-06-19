@@ -31,7 +31,7 @@ async with VRTeleop(axol) as teleop:
         await asyncio.sleep(1 / 120)
 ```
 
-To show camera feeds in the headset, register frame sources after the session is enabled — `VRTeleop.set_video_sources()` forwards them to the VR server's WebRTC relay (requires the GStreamer WebRTC stack, installed by [`axol gst.install`](/cli/gst-install); see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset)). Each source is a connected `ZedCamera` (or anything matching the `FrameSource` protocol):
+To show camera feeds in the headset, register frame sources after the session is enabled — `VRTeleop.set_video_sources()` forwards them to the VR server's WebRTC relay (requires the GStreamer NVENC stack, installed by [`axol gst.install`](/cli/gst-install); see [`almond_axol.vr`](/api/vr#camera-video-to-the-headset)). Each source is a connected `ZedCamera` (or anything matching the `FrameSource` protocol):
 
 ```python
 async with VRTeleop(axol) as teleop:

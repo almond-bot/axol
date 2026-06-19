@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 from lerobot.cameras.configs import CameraConfig
 from lerobot.robots.config import RobotConfig
 
 from ...robot.config import AxolConfig
 from ...utils.shared import CAN_LEFT, CAN_RIGHT
+
+# Camera capture backend. "gst" is the GPU-resident zed-gstreamer pipeline
+# (low latency, shared with teleop); "sdk" is the ZED Python SDK; "auto"
+# prefers gst when its stack is installed and falls back to the SDK.
+VideoBackend = Literal["auto", "gst", "sdk"]
 
 
 @RobotConfig.register_subclass("axol")
@@ -36,6 +42,7 @@ class AxolRobotConfig(RobotConfig):
     observe_torques: bool = False
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
+    video_backend: VideoBackend = "auto"
 
     def observation_cameras(self) -> dict[str, tuple[CameraConfig, str | None]]:
         """Effective observation cameras keyed by dataset/obs name.

@@ -167,7 +167,7 @@ export function ConnectionsBar({
             variant="outline"
             size="icon"
             onClick={onRobotDisconnect}
-            disabled={robotBusy || rs === "busy"}
+            disabled={robotBusy}
             aria-label="Disconnect Axol"
             className="size-8"
           >

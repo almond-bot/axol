@@ -70,15 +70,20 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
     Relays every camera the robot exposes (overhead — or ``overhead_left`` /
     ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
-    show them. Frame-driven (see ``_ZedFrameSource``): each relayed frame is
+    show them. gst cameras already produce GPU-encoded H.264 access units, so
+    they are registered directly (their ``subscribe()`` feeds a pre-encoded
+    WebRTC track — the same one grab/encode serves the dataset). SDK cameras
+    are wrapped frame-driven (see ``_ZedFrameSource``): each relayed frame is
     encoded as soon as it's captured. Reads only consume the latest frame each
     camera already keeps, so the dataset capture pipeline is never blocked.
     """
     from .teleop import _ZedFrameSource
 
-    sources: dict[str, Callable[[], Any]] = {
-        name: _ZedFrameSource(cam) for name, cam in robot.cameras.items()
-    }
+    sources: dict[str, Any] = {}
+    for name, cam in robot.cameras.items():
+        # A gst camera/eye exposes subscribe(); hand it to the manager as-is so
+        # its pre-encoded AUs go straight to RTP. Everything else is raw.
+        sources[name] = cam if hasattr(cam, "subscribe") else _ZedFrameSource(cam)
 
     if not sources:
         return

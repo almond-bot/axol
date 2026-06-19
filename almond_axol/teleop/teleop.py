@@ -300,7 +300,7 @@ class VRTeleop:
         protocol (``width`` / ``height`` / ``fps`` / ``wait_next``); see
         :meth:`almond_axol.vr.server.VRServer.set_video_sources`. Must be
         called after :meth:`enable` (so the VR server exists). Safe to call
-        from any thread. Requires the GStreamer WebRTC stack (``axol
+        from any thread. Requires the GStreamer NVENC stack (``axol
         gst.install``); without it video is silently disabled.
         """
         self._vr_server.set_video_sources(sources)  # type: ignore[arg-type]

@@ -10,6 +10,7 @@ license = { text = "MIT" }
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "aiortc>=1.9", # WebRTC transport for headset camera video (pulls av)
     "draccus==0.10.0",
     "fastapi>=0.135.2",
     "jax>=0.9.2",
@@ -21,11 +22,11 @@ dependencies = [
     "scipy>=1.17.1",
     "uvicorn[standard]>=0.42.0",
     "yourdfpy>=0.0.60",
+    "opencv-python-headless>=4.13.0.92"
 ]
 
 [project.optional-dependencies]
 cuda = ["jax[cuda13]>=0.9.2"] # CPU is usually faster for the JAX IK solver
-dev = ["opencv-python-headless>=4.13.0.92"]
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
 

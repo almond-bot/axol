@@ -59,6 +59,11 @@ def _default_robot_config() -> AxolRobotConfig:
     enforces the input). Other fields are overridable too, e.g.
     ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
     used at data-collection time).
+
+    Inference captures through the ZED Python SDK (``video_backend="sdk"``):
+    run-policy streams no headset video, so the GPU-resident gst pipeline's
+    encoded branch would be pure waste here. Teleop and collect-data default
+    to the gst path; pass ``--robot_config.video_backend gst`` to opt in.
     """
     return AxolRobotConfig(
         cameras={
@@ -66,6 +71,7 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(serial=0),
             "right_arm": ZedCameraConfig(serial=0),
         },
+        video_backend="sdk",
     )
 
 

@@ -49,7 +49,6 @@ Install optional dependency groups as needed:
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 | `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
-| `dev` | OpenCV (headless) | Development / debugging |
 
 ```bash
 uv sync --extra lerobot --extra sim          # teleoperation + data collection
@@ -63,7 +62,7 @@ The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separate
 axol zed.install
 ```
 
-Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) uses a GStreamer-native WebRTC pipeline (system GStreamer plugins + PyGObject), so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
+Streaming the ZED cameras to the headset (`teleop --cameras`, `collect-data`) encodes on the Jetson's NVENC via GStreamer and sends over WebRTC with aiortc. The encode path needs the system GStreamer NVENC tools, so it isn't a dependency extra. Install it once (and, on a Jetson, pin the NVENC/VIC clocks for low-latency encode):
 
 ```bash
 axol gst.install

@@ -76,11 +76,44 @@ class AxolRobot(Robot):
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
 
-        Mono cameras are built via lerobot's registry. A stereo camera is
-        backed by a single ``ZedStereoCamera`` (one decode) whose left/right
-        views are registered under ``<name>_left`` / ``<name>_right`` so the
-        rest of the pipeline treats the two eyes as ordinary cameras.
+        The ``video_backend`` config selects the capture path. ``"gst"`` (or
+        ``"auto"`` when the stack is installed) opens each camera through the
+        GPU-resident zed-gstreamer pipeline (:mod:`almond_axol.vr.gst_zed`):
+        one grab/encode on the GPU serves both the dataset (raw frames, via
+        ``read_at_or_after``) and the headset view (encoded AUs, via
+        ``subscribe``), at far lower latency than the SDK's host round trip.
+        ``"sdk"`` (or ``"auto"`` without the stack) uses the ZED Python SDK.
+
+        Either way a stereo camera is backed by a single object (one decode)
+        whose left/right views are registered under ``<name>_left`` /
+        ``<name>_right`` so the rest of the pipeline treats the two eyes as
+        ordinary cameras.
         """
+        if self._use_gst_cameras():
+            return self._build_gst_cameras()
+        return self._build_sdk_cameras()
+
+    def _use_gst_cameras(self) -> bool:
+        """Whether to open cameras via the gst pipeline for the chosen backend."""
+        backend = getattr(self.config, "video_backend", "auto")
+        if backend == "sdk":
+            return False
+        try:
+            from ...vr.gst_zed import zed_gst_available
+        except Exception:  # noqa: BLE001 - gst module import failed
+            if backend == "gst":
+                _logger.warning("video_backend='gst' but gst_zed is unimportable")
+            return False
+        available = zed_gst_available()
+        if backend == "gst" and not available:
+            _logger.warning(
+                "video_backend='gst' requested but the gst stack is unavailable; "
+                "run `axol gst.install`. Falling back to the SDK camera path."
+            )
+            return False
+        return available
+
+    def _build_sdk_cameras(self) -> tuple[dict, list]:
         obs_cams = self.config.observation_cameras()
         mono = {key: cfg for key, (cfg, eye) in obs_cams.items() if eye is None}
         cameras: dict = dict(make_cameras_from_configs(mono))
@@ -99,6 +132,34 @@ class AxolRobot(Robot):
                     stereo_cameras.append(cam)
                 cameras[key] = cam.left_view if eye == "left" else cam.right_view
         return cameras, stereo_cameras
+
+    def _build_gst_cameras(self) -> tuple[dict, list]:
+        """Build cameras on the gst pipeline (raw for dataset + encoded view)."""
+        from ...vr.gst_zed import ZedGstCamera, ZedGstStereoCamera
+
+        obs_cams = self.config.observation_cameras()
+        cameras: dict = {}
+        owned: list = []
+        by_cfg: dict[int, ZedGstStereoCamera] = {}
+        for key, (cfg, eye) in obs_cams.items():
+            resolution = cfg.resolution_name() or "HD1200"
+            fps = cfg.fps or 60
+            if eye is None:
+                cam = ZedGstCamera(
+                    cfg.serial, resolution, fps, want_encoded=True, want_raw=True
+                )
+                cameras[key] = cam
+                owned.append(cam)
+                continue
+            stereo = by_cfg.get(id(cfg))
+            if stereo is None:
+                stereo = ZedGstStereoCamera(
+                    cfg.serial, resolution, fps, want_encoded=True, want_raw=True
+                )
+                by_cfg[id(cfg)] = stereo
+                owned.append(stereo)
+            cameras[key] = stereo.left_view if eye == "left" else stereo.right_view
+        return cameras, owned
 
     # ------------------------------------------------------------------
     # Properties

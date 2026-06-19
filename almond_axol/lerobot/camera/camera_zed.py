@@ -37,6 +37,7 @@ from threading import Event, Lock, Thread
 from typing import Any
 
 import cv2
+import numpy as np
 import pyzed.sl as sl
 from lerobot.cameras.camera import Camera
 from lerobot.cameras.configs import ColorMode
@@ -70,6 +71,9 @@ class ZedCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
+        # Native BGRA straight from the SDK (no colorspace convert), kept for the
+        # headset video relay so NVENC can be fed 4-channel without a CPU pass.
+        self.latest_bgra: NDArray[Any] | None = None
         self.latest_capture_perf_ts: float | None = None
         self.latest_receive_perf_ts: float | None = None
         self.new_frame_event: Event = Event()
@@ -250,6 +254,7 @@ class ZedCamera(Camera):
         self.stop_event = None
         with self.frame_lock:
             self.latest_frame = None
+            self.latest_bgra = None
             self.latest_capture_perf_ts = None
             self.latest_receive_perf_ts = None
             self.new_frame_event.clear()
@@ -295,6 +300,10 @@ class ZedCamera(Camera):
 
                 self.zed.retrieve_image(image)
                 raw = image.get_data()  # BGRA uint8 (height, width, 4)
+                # ``raw`` views the SDK Mat buffer, which is overwritten on the
+                # next grab; copy it (contiguous) so the relay thread can read
+                # it safely while NVENC is fed 4-channel without a CPU convert.
+                bgra = np.array(raw, dtype=np.uint8, order="C")
 
                 if self.config.color_mode == ColorMode.RGB:
                     frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGB)
@@ -313,6 +322,7 @@ class ZedCamera(Camera):
 
                 with self.frame_lock:
                     self.latest_frame = frame
+                    self.latest_bgra = bgra
                     self.latest_capture_perf_ts = cap_perf
                     self.latest_receive_perf_ts = recv_perf
                 self.new_frame_event.set()
@@ -450,6 +460,51 @@ class ZedCamera(Camera):
                 )
             self.new_frame_event.wait(timeout=remaining)
 
+    @check_if_not_connected
+    def read_bgra_at_or_after(
+        self,
+        target_capture_perf_ts: float,
+        timeout_ms: float = 500,
+    ) -> tuple[NDArray[Any], float, float]:
+        """Like :meth:`read_at_or_after`, but returns the native BGRA frame.
+
+        The headset video relay feeds 4-channel BGRA straight to the hardware
+        encoder (NVENC via ``nvvidconv``), avoiding the CPU colorspace converts
+        the RGB path incurs. ``color_mode`` does not apply here — the bytes are
+        exactly what the SDK retrieved.
+
+        Returns:
+            ``(bgra_frame, capture_perf_ts, receive_perf_ts)``.
+        """
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+
+        while True:
+            self.new_frame_event.clear()
+            with self.frame_lock:
+                frame = self.latest_bgra
+                cap_ts = self.latest_capture_perf_ts
+                recv_ts = self.latest_receive_perf_ts
+            if (
+                frame is not None
+                and cap_ts is not None
+                and recv_ts is not None
+                and cap_ts >= target_capture_perf_ts
+            ):
+                return frame, cap_ts, recv_ts
+
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self} timed out waiting for BGRA frame at "
+                    f"capture_perf_ts >= {target_capture_perf_ts:.6f} "
+                    f"after {timeout_ms:.1f}ms "
+                    f"(latest cap_ts={cap_ts!r})."
+                )
+            self.new_frame_event.wait(timeout=remaining)
+
     def disconnect(self) -> None:
         """Stop the grab thread and close the ZED camera."""
         if not self.is_connected and self.thread is None:
@@ -483,13 +538,22 @@ class _EyeBuffer:
     def __init__(self) -> None:
         self.lock: Lock = Lock()
         self.frame: NDArray[Any] | None = None
+        # Native BGRA for the headset relay (see ZedCamera.latest_bgra).
+        self.bgra: NDArray[Any] | None = None
         self.cap_ts: float | None = None
         self.recv_ts: float | None = None
         self.event: Event = Event()
 
-    def set(self, frame: NDArray[Any], cap_ts: float, recv_ts: float) -> None:
+    def set(
+        self,
+        frame: NDArray[Any],
+        bgra: NDArray[Any],
+        cap_ts: float,
+        recv_ts: float,
+    ) -> None:
         with self.lock:
             self.frame = frame
+            self.bgra = bgra
             self.cap_ts = cap_ts
             self.recv_ts = recv_ts
         self.event.set()
@@ -497,6 +561,7 @@ class _EyeBuffer:
     def clear(self) -> None:
         with self.lock:
             self.frame = None
+            self.bgra = None
             self.cap_ts = None
             self.recv_ts = None
         self.event.clear()
@@ -692,11 +757,14 @@ class ZedStereoCamera:
 
                 for mat, buf in ((left_mat, self._left), (right_mat, self._right)):
                     raw = mat.get_data()  # BGRA uint8 (height, width, 4)
+                    # Copy the native BGRA before the next grab overwrites the
+                    # Mat buffer; the relay feeds it to NVENC without a convert.
+                    bgra = np.array(raw, dtype=np.uint8, order="C")
                     if self.config.color_mode == ColorMode.RGB:
                         frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2RGB)
                     else:
                         frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
-                    buf.set(frame, cap_perf, recv_perf)
+                    buf.set(frame, bgra, cap_perf, recv_perf)
 
             except DeviceNotConnectedError:
                 break
@@ -818,6 +886,40 @@ class _StereoEyeView:
             if remaining <= 0:
                 raise TimeoutError(
                     f"{self} timed out waiting for frame at "
+                    f"capture_perf_ts >= {target_capture_perf_ts:.6f} "
+                    f"after {timeout_ms:.1f}ms (latest cap_ts={cap_ts!r})."
+                )
+            self._buf.event.wait(timeout=remaining)
+
+    def read_bgra_at_or_after(
+        self,
+        target_capture_perf_ts: float,
+        timeout_ms: float = 500,
+    ) -> tuple[NDArray[Any], float, float]:
+        """Like :meth:`read_at_or_after`, but returns the native BGRA frame.
+
+        See :meth:`ZedCamera.read_bgra_at_or_after`.
+        """
+        if not self._running():
+            raise RuntimeError(f"{self} read thread is not running.")
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while True:
+            self._buf.event.clear()
+            with self._buf.lock:
+                frame = self._buf.bgra
+                cap_ts = self._buf.cap_ts
+                recv_ts = self._buf.recv_ts
+            if (
+                frame is not None
+                and cap_ts is not None
+                and recv_ts is not None
+                and cap_ts >= target_capture_perf_ts
+            ):
+                return frame, cap_ts, recv_ts
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"{self} timed out waiting for BGRA frame at "
                     f"capture_perf_ts >= {target_capture_perf_ts:.6f} "
                     f"after {timeout_ms:.1f}ms (latest cap_ts={cap_ts!r})."
                 )
