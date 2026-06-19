@@ -65,7 +65,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``gst.install`` subcommand."""
     subparsers.add_parser(
         "gst.install",
-        help="Install the zed-gstreamer + NVENC + PyGObject stack for video.",
+        help="Install GStreamer + PyGObject support for the ZED camera pipeline.",
     ).set_defaults(func=run)
 
 
@@ -151,7 +151,12 @@ def _pip_install_pygobject() -> bool:
 
 
 def run(_args: object = None) -> None:
-    """Install the zed-gstreamer + NVENC system packages and PyGObject."""
+    """Install the GStreamer framework + introspection typelibs and PyGObject.
+
+    NVENC (``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP and
+    the ``zedxonesrc`` / ``zedsrc`` source elements come from
+    ``axol gst.build-zed``; this command only verifies those are present.
+    """
     if _gst_ok():
         print("GStreamer ZED camera stack already available.")
         return
