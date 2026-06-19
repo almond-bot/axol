@@ -225,48 +225,6 @@ def _connect_zed_cameras(
     return cameras
 
 
-class _ZedFrameSource:
-    """Frame-driven relay source for a connected ZED camera (or stereo eye).
-
-    ``wait_next`` blocks until the camera produces a frame newer than the last
-    one sent, so every relayed frame is encoded the instant it's captured
-    instead of waiting to be sampled by a fixed-rate timer. It returns the
-    SDK's **native BGRA** (4-channel) so the GStreamer pipeline can hand it
-    straight to NVENC via ``nvvidconv`` — no CPU colorspace conversion.
-    """
-
-    def __init__(self, cam: Any) -> None:
-        self._cam = cam
-
-    @property
-    def width(self) -> int:
-        return int(self._cam.width or 0)
-
-    @property
-    def height(self) -> int:
-        return int(self._cam.height or 0)
-
-    @property
-    def fps(self) -> int:
-        return int(self._cam.fps or 30)
-
-    def __call__(self) -> Any:
-        try:
-            return self._cam.read_latest(max_age_ms=1000)
-        except Exception:  # noqa: BLE001 - stale/dropped frame → black feed
-            return None
-
-    def wait_next(self, after_ts: float | None, timeout_ms: float) -> Any:
-        target = after_ts + 1e-6 if after_ts is not None else 0.0
-        try:
-            frame, cap_ts, _recv_ts = self._cam.read_bgra_at_or_after(
-                target, timeout_ms=timeout_ms
-            )
-            return frame, cap_ts
-        except Exception:  # noqa: BLE001 - timeout/stall → keepalive in track
-            return None
-
-
 def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> None:
     """Register connected ZED cameras as WebRTC sources for the headset."""
     if not cameras:
@@ -274,7 +232,9 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
 
     # SDK cameras are wrapped as frame-driven sources for the in-process
     # aiortc WebRTCManager (NVENC encode + aiortc RTP send).
-    sources = {name: _ZedFrameSource(cam) for name, cam in cameras}
+    from ..vr.video import ZedFrameSource
+
+    sources = {name: ZedFrameSource(cam) for name, cam in cameras}
     try:
         teleop.set_video_sources(sources)
         _logger.info("teleop: streaming cameras to headset: %s", ", ".join(sources))

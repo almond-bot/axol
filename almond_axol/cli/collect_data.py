@@ -73,17 +73,17 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
     show them. gst cameras already produce GPU-encoded H.264 access units, so
     they are registered directly (their ``subscribe()`` feeds a pre-encoded
     WebRTC track — the same one grab/encode serves the dataset). SDK cameras
-    are wrapped frame-driven (see ``_ZedFrameSource``): each relayed frame is
+    are wrapped frame-driven (see ``ZedFrameSource``): each relayed frame is
     encoded as soon as it's captured. Reads only consume the latest frame each
     camera already keeps, so the dataset capture pipeline is never blocked.
     """
-    from .teleop import _ZedFrameSource
+    from ..vr.video import ZedFrameSource
 
     sources: dict[str, Any] = {}
     for name, cam in robot.cameras.items():
         # A gst camera/eye exposes subscribe(); hand it to the manager as-is so
         # its pre-encoded AUs go straight to RTP. Everything else is raw.
-        sources[name] = cam if hasattr(cam, "subscribe") else _ZedFrameSource(cam)
+        sources[name] = cam if hasattr(cam, "subscribe") else ZedFrameSource(cam)
 
     if not sources:
         return
