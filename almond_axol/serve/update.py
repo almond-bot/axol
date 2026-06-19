@@ -86,10 +86,13 @@ class SelfUpdater:
         # next idle opportunity without waiting out the debounce again.
         self._restart_pending = False
         # The GStreamer camera stack is provisioned once per process (covers a
-        # host that upgraded into this build from an older main); serialized so
-        # the startup heal and a post-upgrade reinstall never race.
+        # host that upgraded into this build from an older main). ``_env_lock``
+        # serializes everything that mutates the uv tool environment -- the
+        # `uv tool upgrade` and every `axol provision` (startup heal +
+        # post-upgrade reinstall) -- so they can never rebuild/install into it
+        # at the same time.
         self._provision_started = False
-        self._provision_lock = asyncio.Lock()
+        self._env_lock = asyncio.Lock()
 
     @property
     def commit(self) -> str | None:
@@ -117,16 +120,25 @@ class SelfUpdater:
         self._task = asyncio.create_task(self._check())
 
     async def _check(self) -> None:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "uv",
-                "tool",
-                "upgrade",
-                _PACKAGE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            out, _ = await proc.communicate()
+        # `uv tool upgrade` rewrites the whole tool env, so it must not overlap
+        # an `axol provision` installing pyzed/PyGObject into that same env (a
+        # concurrent startup heal). Both take ``_env_lock``; we release it before
+        # the post-upgrade `_provision()` below, which re-acquires it (the lock
+        # is not reentrant).
+        async with self._env_lock:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "uv",
+                    "tool",
+                    "upgrade",
+                    _PACKAGE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                out, _ = await proc.communicate()
+            except OSError as exc:
+                _logger.warning("self-update: could not run uv: %s", exc)
+                return
             if proc.returncode != 0:
                 tail = out.decode("utf-8", "replace").strip().splitlines()
                 _logger.warning(
@@ -135,13 +147,12 @@ class SelfUpdater:
                     tail[-1] if tail else "no output",
                 )
                 return
-        except OSError as exc:
-            _logger.warning("self-update: could not run uv: %s", exc)
-            return
 
-        # The upgrade rewrites the tool environment; re-read the metadata from
-        # disk to see whether the installed commit moved past the running one.
-        new_commit = installed_commit()
+            # The upgrade rewrites the tool environment; re-read the metadata
+            # from disk to see whether the installed commit moved past the
+            # running one (still under the lock, so it reflects this upgrade).
+            new_commit = installed_commit()
+
         if new_commit is None or new_commit == self._commit:
             _logger.info("self-update: already up to date (%s)", self._commit)
             return
@@ -177,13 +188,14 @@ class SelfUpdater:
         them and (re)builds the patched zedxonesrc/zedsrc plugins. It is the
         exact command the hosted installer runs, so the two can't drift, and it
         is idempotent + self-gating (a no-op without the ZED SDK / apt / NVENC).
-        Serialized so the startup heal and a post-upgrade run can't overlap.
+        Takes ``_env_lock`` so it can't overlap another provision or the
+        `uv tool upgrade` (both also rewrite the tool env).
         """
         axol = shutil.which("axol")
         if axol is None:
             _logger.warning("self-update: axol not on PATH; cannot provision")
             return
-        async with self._provision_lock:
+        async with self._env_lock:
             try:
                 proc = await asyncio.create_subprocess_exec(
                     axol,
