@@ -91,10 +91,12 @@ def _detect_cameras() -> dict[str, Any]:
 def create_app(static_dir: Path | None = None) -> FastAPI:
     app = FastAPI(title="axol serve")
 
-    # System setup (Jetson clock pinning, GStreamer WebRTC install) is owned by
-    # the host installer and its boot service (`axol jetson.setup` runs as an
-    # ExecStartPre on axol.service; `axol gst.install` runs once at install
-    # time) — not by this process. serve just runs.
+    # System setup (Jetson clock pinning, GStreamer install) is owned by the
+    # host installer and its boot service (`axol jetson.setup` runs as an
+    # ExecStartPre on axol.service; `axol provision` runs at install time). The
+    # one exception is the self-updater (below), which re-runs `axol provision`
+    # after a `uv tool upgrade` and self-heals a host that upgraded into this
+    # build from an older main.
 
     manager = SessionManager()
     robot = RobotLink()
