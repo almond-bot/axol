@@ -21,9 +21,10 @@ This module provides the pieces shared by all five commands:
   ``JointConfig`` fields). Seeding the encoded default config as the base
   of draccus's ``mergedeep`` step restores correct partial-override
   semantics (defaults -> ``--config_path`` file -> CLI flags).
-- :data:`LogLevel` / :data:`PolicyType` / :data:`AggregateFn`, ``Literal``
-  aliases registered with draccus so it validates choices the way
-  ``argparse``'s ``choices=`` used to.
+- :func:`register_literal` plus the :data:`LogLevel` / :data:`PolicyType` /
+  :data:`AggregateFn` aliases it registers with draccus so it validates
+  choices the way ``argparse``'s ``choices=`` used to. ``lerobot`` config
+  modules call :func:`register_literal` for their own ``Literal`` fields.
 - :class:`TeleopCmdConfig` and :class:`GravityCompCmdConfig`, the two
   command configs that do not touch ``lerobot`` (kept here so importing
   them stays cheap on the sim/teleop-only path). The ``collect-data`` and
@@ -103,10 +104,16 @@ _draccus_docstring.get_attribute_docstring = _safe_get_attribute_docstring
 # registry only accepts concrete type objects (not the bare
 # ``typing.Literal`` origin), so we register one decoder per concrete
 # alias. Each rejects out-of-set values, mirroring argparse ``choices=``.
+#
+# Every ``Literal`` field that draccus parses must be registered this way,
+# including ones defined elsewhere: the ``lerobot`` config modules call
+# :func:`register_literal` for their own aliases (e.g.
+# ``ZedCameraConfig.eyes``, ``AxolRobotConfig.video_backend``). The import
+# arrow only ever points *into* this module, so it stays ``lerobot``-free.
 # ----------------------------------------------------------------------
 
 
-def _register_literal(lit: T) -> T:
+def register_literal(lit: T) -> T:
     """Register a draccus decoder for a concrete ``Literal[...]`` alias."""
     allowed = get_args(lit)
 
@@ -119,11 +126,11 @@ def _register_literal(lit: T) -> T:
     return lit
 
 
-LogLevel = _register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
-PolicyType = _register_literal(
+LogLevel = register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
+PolicyType = register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 )
-AggregateFn = _register_literal(
+AggregateFn = register_literal(
     Literal[
         "temporal_ensemble",
         "weighted_average",

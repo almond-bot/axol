@@ -5,8 +5,11 @@ from typing import Literal
 
 from lerobot.cameras.configs import CameraConfig, ColorMode
 
-# Which eye(s) of a stereo ZED X to expose as observations.
-StereoEyes = Literal["both", "left", "right"]
+from ...cli.config import register_literal
+
+# Which eye(s) of a stereo ZED X to expose as observations. Registered with
+# draccus so it decodes/validates on the CLI (see register_literal).
+StereoEyes = register_literal(Literal["both", "left", "right"])
 
 # Frame dimensions (width, height) for each ZED capture resolution name.
 # For a stereo ZED X these are per eye.

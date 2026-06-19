@@ -8,13 +8,15 @@ from typing import Literal
 from lerobot.cameras.configs import CameraConfig
 from lerobot.robots.config import RobotConfig
 
+from ...cli.config import register_literal
 from ...robot.config import AxolConfig
 from ...utils.shared import CAN_LEFT, CAN_RIGHT
 
 # Camera capture backend. "gst" is the GPU-resident zed-gstreamer pipeline
 # (low latency, shared with teleop); "sdk" is the ZED Python SDK; "auto"
 # prefers gst when its stack is installed and falls back to the SDK.
-VideoBackend = Literal["auto", "gst", "sdk"]
+# Registered with draccus so it decodes/validates on the CLI.
+VideoBackend = register_literal(Literal["auto", "gst", "sdk"])
 
 
 @RobotConfig.register_subclass("axol")
