@@ -92,14 +92,16 @@ class VRServer:
         self._on_frame = callback
 
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
-        """Register per-camera frame sources to stream to the headset.
+        """Register per-camera video sources to stream to the headset.
 
-        Each source is a connected camera (or stereo eye) exposing fixed
-        ``width`` / ``height`` / ``fps`` and ``wait_next`` (returning the
-        SDK's native BGRA). The headset negotiates a WebRTC connection over
-        the existing ``/ws`` channel and receives one video track per source;
-        frames are encoded on the Jetson's hardware NVENC and shipped by
-        aiortc (see :mod:`almond_axol.vr.video`).
+        Each value is a connected ``ZedCamera`` / stereo eye (registered
+        directly — the relay adapts it to BGRA frames), a pre-encoded
+        ``gst_zed`` camera, or any raw-frame source exposing ``width`` /
+        ``height`` / ``fps`` + ``wait_next``; the manager picks the right
+        WebRTC track per source (see :mod:`almond_axol.vr.video`). The headset
+        negotiates a WebRTC connection over the existing ``/ws`` channel and
+        receives one video track per source, encoded on the Jetson's hardware
+        NVENC and shipped by aiortc.
 
         This is the in-process fallback; teleop normally runs the relay in a
         dedicated subprocess via :meth:`set_video_manager`. Pass ``None`` or an

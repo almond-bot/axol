@@ -54,7 +54,7 @@ Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whene
 
 ## Camera video to the headset
 
-The server can stream camera frames to the headset over **WebRTC**. Register per-camera sources with `set_video_sources()`. A source is either a **pre-encoded** camera (the GPU-resident `gst_zed` pipeline, exposing `subscribe()` / `alive` — its H.264 access units go straight to RTP with no Python encode) or a **raw frame** source exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)` (the `FrameSource` protocol — a `ZedCamera` satisfies it directly). The manager picks the right WebRTC track per source automatically:
+The server can stream camera frames to the headset over **WebRTC**. Register per-camera sources with `set_video_sources()`. A source is either a **pre-encoded** camera (the GPU-resident `gst_zed` pipeline, exposing `subscribe()` / `alive` — its H.264 access units go straight to RTP with no Python encode) or a **raw frame** source. A connected `ZedCamera` (or stereo eye) is registered directly — the relay adapts it — and you can equally pass any object exposing fixed `width` / `height` / `fps` plus `wait_next(after_ts, timeout_ms)`. The manager picks the right WebRTC track per source automatically:
 
 ```python
 vr.set_video_sources({

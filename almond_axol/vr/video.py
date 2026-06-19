@@ -105,12 +105,6 @@ class ZedFrameSource:
     def fps(self) -> int:
         return int(self._cam.fps or 30)
 
-    def __call__(self) -> Any:
-        try:
-            return self._cam.read_latest(max_age_ms=1000)
-        except Exception:  # noqa: BLE001 - stale/dropped frame → black feed
-            return None
-
     def wait_next(self, after_ts: float | None, timeout_ms: float) -> Any:
         target = after_ts + 1e-6 if after_ts is not None else 0.0
         try:
@@ -242,6 +236,30 @@ class PrecodedVideoTrack(MediaStreamTrack):
             return packet
 
 
+def _track_for_source(source: Any) -> MediaStreamTrack:
+    """Build the right WebRTC track for a registered video source.
+
+    The video sources accepted by ``set_video_sources`` are duck-typed so
+    callers can hand in whatever they already have:
+
+    * a pre-encoded source exposing ``subscribe()`` (the GPU-resident
+      :mod:`~almond_axol.vr.gst_zed` cameras) → :class:`PrecodedVideoTrack`,
+      whose H.264 access units go straight to RTP with no Python encode;
+    * a connected ``ZedCamera`` / stereo eye (exposes ``read_bgra_at_or_after``
+      but not ``wait_next``) → wrapped in :class:`ZedFrameSource` so a bare
+      camera "just works";
+    * anything already exposing ``wait_next`` (e.g. a hand-built
+      :class:`ZedFrameSource`) → used as-is.
+
+    The last two feed :class:`CameraVideoTrack`, which aiortc encodes via NVENC.
+    """
+    if hasattr(source, "subscribe"):
+        return PrecodedVideoTrack(source)
+    if not hasattr(source, "wait_next") and hasattr(source, "read_bgra_at_or_after"):
+        source = ZedFrameSource(source)
+    return CameraVideoTrack(source)
+
+
 class WebRTCManager:
     """Manages per-client peer connections that send ZED camera video.
 
@@ -254,6 +272,12 @@ class WebRTCManager:
     """
 
     def __init__(self, sources: dict[str, Any]) -> None:
+        """``sources`` maps each headset-visible track name to a video source.
+
+        A source can be a connected ``ZedCamera`` / stereo eye, a pre-encoded
+        ``gst_zed`` camera, or a hand-built :class:`ZedFrameSource`; the right
+        WebRTC track is chosen per source (see :func:`_track_for_source`).
+        """
         self._sources = dict(sources)
         self._pcs: dict[int, RTCPeerConnection] = {}
 
@@ -280,14 +304,7 @@ class WebRTCManager:
 
         track_names: dict[int, str] = {}
         for name, source in self._sources.items():
-            # Sources exposing subscribe() deliver pre-encoded H.264 AUs (the
-            # GPU-resident gst_zed camera pipelines); everything else is a raw
-            # frame source that aiortc encodes via NVENC.
-            track: MediaStreamTrack
-            if hasattr(source, "subscribe"):
-                track = PrecodedVideoTrack(source)
-            else:
-                track = CameraVideoTrack(source)
+            track = _track_for_source(source)
             pc.addTrack(track)
             track_names[id(track)] = name
 
@@ -343,7 +360,8 @@ class WebRTCManager:
     def shutdown(self) -> None:
         """No-op: peer connections are closed via ``close_all`` (async).
 
-        Present so callers that treat the manager as a drop-in for the
-        gstreamer manager (which owns a GLib loop) can call ``shutdown``
-        unconditionally.
+        Present so this in-process manager is a drop-in for the out-of-process
+        relay (:class:`~almond_axol.vr.video_proc.VideoRelayProcess`), whose
+        ``shutdown`` tears down the subprocess; callers can invoke ``shutdown``
+        unconditionally on either.
         """
