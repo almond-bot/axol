@@ -84,6 +84,78 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
+def _open_gst_camera_raw(
+    name: str, spec: dict, cond: object
+) -> tuple[object, dict[str, object], list, dict[str, tuple]] | None:
+    """Open one camera via the gst pipeline with both encoded + raw branches.
+
+    Like :func:`_open_gst_camera`, but additionally allocates a shared-memory
+    :class:`~almond_axol.vr.shm_frames.RawFrameWriter` per source and wires it
+    as the camera's raw sink, so every captured frame is published to the
+    control process for the dataset. Returns
+    ``(owned_camera, {track: source}, [writers], {source: (shm_name, w, h, fps)})``
+    or ``None`` when the gst stack/camera is unavailable (the caller then has no
+    raw path for this camera and falls back to the in-process camera pipeline).
+    """
+    from .gst_zed import (
+        _RESOLUTION_DIMS,
+        ZedGstCamera,
+        ZedGstStereoCamera,
+        zed_gst_available,
+        zed_stereo_gst_available,
+    )
+    from .shm_frames import RawFrameWriter
+
+    serial = int(spec["serial"])
+    resolution = spec.get("resolution") or "HD1200"
+    stereo = bool(spec.get("stereo"))
+    if stereo and not zed_stereo_gst_available():
+        return None
+    if not stereo and not zed_gst_available():
+        return None
+    if resolution not in _RESOLUTION_DIMS:
+        return None
+    width, height = _RESOLUTION_DIMS[resolution]
+
+    for fps in (int(spec.get("fps", 60)), 30):
+        writers: list = []
+        try:
+            if stereo:
+                left = RawFrameWriter.create(width, height, cond)
+                right = RawFrameWriter.create(width, height, cond)
+                writers = [left, right]
+                cam: object = ZedGstStereoCamera(
+                    serial,
+                    resolution,
+                    fps,
+                    want_encoded=True,
+                    left_raw_sink=left.publish,
+                    right_raw_sink=right.publish,
+                )
+                cam.connect()
+                sources = {
+                    f"{name}_left": cam.left_view,
+                    f"{name}_right": cam.right_view,
+                }
+                raw_meta = {
+                    f"{name}_left": (left.name, width, height, fps),
+                    f"{name}_right": (right.name, width, height, fps),
+                }
+                return cam, sources, writers, raw_meta
+            writer = RawFrameWriter.create(width, height, cond)
+            writers = [writer]
+            cam = ZedGstCamera(
+                serial, resolution, fps, want_encoded=True, raw_sink=writer.publish
+            )
+            cam.connect()
+            return cam, {name: cam}, writers, {name: (writer.name, width, height, fps)}
+        except Exception as exc:  # noqa: BLE001 - try lower fps, then give up
+            for w in writers:
+                w.close()
+            _logger.info("video relay: gst-raw %s @ %s fps failed (%s)", name, fps, exc)
+    return None
+
+
 def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] | None:
     """Open one camera via the GPU-resident gst pipeline (encoded only).
 
@@ -133,8 +205,19 @@ def _relay_main(
     conn: multiprocessing.connection.Connection,
     cameras: dict[str, dict],
     log_level: int,
+    want_raw: bool = False,
+    raw_cond: object = None,
 ) -> None:
-    """Relay subprocess entry point: open cameras, serve signaling requests."""
+    """Relay subprocess entry point: open cameras, serve signaling requests.
+
+    When ``want_raw`` is set (data collection), each camera is opened on the gst
+    pipeline with a raw branch whose frames are published to shared memory for
+    the control process; ``raw_cond`` is the shared
+    :class:`multiprocessing.Condition` guarding those blocks. Cameras that can't
+    provide raw via gst still stream to the headset (encoded only) but are
+    omitted from ``raw_meta`` so the parent can fall back to the in-process
+    camera path.
+    """
     logging.basicConfig(level=log_level)
 
     from .video import WebRTCManager
@@ -145,7 +228,19 @@ def _relay_main(
     # ZedCamera/eye, which WebRTCManager adapts to a frame-driven NVENC source.
     owned: list[object] = []
     sources: dict[str, object] = {}
+    writers: list[object] = []
+    raw_meta: dict[str, tuple] = {}
     for name, spec in cameras.items():
+        if want_raw:
+            raw = _open_gst_camera_raw(name, spec, raw_cond)
+            if raw is not None:
+                cam, gst_sources, cam_writers, cam_meta = raw
+                owned.append(cam)
+                sources.update(gst_sources)
+                writers.extend(cam_writers)
+                raw_meta.update(cam_meta)
+                continue
+            # No gst raw path for this camera; still stream it (encoded only).
         gst = _open_gst_camera(name, spec)
         if gst is not None:
             cam, gst_sources = gst
@@ -164,7 +259,7 @@ def _relay_main(
             sources[name] = cam
 
     manager = WebRTCManager(sources) if sources else None
-    conn.send(("ready", sorted(sources)))
+    conn.send(("ready", sorted(sources), raw_meta))
     if manager is None:
         _logger.warning("video relay opened no cameras; nothing to stream")
 
@@ -198,6 +293,11 @@ def _relay_main(
                     await manager.close(client_id)
                 elif kind == "close_all" and manager is not None:
                     await manager.close_all()
+                elif kind == "raw_enable":
+                    _, enabled = msg
+                    for cam in owned:
+                        if hasattr(cam, "set_raw_enabled"):
+                            cam.set_raw_enabled(enabled)
             except Exception as exc:  # noqa: BLE001 - keep serving
                 _logger.error("video relay: error handling %s: %s", kind, exc)
         if manager is not None:
@@ -211,6 +311,11 @@ def _relay_main(
         for cam in owned:
             try:
                 cam.disconnect()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        for writer in writers:
+            try:
+                writer.close()  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
 
@@ -229,18 +334,32 @@ class VideoRelayProcess:
     in an executor so the caller's event loop never blocks.
     """
 
-    def __init__(self, cameras: dict[str, dict]) -> None:
+    def __init__(self, cameras: dict[str, dict], want_raw: bool = False) -> None:
         """Spawn the relay and block until its cameras are streaming.
 
         Args:
             cameras: Per-source spec: ``{name: {"serial": int,
-                "resolution": str, "fps": int}}``.
+                "resolution": str, "fps": int, "stereo": bool}}``.
+            want_raw: Also publish each camera's raw RGB frames to shared memory
+                for the control process (data collection). Successfully exported
+                sources appear in :attr:`raw_cameras` as
+                :class:`~almond_axol.vr.shm_frames.RawFrameReader` proxies.
         """
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
+        # One Condition guards every source's shared-memory metadata; it must be
+        # created here and passed at spawn so parent (readers) and child
+        # (writers) share the same underlying primitive.
+        self._raw_cond = ctx.Condition() if want_raw else None
         self._proc = ctx.Process(
             target=_relay_main,
-            args=(child_conn, cameras, logging.getLogger().level or logging.INFO),
+            args=(
+                child_conn,
+                cameras,
+                logging.getLogger().level or logging.INFO,
+                want_raw,
+                self._raw_cond,
+            ),
             daemon=True,
             name="video-relay",
         )
@@ -249,12 +368,33 @@ class VideoRelayProcess:
         self._lock = threading.Lock()
 
         self.sources: list[str] = []
+        self.raw_cameras: dict[str, object] = {}
         if self._conn.poll(_READY_TIMEOUT_S):
             msg = self._conn.recv()
             if isinstance(msg, tuple) and msg[0] == "ready":
                 self.sources = list(msg[1])
+                raw_meta = msg[2] if len(msg) > 2 else {}
+                self._attach_raw_readers(raw_meta)
         if not self.sources:
             _logger.warning("video relay started no camera streams")
+
+    def _attach_raw_readers(self, raw_meta: dict[str, tuple]) -> None:
+        """Attach a RawFrameReader proxy to each shared-memory block the relay made."""
+        if not raw_meta or self._raw_cond is None:
+            return
+        from .shm_frames import RawFrameReader
+
+        for source, (shm_name, width, height, fps) in raw_meta.items():
+            try:
+                self.raw_cameras[source] = RawFrameReader(
+                    shm_name, width, height, fps, self._raw_cond
+                )
+            except Exception as exc:  # noqa: BLE001 - skip a source we can't map
+                _logger.warning(
+                    "video relay: could not attach raw frames for %s: %s",
+                    source,
+                    exc,
+                )
 
     @property
     def has_sources(self) -> bool:
@@ -304,10 +444,29 @@ class VideoRelayProcess:
             None, self._send, ("close_all",)
         )
 
+    def set_raw_enabled(self, enabled: bool) -> None:
+        """Open/close the raw dataset branch in the relay (recording only).
+
+        The raw RGBA branch (VIC convert + shared-memory copy for every camera)
+        is the bulk of the relay's CPU. ``collect-data`` keeps it closed during
+        the pre-record teleop phase — where nothing reads raw frames — so the
+        control loop keeps the spare cores it needs, then opens it while an
+        episode is actually recording. No-op if the relay has no raw sources.
+        """
+        if not self.raw_cameras:
+            return
+        self._send(("raw_enable", bool(enabled)))
+
     # -- Lifecycle ------------------------------------------------------------
 
     def shutdown(self) -> None:
         """Stop the relay subprocess (cameras and peer connections included)."""
+        for reader in self.raw_cameras.values():
+            try:
+                reader.disconnect()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+        self.raw_cameras = {}
         try:
             with self._lock:
                 self._conn.send(None)

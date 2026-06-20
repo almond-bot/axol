@@ -22,7 +22,7 @@ This:
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already installed.
 - Installs the `axol` CLI from GitHub as a `uv` tool (Python 3.13 included), with every dependency extra except `cuda`.
 - Sets up the headset-video stack ([`gst.install`](/cli/gst-install) plus the patched ZED source plugins, [`gst.build-zed`](/cli/gst-build-zed)) and, on a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)).
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup (re-pinning the Jetson clocks first) and restarts it automatically if it ever goes down.
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup (re-pinning the Jetson clocks first) and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root.
 
 When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — no terminal needed from then on. The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. (Re-running the install command also upgrades.)
 

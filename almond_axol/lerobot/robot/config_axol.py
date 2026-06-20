@@ -32,7 +32,13 @@ class AxolRobotConfig(RobotConfig):
                           ``--robot_config.cameras "{overhead: {serial:
                           41234567}}"``).
         axol_config:      Per-joint gain config forwarded to the Axol hardware driver.
-        telemetry_hz:     Background telemetry polling rate in Hz.
+        telemetry_hz:     Background telemetry polling rate in Hz. Set to ``0``
+                          (or below) to skip the poll loop entirely and rely on
+                          ``motion_control`` command replies to keep the
+                          position/torque cache fresh — matching ``axol teleop``.
+                          Only safe when a ``motion_control`` loop runs every
+                          step (e.g. ``collect-data``); otherwise the cache goes
+                          stale between commands.
         observe_torques:  Include joint torques in observations. Default False.
         left_channel:     SocketCAN interface for the left arm.
         right_channel:    SocketCAN interface for the right arm.

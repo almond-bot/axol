@@ -464,6 +464,26 @@ def run_ik_worker(
     q_current_right: np.ndarray | None = None,
 ) -> None:
     """IK subprocess entry point."""
+    # Confine the JAX solve to a single core's worth of compute. The per-arm IK
+    # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
+    # core for each solve; combined with this process's nice(-10) boost, that
+    # burst preempts the control loop's CAN round-trip and the video relay on
+    # every step — exactly the engaged-only send/act latency spikes and grainy
+    # frames seen in `collect-data`, which (unlike teleop) has no spare core
+    # headroom once the relay's raw-frame branch is running. Single-threaded XLA
+    # is no slower for a problem this small and leaves the real-time loop alone.
+    # Must be set before the first JAX op (backend init reads XLA_FLAGS lazily).
+    _xla = os.environ.get("XLA_FLAGS", "")
+    if "xla_cpu_multi_thread_eigen" not in _xla:
+        os.environ["XLA_FLAGS"] = f"{_xla} --xla_cpu_multi_thread_eigen=false".strip()
+    for _var in (
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(_var, "1")
+
     try:
         os.nice(-10)
     except (AttributeError, OSError):
