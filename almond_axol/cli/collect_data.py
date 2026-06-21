@@ -156,6 +156,97 @@ def _default_vcodec() -> str:
     return "h264" if platform.machine() == "aarch64" else "auto"
 
 
+# Per-stream encoder thread count. Three cameras each spawn their own encoder
+# thread; keeping the inner libx264 thread pool small (vs LeRobot's example of 4)
+# leaves cores free for the control loop while still clearing 60 fps/stream once
+# the preset/GOP below are tuned.
+_ENCODER_THREADS = 2
+
+# Keyframe interval for the software encoder. LeRobot hardcodes a GOP of 2 (a
+# keyframe almost every frame), which is what tanks Tegra encode throughput.
+# 30 frames (0.5 s at 60 fps) is plenty fine-grained for timestamp-tolerant
+# dataset decode and roughly doubles encode speed.
+_ENCODER_GOP = 30
+
+
+def _install_dataset_encoder() -> bool:
+    """Pick the cheapest video encoder the control loop can afford during record.
+
+    LeRobot encodes recorded video **in the control process**. On the Jetson
+    that starves the asyncio control loop: encoding three 960x600@60 streams
+    burns CPU cores *and* does per-frame Python work (PIL convert, running
+    stats) that holds the GIL, so the loop collapses from 120 Hz to ~50 Hz
+    (jerky arm) and the encoder still overflows its queue and drops frames.
+
+    Preferred fix: route encoding to the Jetson hardware encoder out of process
+    (see :mod:`almond_axol.lerobot.nvenc_encoder`). The control process then
+    only writes raw bytes to a pipe (``os.write`` releases the GIL), so the
+    encode lands on the VIC/NVENC hardware blocks, not the CPU. Patch
+    ``LeRobotDataset._build_streaming_encoder`` (a staticmethod called by
+    ``create``/``resume``) to hand back the NVENC encoder.
+
+    Returns ``True`` when the hardware encoder was installed; otherwise falls
+    back to tuning the software libx264 path (see :func:`_tune_software_encoder`)
+    and returns ``False``.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    if getattr(LeRobotDataset, "_axol_nvenc_installed", False):
+        return True
+
+    from ..lerobot.nvenc_encoder import NvencStreamingEncoder, hw_dataset_encoder_available
+
+    if not hw_dataset_encoder_available():
+        _tune_software_encoder()
+        return False
+
+    def _build_nvenc(fps, vcodec, encoder_queue_maxsize, encoder_threads):  # noqa: ANN001
+        return NvencStreamingEncoder(fps=fps, queue_maxsize=encoder_queue_maxsize)
+
+    LeRobotDataset._build_streaming_encoder = staticmethod(_build_nvenc)
+    LeRobotDataset._axol_nvenc_installed = True
+    _logger.info("using Jetson NVENC hardware video encoder for dataset recording")
+    return True
+
+
+def _tune_software_encoder() -> None:
+    """Make LeRobot's libx264/libx265 streaming encoder fast enough for Tegra.
+
+    Fallback for hosts without the Jetson NVENC GStreamer encoder. LeRobot
+    hardcodes the software H.264/HEVC encoder to the libx264 default preset
+    ("medium") with a GOP of 2 — a keyframe almost every frame — which
+    benchmarks at only ~40 fps/stream aggregate across three cameras (below the
+    60 fps we record), so the encoder queue overflows and the control loop is
+    starved.
+
+    There is no public knob — ``LeRobotDataset.create`` doesn't expose
+    ``g``/``crf``/``preset`` and ``_get_codec_options`` ignores ``preset`` for
+    libx264 entirely — so patch the module helper to add a fast preset and a
+    sane keyframe interval (~96 fps/stream aggregate for three streams).
+    """
+    from lerobot.datasets import video_utils as _vu
+
+    if getattr(_vu, "_axol_encoder_tuned", False):
+        return
+
+    _orig_get_codec_options = _vu._get_codec_options
+
+    def _tuned(vcodec: str, g: int | None = 2, crf: int | None = 30, preset=None) -> dict:
+        options = _orig_get_codec_options(vcodec, g=g, crf=crf, preset=preset)
+        if vcodec in ("h264", "hevc"):
+            options["preset"] = "veryfast"
+            options["g"] = str(_ENCODER_GOP)
+        return options
+
+    _vu._get_codec_options = _tuned
+    _vu._axol_encoder_tuned = True
+    _logger.info(
+        "tuned software video encoder: preset=veryfast g=%d threads=%d",
+        _ENCODER_GOP,
+        _ENCODER_THREADS,
+    )
+
+
 @dataclass
 class CollectDataConfig:
     """Config for ``axol collect-data``.
@@ -450,6 +541,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # If any of this setup fails, tear the relay subprocess down so it doesn't
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
+    # Keep video encoding off the control loop: prefer the Jetson hardware
+    # encoder (out of process), else tune the in-process software encoder.
+    _install_dataset_encoder()
+
     try:
         robot.connect()
 
@@ -460,7 +555,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 root=str(dataset_root),
                 image_writer_threads=4,
                 streaming_encoding=True,
-                encoder_threads=4,
+                encoder_threads=_ENCODER_THREADS,
                 vcodec=vcodec,
             )
         else:
@@ -475,7 +570,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 use_videos=True,
                 image_writer_threads=4,
                 streaming_encoding=True,
-                encoder_threads=4,
+                encoder_threads=_ENCODER_THREADS,
                 vcodec=vcodec,
             )
         pos_l, pos_r = robot.positions
