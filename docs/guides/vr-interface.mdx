@@ -3,7 +3,7 @@ title: "VR Interface"
 description: "The WebXR teleop app that streams Quest controller pose to the Axol SDK — now hosted in this repo under web/."
 ---
 
-The Axol VR interface is a **WebXR app** that runs in a Meta Quest browser and streams hand/elbow pose from the headset to the Axol SDK over a secure WebSocket. It's what you connect to during [teleoperation](/quickstart/teleop) and [data collection](/quickstart/data-collection).
+The Axol VR interface is a **WebXR app** that runs in a Meta Quest browser and streams hand/elbow pose from the headset to the Axol SDK over a secure WebSocket. It's what you connect to during [teleoperation](/operations/teleop) and [data collection](/operations/data-collection).
 
 The app's source lives in this repository under `web/` (it was previously the separate `axol-vr` repo). The same `web/` build also produces the [web control panel](/guides/control-panel), and [`axol serve`](/cli/serve) serves both.
 
@@ -112,7 +112,7 @@ During the countdown the state sent to the server stays `DataCollection`; it bec
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Teleoperation quickstart" icon="gamepad" href="/quickstart/teleop">
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
     Go from install to a live VR session.
   </Card>
   <Card title="VR server API" icon="code" href="/api/vr">

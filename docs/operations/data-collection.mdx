@@ -1,0 +1,134 @@
+---
+title: "Data Collection"
+description: "Record VR teleoperation episodes to a LeRobot dataset — from the web control panel or the CLI."
+---
+
+Data collection records teleoperation episodes — joint trajectories plus synchronized camera frames — into a [LeRobot](/api/lerobot) dataset you can later train on. Everything runs on **one machine**: the computer wired to the robot with the three ZED cameras attached (typically a ZED Box / Jetson). Because it owns the dataset, runs teleop, and captures the cameras locally, every recorded frame and joint sample shares the same clock — no time sync to set up.
+
+You drive the arms over VR exactly as in [teleoperation](/operations/teleop); the extra **A** (record) and **B** (mode) controller buttons start and save takes. You can launch it from the **web control panel** or the **CLI** (`axol collect-data`).
+
+## Before you start
+
+- **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
+- **The three ZED cameras connected** over GMSL, with their serial numbers on hand. (Camera serials are printed on the camera body, or read them from the Cameras dialog / Python — see the tip below.)
+- **The VR TLS certificate authorized** once — see [Teleoperation](/operations/teleop#authorize-the-tls-certificate).
+
+<Tip>
+  List the connected cameras and their serials from Python:
+
+  ```bash
+  python -c "from almond_axol.zed import list_zed_devices; print(list_zed_devices())"
+  ```
+
+  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** in the control panel's Cameras dialog.
+</Tip>
+
+## Run it
+
+<Tabs>
+  <Tab title="Control Panel">
+    {/* SCREENSHOT: control-panel-collect-data.png — the Collect Data operation with repo_id / task fields and the Cameras dialog */}
+
+    <Steps>
+      <Step title="Connect the robot and assign cameras">
+        Connect the **Axol Host** and **Axol**, then open the **Cameras** dialog and assign each detected camera to its slot (overhead / left arm / right arm). Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
+      </Step>
+
+      <Step title="Select Collect Data and fill the fields">
+        Pick **Collect Data**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`) and the **task** description. Everything else lives under the **Optional** dropdown (fps, teleop rate, stiffness, push-to-hub).
+      </Step>
+
+      <Step title="Start and record from the headset">
+        Press **Start**, connect the headset, and drive the arms. Recording is controlled entirely from the VR controllers — see [Recording an episode](#recording-an-episode) below.
+      </Step>
+    </Steps>
+
+    <Note>
+      **Collect Data has no on-screen episode buttons** — takes are driven from the VR controller (**A** to record/save, **X** to discard, **B** to switch modes).
+    </Note>
+  </Tab>
+
+  <Tab title="CLI">
+    On the robot machine:
+
+    ```bash
+    axol collect-data \
+        --repo_id myorg/pick-place \
+        --task "Pick the red cube and place it in the bin" \
+        --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+    ```
+
+    Replace the serials with your cameras'. The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). If the overhead is a stereo ZED X, add `stereo: true` to its entry — the dataset then records `overhead_left` / `overhead_right`:
+
+    ```bash
+        --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+    ```
+
+    Connect the headset and record from the controllers — see [Recording an episode](#recording-an-episode). Press `Ctrl+C` to finish. See [`collect-data`](/cli/collect-data) for the full field list (`--fps`, `--teleop_hz`, stiffness, `--push_to_hub`) and [Command configuration](/cli/configuration) for the override syntax.
+  </Tab>
+</Tabs>
+
+## Controller layout
+
+Episodes are driven entirely from the Quest controllers. The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** (record) and **B** (mode) buttons.
+
+<img src="/assets/quest.png" alt="Quest controller diagram" />
+
+| # | Button | Action |
+|---|---|---|
+| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** (toggle, not hold) |
+| 2 | Right grip | See above |
+| 3 | Left trigger | Actuate left gripper |
+| 4 | Right trigger | Actuate right gripper |
+| 5 | X | **Reset** to rest pose. During a recording, stops and **discards** the take; during the start countdown, cancels it |
+| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
+| 7 | Y | **Exit** the VR session |
+| 8 | B | Toggle between **Teleop** and **Data Collection** mode (disabled while recording or counting down) |
+| — | Right thumbstick | Flick to **switch camera view** (overhead / wrists / split); click to reset the screens — see [Camera views](/guides/vr-interface#camera-views) |
+
+<Note>
+  The camera feeds are relayed to the headset during collection, so you can line up takes from the robot's point of view.
+</Note>
+
+## Recording an episode
+
+<Steps>
+  <Step title="Enter Data Collection mode">
+    Press **B** to switch from Teleop into Data Collection. You can drive the arms in either mode, but a take can only be started from Data Collection.
+  </Step>
+
+  <Step title="Start a take">
+    Press **A** to begin recording — a 3-second countdown runs, then frame capture begins. Press **A** again during the countdown, or **X**, to cancel.
+  </Step>
+
+  <Step title="Finish the take">
+    - Press **A** to stop and **save** the episode.
+    - Press **X** to stop and **discard** it (re-record).
+
+    While the episode is written to disk the headset enters the **Saving** state and every control except **Y** (exit) is blocked. When the write completes the headset returns to Data Collection and the arms move back to the rest pose, ready for the next take.
+  </Step>
+</Steps>
+
+| Headset state | Meaning |
+|---|---|
+| `Teleop` | Driving the arms; recording not armed |
+| `Data Collection` | Driving the arms; ready to record |
+| `Recording` | Capturing frames to the dataset |
+| `Saving` | Episode being written to disk; controls blocked |
+
+Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown.
+
+<Note>
+  The full controller bindings and headset state machine are documented in the [VR Interface](/guides/vr-interface) guide.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Run Policy" icon="robot" href="/operations/run-policy">
+    Run a trained policy autonomously on the same machine.
+  </Card>
+  <Card title="collect-data reference" icon="terminal" href="/cli/collect-data">
+    Every flag and the dataset capture internals.
+  </Card>
+</CardGroup>

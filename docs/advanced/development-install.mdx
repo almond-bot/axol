@@ -1,0 +1,114 @@
+---
+title: "Development install"
+description: "Install Axol from a clone with uv for working on the SDK — optional extras, the headset-video stack, and building the web UI."
+---
+
+The [one-command install](/installation) is the right path for running Axol on the robot machine. This page is for **working on Axol itself** — installing from a clone, picking optional dependency extras, and building the web UI locally. If you just want to use the robot, you don't need any of this.
+
+## Install from a clone
+
+Install the package from a checkout using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and resolved automatically:
+
+```bash
+uv sync
+```
+
+Then activate the virtual environment so the `axol` CLI is on your path:
+
+```bash
+source .venv/bin/activate
+```
+
+<Tip>
+  You need to activate the environment in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
+</Tip>
+
+## Optional extras
+
+Install optional dependency groups as needed (the install script includes `lerobot` and `sim`):
+
+| Extra | Contents | When to use |
+|---|---|---|
+| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `sim` | viser | `teleop --sim` |
+| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
+
+```bash
+uv sync --extra lerobot --extra sim                # teleoperation + data collection
+uv sync --extra lerobot --extra cuda               # policy execution on GPU
+uv sync --extra lerobot --extra sim --extra cuda   # everything
+```
+
+<Note>
+  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer + camera stack, installed via [`axol provision`](/cli/provision) (see [Headset-video stack](#headset-video-stack) below).
+</Note>
+
+## ZED Python bindings
+
+The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately, after the ZED SDK is installed:
+
+```bash
+axol zed.install
+```
+
+See [`zed.install`](/cli/zed-install) for details.
+
+## Headset-video stack
+
+Relaying the ZED cameras to the headset grabs and **NVENC**-encodes frames on the GPU via the zed-gstreamer pipeline (`zedxonesrc` / `zedsrc`) and sends them over WebRTC with **aiortc** (a normal Python dependency). The encode path needs the system GStreamer + GObject-introspection packages, **PyGObject**, and the patched ZED source elements — none of which are PyPI extras.
+
+[`axol provision`](/cli/provision) installs all of them idempotently in one step (the same command the install script and the `axol serve` self-updater run):
+
+```bash
+axol provision
+```
+
+This runs [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops if the ZED SDK or `apt` isn't present. You can also run them individually.
+
+On a Jetson, pin the NVENC/VIC and CPU clocks for low-latency encode and a steady IK loop (the install script wires this into the systemd unit so it re-runs at every boot):
+
+```bash
+axol jetson.setup
+```
+
+See [`jetson.setup`](/cli/jetson-setup). It's a no-op on non-Jetson machines.
+
+## First-run hardware setup
+
+Before using any motor or robot commands, initialize the CAN hardware once:
+
+```bash
+axol can.setup
+```
+
+`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures, and [`can.enable`](/cli/can-enable) for bringing the interfaces back up after a mid-session replug.
+
+## Build the web UI
+
+`axol serve` looks for the built web bundle at `web/app/dist`. To serve the control panel and VR interface from your own machine, build it once:
+
+```bash
+cd web
+npm install
+npm run build --workspace=packages/axol-vr-client   # client package first
+npm run build --workspace=app                        # → web/app/dist
+```
+
+Then start the server and open the printed URL:
+
+```bash
+axol serve
+```
+
+`axol serve` works without this step (the API is still available) — the hosted UI at [axol.almond.bot](https://axol.almond.bot) connects to it directly. See [`serve`](/cli/serve) and the [Web Control Panel guide](/guides/control-panel).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="CLI Reference" icon="terminal" href="/cli/configuration">
+    Every `axol` command, flag, and the draccus config model.
+  </Card>
+  <Card title="Python API" icon="code" href="/api/concepts">
+    `Axol`, the kinematics solver, VR teleop, and the LeRobot wrappers.
+  </Card>
+</CardGroup>
