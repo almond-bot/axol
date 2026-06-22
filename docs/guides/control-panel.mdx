@@ -12,7 +12,7 @@ It's served by [`axol serve`](/cli/serve) and runs each operation **in-process**
 
 ## Start the server
 
-With the [quick install](/installation#quick-install-recommended), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+With the [one-command install](/installation), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
 
 On a development install, start it yourself:
 
@@ -31,7 +31,7 @@ Axol control panel:
 Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`.
 
 <Note>
-  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Installation](/installation#web-control-panel-optional).
+  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Development install](/advanced/development-install#build-the-web-ui).
 </Note>
 
 <Tip>
@@ -56,7 +56,7 @@ Press **Connect** to bring up the robot. Under the hood this:
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
 
-The server runs as root under the quick install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
+The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
 ### Cameras
 
@@ -109,7 +109,7 @@ While **Run Policy** is live, an **Episode control** box appears in the operatio
 These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
 
 <Note>
-  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard, **B** to switch modes). See the [Data Collection quickstart](/quickstart/data-collection#controller-layout) for the controller layout.
+  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard, **B** to switch modes). See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
 </Note>
 
 ## Next steps

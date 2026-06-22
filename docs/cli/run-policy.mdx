@@ -6,7 +6,7 @@ description: "Run a trained policy autonomously on the robot with async inferenc
 Runs a trained policy autonomously on the robot using three locally attached ZED cameras and LeRobot's async inference (`lerobot.async_inference`). By default a `PolicyServer` is launched in a child process on localhost; pass `--server_host` to use a remote [`inference-server`](/cli/inference-server) on a more powerful machine instead. Either way the parent drives a thin `RobotClient` subclass that streams observations (joint positions + camera frames) to the server and consumes the returned action chunks. Type `s` on stdin to save the rollout and end the episode, `r` to discard and re-record, or `q` to discard and quit. `--episode_time_s` is a safety cap that falls back to the same `[Enter]=save / r / q` prompt when no key has been pressed.
 
 <Tip>
-  For the end-to-end workflow — including offloading inference to a GPU machine — see the [Policy Inference quickstart](/quickstart/inference).
+  For the end-to-end workflow — including offloading inference to a GPU machine — see the [Run Policy guide](/operations/run-policy).
 </Tip>
 
 This command is configured via draccus. The robot subsystem is exposed as the nested `robot_config` (cameras, per-joint gains) — nest into it with dots or pass a whole-config file. See [Command configuration](/cli/configuration).

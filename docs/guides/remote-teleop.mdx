@@ -1,0 +1,101 @@
+---
+title: "Remote Teleop"
+description: "Drive Axol over the internet from anywhere — put the Quest and the robot machine on the same Tailscale network."
+---
+
+[Teleoperation](/operations/teleop) normally runs over your local network — the headset and the robot machine are on the same Wi-Fi. To drive the robot from **anywhere over the internet**, put both the Meta Quest and the robot machine on the same [Tailscale](https://tailscale.com) network (a "tailnet"). The headset then reaches the robot by its Tailscale address exactly as if it were on the same LAN, with the traffic encrypted end-to-end.
+
+The only catch: Tailscale isn't in the Meta Quest Store, so it has to be **sideloaded**. This guide walks through that, then the connection.
+
+<Note>
+  Remote teleop is sensitive to latency. Tailscale usually connects two devices directly (peer-to-peer); on networks where that isn't possible it falls back to a relay, which adds latency. Expect the best results on connections with low round-trip time.
+</Note>
+
+## Sideload Tailscale on the Quest
+
+Tailscale isn't available on the Meta Quest Store, so you can't install it the normal way. Since the Quest runs Horizon OS (an Android-based system), the workaround is to sideload Tailscale's Android APK.
+
+<Steps>
+  <Step title="Enable Developer Mode on the Quest">
+    1. Open the **Meta Quest** mobile app on your phone, with your headset connected.
+    2. Go to **Menu → Devices →** select your headset **→ Headset Settings → Developer Mode**, and toggle it on. You may be prompted to create a free Meta "organization" first (takes a minute).
+    3. Restart the headset.
+  </Step>
+
+  <Step title="Download the Tailscale APK">
+    Download the Android APK from Tailscale's package server at [pkgs.tailscale.com/stable/#android](https://pkgs.tailscale.com/stable/#android) onto your computer.
+
+    <Warning>
+      Only grab the APK from Tailscale's own site — avoid random third-party APK mirrors.
+    </Warning>
+  </Step>
+
+  <Step title="Sideload it with SideQuest">
+    The easiest tool is [SideQuest](https://sidequestvr.com):
+
+    1. Install SideQuest on your computer from [sidequestvr.com](https://sidequestvr.com).
+    2. Connect the Quest to your computer with a USB-C cable.
+    3. Put the headset on and accept the **Allow USB debugging?** prompt (check **Always allow from this computer**).
+    4. In SideQuest, use the **Install APK from folder** button and select the Tailscale APK.
+
+    Already have ADB set up? Skip SideQuest and run `adb install tailscale.apk`.
+  </Step>
+
+  <Step title="Launch and log in">
+    Tailscale won't appear in your normal app grid — it lives under the **Unknown Sources** section of your Quest app library (the folder icon with a "?"). Open it, sign in to your tailnet, and approve the VPN connection prompt.
+
+    <Tip>
+      The Android client isn't built for VR, so the in-headset login UI can be awkward. Many people find the auth-key / QR-code login flow easier than typing credentials in the headset.
+    </Tip>
+  </Step>
+</Steps>
+
+<Note>
+  Tailscale on the Quest gets no auto-updates this way, so you'll periodically re-sideload a newer APK.
+</Note>
+
+## Connect the robot machine to the same tailnet
+
+On the robot machine, install Tailscale and bring it up (see [Tailscale's Linux install docs](https://tailscale.com/download/linux)):
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+Sign in with the **same tailnet** as the headset. Note the machine's Tailscale address — its `100.x.y.z` IP or its MagicDNS name (`tailscale ip -4`, or check the [Tailscale admin console](https://login.tailscale.com/admin/machines)).
+
+## Drive the robot
+
+With both devices on the tailnet, remote teleop is just [teleoperation](/operations/teleop) pointed at the Tailscale address instead of the LAN one:
+
+<Steps>
+  <Step title="Start teleop on the robot machine">
+    Start it from the [control panel](/guides/control-panel) or the CLI (`axol teleop`), exactly as for local teleop.
+  </Step>
+
+  <Step title="Make sure Tailscale is connected in the headset">
+    Open the sideloaded Tailscale app on the Quest and confirm the VPN is active.
+  </Step>
+
+  <Step title="Enter the Tailscale address in the VR app">
+    Open the VR app at [axol.almond.bot](https://axol.almond.bot) on the headset and enter the robot machine's **Tailscale IP or MagicDNS name** in the **Connect** field (instead of its LAN IP). Press **Connect**, then **Start**.
+  </Step>
+
+  <Step title="Authorize the certificate">
+    As with local teleop, approve the self-signed certificate once — tap **Authorize certificate** when prompted, or visit `https://<tailscale-address>:8000` in the headset browser and proceed past the warning. See [Authorize the TLS certificate](/operations/teleop#authorize-the-tls-certificate).
+  </Step>
+</Steps>
+
+From there the session behaves exactly like local teleop — same controller layout, same camera views.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
+    The full teleop flow and controller layout.
+  </Card>
+  <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
+    The WebXR app, camera views, and connection details.
+  </Card>
+</CardGroup>

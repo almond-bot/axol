@@ -5,45 +5,50 @@ description: "Command-line interface and Python SDK for the Almond Axol dual-arm
 
 <img src="/assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
-The Axol SDK is a Python CLI and SDK for the Almond Axol dual-arm robot. The CLI is invoked as `axol <command> [flags]`; the SDK is importable directly from `almond_axol`.
+The Axol SDK runs the Almond Axol dual-arm robot. Every core operation — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — can be driven two ways: from the **web control panel** in a browser, or from the **`axol` CLI** in a terminal. Each operation page below shows both.
 
 <Note>
-  **New here?** Start with the [Teleoperation quickstart](/quickstart/teleop) to go from a fresh install to a live VR teleoperation session.
+  **New here?** [Install in one command](/installation), then head to [Teleoperation](/operations/teleop) to drive the robot from a VR headset.
 </Note>
 
-## Quickstarts
+## Operations
 
-<CardGroup cols={3}>
-  <Card title="Teleoperation" icon="gamepad" href="/quickstart/teleop">
-    Drive the robot live from a VR headset.
+Each page covers the same task from the **Control Panel** and the **CLI** — pick the tab you prefer.
+
+<CardGroup cols={2}>
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
+    Drive the robot live from a VR headset (or in sim, no hardware).
   </Card>
-  <Card title="Data Collection" icon="record-vinyl" href="/quickstart/data-collection">
+  <Card title="Gravity Compensation" icon="hand" href="/operations/gravity-comp">
+    Hold the arms weightless so you can move them by hand.
+  </Card>
+  <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
     Record teleoperation episodes to a LeRobot dataset.
   </Card>
-  <Card title="Policy Inference" icon="robot" href="/quickstart/inference">
-    Run a trained policy autonomously — locally or with a remote inference server.
+  <Card title="Run Policy" icon="robot" href="/operations/run-policy">
+    Run a trained policy autonomously — locally or on a remote server.
   </Card>
 </CardGroup>
 
 ## Explore
 
 <CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    The one-command install that sets up the robot machine and the web control panel.
+  </Card>
+  <Card title="Remote Teleop" icon="globe" href="/guides/remote-teleop">
+    Drive the robot over the internet — sideload Tailscale on a Meta Quest.
+  </Card>
   <Card title="Web Control Panel" icon="display" href="/guides/control-panel">
     Drive Axol from a browser with `axol serve` — no terminal required.
   </Card>
   <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
     The in-repo WebXR app that streams Quest pose to the SDK.
   </Card>
-  <Card title="Installation" icon="download" href="/installation">
-    The one-line quick install, the `uv sync` development path, optional extras, and first-run setup.
-  </Card>
   <Card title="CLI Reference" icon="terminal" href="/cli/teleop">
     Every `axol` command, flag, and example — one page per command.
   </Card>
   <Card title="Python API" icon="code" href="/api/concepts">
     `Axol`, `KinematicsSolver`, `VRTeleop`, and the LeRobot wrappers.
-  </Card>
-  <Card title="Tuning" icon="sliders" href="/cli/tune-pid">
-    PID, friction, repeatability, and gravity-compensation tools.
   </Card>
 </CardGroup>
