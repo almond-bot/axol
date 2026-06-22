@@ -414,3 +414,34 @@ class AxolRobot(Robot):
         ).result(timeout=1.0)
 
         return action
+
+    def gravity_compensate(
+        self, kd: float = 0.5, free_joints: set[Joint] | None = None
+    ) -> None:
+        """Apply one cycle of gravity compensation on both arms.
+
+        Submits onto the robot's background event loop (mirroring
+        :meth:`send_action`) and blocks until the cycle is sent. Telemetry must
+        be active, so call this only while connected; drive it in a loop at the
+        desired rate to keep the arms free to be hand-guided. See
+        :meth:`almond_axol.robot.axol.Axol.gravity_compensate` for the
+        ``kd``/``free_joints`` semantics.
+        """
+        assert self._axol is not None and self._loop is not None
+        asyncio.run_coroutine_threadsafe(
+            self._axol.gravity_compensate(kd=kd, free_joints=free_joints), self._loop
+        ).result(timeout=1.0)
+
+    def reset_command_state(self) -> None:
+        """Clear cached command history after an out-of-band move.
+
+        Call after hand-guiding the arms (e.g. under
+        :meth:`gravity_compensate`) and before resuming :meth:`send_action`, so
+        the return-to-pose command is not rejected by the max-step safety
+        check. See :meth:`almond_axol.robot.axol.Axol.reset_command_state`.
+
+        Mutates plain Python state on the arm wrappers, so it runs directly
+        without the event loop.
+        """
+        assert self._axol is not None
+        self._axol.reset_command_state()
