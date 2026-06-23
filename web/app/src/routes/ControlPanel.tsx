@@ -186,7 +186,12 @@ export default function ControlPanel() {
   // if `adb reverse` can't establish it.
   const autoUsbRef = useRef(false)
   useEffect(() => {
-    if (conn.state !== "ok") return
+    if (conn.state !== "ok") {
+      // Clear the latch on disconnect so a reconnect gets a fresh auto-connect
+      // attempt rather than inheriting a stuck "already tried" flag.
+      autoUsbRef.current = false
+      return
+    }
     if (!usb || usb.state !== "device") {
       autoUsbRef.current = false
       return
