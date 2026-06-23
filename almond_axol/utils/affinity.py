@@ -42,17 +42,19 @@ def _realtime_core_count(n: int) -> int:
 def core_partition() -> tuple[set[int], set[int]] | None:
     """``(realtime_cores, background_cores)`` for this host, or ``None``.
 
-    Uses the cores actually available to the process (respects any existing
-    affinity / cgroup limit). Returns ``None`` when isolation isn't applicable.
+    Based on the machine's *physical* core count, NOT the process's current
+    affinity: the control process pins itself to the realtime set before spawning
+    the relay/recorder/IK, and those children inherit that restricted mask. They
+    must still compute the full partition (and ``sched_setaffinity`` to the
+    background cores, which is allowed even from a restricted mask) — reading the
+    inherited mask would see only the realtime cores and wrongly keep them there.
+    Returns ``None`` when isolation isn't applicable.
     """
-    try:
-        avail = sorted(os.sched_getaffinity(0))  # type: ignore[attr-defined]
-    except (AttributeError, OSError):
-        return None  # not Linux / not supported (e.g. macOS dev)
-    if len(avail) < _MIN_CORES:
+    n = os.cpu_count()
+    if not n or n < _MIN_CORES:
         return None
-    n_rt = _realtime_core_count(len(avail))
-    return set(avail[:n_rt]), set(avail[n_rt:])
+    n_rt = _realtime_core_count(n)
+    return set(range(n_rt)), set(range(n_rt, n))
 
 
 def pin_realtime() -> bool:
@@ -72,7 +74,7 @@ def _pin(which: int) -> bool:
     cores = part[which]
     try:
         os.sched_setaffinity(0, cores)  # type: ignore[attr-defined]
-    except OSError as exc:
+    except (AttributeError, OSError) as exc:  # AttributeError: no sched_* (macOS)
         _logger.debug("could not set CPU affinity to %s: %s", sorted(cores), exc)
         return False
     _logger.info(
