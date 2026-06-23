@@ -8,6 +8,10 @@
 # installs adb for Quest-over-USB teleop, and registers a root systemd service
 # that keeps `axol serve` running at boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
+#
+# The ZED Box that ships with the Axol Kit comes with axol already installed
+# (and the service running), so you only need this to set up a fresh machine or
+# to upgrade.
 
 set -euo pipefail
 
