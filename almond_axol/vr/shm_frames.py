@@ -49,6 +49,11 @@ _HEADER_BYTES = 64
 # only what the dataset stores crosses the boundary.
 _CHANNELS = 3
 
+# Snapshot channel header: a single int64 sequence counter, padded to 16 bytes so
+# the float64 payload that follows stays 8-byte aligned.
+_SNAP_META_DTYPE = np.dtype([("seq", "<i8")])
+_SNAP_HEADER_BYTES = 16
+
 
 def _block_size(width: int, height: int) -> int:
     return _HEADER_BYTES + 2 * width * height * _CHANNELS
@@ -202,6 +207,106 @@ class RawFrameReader:
 
     # ZedCamera-compatible alias.
     close = disconnect
+
+
+class SnapshotWriter:
+    """Control-process side: publish the latest joint/action snapshot.
+
+    A lock-free single-slot seqlock over one shared-memory block of float64s
+    (``[ts, *joint_obs_vals, *action_vals]`` in fixed ``obs_keys`` / ``action_keys``
+    order). The control loop calls :meth:`write` every tick; the cost is a handful
+    of dict lookups + an aligned float store — no pickle, no lock, no blocking, so
+    it stays off the hot path. The recorder subprocess reads it via
+    :class:`SnapshotReader`. Single-writer / single-reader.
+    """
+
+    def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
+        self._obs_keys = list(obs_keys)
+        self._action_keys = list(action_keys)
+        n = len(self._obs_keys) + len(self._action_keys)
+        self._shm = shared_memory.SharedMemory(
+            create=True, size=_SNAP_HEADER_BYTES + 8 * (1 + n)
+        )
+        self.name = self._shm.name
+        self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
+        self._data = np.ndarray(
+            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+        )
+        self._meta["seq"][0] = 0
+
+    def write(self, joint_obs: dict, action: dict, ts: float) -> None:
+        """Pack one snapshot into the slot (seq odd while writing, even when done)."""
+        self._meta["seq"][0] += 1  # odd: write in progress
+        d = self._data
+        d[0] = ts
+        i = 1
+        for k in self._obs_keys:
+            d[i] = joint_obs[k]
+            i += 1
+        for k in self._action_keys:
+            d[i] = action[k]
+            i += 1
+        self._meta["seq"][0] += 1  # even: committed
+
+    def close(self) -> None:
+        self._meta = None  # type: ignore[assignment]
+        self._data = None  # type: ignore[assignment]
+        try:
+            self._shm.close()
+            self._shm.unlink()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+
+
+class SnapshotReader:
+    """Recorder-subprocess side: read the latest joint/action snapshot.
+
+    Attaches to a :class:`SnapshotWriter`'s block by name and reconstructs the
+    ``(joint_obs, action, ts)`` dicts using the same key order. Returns ``None``
+    before the first write (mirroring the in-process ``_SnapshotPublisher.latest``
+    contract), so the caller can skip a tick just as it did before.
+    """
+
+    def __init__(self, name: str, obs_keys: list[str], action_keys: list[str]) -> None:
+        self._obs_keys = list(obs_keys)
+        self._action_keys = list(action_keys)
+        n = len(self._obs_keys) + len(self._action_keys)
+        self._shm = shared_memory.SharedMemory(name=name)
+        self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
+        self._data = np.ndarray(
+            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+        )
+
+    def read_latest(self) -> tuple[dict, dict, float] | None:
+        # SPSC seqlock: retry while the writer is mid-write (odd seq) or laps us
+        # (seq changed across the copy). Writes are sub-microsecond so this
+        # converges on the first try in practice; bail to None on the rare miss.
+        for _ in range(8):
+            s1 = int(self._meta["seq"][0])
+            if s1 == 0:
+                return None  # no snapshot published yet
+            if s1 & 1:
+                continue  # writer mid-write
+            snap = np.array(self._data, dtype="<f8")
+            if int(self._meta["seq"][0]) != s1:
+                continue  # writer lapped us mid-copy
+            ts = float(snap[0])
+            vals = snap[1:]
+            no = len(self._obs_keys)
+            joint_obs = {k: float(vals[i]) for i, k in enumerate(self._obs_keys)}
+            action = {k: float(vals[no + i]) for i, k in enumerate(self._action_keys)}
+            return joint_obs, action, ts
+        return None
+
+    def close(self) -> None:
+        self._meta = None  # type: ignore[assignment]
+        self._data = None  # type: ignore[assignment]
+        if self._shm is not None:
+            try:
+                self._shm.close()
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._shm = None  # type: ignore[assignment]
 
 
 def _frame_views(buf: Any, width: int, height: int) -> list["NDArray[Any]"]:

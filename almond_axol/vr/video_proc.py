@@ -387,14 +387,28 @@ class VideoRelayProcess:
 
         self.sources: list[str] = []
         self.raw_cameras: dict[str, object] = {}
+        # ``{source: (shm_name, width, height, fps)}`` for the raw blocks the relay
+        # created — exposed (with :attr:`raw_cond`) so a separate recorder
+        # subprocess can attach its own readers to the same shared memory.
+        self.raw_meta: dict[str, tuple] = {}
         if self._conn.poll(_READY_TIMEOUT_S):
             msg = self._conn.recv()
             if isinstance(msg, tuple) and msg[0] == "ready":
                 self.sources = list(msg[1])
                 raw_meta = msg[2] if len(msg) > 2 else {}
+                self.raw_meta = dict(raw_meta)
                 self._attach_raw_readers(raw_meta)
         if not self.sources:
             _logger.warning("video relay started no camera streams")
+
+    @property
+    def raw_cond(self) -> object:
+        """The shared ``multiprocessing.Condition`` guarding the raw shm blocks.
+
+        Must be passed at spawn time to any other process that attaches a
+        :class:`~almond_axol.vr.shm_frames.RawFrameReader` to these blocks.
+        """
+        return self._raw_cond
 
     def _attach_raw_readers(self, raw_meta: dict[str, tuple]) -> None:
         """Attach a RawFrameReader proxy to each shared-memory block the relay made."""

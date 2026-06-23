@@ -13,23 +13,24 @@ controls are blocked until save_episode() completes.
 Recording continues until Ctrl+C.
 
 The teleop loop runs at ``--teleop_hz`` and publishes the latest
-``(joint_obs, action)`` to a single-slot ``_SnapshotPublisher``. A separate
-``_CaptureThread`` ticks at ``--fps`` and, for each tick, blocks on
-``ZedCamera.read_at_or_after(T_n)`` per camera so every recorded frame
-shares the capture instant ``T_n`` with the joint sample, then writes
-the dataset row off the hot control loop.
+``(joint_obs, action)`` snapshot every tick. The dataset itself — frame
+capture, row assembly, encoding, ``save_episode`` — is owned by a separate
+recorder (see :mod:`almond_axol.cli.record_proc`): a subprocess when the video
+relay is up (so the per-frame work never shares the GIL with the control loop),
+or in-process as a fallback when there is no relay. Either way each recorded
+frame is aligned to the joint sample by its shared ``perf_counter`` capture
+timestamp.
 """
 
 import asyncio
 import logging
 import os
-import shutil
 import socket
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
@@ -40,11 +41,13 @@ from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from .config import DatasetResolution, LogLevel, parse
+from .record_proc import (
+    DatasetRecorderProcess,
+    InProcessRecorder,
+    default_vcodec,
+)
 
 if TYPE_CHECKING:
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.types import RobotAction, RobotObservation
-
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
@@ -184,116 +187,6 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     return relay
 
 
-def _default_vcodec() -> str:
-    """Pick a video codec that can actually open on this machine.
-
-    LeRobot's "auto" prefers the NVIDIA hardware encoder (``h264_nvenc``)
-    whenever the codec is compiled into ffmpeg, but on Jetson/Tegra (aarch64)
-    there's no desktop ``libnvidia-encode`` to back it, so it fails to open and
-    kills the encoder thread mid episode. Default to CPU "h264" (software
-    libx264) on aarch64 and let "auto" pick the HW encoder everywhere else.
-    """
-    import platform
-
-    return "h264" if platform.machine() == "aarch64" else "auto"
-
-
-# Per-stream encoder thread count. Three cameras each spawn their own encoder
-# thread; keeping the inner libx264 thread pool small (vs LeRobot's example of 4)
-# leaves cores free for the control loop while still clearing 60 fps/stream once
-# the preset/GOP below are tuned.
-_ENCODER_THREADS = 2
-
-# Keyframe interval for the software encoder. LeRobot hardcodes a GOP of 2 (a
-# keyframe almost every frame), which is what tanks Tegra encode throughput.
-# 30 frames (0.5 s at 60 fps) is plenty fine-grained for timestamp-tolerant
-# dataset decode and roughly doubles encode speed.
-_ENCODER_GOP = 30
-
-
-def _install_dataset_encoder() -> bool:
-    """Pick the cheapest video encoder the control loop can afford during record.
-
-    LeRobot encodes recorded video **in the control process**. On the Jetson
-    that starves the asyncio control loop: encoding three 960x600@60 streams
-    burns CPU cores *and* does per-frame Python work (PIL convert, running
-    stats) that holds the GIL, so the loop collapses from 120 Hz to ~50 Hz
-    (jerky arm) and the encoder still overflows its queue and drops frames.
-
-    Preferred fix: route encoding to the Jetson hardware encoder out of process
-    (see :mod:`almond_axol.lerobot.nvenc_encoder`). The control process then
-    only writes raw bytes to a pipe (``os.write`` releases the GIL), so the
-    encode lands on the VIC/NVENC hardware blocks, not the CPU. Patch
-    ``LeRobotDataset._build_streaming_encoder`` (a staticmethod called by
-    ``create``/``resume``) to hand back the NVENC encoder.
-
-    Returns ``True`` when the hardware encoder was installed; otherwise falls
-    back to tuning the software libx264 path (see :func:`_tune_software_encoder`)
-    and returns ``False``.
-    """
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    if getattr(LeRobotDataset, "_axol_nvenc_installed", False):
-        return True
-
-    from ..lerobot.nvenc_encoder import (
-        NvencStreamingEncoder,
-        hw_dataset_encoder_available,
-    )
-
-    if not hw_dataset_encoder_available():
-        _tune_software_encoder()
-        return False
-
-    def _build_nvenc(fps, vcodec, encoder_queue_maxsize, encoder_threads):  # noqa: ANN001
-        return NvencStreamingEncoder(fps=fps, queue_maxsize=encoder_queue_maxsize)
-
-    LeRobotDataset._build_streaming_encoder = staticmethod(_build_nvenc)
-    LeRobotDataset._axol_nvenc_installed = True
-    _logger.info("using Jetson NVENC hardware video encoder for dataset recording")
-    return True
-
-
-def _tune_software_encoder() -> None:
-    """Make LeRobot's libx264/libx265 streaming encoder fast enough for Tegra.
-
-    Fallback for hosts without the Jetson NVENC GStreamer encoder. LeRobot
-    hardcodes the software H.264/HEVC encoder to the libx264 default preset
-    ("medium") with a GOP of 2 — a keyframe almost every frame — which
-    benchmarks at only ~40 fps/stream aggregate across three cameras (below the
-    60 fps we record), so the encoder queue overflows and the control loop is
-    starved.
-
-    There is no public knob — ``LeRobotDataset.create`` doesn't expose
-    ``g``/``crf``/``preset`` and ``_get_codec_options`` ignores ``preset`` for
-    libx264 entirely — so patch the module helper to add a fast preset and a
-    sane keyframe interval (~96 fps/stream aggregate for three streams).
-    """
-    from lerobot.datasets import video_utils as _vu
-
-    if getattr(_vu, "_axol_encoder_tuned", False):
-        return
-
-    _orig_get_codec_options = _vu._get_codec_options
-
-    def _tuned(
-        vcodec: str, g: int | None = 2, crf: int | None = 30, preset=None
-    ) -> dict:
-        options = _orig_get_codec_options(vcodec, g=g, crf=crf, preset=preset)
-        if vcodec in ("h264", "hevc"):
-            options["preset"] = "veryfast"
-            options["g"] = str(_ENCODER_GOP)
-        return options
-
-    _vu._get_codec_options = _tuned
-    _vu._axol_encoder_tuned = True
-    _logger.info(
-        "tuned software video encoder: preset=veryfast g=%d threads=%d",
-        _ENCODER_GOP,
-        _ENCODER_THREADS,
-    )
-
-
 @dataclass
 class CollectDataConfig:
     """Config for ``axol collect-data``.
@@ -318,220 +211,14 @@ class CollectDataConfig:
     # Clamped to the capture resolution, so it only ever downscales.
     dataset_resolution: DatasetResolution = "SVGA"
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
-    # _default_vcodec). Override with any of LeRobot's VALID_VIDEO_CODECS
-    # (e.g. auto, h264, libsvtav1).
-    vcodec: str = field(default_factory=_default_vcodec)
+    # record_proc.default_vcodec). Override with any of LeRobot's
+    # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
+    vcodec: str = field(default_factory=default_vcodec)
     root: str | None = None
     push_to_hub: bool = False
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
-
-
-@dataclass
-class _Snapshot:
-    """``(joint_obs, action, ts)`` bundle from one teleop tick."""
-
-    joint_obs: "RobotObservation"
-    action: "RobotAction"
-    ts: float
-
-
-class _SnapshotPublisher:
-    """Single-slot publisher shared between the teleop loop and capture thread.
-
-    The teleop loop rebuilds fresh ``joint_obs`` / ``action`` dicts every
-    tick and calls :meth:`publish`; the capture thread reads the latest
-    slot via :meth:`latest`. The lock protects the slot pointer only — the
-    contained dicts are never mutated in place.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._latest: _Snapshot | None = None
-        self._first_event = threading.Event()
-
-    def publish(
-        self,
-        joint_obs: "RobotObservation",
-        action: "RobotAction",
-        ts: float,
-    ) -> None:
-        snap = _Snapshot(joint_obs=joint_obs, action=action, ts=ts)
-        with self._lock:
-            self._latest = snap
-        self._first_event.set()
-
-    def latest(self) -> _Snapshot | None:
-        with self._lock:
-            return self._latest
-
-    def wait_for_first(self, timeout: float) -> bool:
-        return self._first_event.wait(timeout=timeout)
-
-
-class _CaptureThread(threading.Thread):
-    """Capture dataset frames at ``fps`` Hz, decoupled from the teleop loop.
-
-    Each tick the thread sleeps until ``T_n = recording_start + n / fps``,
-    waits for a frame with ``capture_perf_ts >= T_n`` from every camera,
-    pulls the latest joint+action snapshot from ``publisher``, and appends
-    one dataset row. If any camera read times out the previous frame for
-    that camera is reused (logged at DEBUG); if no frame has ever arrived
-    for it the tick is skipped.
-    """
-
-    def __init__(
-        self,
-        *,
-        publisher: _SnapshotPublisher,
-        robot: "AxolRobot",
-        dataset: "LeRobotDataset",
-        robot_obs_proc: Callable[[Any], Any],
-        fps: int,
-        task: str,
-        rerun_ip: str | None,
-    ) -> None:
-        super().__init__(name="axol-capture", daemon=True)
-        self.publisher = publisher
-        self.robot = robot
-        self.dataset = dataset
-        self.robot_obs_proc = robot_obs_proc
-        self.fps = fps
-        self.task = task
-        self.rerun_ip = rerun_ip
-        self.stop_event = threading.Event()
-
-    def run(self) -> None:
-        from lerobot.utils.constants import ACTION, OBS_STR
-        from lerobot.utils.feature_utils import build_dataset_frame
-        from lerobot.utils.visualization_utils import log_rerun_data
-
-        if not self.publisher.wait_for_first(timeout=5.0):
-            _logger.warning(
-                "Capture thread saw no publisher snapshot within 5s; exiting."
-            )
-            return
-        if self.stop_event.is_set():
-            return
-
-        frame_interval = 1.0 / self.fps
-        timeout_ms = int(2 * frame_interval * 1000 + 200)
-        recording_start = time.perf_counter()
-        last_frames: dict[str, tuple[Any, float, float]] = {}
-        tick = 0
-
-        # Rolling per-second INFO readout: the capture body's mean cost
-        # (build_dataset_frame + robot_obs_proc numpy, all GIL-holding in this
-        # process) and how often a camera read times out (reuse/skip) — the
-        # latter correlates with the relay's raw-branch contention.
-        tick_cost_sum = 0.0
-        reuse_count = 0
-        skip_count = 0
-        frames_added = 0
-        ticks_window = 0
-        cap_last_log = recording_start
-
-        while not self.stop_event.is_set():
-            now = time.perf_counter()
-            if now - cap_last_log >= 1.0:
-                dt = now - cap_last_log
-                _logger.info(
-                    "capture: %.1f fps  tick=%.1fms  added=%d reused=%d skipped=%d",
-                    ticks_window / dt,
-                    1e3 * tick_cost_sum / ticks_window if ticks_window else 0.0,
-                    frames_added,
-                    reuse_count,
-                    skip_count,
-                )
-                tick_cost_sum = 0.0
-                reuse_count = 0
-                skip_count = 0
-                frames_added = 0
-                ticks_window = 0
-                cap_last_log = now
-
-            target_perf_ts = recording_start + tick * frame_interval
-
-            wait_s = target_perf_ts - time.perf_counter()
-            if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
-                return
-
-            body_t0 = time.perf_counter()
-            frames: dict[str, tuple[Any, float, float]] = {}
-            skip_tick = False
-            for cam_key, cam in self.robot.cameras.items():
-                try:
-                    frame, cap_ts, recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
-                        target_perf_ts, timeout_ms=timeout_ms
-                    )
-                except (TimeoutError, RuntimeError) as exc:
-                    cached = last_frames.get(cam_key)
-                    if cached is None:
-                        _logger.debug(
-                            "Capture tick %d: %s read failed (%s) and no "
-                            "cached frame; skipping tick.",
-                            tick,
-                            cam_key,
-                            exc,
-                        )
-                        skip_tick = True
-                        break
-                    _logger.debug(
-                        "Capture tick %d: %s read failed (%s); reusing cached frame.",
-                        tick,
-                        cam_key,
-                        exc,
-                    )
-                    reuse_count += 1
-                    frame, cap_ts, recv_ts = cached
-                frames[cam_key] = (frame, cap_ts, recv_ts)
-                last_frames[cam_key] = (frame, cap_ts, recv_ts)
-
-            if skip_tick:
-                skip_count += 1
-                tick += 1
-                continue
-
-            snap = self.publisher.latest()
-            if snap is None:
-                tick += 1
-                continue
-
-            obs: dict[str, Any] = dict(snap.joint_obs)
-            for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
-                obs[cam_key] = frame
-            obs_processed = self.robot_obs_proc(obs)
-
-            obs_frame = build_dataset_frame(
-                self.dataset.features, obs_processed, prefix=OBS_STR
-            )
-            act_frame = build_dataset_frame(
-                self.dataset.features, snap.action, prefix=ACTION
-            )
-            if self.stop_event.is_set():
-                return
-            self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
-            frames_added += 1
-            tick_cost_sum += time.perf_counter() - body_t0
-            ticks_window += 1
-
-            if self.rerun_ip:
-                log_rerun_data(observation=obs_processed, action=snap.action)
-
-            if _logger.isEnabledFor(logging.DEBUG) and tick % 30 == 0:
-                cam_skews = ", ".join(
-                    f"{k}: cap-T={1e3 * (cap_ts - target_perf_ts):+.1f}ms"
-                    for k, (_, cap_ts, _) in frames.items()
-                )
-                _logger.debug(
-                    "Capture tick %d skews — %s, T-snap.ts=%+.1fms",
-                    tick,
-                    cam_skews,
-                    1e3 * (target_perf_ts - snap.ts),
-                )
-
-            tick += 1
 
 
 def main(argv: list[str]) -> None:
@@ -550,7 +237,6 @@ def main(argv: list[str]) -> None:
 
 
 def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) -> None:
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
@@ -647,38 +333,19 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # If any of this setup fails, tear the relay subprocess down so it doesn't
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
-    # Keep video encoding off the control loop: prefer the Jetson hardware
-    # encoder (out of process), else tune the in-process software encoder.
-    _install_dataset_encoder()
-
     try:
         robot.connect()
 
-        if is_complete:
-            log_say(f"Resuming existing dataset at {dataset_root}.")
-            dataset = LeRobotDataset.resume(
-                repo_id=repo_id,
-                root=str(dataset_root),
-                image_writer_threads=4,
-                streaming_encoding=True,
-                encoder_threads=_ENCODER_THREADS,
-                vcodec=vcodec,
-            )
-        else:
-            action_features = hw_to_dataset_features(robot.action_features, ACTION)
-            obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
-            dataset = LeRobotDataset.create(
-                repo_id=repo_id,
-                fps=fps,
-                root=root,
-                features={**action_features, **obs_features},
-                robot_type=robot.name,
-                use_videos=True,
-                image_writer_threads=4,
-                streaming_encoding=True,
-                encoder_threads=_ENCODER_THREADS,
-                vcodec=vcodec,
-            )
+        # The dataset lives in the recorder (subprocess or in-process), not here.
+        # Its features come from the robot's joint features + the camera image
+        # dims; the snapshot schema is the joint-observation keys (no images) +
+        # action keys, in a fixed order shared with the recorder's SnapshotReader.
+        action_features = hw_to_dataset_features(robot.action_features, ACTION)
+        obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+        features = {**action_features, **obs_features}
+        obs_keys = list(robot.get_joint_observation().keys())
+        action_keys = list(robot.action_features.keys())
+
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
 
@@ -695,10 +362,51 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             relay.shutdown()
         raise
 
+    teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
+
+    # The dataset capture + encode runs OUT of the control process so its
+    # per-frame numpy / add_frame / save_episode work never shares the GIL with
+    # the 120 Hz control loop. With the relay up, a recorder subprocess attaches
+    # its own readers to the relay's shared-memory frames and owns the dataset;
+    # without a relay (no gst stack) we fall back to capturing in-process.
+    recorder_config = {
+        "repo_id": repo_id,
+        "root": root,
+        "dataset_root": str(dataset_root),
+        "is_complete": is_complete,
+        "features": features,
+        "robot_type": robot.name,
+        "fps": fps,
+        "vcodec": vcodec,
+        "rerun_ip": rerun_ip,
+        "rerun_port": rerun_port,
+        "push_to_hub": push_to_hub,
+        "log_level": cfg.log_level,
+    }
+    try:
+        if is_complete:
+            log_say(f"Resuming existing dataset at {dataset_root}.")
+        if use_relay:
+            recorder: DatasetRecorderProcess | InProcessRecorder = (
+                DatasetRecorderProcess(
+                    raw_cond=relay.raw_cond,
+                    raw_meta=relay.raw_meta,
+                    obs_keys=obs_keys,
+                    action_keys=action_keys,
+                    config=recorder_config,
+                )
+            )
+        else:
+            recorder = InProcessRecorder(recorder_config, robot, robot_obs_proc)
+    except BaseException:
+        if relay is not None:
+            relay.shutdown()
+        raise
+
     # Background /proc sampler: shows whether the system saturates when engaged
     # and which process/thread is the aggressor. Labels the known subprocesses
     # (mp spawn children all report comm=python, so pid mapping is what makes the
-    # IK solver and video relay legible in the output).
+    # IK solver, video relay, and dataset recorder legible in the output).
     diag_labels: dict[int, str] = {os.getpid(): "main"}
     ik_proc = getattr(teleop, "_ik_process", None)
     if ik_proc is not None and getattr(ik_proc, "pid", None):
@@ -707,6 +415,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         relay_pid = getattr(relay._proc, "pid", None)
         if relay_pid:
             diag_labels[relay_pid] = "relay"
+    if getattr(recorder, "pid", None):
+        diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
     diag = SystemDiag(diag_labels, _logger)
     diag.start()
     # Jetson GPU / EMC / NVENC / per-core-freq / thermal sampler (no-op off-Tegra).
@@ -720,13 +430,9 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     if relay is not None:
         relay.set_raw_enabled(False)
 
-    teleop_action_proc, robot_action_proc, robot_obs_proc = make_default_processors()
-
     episodes_recorded = 0
-    episode_idx = dataset.num_episodes
+    episode_idx = recorder.episode_count()
     teleop_interval = 1.0 / teleop_hz
-    publisher = _SnapshotPublisher()
-    capture: _CaptureThread | None = None
 
     # Rolling control-loop rate readout, mirroring `axol teleop`: the loop rate
     # is measured here; vr/ik come from the teleop's ~2s windows. Logged once a
@@ -802,7 +508,6 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
     async def _episode_loop() -> tuple[bool, bool]:
-        nonlocal capture
         recording = False
         rerecord = False
 
@@ -834,25 +539,17 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             sect["proc"] += t_proc - t_act
             sect["send"] += t_send - t_proc
 
-            publisher.publish(joint_obs, act_processed, t0)
+            recorder.publish(joint_obs, act_processed, t0)
 
             events = teleop.get_teleop_events()
 
             if events.get("start_recording") and not recording:
                 recording = True
-                # Open the relay's raw branch so the capture thread has frames.
+                # Open the relay's raw branch so the recorder has frames, then
+                # tell the recorder to start an episode.
                 if relay is not None:
                     relay.set_raw_enabled(True)
-                capture = _CaptureThread(
-                    publisher=publisher,
-                    robot=robot,
-                    dataset=dataset,
-                    robot_obs_proc=robot_obs_proc,
-                    fps=fps,
-                    task=task,
-                    rerun_ip=rerun_ip,
-                )
-                capture.start()
+                recorder.start_episode(task)
                 log_say("Recording started.")
 
             if events[TeleopEvents.TERMINATE_EPISODE]:
@@ -900,23 +597,22 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
     try:
         while not _stopped():
+            episode_idx = recorder.episode_count()
             log_say(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
-            dataset.clear_episode_buffer()
 
             recording, rerecord = _run_on_robot_loop(_episode_loop())
 
-            if capture is not None:
-                capture.stop_event.set()
-                capture.join()
-                capture = None
             # Recording done — close the raw branch so the rest-pose/reset and
-            # next pre-record phase stay light.
+            # next pre-record phase stay light. (The recorder stops its own
+            # capture loop on save/cancel, below.)
             if relay is not None:
                 relay.set_raw_enabled(False)
 
             if _stopped():
+                if recording:
+                    recorder.cancel_episode()
                 break
 
             log_say("Returning to rest pose.")
@@ -927,15 +623,17 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
             if rerecord:
                 log_say("Re-recording episode.")
+                if recording:
+                    recorder.cancel_episode()
                 continue
 
             if recording:
                 log_say("Saving episode…")
-                dataset.save_episode()
-                episode_idx += 1
+                recorder.save_episode()
                 episodes_recorded += 1
                 log_say(
-                    f"Saved episode {episode_idx} ({episodes_recorded} this session)."
+                    f"Saved episode {recorder.episode_count()} "
+                    f"({episodes_recorded} this session)."
                 )
             else:
                 log_say("Episode ended before recording started, skipping.")
@@ -947,10 +645,6 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         teleop.send_feedback_error()
         raise
     finally:
-        if capture is not None:
-            capture.stop_event.set()
-            capture.join()
-
         log_say("Stopping.")
 
         diag.stop()
@@ -958,19 +652,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
         robot.disconnect()
         teleop.disconnect()
+        # Recorder owns the dataset: finalize, optional push, and empty-dataset
+        # cleanup all happen in recorder.close().
+        recorder.close()
         if relay is not None:
             relay.shutdown()
-
-        dataset.finalize()
-
-        if push_to_hub and episodes_recorded > 0:
-            dataset.push_to_hub()
-
-        if not is_complete and episodes_recorded == 0 and dataset_root.exists():
-            try:
-                shutil.rmtree(dataset_root)
-                log_say(f"No episodes saved — removed empty dataset at {dataset_root}.")
-            except OSError as exc:
-                _logger.warning(
-                    "Failed to remove empty dataset at %s: %s", dataset_root, exc
-                )
