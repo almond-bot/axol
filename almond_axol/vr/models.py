@@ -81,6 +81,8 @@ class VRFrame(BaseModel):
             transmitted frame.
         client_buffered_amount: Browser data-channel buffered bytes immediately
             before the transmitted frame was queued.
+        client_send_copies: Number of redundant copies the browser attempted
+            for this frame on the pose data channel.
     """
 
     l_ee: VRPose
@@ -98,3 +100,4 @@ class VRFrame(BaseModel):
     client_dt_ms: float | None = None
     client_dropped_since_last: int = 0
     client_buffered_amount: int | None = None
+    client_send_copies: int = 1

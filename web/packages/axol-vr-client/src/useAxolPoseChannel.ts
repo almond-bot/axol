@@ -3,7 +3,7 @@ import { useEffect, useRef } from "react"
 
 const POLL_MS = 300
 const ICE_GATHERING_TIMEOUT_MS = 2000
-const STATS_MS = 1000
+const STATS_MS = 200
 
 type StatsRecord = RTCStats & Record<string, unknown>
 

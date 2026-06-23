@@ -6,6 +6,9 @@ import { AxolState } from "./types"
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 const POSE_CHANNEL_MAX_BUFFERED_BYTES = 0
+const POSE_CHANNEL_SEND_COPIES = 3
+const POSE_CHANNEL_DUPLICATE_SPACING_MS = 1
+const POSE_CHANNEL_DUPLICATE_MAX_BUFFERED_BYTES = 4096
 
 export function AxolVRClient({
   wsRef,
@@ -204,28 +207,42 @@ export function AxolVRClient({
     const lastSentAtMs = lastSentAtMsRef.current
     const clientDtMs = lastSentAtMs === null ? null : sentAtMs - lastSentAtMs
 
+    const payload = JSON.stringify({
+      l_ee,
+      r_ee,
+      l_elbow,
+      r_elbow,
+      l_lock,
+      r_lock,
+      l_grip,
+      r_grip,
+      reset,
+      state: stateRef.current,
+      seq,
+      sent_at_ms: sentAtMs,
+      client_dt_ms: clientDtMs,
+      client_dropped_since_last: droppedSinceLastRef.current,
+      client_buffered_amount: dc.bufferedAmount,
+      client_send_copies: POSE_CHANNEL_SEND_COPIES,
+    })
+
     try {
-      dc.send(
-        JSON.stringify({
-          l_ee,
-          r_ee,
-          l_elbow,
-          r_elbow,
-          l_lock,
-          r_lock,
-          l_grip,
-          r_grip,
-          reset,
-          state: stateRef.current,
-          seq,
-          sent_at_ms: sentAtMs,
-          client_dt_ms: clientDtMs,
-          client_dropped_since_last: droppedSinceLastRef.current,
-          client_buffered_amount: dc.bufferedAmount,
-        })
-      )
+      dc.send(payload)
       lastSentAtMsRef.current = sentAtMs
       droppedSinceLastRef.current = 0
+
+      for (let copy = 1; copy < POSE_CHANNEL_SEND_COPIES; copy += 1) {
+        window.setTimeout(() => {
+          const channel = poseChannelRef.current
+          if (channel !== dc || channel.readyState !== "open") return
+          if (channel.bufferedAmount > POSE_CHANNEL_DUPLICATE_MAX_BUFFERED_BYTES) return
+          try {
+            channel.send(payload)
+          } catch {
+            // Best-effort redundancy only; the next XR frame carries fresh state.
+          }
+        }, copy * POSE_CHANNEL_DUPLICATE_SPACING_MS)
+      }
     } catch {
       droppedSinceLastRef.current += 1
     }

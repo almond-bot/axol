@@ -87,14 +87,19 @@ class VRServer:
 
         self._telemetry_window_start: float | None = None
         self._telemetry_last_arrival: float | None = None
+        self._telemetry_last_published_arrival: float | None = None
         self._telemetry_last_seq: int | None = None
         self._telemetry_count: int = 0
+        self._telemetry_published_count: int = 0
         self._telemetry_max_arrival_gap_ms: float = 0.0
+        self._telemetry_max_published_arrival_gap_ms: float = 0.0
         self._telemetry_max_client_dt_ms: float | None = None
         self._telemetry_client_dropped: int = 0
         self._telemetry_max_client_buffered_bytes: int = 0
+        self._telemetry_max_client_send_copies: int = 1
         self._telemetry_max_loop_lag_ms: float = 0.0
         self._telemetry_missing_seq: int = 0
+        self._telemetry_duplicate_seq: int = 0
         self._telemetry_out_of_order_seq: int = 0
 
     # ------------------------------------------------------------------
@@ -303,7 +308,9 @@ class VRServer:
         """Validate and publish one headset pose frame."""
         try:
             frame = VRFrame.model_validate(obj)
-            self._record_frame_telemetry(frame)
+            should_publish = self._record_frame_telemetry(frame)
+            if not should_publish:
+                return
             self._latest_frame = frame
             if self._on_frame is not None:
                 self._on_frame(frame)
@@ -314,20 +321,25 @@ class VRServer:
         """Clear frame-ingress telemetry counters for a fresh headset session."""
         self._telemetry_window_start = None
         self._telemetry_last_arrival = None
+        self._telemetry_last_published_arrival = None
         self._telemetry_last_seq = None
         self._telemetry_count = 0
+        self._telemetry_published_count = 0
         self._telemetry_max_arrival_gap_ms = 0.0
+        self._telemetry_max_published_arrival_gap_ms = 0.0
         self._telemetry_max_client_dt_ms = None
         self._telemetry_client_dropped = 0
         self._telemetry_max_client_buffered_bytes = 0
+        self._telemetry_max_client_send_copies = 1
         self._telemetry_max_loop_lag_ms = 0.0
         self._telemetry_missing_seq = 0
+        self._telemetry_duplicate_seq = 0
         self._telemetry_out_of_order_seq = 0
         self._pose_stats = None
         self._pose_stats_received_at = None
 
-    def _record_frame_telemetry(self, frame: VRFrame) -> None:
-        """Log one-second summaries of headset send cadence vs server receipt."""
+    def _record_frame_telemetry(self, frame: VRFrame) -> bool:
+        """Record one frame and return True if it should be published."""
         now = time.perf_counter()
         if self._telemetry_window_start is None:
             self._telemetry_window_start = now
@@ -338,6 +350,34 @@ class VRServer:
                 self._telemetry_max_arrival_gap_ms, arrival_gap_ms
             )
         self._telemetry_last_arrival = now
+        self._telemetry_count += 1
+
+        should_publish = True
+        if frame.seq is not None and self._telemetry_last_seq is not None:
+            seq_delta = frame.seq - self._telemetry_last_seq
+            if seq_delta > 1:
+                self._telemetry_missing_seq += seq_delta - 1
+            elif seq_delta == 0:
+                self._telemetry_duplicate_seq += 1
+                should_publish = False
+            elif seq_delta < 0:
+                self._telemetry_out_of_order_seq += 1
+                should_publish = False
+
+        if should_publish and frame.seq is not None:
+            self._telemetry_last_seq = frame.seq
+
+        if not should_publish:
+            self._flush_frame_telemetry_if_due(now)
+            return False
+
+        if self._telemetry_last_published_arrival is not None:
+            published_gap_ms = (now - self._telemetry_last_published_arrival) * 1000.0
+            self._telemetry_max_published_arrival_gap_ms = max(
+                self._telemetry_max_published_arrival_gap_ms, published_gap_ms
+            )
+        self._telemetry_last_published_arrival = now
+        self._telemetry_published_count += 1
 
         if frame.client_dt_ms is not None:
             self._telemetry_max_client_dt_ms = max(
@@ -349,22 +389,25 @@ class VRServer:
                 self._telemetry_max_client_buffered_bytes,
                 frame.client_buffered_amount,
             )
+        self._telemetry_max_client_send_copies = max(
+            self._telemetry_max_client_send_copies, frame.client_send_copies
+        )
 
-        if frame.seq is not None:
-            if self._telemetry_last_seq is not None:
-                seq_delta = frame.seq - self._telemetry_last_seq
-                if seq_delta > 1:
-                    self._telemetry_missing_seq += seq_delta - 1
-                elif seq_delta <= 0:
-                    self._telemetry_out_of_order_seq += 1
-            self._telemetry_last_seq = frame.seq
+        self._flush_frame_telemetry_if_due(now)
+        return True
 
-        self._telemetry_count += 1
+    def _flush_frame_telemetry_if_due(self, now: float) -> None:
+        """Log and reset one-second frame-ingress telemetry windows."""
+        if self._telemetry_window_start is None:
+            return
         elapsed = now - self._telemetry_window_start
         if elapsed < 1.0:
             return
 
         hz = self._telemetry_count / elapsed if elapsed > 0.0 else 0.0
+        published_hz = (
+            self._telemetry_published_count / elapsed if elapsed > 0.0 else 0.0
+        )
         client_gap = (
             "n/a"
             if self._telemetry_max_client_dt_ms is None
@@ -374,17 +417,23 @@ class VRServer:
             "n/a" if self._telemetry_last_seq is None else str(self._telemetry_last_seq)
         )
         _logger.info(
-            "vr ingress: %.1f Hz  max_arrival_gap=%.1fms  "
+            "vr ingress: rx=%.1f Hz  published=%.1f Hz  "
+            "max_arrival_gap=%.1fms  max_published_gap=%.1fms  "
             "max_client_dt=%s  max_loop_lag=%.1fms  "
-            "client_dropped=%d  max_client_buffered=%dB  missing_seq=%d  "
-            "out_of_order_seq=%d  last_seq=%s  %s",
+            "client_dropped=%d  max_client_buffered=%dB  client_send_copies=%d  "
+            "missing_seq=%d  duplicate_seq=%d  out_of_order_seq=%d  "
+            "last_seq=%s  %s",
             hz,
+            published_hz,
             self._telemetry_max_arrival_gap_ms,
+            self._telemetry_max_published_arrival_gap_ms,
             client_gap,
             self._telemetry_max_loop_lag_ms,
             self._telemetry_client_dropped,
             self._telemetry_max_client_buffered_bytes,
+            self._telemetry_max_client_send_copies,
             self._telemetry_missing_seq,
+            self._telemetry_duplicate_seq,
             self._telemetry_out_of_order_seq,
             seq,
             self._format_pose_webrtc_stats(),
@@ -392,12 +441,16 @@ class VRServer:
 
         self._telemetry_window_start = now
         self._telemetry_count = 0
+        self._telemetry_published_count = 0
         self._telemetry_max_arrival_gap_ms = 0.0
+        self._telemetry_max_published_arrival_gap_ms = 0.0
         self._telemetry_max_client_dt_ms = None
         self._telemetry_client_dropped = 0
         self._telemetry_max_client_buffered_bytes = 0
+        self._telemetry_max_client_send_copies = 1
         self._telemetry_max_loop_lag_ms = 0.0
         self._telemetry_missing_seq = 0
+        self._telemetry_duplicate_seq = 0
         self._telemetry_out_of_order_seq = 0
 
     async def _handle_signaling(
