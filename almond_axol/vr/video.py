@@ -284,10 +284,55 @@ class WebRTCManager:
         """
         self._sources = dict(sources)
         self._pcs: dict[int, RTCPeerConnection] = {}
+        # Per-client (packetsSent, packetsLost) from the last stats poll, for
+        # per-interval rates.
+        self._prev_stats: dict[int, tuple[int, int]] = {}
 
     @property
     def has_sources(self) -> bool:
         return bool(self._sources)
+
+    async def log_stats_loop(self, period: float = 1.0) -> None:
+        """Log per-client WebRTC send health every ``period`` s (until cancelled).
+
+        Reports the outbound send rate and, from the headset's RTCP reports, the
+        packet-loss rate / RTT / jitter — the direct measure of whether the feed
+        degrades because packets are being dropped in transit (e.g. the send loop
+        not getting CPU) versus the encoder producing bad frames.
+        """
+        while True:
+            await asyncio.sleep(period)
+            for client_id, pc in list(self._pcs.items()):
+                try:
+                    report = await pc.getStats()
+                except Exception:  # noqa: BLE001 - stats are best-effort
+                    continue
+                sent = lost = bytes_sent = 0
+                rtt = jitter = 0.0
+                for stat in report.values():
+                    kind = getattr(stat, "type", "")
+                    if kind == "outbound-rtp":
+                        sent += int(getattr(stat, "packetsSent", 0) or 0)
+                        bytes_sent += int(getattr(stat, "bytesSent", 0) or 0)
+                    elif kind == "remote-inbound-rtp":
+                        lost += int(getattr(stat, "packetsLost", 0) or 0)
+                        rtt = float(getattr(stat, "roundTripTime", 0.0) or 0.0)
+                        jitter = float(getattr(stat, "jitter", 0.0) or 0.0)
+                p_sent, p_lost = self._prev_stats.get(client_id, (sent, lost))
+                self._prev_stats[client_id] = (sent, lost)
+                d_sent = sent - p_sent
+                d_lost = lost - p_lost
+                total = d_sent + d_lost
+                loss_pct = 100.0 * d_lost / total if total else 0.0
+                _logger.info(
+                    "webrtc[%d] send: %d pkt/s  lost=%d/s (%.1f%%)  rtt=%.0fms jitter=%.0fms",
+                    client_id,
+                    d_sent,
+                    d_lost,
+                    loss_pct,
+                    1e3 * rtt,
+                    1e3 * jitter,
+                )
 
     async def create_offer(self, client_id: int) -> tuple[str, dict[str, str]]:
         """Build a fresh peer connection for ``client_id`` and return the offer.

@@ -299,6 +299,10 @@ def _relay_main(
 
     async def serve() -> None:
         loop = asyncio.get_running_loop()
+        # Background WebRTC send-health logger (packets sent / lost / RTT) so we
+        # can see whether a degraded headset feed is transport loss vs encoder.
+        if manager is not None:
+            loop.create_task(manager.log_stats_loop())
         while True:
             try:
                 msg = await loop.run_in_executor(None, conn.recv)

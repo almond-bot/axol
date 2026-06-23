@@ -427,15 +427,37 @@ class _GstPipelineBase:
             except Exception as exc:  # noqa: BLE001 - never kill the pull thread
                 _logger.debug("gst pull handler error: %s", exc)
 
-    def _make_au_handler(self, channel: _AUChannel) -> Any:
+    def _make_au_handler(self, channel: _AUChannel, label: str = "enc") -> Any:
+        # Rolling per-second encoder-output health: the headset H.264 stream's
+        # actual fps + bitrate + bytes/frame. If these hold steady while the feed
+        # looks grainy, the encoder is fine and the loss is downstream (transport);
+        # if fps/bytes collapse, NVENC itself isn't keeping up.
+        stat = {"frames": 0, "bytes": 0, "last": time.perf_counter()}
+
         def handle(buf: Any, _recv_perf: float) -> None:
             ok, mapinfo = buf.map(self._gst.MapFlags.READ)
             if not ok:
                 return
             try:
+                size = mapinfo.size
                 nals = _split_nals(bytes(mapinfo.data))
             finally:
                 buf.unmap(mapinfo)
+            stat["frames"] += 1
+            stat["bytes"] += size
+            now = time.perf_counter()
+            dt = now - stat["last"]
+            if dt >= 1.0:
+                _logger.info(
+                    "relay-enc %s: %.1f fps  %.0f kbps  %.1f KB/frame",
+                    label,
+                    stat["frames"] / dt,
+                    8e-3 * stat["bytes"] / dt,
+                    stat["bytes"] / stat["frames"] / 1024 if stat["frames"] else 0.0,
+                )
+                stat["frames"] = 0
+                stat["bytes"] = 0
+                stat["last"] = now
             if nals:
                 channel.broadcast(nals)
 
@@ -621,7 +643,9 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self._launch(self._pipeline_str())
         if self._enc is not None:
             self._start_pull(
-                f"zedgst-{self.serial}-enc", "enc", self._make_au_handler(self._enc)
+                f"zedgst-{self.serial}-enc",
+                "enc",
+                self._make_au_handler(self._enc, f"sn{self.serial}"),
             )
         if self._want_raw:
             sink = self._raw_sink_override or self._buffer_sink(self._raw)
@@ -811,7 +835,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 self._start_pull(
                     f"zedgst-{self.serial}-enc{suffix}",
                     f"enc_{suffix}",
-                    self._make_au_handler(enc),
+                    self._make_au_handler(enc, f"sn{self.serial}-{suffix}"),
                 )
             if self._want_raw:
                 sink = raw_sink or self._buffer_sink(raw)

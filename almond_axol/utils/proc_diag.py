@@ -214,6 +214,7 @@ class SystemDiag(threading.Thread):
             busy_cores = 0
             sys_acc = 0.0
             ncpu = 0
+            percpu: list[tuple[int, float]] = []
             for name, (busy, total) in cur_cpu.items():
                 pb, pt = prev_cpu.get(name, (busy, total))
                 dtot = total - pt
@@ -224,8 +225,15 @@ class SystemDiag(threading.Thread):
                 sys_acc += frac
                 if frac > 85.0:
                     busy_cores += 1
+                idx = int(name[3:]) if name[3:].isdigit() else ncpu
+                percpu.append((idx, frac))
             prev_cpu = cur_cpu
             sys_pct = sys_acc / ncpu if ncpu else 0.0
+            # Per-core busy% (ordered by core index) so idle vs pegged cores are
+            # visible — distinguishes "genuinely CPU-bound" from "free cores but a
+            # latency-sensitive thread isn't being scheduled" (a placement issue).
+            percpu.sort()
+            percpu_str = "[" + ",".join(f"{f:.0f}" for _, f in percpu) + "]"
 
             # INFO tier: labelled procs (+ their gst children) CPU% / RSS + memory.
             cur_labeled = self._scan_labeled()
@@ -245,10 +253,11 @@ class SystemDiag(threading.Thread):
 
             mem_avail, swap_free, swap_total = read_meminfo()
             self._logger.info(
-                "diag: cores>85%%=%d/%d sys=%.0f%%  %s  memavail=%s swap=%s/%s",
+                "diag: cores>85%%=%d/%d sys=%.0f%% cpu%%=%s  %s  memavail=%s swap=%s/%s",
                 busy_cores,
                 ncpu,
                 sys_pct,
+                percpu_str,
                 top_labeled,
                 _gib(mem_avail),
                 _gib(swap_total - swap_free),
