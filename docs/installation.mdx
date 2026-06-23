@@ -40,6 +40,7 @@ This one command:
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already present.
 - Installs the `axol` CLI from GitHub (Python 3.13 bundled), with the `lerobot` and `sim` extras.
 - Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
+- Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
 - On a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)) for low-latency camera encode and a steady IK loop.
 - Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down.
 
