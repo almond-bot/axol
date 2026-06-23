@@ -1061,7 +1061,12 @@ export default function App() {
 
             {status === AxolConnectionStatus.Open ? (
               <div className="flex flex-col gap-2">
-                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
+                <Button
+                  size="lg"
+                  className="w-full"
+                  onClick={() => store.enterAR()}
+                  disabled={usbPoses && poseStatus !== AxolConnectionStatus.Open}
+                >
                   <Headset />
                   Enter VR
                 </Button>
