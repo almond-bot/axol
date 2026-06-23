@@ -22,7 +22,7 @@ function Tile({
   label,
   pulse,
   children,
-  headerRight,
+  extra,
 }: {
   icon: ReactNode
   title: string
@@ -30,28 +30,28 @@ function Tile({
   label: string
   pulse?: boolean
   children?: ReactNode
-  headerRight?: ReactNode
+  extra?: ReactNode
 }) {
   return (
-    <div className="group relative flex min-w-0 flex-1 flex-col gap-2 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex min-w-0 items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-          {icon}
-          <span className="truncate font-mono">{title}</span>
-        </div>
-        {headerRight}
+    <div className="group relative flex min-w-0 flex-col gap-2.5 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-4">
+      {/* title — its own line */}
+      <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
+        {icon}
+        <span className="font-mono">{title}</span>
       </div>
-      <div className="flex items-center justify-between gap-2">
-        <span className="flex min-w-0 items-center gap-2 text-sm">
-          <span
-            className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
-          />
-          <span className="truncate text-white/75" title={label}>
-            {label}
-          </span>
+      {/* status — its own line, full width */}
+      <div className="flex items-center gap-2 text-sm">
+        <span
+          className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
+        />
+        <span className="min-w-0 truncate text-white/75" title={label}>
+          {label}
         </span>
-        {children}
       </div>
+      {/* optional extra detail (e.g. the Axol motor grid) */}
+      {extra}
+      {/* action — pinned to the bottom so the buttons align across the row */}
+      {children && <div className="mt-auto flex justify-end pt-1">{children}</div>}
     </div>
   )
 }
@@ -188,7 +188,7 @@ export function ConnectionsBar({
         dot={robotDot}
         label={robotLabel}
         pulse={rs === "connecting"}
-        headerRight={
+        extra={
           robot && (rs === "connected" || rs === "busy") ? <MotorGrid robot={robot} /> : undefined
         }
       >
@@ -247,7 +247,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
   const arms = ["left", "right"]
   return (
-    <div className="flex flex-wrap items-center justify-end gap-x-2 gap-y-1">
+    <div className="flex flex-wrap items-center justify-start gap-x-2 gap-y-1">
       {arms.map((arm) => (
         <div key={arm} className="flex items-center gap-1">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>

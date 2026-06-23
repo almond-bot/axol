@@ -181,6 +181,28 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, robot, robotBusy])
 
+  // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
+  // appears. The latch clears once the tunnel is up (so a later drop retries
+  // once) or when the headset goes away, while preventing a per-poll retry loop
+  // if `adb reverse` can't establish it.
+  const autoUsbRef = useRef(false)
+  useEffect(() => {
+    if (conn.state !== "ok") return
+    if (!usb || usb.state !== "device") {
+      autoUsbRef.current = false
+      return
+    }
+    if (usb.reverseActive) {
+      autoUsbRef.current = false
+      return
+    }
+    if (autoUsbRef.current || usbBusy) return
+    autoUsbRef.current = true
+    usbConnectClick()
+    // usbConnectClick is stable (only uses state setters / fetch).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conn.state, usb, usbBusy])
+
   async function hostDisconnectClick() {
     // Kill any running task and wait for it to exit before dropping the host,
     // so disconnecting never leaves an orphaned op running server-side. Only
