@@ -296,12 +296,37 @@ def _relay_main(
     if manager is None:
         _logger.warning("video relay opened no cameras; nothing to stream")
 
+    async def _loop_lag_monitor() -> None:
+        """Log the relay event-loop's worst scheduling lag each second.
+
+        This is the asyncio analog of the control loop's maxgap: it measures how
+        late a fixed-interval wakeup actually fires on the relay's loop — the same
+        loop aiortc sends WebRTC media on. A large lag during recording means the
+        send is being starved *inside the relay process* (by the dataset raw
+        branch), which core isolation can't fix; a small lag means the send is
+        prompt and a degraded feed is downstream (network).
+        """
+        loop = asyncio.get_running_loop()
+        period = 0.05
+        worst = 0.0
+        last = loop.time()
+        while True:
+            t0 = loop.time()
+            await asyncio.sleep(period)
+            worst = max(worst, loop.time() - t0 - period)
+            now = loop.time()
+            if now - last >= 1.0:
+                _logger.info("relay event-loop maxlag=%.1fms", 1e3 * worst)
+                worst = 0.0
+                last = now
+
     async def serve() -> None:
         loop = asyncio.get_running_loop()
         # Background WebRTC send-health logger (packets sent / lost / RTT) so we
         # can see whether a degraded headset feed is transport loss vs encoder.
         if manager is not None:
             loop.create_task(manager.log_stats_loop())
+        loop.create_task(_loop_lag_monitor())
         while True:
             try:
                 msg = await loop.run_in_executor(None, conn.recv)

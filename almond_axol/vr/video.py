@@ -307,17 +307,15 @@ class WebRTCManager:
                     report = await pc.getStats()
                 except Exception:  # noqa: BLE001 - stats are best-effort
                     continue
-                sent = lost = bytes_sent = 0
-                rtt = jitter = 0.0
+                sent = lost = 0
+                rtt = 0.0
                 for stat in report.values():
                     kind = getattr(stat, "type", "")
                     if kind == "outbound-rtp":
                         sent += int(getattr(stat, "packetsSent", 0) or 0)
-                        bytes_sent += int(getattr(stat, "bytesSent", 0) or 0)
                     elif kind == "remote-inbound-rtp":
                         lost += int(getattr(stat, "packetsLost", 0) or 0)
                         rtt = float(getattr(stat, "roundTripTime", 0.0) or 0.0)
-                        jitter = float(getattr(stat, "jitter", 0.0) or 0.0)
                 p_sent, p_lost = self._prev_stats.get(client_id, (sent, lost))
                 self._prev_stats[client_id] = (sent, lost)
                 d_sent = sent - p_sent
@@ -325,13 +323,12 @@ class WebRTCManager:
                 total = d_sent + d_lost
                 loss_pct = 100.0 * d_lost / total if total else 0.0
                 _logger.info(
-                    "webrtc[%d] send: %d pkt/s  lost=%d/s (%.1f%%)  rtt=%.0fms jitter=%.0fms",
+                    "webrtc[%d] send: %d pkt/s  lost=%d/s (%.1f%%)  rtt=%.0fms",
                     client_id,
                     d_sent,
                     d_lost,
                     loss_pct,
                     1e3 * rtt,
-                    1e3 * jitter,
                 )
 
     async def create_offer(self, client_id: int) -> tuple[str, dict[str, str]]:
