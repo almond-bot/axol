@@ -538,6 +538,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         want_encoded: bool = True,
         want_raw: bool = False,
         raw_sink: Any = None,
+        raw_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -555,12 +556,16 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self.resolution = resolution
         self.fps = fps
         self.width, self.height = _RESOLUTION_DIMS[resolution]
+        # The raw (dataset) branch can be downscaled on the VIC to cut the bytes
+        # that cross to the control process; the encoded headset branch always
+        # keeps the full capture resolution. ``raw_dims`` is the relay's target.
+        self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
         self._raw_sink_override = raw_sink
         self._enc = _AUChannel(lambda: self.alive) if want_encoded else None
         self._raw = (
-            _RawBuffer(self.width, self.height)
+            _RawBuffer(self.raw_width, self.raw_height)
             if want_raw and raw_sink is None
             else None
         )
@@ -584,9 +589,12 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # bulk of the relay's CPU, and they're only needed while recording.
         # Defaults open so the SDK-less raw consumers (inference/run-policy) are
         # unchanged; `collect-data` explicitly closes it until an episode records.
+        # nvvidconv (the VIC) resizes for free on the GPU, so a smaller raw caps
+        # downscales here without touching the CPU or the encoded branch.
         raw = (
             f"{_QUEUE} ! valve name=rawvalve drop=false "
-            f"! nvvidconv ! video/x-raw,format=RGBA ! {_raw_appsink('raw')}"
+            f"! nvvidconv ! video/x-raw,format=RGBA,"
+            f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
         )
         if self._want_encoded and self._want_raw:
             return f"{src} ! tee name=t  t. ! {enc}  t. ! {raw}"
@@ -620,7 +628,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             self._start_pull(
                 f"zedgst-{self.serial}-raw",
                 "raw",
-                self._make_raw_handler(sink, self.width, self.height),
+                self._make_raw_handler(sink, self.raw_width, self.raw_height),
             )
         channels = (self._enc,) if self._enc is not None else ()
         if not self._play_and_wait(channels):
@@ -696,6 +704,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         want_raw: bool = False,
         left_raw_sink: Any = None,
         right_raw_sink: Any = None,
+        raw_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -712,6 +721,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.resolution = resolution
         self.fps = fps
         self.width, self.height = _RESOLUTION_DIMS[resolution]
+        # Per-eye downscale target for the raw (dataset) branch; encoded eyes keep
+        # the full capture resolution. See ZedGstCamera for the rationale.
+        self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
         self._left_raw_sink = left_raw_sink
@@ -720,7 +732,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         def eye(raw_sink: Any) -> tuple[_AUChannel | None, _RawBuffer | None, _GstEye]:
             enc = _AUChannel(lambda: self.alive) if want_encoded else None
             raw = (
-                _RawBuffer(self.width, self.height)
+                _RawBuffer(self.raw_width, self.raw_height)
                 if want_raw and raw_sink is None
                 else None
             )
@@ -751,13 +763,18 @@ class ZedGstStereoCamera(_GstPipelineBase):
             )
             raw = (
                 f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false "
-                f"! nvvidconv ! video/x-raw,format=RGBA ! "
+                f"! nvvidconv ! video/x-raw,format=RGBA,"
+                f"width={self.raw_width},height={self.raw_height} ! "
                 f"{_raw_appsink('raw_' + sink_suffix)}"
             )
             return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
         if self._want_encoded:
             return f"{crop} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc_' + sink_suffix)}"
-        return f"{crop} ! nvvidconv ! video/x-raw,format=RGBA ! {_raw_appsink('raw_' + sink_suffix)}"
+        return (
+            f"{crop} ! nvvidconv ! video/x-raw,format=RGBA,"
+            f"width={self.raw_width},height={self.raw_height} ! "
+            f"{_raw_appsink('raw_' + sink_suffix)}"
+        )
 
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close both eyes' raw dataset branches at runtime.
@@ -801,7 +818,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 self._start_pull(
                     f"zedgst-{self.serial}-raw{suffix}",
                     f"raw_{suffix}",
-                    self._make_raw_handler(sink, self.width, self.height),
+                    self._make_raw_handler(sink, self.raw_width, self.raw_height),
                 )
         channels = tuple(c for c in (self._left_enc, self._right_enc) if c is not None)
         if not self._play_and_wait(channels):

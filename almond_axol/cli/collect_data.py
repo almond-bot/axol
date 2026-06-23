@@ -38,7 +38,7 @@ from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
-from .config import LogLevel, parse
+from .config import DatasetResolution, LogLevel, parse
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -134,6 +134,9 @@ def _start_video_relay(cfg: "CollectDataConfig") -> Any | None:
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
+        # Downscale target for the dataset (raw) branch only; the encoded headset
+        # branch keeps the full capture resolution. Clamped to capture in the relay.
+        spec["dataset_resolution"] = cfg.dataset_resolution
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)
@@ -269,6 +272,13 @@ class CollectDataConfig:
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
     fps: int = 60
     teleop_hz: int = 120
+    # Resolution the recorded dataset video is downscaled to (on the relay's VIC,
+    # before frames cross to the control process). The headset/teleop stream
+    # stays at the camera's full capture resolution. Defaults to SVGA (960x600):
+    # full HD1200 frames are ~9 MB each and recording three of them at 60 fps
+    # saturates the Jetson CPU moving raw bytes, collapsing the control loop.
+    # Clamped to the capture resolution, so it only ever downscales.
+    dataset_resolution: DatasetResolution = "SVGA"
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
     # _default_vcodec). Override with any of LeRobot's VALID_VIDEO_CODECS
     # (e.g. auto, h264, libsvtav1).

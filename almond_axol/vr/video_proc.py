@@ -116,13 +116,25 @@ def _open_gst_camera_raw(
     if resolution not in _RESOLUTION_DIMS:
         return None
     width, height = _RESOLUTION_DIMS[resolution]
+    # The dataset (raw) frames are what cross to the control process and feed the
+    # NVENC encoder; downscale them on the relay's VIC when the caller asks for a
+    # smaller dataset resolution (clamped here, so it never upscales). The encoded
+    # headset stream keeps the full capture resolution. The shared-memory blocks,
+    # raw_meta, and gst raw caps must all agree on these dims.
+    raw_w, raw_h = width, height
+    ds_name = spec.get("dataset_resolution")
+    if ds_name in _RESOLUTION_DIMS:
+        dw, dh = _RESOLUTION_DIMS[ds_name]
+        if dw < width or dh < height:
+            raw_w, raw_h = dw, dh
+    raw_dims = (raw_w, raw_h)
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
         try:
             if stereo:
-                left = RawFrameWriter.create(width, height, cond)
-                right = RawFrameWriter.create(width, height, cond)
+                left = RawFrameWriter.create(raw_w, raw_h, cond)
+                right = RawFrameWriter.create(raw_w, raw_h, cond)
                 writers = [left, right]
                 cam: object = ZedGstStereoCamera(
                     serial,
@@ -131,6 +143,7 @@ def _open_gst_camera_raw(
                     want_encoded=True,
                     left_raw_sink=left.publish,
                     right_raw_sink=right.publish,
+                    raw_dims=raw_dims,
                 )
                 cam.connect()
                 sources = {
@@ -138,17 +151,22 @@ def _open_gst_camera_raw(
                     f"{name}_right": cam.right_view,
                 }
                 raw_meta = {
-                    f"{name}_left": (left.name, width, height, fps),
-                    f"{name}_right": (right.name, width, height, fps),
+                    f"{name}_left": (left.name, raw_w, raw_h, fps),
+                    f"{name}_right": (right.name, raw_w, raw_h, fps),
                 }
                 return cam, sources, writers, raw_meta
-            writer = RawFrameWriter.create(width, height, cond)
+            writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
             cam = ZedGstCamera(
-                serial, resolution, fps, want_encoded=True, raw_sink=writer.publish
+                serial,
+                resolution,
+                fps,
+                want_encoded=True,
+                raw_sink=writer.publish,
+                raw_dims=raw_dims,
             )
             cam.connect()
-            return cam, {name: cam}, writers, {name: (writer.name, width, height, fps)}
+            return cam, {name: cam}, writers, {name: (writer.name, raw_w, raw_h, fps)}
         except Exception as exc:  # noqa: BLE001 - try lower fps, then give up
             for w in writers:
                 w.close()
