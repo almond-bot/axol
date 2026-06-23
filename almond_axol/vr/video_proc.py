@@ -239,6 +239,18 @@ def _relay_main(
     """
     logging.basicConfig(level=log_level)
 
+    # Disable the cyclic garbage collector in the relay. aiortc sends WebRTC media
+    # on this process's asyncio loop, and a stop-the-world gen2 GC pause freezes
+    # that loop for ~100ms — which is exactly what stalls the send during
+    # recording (the raw branch's per-frame allocations push GC over its
+    # threshold), making the headset feed laggy + grainy. The per-frame objects
+    # (numpy frame views, encoded byte buffers) are all refcounted, so they free
+    # promptly without the collector; only reference cycles would linger, which is
+    # acceptable for a session-scoped subprocess.
+    import gc
+
+    gc.disable()
+
     # Pin the relay to its own cores (away from both the control loop and the
     # dataset recorder/encoders). Its WebRTC send is latency-sensitive; sharing
     # cores with the dataset throughput during recording starves the send and
