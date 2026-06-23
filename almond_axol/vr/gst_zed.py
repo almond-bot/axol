@@ -486,7 +486,7 @@ class _GstPipelineBase:
             now = time.perf_counter()
             dt = now - stat["last"]
             if dt >= 1.0:
-                _logger.info(
+                _logger.debug(
                     "relay-enc %s: %.1f fps  %.0f kbps  %.1f KB/frame",
                     label,
                     stat["frames"] / dt,

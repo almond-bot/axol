@@ -439,11 +439,14 @@ def _relay_main(
 
     async def serve() -> None:
         loop = asyncio.get_running_loop()
-        # Background WebRTC send-health logger (packets sent / lost / RTT) so we
-        # can see whether a degraded headset feed is transport loss vs encoder.
-        if manager is not None:
-            loop.create_task(manager.log_stats_loop())
-        loop.create_task(_loop_lag_monitor())
+        # The WebRTC send-health logger (packets sent / lost / RTT) and event-loop
+        # lag monitor were the recording-jitter instrumentation; only run them at
+        # DEBUG so the default output stays quiet (they're dedicated diagnostic
+        # tasks — no point spinning them when nothing logs).
+        if _logger.isEnabledFor(logging.DEBUG):
+            if manager is not None:
+                loop.create_task(manager.log_stats_loop())
+            loop.create_task(_loop_lag_monitor())
         while True:
             try:
                 msg = await loop.run_in_executor(None, conn.recv)

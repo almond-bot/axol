@@ -416,25 +416,29 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             relay.shutdown()
         raise
 
-    # Background /proc sampler: shows whether the system saturates when engaged
-    # and which process/thread is the aggressor. Labels the known subprocesses
-    # (mp spawn children all report comm=python, so pid mapping is what makes the
-    # IK solver, video relay, and dataset recorder legible in the output).
-    diag_labels: dict[int, str] = {os.getpid(): "main"}
-    ik_proc = getattr(teleop, "_ik_process", None)
-    if ik_proc is not None and getattr(ik_proc, "pid", None):
-        diag_labels[ik_proc.pid] = "ik"
-    if relay is not None and getattr(relay, "_proc", None) is not None:
-        relay_pid = getattr(relay._proc, "pid", None)
-        if relay_pid:
-            diag_labels[relay_pid] = "relay"
-    if getattr(recorder, "pid", None):
-        diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
-    diag = SystemDiag(diag_labels, _logger)
-    diag.start()
-    # Jetson GPU / EMC / NVENC / per-core-freq / thermal sampler (no-op off-Tegra).
-    tegra = TegraStatsDiag(_logger)
-    tegra.start()
+    # Background perf samplers (per-second /proc CPU breakdown + Jetson GPU/EMC/
+    # NVENC/thermal). These were the instrumentation for the recording-jitter
+    # investigation; keep them available but only run + print them at DEBUG so the
+    # default INFO output stays the single loop-rate line. Labels map the known
+    # subprocesses (mp spawn children all report comm=python) so the IK solver,
+    # video relay, and dataset recorder are legible in the breakdown.
+    diag: SystemDiag | None = None
+    tegra: TegraStatsDiag | None = None
+    if _logger.isEnabledFor(logging.DEBUG):
+        diag_labels: dict[int, str] = {os.getpid(): "main"}
+        ik_proc = getattr(teleop, "_ik_process", None)
+        if ik_proc is not None and getattr(ik_proc, "pid", None):
+            diag_labels[ik_proc.pid] = "ik"
+        if relay is not None and getattr(relay, "_proc", None) is not None:
+            relay_pid = getattr(relay._proc, "pid", None)
+            if relay_pid:
+                diag_labels[relay_pid] = "relay"
+        if getattr(recorder, "pid", None):
+            diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
+        diag = SystemDiag(diag_labels, _logger)
+        diag.start()
+        tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
+        tegra.start()
 
     # Keep the relay's raw dataset branch closed until an episode records: the
     # raw VIC convert + shared-memory copy for every camera is the bulk of the
@@ -490,20 +494,20 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
-        # maxgap/maxslip quantify jitter directly ("the thread lost the CPU"), so
-        # they ride the INFO line next to the rate — the record-start collapse is
-        # exactly a gap/slip spike. The per-section breakdown stays at DEBUG.
         _logger.info(
-            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  maxgap=%.1fms maxslip=%.1fms",
+            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
             loop_hz,
             teleop.vr_hz(),
             teleop.ik_hz(),
-            1e3 * max_gap["v"],
-            1e3 * max_slip["v"],
         )
+        # Jitter detail (maxgap/maxslip = "the thread lost the CPU") and the
+        # per-section breakdown stay at DEBUG so INFO is just the rate line.
         if time_sections:
             _logger.debug(
-                "loop sections (mean ms): obs=%.2f act=%.2f proc=%.2f send=%.2f",
+                "loop maxgap=%.1fms maxslip=%.1fms  sections (mean ms): "
+                "obs=%.2f act=%.2f proc=%.2f send=%.2f",
+                1e3 * max_gap["v"],
+                1e3 * max_slip["v"],
                 1e3 * sect["obs"] / n,
                 1e3 * sect["act"] / n,
                 1e3 * sect["proc"] / n,
@@ -660,8 +664,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     finally:
         log_say("Stopping.")
 
-        diag.stop()
-        tegra.stop()
+        if diag is not None:
+            diag.stop()
+        if tegra is not None:
+            tegra.stop()
 
         robot.disconnect()
         teleop.disconnect()

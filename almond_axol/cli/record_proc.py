@@ -216,7 +216,7 @@ def run_capture_loop(
             now = time.perf_counter()
             if now - cap_last_log >= 1.0:
                 dt = now - cap_last_log
-                _logger.info(
+                _logger.debug(
                     "capture: %.1f fps  tick=%.1fms  added=%d reused=%d skipped=%d",
                     ticks_window / dt,
                     1e3 * tick_cost_sum / ticks_window if ticks_window else 0.0,

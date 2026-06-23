@@ -162,10 +162,9 @@ class _CameraNvencEncoder:
                 exc,
             )
 
-        # Rolling per-second writer-thread cost, logged at INFO so the record
-        # path is visible: how much GIL-holding work each camera's encode does
-        # (the RGB->RGBA copy; the os.write itself releases the GIL) and whether
-        # its queue is backing up — the signal for control-loop starvation.
+        # Rolling per-second writer-thread cost, logged at DEBUG: how much work
+        # each camera's encode does (the RGB->RGBA copy + stats; the os.write
+        # releases the GIL) and whether its queue is backing up.
         self._t_copy = 0.0
         self._frames_window = 0
         self._last_log = time.perf_counter()
@@ -275,7 +274,7 @@ class _CameraNvencEncoder:
             return
         n = self._frames_window
         copy_ms = 1e3 * self._t_copy / n if n else 0.0
-        _logger.info(
+        _logger.debug(
             "nvenc %s: %.1f fps  copy+write=%.1fms  qdepth=%d/%d dropped=%d",
             self.video_path.stem,
             n / dt,
