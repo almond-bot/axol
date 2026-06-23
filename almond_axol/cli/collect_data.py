@@ -298,7 +298,18 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     dataset_resolution = cfg.dataset_resolution
     if is_complete:
         existing = _existing_dataset_resolution(dataset_root)
-        if existing and existing != cfg.dataset_resolution:
+        if existing is None:
+            # We can't read/map the resumed dataset's image resolution, so we
+            # can't guarantee recorded frames match its stored feature shape —
+            # recording would fail LeRobot's validate_frame mid-episode. Fail
+            # fast with guidance instead of crashing the capture thread later.
+            raise ValueError(
+                f"Cannot resume the dataset at {dataset_root}: its recorded image "
+                "resolution couldn't be read from meta/info.json or doesn't map to a "
+                "ZED resolution the recorder produces (SVGA/HD1080/HD1200). Start a "
+                "fresh dataset, or resume one recorded by this tool."
+            )
+        if existing != cfg.dataset_resolution:
             _logger.warning(
                 "resuming a dataset recorded at %s; recording at %s to match it "
                 "(start a new dataset to record at %s).",
@@ -306,8 +317,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 existing,
                 cfg.dataset_resolution,
             )
-        if existing:
-            dataset_resolution = existing
+        dataset_resolution = existing
 
     hostname = socket.gethostname()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
