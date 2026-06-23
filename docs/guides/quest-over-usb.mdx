@@ -1,0 +1,67 @@
+---
+title: "Quest over USB"
+description: "Stream Quest controller poses to the robot over a USB cable instead of Wi-Fi for a low-latency teleop link."
+---
+
+By default the Quest streams controller pose to the robot over Wi-Fi. On some networks the headset's Wi-Fi power-save buffering holds pose packets and releases them in bursts, adding **~150 ms gaps** between updates that show up as stair-stepped, laggy arm motion. **Quest over USB** removes Wi-Fi from the controller path entirely: poses ride a USB cable via an [`adb reverse`](https://developer.android.com/tools/adb) tunnel, so the link is wired and deterministic.
+
+<Note>
+  USB carries **controller poses only**. Camera video still streams over the LAN — WebRTC can't cross the `adb` TCP forward — so you connect to the robot's address as usual and the cameras keep working over Wi-Fi/Ethernet. USB just takes over the pose link.
+</Note>
+
+When USB is selected, poses go **only** over the cable — the app never falls back to Wi-Fi (that would reintroduce the latency USB exists to avoid). If the cable link isn't up, teleop simply pauses until it is.
+
+## One-time setup
+
+<Steps>
+  <Step title="Enable Developer Mode on the Quest">
+    1. Open the **Meta Quest** mobile app on your phone, with your headset connected.
+    2. Go to **Menu → Devices →** select your headset **→ Headset Settings → Developer Mode**, and toggle it on (you may be prompted to create a free Meta "organization" first).
+    3. Restart the headset.
+
+    This is the same Developer Mode used for [remote teleop](/guides/remote-teleop#sideload-tailscale-on-the-quest).
+  </Step>
+
+  <Step title="Confirm adb is installed on the robot machine">
+    `adb` and the Quest udev rule are installed automatically by [`axol provision`](/cli/provision), which the [one-command install](/installation) runs — so a hosted install needs nothing extra. On a development install, run `axol provision` once (or `sudo apt-get install -y adb android-sdk-platform-tools-common`).
+  </Step>
+</Steps>
+
+## Connect and drive
+
+<Steps>
+  <Step title="Plug the headset into the robot machine">
+    Use a data-capable USB-C cable from the headset to the machine running [`axol serve`](/cli/serve) (the one wired to the robot).
+  </Step>
+
+  <Step title="Authorize and connect from the control panel">
+    In the [control panel](/guides/control-panel#quest-usb), the **Quest USB** tile shows the headset state. The first time, accept the **Allow USB debugging?** prompt in the headset (check **Always allow from this computer**). Once authorized, the tunnel comes up **automatically** and the tile turns green (*Controller over USB*); the tile's **Connect** button is a manual fallback / reconnect.
+  </Step>
+
+  <Step title="Enable USB in the VR app">
+    Open the VR app at [axol.almond.bot](https://axol.almond.bot), enter the robot's address as usual, and tick **Quest over USB** before connecting.
+  </Step>
+
+  <Step title="Authorize the USB certificate">
+    The USB link uses `wss://localhost:8000`, whose self-signed certificate is a **separate origin** from the host cert you already approved. While the link is pending, the app shows *waiting for USB link…* and an **Authorize USB certificate** button — tap it and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser and proceed). The status then flips to *controller over cable*.
+  </Step>
+
+  <Step title="Enter VR">
+    With USB selected, **Enter VR** stays disabled until the USB pose link is live, so you never start a session that can't drive the arm. Once it's connected, press **Enter VR** and teleoperate as usual.
+  </Step>
+</Steps>
+
+<Warning>
+  If the **Quest USB** tile shows `unauthorized`, re-accept the prompt in the headset. If it shows no device, replug the cable and confirm Developer Mode is on. A flaky cable is the most common cause of a link that won't come up.
+</Warning>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Web Control Panel" icon="sliders" href="/guides/control-panel">
+    Where the Quest USB tile lives and how connections work.
+  </Card>
+  <Card title="VR Interface" icon="vr-cardboard" href="/guides/vr-interface">
+    The WebXR app, camera views, and connection details.
+  </Card>
+</CardGroup>

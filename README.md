@@ -107,26 +107,11 @@ Each operation can be driven from the web control panel or the CLI:
 
 - [Remote Teleop](https://docs.almond.bot/guides/remote-teleop) — drive over the internet by sideloading Tailscale on a Meta Quest
 
-### Quest over USB
-
-For the lowest-latency controller link, stream the Quest's controller poses over a USB cable instead of WiFi — WiFi power-save buffering otherwise adds ~150 ms gaps between pose updates. Camera video still streams over the LAN (WebRTC can't cross the USB tunnel), so you connect to the robot's IP as usual and just tick a box for USB poses.
-
-**One-time headset setup**
-
-1. Enable **Developer Mode**: in the Meta Horizon phone app, open *Menu → Devices →* your headset *→ Headset Settings → Developer Mode* and toggle it on (needs a free Meta developer account), then reboot the headset.
-2. Plug the headset into the robot host with a data-capable USB-C cable. `adb` and the Oculus udev rule are installed by `axol provision` (run by the installer), so nothing else is needed on the robot.
-
-**Each session**
-
-1. In the web control panel (`axol serve`), the **Quest USB** tile shows the headset state. The first time, accept the *Allow USB debugging?* prompt on the headset (check "Always allow"). Once authorized the tunnel comes up automatically (`adb reverse tcp:8000 tcp:8000`) and the tile turns green ("Controller over USB"); the **Connect** button is a manual fallback / reconnect.
-2. In the VR app, enter the robot's host/IP as usual and tick **Quest over USB** before connecting. The first time, tap **Authorize USB certificate** (accepts the self-signed cert for `localhost`, a separate origin from the host cert). Controller poses then ride the cable while camera video uses the LAN.
-
-If the tile shows `unauthorized`, re-accept the prompt on the headset; if it shows no device, replug the cable and confirm Developer Mode is on.
-
 ### Web Interfaces
 
 - [Web Control Panel](https://docs.almond.bot/guides/control-panel) — drive the robot from a browser via `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
+- [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
 
 ### Advanced
 

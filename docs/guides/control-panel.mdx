@@ -40,10 +40,10 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 
 ## Connections
 
-The top of the panel is a row of three tiles — **Axol Host**, **Axol**, and **Cameras** — each with a colored status dot.
+The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**, and **Quest USB** — each with a colored status dot.
 
-{/* SCREENSHOT: control-panel-connections.png — close-up of the three tiles (Axol Host / Axol / Cameras) */}
-<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras" />
+{/* SCREENSHOT: control-panel-connections.png — close-up of the connection tiles (Axol Host / Axol / Cameras / Quest USB) */}
+<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras, Quest USB" />
 
 ### Axol Host
 
@@ -65,6 +65,10 @@ Data collection and policy inference also need the three ZED cameras attached to
 The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually; a stereo camera captures both eyes from one grab (recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`).
 
 The assignments persist in your browser and are sent along when you start an operation — collect data and run policy need all three slots; teleop streams whichever are assigned to the headset.
+
+### Quest USB
+
+The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the tile sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only.
 
 <Warning>
   Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
