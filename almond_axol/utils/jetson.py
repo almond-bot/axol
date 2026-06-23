@@ -58,8 +58,10 @@ def _is_jetson() -> bool:
         return True
     # Fallback: the encode engines we pin only exist on Tegra, so their
     # presence also identifies a Jetson even if the release file is missing.
+    # (``glob`` returns a generator that is always truthy, so it must be
+    # consumed — ``any(glob(...))`` — to test whether it actually matched.)
     return any(
-        Path("/sys/class/devfreq").glob(pattern) for pattern in _ENGINE_CLOCK_GLOBS
+        any(Path("/sys/class/devfreq").glob(pattern)) for pattern in _ENGINE_CLOCK_GLOBS
     )
 
 

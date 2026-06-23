@@ -41,6 +41,7 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
+from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
@@ -291,6 +292,11 @@ class VRTeleop:
             diag_labels[relay_proc.pid] = "relay"
         diag = SystemDiag(diag_labels, _logger)
         diag.start()
+        # Jetson GPU / EMC / NVENC / per-core-freq / thermal sampler. This is the
+        # A/B baseline for collect-data: teleop runs with the relay raw branch
+        # closed, so its diag/tegra lines isolate the record-phase delta.
+        tegra = TegraStatsDiag(_logger)
+        tegra.start()
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
@@ -363,6 +369,7 @@ class VRTeleop:
             pass
         finally:
             diag.stop()
+            tegra.stop()
 
     # ------------------------------------------------------------------
     # Step

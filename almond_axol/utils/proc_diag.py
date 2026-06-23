@@ -15,6 +15,7 @@ import threading
 import time
 
 CLK_TCK = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 
 
 def read_percpu() -> dict[str, tuple[int, int]]:
@@ -53,14 +54,65 @@ def read_proc_cpu(pid: int) -> tuple[int, str] | None:
         return None
 
 
-class SystemDiag(threading.Thread):
-    """Background ``/proc`` sampler: logs per-core saturation + hottest procs/threads.
+def read_proc_rss(pid: int) -> int:
+    """Resident set size in bytes for ``pid`` (field 2 of ``/proc/<pid>/statm``)."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            pages = int(f.read().split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+    return pages * PAGE_SIZE
 
-    Each ~1s window it reports how many logical CPUs are saturated, overall busy
-    %, the highest-CPU processes (labelled where the pid is known — e.g.
-    main / ik / relay), and the calling process's hottest threads (by
-    ``/proc/self/task/*/comm`` name). CPU is in single-core %, so a process using
-    three cores reads ~300%.
+
+def read_children(pid: int) -> list[int]:
+    """Direct child pids of ``pid`` from the kernel's ``children`` file.
+
+    ``/proc/<pid>/task/<pid>/children`` is a cheap space-separated pid list (one
+    read, no full ``/proc`` walk). Returns ``[]`` when it's unavailable (older
+    kernels without ``CONFIG_PROC_CHILDREN``, or the process is gone).
+    """
+    try:
+        with open(f"/proc/{pid}/task/{pid}/children") as f:
+            return [int(x) for x in f.read().split()]
+    except (OSError, ValueError):
+        return []
+
+
+def read_meminfo() -> tuple[int, int, int]:
+    """``(mem_available, swap_free, swap_total)`` in bytes from ``/proc/meminfo``."""
+    want = {"MemAvailable:": 0, "SwapFree:": 0, "SwapTotal:": 0}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                p = line.split()
+                if p and p[0] in want:
+                    want[p[0]] = int(p[1]) * 1024  # values are in kB
+    except (OSError, IndexError, ValueError):
+        pass
+    return want["MemAvailable:"], want["SwapFree:"], want["SwapTotal:"]
+
+
+def _gib(n: float) -> str:
+    return f"{n / 1024**3:.1f}G"
+
+
+class SystemDiag(threading.Thread):
+    """Background ``/proc`` sampler: logs per-core saturation, memory, and CPU attribution.
+
+    Two tiers each ~1s window:
+
+    * **INFO (always):** per-core saturation (how many logical CPUs are >85%
+      busy, overall busy %), system memory (available + swap), and CPU% / RSS for
+      just the *labelled* processes (e.g. main / ik / relay) plus their direct
+      children (the gst encode subprocesses). This is cheap — it reads a handful
+      of ``/proc`` files, not the whole table — so it can run at the operator's
+      default log level alongside the per-second loop-rate line.
+    * **DEBUG (only when enabled):** the full system-wide breakdown — the
+      highest-CPU process anywhere on the box and the calling process's hottest
+      threads (by ``/proc/self/task/*/comm`` name), for naming the in-process GIL
+      aggressor. This walks every ``/proc/<pid>``, so it stays gated.
+
+    CPU is in single-core %, so a process using three cores reads ~300%.
 
     Args:
         labels: ``{pid: label}`` to make known subprocesses legible (mp spawn
@@ -124,9 +176,31 @@ class SystemDiag(threading.Thread):
     def _label(self, pid: int, comm: str) -> str:
         return self._labels.get(pid, comm)
 
+    def _scan_labeled(self) -> dict[int, tuple[int, str]]:
+        """``{pid: (jiffies, label)}`` for the labelled pids + their gst children.
+
+        Reads only the known pids and one ``children`` file each — a handful of
+        ``/proc`` files, not the whole table — so it is cheap enough for the INFO
+        tier. Children inherit a ``<label>-gst`` name so the per-camera encode
+        subprocesses are legible without a system-wide walk.
+        """
+        out: dict[int, tuple[int, str]] = {}
+        for pid, label in self._labels.items():
+            r = read_proc_cpu(pid)
+            if r is not None:
+                out[pid] = (r[0], label)
+            for child in read_children(pid):
+                cr = read_proc_cpu(child)
+                if cr is not None:
+                    out[child] = (cr[0], f"{label}-{cr[1]}")
+        return out
+
     def run(self) -> None:
         prev_cpu = read_percpu()
-        prev_procs = self._scan_pids()
+        prev_labeled = self._scan_labeled()
+        prev_procs = (
+            self._scan_pids() if self._logger.isEnabledFor(logging.DEBUG) else {}
+        )
         prev_thr = self._scan_threads()
         prev_t = time.perf_counter()
         while not self._stop.wait(self._period):
@@ -134,10 +208,6 @@ class SystemDiag(threading.Thread):
             dt = now - prev_t
             prev_t = now
             if dt <= 0:
-                continue
-            # Scanning a few hundred /proc files every second is pure overhead
-            # unless someone is watching the debug stream — skip it otherwise.
-            if not self._logger.isEnabledFor(logging.DEBUG):
                 continue
 
             cur_cpu = read_percpu()
@@ -156,6 +226,39 @@ class SystemDiag(threading.Thread):
                     busy_cores += 1
             prev_cpu = cur_cpu
             sys_pct = sys_acc / ncpu if ncpu else 0.0
+
+            # INFO tier: labelled procs (+ their gst children) CPU% / RSS + memory.
+            cur_labeled = self._scan_labeled()
+            lab_pct: list[tuple[float, str]] = []
+            for pid, (jif, label) in cur_labeled.items():
+                pj = prev_labeled.get(pid)
+                if pj is None:
+                    continue
+                pct = 100.0 * (jif - pj[0]) / CLK_TCK / dt
+                if pct >= 5.0:
+                    lab_pct.append(
+                        (pct, f"{label}={pct:.0f}%/{_gib(read_proc_rss(pid))}")
+                    )
+            prev_labeled = cur_labeled
+            lab_pct.sort(reverse=True)
+            top_labeled = "  ".join(s for _, s in lab_pct) or "n/a"
+
+            mem_avail, swap_free, swap_total = read_meminfo()
+            self._logger.info(
+                "diag: cores>85%%=%d/%d sys=%.0f%%  %s  memavail=%s swap=%s/%s",
+                busy_cores,
+                ncpu,
+                sys_pct,
+                top_labeled,
+                _gib(mem_avail),
+                _gib(swap_total - swap_free),
+                _gib(swap_total),
+            )
+
+            # DEBUG tier: full system-wide proc + main-thread breakdown (every
+            # /proc/<pid> + every thread of this process — too costly for INFO).
+            if not self._logger.isEnabledFor(logging.DEBUG):
+                continue
 
             cur_procs = self._scan_pids()
             proc_pct: list[tuple[float, str]] = []
@@ -183,11 +286,5 @@ class SystemDiag(threading.Thread):
             thr_pct.sort(reverse=True)
             top_thr = "  ".join(f"{n}={p:.0f}%" for p, n in thr_pct[:5]) or "n/a"
 
-            self._logger.debug(
-                "diag cpu: cores>85%%=%d/%d  sys=%.0f%%  | procs: %s",
-                busy_cores,
-                ncpu,
-                sys_pct,
-                top_procs,
-            )
+            self._logger.debug("diag procs (system-wide): %s", top_procs)
             self._logger.debug("diag main-threads: %s", top_thr)

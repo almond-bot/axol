@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -70,10 +71,14 @@ def hw_dataset_encoder_available() -> bool:
 
 
 def _bitrate_for(width: int, height: int, fps: int) -> int:
-    return max(_BITRATE_MIN, min(_BITRATE_MAX, int(width * height * fps * _BITRATE_BPP)))
+    return max(
+        _BITRATE_MIN, min(_BITRATE_MAX, int(width * height * fps * _BITRATE_BPP))
+    )
 
 
-def _gst_argv(width: int, height: int, fps: int, bitrate: int, out_path: Path) -> list[str]:
+def _gst_argv(
+    width: int, height: int, fps: int, bitrate: int, out_path: Path
+) -> list[str]:
     """``gst-launch-1.0`` argv: packed RGBA on stdin -> H.264 mp4 file.
 
     ``nvvidconv`` does the RGBA->NV12 colorspace conversion on the VIC and
@@ -135,6 +140,16 @@ class _CameraNvencEncoder:
         self._stats = RunningQuantileStats()
         self._stats_samples = 0
 
+        # Rolling per-second writer-thread cost, logged at INFO so the record
+        # path is visible: how much GIL-holding numpy work each camera's encode
+        # does (copy+write vs stats) and whether its queue is backing up — the
+        # signal for whether these threads are starving the control loop.
+        self._t_copy = 0.0
+        self._t_stats = 0.0
+        self._frames_window = 0
+        self._stats_window = 0
+        self._last_log = time.perf_counter()
+
         self._thread = threading.Thread(
             target=self._run, name=f"nvenc-{video_path.stem}", daemon=True
         )
@@ -165,10 +180,14 @@ class _CameraNvencEncoder:
         self._queue.put(None)
         self._thread.join(timeout=120)
         if self._thread.is_alive():
-            _logger.error("NVENC encoder for %s did not finish in time", self.video_path.name)
+            _logger.error(
+                "NVENC encoder for %s did not finish in time", self.video_path.name
+            )
             return self.video_path, None
         if self._error is not None:
-            raise RuntimeError(f"NVENC encoder for {self.video_path.name} failed: {self._error}")
+            raise RuntimeError(
+                f"NVENC encoder for {self.video_path.name} failed: {self._error}"
+            )
         stats = self._stats.get_statistics() if self._stats_samples >= 1 else None
         return self.video_path, stats
 
@@ -189,10 +208,13 @@ class _CameraNvencEncoder:
             self._finalize()
         except Exception as exc:  # noqa: BLE001 - surface via _error on finish()
             self._error = str(exc)
-            _logger.error("NVENC encoder thread for %s failed: %s", self.video_path.name, exc)
+            _logger.error(
+                "NVENC encoder thread for %s failed: %s", self.video_path.name, exc
+            )
             self._kill()
 
     def _encode(self, image: "NDArray") -> None:
+        t0 = time.perf_counter()
         frame = _to_hwc_rgb_uint8(image)
         h, w = frame.shape[:2]
         if self._proc is None:
@@ -200,14 +222,47 @@ class _CameraNvencEncoder:
         assert self._rgba is not None and self._stdin_fd is not None
         self._rgba[:, :, :3] = frame
         self._write(self._rgba)
+        self._t_copy += time.perf_counter() - t0
 
         if self._frame_count % _STATS_EVERY == 0:
             from lerobot.datasets.compute_stats import auto_downsample_height_width
 
+            t1 = time.perf_counter()
             ds = auto_downsample_height_width(frame.transpose(2, 0, 1))
             self._stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
             self._stats_samples += 1
+            self._t_stats += time.perf_counter() - t1
+            self._stats_window += 1
         self._frame_count += 1
+        self._frames_window += 1
+        self._maybe_log()
+
+    def _maybe_log(self) -> None:
+        now = time.perf_counter()
+        dt = now - self._last_log
+        if dt < 1.0:
+            return
+        n = self._frames_window
+        copy_ms = 1e3 * self._t_copy / n if n else 0.0
+        stats_ms = (
+            1e3 * self._t_stats / self._stats_window if self._stats_window else 0.0
+        )
+        _logger.info(
+            "nvenc %s: %.1f fps  copy+write=%.1fms stats=%.1fms/%df  qdepth=%d/%d dropped=%d",
+            self.video_path.stem,
+            n / dt,
+            copy_ms,
+            stats_ms,
+            _STATS_EVERY,
+            self._queue.qsize(),
+            self._queue.maxsize,
+            self._dropped,
+        )
+        self._t_copy = 0.0
+        self._t_stats = 0.0
+        self._frames_window = 0
+        self._stats_window = 0
+        self._last_log = now
 
     def _start(self, width: int, height: int) -> None:
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
@@ -290,7 +345,9 @@ class NvencStreamingEncoder:
         for video_key in video_keys:
             ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
             video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
-            self._cams[video_key] = _CameraNvencEncoder(video_path, self.fps, self.queue_maxsize)
+            self._cams[video_key] = _CameraNvencEncoder(
+                video_path, self.fps, self.queue_maxsize
+            )
         self._episode_active = True
 
     def feed_frame(self, video_key: str, image: "NDArray") -> None:

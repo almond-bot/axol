@@ -36,6 +36,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from .config import LogLevel, parse
 
@@ -194,7 +195,10 @@ def _install_dataset_encoder() -> bool:
     if getattr(LeRobotDataset, "_axol_nvenc_installed", False):
         return True
 
-    from ..lerobot.nvenc_encoder import NvencStreamingEncoder, hw_dataset_encoder_available
+    from ..lerobot.nvenc_encoder import (
+        NvencStreamingEncoder,
+        hw_dataset_encoder_available,
+    )
 
     if not hw_dataset_encoder_available():
         _tune_software_encoder()
@@ -231,7 +235,9 @@ def _tune_software_encoder() -> None:
 
     _orig_get_codec_options = _vu._get_codec_options
 
-    def _tuned(vcodec: str, g: int | None = 2, crf: int | None = 30, preset=None) -> dict:
+    def _tuned(
+        vcodec: str, g: int | None = 2, crf: int | None = 30, preset=None
+    ) -> dict:
         options = _orig_get_codec_options(vcodec, g=g, crf=crf, preset=preset)
         if vcodec in ("h264", "hevc"):
             options["preset"] = "veryfast"
@@ -367,13 +373,43 @@ class _CaptureThread(threading.Thread):
         last_frames: dict[str, tuple[Any, float, float]] = {}
         tick = 0
 
+        # Rolling per-second INFO readout: the capture body's mean cost
+        # (build_dataset_frame + robot_obs_proc numpy, all GIL-holding in this
+        # process) and how often a camera read times out (reuse/skip) — the
+        # latter correlates with the relay's raw-branch contention.
+        tick_cost_sum = 0.0
+        reuse_count = 0
+        skip_count = 0
+        frames_added = 0
+        ticks_window = 0
+        cap_last_log = recording_start
+
         while not self.stop_event.is_set():
+            now = time.perf_counter()
+            if now - cap_last_log >= 1.0:
+                dt = now - cap_last_log
+                _logger.info(
+                    "capture: %.1f fps  tick=%.1fms  added=%d reused=%d skipped=%d",
+                    ticks_window / dt,
+                    1e3 * tick_cost_sum / ticks_window if ticks_window else 0.0,
+                    frames_added,
+                    reuse_count,
+                    skip_count,
+                )
+                tick_cost_sum = 0.0
+                reuse_count = 0
+                skip_count = 0
+                frames_added = 0
+                ticks_window = 0
+                cap_last_log = now
+
             target_perf_ts = recording_start + tick * frame_interval
 
             wait_s = target_perf_ts - time.perf_counter()
             if wait_s > 0 and self.stop_event.wait(timeout=wait_s):
                 return
 
+            body_t0 = time.perf_counter()
             frames: dict[str, tuple[Any, float, float]] = {}
             skip_tick = False
             for cam_key, cam in self.robot.cameras.items():
@@ -399,11 +435,13 @@ class _CaptureThread(threading.Thread):
                         cam_key,
                         exc,
                     )
+                    reuse_count += 1
                     frame, cap_ts, recv_ts = cached
                 frames[cam_key] = (frame, cap_ts, recv_ts)
                 last_frames[cam_key] = (frame, cap_ts, recv_ts)
 
             if skip_tick:
+                skip_count += 1
                 tick += 1
                 continue
 
@@ -426,6 +464,9 @@ class _CaptureThread(threading.Thread):
             if self.stop_event.is_set():
                 return
             self.dataset.add_frame({**obs_frame, **act_frame, "task": self.task})
+            frames_added += 1
+            tick_cost_sum += time.perf_counter() - body_t0
+            ticks_window += 1
 
             if self.rerun_ip:
                 log_rerun_data(observation=obs_processed, action=snap.action)
@@ -603,6 +644,9 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             diag_labels[relay_pid] = "relay"
     diag = SystemDiag(diag_labels, _logger)
     diag.start()
+    # Jetson GPU / EMC / NVENC / per-core-freq / thermal sampler (no-op off-Tegra).
+    tegra = TegraStatsDiag(_logger)
+    tegra.start()
 
     # Keep the relay's raw dataset branch closed until an episode records: the
     # raw VIC convert + shared-memory copy for every camera is the bulk of the
@@ -662,22 +706,24 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
+        # maxgap/maxslip quantify jitter directly ("the thread lost the CPU"), so
+        # they ride the INFO line next to the rate — the record-start collapse is
+        # exactly a gap/slip spike. The per-section breakdown stays at DEBUG.
         _logger.info(
-            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  maxgap=%.1fms maxslip=%.1fms",
             loop_hz,
             teleop.vr_hz(),
             teleop.ik_hz(),
+            1e3 * max_gap["v"],
+            1e3 * max_slip["v"],
         )
         if time_sections:
             _logger.debug(
-                "loop sections (mean ms): obs=%.2f act=%.2f proc=%.2f send=%.2f  "
-                "maxgap=%.1fms maxslip=%.1fms",
+                "loop sections (mean ms): obs=%.2f act=%.2f proc=%.2f send=%.2f",
                 1e3 * sect["obs"] / n,
                 1e3 * sect["act"] / n,
                 1e3 * sect["proc"] / n,
                 1e3 * sect["send"] / n,
-                1e3 * max_gap["v"],
-                1e3 * max_slip["v"],
             )
             sect = {"obs": 0.0, "act": 0.0, "proc": 0.0, "send": 0.0}
         loop_times.clear()
@@ -843,6 +889,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         log_say("Stopping.")
 
         diag.stop()
+        tegra.stop()
 
         robot.disconnect()
         teleop.disconnect()
