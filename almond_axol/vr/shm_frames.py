@@ -29,6 +29,7 @@ the dataset relies on.
 
 from __future__ import annotations
 
+import threading
 import time
 from multiprocessing import shared_memory
 from typing import TYPE_CHECKING, Any
@@ -206,6 +207,160 @@ class RawFrameReader:
             self._shm = None  # type: ignore[assignment]
 
     # ZedCamera-compatible alias.
+    close = disconnect
+
+
+class GstShmFrameReader:
+    """Recorder-side raw-frame source backed by a gst ``shmsrc`` → ``appsink``.
+
+    The relay's raw branch writes RGBA frames to shared memory with gst's native
+    (C) ``shmsink`` — no Python pull loop in the relay, so its interpreter is free
+    for the latency-critical aiortc send (running the pull loop *in the relay* is
+    what halved the send during recording and made the live feed laggy/grainy).
+    This reader runs the matching ``shmsrc`` consumer in the **recorder** process,
+    where the per-frame Python work lands on the recorder's own GIL and can't
+    starve the relay's send. It exposes the same ``read_at_or_after`` /
+    ``read_latest`` / ``connect`` / ``close`` slice of the camera interface as
+    :class:`RawFrameReader`, so the capture loop and ``AxolRobot`` are unchanged.
+
+    Shared memory carries no buffer PTS, so each frame is stamped
+    ``recv_perf - latency_s`` (``latency_s`` a relay-reported pipeline-latency
+    scalar) on the shared ``perf_counter`` clock — an approximation of the
+    per-frame :meth:`~almond_axol.vr.gst_zed._GstPipelineBase._cap_perf_from_pts`
+    compensation. A small constant bias only shifts all images uniformly vs the
+    joint samples, within the capture loop's frame tolerance.
+    """
+
+    def __init__(
+        self,
+        socket_path: str,
+        caps: str,
+        width: int,
+        height: int,
+        fps: int,
+        latency_s: float,
+    ) -> None:
+        from .gst_zed import _require_gst
+
+        self._gst, _ = _require_gst()
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self._latency_s = latency_s
+        self._lock = threading.Lock()
+        self._new_frame = threading.Event()
+        self._rgb: NDArray[Any] | None = None
+        self._cap_ts: float | None = None
+        self._recv_ts: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._sink: Any = None
+        self._pipeline = self._gst.parse_launch(
+            f"shmsrc socket-path={socket_path} is-live=true do-timestamp=true "
+            f"! {caps} ! appsink name=raw emit-signals=false max-buffers=2 "
+            "drop=true sync=false"
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        return self._pipeline is not None
+
+    def connect(self, warmup: bool = True) -> None:
+        """Start the shmsrc pipeline + pull thread (relay owns the camera)."""
+        self._sink = self._pipeline.get_by_name("raw")
+        self._pipeline.set_state(self._gst.State.PLAYING)
+        self._thread = threading.Thread(
+            target=self._pull_loop, name="recorder-shmsrc", daemon=True
+        )
+        self._thread.start()
+
+    def _pull_loop(self) -> None:
+        Gst = self._gst
+        w, h = self.width, self.height
+        while not self._stop.is_set():
+            sample = self._sink.emit("try-pull-sample", Gst.SECOND // 2)
+            if sample is None:
+                continue  # valve closed (not recording) or starting up — idle
+            recv_perf = time.perf_counter()
+            buf = sample.get_buffer()
+            ok, mapinfo = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                continue
+            try:
+                arr = np.frombuffer(mapinfo.data, dtype=np.uint8)
+                if arr.size < w * h * 4:
+                    rgb = None
+                else:
+                    rgb = np.ascontiguousarray(
+                        arr[: w * h * 4].reshape(h, w, 4)[:, :, :3]
+                    )
+            finally:
+                buf.unmap(mapinfo)
+            if rgb is None:
+                continue
+            with self._lock:
+                self._rgb = rgb
+                self._cap_ts = recv_perf - self._latency_s
+                self._recv_ts = recv_perf
+            self._new_frame.set()
+
+    def read_at_or_after(
+        self, target: float, timeout_ms: float = 500
+    ) -> tuple["NDArray[Any]", float, float]:
+        """Block until a frame with ``cap_ts >= target`` is available; return it."""
+        deadline = time.perf_counter() + timeout_ms / 1000.0
+        while True:
+            self._new_frame.clear()
+            with self._lock:
+                rgb, cap, recv = self._rgb, self._cap_ts, self._recv_ts
+            if (
+                rgb is not None
+                and cap is not None
+                and recv is not None
+                and cap >= target
+            ):
+                return rgb, cap, recv
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"shmsrc camera timed out waiting for a frame at "
+                    f"capture_perf_ts >= {target:.6f} after {timeout_ms:.1f}ms."
+                )
+            self._new_frame.wait(timeout=remaining)
+
+    def read_latest_with_ts(self) -> tuple["NDArray[Any]", float, float]:
+        with self._lock:
+            rgb, cap, recv = self._rgb, self._cap_ts, self._recv_ts
+        if rgb is None or cap is None or recv is None:
+            raise RuntimeError("shmsrc camera has not captured any frames yet.")
+        return rgb, cap, recv
+
+    def read_latest(self, max_age_ms: int = 500) -> "NDArray[Any]":
+        frame, _cap, recv = self.read_latest_with_ts()
+        age_ms = (time.perf_counter() - recv) * 1e3
+        if age_ms > max_age_ms:
+            raise TimeoutError(
+                f"latest shmsrc frame is {age_ms:.0f}ms old (> {max_age_ms})."
+            )
+        return frame
+
+    def read(self) -> "NDArray[Any]":
+        return self.read_at_or_after(0.0, timeout_ms=10000)[0]
+
+    def disconnect(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        if self._pipeline is not None:
+            try:
+                self._pipeline.set_state(self._gst.State.NULL)
+            except Exception:  # noqa: BLE001 - best-effort teardown
+                pass
+            self._pipeline = None  # type: ignore[assignment]
+        self._sink = None
+
+    # camera-compatible alias.
     close = disconnect
 
 

@@ -85,18 +85,60 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
+def _raw_caps(width: int, height: int, fps: int) -> str:
+    """gst caps for the raw RGBA frames the recorder's shmsrc must declare.
+
+    Shared memory carries no caps, so the recorder's ``shmsrc`` needs these
+    explicitly to interpret the bytes; they must match the relay's shmsink input
+    (the ``nvvidconv`` RGBA output at the downscaled dataset dims).
+    """
+    return f"video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1"
+
+
+def _gstshm_meta(
+    socket_path: str, caps: str, width: int, height: int, fps: int, latency_s: float
+) -> dict:
+    return {
+        "transport": "gstshm",
+        "socket_path": socket_path,
+        "caps": caps,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "latency_s": latency_s,
+    }
+
+
+def _pyshm_meta(shm_name: str, width: int, height: int, fps: int) -> dict:
+    return {
+        "transport": "pyshm",
+        "shm_name": shm_name,
+        "width": width,
+        "height": height,
+        "fps": fps,
+    }
+
+
 def _open_gst_camera_raw(
-    name: str, spec: dict, cond: object
-) -> tuple[object, dict[str, object], list, dict[str, tuple]] | None:
+    name: str, spec: dict, cond: object, socket_dir: str | None
+) -> tuple[object, dict[str, object], list, dict[str, dict]] | None:
     """Open one camera via the gst pipeline with both encoded + raw branches.
 
-    Like :func:`_open_gst_camera`, but additionally allocates a shared-memory
-    :class:`~almond_axol.vr.shm_frames.RawFrameWriter` per source and wires it
-    as the camera's raw sink, so every captured frame is published to the
-    control process for the dataset. Returns
-    ``(owned_camera, {track: source}, [writers], {source: (shm_name, w, h, fps)})``
-    or ``None`` when the gst stack/camera is unavailable (the caller then has no
-    raw path for this camera and falls back to the in-process camera pipeline).
+    Like :func:`_open_gst_camera`, but additionally exports each source's raw
+    frames to the recorder process for the dataset. Two transports:
+
+    * **gstshm** (``socket_dir`` set — gst's ``shm`` plugin is available): the raw
+      branch ends in a native ``shmsink`` (pure C), so the relay does **zero**
+      Python per raw frame and its interpreter stays free for the WebRTC send.
+      The recorder reads via ``shmsrc`` (:class:`GstShmFrameReader`).
+    * **pyshm** (fallback): a Python pull loop copies each frame into a
+      :class:`RawFrameWriter` shared-memory block (the older path; runs the copy
+      in the relay's interpreter).
+
+    Returns ``(owned_camera, {track: source}, [writers], {source: meta})`` — where
+    ``meta`` is the per-source dict from :func:`_gstshm_meta` / :func:`_pyshm_meta`
+    — or ``None`` when the gst stack/camera is unavailable (the caller then falls
+    back to the in-process camera pipeline).
     """
     from .gst_zed import (
         _RESOLUTION_DIMS,
@@ -117,10 +159,10 @@ def _open_gst_camera_raw(
     if resolution not in _RESOLUTION_DIMS:
         return None
     width, height = _RESOLUTION_DIMS[resolution]
-    # The dataset (raw) frames are what cross to the control process and feed the
+    # The dataset (raw) frames are what cross to the recorder process and feed the
     # NVENC encoder; downscale them on the relay's VIC when the caller asks for a
     # smaller dataset resolution (clamped here, so it never upscales). The encoded
-    # headset stream keeps the full capture resolution. The shared-memory blocks,
+    # headset stream keeps the full capture resolution. The shm blocks/sockets,
     # raw_meta, and gst raw caps must all agree on these dims.
     raw_w, raw_h = width, height
     ds_name = spec.get("dataset_resolution")
@@ -129,15 +171,44 @@ def _open_gst_camera_raw(
         if dw < width or dh < height:
             raw_w, raw_h = dw, dh
     raw_dims = (raw_w, raw_h)
+    use_shm = socket_dir is not None
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
         try:
+            if stereo and use_shm:
+                left_sock = os.path.join(socket_dir, f"{name}_left.sock")
+                right_sock = os.path.join(socket_dir, f"{name}_right.sock")
+                cam: object = ZedGstStereoCamera(
+                    serial,
+                    resolution,
+                    fps,
+                    want_encoded=True,
+                    left_raw_socket_path=left_sock,
+                    right_raw_socket_path=right_sock,
+                    raw_dims=raw_dims,
+                )
+                cam.connect()
+                sources = {
+                    f"{name}_left": cam.left_view,
+                    f"{name}_right": cam.right_view,
+                }
+                caps = _raw_caps(raw_w, raw_h, fps)
+                lat = cam.raw_latency_s
+                raw_meta = {
+                    f"{name}_left": _gstshm_meta(
+                        left_sock, caps, raw_w, raw_h, fps, lat
+                    ),
+                    f"{name}_right": _gstshm_meta(
+                        right_sock, caps, raw_w, raw_h, fps, lat
+                    ),
+                }
+                return cam, sources, [], raw_meta
             if stereo:
                 left = RawFrameWriter.create(raw_w, raw_h, cond)
                 right = RawFrameWriter.create(raw_w, raw_h, cond)
                 writers = [left, right]
-                cam: object = ZedGstStereoCamera(
+                cam = ZedGstStereoCamera(
                     serial,
                     resolution,
                     fps,
@@ -152,10 +223,26 @@ def _open_gst_camera_raw(
                     f"{name}_right": cam.right_view,
                 }
                 raw_meta = {
-                    f"{name}_left": (left.name, raw_w, raw_h, fps),
-                    f"{name}_right": (right.name, raw_w, raw_h, fps),
+                    f"{name}_left": _pyshm_meta(left.name, raw_w, raw_h, fps),
+                    f"{name}_right": _pyshm_meta(right.name, raw_w, raw_h, fps),
                 }
                 return cam, sources, writers, raw_meta
+            if use_shm:
+                sock = os.path.join(socket_dir, f"{name}.sock")
+                cam = ZedGstCamera(
+                    serial,
+                    resolution,
+                    fps,
+                    want_encoded=True,
+                    raw_socket_path=sock,
+                    raw_dims=raw_dims,
+                )
+                cam.connect()
+                caps = _raw_caps(raw_w, raw_h, fps)
+                meta = {
+                    name: _gstshm_meta(sock, caps, raw_w, raw_h, fps, cam.raw_latency_s)
+                }
+                return cam, {name: cam}, [], meta
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
             cam = ZedGstCamera(
@@ -167,7 +254,12 @@ def _open_gst_camera_raw(
                 raw_dims=raw_dims,
             )
             cam.connect()
-            return cam, {name: cam}, writers, {name: (writer.name, raw_w, raw_h, fps)}
+            return (
+                cam,
+                {name: cam},
+                writers,
+                {name: _pyshm_meta(writer.name, raw_w, raw_h, fps)},
+            )
         except Exception as exc:  # noqa: BLE001 - try lower fps, then give up
             for w in writers:
                 w.close()
@@ -274,10 +366,23 @@ def _relay_main(
     owned: list[object] = []
     sources: dict[str, object] = {}
     writers: list[object] = []
-    raw_meta: dict[str, tuple] = {}
+    raw_meta: dict[str, dict] = {}
+    # Prefer the gst-native shmsink transport for raw frames: it exports each
+    # frame to the recorder in C, so the relay does zero Python per raw frame and
+    # the WebRTC send keeps the GIL it needs (the recording-feed fix). Falls back
+    # to the in-relay Python copy (RawFrameWriter) when gst's shm plugin is
+    # absent. A per-relay-PID dir holds one socket per source; removed on exit.
+    socket_dir: str | None = None
+    if want_raw:
+        from .gst_zed import _element_available
+
+        if _element_available("shmsink") and _element_available("shmsrc"):
+            import tempfile
+
+            socket_dir = tempfile.mkdtemp(prefix="axol-raw-")
     for name, spec in cameras.items():
         if want_raw:
-            raw = _open_gst_camera_raw(name, spec, raw_cond)
+            raw = _open_gst_camera_raw(name, spec, raw_cond, socket_dir)
             if raw is not None:
                 cam, gst_sources, cam_writers, cam_meta = raw
                 owned.append(cam)
@@ -398,11 +503,51 @@ def _relay_main(
                 writer.close()  # type: ignore[attr-defined]
             except Exception:  # noqa: BLE001 - best-effort cleanup
                 pass
+        if socket_dir is not None:
+            import shutil
+
+            shutil.rmtree(socket_dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
 # Parent side
 # ---------------------------------------------------------------------------
+
+
+class _RawCameraStub:
+    """Dims-only stand-in for a relay raw source on the gst-shm transport.
+
+    On the shmsink path the control process never reads raw frames — the recorder
+    owns the ``shmsrc`` consumer — so the control process needs only the camera's
+    width/height/fps to size the dataset observation features and to satisfy the
+    robot's camera lifecycle (``connect``/``disconnect`` are no-ops on a proxy).
+    Reads raise: nothing in the control process should pull frames from these.
+    """
+
+    def __init__(self, width: int, height: int, fps: int) -> None:
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+    @property
+    def is_connected(self) -> bool:
+        return True
+
+    def connect(self, warmup: bool = True) -> None:
+        pass
+
+    def disconnect(self) -> None:
+        pass
+
+    close = disconnect
+
+    def _no_read(self, *args: object, **kwargs: object):
+        raise RuntimeError(
+            "raw frames are read by the recorder subprocess on the gst-shm "
+            "transport, not the control process."
+        )
+
+    read = read_at_or_after = read_latest = read_latest_with_ts = _no_read
 
 
 class VideoRelayProcess:
@@ -449,10 +594,10 @@ class VideoRelayProcess:
 
         self.sources: list[str] = []
         self.raw_cameras: dict[str, object] = {}
-        # ``{source: (shm_name, width, height, fps)}`` for the raw blocks the relay
-        # created — exposed (with :attr:`raw_cond`) so a separate recorder
-        # subprocess can attach its own readers to the same shared memory.
-        self.raw_meta: dict[str, tuple] = {}
+        # ``{source: meta}`` describing each raw source's transport (gstshm socket
+        # + caps, or pyshm block name) and dims — exposed (with :attr:`raw_cond`)
+        # so the recorder subprocess can attach its own consumer per source.
+        self.raw_meta: dict[str, dict] = {}
         if self._conn.poll(_READY_TIMEOUT_S):
             msg = self._conn.recv()
             if isinstance(msg, tuple) and msg[0] == "ready":
@@ -472,17 +617,32 @@ class VideoRelayProcess:
         """
         return self._raw_cond
 
-    def _attach_raw_readers(self, raw_meta: dict[str, tuple]) -> None:
-        """Attach a RawFrameReader proxy to each shared-memory block the relay made."""
-        if not raw_meta or self._raw_cond is None:
+    def _attach_raw_readers(self, raw_meta: dict[str, dict]) -> None:
+        """Expose each relay raw source to the control process.
+
+        On the **gstshm** transport the control process never reads frames (the
+        recorder owns the shmsrc consumer), so attach a dims-only
+        :class:`_RawCameraStub`. On the **pyshm** fallback, attach a
+        :class:`RawFrameReader` over the shared-memory block.
+        """
+        if not raw_meta:
             return
         from .shm_frames import RawFrameReader
 
-        for source, (shm_name, width, height, fps) in raw_meta.items():
+        for source, meta in raw_meta.items():
             try:
-                self.raw_cameras[source] = RawFrameReader(
-                    shm_name, width, height, fps, self._raw_cond
-                )
+                if meta["transport"] == "gstshm":
+                    self.raw_cameras[source] = _RawCameraStub(
+                        meta["width"], meta["height"], meta["fps"]
+                    )
+                elif self._raw_cond is not None:
+                    self.raw_cameras[source] = RawFrameReader(
+                        meta["shm_name"],
+                        meta["width"],
+                        meta["height"],
+                        meta["fps"],
+                        self._raw_cond,
+                    )
             except Exception as exc:  # noqa: BLE001 - skip a source we can't map
                 _logger.warning(
                     "video relay: could not attach raw frames for %s: %s",

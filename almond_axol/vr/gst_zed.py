@@ -358,6 +358,23 @@ def _raw_appsink(name: str) -> str:
     return f"appsink name={name} emit-signals=false max-buffers=2 drop=true sync=false"
 
 
+def _raw_shmsink(socket_path: str) -> str:
+    """Write raw RGBA frames to shared memory via gst's native (C) ``shmsink``.
+
+    Replaces the Python appsink-pull on the relay's raw branch: ``shmsink`` does
+    the per-frame work in C, so the relay's interpreter does **zero** Python per
+    raw frame — keeping its GIL free for the latency-critical aiortc send (the
+    Python pull loop is what halved the send during recording). The recorder
+    process reads these frames with a matching ``shmsrc`` (see
+    :class:`~almond_axol.vr.shm_frames.GstShmFrameReader`). ``wait-for-connection
+    =false`` so the relay never blocks when the recorder isn't attached yet.
+    """
+    return (
+        f"shmsink socket-path={socket_path} wait-for-connection=false "
+        "sync=false async=false"
+    )
+
+
 def _enc_branch(bitrate: int, fps: int) -> str:
     return (
         f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
@@ -405,6 +422,27 @@ class _GstPipelineBase:
         running_now = self._clock.get_time() - self._pipeline.get_base_time()
         latency_s = max(0, running_now - pts) / 1e9
         return recv_perf - latency_s
+
+    def _measure_raw_latency_s(self, fps: int) -> float:
+        """Best-effort glass-to-pull latency (s) for shmsink-path frame stamps.
+
+        On the ``shmsink`` raw path the recorder gets no buffer PTS, so it can't
+        run :meth:`_cap_perf_from_pts`; it stamps ``recv_perf - latency_s``
+        instead. The pipeline's queried latency is a cheap, one-shot proxy for
+        that compensation (no per-frame cost); fall back to one frame interval
+        when the query is unavailable. A small constant bias here only shifts all
+        images uniformly vs the joint samples (both on the same perf_counter
+        clock), within the capture loop's frame tolerance.
+        """
+        try:
+            q = self._gst.Query.new_latency()
+            if self._pipeline.query(q):
+                _live, min_lat, _max_lat = q.parse_latency()
+                if min_lat is not None and min_lat != self._gst.CLOCK_TIME_NONE:
+                    return min_lat / 1e9
+        except Exception:  # noqa: BLE001 - latency query is best-effort
+            pass
+        return 1.0 / fps if fps else 0.0
 
     def _start_pull(self, name: str, sink_name: str, handler: Any) -> None:
         sink = self._pipeline.get_by_name(sink_name)
@@ -560,6 +598,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         want_encoded: bool = True,
         want_raw: bool = False,
         raw_sink: Any = None,
+        raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
@@ -568,10 +607,12 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 f"unsupported ZED X One resolution {resolution!r} "
                 f"(expected one of {', '.join(_RESOLUTION_ENUM)})"
             )
-        # A custom raw sink (e.g. the relay's shared-memory writer) implies the
-        # raw branch; it replaces the in-process _RawBuffer so no frame is ever
-        # stored locally — the consumer reads from the sink instead.
-        want_raw = want_raw or raw_sink is not None
+        # A custom raw sink (the relay's shared-memory writer) or a shmsink socket
+        # path both imply the raw branch and replace the in-process _RawBuffer: no
+        # frame is stored locally — the consumer reads from the sink / shm instead.
+        # ``raw_socket_path`` routes the raw branch through gst's native shmsink so
+        # the relay does no Python per raw frame (the fix for the recording feed).
+        want_raw = want_raw or raw_sink is not None or raw_socket_path is not None
         if not (want_encoded or want_raw):
             raise ValueError("ZedGstCamera needs at least one of encoded/raw")
         self.serial = serial
@@ -585,10 +626,14 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self._want_encoded = want_encoded
         self._want_raw = want_raw
         self._raw_sink_override = raw_sink
+        self._raw_socket_path = raw_socket_path
+        # Pipeline latency for the shmsink path's recorder-side frame stamps,
+        # measured once after the pipeline plays (see _measure_raw_latency_s).
+        self.raw_latency_s = 0.0
         self._enc = _AUChannel(lambda: self.alive) if want_encoded else None
         self._raw = (
             _RawBuffer(self.raw_width, self.raw_height)
-            if want_raw and raw_sink is None
+            if want_raw and raw_sink is None and raw_socket_path is None
             else None
         )
         self._alive_fn = lambda: self.alive
@@ -613,10 +658,15 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         # unchanged; `collect-data` explicitly closes it until an episode records.
         # nvvidconv (the VIC) resizes for free on the GPU, so a smaller raw caps
         # downscales here without touching the CPU or the encoded branch.
+        raw_tail = (
+            _raw_shmsink(self._raw_socket_path)
+            if self._raw_socket_path
+            else _raw_appsink("raw")
+        )
         raw = (
             f"{_QUEUE} ! valve name=rawvalve drop=false "
             f"! nvvidconv ! video/x-raw,format=RGBA,"
-            f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
+            f"width={self.raw_width},height={self.raw_height} ! {raw_tail}"
         )
         if self._want_encoded and self._want_raw:
             return f"{src} ! tee name=t  t. ! {enc}  t. ! {raw}"
@@ -647,7 +697,10 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 "enc",
                 self._make_au_handler(self._enc, f"sn{self.serial}"),
             )
-        if self._want_raw:
+        # On the shmsink path the frame copy happens in gst's C threads (no
+        # Python pull loop here), so the relay's interpreter stays free for the
+        # WebRTC send. Only the appsink path needs a Python pull thread.
+        if self._want_raw and self._raw_socket_path is None:
             sink = self._raw_sink_override or self._buffer_sink(self._raw)
             self._start_pull(
                 f"zedgst-{self.serial}-raw",
@@ -661,6 +714,8 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
                 f"ZedGstCamera(serial={self.serial}) did not start streaming "
                 f"within {_READY_TIMEOUT_S:.0f}s (camera absent or in use?)."
             )
+        if self._raw_socket_path is not None:
+            self.raw_latency_s = self._measure_raw_latency_s(self.fps)
         _logger.info(
             "ZedGstCamera connected (sn=%d %dx%d @ %dfps, encoded=%s raw=%s).",
             self.serial,
@@ -728,6 +783,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
         want_raw: bool = False,
         left_raw_sink: Any = None,
         right_raw_sink: Any = None,
+        left_raw_socket_path: str | None = None,
+        right_raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
@@ -736,9 +793,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"unsupported stereo ZED X resolution {resolution!r} "
                 f"(expected one of {', '.join(_STEREO_RESOLUTION_ENUM)})"
             )
-        # A per-eye raw sink (the relay's shared-memory writer) implies the raw
-        # branch and replaces that eye's in-process _RawBuffer.
-        want_raw = want_raw or left_raw_sink is not None or right_raw_sink is not None
+        # A per-eye raw sink (the relay's shared-memory writer) or a shmsink socket
+        # path implies that eye's raw branch and replaces its in-process _RawBuffer.
+        want_raw = (
+            want_raw
+            or left_raw_sink is not None
+            or right_raw_sink is not None
+            or left_raw_socket_path is not None
+            or right_raw_socket_path is not None
+        )
         if not (want_encoded or want_raw):
             raise ValueError("ZedGstStereoCamera needs at least one of encoded/raw")
         self.serial = serial
@@ -752,19 +815,29 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self._want_raw = want_raw
         self._left_raw_sink = left_raw_sink
         self._right_raw_sink = right_raw_sink
+        self._left_raw_socket_path = left_raw_socket_path
+        self._right_raw_socket_path = right_raw_socket_path
+        # Pipeline latency for the shmsink path's recorder-side frame stamps.
+        self.raw_latency_s = 0.0
 
-        def eye(raw_sink: Any) -> tuple[_AUChannel | None, _RawBuffer | None, _GstEye]:
+        def eye(
+            raw_sink: Any, socket_path: str | None
+        ) -> tuple[_AUChannel | None, _RawBuffer | None, _GstEye]:
             enc = _AUChannel(lambda: self.alive) if want_encoded else None
             raw = (
                 _RawBuffer(self.raw_width, self.raw_height)
-                if want_raw and raw_sink is None
+                if want_raw and raw_sink is None and socket_path is None
                 else None
             )
             view = _GstEye(self, enc, raw, self.width, self.height, self.fps)
             return enc, raw, view
 
-        self._left_enc, self._left_raw, self.left_view = eye(left_raw_sink)
-        self._right_enc, self._right_raw, self.right_view = eye(right_raw_sink)
+        self._left_enc, self._left_raw, self.left_view = eye(
+            left_raw_sink, left_raw_socket_path
+        )
+        self._right_enc, self._right_raw, self.right_view = eye(
+            right_raw_sink, right_raw_socket_path
+        )
 
     def __repr__(self) -> str:
         return f"ZedGstStereoCamera(serial={self.serial})"
@@ -785,11 +858,18 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! "
                 f"{_enc_appsink('enc_' + sink_suffix)}"
             )
+            sock = (
+                self._left_raw_socket_path
+                if sink_suffix == "l"
+                else self._right_raw_socket_path
+            )
+            raw_tail = (
+                _raw_shmsink(sock) if sock else _raw_appsink("raw_" + sink_suffix)
+            )
             raw = (
                 f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
-                f"width={self.raw_width},height={self.raw_height} ! "
-                f"{_raw_appsink('raw_' + sink_suffix)}"
+                f"width={self.raw_width},height={self.raw_height} ! {raw_tail}"
             )
             return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
         if self._want_encoded:
@@ -827,9 +907,21 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
     def connect(self, warmup: bool = True) -> None:
         self._launch(self._pipeline_str())
-        for enc, raw, raw_sink, suffix in (
-            (self._left_enc, self._left_raw, self._left_raw_sink, "l"),
-            (self._right_enc, self._right_raw, self._right_raw_sink, "r"),
+        for enc, raw, raw_sink, sock, suffix in (
+            (
+                self._left_enc,
+                self._left_raw,
+                self._left_raw_sink,
+                self._left_raw_socket_path,
+                "l",
+            ),
+            (
+                self._right_enc,
+                self._right_raw,
+                self._right_raw_sink,
+                self._right_raw_socket_path,
+                "r",
+            ),
         ):
             if enc is not None:
                 self._start_pull(
@@ -837,7 +929,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     f"enc_{suffix}",
                     self._make_au_handler(enc, f"sn{self.serial}-{suffix}"),
                 )
-            if self._want_raw:
+            # shmsink writes the frame in C; only the appsink path needs a Python
+            # pull thread (which would contend with the relay's send — the bug).
+            if self._want_raw and sock is None:
                 sink = raw_sink or self._buffer_sink(raw)
                 self._start_pull(
                     f"zedgst-{self.serial}-raw{suffix}",
@@ -851,6 +945,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"ZedGstStereoCamera(serial={self.serial}) did not start "
                 f"streaming within {_READY_TIMEOUT_S:.0f}s."
             )
+        if self._left_raw_socket_path or self._right_raw_socket_path:
+            self.raw_latency_s = self._measure_raw_latency_s(self.fps)
         _logger.info(
             "ZedGstStereoCamera connected (sn=%d %dx%d/eye @ %dfps).",
             self.serial,

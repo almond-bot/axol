@@ -11,9 +11,12 @@ This module moves all of that into a dedicated **recorder subprocess**
 (:class:`DatasetRecorderProcess`) so the control process only writes a tiny
 joint/action snapshot per tick (via
 :class:`~almond_axol.vr.shm_frames.SnapshotWriter`) and sends episode-lifecycle
-commands. The recorder attaches its own :class:`RawFrameReader`\\ s to the relay's
-shared-memory camera blocks (no extra frame copy — the frames already live in
-shared memory) and owns the ``LeRobotDataset`` end to end.
+commands. The recorder pulls each camera's raw frames from the relay — via a gst
+``shmsrc`` consumer (the relay's ``shmsink`` exports frames in C, so the relay
+does no Python per frame and its WebRTC send keeps its GIL), or, when gst's shm
+plugin is absent, via a :class:`RawFrameReader` over a shared-memory block the
+relay's Python pull loop fills. Either way the recorder owns the
+``LeRobotDataset`` end to end.
 
 When the video relay is unavailable (no gst stack — a degraded, non-Jetson path),
 :class:`InProcessRecorder` keeps the old behavior: dataset + capture thread in
@@ -441,14 +444,39 @@ def _recorder_main(
 
     from lerobot.processor import make_default_processors
 
-    from ..vr.shm_frames import RawFrameReader, SnapshotReader
+    from ..vr.shm_frames import GstShmFrameReader, RawFrameReader, SnapshotReader
 
     install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
 
+    # Build a per-source raw-frame reader matching the relay's chosen transport.
+    # gstshm: a shmsrc → appsink consumer pulling on THIS process's GIL (so the
+    # relay's send is never starved — the fix). pyshm: the older RawFrameReader
+    # over a shared-memory block the relay's Python pull loop fills. Started here
+    # (before "ready") and torn down in the finally; the relay's rawvalve gates
+    # episode on/off, so the consumers can run continuously and just idle when
+    # the valve is closed.
     cameras: dict[str, Any] = {}
-    for source, (shm_name, width, height, fps) in config["raw_meta"].items():
-        cameras[source] = RawFrameReader(shm_name, width, height, fps, raw_cond)
+    for source, meta in config["raw_meta"].items():
+        if meta["transport"] == "gstshm":
+            cam = GstShmFrameReader(
+                meta["socket_path"],
+                meta["caps"],
+                meta["width"],
+                meta["height"],
+                meta["fps"],
+                meta["latency_s"],
+            )
+            cam.connect()
+            cameras[source] = cam
+        else:
+            cameras[source] = RawFrameReader(
+                meta["shm_name"],
+                meta["width"],
+                meta["height"],
+                meta["fps"],
+                raw_cond,
+            )
     snap_reader = SnapshotReader(
         config["snapshot_shm_name"], config["obs_keys"], config["action_keys"]
     )
@@ -547,7 +575,7 @@ class DatasetRecorderProcess:
         self,
         *,
         raw_cond: Any,
-        raw_meta: dict[str, tuple],
+        raw_meta: dict[str, dict],
         obs_keys: list[str],
         action_keys: list[str],
         config: dict,
