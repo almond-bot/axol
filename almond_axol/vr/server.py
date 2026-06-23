@@ -88,6 +88,8 @@ class VRServer:
         self._telemetry_count: int = 0
         self._telemetry_max_arrival_gap_ms: float = 0.0
         self._telemetry_max_client_dt_ms: float | None = None
+        self._telemetry_client_dropped: int = 0
+        self._telemetry_max_client_buffered_bytes: int = 0
         self._telemetry_missing_seq: int = 0
         self._telemetry_out_of_order_seq: int = 0
 
@@ -287,6 +289,8 @@ class VRServer:
         self._telemetry_count = 0
         self._telemetry_max_arrival_gap_ms = 0.0
         self._telemetry_max_client_dt_ms = None
+        self._telemetry_client_dropped = 0
+        self._telemetry_max_client_buffered_bytes = 0
         self._telemetry_missing_seq = 0
         self._telemetry_out_of_order_seq = 0
 
@@ -306,6 +310,12 @@ class VRServer:
         if frame.client_dt_ms is not None:
             self._telemetry_max_client_dt_ms = max(
                 self._telemetry_max_client_dt_ms or 0.0, frame.client_dt_ms
+            )
+        self._telemetry_client_dropped += max(0, frame.client_dropped_since_last)
+        if frame.client_buffered_amount is not None:
+            self._telemetry_max_client_buffered_bytes = max(
+                self._telemetry_max_client_buffered_bytes,
+                frame.client_buffered_amount,
             )
 
         if frame.seq is not None:
@@ -333,10 +343,14 @@ class VRServer:
         )
         _logger.info(
             "vr ingress: %.1f Hz  max_arrival_gap=%.1fms  "
-            "max_client_dt=%s  missing_seq=%d  out_of_order_seq=%d  last_seq=%s",
+            "max_client_dt=%s  client_dropped=%d  "
+            "max_client_buffered=%dB  missing_seq=%d  "
+            "out_of_order_seq=%d  last_seq=%s",
             hz,
             self._telemetry_max_arrival_gap_ms,
             client_gap,
+            self._telemetry_client_dropped,
+            self._telemetry_max_client_buffered_bytes,
             self._telemetry_missing_seq,
             self._telemetry_out_of_order_seq,
             seq,
@@ -346,6 +360,8 @@ class VRServer:
         self._telemetry_count = 0
         self._telemetry_max_arrival_gap_ms = 0.0
         self._telemetry_max_client_dt_ms = None
+        self._telemetry_client_dropped = 0
+        self._telemetry_max_client_buffered_bytes = 0
         self._telemetry_missing_seq = 0
         self._telemetry_out_of_order_seq = 0
 

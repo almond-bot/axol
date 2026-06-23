@@ -74,6 +74,11 @@ Each frame sends a JSON message over the unreliable unordered WebRTC pose data c
   r_grip:  number    // right grip
   reset:   boolean   // true on the frame X was pressed
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
+  seq:     number
+  sent_at_ms: number
+  client_dt_ms: number | null
+  client_dropped_since_last: number
+  client_buffered_amount: number
 }
 ```
 

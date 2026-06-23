@@ -76,6 +76,11 @@ class VRFrame(BaseModel):
             useful only for comparing deltas from the same headset clock.
         client_dt_ms: Sender-side milliseconds since the previous transmitted
             frame, if provided.
+        client_dropped_since_last: Number of pose frames intentionally skipped
+            by the browser due to pose-channel backpressure since the previous
+            transmitted frame.
+        client_buffered_amount: Browser data-channel buffered bytes immediately
+            before the transmitted frame was queued.
     """
 
     l_ee: VRPose
@@ -91,3 +96,5 @@ class VRFrame(BaseModel):
     seq: int | None = None
     sent_at_ms: float | None = None
     client_dt_ms: float | None = None
+    client_dropped_since_last: int = 0
+    client_buffered_amount: int | None = None

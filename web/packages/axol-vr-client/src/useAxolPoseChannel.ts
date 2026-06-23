@@ -80,7 +80,7 @@ export function useAxolPoseChannel(
       pcRef.current = pc
       const channel = pc.createDataChannel("pose", {
         ordered: false,
-        maxRetransmits: 0,
+        maxPacketLifeTime: 20,
       })
       channelRef.current = channel
 

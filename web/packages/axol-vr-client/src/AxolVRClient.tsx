@@ -5,6 +5,7 @@ import { AxolState } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
+const POSE_CHANNEL_MAX_BUFFERED_BYTES = 0
 
 export function AxolVRClient({
   wsRef,
@@ -24,6 +25,7 @@ export function AxolVRClient({
   const stateRef = useRef<AxolState>(AxolState.Teleop)
   const seqRef = useRef(0)
   const lastSentAtMsRef = useRef<number | null>(null)
+  const droppedSinceLastRef = useRef(0)
   const prevXRef = useRef(false)
   const prevYRef = useRef(false)
   const prevARef = useRef(false)
@@ -152,6 +154,16 @@ export function AxolVRClient({
 
     const dc = poseChannelRef.current
     if (!dc || dc.readyState !== "open") return
+    const seq = ++seqRef.current
+
+    // Keep the pose stream latest-only. If the browser already has any pose
+    // bytes queued for the channel, adding another frame just recreates the
+    // stale-frame buffering we moved away from WebSocket to avoid. Reset is a
+    // single-frame command edge, so let it through even under backpressure.
+    if (!reset && dc.bufferedAmount > POSE_CHANNEL_MAX_BUFFERED_BYTES) {
+      droppedSinceLastRef.current += 1
+      return
+    }
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -191,25 +203,32 @@ export function AxolVRClient({
     const sentAtMs = performance.now()
     const lastSentAtMs = lastSentAtMsRef.current
     const clientDtMs = lastSentAtMs === null ? null : sentAtMs - lastSentAtMs
-    lastSentAtMsRef.current = sentAtMs
 
-    dc.send(
-      JSON.stringify({
-        l_ee,
-        r_ee,
-        l_elbow,
-        r_elbow,
-        l_lock,
-        r_lock,
-        l_grip,
-        r_grip,
-        reset,
-        state: stateRef.current,
-        seq: ++seqRef.current,
-        sent_at_ms: sentAtMs,
-        client_dt_ms: clientDtMs,
-      })
-    )
+    try {
+      dc.send(
+        JSON.stringify({
+          l_ee,
+          r_ee,
+          l_elbow,
+          r_elbow,
+          l_lock,
+          r_lock,
+          l_grip,
+          r_grip,
+          reset,
+          state: stateRef.current,
+          seq,
+          sent_at_ms: sentAtMs,
+          client_dt_ms: clientDtMs,
+          client_dropped_since_last: droppedSinceLastRef.current,
+          client_buffered_amount: dc.bufferedAmount,
+        })
+      )
+      lastSentAtMsRef.current = sentAtMs
+      droppedSinceLastRef.current = 0
+    } catch {
+      droppedSinceLastRef.current += 1
+    }
   })
 
   return null

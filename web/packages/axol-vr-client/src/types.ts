@@ -30,4 +30,6 @@ export type AxolPoseData = {
   seq?: number
   sent_at_ms?: number
   client_dt_ms?: number | null
+  client_dropped_since_last?: number
+  client_buffered_amount?: number
 }
