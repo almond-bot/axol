@@ -1112,18 +1112,14 @@ export default function App() {
                   onChange={(e) => setHostname(e.target.value)}
                   placeholder="axol-host.local"
                 />
-                <label className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/5 p-3 text-xs text-white/70">
+                <label className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 p-3 text-sm text-white/80">
                   <input
                     type="checkbox"
                     checked={usbPoses}
                     onChange={(e) => handleUsbToggle(e.target.checked)}
-                    className="mt-0.5 size-4 shrink-0 accent-white"
+                    className="size-4 shrink-0 accent-white"
                   />
-                  <span>
-                    <span className="font-medium text-white/90">Quest over USB</span> — stream
-                    controller poses over the cable for low latency. Camera video still uses the
-                    host above. Set up the USB connection from the control panel first.
-                  </span>
+                  Quest over USB
                 </label>
                 <Button type="submit" className="w-full" disabled={!hostname.trim()}>
                   Connect
