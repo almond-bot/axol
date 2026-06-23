@@ -21,6 +21,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--repo_id <user>/<dataset>` | Optional dataset repo ID to save rollouts |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push rollout dataset to HuggingFace Hub when done |
+| `--vcodec STR` | Video codec recorded for saved rollout datasets (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Only used with `--repo_id`. |
 | `--device STR` | PyTorch device for policy inference (default: `cuda`) |
 | `--server_host HOST` | Address of a remote [`inference-server`](/cli/inference-server). Default `null`: a `PolicyServer` child process is spawned on localhost. When set, `--policy_path` must be reachable from the server (e.g. a HF Hub repo ID) |
 | `--server_port INT` | Policy server port — for the localhost child process or the remote server (default: 8765) |
