@@ -82,6 +82,33 @@ def pin_background() -> bool:
     return _pin("background")
 
 
+def pin_relay_send_thread() -> bool:
+    """Pin the *calling thread* to a single dedicated core within the relay group.
+
+    aiortc runs the whole WebRTC send (SRTP + sendto for every stream) on one
+    asyncio thread, which is CPU-bound and pegs a core. Pinning that thread to one
+    relay core — while the relay's other threads (gst encode + the dataset
+    raw-branch shm copy) stay on the full relay group — keeps the recording
+    workload from stealing the send's CPU, so it doesn't fall behind. Call from
+    the relay's event-loop thread after its other threads exist. No-op where
+    affinity isn't available or the relay group has only one core.
+    """
+    groups = core_groups()
+    if groups is None:
+        return False
+    relay = sorted(groups["relay"])
+    if len(relay) < 2:
+        return False  # nothing to dedicate
+    send_core = {relay[0]}
+    try:
+        os.sched_setaffinity(0, send_core)  # type: ignore[attr-defined]
+    except (AttributeError, OSError) as exc:
+        _logger.debug("could not pin relay send thread to %s: %s", send_core, exc)
+        return False
+    _logger.info("pinned relay send thread to core %s", relay[0])
+    return True
+
+
 def _pin(group: str) -> bool:
     groups = core_groups()
     if groups is None:

@@ -377,6 +377,12 @@ def _relay_main(
         if manager is not None:
             await manager.close_all()
 
+    # Dedicate one relay core to the WebRTC send: aiortc does the whole send on
+    # this (the main) thread, and it's CPU-bound. Done here — after the cameras'
+    # gst pull threads were created (so they keep the full relay group and land on
+    # the other relay core) and right before the event loop runs on this thread.
+    affinity.pin_relay_send_thread()
+
     try:
         asyncio.run(serve())
     finally:
