@@ -71,18 +71,6 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
-        seq:     Monotonic sender-side frame sequence number, if provided.
-        sent_at_ms: Sender-side ``performance.now()`` timestamp in milliseconds,
-            useful only for comparing deltas from the same headset clock.
-        client_dt_ms: Sender-side milliseconds since the previous transmitted
-            frame, if provided.
-        client_dropped_since_last: Number of pose frames intentionally skipped
-            by the browser due to pose-channel backpressure since the previous
-            transmitted frame.
-        client_buffered_amount: Browser data-channel buffered bytes immediately
-            before the transmitted frame was queued.
-        client_send_copies: Number of redundant copies the browser attempted
-            for this frame on the pose data channel.
     """
 
     l_ee: VRPose
@@ -95,9 +83,3 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
-    seq: int | None = None
-    sent_at_ms: float | None = None
-    client_dt_ms: float | None = None
-    client_dropped_since_last: int = 0
-    client_buffered_amount: int | None = None
-    client_send_copies: int = 1

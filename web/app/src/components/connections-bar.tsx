@@ -1,7 +1,7 @@
-import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power } from "lucide-react"
+import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power, Usb } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { cameraCount, type CameraSpec, type RobotStatus } from "@/lib/supervisor"
+import { cameraCount, type CameraSpec, type RobotStatus, type UsbStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -68,6 +68,9 @@ export function ConnectionsBar({
   onRobotDisconnect,
   cameras,
   onConfigureCameras,
+  usb,
+  usbBusy,
+  onUsbConnect,
 }: {
   conn: ConnState
   host: string
@@ -80,6 +83,9 @@ export function ConnectionsBar({
   onRobotDisconnect: () => void
   cameras: CameraSpec
   onConfigureCameras: () => void
+  usb: UsbStatus | null
+  usbBusy: boolean
+  onUsbConnect: () => void
 }) {
   const online = conn === "ok"
 
@@ -125,8 +131,32 @@ export function ConnectionsBar({
   const camDot: Dot = camCount === 3 ? "ok" : camCount > 0 ? "warn" : "idle"
   const camLabel = camCount === 0 ? "Not configured" : `${camCount}/3 configured`
 
+  // -- quest usb (adb reverse pose tunnel) --
+  const usbDot: Dot = !usb
+    ? "idle"
+    : !usb.installed
+      ? "warn"
+      : usb.ready
+        ? "ok"
+        : usb.state === "none"
+          ? "idle"
+          : "warn"
+  const usbLabel = !usb
+    ? "—"
+    : !usb.installed
+      ? "adb not installed"
+      : usb.ready
+        ? "Controller over USB"
+        : usb.state === "device"
+          ? "Headset ready"
+          : usb.state === "none"
+            ? "No headset"
+            : usb.state === "unauthorized"
+              ? "Authorize on headset"
+              : usb.state
+
   return (
-    <div className="grid grid-cols-1 gap-3 lg:grid-cols-3">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -190,6 +220,18 @@ export function ConnectionsBar({
         <Button variant="outline" size="sm" onClick={onConfigureCameras} disabled={!online}>
           <Settings2 />
           Configure
+        </Button>
+      </Tile>
+
+      <Tile icon={<Usb className="size-3.5" />} title="Quest USB" dot={usbDot} label={usbLabel}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onUsbConnect}
+          disabled={!online || usbBusy || usb?.installed === false}
+        >
+          {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+          {usb?.ready ? "Reconnect" : "Connect"}
         </Button>
       </Tile>
     </div>

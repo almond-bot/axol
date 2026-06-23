@@ -5,17 +5,19 @@ import { AxolState } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
-const POSE_MAX_BUFFERED_BYTES = 0
 
 export function AxolVRClient({
   wsRef,
-  poseChannelRef,
+  poseWsRef,
   onStateChange,
   onPendingRecording,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
-  poseChannelRef: RefObject<RTCDataChannel | null>
+  // Optional dedicated pose WebSocket — the Quest-over-USB `adb reverse`
+  // tunnel. When open, pose frames go here so controller data avoids WiFi,
+  // while camera and state stay on the main WebSocket.
+  poseWsRef?: RefObject<WebSocket | null>
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
   onExit?: () => void
@@ -24,8 +26,6 @@ export function AxolVRClient({
 
   const stateRef = useRef<AxolState>(AxolState.Teleop)
   const seqRef = useRef(0)
-  const lastSentAtMsRef = useRef<number | null>(null)
-  const droppedSinceLastRef = useRef(0)
   const prevXRef = useRef(false)
   const prevYRef = useRef(false)
   const prevARef = useRef(false)
@@ -152,29 +152,12 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    // Prefer the WebRTC data channel (WiFi/LAN path). On the wired
-    // `adb reverse` path the data channel never opens — the TCP port-forward
-    // can't carry WebRTC — so fall back to the signaling WebSocket, which the
-    // server also accepts pose frames on.
-    const dc = poseChannelRef.current
-    const ws = wsRef.current
-    const sink: RTCDataChannel | WebSocket | null =
-      dc != null && dc.readyState === "open"
-        ? dc
-        : ws != null && ws.readyState === WebSocket.OPEN
-          ? ws
-          : null
-    if (sink == null) return
-    const seq = ++seqRef.current
-
-    // Keep the pose stream latest-only. If bytes are already queued, adding
-    // another frame just recreates the stale-frame buffering we are avoiding.
-    // Reset is a single-frame command edge, so let it through even under
-    // backpressure.
-    if (!reset && sink.bufferedAmount > POSE_MAX_BUFFERED_BYTES) {
-      droppedSinceLastRef.current += 1
-      return
-    }
+    // Send poses over the dedicated USB pose socket when it's open; otherwise
+    // the main WebSocket. Both deliver untyped pose JSON the server publishes
+    // as the latest frame.
+    const poseWs = poseWsRef?.current
+    const sink = poseWs != null && poseWs.readyState === WebSocket.OPEN ? poseWs : wsRef.current
+    if (sink == null || sink.readyState !== WebSocket.OPEN) return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -211,36 +194,21 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    const sentAtMs = performance.now()
-    const lastSentAtMs = lastSentAtMsRef.current
-    const clientDtMs = lastSentAtMs === null ? null : sentAtMs - lastSentAtMs
-
-    const payload = JSON.stringify({
-      l_ee,
-      r_ee,
-      l_elbow,
-      r_elbow,
-      l_lock,
-      r_lock,
-      l_grip,
-      r_grip,
-      reset,
-      state: stateRef.current,
-      seq,
-      sent_at_ms: sentAtMs,
-      client_dt_ms: clientDtMs,
-      client_dropped_since_last: droppedSinceLastRef.current,
-      client_buffered_amount: sink.bufferedAmount,
-      client_send_copies: 1,
-    })
-
-    try {
-      sink.send(payload)
-      lastSentAtMsRef.current = sentAtMs
-      droppedSinceLastRef.current = 0
-    } catch {
-      droppedSinceLastRef.current += 1
-    }
+    sink.send(
+      JSON.stringify({
+        l_ee,
+        r_ee,
+        l_elbow,
+        r_elbow,
+        l_lock,
+        r_lock,
+        l_grip,
+        r_grip,
+        reset,
+        state: stateRef.current,
+        seq: ++seqRef.current,
+      })
+    )
   })
 
   return null

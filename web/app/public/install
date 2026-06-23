@@ -59,7 +59,7 @@ UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- System provisioning (pyzed + GStreamer camera stack) ---------------------
+# -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
 
 # `uv tool install` handles the Python package + PyPI deps, but a few pieces it
 # can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
@@ -70,7 +70,9 @@ say "axol installed at $(command -v axol)."
 # idempotently -- the same command the `axol serve` self-updater runs after an
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
-say "Provisioning system dependencies (pyzed + GStreamer camera stack)..."
+# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport);
+# self-gates on apt and is a no-op where unavailable.
+say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
 
 # -- Jetson clocks ------------------------------------------------------------

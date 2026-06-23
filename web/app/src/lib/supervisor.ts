@@ -175,6 +175,25 @@ export async function restartCameraDaemon(): Promise<{ ok: boolean; error: strin
   return json(await fetch(apiUrl("/api/cameras/restart-daemon"), { method: "POST" }))
 }
 
+// -- Quest over USB (adb reverse pose tunnel) -----------------------------
+
+export interface UsbStatus {
+  installed: boolean
+  serial: string | null
+  // "none" | "device" | "unauthorized" | "offline" | raw adb state string
+  state: string
+  reverseActive: boolean
+  ready: boolean
+}
+
+export async function fetchUsbStatus(): Promise<UsbStatus> {
+  return json(await fetch(apiUrl("/api/usb/status")))
+}
+
+export async function usbConnect(): Promise<UsbStatus> {
+  return json(await fetch(apiUrl("/api/usb/connect"), { method: "POST" }))
+}
+
 // ---------------------------------------------------------------------------
 // In-process operations (teleop / gravity-comp / collect-data / run-policy)
 // ---------------------------------------------------------------------------

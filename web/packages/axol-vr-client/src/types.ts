@@ -27,10 +27,4 @@ export type AxolPoseData = {
   r_grip: number
   reset: boolean
   state: AxolState
-  seq?: number
-  sent_at_ms?: number
-  client_dt_ms?: number | null
-  client_dropped_since_last?: number
-  client_buffered_amount?: number
-  client_send_copies?: number
 }

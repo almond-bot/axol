@@ -15,8 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
-  isLoopbackHost,
-  useAxolPoseChannel,
+  useAxolPoseSocket,
   useAxolTracking,
   useAxolVideo,
   useAxolVRClient,
@@ -1021,16 +1020,25 @@ function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
 
 export default function App() {
   const [hostname, setHostname] = useState(() => localStorage.getItem("wsHostname") ?? "")
+  const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
-  // Wired loopback (`adb reverse`) can't carry WebRTC, so skip negotiation and
-  // let AxolVRClient stream poses over the WebSocket instead.
-  const poseChannelRef = useAxolPoseChannel(wsRef, !isLoopbackHost(hostname))
+  // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
+  // avoid WiFi latency; camera video keeps using the LAN host above. The pose
+  // socket comes up once the main connection is open and the operator opts in.
+  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(
+    usbPoses && status === AxolConnectionStatus.Open
+  )
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
     connect()
+  }
+
+  const handleUsbToggle = (next: boolean) => {
+    setUsbPoses(next)
+    localStorage.setItem("usbPoses", next ? "1" : "0")
   }
 
   return (
@@ -1060,6 +1068,23 @@ export default function App() {
                 <Button variant="ghost" className="w-full" onClick={disconnect}>
                   Disconnect
                 </Button>
+                {usbPoses && (
+                  <p className="text-center text-xs text-white/40">
+                    Quest over USB:{" "}
+                    <span
+                      className={cn(
+                        "font-medium",
+                        poseStatus === AxolConnectionStatus.Open
+                          ? "text-emerald-400"
+                          : "text-amber-400"
+                      )}
+                    >
+                      {poseStatus === AxolConnectionStatus.Open
+                        ? "controller over cable"
+                        : "waiting for cable…"}
+                    </span>
+                  </p>
+                )}
               </div>
             ) : status === AxolConnectionStatus.Connecting ? (
               <Button variant="secondary" className="w-full" onClick={disconnect}>
@@ -1087,6 +1112,19 @@ export default function App() {
                   onChange={(e) => setHostname(e.target.value)}
                   placeholder="axol-host.local"
                 />
+                <label className="flex items-start gap-2 rounded-lg border border-white/10 bg-white/5 p-3 text-xs text-white/70">
+                  <input
+                    type="checkbox"
+                    checked={usbPoses}
+                    onChange={(e) => handleUsbToggle(e.target.checked)}
+                    className="mt-0.5 size-4 shrink-0 accent-white"
+                  />
+                  <span>
+                    <span className="font-medium text-white/90">Quest over USB</span> — stream
+                    controller poses over the cable for low latency. Camera video still uses the
+                    host above. Set up the USB connection from the control panel first.
+                  </span>
+                </label>
                 <Button type="submit" className="w-full" disabled={!hostname.trim()}>
                   Connect
                 </Button>
@@ -1150,7 +1188,7 @@ export default function App() {
           <XR store={store}>
             <AxolVRClient
               wsRef={wsRef}
-              poseChannelRef={poseChannelRef}
+              poseWsRef={poseWsRef}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
               onExit={() => store.getState().session?.end()}
