@@ -28,12 +28,13 @@ import socket
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from lerobot.robots.config import RobotConfig
 from lerobot.teleoperators.config import TeleoperatorConfig
 
-from ..lerobot.camera.configuration_zed import ZedCameraConfig
+from ..lerobot.camera.configuration_zed import ZedCameraConfig, resolution_for_dims
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
 from ..utils.jetson_diag import TegraStatsDiag
@@ -97,7 +98,40 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
         _logger.warning("failed to enable camera video: %s", exc)
 
 
-def _start_video_relay(cfg: "CollectDataConfig") -> Any | None:
+def _existing_dataset_resolution(dataset_root: "Path") -> str | None:
+    """Resolution name of an existing dataset's recorded images, or ``None``.
+
+    On resume the dataset's image feature shape is fixed (baked into
+    ``meta/info.json`` when the dataset was created), so the relay must deliver
+    frames at that resolution — a differently-sized frame fails LeRobot's
+    ``validate_frame`` and kills the capture thread mid-episode. The caller reads
+    this to pin the relay to the existing resolution. Returns ``None`` if the
+    file/shape can't be read or doesn't map to a known ZED resolution.
+    """
+    import json
+
+    try:
+        data = json.loads((dataset_root / "meta" / "info.json").read_text())
+        features = data.get("features", {})
+    except (OSError, ValueError):
+        return None
+    for key, spec in features.items():
+        if not key.startswith("observation.images."):
+            continue
+        shape = spec.get("shape")
+        if not shape or len(shape) != 3:
+            continue
+        dims = [int(x) for x in shape]
+        # Stored as HWC ((H, W, 3)); tolerate a leading channel dim (CHW) too.
+        h, w = (dims[1], dims[2]) if dims[0] == 3 else (dims[0], dims[1])
+        try:
+            return resolution_for_dims(w, h)
+        except ValueError:
+            return None
+    return None
+
+
+def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any | None:
     """Start the out-of-process video relay for data collection.
 
     The relay subprocess opens the ZED cameras on the GPU-resident gst pipeline,
@@ -106,6 +140,10 @@ def _start_video_relay(cfg: "CollectDataConfig") -> Any | None:
     dataset (see :mod:`almond_axol.vr.shm_frames`). This keeps the control
     process off the camera grab/encode/RTP path entirely, so the teleop and IK
     loops stay as fast as ``axol teleop`` — even while recording.
+
+    ``dataset_resolution`` is the effective downscale target for the dataset (raw)
+    branch — the configured value for a fresh dataset, or the existing dataset's
+    resolution when resuming (the caller resolves this; see _run).
 
     Returns the :class:`VideoRelayProcess`, or ``None`` when it can't be used
     (no cameras or aiortc unavailable), in which case the caller uses the
@@ -136,7 +174,7 @@ def _start_video_relay(cfg: "CollectDataConfig") -> Any | None:
             spec["resolution"] = res
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
-        spec["dataset_resolution"] = cfg.dataset_resolution
+        spec["dataset_resolution"] = dataset_resolution
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)
@@ -512,8 +550,6 @@ def main(argv: list[str]) -> None:
 
 
 def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) -> None:
-    from pathlib import Path
-
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
@@ -555,6 +591,25 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             f"  rm -rf {dataset_root}"
         )
 
+    # A resumed dataset's image resolution is fixed by its existing metadata, so
+    # the relay must record at it regardless of the configured dataset_resolution
+    # — otherwise the downscaled frames mismatch the stored feature shape and
+    # LeRobot's validate_frame kills the capture thread mid-episode. A fresh
+    # dataset uses the configured resolution.
+    dataset_resolution = cfg.dataset_resolution
+    if is_complete:
+        existing = _existing_dataset_resolution(dataset_root)
+        if existing and existing != cfg.dataset_resolution:
+            _logger.warning(
+                "resuming a dataset recorded at %s; recording at %s to match it "
+                "(start a new dataset to record at %s).",
+                existing,
+                existing,
+                cfg.dataset_resolution,
+            )
+        if existing:
+            dataset_resolution = existing
+
     hostname = socket.gethostname()
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
         _s.connect(("8.8.8.8", 80))
@@ -571,7 +626,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # memory, so the control loops stay as fast as `axol teleop`. Only use it
     # when it exported raw frames for every observation camera; otherwise tear
     # it down and fall back to the in-process camera path (robot owns cameras).
-    relay = _start_video_relay(cfg)
+    relay = _start_video_relay(cfg, dataset_resolution)
     expected = set(cfg.robot_config.observation_cameras().keys())
     use_relay = relay is not None and expected <= set(relay.raw_cameras)
     if use_relay:
