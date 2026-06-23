@@ -119,7 +119,7 @@ For the lowest-latency controller link, stream the Quest's controller poses over
 **Each session**
 
 1. In the web control panel (`axol serve`), the **Quest USB** tile shows the headset state. The first time, accept the *Allow USB debugging?* prompt on the headset (check "Always allow"). Once authorized the tunnel comes up automatically (`adb reverse tcp:8000 tcp:8000`) and the tile turns green ("Controller over USB"); the **Connect** button is a manual fallback / reconnect.
-2. In the VR app, enter the robot's host/IP as usual and tick **Quest over USB** before connecting. Controller poses then ride the cable while camera video uses the LAN.
+2. In the VR app, enter the robot's host/IP as usual and tick **Quest over USB** before connecting. The first time, tap **Authorize USB certificate** (accepts the self-signed cert for `localhost`, a separate origin from the host cert). Controller poses then ride the cable while camera video uses the LAN.
 
 If the tile shows `unauthorized`, re-accept the prompt on the headset; if it shows no device, replug the cable and confirm Developer Mode is on.
 

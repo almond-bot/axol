@@ -1069,21 +1069,34 @@ export default function App() {
                   Disconnect
                 </Button>
                 {usbPoses && (
-                  <p className="text-center text-xs text-white/40">
-                    Quest over USB:{" "}
-                    <span
-                      className={cn(
-                        "font-medium",
-                        poseStatus === AxolConnectionStatus.Open
-                          ? "text-emerald-400"
-                          : "text-amber-400"
-                      )}
-                    >
-                      {poseStatus === AxolConnectionStatus.Open
-                        ? "controller over cable"
-                        : "waiting for cable…"}
-                    </span>
-                  </p>
+                  <div className="flex flex-col gap-2">
+                    <p className="text-center text-xs text-white/40">
+                      Quest over USB:{" "}
+                      <span
+                        className={cn(
+                          "font-medium",
+                          poseStatus === AxolConnectionStatus.Open
+                            ? "text-emerald-400"
+                            : "text-amber-400"
+                        )}
+                      >
+                        {poseStatus === AxolConnectionStatus.Open
+                          ? "controller over cable"
+                          : "waiting for USB link…"}
+                      </span>
+                    </p>
+                    {poseStatus !== AxolConnectionStatus.Open && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={() => authorizeCert(`https://localhost:${VR_WS_PORT}`)}
+                      >
+                        <ShieldCheck />
+                        Authorize USB certificate
+                      </Button>
+                    )}
+                  </div>
                 )}
               </div>
             ) : status === AxolConnectionStatus.Connecting ? (

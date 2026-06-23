@@ -47,8 +47,9 @@ def create_self_signed_cert(certfile: str, keyfile: str) -> None:
     certificate is valid for 365 days with CN=localhost and a
     ``subjectAltName`` covering ``localhost`` / ``127.0.0.1`` — so the
     Quest-over-USB ``wss://localhost:8000`` pose tunnel (``adb reverse``)
-    validates cleanly with no separate cert acceptance. LAN-IP connections
-    still mismatch and use the in-app "Authorize certificate" flow.
+    matches the cert hostname. It is still self-signed, so the browser accepts
+    it once per origin via the in-app "Authorize USB certificate" flow — same
+    as the LAN-IP host cert.
     """
     cert_dir = os.path.dirname(certfile)
     if cert_dir:
