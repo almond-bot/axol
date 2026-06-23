@@ -239,16 +239,15 @@ def _relay_main(
     """
     logging.basicConfig(level=log_level)
 
-    # Keep the relay off the control loop's cores: its WebRTC send + raw-branch
-    # shm copy (~2 cores) would otherwise preempt the control thread and cause
-    # record-time loop jitter. Core isolation is preferred — it leaves the relay
-    # at normal priority on its own cores so the headset feed stays smooth. Where
-    # affinity isn't available, fall back to a positive nice (deprioritizes the
-    # relay's CPU work; the feed may stutter under contention, but the control
-    # loop wins). Frame grab + VIC convert are on GPU/VIC hardware regardless.
+    # Pin the relay to its own cores (away from both the control loop and the
+    # dataset recorder/encoders). Its WebRTC send is latency-sensitive; sharing
+    # cores with the dataset throughput during recording starves the send and
+    # makes the headset feed laggy + grainy. Isolated, it gets prompt CPU like in
+    # teleop. Where affinity isn't available, fall back to a positive nice so it
+    # at least doesn't preempt the control loop.
     from ..utils import affinity
 
-    if not affinity.pin_background():
+    if not affinity.pin_relay():
         try:
             os.nice(10)
         except (AttributeError, OSError):
