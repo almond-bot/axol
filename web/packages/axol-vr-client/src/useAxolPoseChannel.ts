@@ -3,6 +3,29 @@ import { useEffect, useRef } from "react"
 
 const POLL_MS = 300
 const ICE_GATHERING_TIMEOUT_MS = 2000
+const STATS_MS = 1000
+
+type StatsRecord = RTCStats & Record<string, unknown>
+
+function statNumber(stat: StatsRecord | undefined, key: string): number | undefined {
+  const value = stat?.[key]
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
+}
+
+function statString(stat: StatsRecord | undefined, key: string): string | undefined {
+  const value = stat?.[key]
+  return typeof value === "string" ? value : undefined
+}
+
+function candidateLabel(stat: StatsRecord | undefined): string | undefined {
+  if (!stat) return undefined
+  const address = statString(stat, "address") ?? statString(stat, "ip") ?? "?"
+  const port = statNumber(stat, "port")
+  const protocol = statString(stat, "protocol") ?? "?"
+  const candidateType = statString(stat, "candidateType") ?? "?"
+  const networkType = statString(stat, "networkType")
+  return `${address}${port ? `:${port}` : ""}/${protocol}/${candidateType}${networkType ? `/${networkType}` : ""}`
+}
 
 function waitForIceGatheringComplete(pc: RTCPeerConnection): Promise<void> {
   if (pc.iceGatheringState === "complete") return Promise.resolve()
@@ -124,6 +147,64 @@ export function useAxolPoseChannel(
       }
     }
 
+    async function sendStats(ws: WebSocket) {
+      const pc = pcRef.current
+      const channel = channelRef.current
+      if (!pc || !channel || ws.readyState !== WebSocket.OPEN) return
+
+      try {
+        const report = await pc.getStats()
+        let selectedPair: StatsRecord | undefined
+        let fallbackPair: StatsRecord | undefined
+        let dataChannelStats: StatsRecord | undefined
+
+        report.forEach((raw) => {
+          const stat = raw as StatsRecord
+          if (stat.type === "candidate-pair") {
+            const state = statString(stat, "state")
+            const nominated = stat["nominated"] === true
+            const selected = stat["selected"] === true
+            if (selected) selectedPair = stat
+            if (!fallbackPair && nominated && state === "succeeded") fallbackPair = stat
+          } else if (stat.type === "data-channel" && statString(stat, "label") === "pose") {
+            dataChannelStats = stat
+          }
+        })
+
+        const pair = selectedPair ?? fallbackPair
+        const local = pair
+          ? (report.get(statString(pair, "localCandidateId") ?? "") as StatsRecord | undefined)
+          : undefined
+        const remote = pair
+          ? (report.get(statString(pair, "remoteCandidateId") ?? "") as StatsRecord | undefined)
+          : undefined
+        const rtt = statNumber(pair, "currentRoundTripTime")
+
+        ws.send(
+          JSON.stringify({
+            type: "pose-webrtc-stats",
+            pc_state: pc.connectionState,
+            ice_state: pc.iceConnectionState,
+            channel_state: channel.readyState,
+            channel_buffered_amount: channel.bufferedAmount,
+            selected_pair_id: pair?.id,
+            current_rtt_ms: rtt === undefined ? undefined : rtt * 1000,
+            available_outgoing_bitrate: statNumber(pair, "availableOutgoingBitrate"),
+            pair_bytes_sent: statNumber(pair, "bytesSent"),
+            pair_bytes_received: statNumber(pair, "bytesReceived"),
+            local_candidate: candidateLabel(local),
+            remote_candidate: candidateLabel(remote),
+            data_messages_sent: statNumber(dataChannelStats, "messagesSent"),
+            data_messages_received: statNumber(dataChannelStats, "messagesReceived"),
+            data_bytes_sent: statNumber(dataChannelStats, "bytesSent"),
+            data_bytes_received: statNumber(dataChannelStats, "bytesReceived"),
+          })
+        )
+      } catch {
+        // Stats are diagnostic only.
+      }
+    }
+
     function onMessage(e: MessageEvent) {
       let msg: unknown
       try {
@@ -165,8 +246,14 @@ export function useAxolPoseChannel(
       }
     }, POLL_MS)
 
+    const statsInterval = setInterval(() => {
+      const ws = attachedWsRef.current
+      if (ws) void sendStats(ws)
+    }, STATS_MS)
+
     return () => {
       clearInterval(interval)
+      clearInterval(statsInterval)
       detach()
     }
   }, [wsRef])

@@ -82,6 +82,8 @@ class VRServer:
         self._uvicorn_server: uvicorn.Server | None = None
         self._webrtc: WebRTCManager | Any | None = None
         self._pose_pcs: dict[int, Any] = {}
+        self._pose_stats: dict[str, Any] | None = None
+        self._pose_stats_received_at: float | None = None
 
         self._telemetry_window_start: float | None = None
         self._telemetry_last_arrival: float | None = None
@@ -321,6 +323,8 @@ class VRServer:
         self._telemetry_max_loop_lag_ms = 0.0
         self._telemetry_missing_seq = 0
         self._telemetry_out_of_order_seq = 0
+        self._pose_stats = None
+        self._pose_stats_received_at = None
 
     def _record_frame_telemetry(self, frame: VRFrame) -> None:
         """Log one-second summaries of headset send cadence vs server receipt."""
@@ -373,7 +377,7 @@ class VRServer:
             "vr ingress: %.1f Hz  max_arrival_gap=%.1fms  "
             "max_client_dt=%s  max_loop_lag=%.1fms  "
             "client_dropped=%d  max_client_buffered=%dB  missing_seq=%d  "
-            "out_of_order_seq=%d  last_seq=%s",
+            "out_of_order_seq=%d  last_seq=%s  %s",
             hz,
             self._telemetry_max_arrival_gap_ms,
             client_gap,
@@ -383,6 +387,7 @@ class VRServer:
             self._telemetry_missing_seq,
             self._telemetry_out_of_order_seq,
             seq,
+            self._format_pose_webrtc_stats(),
         )
 
         self._telemetry_window_start = now
@@ -405,6 +410,9 @@ class VRServer:
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
                 await self._handle_pose_webrtc_offer(websocket, client_id, sdp)
+            return
+        if msg_type == "pose-webrtc-stats":
+            self._record_pose_webrtc_stats(obj)
             return
 
         if self._webrtc is None:
@@ -488,6 +496,40 @@ class VRServer:
             _logger.error("failed to answer pose webrtc offer: %s", exc)
             await self._close_pose_channel(client_id)
             await websocket.send_text(json.dumps({"type": "pose-webrtc-unavailable"}))
+
+    @staticmethod
+    def _fmt_stat_ms(value: Any) -> str:
+        return f"{value:.1f}ms" if isinstance(value, int | float) else "n/a"
+
+    @staticmethod
+    def _fmt_stat_int(value: Any, suffix: str = "") -> str:
+        return f"{value:.0f}{suffix}" if isinstance(value, int | float) else "n/a"
+
+    def _record_pose_webrtc_stats(self, obj: dict[str, Any]) -> None:
+        """Store the latest browser-side WebRTC stats sample."""
+        self._pose_stats = dict(obj)
+        self._pose_stats_received_at = time.perf_counter()
+
+    def _format_pose_webrtc_stats(self) -> str:
+        """Return a compact browser WebRTC stats summary for ingress logs."""
+        stats = self._pose_stats
+        received = self._pose_stats_received_at
+        if stats is None or received is None:
+            return "rtc_stats=n/a"
+        age_ms = (time.perf_counter() - received) * 1000.0
+        local = stats.get("local_candidate") or "?"
+        remote = stats.get("remote_candidate") or "?"
+        return (
+            f"rtc_rtt={self._fmt_stat_ms(stats.get('current_rtt_ms'))}  "
+            f"rtc_age={age_ms:.0f}ms  "
+            f"rtc_state={stats.get('pc_state', 'n/a')}/{stats.get('ice_state', 'n/a')}/"
+            f"{stats.get('channel_state', 'n/a')}  "
+            f"rtc_pair={local}->{remote}  "
+            f"rtc_pair_bytes={self._fmt_stat_int(stats.get('pair_bytes_sent'))}/"
+            f"{self._fmt_stat_int(stats.get('pair_bytes_received'))}  "
+            f"dc_msgs={self._fmt_stat_int(stats.get('data_messages_sent'))}/"
+            f"{self._fmt_stat_int(stats.get('data_messages_received'))}"
+        )
 
     async def _close_pose_channel(self, client_id: int) -> None:
         """Close the pose WebRTC peer connection for one headset, if present."""
