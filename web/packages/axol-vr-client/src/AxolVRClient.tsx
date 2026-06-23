@@ -5,10 +5,7 @@ import { AxolState } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
-const POSE_CHANNEL_MAX_BUFFERED_BYTES = 0
-const POSE_CHANNEL_SEND_COPIES = 3
-const POSE_CHANNEL_DUPLICATE_SPACING_MS = 1
-const POSE_CHANNEL_DUPLICATE_MAX_BUFFERED_BYTES = 4096
+const POSE_MAX_BUFFERED_BYTES = 0
 
 export function AxolVRClient({
   wsRef,
@@ -155,15 +152,26 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
+    // Prefer the WebRTC data channel (WiFi/LAN path). On the wired
+    // `adb reverse` path the data channel never opens — the TCP port-forward
+    // can't carry WebRTC — so fall back to the signaling WebSocket, which the
+    // server also accepts pose frames on.
     const dc = poseChannelRef.current
-    if (!dc || dc.readyState !== "open") return
+    const ws = wsRef.current
+    const sink: RTCDataChannel | WebSocket | null =
+      dc != null && dc.readyState === "open"
+        ? dc
+        : ws != null && ws.readyState === WebSocket.OPEN
+          ? ws
+          : null
+    if (sink == null) return
     const seq = ++seqRef.current
 
-    // Keep the pose stream latest-only. If the browser already has any pose
-    // bytes queued for the channel, adding another frame just recreates the
-    // stale-frame buffering we moved away from WebSocket to avoid. Reset is a
-    // single-frame command edge, so let it through even under backpressure.
-    if (!reset && dc.bufferedAmount > POSE_CHANNEL_MAX_BUFFERED_BYTES) {
+    // Keep the pose stream latest-only. If bytes are already queued, adding
+    // another frame just recreates the stale-frame buffering we are avoiding.
+    // Reset is a single-frame command edge, so let it through even under
+    // backpressure.
+    if (!reset && sink.bufferedAmount > POSE_MAX_BUFFERED_BYTES) {
       droppedSinceLastRef.current += 1
       return
     }
@@ -222,27 +230,14 @@ export function AxolVRClient({
       sent_at_ms: sentAtMs,
       client_dt_ms: clientDtMs,
       client_dropped_since_last: droppedSinceLastRef.current,
-      client_buffered_amount: dc.bufferedAmount,
-      client_send_copies: POSE_CHANNEL_SEND_COPIES,
+      client_buffered_amount: sink.bufferedAmount,
+      client_send_copies: 1,
     })
 
     try {
-      dc.send(payload)
+      sink.send(payload)
       lastSentAtMsRef.current = sentAtMs
       droppedSinceLastRef.current = 0
-
-      for (let copy = 1; copy < POSE_CHANNEL_SEND_COPIES; copy += 1) {
-        window.setTimeout(() => {
-          const channel = poseChannelRef.current
-          if (channel !== dc || channel.readyState !== "open") return
-          if (channel.bufferedAmount > POSE_CHANNEL_DUPLICATE_MAX_BUFFERED_BYTES) return
-          try {
-            channel.send(payload)
-          } catch {
-            // Best-effort redundancy only; the next XR frame carries fresh state.
-          }
-        }, copy * POSE_CHANNEL_DUPLICATE_SPACING_MS)
-      }
     } catch {
       droppedSinceLastRef.current += 1
     }

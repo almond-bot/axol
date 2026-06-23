@@ -48,9 +48,15 @@ function waitForIceGatheringComplete(pc: RTCPeerConnection): Promise<void> {
  * frames. The existing WebSocket remains only for SDP signaling and low-rate
  * server feedback; once this ref is open, pose transport is UDP/SCTP rather
  * than reliable ordered WebSocket/TCP.
+ *
+ * Pass ``enabled=false`` on the wired loopback (`adb reverse`) path: WebRTC
+ * can't traverse the TCP port-forward, so negotiation would only fail and
+ * churn. The ref then stays null and the caller sends poses over the
+ * WebSocket instead.
  */
 export function useAxolPoseChannel(
-  wsRef: RefObject<WebSocket | null>
+  wsRef: RefObject<WebSocket | null>,
+  enabled = true
 ): RefObject<RTCDataChannel | null> {
   const channelRef = useRef<RTCDataChannel | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
@@ -60,6 +66,7 @@ export function useAxolPoseChannel(
   const connectingRef = useRef(false)
 
   useEffect(() => {
+    if (!enabled) return
     function closePc() {
       const channel = channelRef.current
       if (channel) {
@@ -256,7 +263,7 @@ export function useAxolPoseChannel(
       clearInterval(statsInterval)
       detach()
     }
-  }, [wsRef])
+  }, [wsRef, enabled])
 
   return channelRef
 }

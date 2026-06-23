@@ -15,6 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  isLoopbackHost,
   useAxolPoseChannel,
   useAxolTracking,
   useAxolVideo,
@@ -1023,7 +1024,9 @@ export default function App() {
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
-  const poseChannelRef = useAxolPoseChannel(wsRef)
+  // Wired loopback (`adb reverse`) can't carry WebRTC, so skip negotiation and
+  // let AxolVRClient stream poses over the WebSocket instead.
+  const poseChannelRef = useAxolPoseChannel(wsRef, !isLoopbackHost(hostname))
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
