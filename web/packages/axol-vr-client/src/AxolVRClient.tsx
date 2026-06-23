@@ -8,11 +8,13 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 
 export function AxolVRClient({
   wsRef,
+  poseChannelRef,
   onStateChange,
   onPendingRecording,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
+  poseChannelRef: RefObject<RTCDataChannel | null>
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
   onExit?: () => void
@@ -148,8 +150,8 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    const dc = wsRef.current
-    if (!dc || dc.readyState !== WebSocket.OPEN) return
+    const dc = poseChannelRef.current
+    if (!dc || dc.readyState !== "open") return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null

@@ -1,13 +1,14 @@
 """
-VR WebSocket server for the Axol arm.
+VR network server for the Axol arm.
 
 VRServer accepts secure WebSocket (WSS) connections from a VR headset and
-surfaces the latest VRFrame to the caller. IK and motor control are handled
-separately — this class is purely the network layer.
+negotiates WebRTC data channels for high-rate pose transport. It surfaces the
+latest VRFrame to the caller. IK and motor control are handled separately —
+this class is purely the network layer.
 
 Communication is bidirectional:
-  - headset → server: VRFrame JSON every XR frame
-  - server → headset: arbitrary JSON (e.g. state feedback via broadcast_text)
+  - headset → server: VRFrame JSON over an unreliable unordered WebRTC data channel
+  - WebSocket: SDP signaling plus arbitrary JSON feedback (e.g. broadcast_text)
 
 Typical usage::
 
@@ -52,7 +53,7 @@ _logger = logging.getLogger(__name__)
 
 
 class VRServer:
-    """Secure WebSocket server that receives VRFrame data from a VR headset.
+    """Secure WebSocket server plus WebRTC pose channel for a VR headset.
 
     Args:
         config:  Server configuration (port, TLS paths). Defaults to VRServerConfig().
@@ -79,6 +80,7 @@ class VRServer:
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._webrtc: WebRTCManager | Any | None = None
+        self._pose_pcs: dict[int, Any] = {}
 
         self._telemetry_window_start: float | None = None
         self._telemetry_last_arrival: float | None = None
@@ -191,6 +193,8 @@ class VRServer:
 
     async def disable(self) -> None:
         """Gracefully shut down the WSS server."""
+        await self._close_all_pose_channels()
+
         if self._webrtc is not None:
             await self._webrtc.close_all()
 
@@ -235,18 +239,37 @@ class VRServer:
     ) -> None:
         """Dispatch one inbound text message.
 
-        Signaling messages carry a ``type`` field; pose frames do not.
+        Signaling messages carry a ``type`` field. Pose frames normally arrive
+        on the WebRTC data channel; untyped WebSocket frames are accepted for
+        compatibility with older clients.
         """
-        try:
-            obj = json.loads(data)
-        except Exception as exc:
-            _logger.warning("invalid json: %s", exc)
+        obj = self._parse_json(data)
+        if obj is None:
             return
 
         if isinstance(obj, dict) and "type" in obj:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
+        self._handle_pose_payload(obj)
+
+    @staticmethod
+    def _parse_json(data: str | bytes) -> Any | None:
+        """Parse an inbound text/bytes JSON payload, logging malformed input."""
+        if isinstance(data, bytes):
+            try:
+                data = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                _logger.warning("invalid utf-8: %s", exc)
+                return None
+        try:
+            return json.loads(data)
+        except Exception as exc:
+            _logger.warning("invalid json: %s", exc)
+            return None
+
+    def _handle_pose_payload(self, obj: Any) -> None:
+        """Validate and publish one headset pose frame."""
         try:
             frame = VRFrame.model_validate(obj)
             self._record_frame_telemetry(frame)
@@ -332,6 +355,12 @@ class VRServer:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
 
+        if msg_type == "pose-webrtc-offer":
+            sdp = obj.get("sdp")
+            if isinstance(sdp, str):
+                await self._handle_pose_webrtc_offer(websocket, client_id, sdp)
+            return
+
         if self._webrtc is None:
             if msg_type == "webrtc-request":
                 await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
@@ -356,6 +385,77 @@ class VRServer:
                     _logger.error("failed to apply webrtc answer: %s", exc)
         else:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
+
+    async def _handle_pose_webrtc_offer(
+        self, websocket: WebSocket, client_id: int, sdp: str
+    ) -> None:
+        """Answer a client-created WebRTC data channel for pose frames."""
+        try:
+            from aiortc import RTCPeerConnection, RTCSessionDescription
+        except Exception as exc:  # noqa: BLE001 - dependency unavailable
+            _logger.warning("pose webrtc unavailable: %s", exc)
+            await websocket.send_text(json.dumps({"type": "pose-webrtc-unavailable"}))
+            return
+
+        await self._close_pose_channel(client_id)
+
+        pc = RTCPeerConnection()
+        self._pose_pcs[client_id] = pc
+
+        @pc.on("connectionstatechange")
+        async def _on_state() -> None:
+            _logger.info(
+                "pose-webrtc[%d] connectionState=%s",
+                client_id,
+                pc.connectionState,
+            )
+            if pc.connectionState in ("failed", "closed"):
+                await self._close_pose_channel(client_id)
+
+        @pc.on("datachannel")
+        def _on_datachannel(channel: Any) -> None:
+            _logger.info(
+                "pose-webrtc[%d] data channel opened: %s",
+                client_id,
+                channel.label,
+            )
+            if channel.label != "pose":
+                _logger.debug("ignoring unexpected data channel: %s", channel.label)
+                return
+
+            @channel.on("message")
+            def _on_message(message: str | bytes) -> None:
+                obj = self._parse_json(message)
+                if obj is not None:
+                    self._handle_pose_payload(obj)
+
+        try:
+            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+            await websocket.send_text(
+                json.dumps(
+                    {"type": "pose-webrtc-answer", "sdp": pc.localDescription.sdp}
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - report and clear failed pc
+            _logger.error("failed to answer pose webrtc offer: %s", exc)
+            await self._close_pose_channel(client_id)
+            await websocket.send_text(json.dumps({"type": "pose-webrtc-unavailable"}))
+
+    async def _close_pose_channel(self, client_id: int) -> None:
+        """Close the pose WebRTC peer connection for one headset, if present."""
+        pc = self._pose_pcs.pop(client_id, None)
+        if pc is not None:
+            try:
+                await pc.close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+
+    async def _close_all_pose_channels(self) -> None:
+        """Close every active pose WebRTC peer connection."""
+        for client_id in list(self._pose_pcs):
+            await self._close_pose_channel(client_id)
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
@@ -389,6 +489,7 @@ class VRServer:
             finally:
                 server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
+                await server._close_pose_channel(client_id)
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
 

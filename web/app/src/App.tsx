@@ -15,6 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  useAxolPoseChannel,
   useAxolTracking,
   useAxolVideo,
   useAxolVRClient,
@@ -1022,6 +1023,7 @@ export default function App() {
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
+  const poseChannelRef = useAxolPoseChannel(wsRef)
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
@@ -1145,6 +1147,7 @@ export default function App() {
           <XR store={store}>
             <AxolVRClient
               wsRef={wsRef}
+              poseChannelRef={poseChannelRef}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
               onExit={() => store.getState().session?.end()}

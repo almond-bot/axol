@@ -31,13 +31,14 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 
 | Export | Description |
 |---|---|
-| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over WebSocket |
+| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over the WebRTC pose channel |
+| `useAxolPoseChannel` | Hook — negotiates an unreliable unordered WebRTC data channel over the WebSocket signaling connection for high-rate pose frames |
 | `useAxolVRClient` | Hook — manages WebSocket lifecycle (connect, disconnect, auto-retry) |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
 | `useAxolTracking` | Hook — returns a frame-readable `ref` reflecting whether the robot is currently engaged (mirroring the operator), driven by the server's `{"type":"tracking"}` pushes with a local grip-toggle fallback. Used to gate camera-screen repositioning to when the robot isn't being controlled |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
-| `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
+| `AxolPoseData` | Type — shape of each frame sent over the WebRTC pose channel |
 | `CameraStreams` | Type — `Record<string, MediaStream>`, the camera-name → stream map returned by `useAxolVideo` |
 
 **`AxolVRClient` props**
@@ -45,6 +46,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | Prop | Type | Description |
 |---|---|---|
 | `wsRef` | `RefObject<WebSocket \| null>` | WebSocket ref from `useAxolVRClient` |
+| `poseChannelRef` | `RefObject<RTCDataChannel \| null>` | Unreliable unordered pose channel ref from `useAxolPoseChannel` |
 | `onStateChange` | `(state: AxolState) => void` | Fires when the controller state machine transitions |
 | `onPendingRecording` | `(pendingAt: number \| null) => void` | Fires with a timestamp when a 3-second recording countdown begins; `null` when cancelled or resolved |
 | `onExit` | `() => void` | Fires when the Y button exits the XR session |
@@ -58,7 +60,7 @@ useAxolVRClient(hostname: string, port = 8000, maxRetries = 3, retryMs = 1000)
 
 **Frame data (`AxolPoseData`)**
 
-Each frame sends a JSON message over the WebSocket:
+Each frame sends a JSON message over the unreliable unordered WebRTC pose data channel:
 
 ```ts
 {

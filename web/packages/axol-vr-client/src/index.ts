@@ -1,4 +1,5 @@
 export { AxolVRClient } from "./AxolVRClient"
+export { useAxolPoseChannel } from "./useAxolPoseChannel"
 export { useAxolVRClient } from "./useAxolVRClient"
 export { useAxolVideo } from "./useAxolVideo"
 export { useAxolTracking } from "./useAxolTracking"
