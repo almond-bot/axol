@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import logging
 import re
 from dataclasses import MISSING, dataclass, field
 from typing import Any, Literal, TypeVar, get_args
@@ -56,6 +57,8 @@ from ..utils.shared import CAN_LEFT, CAN_RIGHT
 from ..vr.config import VRServerConfig
 
 T = TypeVar("T")
+
+_logger = logging.getLogger(__name__)
 
 
 # ----------------------------------------------------------------------
@@ -335,43 +338,24 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
     Purely cosmetic: every suppressed field is still fully overridable on
     the CLI. A no-op for configs without nested dataclasses (e.g.
     ``gravity-comp``), whose help is already short.
+
+    Private-API note: this is the one place we intentionally read argparse's
+    internal ``_actions`` / ``_action_groups`` / ``_group_actions``. There is
+    no public way to condense help here — the truly public seam is
+    ``add_argument(help=SUPPRESS)`` at construction time, but *draccus* builds
+    the parser, not us, so we can only adjust it after the fact; argparse
+    exposes no public post-hoc help API and ``HelpFormatter`` subclassing is
+    equally undocumented. These attributes have been stable since Python 2,
+    but the whole introspection is wrapped defensively so a future CPython
+    change degrades to the full (un-condensed) help instead of breaking
+    ``--help`` and argument parsing for every command.
     """
-    actions: dict[int, argparse.Action] = {id(a): a for a in ap._actions}
-    for group in ap._action_groups:
-        for a in group._group_actions:
-            actions[id(a)] = a
-
-    suppressed = 0
-    for a in actions.values():
-        if _is_help_noise(a):
-            a.help = argparse.SUPPRESS
-            suppressed += 1
-    if not suppressed:
-        return
-
-    # Clean up the help shown for the fields that remain visible.
-    for a in actions.values():
-        if a.help == argparse.SUPPRESS:
-            continue
-        opt = next((o for o in a.option_strings if o.startswith("--")), "")
-        leaf = opt.lstrip("-").split(".")[-1]
-        if leaf in _FIELD_HELP:
-            a.help = _FIELD_HELP[leaf]
-        elif any(marker in (a.help or "") for marker in _GARBLED_HELP_MARKERS):
-            a.help = None
-
-    for group in ap._action_groups:
-        # Nested-dataclass groups are titled like ``AxolConfig ['axol']`` /
-        # ``JointConfig ['axol.left.elbow']``; their docstrings are the bulk
-        # of the noise. The top command-config group (no ``[`` in the title)
-        # keeps its docstring as the command summary.
-        if "[" in (group.title or ""):
-            group.description = None
-        if not any(a.help != argparse.SUPPRESS for a in group._group_actions):
-            group.title = None
-            group.description = None
-
-    ap.epilog = (
+    # The epilog narrates the condensing ("only common fields are shown"), so
+    # it's only set once we know condensing happened — either it ran (below) or
+    # it was skipped by a future argparse layout change (the except block). A
+    # config with nothing to condense (no nested dataclasses, e.g.
+    # ``gravity-comp``) shows its full, short help with no epilog.
+    epilog = (
         "Only common fields are shown above. Every nested config field is "
         "still overridable from the CLI — e.g. per-joint gains like "
         "--axol.left.elbow.kp 60 (or --robot_config.axol_config.* for "
@@ -379,6 +363,54 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
         "--config_path. Full reference: "
         "https://docs.almond.bot/cli/configuration"
     )
+
+    try:
+        # draccus registers the include options on the argument *groups* but
+        # not on ``parser._actions``, so both are scanned.
+        actions: dict[int, argparse.Action] = {id(a): a for a in ap._actions}
+        for group in ap._action_groups:
+            for a in group._group_actions:
+                actions[id(a)] = a
+
+        suppressed = 0
+        for a in actions.values():
+            if _is_help_noise(a):
+                a.help = argparse.SUPPRESS
+                suppressed += 1
+        if not suppressed:
+            return
+        ap.epilog = epilog
+
+        # Clean up the help shown for the fields that remain visible.
+        for a in actions.values():
+            if a.help == argparse.SUPPRESS:
+                continue
+            opt = next((o for o in a.option_strings if o.startswith("--")), "")
+            leaf = opt.lstrip("-").split(".")[-1]
+            if leaf in _FIELD_HELP:
+                a.help = _FIELD_HELP[leaf]
+            elif any(marker in (a.help or "") for marker in _GARBLED_HELP_MARKERS):
+                a.help = None
+
+        for group in ap._action_groups:
+            # Nested-dataclass groups are titled like ``AxolConfig ['axol']`` /
+            # ``JointConfig ['axol.left.elbow']``; their docstrings are the bulk
+            # of the noise. The top command-config group (no ``[`` in the title)
+            # keeps its docstring as the command summary.
+            if "[" in (group.title or ""):
+                group.description = None
+            if not any(a.help != argparse.SUPPRESS for a in group._group_actions):
+                group.title = None
+                group.description = None
+    except AttributeError:
+        # argparse changed its internal layout; show the full help rather than
+        # crash. Parsing is unaffected (these attrs only drive --help). Still
+        # attach the epilog so the "everything is overridable" pointer survives.
+        ap.epilog = epilog
+        _logger.debug(
+            "Skipping --help condensing: argparse internals not as expected.",
+            exc_info=True,
+        )
 
 
 def parse(config_class: type[T], argv: list[str]) -> T:

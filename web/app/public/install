@@ -5,8 +5,8 @@
 #
 # Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
 # except cuda), installs the pyzed bindings when the ZED SDK is present,
-# and registers a root systemd service that keeps `axol serve` running at
-# boot and restarts it if it ever goes down.
+# installs adb for Quest-over-USB teleop, and registers a root systemd service
+# that keeps `axol serve` running at boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
 
 set -euo pipefail
@@ -22,6 +22,16 @@ PYTHON_VERSION="3.13"
 BIN_DIR="/usr/local/bin"
 SERVICE_NAME="axol"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+# We install as root (the systemd service runs as root), but operators log in
+# as their own user and expect `axol` to work there too. uv's default tool +
+# managed-Python locations live under /root (mode 0700), which only root can
+# traverse, so the `axol` wrapper on PATH would fail for everyone else. Pin
+# both to shared, world-readable locations instead. The same vars are baked
+# into the systemd unit below so the self-updater's `uv tool upgrade` keeps
+# operating on this one shared install rather than spawning a /root copy.
+UV_TOOL_DIR="/opt/axol/uv/tools"
+UV_PYTHON_INSTALL_DIR="/opt/axol/uv/python"
+export UV_TOOL_DIR UV_PYTHON_INSTALL_DIR
 
 say() { printf "\033[1;36m[axol]\033[0m %s\n" "$*"; }
 die() { printf "\033[1;31m[axol]\033[0m %s\n" "$*" >&2; exit 1; }
@@ -51,15 +61,21 @@ UV="$(command -v uv || echo "${BIN_DIR}/uv")"
 # -- axol ---------------------------------------------------------------------
 
 say "Installing axol from GitHub (extras: ${EXTRAS}) — this can take a few minutes..."
+mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
     "almond-axol[${EXTRAS}] @ ${REPO}"
 
+# uv creates the tool venv + managed Python with the root umask; make sure every
+# user can read/traverse them (dirs + already-executable files only, via 'X') so
+# the `axol` wrapper on PATH works for the operator's own login, not just root.
+chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
+
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- System provisioning (pyzed + GStreamer camera stack) ---------------------
+# -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
 
 # `uv tool install` handles the Python package + PyPI deps, but a few pieces it
 # can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
@@ -70,7 +86,9 @@ say "axol installed at $(command -v axol)."
 # idempotently -- the same command the `axol serve` self-updater runs after an
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
-say "Provisioning system dependencies (pyzed + GStreamer camera stack)..."
+# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport);
+# self-gates on apt and is a no-op where unavailable.
+say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
 
 # -- Jetson clocks ------------------------------------------------------------
@@ -135,6 +153,10 @@ Environment=PYTHONUNBUFFERED=1
 # Store collected datasets under the installing user's home (see above) rather
 # than root's cache. Empty when no non-root user home was resolved.
 ${LEROBOT_HOME_ENV}
+# Keep the self-updater's \`uv tool upgrade\` on the same shared install the
+# installer wrote, rather than letting uv fall back to its /root defaults.
+Environment=UV_TOOL_DIR=${UV_TOOL_DIR}
+Environment=UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR}
 
 [Install]
 WantedBy=multi-user.target

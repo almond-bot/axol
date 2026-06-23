@@ -1,5 +1,6 @@
 export { AxolVRClient } from "./AxolVRClient"
 export { useAxolVRClient } from "./useAxolVRClient"
+export { useAxolPoseSocket } from "./useAxolPoseSocket"
 export { useAxolVideo } from "./useAxolVideo"
 export { useAxolTracking } from "./useAxolTracking"
 export { AxolConnectionStatus, AxolState } from "./types"

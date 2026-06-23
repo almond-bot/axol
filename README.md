@@ -8,7 +8,7 @@ The browser front-ends live under [`web/`](web/): a **VR teleoperation interface
 
 The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). The sources live under [`docs/`](docs/), and the pages below link to them.
 
-**New here?** See the [Teleoperation quickstart](https://docs.almond.bot/quickstart/teleop) to go from installation to a live teleoperation session, or the [Web Control Panel guide](https://docs.almond.bot/guides/control-panel) to drive Axol from a browser.
+**New here?** See [Teleoperation](https://docs.almond.bot/operations/teleop) to go from installation to a live session, or the [Web Control Panel guide](https://docs.almond.bot/guides/control-panel) to drive Axol from a browser.
 
 ## Requirements
 
@@ -18,7 +18,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ## Installation
 
-### Quick install (recommended)
+### One-command install (recommended)
 
 One command installs `uv`, the `axol` CLI (from GitHub, with every extra except `cuda`), and a root systemd service that keeps `axol serve` running at boot:
 
@@ -94,16 +94,28 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [Overview](https://docs.almond.bot)
 - [Installation](https://docs.almond.bot/installation)
 
-### Quickstart
+### Operations
 
-- [Teleoperation](https://docs.almond.bot/quickstart/teleop)
-- [Data Collection](https://docs.almond.bot/quickstart/data-collection)
-- [Policy Inference](https://docs.almond.bot/quickstart/inference) — local or remote inference server
+Each operation can be driven from the web control panel or the CLI:
+
+- [Teleoperation](https://docs.almond.bot/operations/teleop) — drive the robot live from a VR headset (or in sim)
+- [Gravity Compensation](https://docs.almond.bot/operations/gravity-comp) — hold the arms weightless for hand-guiding
+- [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
+- [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+
+### Remote Teleop
+
+- [Remote Teleop](https://docs.almond.bot/guides/remote-teleop) — drive over the internet by sideloading Tailscale on a Meta Quest
 
 ### Web Interfaces
 
 - [Web Control Panel](https://docs.almond.bot/guides/control-panel) — drive the robot from a browser via `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
+- [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
+
+### Advanced
+
+- [Development install](https://docs.almond.bot/advanced/development-install) — clone + `uv sync`, optional extras, building the web UI
 
 ### CLI Reference
 
@@ -119,6 +131,7 @@ See the [installation guide](https://docs.almond.bot/installation) for the full 
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
+- [`provision`](https://docs.almond.bot/cli/provision)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)

@@ -51,13 +51,9 @@ def main(argv: list[str]) -> None:
     cfg = parse(InferenceServerConfig, argv)
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
 
-    from lerobot.async_inference import policy_server as _ps
+    from ..lerobot.inference_patch import disable_observation_similarity_filter
 
-    # Upstream's 1-rad L2 similarity filter drops nearly every observation
-    # on Axol's 16-DOF arms at 60 Hz, starving the action queue. There is
-    # no config knob, so patch the module symbol before ``serve`` (mirrors
-    # run-policy's local-server spawn).
-    _ps.observations_similar = lambda *args, **kwargs: False
+    disable_observation_similarity_filter()
 
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve

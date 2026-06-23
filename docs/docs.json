@@ -23,56 +23,71 @@
         ]
       },
       {
-        "group": "Quickstart",
+        "group": "Operations",
         "pages": [
-          "quickstart/teleop",
-          "quickstart/data-collection",
-          "quickstart/inference"
+          "operations/teleop",
+          "operations/gravity-comp",
+          "operations/data-collection",
+          "operations/run-policy"
+        ]
+      },
+      {
+        "group": "Remote Teleop",
+        "pages": [
+          "guides/remote-teleop"
         ]
       },
       {
         "group": "Web Interfaces",
         "pages": [
           "guides/control-panel",
-          "guides/vr-interface"
+          "guides/vr-interface",
+          "guides/quest-over-usb"
         ]
       },
       {
-        "group": "CLI Reference",
+        "group": "Advanced",
         "pages": [
-          "cli/configuration",
-          "cli/serve",
-          "cli/can-setup",
-          "cli/can-enable",
-          "cli/can-driver",
-          "cli/motor-info",
-          "cli/motor-set-can-id",
-          "cli/motor-set-zero-pos",
-          "cli/teleop",
-          "cli/collect-data",
-          "cli/run-policy",
-          "cli/inference-server",
-          "cli/zed-install",
-          "cli/gst-install",
-          "cli/gst-build-zed",
-          "cli/jetson-setup",
-          "cli/tune-pid",
-          "cli/tune-friction",
-          "cli/tune-repeatability",
-          "cli/gravity-comp"
-        ]
-      },
-      {
-        "group": "Python API",
-        "pages": [
-          "api/concepts",
-          "api/robot",
-          "api/kinematics",
-          "api/teleop",
-          "api/vr",
-          "api/zed",
-          "api/motor",
-          "api/lerobot"
+          "advanced/development-install",
+          {
+            "group": "CLI Reference",
+            "pages": [
+              "cli/configuration",
+              "cli/serve",
+              "cli/can-setup",
+              "cli/can-enable",
+              "cli/can-driver",
+              "cli/motor-info",
+              "cli/motor-set-can-id",
+              "cli/motor-set-zero-pos",
+              "cli/teleop",
+              "cli/collect-data",
+              "cli/run-policy",
+              "cli/inference-server",
+              "cli/provision",
+              "cli/zed-install",
+              "cli/gst-install",
+              "cli/gst-build-zed",
+              "cli/jetson-setup",
+              "cli/tune-pid",
+              "cli/tune-friction",
+              "cli/tune-repeatability",
+              "cli/gravity-comp"
+            ]
+          },
+          {
+            "group": "Python API",
+            "pages": [
+              "api/concepts",
+              "api/robot",
+              "api/kinematics",
+              "api/teleop",
+              "api/vr",
+              "api/zed",
+              "api/motor",
+              "api/lerobot"
+            ]
+          }
         ]
       }
     ]

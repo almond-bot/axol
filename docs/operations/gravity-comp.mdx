@@ -1,0 +1,63 @@
+---
+title: "Gravity Compensation"
+description: "Hold the arms weightless so you can move them by hand — from the web control panel or the CLI."
+---
+
+Gravity compensation holds both arms weightless so you can move them freely by hand. Each free joint is commanded with zero stiffness, velocity damping, and a feedforward torque that cancels the arm's modelled gravity — so the arm neither sags nor springs back. It's the easiest way to pose the robot, check its range of motion, or hand-guide it.
+
+You can run it from the **web control panel** or the **CLI** (`axol gravity-comp`).
+
+## Before you start
+
+- **Axol installed** ([one-command install](/installation)) and the robot powered on.
+- **CAN up and motors verified**. The control panel handles this on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once, then check a motor with [`axol motor.info`](/cli/motor-info).
+
+<Warning>
+  The arms go compliant the moment this starts — be ready to support them so they don't drop.
+</Warning>
+
+## Run it
+
+<Tabs>
+  <Tab title="Control Panel">
+    <img src="/assets/control-panel-gravity-comp.png" alt="Gravity Compensation in the web control panel" />
+
+    <Steps>
+      <Step title="Connect the robot">
+        Connect the **Axol Host** and press **Connect** on the **Axol** tile. Gravity comp needs only the robot connection — no cameras. See the [Web Control Panel guide](/guides/control-panel#connections).
+      </Step>
+
+      <Step title="Select Gravity Compensation and Start">
+        Pick **Gravity Compensation** from the operation selector and press **Start**. The arms go weightless immediately. Press **Stop** to hold them rigid again.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="CLI">
+    On the robot machine:
+
+    ```bash
+    axol gravity-comp                                 # all 7 joints free, both arms
+    axol gravity-comp --right_channel null            # left arm only
+    axol gravity-comp --kd 1.0                        # heavier damping (less floppy)
+    axol gravity-comp --free_joints [WRIST_3]         # only WRIST_3 free; the rest held rigid
+    ```
+
+    Press `Ctrl+C` to stop. Use `--free_joints` to float only the named joints while the rest of the arm holds its pose — handy for isolating one joint at a time. See the [`gravity-comp`](/cli/gravity-comp) reference for every flag.
+  </Tab>
+</Tabs>
+
+<Tip>
+  If an arm sags or pushes back, the gravity model needs tuning — adjust the per-joint `mass` and `com` fields on `AxolConfig`. See [Gravity compensation](/api/robot#gravity-compensation).
+</Tip>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
+    Drive the arms from a VR headset instead of by hand.
+  </Card>
+  <Card title="gravity-comp reference" icon="terminal" href="/cli/gravity-comp">
+    Every flag — free joints, damping, per-arm channels.
+  </Card>
+</CardGroup>

@@ -8,6 +8,7 @@ import {
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchUsbStatus,
   loadOpSettings,
   operationMeta,
   parseImportedSettings,
@@ -18,6 +19,7 @@ import {
   setServerBase,
   startOperation,
   stopOperation,
+  usbConnect,
   useSessionLogs,
   type CameraSpec,
   type CommandSpec,
@@ -26,6 +28,7 @@ import {
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type UsbStatus,
 } from "@/lib/supervisor"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
@@ -76,6 +79,8 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
+  const [usb, setUsb] = useState<UsbStatus | null>(null)
+  const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
@@ -131,20 +136,27 @@ export default function ControlPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Poll the robot connection while online.
+  // Poll the robot connection + Quest-USB status while online.
   useEffect(() => {
     if (conn.state !== "ok") return
     // Guard against in-flight polls landing after a disconnect (which flips
     // conn.state and tears this effect down): a late response must not
-    // repopulate the robot tile while the host tile shows disconnected.
+    // repopulate a tile while the host tile shows disconnected.
     let active = true
-    const t = setInterval(() => {
+    const poll = () => {
       fetchRobotStatus()
         .then((r) => {
           if (active) setRobot(r)
         })
         .catch(() => {})
-    }, 2000)
+      fetchUsbStatus()
+        .then((u) => {
+          if (active) setUsb(u)
+        })
+        .catch(() => {})
+    }
+    poll()
+    const t = setInterval(poll, 2000)
     return () => {
       active = false
       clearInterval(t)
@@ -166,8 +178,33 @@ export default function ControlPanel() {
       robotConnectClick()
     }
     // robotConnectClick is stable enough (only uses state setters / fetch).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, robot, robotBusy])
+
+  // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
+  // appears. The latch clears once the tunnel is up (so a later drop retries
+  // once) or when the headset goes away, while preventing a per-poll retry loop
+  // if `adb reverse` can't establish it.
+  const autoUsbRef = useRef(false)
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      // Clear the latch on disconnect so a reconnect gets a fresh auto-connect
+      // attempt rather than inheriting a stuck "already tried" flag.
+      autoUsbRef.current = false
+      return
+    }
+    if (!usb || usb.state !== "device") {
+      autoUsbRef.current = false
+      return
+    }
+    if (usb.reverseActive) {
+      autoUsbRef.current = false
+      return
+    }
+    if (autoUsbRef.current || usbBusy) return
+    autoUsbRef.current = true
+    usbConnectClick()
+    // usbConnectClick is stable (only uses state setters / fetch).
+  }, [conn.state, usb, usbBusy])
 
   async function hostDisconnectClick() {
     // Kill any running task and wait for it to exit before dropping the host,
@@ -269,6 +306,21 @@ export default function ControlPanel() {
     }
   }
 
+  // -- quest over usb (adb reverse pose tunnel) --
+  async function usbConnectClick() {
+    setUsbBusy(true)
+    setError(null)
+    try {
+      // Runs `adb reverse`; the first touch also pops the USB-debugging
+      // authorization prompt on the headset.
+      setUsb(await usbConnect())
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setUsbBusy(false)
+    }
+  }
+
   // -- operation lifecycle --
   // Liveness comes from two sources that can briefly disagree about the same
   // session: `session` (the REST start/stop responses) and `status` (the logs
@@ -350,6 +402,9 @@ export default function ControlPanel() {
           onRobotDisconnect={robotDisconnectClick}
           cameras={cameras}
           onConfigureCameras={() => setCamerasDialogOpen(true)}
+          usb={usb}
+          usbBusy={usbBusy}
+          onUsbConnect={() => usbConnectClick()}
         />
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
