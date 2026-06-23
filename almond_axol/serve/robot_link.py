@@ -24,7 +24,6 @@ from typing import Any
 
 from ..motor import CanBus, Joint, Motor, MotorError
 from ..utils.shared import CAN_LEFT, CAN_RIGHT
-from ..utils.sudo import run_root
 
 _logger = logging.getLogger(__name__)
 
@@ -299,28 +298,27 @@ class RobotLink:
     def _enable_can(self) -> None:
         """Bring up the CAN interfaces.
 
-        Order of attempts:
-          1. If the interfaces are already up, do nothing (common case: cron
-             brought them up at boot).
-          2. If CAN was never configured on this machine, run the full
-             ``can.setup`` (udev rules, persistent names, @reboot bring-up)
-             non-interactively — it may not have been set up before.
-          3. Otherwise just run the persisted startup script.
+        1. If the interfaces are already up, do nothing (common case: cron
+           brought them up at boot).
+        2. Otherwise run the full ``can.setup`` (driver, udev rules, persistent
+           names, @reboot bring-up, then bring-up) non-interactively.
 
-        ``axol serve`` runs as root under the hosted install, so privileged
-        steps run directly through :func:`run_root`.
+        We always run the full setup rather than just the persisted startup
+        script (``can.enable``): on a fresh axol the script doesn't exist yet,
+        and on a partially-configured one the driver may be unloaded or the
+        interfaces unnamed, so the bare bring-up script can't connect. The
+        whole setup is idempotent (see :func:`ensure_setup`), so re-running it
+        on an already-configured machine is safe and cheap.
+
+        ``axol serve`` runs as root under the hosted install, so the privileged
+        steps inside :func:`ensure_setup` run without a sudo prompt.
         """
         if self._can_already_up():
             _logger.info("CAN interfaces already up; skipping bring-up.")
             return
 
-        from ..cli.can.setup import _CRON_SCRIPT, ensure_setup, is_configured
+        from ..cli.can.setup import ensure_setup
 
-        if not is_configured():
-            _logger.info("CAN not configured yet; running can.setup.")
-            ensure_setup()
-            _logger.info("CAN setup complete; interfaces brought up.")
-            return
-
-        run_root(["bash", str(_CRON_SCRIPT)], check=True)
-        _logger.info("CAN interfaces brought up.")
+        _logger.info("CAN interfaces down; running can.setup.")
+        ensure_setup()
+        _logger.info("CAN setup complete; interfaces brought up.")
