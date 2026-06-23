@@ -59,14 +59,13 @@ _BITRATE_BPP = 0.25
 _BITRATE_MIN = 6_000_000
 _BITRATE_MAX = 40_000_000
 
-# Sample every Nth frame for image stats. Stats feed dataset normalization and
-# are robust to subsampling. They are accumulated *during* the episode, on the
-# encoder's writer thread in the recorder subprocess — not by decoding the
-# finished mp4 afterwards (which made save_episode slow). The recorder has its
-# own GIL/cores, away from the control loop and the relay's WebRTC send, so this
-# light per-frame work no longer harms either; computing on the source frames
-# (pre-encode) also matches LeRobot's software path more closely than decoding.
-_STATS_EVERY = 4
+# Image stats are accumulated *during* the episode on the encoder's writer
+# thread in the recorder subprocess (not by decoding the finished mp4 afterwards,
+# which made save_episode slow). This mirrors LeRobot's own streaming encoder
+# (_StreamingEncoderThread in datasets/video_utils.py) exactly: the same
+# auto_downsample_height_width + RunningQuantileStats, updated on every frame.
+# The recorder has its own GIL/cores, away from the control loop and the relay's
+# WebRTC send, so the per-frame work is harmless there.
 
 
 def hw_dataset_encoder_available() -> bool:
@@ -122,11 +121,11 @@ class _CameraNvencEncoder:
     """One camera's NVENC pipeline plus the thread that feeds it.
 
     ``feed`` (called from the capture thread) only enqueues; a dedicated writer
-    thread pads RGB->RGBA, writes the bytes to the gst subprocess, and folds every
-    ``_STATS_EVERY``-th frame into a running image-stats accumulator. ``finish()``
-    just returns the accumulated stats, so save_episode no longer re-decodes the
-    whole mp4. This work runs in the recorder subprocess, off the control loop and
-    the relay's WebRTC send.
+    thread pads RGB->RGBA, writes the bytes to the gst subprocess, and folds each
+    frame into a running image-stats accumulator (the same per-frame stats
+    LeRobot's streaming encoder does). ``finish()`` just returns the accumulated
+    stats, so save_episode no longer re-decodes the whole mp4. This work runs in
+    the recorder subprocess, off the control loop and the relay's WebRTC send.
     """
 
     def __init__(self, video_path: Path, fps: int, queue_maxsize: int) -> None:
@@ -209,9 +208,10 @@ class _CameraNvencEncoder:
             )
         # Stats were accumulated inline during the episode, so finishing is just
         # the mp4 finalize (moov flush) above — no re-decode of the whole file.
+        # Require >=2 samples, matching LeRobot's streaming encoder.
         stats = (
             self._stats.get_statistics()  # type: ignore[attr-defined]
-            if self._stats is not None and self._stats_samples
+            if self._stats is not None and self._stats_samples >= 2
             else None
         )
         return self.video_path, stats
@@ -247,7 +247,7 @@ class _CameraNvencEncoder:
         assert self._rgba is not None and self._stdin_fd is not None
         self._rgba[:, :, :3] = frame
         self._write(self._rgba)
-        if self._stats is not None and self._frame_count % _STATS_EVERY == 0:
+        if self._stats is not None:
             self._update_stats(frame)
         self._t_copy += time.perf_counter() - t0
         self._frame_count += 1
