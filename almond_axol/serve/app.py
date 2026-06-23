@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+from ..utils import adb
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import command_specs
 from .manager import Session, SessionManager
@@ -86,6 +87,17 @@ def _detect_cameras() -> dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001 - SDK errors surface to the UI
         return {"devices": [], "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _usb_status_dict(status: adb.AdbStatus) -> dict[str, Any]:
+    """Serialize the adb device + reverse-tunnel status for the UI."""
+    return {
+        "installed": status.installed,
+        "serial": status.serial,
+        "state": status.state,
+        "reverseActive": status.reverse_active,
+        "ready": status.ready,
+    }
 
 
 def create_app(static_dir: Path | None = None) -> FastAPI:
@@ -192,6 +204,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         result = await asyncio.to_thread(_restart)
         return JSONResponse(result, status_code=200 if result["ok"] else 500)
+
+    # -- Quest-over-USB (adb reverse pose tunnel) ---------------------------
+
+    @app.get("/api/usb/status")
+    async def usb_status() -> dict[str, Any]:
+        """adb device + reverse-tunnel status for the Quest-over-USB pose link."""
+        return _usb_status_dict(await asyncio.to_thread(adb.status))
+
+    @app.post("/api/usb/connect")
+    async def usb_connect() -> dict[str, Any]:
+        """Forward the headset's localhost:VR_PORT to this host via `adb reverse`.
+
+        The first adb command against a freshly plugged-in headset also triggers
+        the USB-debugging authorization popup on the device.
+        """
+        return _usb_status_dict(await asyncio.to_thread(adb.connect))
 
     # -- in-process operations (teleop / gravity / collect / policy) --------
 

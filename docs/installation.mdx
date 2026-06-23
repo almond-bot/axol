@@ -1,139 +1,81 @@
 ---
 title: "Installation"
-description: "Install the Axol CLI and SDK, optional dependency extras, and first-run hardware setup."
+description: "Install Axol on the robot machine with one command, then open the web control panel."
 ---
+
+Axol installs with a single command on the machine wired to the robot (typically a ZED Box / NVIDIA Jetson). It sets up the `axol` CLI and starts the web control panel as a background service — so once it finishes you can drive the robot from a browser, no terminal needed.
+
+<Note>
+  Working on Axol itself, or running without the install script? See [Development install](/advanced/development-install) in the Advanced section for the clone + `uv sync` path.
+</Note>
 
 ## Requirements
 
-- **Linux**
-- **Python 3.13+** (the quick install below provides it automatically)
-- **(Optional) NVIDIA Jetson** (e.g. a ZED Box) — required for the GMSL-attached ZED cameras (data collection / policy inference).
+- **Linux** with **systemd** (the installer registers a service).
+- **(Optional) NVIDIA Jetson** (e.g. a ZED Box) — required for the GMSL-attached ZED cameras used in data collection and policy inference. The installer runs on any Linux host; the Jetson-specific tuning steps simply no-op elsewhere.
 
-## Quick install (recommended)
+## ZED Box login
 
-One command installs everything and starts the web control panel:
+If you're setting up a ZED Box from Almond, log in with the default credentials. (Axol Kit boxes ship with axol already installed — see the note under [Install](#install).)
+
+| Field | Value |
+|---|---|
+| Username | `user` |
+| Password | `admin` |
+
+<Warning>
+  Change the default password after first login if the machine is reachable by anyone else.
+</Warning>
+
+## Install
+
+<Note>
+  The ZED Box that ships with the **Axol Kit** comes with axol already installed and the control-panel service running — skip straight to [First connection](#first-connection). Run the command below only to set up a fresh machine, or to upgrade an existing one (re-running upgrades in place).
+</Note>
+
+Run this on the robot machine:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
-This:
+This one command:
 
-- Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already installed.
-- Installs the `axol` CLI from GitHub as a `uv` tool (Python 3.13 included), with every dependency extra except `cuda`.
-- Sets up the headset-video stack ([`gst.install`](/cli/gst-install) plus the patched ZED source plugins, [`gst.build-zed`](/cli/gst-build-zed)) and, on a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)).
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at startup (re-pinning the Jetson clocks first) and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root.
+- Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already present.
+- Installs the `axol` CLI from GitHub (Python 3.13 bundled), with the `lerobot` and `sim` extras.
+- Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
+- Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
+- On a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)) for low-latency camera encode and a steady IK loop.
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root.
 
-When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — no terminal needed from then on. The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. (Re-running the install command also upgrades.)
-
-```bash
-journalctl -u axol -f        # service logs
-systemctl restart axol       # manual restart
-```
+When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — see the [Web Control Panel guide](/guides/control-panel). From then on, everything happens in the browser.
 
 <Note>
-  The service runs as root, so privileged steps (CAN bring-up, ZED daemon restarts) need no sudo password.
+  The service runs as root, so privileged steps (CAN bring-up, ZED daemon restarts) need no `sudo` password.
 </Note>
 
-## Development install
+### Staying up to date
 
-For working on Axol itself, install from a clone using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and resolved automatically:
-
-```bash
-uv sync
-```
-
-Then activate the virtual environment so the `axol` CLI is on your path:
+The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. Re-running the install command also upgrades.
 
 ```bash
-source .venv/bin/activate
+journalctl -u axol -f        # follow the service logs
+systemctl restart axol       # restart manually
 ```
 
-<Tip>
-  You need to activate the environment in every new shell session. Alternatively, prefix every command with `uv run` (e.g. `uv run axol can.setup`) to skip activation.
-</Tip>
+## First connection
 
-### Optional extras
+Open [axol.almond.bot](https://axol.almond.bot) on any machine on the same network and enter the robot machine's IP address. The very first time, your browser will warn about the self-signed certificate — accept it once (the certificate is shared between the control panel and the VR teleop link). See the [Web Control Panel guide](/guides/control-panel) for the full connect flow.
 
-Install optional dependency groups as needed (the quick install above includes all of them except `cuda`):
+The control panel runs [`can.setup`](/cli/can-setup) for you on first connect, so there's no manual hardware setup on the install path.
 
-| Extra | Contents | When to use |
-|---|---|---|
-| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
-| `sim` | viser | `teleop --sim` |
-| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
+## Next steps
 
-```bash
-uv sync --extra lerobot --extra sim          # teleoperation + data collection
-uv sync --extra lerobot --extra cuda         # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra cuda   # everything
-```
-
-<Note>
-  Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer NVENC tools. Install them with [`axol gst.install`](/cli/gst-install); see [Headset video](#headset-video-nvenc) below.
-</Note>
-
-## ZED Python bindings
-
-The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:
-
-```bash
-axol zed.install
-```
-
-See [`zed.install`](/cli/zed-install) for details.
-
-## Headset video (NVENC)
-
-Relaying the ZED cameras to the headset (`teleop --cameras`, `collect-data`) grabs and **NVENC**-encodes frames entirely on the GPU via the zed-gstreamer pipeline (`zedxonesrc` / `zedsrc`), and sends them over WebRTC with **aiortc** (a normal Python dependency). This path needs the system GStreamer + GObject-introspection packages and **PyGObject** (built into the axol environment, like `pyzed`), which aren't a PyPI extra. Install them once:
-
-```bash
-axol gst.install
-```
-
-The ZED source elements (`zedxonesrc` / `zedsrc`) aren't part of that stack — build the patched versions (sensor-accurate frame timestamps) once, with the ZED SDK present:
-
-```bash
-axol gst.build-zed
-```
-
-On a Jetson, also pin the NVENC/VIC clocks for low-latency encode (the quick install does this at boot via systemd):
-
-```bash
-axol jetson.setup
-```
-
-The quick install runs all three for you. See [`gst.install`](/cli/gst-install), [`gst.build-zed`](/cli/gst-build-zed), and [`jetson.setup`](/cli/jetson-setup).
-
-## Web control panel (optional)
-
-With the quick install, the control panel is already running — just open [axol.almond.bot](https://axol.almond.bot) and connect to the machine.
-
-For a development install, you can build and serve the UI locally instead. This produces the bundle that [`axol serve`](/cli/serve) hosts at `web/app/dist`:
-
-```bash
-cd web
-npm install
-npm run build --workspace=packages/axol-vr-client   # client package first
-npm run build --workspace=app                        # → web/app/dist
-```
-
-Then start the server and open the printed URL:
-
-```bash
-axol serve
-```
-
-The same build also serves the [VR interface](/guides/vr-interface). `axol serve` works without this step (the API is still available) — the hosted UI at [axol.almond.bot](https://axol.almond.bot) connects to it directly. See the [Web Control Panel guide](/guides/control-panel).
-
-## First-run hardware setup
-
-Before using any motor or robot commands, initialize the CAN hardware:
-
-```bash
-axol can.setup
-```
-
-<Note>
-  Run directly in a terminal, `sudo` is invoked automatically where required (with the quick install, the control panel runs this for you as root on first connect). See [`can.setup`](/cli/can-setup) for what it configures.
-</Note>
+<CardGroup cols={2}>
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
+    Drive the robot from a VR headset.
+  </Card>
+  <Card title="Web Control Panel" icon="display" href="/guides/control-panel">
+    The browser UI that drives every operation.
+  </Card>
+</CardGroup>

@@ -12,7 +12,7 @@ It's served by [`axol serve`](/cli/serve) and runs each operation **in-process**
 
 ## Start the server
 
-With the [quick install](/installation#quick-install-recommended), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
+With the [one-command install](/installation), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
 
 On a development install, start it yourself:
 
@@ -31,7 +31,7 @@ Axol control panel:
 Open the **Local** URL on the host, or the **LAN** URL from another machine on the same network (accept the self-signed certificate once). The control panel lives at `/control`.
 
 <Note>
-  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Installation](/installation#web-control-panel-optional).
+  For a development install, the local UI must be built once (`cd web && npm install`, then `npm run build` for the `axol-vr-client` and `app` workspaces) — or skip the build and use the hosted UI at [axol.almond.bot](https://axol.almond.bot), which connects to your `axol serve` directly. See [Development install](/advanced/development-install#build-the-web-ui).
 </Note>
 
 <Tip>
@@ -40,10 +40,10 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 
 ## Connections
 
-The top of the panel is a row of three tiles — **Axol Host**, **Axol**, and **Cameras** — each with a colored status dot.
+The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**, and **Quest USB** — each with a colored status dot.
 
-{/* SCREENSHOT: control-panel-connections.png — close-up of the three tiles (Axol Host / Axol / Cameras) */}
-<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras" />
+{/* SCREENSHOT: control-panel-connections.png — close-up of the connection tiles (Axol Host / Axol / Cameras / Quest USB) */}
+<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras, Quest USB" />
 
 ### Axol Host
 
@@ -56,7 +56,7 @@ Press **Connect** to bring up the robot. Under the hood this:
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
 
-The server runs as root under the quick install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
+The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
 ### Cameras
 
@@ -65,6 +65,10 @@ Data collection and policy inference also need the three ZED cameras attached to
 The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually; a stereo camera captures both eyes from one grab (recorded as `overhead_left` / `overhead_right` during data collection). A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`).
 
 The assignments persist in your browser and are sent along when you start an operation — collect data and run policy need all three slots; teleop streams whichever are assigned to the headset.
+
+### Quest USB
+
+The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the tile sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only.
 
 <Warning>
   Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
@@ -109,7 +113,7 @@ While **Run Policy** is live, an **Episode control** box appears in the operatio
 These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
 
 <Note>
-  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard, **B** to switch modes). See the [Data Collection quickstart](/quickstart/data-collection#controller-layout) for the controller layout.
+  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard, **B** to switch modes). See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
 </Note>
 
 ## Next steps

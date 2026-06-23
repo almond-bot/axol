@@ -13,7 +13,7 @@ Pins the Jetson clocks the real-time loops depend on:
 axol jetson.setup
 ```
 
-These pins reset on every reboot, so the [quick install](/installation#quick-install-recommended) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
+These pins reset on every reboot, so the [one-command install](/installation) wires this into the `axol.service` systemd unit as an `ExecStartPre`, re-pinning the clocks at every boot, and runs it once during install. It is **not** called from `teleop` / `collect-data` / `serve` — those entry points just run.
 
 <Note>
   Best-effort and a no-op on non-Jetson machines. Pinning needs root: run as root, or you'll be prompted for `sudo` once on a terminal; if escalation isn't possible it logs the manual command and continues.

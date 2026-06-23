@@ -116,8 +116,10 @@ class Motor:
         self._position: float | None = None
         self._torque: float | None = None
         self._telemetry_task: asyncio.Task | None = None
-        self._driver._on_feedback = lambda pos, torq: (
-            setattr(self, "_position", pos) or setattr(self, "_torque", torq)
+        self._driver.set_feedback_callback(
+            lambda pos, torq: (
+                setattr(self, "_position", pos) or setattr(self, "_torque", torq)
+            )
         )
 
     async def enable(self) -> None:

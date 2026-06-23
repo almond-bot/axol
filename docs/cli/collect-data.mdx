@@ -6,7 +6,7 @@ description: "Record teleoperation episodes to a LeRobot-format dataset."
 Records teleoperation episodes using VR controller inputs and three locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
 
 <Tip>
-  For the end-to-end workflow, see the [Data Collection quickstart](/quickstart/data-collection).
+  For the end-to-end workflow, see the [Data Collection guide](/operations/data-collection).
 </Tip>
 
 This command is configured via draccus. The robot and teleop subsystems are exposed as the nested `robot_config` / `teleop_config` configs (cameras, per-joint gains, IK, VR server) — nest into them with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
@@ -45,7 +45,7 @@ During collection the camera feeds are also relayed to the headset over WebRTC (
 
 ## VR controller controls
 
-Episodes are driven from the Quest controllers. For the full controller layout and step-by-step flow, see the [Data Collection quickstart](/quickstart/data-collection#controller-layout).
+Episodes are driven from the Quest controllers. For the full controller layout and step-by-step flow, see the [Data Collection guide](/operations/data-collection#controller-layout).
 
 | Button | Action |
 |---|---|

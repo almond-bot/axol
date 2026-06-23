@@ -1,0 +1,25 @@
+---
+title: "provision"
+description: "Install or refresh the non-PyPI and system pieces — adb, pyzed, GStreamer/PyGObject, and the patched zed-gstreamer plugins."
+---
+
+Installs and refreshes the pieces `uv tool install` / `uv tool upgrade` can't manage on their own:
+
+- **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
+- [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
+- [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped on every `uv tool upgrade`).
+- [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
+
+```bash
+axol provision
+```
+
+Both the hosted installer and the [`axol serve`](/cli/serve) self-updater run **this** command, so the set of steps lives in exactly one place and can't drift between them. Every step is idempotent and best-effort — each self-gates on the ZED SDK / `apt` / NVENC and no-ops when unavailable — so `axol provision` is safe to run on any host and re-run anytime.
+
+<Note>
+  `provision` does **not** pin the Jetson clocks — that's [`jetson.setup`](/cli/jetson-setup), a per-boot runtime tweak owned by the systemd `ExecStartPre`, not an install step.
+</Note>
+
+When there's no ZED SDK at `/usr/local/zed`, the pyzed and zed-gstreamer build steps are skipped (only the GStreamer/PyGObject stack and adb are installed).
+
+See [Development install → Headset-video stack](/advanced/development-install#headset-video-stack) for when you'd run this by hand.

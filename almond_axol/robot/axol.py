@@ -690,6 +690,29 @@ class AxolArm:
         self._gc_hold_q = None
         self._gc_hold_free = None
 
+    def reset_command_state(self) -> None:
+        """Forget cached command history after an out-of-band move.
+
+        When the arm is moved without going through :meth:`motion_control`
+        (e.g. hand-guided while under :meth:`gravity_compensate`), the cached
+        ``_last_q_commanded`` and the velocity/accel differentiators no longer
+        reflect the real pose. Left stale, the next ``motion_control`` command
+        would be measured against the old setpoint: the max-step safety check
+        could reject the first waypoint, and the velocity/accel feedforward
+        would spike on a phantom jump.
+
+        Calling this clears that history so the next ``motion_control`` is
+        treated like the first command after :meth:`connect` — the max-step
+        check is skipped and the differentiators restart from zero. Pair it
+        with :meth:`reset_gravity_hold` when handing control back after a
+        manual reposition.
+        """
+        self._last_q_commanded = None
+        n = len(list(Joint))
+        self._vel_diff = Differentiator(n=n)
+        self._accel_diff = Differentiator(n=n)
+        self._meas_vel_diff = Differentiator(n=n)
+
 
 class Axol(RobotBase):
     """Dual-arm Axol robot interface.
@@ -1120,3 +1143,16 @@ class Axol(RobotBase):
             self.left.reset_gravity_hold()
         if self.right is not None:
             self.right.reset_gravity_hold()
+
+    def reset_command_state(self) -> None:
+        """Clear cached command history on both arms after an out-of-band move.
+
+        See :meth:`AxolArm.reset_command_state`. Call this after hand-guiding
+        the arms (e.g. under :meth:`gravity_compensate`) and before resuming
+        :meth:`motion_control`, so the return-to-pose command is not rejected
+        by the max-step safety check.
+        """
+        if self.left is not None:
+            self.left.reset_command_state()
+        if self.right is not None:
+            self.right.reset_command_state()

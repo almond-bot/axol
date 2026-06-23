@@ -18,6 +18,29 @@ class MotorDriver(ABC):
     carry the authoritative docstrings inherited by both implementations.
     """
 
+    # Push-based feedback callback, installed via ``set_feedback_callback``.
+    # Subclasses initialize this to ``None`` in ``__init__`` and invoke it
+    # from their CAN message handler when a feedback frame arrives.
+    _on_feedback: Callable[[float, float], None] | None = None
+
+    def set_feedback_callback(
+        self, callback: Callable[[float, float], None] | None
+    ) -> None:
+        """Register a callback fired with ``(position, torque)`` on each feedback frame.
+
+        This is the push-based counterpart to :meth:`get_telemetry`'s
+        pull-based ``on_position`` / ``on_torque`` callbacks: drivers invoke
+        it whenever an unsolicited or command-response feedback frame arrives
+        (for example the response to :meth:`set_impedance`), letting callers
+        cache the latest position/torque without an explicit telemetry
+        round-trip. Pass ``None`` to clear the callback.
+
+        Args:
+            callback: Receives ``(position_rad, torque_nm)``, or ``None`` to
+                disable feedback callbacks.
+        """
+        self._on_feedback = callback
+
     @abstractmethod
     async def enable(self) -> None:
         """Enable the motor and release the brake."""

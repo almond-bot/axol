@@ -3,7 +3,7 @@ title: "VR Interface"
 description: "The WebXR teleop app that streams Quest controller pose to the Axol SDK — now hosted in this repo under web/."
 ---
 
-The Axol VR interface is a **WebXR app** that runs in a Meta Quest browser and streams hand/elbow pose from the headset to the Axol SDK over a secure WebSocket. It's what you connect to during [teleoperation](/quickstart/teleop) and [data collection](/quickstart/data-collection).
+The Axol VR interface is a **WebXR app** that runs in a Meta Quest browser and streams hand/elbow pose from the headset to the Axol SDK over a secure WebSocket. It's what you connect to during [teleoperation](/operations/teleop) and [data collection](/operations/data-collection).
 
 The app's source lives in this repository under `web/` (it was previously the separate `axol-vr` repo). The same `web/` build also produces the [web control panel](/guides/control-panel), and [`axol serve`](/cli/serve) serves both.
 
@@ -15,6 +15,10 @@ The app's source lives in this repository under `web/` (it was previously the se
 | **Self-hosted** | `https://<host>:8001/` | Served from your own machine by [`axol serve`](/cli/serve), or by `npm run dev` for development. Use when iterating on the interface or running fully offline. |
 
 Either way, the headset connects to the **VR WebSocket server on port 8000** that [`axol teleop`](/cli/teleop) (and the control panel's teleop/collect operations) runs on the host.
+
+<Note>
+  On networks where Wi-Fi adds latency, tick **Quest over USB** on the connect screen to stream controller poses over a USB cable instead — the camera feeds keep using the LAN. See [Quest over USB](/guides/quest-over-usb).
+</Note>
 
 <Warning>
   The WSS link is self-signed, so it needs a one-time approval in the Quest browser. When you press **Connect** and the certificate hasn't been approved yet, the connection fails and an **Authorize certificate** button appears — tap it, proceed past the warning in the popup, and the app reconnects. (Equivalently, visit `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceed past the warning yourself.) The cert is cached in `~/.almond/vr/certs/` and shared with [`axol serve`](/cli/serve).
@@ -112,7 +116,7 @@ During the countdown the state sent to the server stays `DataCollection`; it bec
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Teleoperation quickstart" icon="gamepad" href="/quickstart/teleop">
+  <Card title="Teleoperation" icon="gamepad" href="/operations/teleop">
     Go from install to a live VR session.
   </Card>
   <Card title="VR server API" icon="code" href="/api/vr">

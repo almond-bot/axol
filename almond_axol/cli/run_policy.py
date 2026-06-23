@@ -330,12 +330,9 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-    from lerobot.async_inference import policy_server as _ps
+    from ..lerobot.inference_patch import disable_observation_similarity_filter
 
-    # Upstream's 1-rad L2 similarity filter drops nearly every observation
-    # on Axol's 16-DOF arms at 60 Hz, starving the action queue. There is
-    # no config knob, so patch the module symbol before ``serve``.
-    _ps.observations_similar = lambda *args, **kwargs: False
+    disable_observation_similarity_filter()
 
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
@@ -391,11 +388,26 @@ def _build_axol_robot_client(
           through ``_install_future_queue`` to avoid re-popping a
           just-executed timestep.
         - ``control_loop`` only pops actions; observation capture + send
-          moves to ``_observation_loop`` so the ~60-70 ms ZED read + gRPC
+          moves to ``observation_loop`` so the ~60-70 ms ZED read + gRPC
           send can't stall the 60 Hz action stream.
         - ``control_loop_action`` updates ``latest_action`` atomically
           with the queue pop (upstream updates it after ``send_action``,
           which leaves a re-pop race for the aggregator).
+
+        Everything here is built on public ``RobotClient`` API (public
+        instance attributes + public ``control_loop_observation`` /
+        ``send_action`` / ``actions_available``) with one unavoidable
+        exception: overriding ``_aggregate_action_queues``. LeRobot calls
+        the aggregator by that private name inside the public
+        ``receive_actions`` (robot_client.py), and its only public
+        aggregation hook (``RobotClientConfig.aggregate_fn_name``) selects
+        one of four *stateless, pairwise* blend functions — which cannot
+        express our stateful, multi-chunk, recency-weighted
+        ``temporal_ensemble``. Overriding the private method is therefore
+        the minimal seam. ``__init__`` asserts the symbol still exists so a
+        LeRobot bump that renames it fails loudly instead of silently
+        disabling ensembling. (Upstreaming a public aggregator hook would
+        remove this last dependency.)
 
         The constructor also skips ``make_robot_from_config`` / connect so
         re-recording doesn't pay the camera reconnect cost, publishes
@@ -418,6 +430,19 @@ def _build_axol_robot_client(
             aggregate_strategy,
             temporal_ensemble_coeff,
         ):
+            # We override the private RobotClient._aggregate_action_queues to
+            # inject temporal_ensemble (no public hook can express it — see the
+            # class docstring). If a LeRobot upgrade renames it, receive_actions
+            # would call the new name and our override would silently never run,
+            # disabling ensembling. Fail loudly at construction instead.
+            if not hasattr(RobotClient, "_aggregate_action_queues"):
+                raise RuntimeError(
+                    "lerobot RobotClient no longer defines "
+                    "'_aggregate_action_queues'; AxolRobotClient's "
+                    "temporal_ensemble override needs review against the new "
+                    "LeRobot version."
+                )
+
             self.config = config
             self.robot = robot
             self._publisher = publisher
@@ -457,7 +482,6 @@ def _build_axol_robot_client(
             self.latest_action_lock = _threading.Lock()
             self.latest_action = -1
             self.action_chunk_size = -1
-            self._chunk_size_threshold = config.chunk_size_threshold
             self.action_queue = Queue()
             self.action_queue_lock = _threading.Lock()
             self.action_queue_size = []
@@ -664,9 +688,16 @@ def _build_axol_robot_client(
                     self.latest_action = timed_action.get_timestep()
                 qs_after = self.action_queue.qsize()
 
-            performed = self.robot.send_action(
-                self._action_tensor_to_action_dict(timed_action.get_action())
-            )
+            # Inlined from upstream RobotClient._action_tensor_to_action_dict
+            # so we depend only on the public ``robot.action_features`` rather
+            # than a private LeRobot method. Maps the flat action tensor to a
+            # {motor_name: float} dict by position.
+            action_tensor = timed_action.get_action()
+            action = {
+                key: action_tensor[i].item()
+                for i, key in enumerate(self.robot.action_features)
+            }
+            performed = self.robot.send_action(action)
 
             if verbose:
                 self.logger.debug(
@@ -680,7 +711,7 @@ def _build_axol_robot_client(
             return performed
 
         def control_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def,override]
-            """Action-only control loop; obs send is on ``_observation_loop``.
+            """Action-only control loop; obs send is on ``observation_loop``.
 
             Upstream interleaves microsecond action pops with the 60-70 ms
             obs send on one thread, collapsing 60 Hz down to ~27 Hz on
@@ -705,7 +736,7 @@ def _build_axol_robot_client(
                 self.fatal_error = exc
                 self.shutdown_event.set()
 
-        def _observation_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def]
+        def observation_loop(self, task, verbose: bool = False):  # type: ignore[no-untyped-def]
             """Dedicated thread: capture and send observations.
 
             Fires ``control_loop_observation`` once the action queue
@@ -715,7 +746,16 @@ def _build_axol_robot_client(
             self.logger.info("Observation loop thread starting")
             while self.running:
                 try:
-                    if self._ready_to_send_observation():
+                    # Inlined from upstream RobotClient._ready_to_send_observation
+                    # so we read only public state (``action_queue``,
+                    # ``action_chunk_size``) and the public
+                    # ``config.chunk_size_threshold`` instead of the private
+                    # method/attribute. Send once the queue drains to threshold.
+                    with self.action_queue_lock:
+                        queue_fraction = (
+                            self.action_queue.qsize() / self.action_chunk_size
+                        )
+                    if queue_fraction <= self.config.chunk_size_threshold:
                         self.control_loop_observation(task, verbose)
                     else:
                         time.sleep(self.config.environment_dt)
@@ -977,7 +1017,7 @@ def _run(
             )
             # Decoupled from the control thread — see AxolRobotClient.control_loop.
             obs_thread = threading.Thread(
-                target=client._observation_loop,
+                target=client.observation_loop,
                 args=(task,),
                 name="axol-obs-loop",
                 daemon=True,
