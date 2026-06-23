@@ -78,6 +78,7 @@ class VRServer:
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
+        self._loop_lag_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._webrtc: WebRTCManager | Any | None = None
         self._pose_pcs: dict[int, Any] = {}
@@ -90,6 +91,7 @@ class VRServer:
         self._telemetry_max_client_dt_ms: float | None = None
         self._telemetry_client_dropped: int = 0
         self._telemetry_max_client_buffered_bytes: int = 0
+        self._telemetry_max_loop_lag_ms: float = 0.0
         self._telemetry_missing_seq: int = 0
         self._telemetry_out_of_order_seq: int = 0
 
@@ -190,6 +192,7 @@ class VRServer:
             ssl_keyfile=self._keyfile,
         )
         self._uvicorn_server = uvicorn.Server(config)
+        self._loop_lag_task = asyncio.create_task(self._sample_loop_lag())
         self._server_task = asyncio.create_task(self._uvicorn_server.serve())
         _logger.info("listening on wss://0.0.0.0:%d/ws", self._port)
 
@@ -199,6 +202,14 @@ class VRServer:
 
         if self._webrtc is not None:
             await self._webrtc.close_all()
+
+        if self._loop_lag_task is not None:
+            self._loop_lag_task.cancel()
+            try:
+                await self._loop_lag_task
+            except asyncio.CancelledError:
+                pass
+            self._loop_lag_task = None
 
         if self._uvicorn_server is not None:
             try:
@@ -235,6 +246,22 @@ class VRServer:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    async def _sample_loop_lag(self) -> None:
+        """Track worst asyncio scheduling delay on the VR server loop."""
+        interval = 0.01
+        loop = asyncio.get_running_loop()
+        next_tick = loop.time() + interval
+        while True:
+            await asyncio.sleep(max(0.0, next_tick - loop.time()))
+            now = loop.time()
+            lag_ms = max(0.0, (now - next_tick) * 1000.0)
+            self._telemetry_max_loop_lag_ms = max(
+                self._telemetry_max_loop_lag_ms, lag_ms
+            )
+            # If the loop was blocked for multiple periods, resync instead of
+            # reporting a train of artificial catch-up ticks.
+            next_tick = max(next_tick + interval, now + interval)
 
     async def _handle_message(
         self, websocket: WebSocket, client_id: int, data: str
@@ -291,6 +318,7 @@ class VRServer:
         self._telemetry_max_client_dt_ms = None
         self._telemetry_client_dropped = 0
         self._telemetry_max_client_buffered_bytes = 0
+        self._telemetry_max_loop_lag_ms = 0.0
         self._telemetry_missing_seq = 0
         self._telemetry_out_of_order_seq = 0
 
@@ -343,12 +371,13 @@ class VRServer:
         )
         _logger.info(
             "vr ingress: %.1f Hz  max_arrival_gap=%.1fms  "
-            "max_client_dt=%s  client_dropped=%d  "
-            "max_client_buffered=%dB  missing_seq=%d  "
+            "max_client_dt=%s  max_loop_lag=%.1fms  "
+            "client_dropped=%d  max_client_buffered=%dB  missing_seq=%d  "
             "out_of_order_seq=%d  last_seq=%s",
             hz,
             self._telemetry_max_arrival_gap_ms,
             client_gap,
+            self._telemetry_max_loop_lag_ms,
             self._telemetry_client_dropped,
             self._telemetry_max_client_buffered_bytes,
             self._telemetry_missing_seq,
@@ -362,6 +391,7 @@ class VRServer:
         self._telemetry_max_client_dt_ms = None
         self._telemetry_client_dropped = 0
         self._telemetry_max_client_buffered_bytes = 0
+        self._telemetry_max_loop_lag_ms = 0.0
         self._telemetry_missing_seq = 0
         self._telemetry_out_of_order_seq = 0
 
