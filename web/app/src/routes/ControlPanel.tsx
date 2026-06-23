@@ -178,7 +178,6 @@ export default function ControlPanel() {
       robotConnectClick()
     }
     // robotConnectClick is stable enough (only uses state setters / fetch).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, robot, robotBusy])
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
@@ -200,7 +199,6 @@ export default function ControlPanel() {
     autoUsbRef.current = true
     usbConnectClick()
     // usbConnectClick is stable (only uses state setters / fetch).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conn.state, usb, usbBusy])
 
   async function hostDisconnectClick() {

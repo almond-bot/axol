@@ -60,7 +60,20 @@ def install() -> None:
         )
         return
     if _adb() is None:
-        run_root(["apt-get", "install", "-y", *_APT_PACKAGES])
+        # `update` refreshes a stale/empty package index (best-effort, like the
+        # GStreamer step); `install` is checked so a failure doesn't fall
+        # through to claiming success with adb still missing.
+        run_root(["apt-get", "update"])
+        try:
+            run_root(["apt-get", "install", "-y", *_APT_PACKAGES], check=True)
+        except RuntimeError as exc:
+            _logger.warning(
+                "adb install failed (%s); Quest-over-USB unavailable. "
+                "Retry with: sudo apt-get install -y %s",
+                exc,
+                " ".join(_APT_PACKAGES),
+            )
+            return
     run_root(["tee", _OCULUS_RULE_PATH], input_text=_OCULUS_RULE + "\n")
     run_root(["udevadm", "control", "--reload-rules"])
     run_root(["udevadm", "trigger"])
