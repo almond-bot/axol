@@ -1198,6 +1198,7 @@ export default function App() {
             <AxolVRClient
               wsRef={wsRef}
               poseWsRef={poseWsRef}
+              usbOnly={usbPoses}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
               onExit={() => store.getState().session?.end()}
