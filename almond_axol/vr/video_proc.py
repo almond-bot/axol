@@ -239,18 +239,20 @@ def _relay_main(
     """
     logging.basicConfig(level=log_level)
 
-    # Deprioritize the relay below the control loop (nice 0) and IK (nice -10):
-    # its WebRTC RTP/SRTP send + raw-branch shm copy are ~2 cores at nice 0, equal
-    # priority to the control process, so CFS time-slices them fairly and the
-    # control thread waits up to a full slice (the ~20-49ms record-time loop gaps).
-    # At a positive nice the scheduler preempts the relay the instant the control
-    # thread wakes. Frame grab + VIC convert are on GPU/VIC hardware, so this only
-    # yields the relay's CPU work — no effect during teleop, where there's no
-    # contention. Best-effort.
-    try:
-        os.nice(10)
-    except (AttributeError, OSError):
-        pass
+    # Keep the relay off the control loop's cores: its WebRTC send + raw-branch
+    # shm copy (~2 cores) would otherwise preempt the control thread and cause
+    # record-time loop jitter. Core isolation is preferred — it leaves the relay
+    # at normal priority on its own cores so the headset feed stays smooth. Where
+    # affinity isn't available, fall back to a positive nice (deprioritizes the
+    # relay's CPU work; the feed may stutter under contention, but the control
+    # loop wins). Frame grab + VIC convert are on GPU/VIC hardware regardless.
+    from ..utils import affinity
+
+    if not affinity.pin_background():
+        try:
+            os.nice(10)
+        except (AttributeError, OSError):
+            pass
 
     from .video import WebRTCManager
 

@@ -489,6 +489,12 @@ def run_ik_worker(
     except (AttributeError, OSError):
         pass
 
+    # Share the control loop's dedicated cores (away from the video relay /
+    # recorder / encoders) so IK isn't preempted by background recording work.
+    from ..utils import affinity
+
+    affinity.pin_realtime()
+
     worker = IKWorker(config, kinematics_config)
     q_rest = worker.get_rest_q()
 

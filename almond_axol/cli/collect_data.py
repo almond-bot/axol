@@ -38,6 +38,7 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig, resolution_for_dims
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
+from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from .config import DatasetResolution, LogLevel, parse
@@ -259,6 +260,18 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     push_to_hub = cfg.push_to_hub
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
+
+    # Pin the control process to its dedicated cores before any threads are
+    # created (the control loop, VR server, and IK dispatch threads inherit it on
+    # connect), so background recording work — relay, recorder, NVENC encoders,
+    # all pinned to the other cores — can't preempt the 120 Hz loop. Restored in
+    # the finally so a long-lived serve process isn't left pinned. No-op where
+    # affinity isn't available.
+    try:
+        _orig_affinity = os.sched_getaffinity(0)
+    except (AttributeError, OSError):
+        _orig_affinity = None
+    affinity.pin_realtime()
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
@@ -657,3 +670,11 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         recorder.close()
         if relay is not None:
             relay.shutdown()
+
+        # Restore the process's original CPU affinity (a serve process is
+        # long-lived and runs other operations after this one).
+        if _orig_affinity is not None:
+            try:
+                os.sched_setaffinity(0, _orig_affinity)
+            except OSError:
+                pass

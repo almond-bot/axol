@@ -427,10 +427,17 @@ def _recorder_main(
 ) -> None:
     """Recorder subprocess entry: own the dataset, capture from shared memory."""
     logging.basicConfig(level=config["log_level"])
-    try:
-        os.nice(5)  # below the control loop / IK so it never preempts them
-    except (AttributeError, OSError):
-        pass
+
+    # Keep the recorder (+ its NVENC gst children, which inherit this) off the
+    # control loop's cores; fall back to a positive nice where affinity isn't
+    # available so it still never preempts the control loop / IK.
+    from ..utils import affinity
+
+    if not affinity.pin_background():
+        try:
+            os.nice(5)
+        except (AttributeError, OSError):
+            pass
 
     from lerobot.processor import make_default_processors
 
