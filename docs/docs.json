@@ -41,7 +41,8 @@
         "group": "Web Interfaces",
         "pages": [
           "guides/control-panel",
-          "guides/vr-interface"
+          "guides/vr-interface",
+          "guides/quest-over-usb"
         ]
       },
       {

@@ -31,8 +31,9 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 
 | Export | Description |
 |---|---|
-| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over WebSocket |
+| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over the main WebSocket, or a dedicated USB pose socket when one is supplied |
 | `useAxolVRClient` | Hook — manages WebSocket lifecycle (connect, disconnect, auto-retry) |
+| `useAxolPoseSocket` | Hook — maintains a dedicated pose WebSocket to `wss://localhost:<port>` (the Quest-over-USB `adb reverse` tunnel) so controller poses avoid WiFi latency; returns `{ poseWsRef, status }` |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
 | `useAxolTracking` | Hook — returns a frame-readable `ref` reflecting whether the robot is currently engaged (mirroring the operator), driven by the server's `{"type":"tracking"}` pushes with a local grip-toggle fallback. Used to gate camera-screen repositioning to when the robot isn't being controlled |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
@@ -45,6 +46,8 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | Prop | Type | Description |
 |---|---|---|
 | `wsRef` | `RefObject<WebSocket \| null>` | WebSocket ref from `useAxolVRClient` |
+| `poseWsRef` | `RefObject<WebSocket \| null>` (optional) | Dedicated pose WebSocket from `useAxolPoseSocket` (Quest-over-USB) |
+| `usbOnly` | `boolean` (optional) | When true, poses go **only** over `poseWsRef`; never the network WebSocket. Teleop pauses (no poses sent) while the USB link is down rather than falling back to WiFi |
 | `onStateChange` | `(state: AxolState) => void` | Fires when the controller state machine transitions |
 | `onPendingRecording` | `(pendingAt: number \| null) => void` | Fires with a timestamp when a 3-second recording countdown begins; `null` when cancelled or resolved |
 | `onExit` | `() => void` | Fires when the Y button exits the XR session |
@@ -55,6 +58,19 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 useAxolVRClient(hostname: string, port = 8000, maxRetries = 3, retryMs = 1000)
 // returns: { status, connect, disconnect, wsRef }
 ```
+
+**`useAxolPoseSocket` params**
+
+```ts
+useAxolPoseSocket(enabled: boolean, port = 8000)
+// returns: { poseWsRef, status }
+```
+
+When `enabled`, maintains `wss://localhost:<port>` — the Quest-over-USB
+`adb reverse` tunnel — with auto-retry, and closes when disabled. Pass
+`poseWsRef` to `AxolVRClient` so controller poses ride the USB cable (avoiding
+WiFi power-save buffering) while camera video keeps using the LAN connection.
+See **Quest over USB** in the repo README for the operator flow.
 
 **Frame data (`AxolPoseData`)**
 

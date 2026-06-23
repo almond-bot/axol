@@ -8,11 +8,19 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 
 export function AxolVRClient({
   wsRef,
+  poseWsRef,
+  usbOnly = false,
   onStateChange,
   onPendingRecording,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
+  // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel.
+  poseWsRef?: RefObject<WebSocket | null>
+  // When true, pose frames go ONLY over `poseWsRef` (USB); they are never sent
+  // over the network WebSocket, so teleop pauses rather than silently falling
+  // back to WiFi when the USB link isn't up.
+  usbOnly?: boolean
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
   onExit?: () => void
@@ -147,8 +155,12 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    const dc = wsRef.current
-    if (!dc || dc.readyState !== WebSocket.OPEN) return
+    // Pick the pose transport. In USB mode poses go ONLY over the dedicated USB
+    // pose socket — never the network — so teleop pauses rather than silently
+    // falling back to WiFi when the cable link isn't up. Otherwise poses ride
+    // the main WebSocket.
+    const sink = usbOnly ? (poseWsRef?.current ?? null) : wsRef.current
+    if (sink == null || sink.readyState !== WebSocket.OPEN) return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -185,7 +197,7 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    dc.send(
+    sink.send(
       JSON.stringify({
         l_ee,
         r_ee,

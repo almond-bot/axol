@@ -5,8 +5,8 @@
 #
 # Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
 # except cuda), installs the pyzed bindings when the ZED SDK is present,
-# and registers a root systemd service that keeps `axol serve` running at
-# boot and restarts it if it ever goes down.
+# installs adb for Quest-over-USB teleop, and registers a root systemd service
+# that keeps `axol serve` running at boot and restarts it if it ever goes down.
 # Safe to re-run: re-running upgrades to the latest main.
 
 set -euo pipefail
@@ -75,7 +75,7 @@ chmod -R a+rX "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 command -v axol >/dev/null 2>&1 || die "axol did not end up on PATH (expected ${BIN_DIR}/axol)."
 say "axol installed at $(command -v axol)."
 
-# -- System provisioning (pyzed + GStreamer camera stack) ---------------------
+# -- System provisioning (pyzed + GStreamer camera stack + adb) ---------------
 
 # `uv tool install` handles the Python package + PyPI deps, but a few pieces it
 # can't: the pyzed bindings (not on PyPI), PyGObject (the in-process appsink
@@ -86,7 +86,9 @@ say "axol installed at $(command -v axol)."
 # idempotently -- the same command the `axol serve` self-updater runs after an
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
-say "Provisioning system dependencies (pyzed + GStreamer camera stack)..."
+# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport);
+# self-gates on apt and is a no-op where unavailable.
+say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
 
 # -- Jetson clocks ------------------------------------------------------------

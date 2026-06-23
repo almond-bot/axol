@@ -15,6 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  useAxolPoseSocket,
   useAxolTracking,
   useAxolVideo,
   useAxolVRClient,
@@ -1019,13 +1020,25 @@ function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
 
 export default function App() {
   const [hostname, setHostname] = useState(() => localStorage.getItem("wsHostname") ?? "")
+  const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
+  // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
+  // avoid WiFi latency; camera video keeps using the LAN host above. The pose
+  // socket comes up once the main connection is open and the operator opts in.
+  const { poseWsRef, status: poseStatus } = useAxolPoseSocket(
+    usbPoses && status === AxolConnectionStatus.Open
+  )
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
     connect()
+  }
+
+  const handleUsbToggle = (next: boolean) => {
+    setUsbPoses(next)
+    localStorage.setItem("usbPoses", next ? "1" : "0")
   }
 
   return (
@@ -1048,13 +1061,48 @@ export default function App() {
 
             {status === AxolConnectionStatus.Open ? (
               <div className="flex flex-col gap-2">
-                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
+                <Button
+                  size="lg"
+                  className="w-full"
+                  onClick={() => store.enterAR()}
+                  disabled={usbPoses && poseStatus !== AxolConnectionStatus.Open}
+                >
                   <Headset />
                   Enter VR
                 </Button>
                 <Button variant="ghost" className="w-full" onClick={disconnect}>
                   Disconnect
                 </Button>
+                {usbPoses && (
+                  <div className="flex flex-col gap-2">
+                    <p className="text-center text-xs text-white/40">
+                      Quest over USB:{" "}
+                      <span
+                        className={cn(
+                          "font-medium",
+                          poseStatus === AxolConnectionStatus.Open
+                            ? "text-emerald-400"
+                            : "text-amber-400"
+                        )}
+                      >
+                        {poseStatus === AxolConnectionStatus.Open
+                          ? "controller over cable"
+                          : "waiting for USB link…"}
+                      </span>
+                    </p>
+                    {poseStatus !== AxolConnectionStatus.Open && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="w-full"
+                        onClick={() => authorizeCert(`https://localhost:${VR_WS_PORT}`)}
+                      >
+                        <ShieldCheck />
+                        Authorize USB certificate
+                      </Button>
+                    )}
+                  </div>
+                )}
               </div>
             ) : status === AxolConnectionStatus.Connecting ? (
               <Button variant="secondary" className="w-full" onClick={disconnect}>
@@ -1082,6 +1130,15 @@ export default function App() {
                   onChange={(e) => setHostname(e.target.value)}
                   placeholder="axol-host.local"
                 />
+                <label className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 p-3 text-sm text-white/80">
+                  <input
+                    type="checkbox"
+                    checked={usbPoses}
+                    onChange={(e) => handleUsbToggle(e.target.checked)}
+                    className="size-4 shrink-0 accent-white"
+                  />
+                  Quest over USB
+                </label>
                 <Button type="submit" className="w-full" disabled={!hostname.trim()}>
                   Connect
                 </Button>
@@ -1145,6 +1202,8 @@ export default function App() {
           <XR store={store}>
             <AxolVRClient
               wsRef={wsRef}
+              poseWsRef={poseWsRef}
+              usbOnly={usbPoses}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
               onExit={() => store.getState().session?.end()}

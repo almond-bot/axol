@@ -4,6 +4,9 @@ axol provision
 The single idempotent provisioning path for the pieces ``uv tool install`` /
 ``uv tool upgrade`` can't manage on their own:
 
+* ``adb``           — Android Debug Bridge + the Oculus udev rule, for
+                      streaming Quest controller poses over a USB
+                      ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
@@ -28,6 +31,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .zed import install as zed_install
@@ -63,6 +67,9 @@ def _step(label: str, fn: Callable[[], None]) -> None:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
+    # adb + the Oculus udev rule, for streaming Quest controller poses over a
+    # USB `adb reverse` tunnel (avoids WiFi latency). Self-gates on apt-get.
+    _step("adb (Quest-over-USB)", adb.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)

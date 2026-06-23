@@ -111,6 +111,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 - [Web Control Panel](https://docs.almond.bot/guides/control-panel) — drive the robot from a browser via `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
+- [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
 
 ### Advanced
 

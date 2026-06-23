@@ -16,6 +16,10 @@ The app's source lives in this repository under `web/` (it was previously the se
 
 Either way, the headset connects to the **VR WebSocket server on port 8000** that [`axol teleop`](/cli/teleop) (and the control panel's teleop/collect operations) runs on the host.
 
+<Note>
+  On networks where Wi-Fi adds latency, tick **Quest over USB** on the connect screen to stream controller poses over a USB cable instead — the camera feeds keep using the LAN. See [Quest over USB](/guides/quest-over-usb).
+</Note>
+
 <Warning>
   The WSS link is self-signed, so it needs a one-time approval in the Quest browser. When you press **Connect** and the certificate hasn't been approved yet, the connection fails and an **Authorize certificate** button appears — tap it, proceed past the warning in the popup, and the app reconnects. (Equivalently, visit `https://<hostname>.local:8000` or `https://<local-ip>:8000` and proceed past the warning yourself.) The cert is cached in `~/.almond/vr/certs/` and shared with [`axol serve`](/cli/serve).
 </Warning>
