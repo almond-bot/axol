@@ -21,6 +21,7 @@ export function AxolVRClient({
 
   const stateRef = useRef<AxolState>(AxolState.Teleop)
   const seqRef = useRef(0)
+  const lastSentAtMsRef = useRef<number | null>(null)
   const prevXRef = useRef(false)
   const prevYRef = useRef(false)
   const prevARef = useRef(false)
@@ -185,6 +186,11 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
+    const sentAtMs = performance.now()
+    const lastSentAtMs = lastSentAtMsRef.current
+    const clientDtMs = lastSentAtMs === null ? null : sentAtMs - lastSentAtMs
+    lastSentAtMsRef.current = sentAtMs
+
     dc.send(
       JSON.stringify({
         l_ee,
@@ -198,6 +204,8 @@ export function AxolVRClient({
         reset,
         state: stateRef.current,
         seq: ++seqRef.current,
+        sent_at_ms: sentAtMs,
+        client_dt_ms: clientDtMs,
       })
     )
   })

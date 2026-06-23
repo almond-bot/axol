@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -78,6 +79,15 @@ class VRServer:
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._webrtc: WebRTCManager | Any | None = None
+
+        self._telemetry_window_start: float | None = None
+        self._telemetry_last_arrival: float | None = None
+        self._telemetry_last_seq: int | None = None
+        self._telemetry_count: int = 0
+        self._telemetry_max_arrival_gap_ms: float = 0.0
+        self._telemetry_max_client_dt_ms: float | None = None
+        self._telemetry_missing_seq: int = 0
+        self._telemetry_out_of_order_seq: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -239,11 +249,82 @@ class VRServer:
 
         try:
             frame = VRFrame.model_validate(obj)
+            self._record_frame_telemetry(frame)
             self._latest_frame = frame
             if self._on_frame is not None:
                 self._on_frame(frame)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
+
+    def _reset_frame_telemetry(self) -> None:
+        """Clear frame-ingress telemetry counters for a fresh headset session."""
+        self._telemetry_window_start = None
+        self._telemetry_last_arrival = None
+        self._telemetry_last_seq = None
+        self._telemetry_count = 0
+        self._telemetry_max_arrival_gap_ms = 0.0
+        self._telemetry_max_client_dt_ms = None
+        self._telemetry_missing_seq = 0
+        self._telemetry_out_of_order_seq = 0
+
+    def _record_frame_telemetry(self, frame: VRFrame) -> None:
+        """Log one-second summaries of headset send cadence vs server receipt."""
+        now = time.perf_counter()
+        if self._telemetry_window_start is None:
+            self._telemetry_window_start = now
+
+        if self._telemetry_last_arrival is not None:
+            arrival_gap_ms = (now - self._telemetry_last_arrival) * 1000.0
+            self._telemetry_max_arrival_gap_ms = max(
+                self._telemetry_max_arrival_gap_ms, arrival_gap_ms
+            )
+        self._telemetry_last_arrival = now
+
+        if frame.client_dt_ms is not None:
+            self._telemetry_max_client_dt_ms = max(
+                self._telemetry_max_client_dt_ms or 0.0, frame.client_dt_ms
+            )
+
+        if frame.seq is not None:
+            if self._telemetry_last_seq is not None:
+                seq_delta = frame.seq - self._telemetry_last_seq
+                if seq_delta > 1:
+                    self._telemetry_missing_seq += seq_delta - 1
+                elif seq_delta <= 0:
+                    self._telemetry_out_of_order_seq += 1
+            self._telemetry_last_seq = frame.seq
+
+        self._telemetry_count += 1
+        elapsed = now - self._telemetry_window_start
+        if elapsed < 1.0:
+            return
+
+        hz = self._telemetry_count / elapsed if elapsed > 0.0 else 0.0
+        client_gap = (
+            "n/a"
+            if self._telemetry_max_client_dt_ms is None
+            else f"{self._telemetry_max_client_dt_ms:.1f}ms"
+        )
+        seq = (
+            "n/a" if self._telemetry_last_seq is None else str(self._telemetry_last_seq)
+        )
+        _logger.info(
+            "vr ingress: %.1f Hz  max_arrival_gap=%.1fms  "
+            "max_client_dt=%s  missing_seq=%d  out_of_order_seq=%d  last_seq=%s",
+            hz,
+            self._telemetry_max_arrival_gap_ms,
+            client_gap,
+            self._telemetry_missing_seq,
+            self._telemetry_out_of_order_seq,
+            seq,
+        )
+
+        self._telemetry_window_start = now
+        self._telemetry_count = 0
+        self._telemetry_max_arrival_gap_ms = 0.0
+        self._telemetry_max_client_dt_ms = None
+        self._telemetry_missing_seq = 0
+        self._telemetry_out_of_order_seq = 0
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -289,6 +370,7 @@ class VRServer:
         async def _ws(websocket: WebSocket) -> None:
             await websocket.accept()
             _logger.info("client connected %s", websocket.client)
+            server._reset_frame_telemetry()
             server._client_count += 1
             server._active_clients.add(websocket)
             client_id = id(websocket)

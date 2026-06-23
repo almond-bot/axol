@@ -71,6 +71,11 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
+        seq:     Monotonic sender-side frame sequence number, if provided.
+        sent_at_ms: Sender-side ``performance.now()`` timestamp in milliseconds,
+            useful only for comparing deltas from the same headset clock.
+        client_dt_ms: Sender-side milliseconds since the previous transmitted
+            frame, if provided.
     """
 
     l_ee: VRPose
@@ -83,3 +88,6 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
+    seq: int | None = None
+    sent_at_ms: float | None = None
+    client_dt_ms: float | None = None
