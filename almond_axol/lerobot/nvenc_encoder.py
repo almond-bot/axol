@@ -59,11 +59,13 @@ _BITRATE_BPP = 0.25
 _BITRATE_MIN = 6_000_000
 _BITRATE_MAX = 40_000_000
 
-# Stride for the post-episode stats pass: sample every Nth decoded frame. Stats
-# feed dataset normalization and are robust to subsampling. They are computed
-# *after* recording (by decoding the finished mp4, see _compute_stats_from_mp4)
-# rather than inline, because the per-frame numpy work holds the GIL and — even
-# with spare CPU cores — starves the asyncio control loop during recording.
+# Sample every Nth frame for image stats. Stats feed dataset normalization and
+# are robust to subsampling. They are accumulated *during* the episode, on the
+# encoder's writer thread in the recorder subprocess — not by decoding the
+# finished mp4 afterwards (which made save_episode slow). The recorder has its
+# own GIL/cores, away from the control loop and the relay's WebRTC send, so this
+# light per-frame work no longer harms either; computing on the source frames
+# (pre-encode) also matches LeRobot's software path more closely than decoding.
 _STATS_EVERY = 4
 
 
@@ -116,52 +118,15 @@ def _to_hwc_rgb_uint8(frame: "NDArray") -> "NDArray":
     return np.ascontiguousarray(frame)
 
 
-def _compute_stats_from_mp4(path: Path, stride: int = _STATS_EVERY) -> dict | None:
-    """Compute LeRobot image stats by decoding the finished mp4 (post-episode).
-
-    Called from ``finish()`` after recording has stopped, so the per-frame
-    downsample + quantile work (numpy, GIL-holding) never competes with the
-    control loop. Samples every ``stride``-th frame to match the old in-stream
-    subsampling, and mirrors LeRobot's ``auto_downsample_height_width`` +
-    ``RunningQuantileStats`` pipeline so the result matches the software path.
-    Returns ``None`` if a decoder is unavailable or the file has no frames (the
-    dataset writer treats missing stats gracefully).
-    """
-    try:
-        import av
-        from lerobot.datasets.compute_stats import (
-            RunningQuantileStats,
-            auto_downsample_height_width,
-        )
-    except Exception as exc:  # noqa: BLE001 - no decoder/lerobot -> skip stats
-        _logger.warning("cannot compute video stats for %s: %s", path.name, exc)
-        return None
-
-    stats = RunningQuantileStats()
-    samples = 0
-    try:
-        with av.open(str(path)) as container:
-            stream = container.streams.video[0]
-            for i, frame in enumerate(container.decode(stream)):
-                if i % stride:
-                    continue
-                arr = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
-                ds = auto_downsample_height_width(arr.transpose(2, 0, 1))
-                stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
-                samples += 1
-    except Exception as exc:  # noqa: BLE001 - corrupt/short file -> skip stats
-        _logger.warning("failed to decode %s for stats: %s", path.name, exc)
-        return None
-    return stats.get_statistics() if samples else None
-
-
 class _CameraNvencEncoder:
     """One camera's NVENC pipeline plus the thread that feeds it.
 
     ``feed`` (called from the capture thread) only enqueues; a dedicated writer
-    thread pads RGB->RGBA and writes the bytes to the gst subprocess. Stats are
-    computed once at ``finish()`` from the finished mp4, not per frame, so no
-    GIL-holding numpy work runs alongside the control loop during recording.
+    thread pads RGB->RGBA, writes the bytes to the gst subprocess, and folds every
+    ``_STATS_EVERY``-th frame into a running image-stats accumulator. ``finish()``
+    just returns the accumulated stats, so save_episode no longer re-decodes the
+    whole mp4. This work runs in the recorder subprocess, off the control loop and
+    the relay's WebRTC send.
     """
 
     def __init__(self, video_path: Path, fps: int, queue_maxsize: int) -> None:
@@ -175,6 +140,27 @@ class _CameraNvencEncoder:
         self._frame_count = 0
         self._dropped = 0
         self._error: str | None = None
+
+        # Running image stats, accumulated inline as frames are encoded (mirrors
+        # LeRobot's auto_downsample + RunningQuantileStats so the result matches
+        # the software path). Disabled if lerobot's compute_stats can't import.
+        self._stats: object | None = None
+        self._downsample = None
+        self._stats_samples = 0
+        try:
+            from lerobot.datasets.compute_stats import (
+                RunningQuantileStats,
+                auto_downsample_height_width,
+            )
+
+            self._stats = RunningQuantileStats()
+            self._downsample = auto_downsample_height_width
+        except Exception as exc:  # noqa: BLE001 - no lerobot -> record without stats
+            _logger.warning(
+                "video stats unavailable for %s, recording without them: %s",
+                video_path.name,
+                exc,
+            )
 
         # Rolling per-second writer-thread cost, logged at INFO so the record
         # path is visible: how much GIL-holding work each camera's encode does
@@ -222,9 +208,14 @@ class _CameraNvencEncoder:
             raise RuntimeError(
                 f"NVENC encoder for {self.video_path.name} failed: {self._error}"
             )
-        # Recording has stopped; decode the finished mp4 to compute stats off the
-        # control-loop path (see _compute_stats_from_mp4).
-        return self.video_path, _compute_stats_from_mp4(self.video_path)
+        # Stats were accumulated inline during the episode, so finishing is just
+        # the mp4 finalize (moov flush) above — no re-decode of the whole file.
+        stats = (
+            self._stats.get_statistics()  # type: ignore[attr-defined]
+            if self._stats is not None and self._stats_samples
+            else None
+        )
+        return self.video_path, stats
 
     def cancel(self) -> None:
         self._queue.put(None)
@@ -257,10 +248,25 @@ class _CameraNvencEncoder:
         assert self._rgba is not None and self._stdin_fd is not None
         self._rgba[:, :, :3] = frame
         self._write(self._rgba)
+        if self._stats is not None and self._frame_count % _STATS_EVERY == 0:
+            self._update_stats(frame)
         self._t_copy += time.perf_counter() - t0
         self._frame_count += 1
         self._frames_window += 1
         self._maybe_log()
+
+    def _update_stats(self, frame: "NDArray") -> None:
+        """Fold one (HWC RGB uint8) frame into the running image stats.
+
+        Mirrors LeRobot's ``compute_stats`` pipeline (downsample then quantile
+        update) so the values match the software encoder path.
+        """
+        try:
+            ds = self._downsample(frame.transpose(2, 0, 1))  # type: ignore[misc]
+            self._stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))  # type: ignore[attr-defined]
+            self._stats_samples += 1
+        except Exception as exc:  # noqa: BLE001 - never kill encode over stats
+            _logger.debug("stats update failed for %s: %s", self.video_path.name, exc)
 
     def _maybe_log(self) -> None:
         now = time.perf_counter()
