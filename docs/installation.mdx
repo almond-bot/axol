@@ -46,7 +46,7 @@ This one command:
 - Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
 - Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
 - On a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)) for low-latency camera encode and a steady IK loop.
-- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down.
+- Registers a root systemd service (`axol.service`) that runs [`axol serve`](/cli/serve) at boot and restarts it automatically if it ever goes down. The service is pointed at the installing user's home for dataset storage (`HF_LEROBOT_HOME=~<user>/.cache/huggingface/lerobot`), so [`collect-data`](/cli/collect-data) datasets land in that account rather than `/root` even though the service runs as root.
 
 When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to the machine — see the [Web Control Panel guide](/guides/control-panel). From then on, everything happens in the browser.
 

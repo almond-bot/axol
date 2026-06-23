@@ -176,6 +176,23 @@ class AxolRobot(Robot):
             cameras[key] = stereo.left_view if eye == "left" else stereo.right_view
         return cameras, owned
 
+    def set_external_cameras(self, cameras: dict) -> None:
+        """Replace the camera set with externally-owned cameras.
+
+        Used by ``collect-data`` when the ZED cameras live in the out-of-process
+        video relay (:mod:`almond_axol.vr.video_proc`) and are exposed to this
+        process as shared-memory readers (:mod:`almond_axol.vr.shm_frames`).
+        Must be called before :meth:`connect`: the robot then treats them as
+        ordinary cameras (``read_at_or_after`` / ``read_latest``; ``connect`` is
+        a no-op on a proxy) and never opens the physical devices itself, so the
+        control process stays off the camera grab/encode path entirely.
+        """
+        if self._axol is not None:
+            raise RuntimeError("set_external_cameras must be called before connect().")
+        self.cameras = cameras
+        self._stereo_cameras = []
+        self._observation_features = None
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -251,10 +268,26 @@ class AxolRobot(Robot):
             right_channel=self.config.right_channel,
         )
         await self._axol.enable()
-        await self._axol.start_telemetry(
-            self.config.telemetry_hz, torque=self.config.observe_torques
-        )
-        await self._axol.wait_for_telemetry()
+        if self.config.telemetry_hz > 0:
+            await self._axol.start_telemetry(
+                self.config.telemetry_hz, torque=self.config.observe_torques
+            )
+            await self._axol.wait_for_telemetry()
+        else:
+            # No background poll loop: rely on motion_control replies (every
+            # impedance/gripper command returns a feedback frame) to keep the
+            # position/torque cache fresh, exactly like `axol teleop`. This
+            # removes ~telemetry_hz × 16 redundant CAN transactions/sec that
+            # otherwise contend with motion_control on the bus and the loop.
+            #
+            # Seed the cache before the first cached read: get_positions() uses
+            # register reads that return values but don't populate the .position
+            # cache (only feedback frames do), and command sends are
+            # fire-and-forget, so issue one hold-in-place motion_control to
+            # elicit feedback from every motor and wait for those frames to land.
+            pos_l, pos_r = await self._axol.get_positions()
+            await self._axol.motion_control(left=pos_l, right=pos_r)
+            await self._axol.wait_for_telemetry()
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""
@@ -303,6 +336,20 @@ class AxolRobot(Robot):
         assert self._axol.left is not None
         assert self._axol.right is not None
         return self._axol.left.positions, self._axol.right.positions
+
+    @property
+    def event_loop(self) -> asyncio.AbstractEventLoop:
+        """The robot's asyncio event loop (CAN telemetry + motion control).
+
+        ``collect-data`` runs its hot control loop *on* this loop so
+        :meth:`send_action_async` awaits ``motion_control`` inline —
+        cooperatively interleaved with telemetry on a single thread, exactly
+        like ``axol teleop``. That removes the per-step cross-thread
+        ``send_action`` round trip (``run_coroutine_threadsafe(...).result()``),
+        which is what otherwise caps the data-collection control rate.
+        """
+        assert self._loop is not None, "connect() first"
+        return self._loop
 
     # ------------------------------------------------------------------
     # Observation / action
@@ -398,20 +445,46 @@ class AxolRobot(Robot):
     def send_action(self, action: RobotAction) -> RobotAction:
         """Send joint position targets via impedance control (arm joints) and position-force control (gripper).
 
+        Synchronous wrapper for callers not running on :attr:`event_loop`
+        (e.g. ``run-policy``): it hops to the robot's loop and blocks on the
+        result. The high-rate ``collect-data`` path uses
+        :meth:`send_action_async` instead to avoid that cross-thread wait.
+
         Args:
             action: Dict with keys matching action_features, values in radians.
 
         Returns:
             The action as sent (unmodified).
         """
-        assert self._axol is not None and self._loop is not None
+        assert self._loop is not None
+
+        asyncio.run_coroutine_threadsafe(
+            self.send_action_async(action), self._loop
+        ).result(timeout=1.0)
+
+        return action
+
+    async def send_action_async(self, action: RobotAction) -> RobotAction:
+        """Await ``motion_control`` directly on the robot's event loop.
+
+        Must be awaited from a coroutine already running on
+        :attr:`event_loop`. Unlike :meth:`send_action` this performs no thread
+        hop: the control loop and CAN telemetry share one loop, so the command
+        is dispatched inline (cooperatively with telemetry) with no
+        cross-thread ``.result()`` block.
+
+        Args:
+            action: Dict with keys matching action_features, values in radians.
+
+        Returns:
+            The action as sent (unmodified).
+        """
+        assert self._axol is not None
 
         left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
         right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
 
-        asyncio.run_coroutine_threadsafe(
-            self._axol.motion_control(left=left, right=right), self._loop
-        ).result(timeout=1.0)
+        await self._axol.motion_control(left=left, right=right)
 
         return action
 

@@ -14,14 +14,18 @@ Two Tegra defaults trade latency for power/throughput and hurt us:
   underclocks the cores to ~40-70% of max, which drops the IK rate by a
   matching ~30% (measured 79 Hz vs 113 Hz pinned).
 
-Pinning both to max fixes the latency / rate. Best-effort and cleared on
-reboot, so ``axol jetson.setup`` (which calls :func:`pin_realtime_clocks`) is
-run at boot from the host installer's systemd unit — not from teleop / serve.
+Both ceilings are themselves capped by the ``nvpmodel`` power mode, so
+:func:`pin_realtime_clocks` first selects MAXN (mode 0) to uncap them, then
+pins the engine and CPU clocks to that max — fixing the latency / rate.
+Best-effort and cleared on reboot, so ``axol jetson.setup`` (which calls
+:func:`pin_realtime_clocks`) is run at boot from the host installer's systemd
+unit — not from teleop / serve.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -32,9 +36,14 @@ _logger = logging.getLogger(__name__)
 # Hardware engines whose devfreq clocks the encode path depends on.
 _ENGINE_CLOCK_GLOBS = ("*.nvenc", "*.vic")
 
-# cpufreq governor that holds the cores at their max clock. ``nvpmodel``
-# still caps the ceiling, so MAXN is assumed for the full benefit.
+# cpufreq governor that holds the cores at their max clock. The ceiling it
+# holds them at is whatever the active ``nvpmodel`` power mode allows, so we
+# select MAXN first (see :func:`_set_max_power_mode`) for the full benefit.
 _CPU_GOVERNOR = "performance"
+
+# nvpmodel power mode that uncaps the clock ceiling. MAXN is mode 0 on every
+# Jetson, so the governor and engine pins can reach the real max clocks.
+_MAXN_MODE = "0"
 
 # Canonical L4T marker present on every Jetson. CPU-governor pinning is gated
 # on Jetson detection so ``jetson.setup`` on a non-Tegra Linux host never
@@ -49,18 +58,20 @@ def _is_jetson() -> bool:
         return True
     # Fallback: the encode engines we pin only exist on Tegra, so their
     # presence also identifies a Jetson even if the release file is missing.
+    # (``glob`` returns a generator that is always truthy, so it must be
+    # consumed — ``any(glob(...))`` — to test whether it actually matched.)
     return any(
-        Path("/sys/class/devfreq").glob(pattern) for pattern in _ENGINE_CLOCK_GLOBS
+        any(Path("/sys/class/devfreq").glob(pattern)) for pattern in _ENGINE_CLOCK_GLOBS
     )
 
 
-class _SysfsWriter:
-    """Writes sysfs values, escalating to ``sudo`` once if needed.
+class _RootEscalator:
+    """Writes sysfs values / runs commands, escalating to ``sudo`` once.
 
     The hosted install runs as root (direct writes succeed); a CLI user
-    may not be, so the first failed write primes sudo credentials (a tty
-    prompt when ``interactive``) and every write after that uses
-    ``sudo -n``. Priming happens at most once, and only when a value
+    may not be, so the first failed operation primes sudo credentials (a tty
+    prompt when ``interactive``) and every operation after that uses
+    ``sudo -n``. Priming happens at most once, and only when something
     actually needs changing.
     """
 
@@ -68,14 +79,17 @@ class _SysfsWriter:
         self._interactive = interactive
         self._primed = False
 
+    def _prime(self) -> None:
+        if self._interactive and not self._primed:
+            self._primed = prime_sudo()
+
     def write(self, path: Path, value: str) -> bool:
         try:
             path.write_text(value)
             return True
         except OSError:
             pass
-        if self._interactive and not self._primed:
-            self._primed = prime_sudo()
+        self._prime()
         return (
             subprocess.run(
                 ["sudo", "-n", "tee", str(path)],
@@ -86,8 +100,59 @@ class _SysfsWriter:
             == 0
         )
 
+    def run(self, argv: list[str]) -> bool:
+        """Run ``argv`` as root: directly when possible, else via ``sudo -n``."""
+        try:
+            if subprocess.run(argv, capture_output=True, text=True).returncode == 0:
+                return True
+        except OSError:
+            pass
+        self._prime()
+        return (
+            subprocess.run(
+                ["sudo", "-n", *argv], capture_output=True, text=True
+            ).returncode
+            == 0
+        )
 
-def _pin_engines(writer: _SysfsWriter) -> None:
+
+def _set_max_power_mode(escalator: _RootEscalator) -> None:
+    """Select the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling).
+
+    Jetson-only and best-effort. MAXN is the prerequisite for the CPU
+    governor and engine pins below: ``nvpmodel`` caps the clock ceiling, so
+    without MAXN the ``performance`` governor merely holds the cores at a
+    lower mode's max. A no-op when already in MAXN (so no needless sudo
+    prompt) or when ``nvpmodel`` is absent.
+    """
+    if not _is_jetson():
+        _logger.debug("not a Jetson; leaving the nvpmodel power mode unchanged")
+        return
+    nvpmodel = shutil.which("nvpmodel")
+    if nvpmodel is None:
+        _logger.debug("nvpmodel not found; leaving the power mode unchanged")
+        return
+    # ``nvpmodel -q`` prints the active mode id on its last non-empty line;
+    # skip the (root-only) switch when it already reports MAXN.
+    try:
+        query = subprocess.run([nvpmodel, "-q"], capture_output=True, text=True)
+        lines = [ln.strip() for ln in query.stdout.splitlines() if ln.strip()]
+        if lines and lines[-1] == _MAXN_MODE:
+            return
+    except OSError:
+        pass
+    if escalator.run([nvpmodel, "-m", _MAXN_MODE]):
+        _logger.info("set Jetson power mode to MAXN (nvpmodel -m %s)", _MAXN_MODE)
+    else:
+        _logger.warning(
+            "cannot set the Jetson power mode to MAXN (need root) — the active "
+            "nvpmodel mode caps the clock ceiling the performance governor and "
+            "engine pins can reach. Fix manually with: sudo nvpmodel -m %s",
+            _MAXN_MODE,
+        )
+
+
+def _pin_engines(writer: _RootEscalator) -> None:
     """Set ``min_freq = max_freq`` on the NVENC/VIC devfreq nodes."""
     for pattern in _ENGINE_CLOCK_GLOBS:
         for node in Path("/sys/class/devfreq").glob(pattern):
@@ -111,7 +176,7 @@ def _pin_engines(writer: _SysfsWriter) -> None:
                 )
 
 
-def _pin_cpu(writer: _SysfsWriter) -> None:
+def _pin_cpu(writer: _RootEscalator) -> None:
     """Switch every online CPU to the ``performance`` cpufreq governor.
 
     Jetson-only: gated on :func:`_is_jetson` so running ``jetson.setup`` on a
@@ -159,21 +224,24 @@ def pin_engine_clocks(*, interactive: bool = False) -> None:
     once on the tty (via :func:`prime_sudo`) — only when a clock actually
     needs pinning. Use from CLI entry points; never mid-session.
     """
-    _pin_engines(_SysfsWriter(interactive=interactive))
+    _pin_engines(_RootEscalator(interactive=interactive))
 
 
 def pin_realtime_clocks(*, interactive: bool = False) -> None:
-    """Pin engine **and** CPU clocks for the real-time control loops.
+    """Select MAXN and pin engine **and** CPU clocks for the control loops.
 
-    Pins NVENC/VIC (encode latency) and switches the CPUs to the
-    ``performance`` governor (IK rate). Both are Jetson-only: engine pinning
-    is a no-op without the Tegra devfreq nodes, and CPU-governor pinning is
-    gated on :func:`_is_jetson` so it never alters a non-Tegra host's
-    system-wide governor. Same best-effort / ``interactive`` escalation
-    semantics as :func:`pin_engine_clocks`; sudo is primed at most once across
-    both. Invoked via ``axol jetson.setup`` (host installer + boot service),
+    Selects the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling), pins
+    NVENC/VIC (encode latency), and switches the CPUs to the ``performance``
+    governor (IK rate). All three are Jetson-only: MAXN selection and
+    CPU-governor pinning are gated on :func:`_is_jetson` so they never alter a
+    non-Tegra host, and engine pinning is a no-op without the Tegra devfreq
+    nodes. MAXN is selected first because it sets the ceiling the governor and
+    engine pins reach. Same best-effort / ``interactive`` escalation semantics
+    as :func:`pin_engine_clocks`; sudo is primed at most once across all of
+    them. Invoked via ``axol jetson.setup`` (host installer + boot service),
     not from the teleop / collect-data / serve entry points.
     """
-    writer = _SysfsWriter(interactive=interactive)
-    _pin_engines(writer)
-    _pin_cpu(writer)
+    escalator = _RootEscalator(interactive=interactive)
+    _set_max_power_mode(escalator)
+    _pin_engines(escalator)
+    _pin_cpu(escalator)

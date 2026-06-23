@@ -33,6 +33,7 @@ import logging
 import multiprocessing
 import multiprocessing.connection
 import multiprocessing.context
+import os
 import threading
 import time
 
@@ -40,36 +41,15 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
+from ..utils.jetson_diag import TegraStatsDiag
+from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
-from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
+from .core import VRTeleopCore
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
-
-_IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
-
-
-def _recv_with_timeout(
-    conn: multiprocessing.connection.Connection,
-    timeout: float,
-    stop_event: threading.Event | None = None,
-) -> object | None:
-    """Return ``conn.recv()`` if data arrives within ``timeout``, else ``None``.
-
-    Polls in short intervals so ``stop_event`` can interrupt a long wait.
-    """
-    poll_interval = 0.05
-    deadline = time.monotonic() + timeout
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return None
-        if stop_event is not None and stop_event.is_set():
-            return None
-        if conn.poll(min(poll_interval, remaining)):
-            return conn.recv()
 
 
 class VRTeleop:
@@ -110,39 +90,17 @@ class VRTeleop:
         self._vr_server = VRServer(vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
 
-        # Full joint vector (radians), updated by _ik_loop
-        self._q: np.ndarray | None = None
-        self._left_indices: list[int] = []
-        self._right_indices: list[int] = []
-
-        self._l_grip: float = 0.0
-        self._r_grip: float = 0.0
-        self._prev_reset: bool = False
-        # Latched by _on_vr_frame on every rising edge so the IK loop can't
-        # miss a short reset press that arrives while blocked on conn.recv.
-        self._reset_latched: bool = False
-
-        self._reset_interp = ResetInterpolator()
-        dt = 1.0 / config.frequency
-        self._ema_left = AlphaSmoothFilter(config.ik_alpha)
-        self._ema_right = AlphaSmoothFilter(config.ik_alpha)
-        self._smooth_left = TrapezoidalFilter(
-            config.teleop_max_vel, config.teleop_max_accel, dt
-        )
-        self._smooth_right = TrapezoidalFilter(
-            config.teleop_max_vel, config.teleop_max_accel, dt
-        )
-
-        self._teleop_enabled: bool = False
-        self._prev_both: bool = False
-        self._prev_either: bool = False
-        self._at_rest: bool = True
-        self._engage_time: float | None = None
+        # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
+        # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
+        # cannot drift apart.
+        self._core = VRTeleopCore(config, _logger, self._broadcast_tracking)
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
         self._ik_thread: threading.Thread | None = None
         self._ik_stop: threading.Event = threading.Event()
+        # Stashed only so the CPU diag can label the relay subprocess.
+        self._video_manager: object | None = None
 
         self._ik_loop_times: list[float] = []
         self._ik_loop_times_lock: threading.Lock = threading.Lock()
@@ -207,10 +165,10 @@ class VRTeleop:
         await self._robot.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
-        if pos_l is not None:
-            self._l_grip = float(pos_l[7])
-        if pos_r is not None:
-            self._r_grip = float(pos_r[7])
+        self._core.set_initial_grips(
+            pos_l[7] if pos_l is not None else None,
+            pos_r[7] if pos_r is not None else None,
+        )
 
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
@@ -235,22 +193,11 @@ class VRTeleop:
         msg = await loop.run_in_executor(None, parent_conn.recv)
         assert isinstance(msg, tuple) and msg[0] == "ready"
         _, q_init, left_indices, right_indices, startup_traj = msg
-        self._q = np.asarray(q_init, dtype=np.float32)
-        self._left_indices = left_indices
-        self._right_indices = right_indices
+        self._core.set_solution(q_init, left_indices, right_indices)
 
         cur_l, cur_r = await self._robot.get_positions()
-        if cur_l is not None:
-            seed_l = np.append(cur_l[:7], self._l_grip)
-            self._ema_left.reset(seed=seed_l)
-            self._smooth_left.reset(seed=seed_l[:7])
-        if cur_r is not None:
-            seed_r = np.append(cur_r[:7], self._r_grip)
-            self._ema_right.reset(seed=seed_r)
-            self._smooth_right.reset(seed=seed_r[:7])
-
-        if startup_traj:
-            self._reset_interp.set_trajectory(startup_traj, self._l_grip, self._r_grip)
+        self._core.seed_filters(cur_l, cur_r)
+        self._core.set_startup_trajectory(startup_traj)
 
         self._ik_stop.clear()
         self._ik_thread = threading.Thread(
@@ -314,6 +261,7 @@ class VRTeleop:
         and RTP traffic never contend with the teleop control loops. Must
         be called after :meth:`enable`. Safe to call from any thread.
         """
+        self._video_manager = manager
         self._vr_server.set_video_manager(manager)
 
     # ------------------------------------------------------------------
@@ -325,6 +273,30 @@ class VRTeleop:
         interval = 1.0 / self._config.frequency
         loop_times: list[float] = []
         last_log = time.perf_counter()
+        # Per-section timing, matching `axol collect-data` so the two flows can
+        # be compared directly: `step` is the smoothing, `send` is the CAN
+        # motion_control round-trip. A `send` that stays flat here but inflates
+        # under collect-data points at cross-thread GIL contention, not the bus.
+        sect = {"step": 0.0, "send": 0.0}
+        max_gap = 0.0  # worst loop-iteration spacing within the window
+        max_slip = 0.0  # worst lateness past the absolute deadline
+        prev_iter = 0.0
+
+        # Same /proc CPU sampler as collect-data, so the two flows' per-core
+        # saturation + hottest process/thread breakdowns line up exactly.
+        diag_labels: dict[int, str] = {os.getpid(): "main"}
+        if self._ik_process is not None and getattr(self._ik_process, "pid", None):
+            diag_labels[self._ik_process.pid] = "ik"
+        relay_proc = getattr(self._video_manager, "_proc", None)
+        if getattr(relay_proc, "pid", None):
+            diag_labels[relay_proc.pid] = "relay"
+        diag = SystemDiag(diag_labels, _logger)
+        diag.start()
+        # Jetson GPU / EMC / NVENC / per-core-freq / thermal sampler. This is the
+        # A/B baseline for collect-data: teleop runs with the relay raw branch
+        # closed, so its diag/tegra lines isolate the record-phase delta.
+        tegra = TegraStatsDiag(_logger)
+        tegra.start()
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
@@ -333,19 +305,17 @@ class VRTeleop:
         try:
             while True:
                 deadline += interval
-                if self._engage_time is not None:
-                    if (
-                        time.perf_counter() - self._engage_time
-                        >= self._config.engage_duration
-                    ):
-                        self._smooth_left.max_vel = self._config.teleop_max_vel
-                        self._smooth_right.max_vel = self._config.teleop_max_vel
-                        self._engage_time = None
-
+                t_start = time.perf_counter()
                 left, right = self.step()
+                t_step = time.perf_counter()
                 await self._robot.motion_control(left=left, right=right)
 
                 now = time.perf_counter()
+                sect["step"] += t_step - t_start
+                sect["send"] += now - t_step
+                if prev_iter:
+                    max_gap = max(max_gap, now - prev_iter)
+                prev_iter = now
                 loop_times.append(now)
                 if now - last_log >= 1.0 and len(loop_times) > 1:
                     total = loop_times[-1] - loop_times[0]
@@ -376,12 +346,30 @@ class VRTeleop:
                             _logger.info("loop: %.1f Hz  ik: %.1f Hz", rate, ik_hz)
                     else:
                         _logger.info("loop: %.1f Hz", rate)
+                    n = len(loop_times)
+                    _logger.debug(
+                        "loop sections (mean ms): step=%.2f send=%.2f  "
+                        "maxgap=%.1fms maxslip=%.1fms",
+                        1e3 * sect["step"] / n,
+                        1e3 * sect["send"] / n,
+                        1e3 * max_gap,
+                        1e3 * max_slip,
+                    )
+                    sect = {"step": 0.0, "send": 0.0}
+                    max_gap = 0.0
+                    max_slip = 0.0
                     loop_times.clear()
                     last_log = now
 
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+                slip = time.perf_counter() - deadline
+                if slip > max_slip:
+                    max_slip = slip
         except asyncio.CancelledError:
             pass
+        finally:
+            diag.stop()
+            tegra.stop()
 
     # ------------------------------------------------------------------
     # Step
@@ -390,65 +378,20 @@ class VRTeleop:
     def step(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return the latest smoothed joint positions.
 
-        Returns ``(None, None)`` until the IK subprocess is ready.
-        Once ready, always returns positions so the robot actively holds
-        its commanded pose (matching the arm repo behaviour).
+        Returns ``(None, None)`` until the IK subprocess is ready. Once ready,
+        always returns positions so the robot actively holds its commanded pose.
+        The smoothing itself lives in :meth:`VRTeleopCore.compute_output` so it
+        stays identical to the ``collect-data`` flow.
 
         Returns:
             Tuple ``(left, right)`` where each is a shape (8,) float32 array
             of joint positions in radians (Joint enum order), or ``None``
             if not yet ready.
         """
-        if self._q is None:
+        out = self._core.compute_output()
+        if out is None:
             return None, None
-
-        if self._reset_interp.is_active():
-            new_q, l_grip, r_grip, done = self._reset_interp.step()
-            if new_q is None:
-                return None, None
-            q = np.asarray(new_q, dtype=np.float32)
-            if done:
-                self._q = q.copy()
-                self._l_grip = l_grip
-                self._r_grip = r_grip
-                self._at_rest = True
-                seed_l = np.append(q[self._left_indices], l_grip)
-                seed_r = np.append(q[self._right_indices], r_grip)
-                self._ema_left.reset(seed=seed_l)
-                self._ema_right.reset(seed=seed_r)
-                self._smooth_left.reset(seed=q[self._left_indices])
-                self._smooth_right.reset(seed=q[self._right_indices])
-
-            left = np.empty(8, dtype=np.float32)
-            left[:7] = q[self._left_indices]
-            left[7] = l_grip
-            right = np.empty(8, dtype=np.float32)
-            right[:7] = q[self._right_indices]
-            right[7] = r_grip
-            return left, right
-
-        q = self._q
-        l_grip = self._l_grip
-        r_grip = self._r_grip
-
-        ema_l = self._ema_left.update(np.append(q[self._left_indices], l_grip))
-        ema_r = self._ema_right.update(np.append(q[self._right_indices], r_grip))
-
-        # Arm joints go through the trapezoidal filter; the gripper bypasses it
-        # so it responds immediately (limited only by the EMA smoother) rather
-        # than being throttled by the rad/s velocity limit designed for arm joints.
-        smoothed_l_arm = self._smooth_left.update(ema_l[:7])
-        smoothed_r_arm = self._smooth_right.update(ema_r[:7])
-
-        left = np.empty(8, dtype=np.float32)
-        left[:7] = smoothed_l_arm
-        left[7] = ema_l[7]
-
-        right = np.empty(8, dtype=np.float32)
-        right[:7] = smoothed_r_arm
-        right[7] = ema_r[7]
-
-        return left, right
+        return out[:8], out[8:]
 
     # ------------------------------------------------------------------
     # VR frame callback (runs on every incoming frame)
@@ -467,131 +410,34 @@ class VRTeleop:
                 and self._vr_frame_times[-1] - self._vr_frame_times[0] > 2.0
             ):
                 self._vr_frame_times.pop(0)
-        if frame.reset and not self._prev_reset:
-            self._reset_latched = True
-        self._prev_reset = frame.reset
+        self._core.note_frame_reset(frame.reset)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)
     # ------------------------------------------------------------------
 
-    def _ik_loop(self) -> None:
-        """Dispatch VR frames to the IK subprocess and receive results.
+    def _note_ik_sample(self, now: float) -> None:
+        with self._ik_loop_times_lock:
+            self._ik_loop_times.append(now)
+            while (
+                len(self._ik_loop_times) > 1
+                and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
+            ):
+                self._ik_loop_times.pop(0)
 
-        Runs in a dedicated daemon thread so that asyncio event-loop activity
-        (e.g. VR WebSocket burst callbacks) cannot delay IK scheduling.
+    def _ik_loop(self) -> None:
+        """Dispatch VR frames to the IK subprocess via the shared core.
+
+        Runs in a dedicated daemon thread so asyncio event-loop activity (e.g.
+        VR WebSocket burst callbacks) cannot delay IK scheduling. All the engage
+        / reset / dispatch logic lives in :meth:`VRTeleopCore.run_ik_loop`, so
+        it stays identical to the ``collect-data`` flow.
         """
         assert self._parent_conn is not None
-        conn = self._parent_conn
-        ik_interval = 1.0 / self._config.frequency
-        last_frame = None
-
-        while not self._ik_stop.is_set():
-            t0 = time.perf_counter()
-            frame = self._vr_server.get_frame()
-
-            if frame is None or frame is last_frame:
-                time.sleep(0.001)
-                continue
-            last_frame = frame
-
-            both = frame.l_lock and frame.r_lock
-            either = frame.l_lock or frame.r_lock
-
-            # Toggle logic via rising-edge detection:
-            #   rising edge of BOTH grips pressed together → enable tracking
-            #   rising edge of EITHER grip pressed alone   → disable tracking
-            if not self._teleop_enabled:
-                if both and not self._prev_both:
-                    self._teleop_enabled = True
-                    _logger.info("Teleop enabled")
-                    self._broadcast_tracking(True)
-                    if self._at_rest:
-                        self._smooth_left.max_vel = self._config.engage_max_vel
-                        self._smooth_right.max_vel = self._config.engage_max_vel
-                        self._engage_time = time.perf_counter()
-                        self._at_rest = False
-            else:
-                if either and not self._prev_either:
-                    self._teleop_enabled = False
-                    _logger.info("Teleop disabled")
-                    self._broadcast_tracking(False)
-
-            self._prev_both = both
-            self._prev_either = either
-
-            # Only track gripper position when arm movement is also enabled so
-            # that the gripper cannot be actuated independently of the toggle.
-            if self._teleop_enabled:
-                self._l_grip = frame.l_grip
-                self._r_grip = frame.r_grip
-
-            if self._reset_latched:
-                if self._reset_interp.is_active() or self._q is None:
-                    self._reset_latched = False
-                else:
-                    self._reset_latched = False
-                    try:
-                        conn.send(("reset", self._q.copy()))
-                        result = conn.recv()
-                        if isinstance(result, tuple) and result[0] == "reset_traj":
-                            _, q_default, trajectory = result
-                            if trajectory:
-                                # Reset trajectory playback in step() bypasses
-                                # the EMA and trapezoidal filters and reseeds
-                                # them on completion, so there's no filter
-                                # state to clear here.
-                                self._reset_interp.set_trajectory(
-                                    trajectory, self._l_grip, self._r_grip
-                                )
-                                self._teleop_enabled = False
-                                self._broadcast_tracking(False)
-                                self._prev_both = False
-                                self._prev_either = False
-                                self._engage_time = None
-                            self._q = np.asarray(q_default, dtype=np.float32)
-                    except Exception as e:
-                        _logger.error("Reset error: %s", e)
-                    _rem = ik_interval - (time.perf_counter() - t0)
-                    if _rem > 0.0:
-                        time.sleep(_rem)
-                    continue
-
-            if self._reset_interp.is_active():
-                time.sleep(0.001)
-                continue
-
-            if self._ik_process is not None and not self._ik_process.is_alive():
-                _logger.warning("IK process is not alive")
-                _rem = ik_interval - (time.perf_counter() - t0)
-                if _rem > 0.0:
-                    time.sleep(_rem)
-                continue
-
-            try:
-                # Synthesize lock state: worker sees both locks = enabled state,
-                # so its _active flag tracks our toggle rather than the physical buttons.
-                frame_to_send = frame.model_copy(
-                    update={
-                        "l_lock": self._teleop_enabled,
-                        "r_lock": self._teleop_enabled,
-                    }
-                )
-                conn.send(frame_to_send)
-                result = _recv_with_timeout(conn, _IK_RECV_TIMEOUT, self._ik_stop)
-                if result is not None:
-                    self._q = np.asarray(result, dtype=np.float32)
-                    now = time.perf_counter()
-                    with self._ik_loop_times_lock:
-                        self._ik_loop_times.append(now)
-                        while (
-                            len(self._ik_loop_times) > 1
-                            and self._ik_loop_times[-1] - self._ik_loop_times[0] > 2.0
-                        ):
-                            self._ik_loop_times.pop(0)
-            except Exception as e:
-                _logger.error("IK dispatch error: %s", e)
-
-            _rem = ik_interval - (time.perf_counter() - t0)
-            if _rem > 0.0:
-                time.sleep(_rem)
+        self._core.run_ik_loop(
+            self._parent_conn,
+            self._vr_server.get_frame,
+            self._ik_stop,
+            lambda: self._ik_process is None or self._ik_process.is_alive(),
+            self._note_ik_sample,
+        )

@@ -30,6 +30,7 @@ from ..cli import config as _config  # noqa: F401
 # of the dotted path, so they render as dropdowns instead of free text.
 _KNOWN_OPTIONS: dict[str, list[str]] = {
     "log_level": ["DEBUG", "INFO", "WARNING", "ERROR"],
+    "dataset_resolution": ["SVGA", "HD1080", "HD1200"],
     "eyes": ["both", "left", "right"],
     "policy_type": [
         "act",

@@ -130,6 +130,10 @@ def register_literal(lit: T) -> T:
 
 
 LogLevel = register_literal(Literal["DEBUG", "INFO", "WARNING", "ERROR"])
+# Downscale target for the recorded dataset video (collect-data). Names mirror
+# ``ZED_RESOLUTION_DIMS``; the relay clamps to the capture resolution so this
+# only ever downscales (never upscales).
+DatasetResolution = register_literal(Literal["SVGA", "HD1080", "HD1200"])
 PolicyType = register_literal(
     Literal["act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05", "groot"]
 )

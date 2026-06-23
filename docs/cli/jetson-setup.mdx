@@ -5,6 +5,7 @@ description: "Pin the Jetson NVENC/VIC and CPU clocks for the real-time loops."
 
 Pins the Jetson clocks the real-time loops depend on:
 
+- the **MAXN power mode** (`nvpmodel -m 0`), which uncaps the clock ceiling the other two pins reach (`nvpmodel` otherwise caps how high the governor and engine clocks can go),
 - the **NVENC / VIC engine** devfreq nodes, so the camera relay's hardware H.264 encode stays low-latency (the default devfreq governor scales them for throughput, which roughly triples per-frame encode time), and
 - the **CPU governor**, so the bursty IK loop isn't underclocked.
 

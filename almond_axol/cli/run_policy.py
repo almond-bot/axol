@@ -75,6 +75,20 @@ def _default_robot_config() -> AxolRobotConfig:
     )
 
 
+def _default_vcodec() -> str:
+    """Pick a video codec that can actually open on this machine.
+
+    LeRobot's "auto" prefers the NVIDIA hardware encoder (``h264_nvenc``)
+    whenever the codec is compiled into ffmpeg, but on Jetson/Tegra (aarch64)
+    there's no desktop ``libnvidia-encode`` to back it, so it fails to open and
+    kills the encoder thread mid episode. Default to CPU "h264" (software
+    libx264) on aarch64 and let "auto" pick the HW encoder everywhere else.
+    """
+    import platform
+
+    return "h264" if platform.machine() == "aarch64" else "auto"
+
+
 @dataclass
 class RunPolicyConfig:
     """Config for ``axol run-policy``.
@@ -99,6 +113,10 @@ class RunPolicyConfig:
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     episode_time_s: int = 120
     fps: int = 60
+    # Video codec for the recorded LeRobot dataset; defaults per-platform (see
+    # _default_vcodec). Override with any of LeRobot's VALID_VIDEO_CODECS
+    # (e.g. auto, h264, libsvtav1).
+    vcodec: str = field(default_factory=_default_vcodec)
     repo_id: str | None = None
     root: str | None = None
     push_to_hub: bool = False
@@ -798,6 +816,7 @@ def _run(
     task = cfg.task
     episode_time_s = cfg.episode_time_s
     fps = cfg.fps
+    vcodec = cfg.vcodec
     repo_id = cfg.repo_id
     root = cfg.root
     push_to_hub = cfg.push_to_hub
@@ -850,7 +869,7 @@ def _run(
                 image_writer_threads=4,
                 streaming_encoding=True,
                 encoder_threads=4,
-                vcodec="auto",
+                vcodec=vcodec,
             )
             resumed_dataset = True
         else:
@@ -882,7 +901,7 @@ def _run(
                 image_writer_threads=4,
                 streaming_encoding=True,
                 encoder_threads=4,
-                vcodec="auto",
+                vcodec=vcodec,
             )
 
     if rerun_ip:

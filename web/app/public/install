@@ -100,6 +100,37 @@ axol provision || say "WARNING: provisioning failed; cameras may be unavailable 
 say "Pinning Jetson clocks for the real-time loops..."
 axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs root)."
 
+# -- Dataset storage location -------------------------------------------------
+
+# The service runs as root, so without help LeRobot would write collected
+# datasets to /root/.cache/huggingface/lerobot. Point HF_LEROBOT_HOME at the
+# installing user's home instead so datasets live in their account. SUDO_USER
+# is set because we re-exec under sudo above; fall back to the owner of the
+# first /home/* directory when the installer is run directly as root.
+DATASET_USER="${SUDO_USER:-}"
+if [ -z "${DATASET_USER}" ] || [ "${DATASET_USER}" = "root" ]; then
+    DATASET_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
+fi
+LEROBOT_HOME_ENV=""
+if [ -n "${DATASET_USER}" ]; then
+    DATASET_HOME="$(getent passwd "${DATASET_USER}" | cut -d: -f6)"
+    if [ -n "${DATASET_HOME}" ] && [ -d "${DATASET_HOME}" ]; then
+        LEROBOT_HOME="${DATASET_HOME}/.cache/huggingface/lerobot"
+        say "Datasets will be stored under ${LEROBOT_HOME} (user: ${DATASET_USER})."
+        mkdir -p "${LEROBOT_HOME}"
+        # Own the cache chain so the user can browse/manage datasets (episode
+        # files written by the root service stay root-owned but readable).
+        chown "${DATASET_USER}:" \
+            "${DATASET_HOME}/.cache" \
+            "${DATASET_HOME}/.cache/huggingface" \
+            "${LEROBOT_HOME}" 2>/dev/null || true
+        LEROBOT_HOME_ENV="Environment=HF_LEROBOT_HOME=${LEROBOT_HOME}"
+    fi
+fi
+if [ -z "${LEROBOT_HOME_ENV}" ]; then
+    say "WARNING: could not resolve a non-root user home; datasets default to root's cache."
+fi
+
 # -- systemd service ----------------------------------------------------------
 
 say "Writing ${SERVICE_FILE}..."
@@ -119,6 +150,9 @@ RestartSec=3
 # Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
 Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
+# Store collected datasets under the installing user's home (see above) rather
+# than root's cache. Empty when no non-root user home was resolved.
+${LEROBOT_HOME_ENV}
 # Keep the self-updater's \`uv tool upgrade\` on the same shared install the
 # installer wrote, rather than letting uv fall back to its /root defaults.
 Environment=UV_TOOL_DIR=${UV_TOOL_DIR}
