@@ -52,6 +52,13 @@ _MAXN_MODE = "0"
 _JETSON_RELEASE = Path("/etc/nv_tegra_release")
 
 
+def _combine_output(proc: subprocess.CompletedProcess[str]) -> str:
+    """Merge a command's stdout + stderr (a prompt may land on either)."""
+    return "\n".join(
+        s for s in ((proc.stdout or "").strip(), (proc.stderr or "").strip()) if s
+    )
+
+
 def _is_jetson() -> bool:
     """True on NVIDIA Jetson (L4T) hardware, False on any other host."""
     if _JETSON_RELEASE.exists():
@@ -115,11 +122,12 @@ class _RootEscalator:
     ) -> tuple[bool, str]:
         """Run ``argv`` as root (direct, else ``sudo -n``); return ``(ok, detail)``.
 
-        ``input_text`` is fed to the command's stdin so a tool that prompts for
-        confirmation before acting (e.g. ``nvpmodel`` asking before a mode
-        switch) auto-confirms instead of aborting on EOF when its stdin is
-        captured. ``detail`` is the failing attempt's captured output, so a
-        non-permission failure is reported accurately rather than as "need root".
+        ``input_text`` is fed to the command's stdin so the caller controls the
+        answer to any confirmation prompt (e.g. ``nvpmodel`` asking to reboot
+        before a mode switch -- which must be declined, never auto-confirmed)
+        instead of the command blocking on a tty or aborting on EOF. ``detail``
+        is the failing attempt's captured output, so a non-permission failure is
+        reported accurately rather than as "need root".
         """
         try:
             proc = subprocess.run(
@@ -127,7 +135,7 @@ class _RootEscalator:
             )
             if proc.returncode == 0:
                 return True, ""
-            detail = (proc.stderr or proc.stdout or "").strip()
+            detail = _combine_output(proc)
         except OSError as exc:
             detail = str(exc)
         self._prime()
@@ -136,7 +144,7 @@ class _RootEscalator:
         )
         if sudo.returncode == 0:
             return True, ""
-        return False, (sudo.stderr or sudo.stdout or "").strip() or detail
+        return False, _combine_output(sudo) or detail
 
 
 def _set_max_power_mode(escalator: _RootEscalator) -> None:
@@ -164,12 +172,24 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             return
     except OSError:
         pass
-    # Feed "y" to stdin: switching modes can prompt for confirmation, and with
-    # stdin captured (subprocess) an unanswered prompt aborts non-zero — which
-    # used to surface as a misleading "need root" even when running as root.
-    ok, detail = escalator.run([nvpmodel, "-m", _MAXN_MODE], input_text="y\n")
+    # Answer "n" to any confirmation prompt. On some Jetsons switching to MAXN
+    # warns that it needs a reboot and asks to reboot *now* ([y/N]); we must
+    # never reboot the box here -- jetson.setup runs mid-install (over the
+    # operator's SSH session) and at boot, and an in-place reboot would drop
+    # that session and restart the robot. "n" declines the reboot; nvpmodel
+    # still records the pending mode, which applies on the next *natural* reboot
+    # (when the boot service re-pins the clocks). Feeding stdin also stops the
+    # interactive `axol jetson.setup` run from blocking on the prompt.
+    ok, detail = escalator.run([nvpmodel, "-m", _MAXN_MODE], input_text="n\n")
     if ok:
         _logger.info("set Jetson power mode to MAXN (nvpmodel -m %s)", _MAXN_MODE)
+    elif "reboot" in detail.lower():
+        _logger.warning(
+            "Jetson power mode MAXN needs a reboot to take effect — declined the "
+            "in-place reboot so this session/robot isn't restarted. It will apply "
+            "on the next reboot (the boot service re-pins the clocks then); the "
+            "engine/CPU pins below still help at the current mode's ceiling.",
+        )
     else:
         _logger.warning(
             "cannot set the Jetson power mode to MAXN (nvpmodel -m %s failed%s) — "
