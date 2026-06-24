@@ -155,8 +155,12 @@ Environment=PYTHONUNBUFFERED=1
 ${LEROBOT_HOME_ENV}
 # Keep the self-updater's \`uv tool upgrade\` on the same shared install the
 # installer wrote, rather than letting uv fall back to its /root defaults.
+# UV_TOOL_BIN_DIR must match the install-time bin dir: without it, the first
+# \`uv tool upgrade\` relocates the \`axol\` wrapper to uv's default (/root/.local/bin),
+# deleting ${BIN_DIR}/axol and breaking this unit's ExecStart with 203/EXEC.
 Environment=UV_TOOL_DIR=${UV_TOOL_DIR}
 Environment=UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR}
+Environment=UV_TOOL_BIN_DIR=${BIN_DIR}
 
 [Install]
 WantedBy=multi-user.target
