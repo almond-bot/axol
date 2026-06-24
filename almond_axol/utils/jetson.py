@@ -73,6 +73,10 @@ class _RootEscalator:
     prompt when ``interactive``) and every operation after that uses
     ``sudo -n``. Priming happens at most once, and only when something
     actually needs changing.
+
+    Each operation returns ``(ok, detail)`` — on failure ``detail`` carries the
+    captured error so callers report the real cause (a genuine command/write
+    failure under root) instead of always assuming root was missing.
     """
 
     def __init__(self, *, interactive: bool) -> None:
@@ -83,37 +87,56 @@ class _RootEscalator:
         if self._interactive and not self._primed:
             self._primed = prime_sudo()
 
-    def write(self, path: Path, value: str) -> bool:
+    def write(self, path: Path, value: str) -> tuple[bool, str]:
+        """Write ``value`` to ``path`` as root; return ``(ok, failure_detail)``.
+
+        ``failure_detail`` is the captured error from the failing attempt so the
+        caller can report *why* it failed (a real write error vs. a missing
+        privilege) rather than always blaming root.
+        """
         try:
             path.write_text(value)
-            return True
-        except OSError:
-            pass
+            return True, ""
+        except OSError as exc:
+            detail = str(exc)
         self._prime()
-        return (
-            subprocess.run(
-                ["sudo", "-n", "tee", str(path)],
-                input=value,
-                capture_output=True,
-                text=True,
-            ).returncode
-            == 0
+        proc = subprocess.run(
+            ["sudo", "-n", "tee", str(path)],
+            input=value,
+            capture_output=True,
+            text=True,
         )
+        if proc.returncode == 0:
+            return True, ""
+        return False, (proc.stderr or "").strip() or detail
 
-    def run(self, argv: list[str]) -> bool:
-        """Run ``argv`` as root: directly when possible, else via ``sudo -n``."""
+    def run(
+        self, argv: list[str], *, input_text: str | None = None
+    ) -> tuple[bool, str]:
+        """Run ``argv`` as root (direct, else ``sudo -n``); return ``(ok, detail)``.
+
+        ``input_text`` is fed to the command's stdin so a tool that prompts for
+        confirmation before acting (e.g. ``nvpmodel`` asking before a mode
+        switch) auto-confirms instead of aborting on EOF when its stdin is
+        captured. ``detail`` is the failing attempt's captured output, so a
+        non-permission failure is reported accurately rather than as "need root".
+        """
         try:
-            if subprocess.run(argv, capture_output=True, text=True).returncode == 0:
-                return True
-        except OSError:
-            pass
+            proc = subprocess.run(
+                argv, input=input_text, capture_output=True, text=True
+            )
+            if proc.returncode == 0:
+                return True, ""
+            detail = (proc.stderr or proc.stdout or "").strip()
+        except OSError as exc:
+            detail = str(exc)
         self._prime()
-        return (
-            subprocess.run(
-                ["sudo", "-n", *argv], capture_output=True, text=True
-            ).returncode
-            == 0
+        sudo = subprocess.run(
+            ["sudo", "-n", *argv], input=input_text, capture_output=True, text=True
         )
+        if sudo.returncode == 0:
+            return True, ""
+        return False, (sudo.stderr or sudo.stdout or "").strip() or detail
 
 
 def _set_max_power_mode(escalator: _RootEscalator) -> None:
@@ -141,13 +164,19 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
             return
     except OSError:
         pass
-    if escalator.run([nvpmodel, "-m", _MAXN_MODE]):
+    # Feed "y" to stdin: switching modes can prompt for confirmation, and with
+    # stdin captured (subprocess) an unanswered prompt aborts non-zero — which
+    # used to surface as a misleading "need root" even when running as root.
+    ok, detail = escalator.run([nvpmodel, "-m", _MAXN_MODE], input_text="y\n")
+    if ok:
         _logger.info("set Jetson power mode to MAXN (nvpmodel -m %s)", _MAXN_MODE)
     else:
         _logger.warning(
-            "cannot set the Jetson power mode to MAXN (need root) — the active "
-            "nvpmodel mode caps the clock ceiling the performance governor and "
+            "cannot set the Jetson power mode to MAXN (nvpmodel -m %s failed%s) — "
+            "the active mode caps the clock ceiling the performance governor and "
             "engine pins can reach. Fix manually with: sudo nvpmodel -m %s",
+            _MAXN_MODE,
+            f": {detail}" if detail else "",
             _MAXN_MODE,
         )
 
@@ -163,14 +192,16 @@ def _pin_engines(writer: _RootEscalator) -> None:
             except OSError as exc:
                 _logger.warning("cannot read %s clock state: %s", node.name, exc)
                 continue
-            if writer.write(node / "min_freq", max_freq):
+            ok, detail = writer.write(node / "min_freq", max_freq)
+            if ok:
                 _logger.info("pinned %s clock to %s Hz", node.name, max_freq)
             else:
                 _logger.warning(
-                    "cannot pin %s to its max clock (need root) — hardware "
-                    "encode latency will be ~3x worse. Fix manually with: "
+                    "cannot pin %s to its max clock (%s) — hardware encode "
+                    "latency will be ~3x worse. Fix manually with: "
                     "echo %s | sudo tee %s",
                     node.name,
+                    detail or "write failed",
                     max_freq,
                     node / "min_freq",
                 )
@@ -187,7 +218,7 @@ def _pin_cpu(writer: _RootEscalator) -> None:
         _logger.debug("not a Jetson; leaving the CPU cpufreq governor unchanged")
         return
     pinned = 0
-    failed: Path | None = None
+    failed: str | None = None
     for cpu in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*")):
         gov = cpu / "cpufreq" / "scaling_governor"
         try:
@@ -195,19 +226,21 @@ def _pin_cpu(writer: _RootEscalator) -> None:
                 continue
         except OSError:
             continue  # offline core or no cpufreq (not a throttled Jetson)
-        if writer.write(gov, _CPU_GOVERNOR):
+        ok, detail = writer.write(gov, _CPU_GOVERNOR)
+        if ok:
             pinned += 1
         else:
-            failed = gov
+            failed = detail
     if pinned:
         _logger.info("pinned %d CPU core(s) to the %s governor", pinned, _CPU_GOVERNOR)
     if failed is not None:
         _logger.warning(
-            "cannot set CPU governor to %s (need root) — the schedutil default "
+            "cannot set CPU governor to %s (%s) — the schedutil default "
             "underclocks bursty control loops (~30%% lower IK rate). Fix "
             "manually with: echo %s | sudo tee "
             "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor",
             _CPU_GOVERNOR,
+            failed or "write failed",
             _CPU_GOVERNOR,
         )
 
