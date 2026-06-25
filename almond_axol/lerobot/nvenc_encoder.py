@@ -70,11 +70,20 @@ _FEED_QUEUE_MAXSIZE = 90
 
 # Image stats are accumulated *during* the episode on the encoder's writer
 # thread in the recorder subprocess (not by decoding the finished mp4 afterwards,
-# which made save_episode slow). This mirrors LeRobot's own streaming encoder
-# (_StreamingEncoderThread in datasets/video_utils.py) exactly: the same
-# auto_downsample_height_width + RunningQuantileStats, updated on every frame.
-# The recorder has its own GIL/cores, away from the control loop and the relay's
-# WebRTC send, so the per-frame work is harmless there.
+# which made save_episode slow). Like LeRobot's streaming encoder we use
+# auto_downsample_height_width + RunningQuantileStats, but on a *sampled* subset
+# of frames rather than every frame: each update costs ~4.3 ms (downsample +
+# quantile sketch), so updating all three cameras at 60 fps would need ~780 ms of
+# GIL-held time per wall-clock second. Since the recorder's three writer threads
+# share one GIL, that alone saturates it, the threads can't drain their feed
+# queues, and frames overflow ("queue full, dropped N" storm). Sampling at
+# ~_STATS_SAMPLE_HZ keeps the per-second stats cost ~6x lower while still feeding
+# the quantile sketch hundreds of uniformly-spaced frames per episode — far more
+# than enough for image normalization stats.
+#
+# Target rate (Hz) at which each camera folds a frame into its running image
+# stats. The per-camera stride is derived from this and the dataset fps.
+_STATS_SAMPLE_HZ = 10
 
 
 def hw_dataset_encoder_available() -> bool:
@@ -164,12 +173,15 @@ class _CameraNvencEncoder:
         self._dropped = 0
         self._error: str | None = None
 
-        # Running image stats, accumulated inline as frames are encoded (mirrors
-        # LeRobot's auto_downsample + RunningQuantileStats so the result matches
-        # the software path). Disabled if lerobot's compute_stats can't import.
+        # Running image stats, accumulated inline from a sampled subset of frames
+        # (LeRobot's auto_downsample + RunningQuantileStats; see _STATS_SAMPLE_HZ
+        # for why we sample). Disabled if lerobot's compute_stats can't import.
         self._stats: object | None = None
         self._downsample = None
         self._stats_samples = 0
+        # Fold every Nth frame into the running stats (uniform sampling) so the
+        # quantile sketch stays cheap on the shared-GIL writer threads. >=1.
+        self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
         try:
             from lerobot.datasets.compute_stats import (
                 RunningQuantileStats,
@@ -271,7 +283,10 @@ class _CameraNvencEncoder:
         assert self._rgba is not None and self._stdin_fd is not None
         self._rgba[:, :, :3] = frame
         self._write(self._rgba)
-        if self._stats is not None:
+        # Sample stats every _stats_stride-th frame to keep the GIL-bound quantile
+        # update off the per-frame hot path (see _STATS_SAMPLE_HZ). frame 0 is
+        # always sampled so even short episodes contribute.
+        if self._stats is not None and self._frame_count % self._stats_stride == 0:
             self._update_stats(frame)
         self._t_copy += time.perf_counter() - t0
         self._frame_count += 1
