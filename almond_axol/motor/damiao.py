@@ -178,18 +178,39 @@ class DamiaoMotor(MotorDriver):
     async def _raw_send(self, data: bytes, arb_id: int | None = None) -> None:
         await self._bus._send(arb_id if arb_id is not None else self._motor_id, data)
 
-    async def _read_register(self, rid: int, timeout: float = 0.2) -> float | int:
+    async def _read_register(
+        self, rid: int, timeout: float = 0.2, attempts: int = 5
+    ) -> float | int:
+        """Read a parameter register, re-sending the request if a reply is missed.
+
+        The parameter-read reply is a single unacknowledged CAN frame, so it can
+        be dropped — most often on the very first read right after the bus comes
+        up or after ``clear_errors`` during ``enable``, when several motors are
+        all reading registers in one burst. A single miss should not abort the
+        whole enable, so each attempt re-sends the request and waits afresh.
+        """
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[float | int] = loop.create_future()
-        self._register_waiters[rid] = fut
         canid_l, canid_h = self._canid_bytes()
-        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0x33, rid, 0, 0, 0, 0]))
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            raise MotorError(
-                f"Damiao motor {self._motor_id:#04x} register {rid} read timed out"
+        last_exc: asyncio.TimeoutError | None = None
+        for _ in range(attempts):
+            fut: asyncio.Future[float | int] = loop.create_future()
+            self._register_waiters[rid] = fut
+            await self._bus._send(
+                0x7FF, bytes([canid_l, canid_h, 0x33, rid, 0, 0, 0, 0])
             )
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+            finally:
+                # Drop our waiter unless a reply already replaced/resolved it, so
+                # a late reply can't resolve a future from a previous attempt.
+                if self._register_waiters.get(rid) is fut:
+                    self._register_waiters.pop(rid, None)
+        raise MotorError(
+            f"Damiao motor {self._motor_id:#04x} register {rid} read timed out "
+            f"after {attempts} attempts"
+        ) from last_exc
 
     async def _write_register(self, rid: int, value: float | int) -> None:
         """Write a register via the 0x55 command (RAM only; call _store_parameters to persist).
