@@ -59,6 +59,15 @@ _BITRATE_BPP = 0.25
 _BITRATE_MIN = 6_000_000
 _BITRATE_MAX = 40_000_000
 
+# Per-camera feed-queue depth (frames). LeRobot's default is 30 (0.5 s at 60 fps),
+# too shallow to ride out the gst pipeline's spin-up: gst-launch takes ~1 s to
+# negotiate caps and allocate NVMM before its first frame is consumed, during
+# which the queue fills at the capture rate and overflows. 90 frames (~1.5 s) buys
+# enough slack to absorb that transient; steady-state throughput is handled by the
+# pipelined gst queues (see `_gst_argv`), so in normal running it stays near empty.
+# Cost is ~1.7 MB/frame (HWC RGB uint8): 90 x 3 cameras ~= 460 MB peak.
+_FEED_QUEUE_MAXSIZE = 90
+
 # Image stats are accumulated *during* the episode on the encoder's writer
 # thread in the recorder subprocess (not by decoding the finished mp4 afterwards,
 # which made save_episode slow). This mirrors LeRobot's own streaming encoder
@@ -88,6 +97,19 @@ def _gst_argv(
     ``nvv4l2h264enc`` encodes on NVENC, so no CPU ``videoconvert`` is involved.
     ``h264parse`` + ``mp4mux`` produce a standard mp4; closing stdin sends EOS so
     ``mp4mux`` finalizes the moov atom and ``filesink`` flushes the file.
+
+    The two ``queue`` elements are load-bearing, not cosmetic. Without them the
+    whole chain runs in ``fdsrc``'s single streaming thread, so ``fdsrc`` only
+    reads the next frame off the pipe *after* VIC convert + NVENC + mux finish the
+    previous one — i.e. the pipe-drain rate equals the full serial chain rate. On
+    the recorder's niced/background cores that can't keep up with 60 fps x 3
+    cameras, the ``os.write`` on the feeding side blocks, the writer thread stalls,
+    and the Python feed queue overflows (the "queue full, dropped N frames" storm).
+    A ``queue`` after ``fdsrc`` lets it keep draining the pipe (unblocking the
+    writer) while a ``queue`` before the encoder puts the VIC and NVENC on separate
+    threads, so chain throughput is ``min(VIC, NVENC)`` instead of their sum. The
+    queues are non-leaky (back-pressure is fine; real drops are counted/logged in
+    Python ``feed``) and bounded by buffer count to cap latency and memory.
     """
     pipeline = [
         f"fdsrc fd=0 blocksize={width * height * 4}",
@@ -95,8 +117,10 @@ def _gst_argv(
             "rawvideoparse use-sink-caps=false format=rgba "
             f"width={width} height={height} framerate={fps}/1"
         ),
+        "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         "nvvidconv",
         "video/x-raw(memory:NVMM),format=NV12",
+        "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         (
             f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
             f"insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
@@ -353,7 +377,7 @@ class NvencStreamingEncoder:
     / ``close``. One ``_CameraNvencEncoder`` (and one gst subprocess) per camera.
     """
 
-    def __init__(self, fps: int, queue_maxsize: int = 30) -> None:
+    def __init__(self, fps: int, queue_maxsize: int = _FEED_QUEUE_MAXSIZE) -> None:
         self.fps = fps
         self.queue_maxsize = queue_maxsize
         self._cams: dict[str, _CameraNvencEncoder] = {}

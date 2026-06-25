@@ -100,6 +100,146 @@ def _tune_software_encoder() -> None:
     )
 
 
+def _concatenate_video_files_rebased(
+    input_video_paths: list,
+    output_video_path: "Path | str",
+    overwrite: bool = True,
+    compatibility_check: bool = False,
+) -> None:
+    """Stream-copy concat that re-bases each segment's timestamps (drop-in for
+    LeRobot's ``concatenate_video_files``).
+
+    LeRobot appends each new episode's video to the running per-key chunk file
+    (``save_episode`` on episode index >= 1). Its stock implementation feeds both
+    segments through PyAV's ``concat`` demuxer and copies packets verbatim, trusting
+    the demuxer to offset the later segment past the first. With our NVENC mp4
+    segments that offset isn't applied, so at the segment boundary the muxer's DTS
+    jumps backwards (e.g. ``734200 >= 367200``) and libav aborts:
+
+        non monotonically increasing dts to muxer in stream 0
+        [Errno 22] Invalid argument: '/tmp/tmpXXXX.mp4'
+
+    which surfaces as ``recorder save_episode failed`` and loses the episode.
+
+    Instead, open each input independently and shift every packet so each segment
+    starts exactly where the previous one ended (per output stream, in the output
+    stream's time_base). Within a segment timestamps are already monotonic, so the
+    concatenated stream is monotonic by construction — independent of whatever
+    start offset / duration metadata the source segments carry. PTS-vs-DTS
+    spacing is preserved, so B-frame reordering survives.
+    """
+    import tempfile
+    from fractions import Fraction
+    from pathlib import Path
+
+    import av
+
+    output_video_path = Path(output_video_path)
+    if output_video_path.exists() and not overwrite:
+        _logger.warning(
+            "Video file already exists: %s. Skipping concatenation.", output_video_path
+        )
+        return
+    if len(input_video_paths) == 0:
+        raise FileNotFoundError("No input video paths provided.")
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+        tmp_output_video_path = tmp_named_file.name
+
+    try:
+        with av.open(
+            tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+        ) as dst:
+            out_streams: dict[int, object] = {}  # input stream index -> output stream
+            offsets: dict[object, int] = {}  # output stream -> next start dts (out tb)
+
+            for file_idx, input_path in enumerate(input_video_paths):
+                with av.open(str(input_path), mode="r") as src:
+                    seg_start: dict[
+                        object, int
+                    ] = {}  # out stream -> first dts (out tb)
+                    seg_end: dict[
+                        object, int
+                    ] = {}  # out stream -> last dts+dur (out tb)
+                    for in_stream in src.streams:
+                        if in_stream.type not in ("video", "audio", "subtitle"):
+                            continue
+                        if file_idx == 0:
+                            out_stream = dst.add_stream_from_template(
+                                template=in_stream, opaque=True
+                            )
+                            out_stream.time_base = in_stream.time_base
+                            out_streams[in_stream.index] = out_stream
+                            offsets[out_stream] = 0
+
+                    for packet in src.demux():
+                        if packet.dts is None:  # demux flushing packet
+                            continue
+                        out_stream = out_streams.get(packet.stream.index)
+                        if out_stream is None:
+                            continue
+                        # Rescale into the output stream's time_base (a no-op for our
+                        # homogeneous segments, correct if a segment ever differs).
+                        ratio = Fraction(packet.stream.time_base) / Fraction(
+                            out_stream.time_base
+                        )
+                        dts = int(round(packet.dts * ratio))
+                        pts = (
+                            None
+                            if packet.pts is None
+                            else int(round(packet.pts * ratio))
+                        )
+                        dur = int(round((packet.duration or 0) * ratio))
+
+                        if out_stream not in seg_start:
+                            seg_start[out_stream] = dts
+                        shift = offsets[out_stream] - seg_start[out_stream]
+
+                        packet.dts = dts + shift
+                        packet.pts = None if pts is None else pts + shift
+                        packet.duration = dur
+                        packet.stream = out_stream
+
+                        end = packet.dts + dur
+                        if end > seg_end.get(out_stream, end - 1):
+                            seg_end[out_stream] = end
+                        dst.mux(packet)
+
+                    for out_stream, end in seg_end.items():
+                        offsets[out_stream] = end
+
+        shutil.move(tmp_output_video_path, str(output_video_path))
+    except Exception:
+        Path(tmp_output_video_path).unlink(missing_ok=True)
+        raise
+
+    if not output_video_path.exists():
+        raise OSError(
+            f"Video concatenation did not work. File not found: {output_video_path}."
+        )
+
+
+def _patch_video_concat() -> None:
+    """Replace LeRobot's ``concatenate_video_files`` with the re-basing version.
+
+    Idempotent. Patches the name where it's *called* (``dataset_writer``, which does
+    ``from .video_utils import concatenate_video_files``) as well as its definition
+    module, so every code path picks up the fix.
+    """
+    import lerobot.datasets.dataset_writer as _dw
+    import lerobot.datasets.video_utils as _vu
+
+    if getattr(_vu, "_axol_concat_rebased", False):
+        return
+    _vu.concatenate_video_files = _concatenate_video_files_rebased
+    _dw.concatenate_video_files = _concatenate_video_files_rebased
+    _vu._axol_concat_rebased = True
+    _logger.info(
+        "patched LeRobot concatenate_video_files to re-base segment timestamps"
+    )
+
+
 def install_dataset_encoder() -> bool:
     """Prefer the Jetson NVENC encoder for dataset video; else tune libx264.
 
@@ -115,6 +255,10 @@ def install_dataset_encoder() -> bool:
         hw_dataset_encoder_available,
     )
 
+    # Episode-append concat re-bases timestamps regardless of which encoder writes
+    # the segments, so patch it on every path (NVENC and the libx264 fallback).
+    _patch_video_concat()
+
     if getattr(LeRobotDataset, "_axol_nvenc_installed", False):
         return True
 
@@ -123,7 +267,9 @@ def install_dataset_encoder() -> bool:
         return False
 
     def _build_nvenc(fps, vcodec, encoder_queue_maxsize, encoder_threads):
-        return NvencStreamingEncoder(fps=fps, queue_maxsize=encoder_queue_maxsize)
+        # Ignore LeRobot's shallow default (30); NvencStreamingEncoder uses its own
+        # deeper feed queue to ride out gst pipeline spin-up. See _FEED_QUEUE_MAXSIZE.
+        return NvencStreamingEncoder(fps=fps)
 
     LeRobotDataset._build_streaming_encoder = staticmethod(_build_nvenc)
     LeRobotDataset._axol_nvenc_installed = True
