@@ -238,7 +238,8 @@ def _pin_cpu(writer: _RootEscalator) -> None:
         _logger.debug("not a Jetson; leaving the CPU cpufreq governor unchanged")
         return
     pinned = 0
-    failed: str | None = None
+    failed = 0
+    failed_detail: str | None = None
     for cpu in sorted(Path("/sys/devices/system/cpu").glob("cpu[0-9]*")):
         gov = cpu / "cpufreq" / "scaling_governor"
         try:
@@ -250,17 +251,26 @@ def _pin_cpu(writer: _RootEscalator) -> None:
         if ok:
             pinned += 1
         else:
-            failed = detail
+            failed += 1
+            failed_detail = detail
     if pinned:
         _logger.info("pinned %d CPU core(s) to the %s governor", pinned, _CPU_GOVERNOR)
-    if failed is not None:
+    if failed:
+        # Report the count (not just the last core's error): a single line that
+        # named only cpuN understated how many cores actually failed. EINVAL
+        # here is usually the clock-ceiling cap of a non-MAXN power mode, which
+        # clears once MAXN is active (it may be pending a reboot — the boot
+        # service re-pins then), so point there before the manual override.
         _logger.warning(
-            "cannot set CPU governor to %s (%s) — the schedutil default "
-            "underclocks bursty control loops (~30%% lower IK rate). Fix "
-            "manually with: echo %s | sudo tee "
+            "could not set %d CPU core(s) to the %s governor (last error: %s) — "
+            "the schedutil default underclocks bursty control loops (~30%% lower "
+            "IK rate). This usually clears once the MAXN power mode is active "
+            "(it may be pending a reboot; the boot service re-pins then). If it "
+            "persists, fix manually with: echo %s | sudo tee "
             "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor",
+            failed,
             _CPU_GOVERNOR,
-            failed or "write failed",
+            failed_detail or "write failed",
             _CPU_GOVERNOR,
         )
 
