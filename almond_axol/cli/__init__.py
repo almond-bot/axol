@@ -12,6 +12,7 @@ from .can import setup as can_setup
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .jetson import setup as jetson_setup
+from .motor import health as motor_health
 from .motor import info as motor_info
 from .motor import set_can_id, set_zero_pos
 from .tune import friction, pid, repeatability
@@ -57,6 +58,7 @@ def main() -> None:
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
+    motor_health.add_parser(subparsers)
     zed_install.add_parser(subparsers)
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)

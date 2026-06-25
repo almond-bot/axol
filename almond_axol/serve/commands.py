@@ -211,6 +211,16 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.motor.info"),
         requires_hardware=True,
     ),
+    "motor.health": CommandDef(
+        "motor.health",
+        "motor.health",
+        "Motor health",
+        "Probe all 16 motors and report which responded.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.health"),
+        requires_hardware=True,
+    ),
     # -- Setup --------------------------------------------------------------
     "can.setup": CommandDef(
         "can.setup",

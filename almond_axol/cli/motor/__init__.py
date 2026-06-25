@@ -1,1 +1,1 @@
-"""Per-motor CLI commands (info, CAN ID, zero-position calibration)."""
+"""Per-motor CLI commands (info, health, CAN ID, zero-position calibration)."""
