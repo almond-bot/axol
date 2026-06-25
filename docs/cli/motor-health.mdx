@@ -1,0 +1,12 @@
+---
+title: "motor.health"
+description: "Probe every motor on both arms and report which responded."
+---
+
+Probes all 16 motors (8 per arm) and reports which responded. For each motor it runs the same status reads as [`motor.info`](https://docs.almond.bot/cli/motor-info) — position, velocity, torque, temperature, voltage, error code, control mode, firmware version, and model — and prints `OK` if every read succeeds or the error string if any read fails.
+
+The command iterates the left arm (`CAN_LEFT`) then the right arm (`CAN_RIGHT`), printing one line per joint. It exits with status `1` if any motor failed to respond, making it suitable for scripts and provisioning checks.
+
+```bash
+axol motor.health
+```

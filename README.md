@@ -125,6 +125,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
 - [`can.driver`](https://docs.almond.bot/cli/can-driver)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
+- [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
