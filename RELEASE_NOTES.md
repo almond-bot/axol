@@ -1,56 +1,16 @@
-# Almond Axol v0.1.0 — First Release
+# Almond Axol v0.1.1
 
-We're excited to announce the **first release** of the Almond Axol SDK: the command-line interface and Python SDK for the Almond Axol dual-arm robot.
+Changes landed since the v0.1.0 release, focused on data-collection reliability and operational tooling.
 
-This release establishes the full operating stack — from low-level CAN/motor control to VR teleoperation, data collection, and policy execution — plus a browser-based control panel for driving the robot without touching a terminal.
+## New
 
-## Highlights
+- **`motor.health` command** — Probes all 16 motors (8 per arm), running the same status reads as `motor.info` on each joint and printing `OK` or the error string per motor. Exits with status `1` if any motor fails to respond, so it works in scripts and provisioning checks. Also available from the web control panel under **Calibrate**.
 
-- **VR teleoperation** — Drive Axol live from a WebXR headset (or in `--sim` mode without hardware) through the hosted interface at [axol.almond.bot](https://axol.almond.bot). Includes a JAX/PyRoki inverse-kinematics solver and motion filtering for smooth, responsive control.
-- **Web control panel** — Operate the robot entirely from the browser via `axol serve`, with a self-updating server that stays in sync with `main` and restarts onto new versions once idle.
-- **One-command install** — `curl https://axol.almond.bot/install -fsS | bash` sets up `uv`, the `axol` CLI, and a systemd service that keeps the robot server running at boot.
-- **Data collection** — Record teleop episodes straight to a LeRobot dataset for training.
-- **Policy execution** — Run trained policies on the robot with local or remote inference via the bundled inference server.
-- **Quest-over-USB transport** — Low-latency wired controller transport that tunnels headset poses over a USB `adb` connection while keeping camera video on the LAN.
-- **ZED camera streaming** — Hardware-accelerated NVENC encoding on the Jetson/ZED Box, streamed to the headset over WebRTC.
-- **Gravity compensation** — Hold the arms weightless for hand-guiding and demonstration.
-- **Tuning tools** — Built-in routines for PID, friction, and repeatability characterization.
+## Improvements
 
-## CLI Commands
+- **`motor.info` for IDs outside 1–8** — Querying a motor ID outside the known arm range no longer errors out; pass `--type myactuator|damiao` to probe arbitrary IDs (useful when configuring a fresh motor).
+- **Jetson setup / power-mode hardening** — `jetson.setup` now reports the real cause when it can't set the MAXN power mode or pin engine/CPU clocks (a genuine command/write failure vs. missing root) instead of always blaming root. It also declines `nvpmodel`'s reboot prompt so the mid-install SSH session and the robot aren't restarted (the mode applies on the next natural reboot), and feeds stdin to prompts so interactive runs don't block.
 
-- `teleop` — VR teleoperation session (supports `--sim`)
-- `serve` — web control panel + API server
-- `gravity-comp` — gravity-compensation / hand-guiding mode
-- `collect-data` — record teleoperation episodes
-- `run-policy` / `inference-server` — policy execution and inference
-- `can.setup` / `can.enable` / `can.driver` — CAN bus initialization
-- `motor.info` / `motor.set-can-id` / `motor.set-zero-pos` — motor configuration
-- `zed.install` / `gst.install` / `gst.build-zed` / `jetson.setup` — camera & encode setup
-- `tune.pid` / `tune.friction` / `tune.repeatability` — tuning utilities
-- `provision` — machine provisioning
+## Fixes
 
-## Python SDK
-
-Public modules for building on top of Axol:
-
-- `almond_axol.robot` — `Axol`, `Sim`, configuration, gravity compensation
-- `almond_axol.kinematics` — IK solver
-- `almond_axol.teleop` — teleoperation control loop
-- `almond_axol.vr` — WebXR/VR transport and video
-- `almond_axol.zed` — ZED camera integration
-- `almond_axol.motor` — low-level motor bus and drivers
-- `almond_axol.lerobot` — LeRobot dataset and policy integration
-
-## Requirements
-
-- Linux
-- Python 3.13+
-- (Optional) NVIDIA Jetson / ZED Box for GMSL-attached ZED cameras
-
-## Getting Started
-
-```bash
-curl https://axol.almond.bot/install -fsS | bash
-```
-
-Then open [axol.almond.bot](https://axol.almond.bot) and connect to your machine. Full documentation is available at [docs.almond.bot](https://docs.almond.bot).
+- **Drop-free episode recording** — Fixed an mp4 DTS crash (`non monotonically increasing dts to muxer`) that lost any episode at index ≥ 1 by re-basing each segment's timestamps when concatenating NVENC mp4 segments. Also fixed a sustained NVENC frame-drop storm during `collect-data` by pipelining the gst stages with queue elements, deepening per-camera feed queues (30 → 90 frames), sampling per-frame image stats at ~10 Hz instead of every frame, and re-partitioning recorder cores (control 3 / relay 1 / dataset 4). Recording now runs drop-free at 960×600@60fps across three cameras with the control loop steady at 120 Hz.
