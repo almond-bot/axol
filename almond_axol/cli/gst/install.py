@@ -41,11 +41,16 @@ _logger = logging.getLogger(__name__)
 # cannot build here. Pin to the last 3.5x that targets girepository-1.0.
 _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
-# GStreamer elements the gst_zed pipeline relies on. zedxonesrc / zedsrc are
-# built + installed by ``axol gst.build-zed`` (patched for sensor-accurate
-# PTS); nvvidconv / nvv4l2h264enc ship with the Jetson L4T BSP (none of these
-# are apt-installable here — verified + warned).
+# GStreamer elements gst.install is itself responsible for verifying: the NVENC
+# encode path (nvvidconv / nvv4l2h264enc), which ships with the Jetson L4T BSP.
+# These gate gst.install's success alongside the gi/appsink import.
 _REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc")
+
+# The patched ZED source element ``axol gst.build-zed`` builds + installs
+# (sensor-accurate PTS). gst.install only *reports* whether it's present — its
+# absence is expected before build-zed runs, so it's a note, not a failure
+# (build-zed, which the installer/provision runs right after, installs it).
+_ZED_SOURCE_MARKER = "zedxonesrc"
 
 # System packages: GStreamer introspection typelibs (Gst + GstApp/appsink) and
 # the build deps PyGObject needs to compile against gobject-introspection.
@@ -86,8 +91,8 @@ def _run(cmd: list[str]) -> bool:
     return True
 
 
-def _gst_ok() -> bool:
-    """True when a clean subprocess can import gi and find the gst elements.
+def _gi_elements_ok(elements: tuple[str, ...]) -> bool:
+    """True when a clean subprocess can import gi and find every element given.
 
     Checked in a subprocess so the result reflects a PyGObject that was just
     installed (importing it in this process would hit a stale import state).
@@ -95,7 +100,7 @@ def _gst_ok() -> bool:
     from ...vr.gst_zed import _set_typelib_path
 
     _set_typelib_path()  # ensure the child inherits the typelib search path
-    elements = ",".join(repr(e) for e in (*_REQUIRED_ELEMENTS, "zedxonesrc"))
+    els = ",".join(repr(e) for e in elements)
     code = (
         "import gi;"
         "gi.require_version('Gst','1.0');"
@@ -103,7 +108,7 @@ def _gst_ok() -> bool:
         "from gi.repository import Gst, GstApp;"  # GstApp registers AppSink
         "Gst.init(None);"
         "import sys;"
-        f"els=({elements},);"
+        f"els=({els},);"
         "sys.exit(0 if all(Gst.ElementFactory.find(e) for e in els) else 1)"
     )
     try:
@@ -115,6 +120,35 @@ def _gst_ok() -> bool:
         )
     except Exception:  # noqa: BLE001 - interpreter/import failure
         return False
+
+
+def _gst_ok() -> bool:
+    """True when gst.install's own deliverables work: PyGObject can import gi +
+    GstApp (the appsink reader) and the Jetson NVENC elements are present.
+
+    Deliberately excludes the zedxonesrc / zedsrc source elements: those are
+    ``axol gst.build-zed``'s responsibility and aren't built until the step
+    *after* this one, so gating on them here would misreport a clean install as
+    failed. Their presence is reported separately by :func:`_note_zed_sources`.
+    """
+    return _gi_elements_ok(_REQUIRED_ELEMENTS)
+
+
+def _note_zed_sources() -> None:
+    """Report (note only) whether the patched ZED source elements are present.
+
+    ``axol gst.build-zed`` builds + installs zedxonesrc / zedsrc, and the
+    installer/provision runs it right after gst.install, so their absence here
+    is expected on a first install — informational, never a warning.
+    """
+    if _gi_elements_ok((_ZED_SOURCE_MARKER,)):
+        print("Patched ZED source elements (zedxonesrc / zedsrc) present.")
+    else:
+        print(
+            "Note: the ZED source elements (zedxonesrc / zedsrc) aren't built "
+            "yet — 'axol gst.build-zed' builds + installs them (the installer "
+            "runs it right after this step)."
+        )
 
 
 def _apt_install() -> bool:
@@ -158,7 +192,8 @@ def run(_args: object = None) -> None:
     ``axol gst.build-zed``; this command only verifies those are present.
     """
     if _gst_ok():
-        print("GStreamer ZED camera stack already available.")
+        print("GStreamer appsink + NVENC stack already available.")
+        _note_zed_sources()
         return
 
     print("Installing GStreamer system packages (apt)...")
@@ -167,13 +202,13 @@ def run(_args: object = None) -> None:
     _pip_install_pygobject()
 
     if _gst_ok():
-        print("GStreamer ZED camera stack installed.")
+        print("GStreamer appsink + NVENC stack installed.")
+        _note_zed_sources()
     else:
         print(
-            "WARNING: the GStreamer ZED camera stack is still unavailable. "
-            "Ensure PyGObject, the zed-gstreamer elements (zedxonesrc / zedsrc), "
-            "and the Jetson NVENC elements (nvvidconv / nvv4l2h264enc) are "
-            "installed. Camera video will fall back to the ZED SDK path "
-            "(higher latency) until then.",
+            "WARNING: the GStreamer appsink + NVENC stack is still unavailable. "
+            "Ensure PyGObject and the Jetson NVENC elements (nvvidconv / "
+            "nvv4l2h264enc) are installed. Camera video will fall back to the "
+            "ZED SDK path (higher latency) until then.",
             file=sys.stderr,
         )
