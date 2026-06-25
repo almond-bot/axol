@@ -53,9 +53,18 @@ def run(args: argparse.Namespace) -> None:
     asyncio.run(_run(args))
 
 
-async def _print_motor(bus: CanBus, motor_id: int, channel: str, motor_type_arg: str | None) -> None:
+async def _print_motor(
+    bus: CanBus, motor_id: int, channel: str, motor_type_arg: str | None
+) -> None:
     """Read and print one motor's status."""
-    motor = make_driver(bus, motor_id, kt=1.0, motor_type=motor_type_arg)
+    try:
+        motor = make_driver(bus, motor_id, kt=1.0, motor_type=motor_type_arg)
+    except ValueError as e:
+        print(f"\nmotor-info — {channel}  id={motor_id:#04x}\n")
+        print(f"  ERROR: {e}")
+        print("  Pass --type myactuator|damiao to query an ID outside the known range.")
+        return
+
     motor_type = type(motor).__name__.removesuffix("Motor").lower()
     print(f"\nmotor-info — {channel}  type={motor_type}  id={motor_id:#04x}\n")
 
