@@ -59,13 +59,31 @@ _BITRATE_BPP = 0.25
 _BITRATE_MIN = 6_000_000
 _BITRATE_MAX = 40_000_000
 
+# Per-camera feed-queue depth (frames). LeRobot's default is 30 (0.5 s at 60 fps),
+# too shallow to ride out the gst pipeline's spin-up: gst-launch takes ~1 s to
+# negotiate caps and allocate NVMM before its first frame is consumed, during
+# which the queue fills at the capture rate and overflows. 90 frames (~1.5 s) buys
+# enough slack to absorb that transient; steady-state throughput is handled by the
+# pipelined gst queues (see `_gst_argv`), so in normal running it stays near empty.
+# Cost is ~1.7 MB/frame (HWC RGB uint8): 90 x 3 cameras ~= 460 MB peak.
+_FEED_QUEUE_MAXSIZE = 90
+
 # Image stats are accumulated *during* the episode on the encoder's writer
 # thread in the recorder subprocess (not by decoding the finished mp4 afterwards,
-# which made save_episode slow). This mirrors LeRobot's own streaming encoder
-# (_StreamingEncoderThread in datasets/video_utils.py) exactly: the same
-# auto_downsample_height_width + RunningQuantileStats, updated on every frame.
-# The recorder has its own GIL/cores, away from the control loop and the relay's
-# WebRTC send, so the per-frame work is harmless there.
+# which made save_episode slow). Like LeRobot's streaming encoder we use
+# auto_downsample_height_width + RunningQuantileStats, but on a *sampled* subset
+# of frames rather than every frame: each update costs ~4.3 ms (downsample +
+# quantile sketch), so updating all three cameras at 60 fps would need ~780 ms of
+# GIL-held time per wall-clock second. Since the recorder's three writer threads
+# share one GIL, that alone saturates it, the threads can't drain their feed
+# queues, and frames overflow ("queue full, dropped N" storm). Sampling at
+# ~_STATS_SAMPLE_HZ keeps the per-second stats cost ~6x lower while still feeding
+# the quantile sketch hundreds of uniformly-spaced frames per episode — far more
+# than enough for image normalization stats.
+#
+# Target rate (Hz) at which each camera folds a frame into its running image
+# stats. The per-camera stride is derived from this and the dataset fps.
+_STATS_SAMPLE_HZ = 10
 
 
 def hw_dataset_encoder_available() -> bool:
@@ -88,6 +106,19 @@ def _gst_argv(
     ``nvv4l2h264enc`` encodes on NVENC, so no CPU ``videoconvert`` is involved.
     ``h264parse`` + ``mp4mux`` produce a standard mp4; closing stdin sends EOS so
     ``mp4mux`` finalizes the moov atom and ``filesink`` flushes the file.
+
+    The two ``queue`` elements are load-bearing, not cosmetic. Without them the
+    whole chain runs in ``fdsrc``'s single streaming thread, so ``fdsrc`` only
+    reads the next frame off the pipe *after* VIC convert + NVENC + mux finish the
+    previous one — i.e. the pipe-drain rate equals the full serial chain rate. On
+    the recorder's niced/background cores that can't keep up with 60 fps x 3
+    cameras, the ``os.write`` on the feeding side blocks, the writer thread stalls,
+    and the Python feed queue overflows (the "queue full, dropped N frames" storm).
+    A ``queue`` after ``fdsrc`` lets it keep draining the pipe (unblocking the
+    writer) while a ``queue`` before the encoder puts the VIC and NVENC on separate
+    threads, so chain throughput is ``min(VIC, NVENC)`` instead of their sum. The
+    queues are non-leaky (back-pressure is fine; real drops are counted/logged in
+    Python ``feed``) and bounded by buffer count to cap latency and memory.
     """
     pipeline = [
         f"fdsrc fd=0 blocksize={width * height * 4}",
@@ -95,8 +126,10 @@ def _gst_argv(
             "rawvideoparse use-sink-caps=false format=rgba "
             f"width={width} height={height} framerate={fps}/1"
         ),
+        "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         "nvvidconv",
         "video/x-raw(memory:NVMM),format=NV12",
+        "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         (
             f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
             f"insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
@@ -140,12 +173,15 @@ class _CameraNvencEncoder:
         self._dropped = 0
         self._error: str | None = None
 
-        # Running image stats, accumulated inline as frames are encoded (mirrors
-        # LeRobot's auto_downsample + RunningQuantileStats so the result matches
-        # the software path). Disabled if lerobot's compute_stats can't import.
+        # Running image stats, accumulated inline from a sampled subset of frames
+        # (LeRobot's auto_downsample + RunningQuantileStats; see _STATS_SAMPLE_HZ
+        # for why we sample). Disabled if lerobot's compute_stats can't import.
         self._stats: object | None = None
         self._downsample = None
         self._stats_samples = 0
+        # Fold every Nth frame into the running stats (uniform sampling) so the
+        # quantile sketch stays cheap on the shared-GIL writer threads. >=1.
+        self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
         try:
             from lerobot.datasets.compute_stats import (
                 RunningQuantileStats,
@@ -247,7 +283,10 @@ class _CameraNvencEncoder:
         assert self._rgba is not None and self._stdin_fd is not None
         self._rgba[:, :, :3] = frame
         self._write(self._rgba)
-        if self._stats is not None:
+        # Sample stats every _stats_stride-th frame to keep the GIL-bound quantile
+        # update off the per-frame hot path (see _STATS_SAMPLE_HZ). frame 0 is
+        # always sampled so even short episodes contribute.
+        if self._stats is not None and self._frame_count % self._stats_stride == 0:
             self._update_stats(frame)
         self._t_copy += time.perf_counter() - t0
         self._frame_count += 1
@@ -353,7 +392,7 @@ class NvencStreamingEncoder:
     / ``close``. One ``_CameraNvencEncoder`` (and one gst subprocess) per camera.
     """
 
-    def __init__(self, fps: int, queue_maxsize: int = 30) -> None:
+    def __init__(self, fps: int, queue_maxsize: int = _FEED_QUEUE_MAXSIZE) -> None:
         self.fps = fps
         self.queue_maxsize = queue_maxsize
         self._cams: dict[str, _CameraNvencEncoder] = {}

@@ -45,18 +45,22 @@ def core_groups() -> dict[str, set[int]] | None:
     a restricted mask). Reading the inherited mask would wrongly see only the
     realtime cores.
 
-    8+ cores get the full 3-way split (control 3 / relay 2 / dataset rest). On
-    6-7 cores the control group shrinks to 2; below 6 there's no room to isolate
-    the relay, so relay shares the background group (still kept off the control
-    cores). ``None`` when partitioning isn't applicable at all.
+    8+ cores: control 3 / relay 1 / dataset rest. The dataset recorder re-encodes
+    three camera streams from raw RGBA and is the heaviest throughput consumer, so
+    it gets the widest group; the relay keeps a single core because its headset
+    H.264 runs on the hardware NVENC block (``nvv4l2h264enc``) and that core mainly
+    carries the latency-sensitive WebRTC send. On 6-7 cores the control group
+    shrinks to 2; below 6 there's no room to isolate the relay, so relay shares the
+    background group (still kept off the control cores). ``None`` when partitioning
+    isn't applicable at all.
     """
     n = os.cpu_count()
     if not n or n < _MIN_CORES:
         return None
     if n >= 8:
         rt = set(range(3))
-        relay = {3, 4}
-        bg = set(range(5, n))
+        relay = {3}
+        bg = set(range(4, n))
     elif n >= 6:
         rt = {0, 1}
         relay = {2, 3}
