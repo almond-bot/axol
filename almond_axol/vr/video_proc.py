@@ -119,6 +119,20 @@ def _pyshm_meta(shm_name: str, width: int, height: int, fps: int) -> dict:
     }
 
 
+def _eye_plan(name: str, spec: dict) -> list[tuple[str, str]]:
+    """``[(eye_side, source_name)]`` for a stereo camera spec.
+
+    ``spec["eyes"]`` lists the eyes to build (default both); ``spec["eye_suffix"]``
+    (default True) decides naming. The head camera streams/records both eyes as
+    ``{name}_left`` / ``{name}_right``; a wrist stereo camera builds only its left
+    eye and exposes it under the plain ``{name}`` (``eye_suffix=False``), so it is
+    indistinguishable from a mono wrist downstream — one encode, one source.
+    """
+    eyes = spec.get("eyes") or ["left", "right"]
+    suffix = spec.get("eye_suffix", True)
+    return [(side, f"{name}_{side}" if suffix else name) for side in eyes]
+
+
 def _open_gst_camera_raw(
     name: str, spec: dict, cond: object, socket_dir: str | None
 ) -> tuple[object, dict[str, object], list, dict[str, dict]] | None:
@@ -177,55 +191,65 @@ def _open_gst_camera_raw(
         writers: list = []
         try:
             if stereo and use_shm:
-                left_sock = os.path.join(socket_dir, f"{name}_left.sock")
-                right_sock = os.path.join(socket_dir, f"{name}_right.sock")
+                plan = _eye_plan(name, spec)
+                gst_eyes = "both" if len(plan) == 2 else plan[0][0]
+                socks = {
+                    side: os.path.join(socket_dir, f"{src}.sock") for side, src in plan
+                }
+                eye_kwargs: dict = {}
+                if "left" in socks:
+                    eye_kwargs["left_raw_socket_path"] = socks["left"]
+                if "right" in socks:
+                    eye_kwargs["right_raw_socket_path"] = socks["right"]
                 cam: object = ZedGstStereoCamera(
                     serial,
                     resolution,
                     fps,
                     want_encoded=True,
-                    left_raw_socket_path=left_sock,
-                    right_raw_socket_path=right_sock,
                     raw_dims=raw_dims,
+                    eyes=gst_eyes,
+                    **eye_kwargs,
                 )
                 cam.connect()
-                sources = {
-                    f"{name}_left": cam.left_view,
-                    f"{name}_right": cam.right_view,
-                }
                 caps = _raw_caps(raw_w, raw_h, fps)
                 lat = cam.raw_latency_s
-                raw_meta = {
-                    f"{name}_left": _gstshm_meta(
-                        left_sock, caps, raw_w, raw_h, fps, lat
-                    ),
-                    f"{name}_right": _gstshm_meta(
-                        right_sock, caps, raw_w, raw_h, fps, lat
-                    ),
-                }
+                sources = {}
+                raw_meta = {}
+                for side, src in plan:
+                    sources[src] = cam.left_view if side == "left" else cam.right_view
+                    raw_meta[src] = _gstshm_meta(
+                        socks[side], caps, raw_w, raw_h, fps, lat
+                    )
                 return cam, sources, [], raw_meta
             if stereo:
-                left = RawFrameWriter.create(raw_w, raw_h, cond)
-                right = RawFrameWriter.create(raw_w, raw_h, cond)
-                writers = [left, right]
+                plan = _eye_plan(name, spec)
+                gst_eyes = "both" if len(plan) == 2 else plan[0][0]
+                eye_writers = {
+                    side: RawFrameWriter.create(raw_w, raw_h, cond) for side, _ in plan
+                }
+                writers = list(eye_writers.values())
+                eye_kwargs = {}
+                if "left" in eye_writers:
+                    eye_kwargs["left_raw_sink"] = eye_writers["left"].publish
+                if "right" in eye_writers:
+                    eye_kwargs["right_raw_sink"] = eye_writers["right"].publish
                 cam = ZedGstStereoCamera(
                     serial,
                     resolution,
                     fps,
                     want_encoded=True,
-                    left_raw_sink=left.publish,
-                    right_raw_sink=right.publish,
                     raw_dims=raw_dims,
+                    eyes=gst_eyes,
+                    **eye_kwargs,
                 )
                 cam.connect()
-                sources = {
-                    f"{name}_left": cam.left_view,
-                    f"{name}_right": cam.right_view,
-                }
-                raw_meta = {
-                    f"{name}_left": _pyshm_meta(left.name, raw_w, raw_h, fps),
-                    f"{name}_right": _pyshm_meta(right.name, raw_w, raw_h, fps),
-                }
+                sources = {}
+                raw_meta = {}
+                for side, src in plan:
+                    sources[src] = cam.left_view if side == "left" else cam.right_view
+                    raw_meta[src] = _pyshm_meta(
+                        eye_writers[side].name, raw_w, raw_h, fps
+                    )
                 return cam, sources, writers, raw_meta
             if use_shm:
                 sock = os.path.join(socket_dir, f"{name}.sock")
@@ -294,14 +318,22 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
     for fps in (int(spec.get("fps", 60)), 30):
         try:
             if stereo:
+                plan = _eye_plan(name, spec)
+                gst_eyes = "both" if len(plan) == 2 else plan[0][0]
                 cam: object = ZedGstStereoCamera(
-                    serial, resolution, fps, want_encoded=True, want_raw=False
+                    serial,
+                    resolution,
+                    fps,
+                    want_encoded=True,
+                    want_raw=False,
+                    eyes=gst_eyes,
                 )
                 cam.connect()
-                return cam, {
-                    f"{name}_left": cam.left_view,
-                    f"{name}_right": cam.right_view,
+                sources = {
+                    src: (cam.left_view if side == "left" else cam.right_view)
+                    for side, src in plan
                 }
+                return cam, sources
             cam = ZedGstCamera(
                 serial, resolution, fps, want_encoded=True, want_raw=False
             )
@@ -402,9 +434,11 @@ def _relay_main(
             continue
         owned.append(cam)
         if spec.get("stereo"):
-            # One camera, two eyes -> overhead_left / overhead_right.
-            sources[f"{name}_left"] = cam.left_view
-            sources[f"{name}_right"] = cam.right_view
+            # One grab, per-eye views. The head camera maps both eyes
+            # (overhead_left / overhead_right); a wrist stereo camera maps only
+            # its left eye under the plain name (see _eye_plan).
+            for side, src in _eye_plan(name, spec):
+                sources[src] = cam.left_view if side == "left" else cam.right_view
         else:
             sources[name] = cam
 

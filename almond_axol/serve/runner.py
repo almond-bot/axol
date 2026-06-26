@@ -347,9 +347,11 @@ class OperationRunner:
         if not serials:
             return
         cfg.cameras = serials
-        # Any camera slot (overhead or a wrist) whose serial is a stereo ZED X
-        # is streamed per-lens; teleop auto-detects this per serial, so this is
-        # just the operator-facing note. See ``cli.teleop._stereo_serials_for``.
+        # A stereo ZED X at the head streams both eyes per-lens; a stereo ZED X
+        # at a wrist streams only its left eye (one feed, like a mono camera) so
+        # wrist cost stays flat regardless of camera type. teleop auto-detects
+        # stereo per serial, so this is just the operator-facing note. See
+        # ``cli.teleop._stereo_serials_for`` / ``_stereo_eyes_for``.
         detected = stereo_serials()
         stereo_slots = sorted(s for s, serial in serials.items() if serial in detected)
         resolution = str((cameras or {}).get("resolution") or "").strip()

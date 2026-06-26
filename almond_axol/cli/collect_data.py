@@ -166,19 +166,42 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     if not webrtc_available():
         return None
 
+    # Auto-detected stereo serials so a physically-stereo wrist is grabbed via
+    # the stereo element (a mono open would crash) even though it records as
+    # mono. Best-effort: enumeration failure treats every camera as mono.
+    from ..zed import stereo_serials
+
+    detected = stereo_serials()
+
     specs: dict[str, dict[str, Any]] = {}
     for name, camcfg in cameras.items():
-        spec: dict[str, Any] = {
-            "serial": int(camcfg.serial),
-            "fps": camcfg.fps or 60,
-            "stereo": bool(getattr(camcfg, "stereo", False)),
-        }
+        serial = int(camcfg.serial)
+        spec: dict[str, Any] = {"serial": serial, "fps": camcfg.fps or 60}
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
+        # Eye policy must match observation_cameras() so the relay exports exactly
+        # the keys the recorder expects. A camera flagged stereo in the config
+        # (the head camera) records the eye(s) its ``eyes`` selects, suffixed
+        # (overhead_left / overhead_right). A camera that's only *physically*
+        # stereo (a wrist left as mono in the config) is grabbed stereo but
+        # crops/encodes just its left eye, exported under the plain name — so it
+        # records one image like a mono camera. Both-eye recording is reserved
+        # for the head camera.
+        if bool(getattr(camcfg, "stereo", False)):
+            eyes_cfg = getattr(camcfg, "eyes", "both")
+            spec["stereo"] = True
+            spec["eyes"] = ["left", "right"] if eyes_cfg == "both" else [eyes_cfg]
+            spec["eye_suffix"] = True
+        elif serial in detected:
+            spec["stereo"] = True
+            spec["eyes"] = ["left"]
+            spec["eye_suffix"] = False
+        else:
+            spec["stereo"] = False
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)

@@ -771,6 +771,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
     Exposes :attr:`left_view` / :attr:`right_view` (each a
     :class:`_GstStreamConsumer`), matching ``ZedStereoCamera`` so the rest of
     the pipeline treats the two eyes as ordinary cameras.
+
+    ``eyes`` selects which eye(s) are built: ``"both"`` (the head camera) crops
+    and encodes the full pair, while ``"left"`` / ``"right"`` build a single eye
+    only — the wrist policy, where a stereo camera streams/records just its left
+    eye so it costs no more than a mono one. The unbuilt eye's view is ``None``.
     """
 
     def __init__(
@@ -786,6 +791,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         left_raw_socket_path: str | None = None,
         right_raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
+        eyes: str = "both",
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -793,6 +799,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"unsupported stereo ZED X resolution {resolution!r} "
                 f"(expected one of {', '.join(_STEREO_RESOLUTION_ENUM)})"
             )
+        # Which eye(s) to actually crop + encode/convert. A wrist stereo camera
+        # streams/records only its left eye (``eyes="left"``), so the second
+        # NVENC encode and VIC convert are never built — making a stereo wrist
+        # cost exactly as much as a mono one. ``eyes="both"`` (the head camera)
+        # builds the full per-eye pair.
+        if eyes not in ("both", "left", "right"):
+            raise ValueError(f"eyes must be 'both', 'left', or 'right'; got {eyes!r}.")
+        self.eyes = eyes
+        self._sides: tuple[str, ...] = ("left", "right") if eyes == "both" else (eyes,)
         # A per-eye raw sink (the relay's shared-memory writer) or a shmsink socket
         # path implies that eye's raw branch and replaces its in-process _RawBuffer.
         want_raw = (
@@ -832,12 +847,20 @@ class ZedGstStereoCamera(_GstPipelineBase):
             view = _GstEye(self, enc, raw, self.width, self.height, self.fps)
             return enc, raw, view
 
-        self._left_enc, self._left_raw, self.left_view = eye(
-            left_raw_sink, left_raw_socket_path
-        )
-        self._right_enc, self._right_raw, self.right_view = eye(
-            right_raw_sink, right_raw_socket_path
-        )
+        # Only build the eye(s) named in ``self._sides``; the unbuilt eye's
+        # view is ``None`` (callers wire up only the eyes they asked for).
+        self._left_enc = self._left_raw = None
+        self._right_enc = self._right_raw = None
+        self.left_view: _GstEye | None = None
+        self.right_view: _GstEye | None = None
+        if "left" in self._sides:
+            self._left_enc, self._left_raw, self.left_view = eye(
+                left_raw_sink, left_raw_socket_path
+            )
+        if "right" in self._sides:
+            self._right_enc, self._right_raw, self.right_view = eye(
+                right_raw_sink, right_raw_socket_path
+            )
 
     def __repr__(self) -> str:
         return f"ZedGstStereoCamera(serial={self.serial})"
@@ -888,8 +911,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
         """
         if not self._want_raw or self._pipeline is None:
             return
-        for suffix in ("l", "r"):
-            valve = self._pipeline.get_by_name(f"rawvalve_{suffix}")
+        for side in self._sides:
+            valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
             if valve is not None:
                 valve.set_property("drop", not enabled)
 
@@ -900,15 +923,16 @@ class ZedGstStereoCamera(_GstPipelineBase):
             f"camera-fps={self.fps} stream-type=7 do-timestamp=false "
             "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
-        return (
-            f"{src}  split. ! {self._eye_branch('left', 'l')}  "
-            f"split. ! {self._eye_branch('right', 'r')}"
+        branches = "  ".join(
+            f"split. ! {self._eye_branch(side, side[0])}" for side in self._sides
         )
+        return f"{src}  {branches}"
 
     def connect(self, warmup: bool = True) -> None:
         self._launch(self._pipeline_str())
-        for enc, raw, raw_sink, sock, suffix in (
+        eye_specs = [
             (
+                "left",
                 self._left_enc,
                 self._left_raw,
                 self._left_raw_sink,
@@ -916,13 +940,17 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 "l",
             ),
             (
+                "right",
                 self._right_enc,
                 self._right_raw,
                 self._right_raw_sink,
                 self._right_raw_socket_path,
                 "r",
             ),
-        ):
+        ]
+        for side, enc, raw, raw_sink, sock, suffix in eye_specs:
+            if side not in self._sides:
+                continue
             if enc is not None:
                 self._start_pull(
                     f"zedgst-{self.serial}-enc{suffix}",
