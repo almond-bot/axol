@@ -315,12 +315,22 @@ class OperationRunner:
         return session
 
     def _begin_stop(self, session: Session) -> bool:
-        """Signal the op to unwind. Returns ``False`` if a stop is already underway."""
+        """Signal the op to unwind. Returns ``False`` if there's nothing to stop.
+
+        The status check + flip happen under the lock, and the terminal
+        transitions (:meth:`_mark_terminal`) take the same lock, so a Stop that
+        races the op's own exit can't resurrect a finished session as
+        ``stopping``: either we flip a still-running op to ``stopping`` (and a
+        later ``_finish`` moves it to ``exited``), or the op already reached a
+        terminal state and we bail.
+        """
         with self._lock:
             if self._stopping:
                 return False
+            if session.status not in ("starting", "running"):
+                return False
             self._stopping = True
-        session.status = "stopping"
+            session.status = "stopping"
         session.emit("[serve] stopping…")
         self._stop_event.set()
         loop, task = self._async_loop, self._async_task
@@ -524,8 +534,9 @@ class OperationRunner:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:  # noqa: BLE001
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.status = "error"
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 try:
@@ -561,8 +572,9 @@ class OperationRunner:
                     self._policy_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
             except Exception as exc:  # noqa: BLE001
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.status = "error"
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 self._policy_control = None
@@ -570,10 +582,26 @@ class OperationRunner:
 
     # -- shared teardown ----------------------------------------------------
 
+    def _mark_terminal(
+        self, session: Session, status: str, *, error: str | None = None
+    ) -> None:
+        """Move a session to a terminal state (``exited`` / ``error``).
+
+        Taken under the lock so it can't interleave with :meth:`_begin_stop`'s
+        running-check-then-flip. Never downgrades an existing ``error`` (the
+        first failure wins, and a stop arriving after an error stays ``error``).
+        """
+        with self._lock:
+            if session.status == "error":
+                return
+            if error is not None:
+                session.error = error
+            session.status = status
+            if status == "exited":
+                session.exit_code = 0
+
     def _finish(self, session: Session, needs_robot: bool) -> None:
-        if session.status not in ("error",):
-            session.status = "exited"
-            session.exit_code = 0
+        self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
         session.close_stream()
         if needs_robot and self._robot_link is not None:

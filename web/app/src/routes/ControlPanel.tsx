@@ -371,12 +371,27 @@ export default function ControlPanel() {
     [commands, selectedOp]
   )
 
-  // Stop the running task (if any) and wait for it to actually exit. The
-  // server-side stop joins the task thread before responding, so awaiting this
-  // guarantees the op is gone before a disconnect tears its connection down.
+  // Stop the running task (if any) and wait for it to actually exit before
+  // returning, so a disconnect never tears the host/robot link down mid-cleanup.
+  // The server-side stop now returns immediately with "stopping" (it force-kills
+  // a stuck op in the background), so we poll op status until the op is truly
+  // gone rather than relying on the stop response to block.
   async function stopRunningOp() {
     if (!isLive) return
     setSession(await stopOperation())
+    // Bounded so an unkillable op (abandoned server-side) can't wedge the UI;
+    // we proceed best-effort after the deadline.
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500))
+      try {
+        const op = await fetchOpStatus()
+        if (op.session) setSession(op.session)
+        if (!op.running) return
+      } catch {
+        return // host unreachable — nothing left to wait on
+      }
+    }
   }
 
   async function handleStart() {
