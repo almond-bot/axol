@@ -23,12 +23,14 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .ports import VR_PORT
 from .sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
 
-# The VR WebSocket server port; we forward the headset's loopback copy of it.
-VR_PORT = 8000
+# ``VR_PORT`` (the port we forward the headset's loopback copy of) is owned by
+# ``utils.ports`` so the tunnel target and the VR server's bind can't drift.
+__all__ = ["VR_PORT", "AdbStatus", "install", "status", "connect"]
 
 # Meta/Oculus USB vendor id. The udev rule lets a non-root user open the
 # headset for interactive ``adb`` (the root ``axol serve`` process opens it
@@ -230,6 +232,16 @@ def connect(port: int = VR_PORT) -> AdbStatus:
     The first adb command against a freshly connected headset also triggers the
     USB-debugging authorization popup on the device. Returns the resulting
     status so the caller can surface "authorize on headset" vs "ready".
+
+    Self-healing: any existing reverse for this port is removed first, then a
+    fresh one is added. ``adb reverse`` keys on the device-side spec, so a plain
+    re-add already replaces a prior mapping, but removing first also clears a
+    *wedged* tunnel (e.g. one left pointing at a server we since reclaimed/killed
+    on a different run) so reconnect reliably yields a working forward rather
+    than trusting whatever stale state the device held.
     """
+    # ``--remove`` of a non-existent reverse exits non-zero; that's expected and
+    # harmless (``_run`` only warns on spawn/timeout errors, not exit codes).
+    _run(["reverse", "--remove", f"tcp:{port}"])
     _run(["reverse", f"tcp:{port}", f"tcp:{port}"])
     return status(port)

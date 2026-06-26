@@ -117,7 +117,22 @@ def run(args: argparse.Namespace) -> None:
     if args.open:
         _open_browser_when_ready(local)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info", **ssl_kwargs)
+    # Bind the port ourselves — reclaiming it from a stale/leftover listener —
+    # before handing the socket to uvicorn, so a restart (or a crashed previous
+    # instance that didn't release the socket) doesn't fail with "address
+    # already in use". uvicorn still installs its own SIGINT/SIGTERM handlers
+    # and closes the adopted socket on exit.
+    from ..utils.ports import open_listen_socket
+
+    sock = open_listen_socket(args.host, args.port)
+    config = uvicorn.Config(
+        app, host=args.host, port=args.port, log_level="info", **ssl_kwargs
+    )
+    server = uvicorn.Server(config)
+    try:
+        server.run(sockets=[sock])
+    finally:
+        sock.close()
 
 
 def _ensure_cert() -> None:

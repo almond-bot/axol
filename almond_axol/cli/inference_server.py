@@ -58,6 +58,13 @@ def main(argv: list[str]) -> None:
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
+    from ..utils.ports import reclaim_port
+
+    # The gRPC port is fixed (it must match run-policy's ``--server_port``), so
+    # evict a leftover server from a crashed/previous run rather than failing to
+    # bind. lerobot owns the socket once ``serve`` takes over.
+    reclaim_port(cfg.port)
+
     _logger.info(
         "Serving policy inference on %s:%d (Ctrl+C to stop).", cfg.host, cfg.port
     )

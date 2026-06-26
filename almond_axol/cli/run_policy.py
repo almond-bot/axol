@@ -933,6 +933,12 @@ def _run(
             "port": server_port,
             "fps": fps,
         }
+        # Evict a leftover PolicyServer from a crashed/previous run before
+        # spawning ours, otherwise it would bind-fail and ``_wait_for_port``
+        # would silently attach to the stale (wrong-policy) server.
+        from ..utils.ports import reclaim_port
+
+        reclaim_port(server_port)
         ctx = mp.get_context("spawn")
         server_proc = ctx.Process(
             target=_serve_policy_server,
