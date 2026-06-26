@@ -362,9 +362,21 @@ class OperationRunner:
         across the pipe while it compiles JAX). Killing the children makes the
         blocked join/recv return so the thread can finish.
         """
-        for child in multiprocessing.active_children():
-            if child.pid in self._baseline_children:
-                continue
+        # Snapshot the targets under the lock and only if this is still the
+        # op being stopped: a slow watchdog could otherwise wake after the
+        # stopped worker exited and a *new* op started, and SIGKILL the new
+        # op's subprocesses. ``start()`` swaps ``_session`` / ``_baseline_children``
+        # under the same lock, so either we see the old op (and its children) or
+        # we see the swap and bail — never a mix.
+        with self._lock:
+            if self._session is not session:
+                return
+            targets = [
+                c
+                for c in multiprocessing.active_children()
+                if c.pid not in self._baseline_children
+            ]
+        for child in targets:
             session.emit(
                 f"[serve] killing child process {child.name} (pid {child.pid})"
             )
