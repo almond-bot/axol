@@ -347,7 +347,6 @@ class VRServer:
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
-                _logger.info("webrtc[%d] answer received from headset", client_id)
                 try:
                     await self._webrtc.set_answer(client_id, sdp)
                 except Exception as exc:

@@ -121,6 +121,10 @@ export AXOL_TURN_PASSWORD="your-turn-credential"
 
 `AXOL_TURN_URL` is a comma-separated list of ICE URLs (`turn:`, `turns:`, or `stun:`). Without these, control still works over the Funnel but the camera feed stays blank for an off-tailnet operator. On a LAN or plain tailnet, leave them unset — the direct path is used as before.
 
+<Tip>
+  Instead of exporting these every shell, drop them in a `.env.local` file at the repo root — `axol` loads it automatically at startup. It's git-ignored, so your TURN credentials stay out of version control.
+</Tip>
+
 ### 3. Connect from the headset
 
 In the VR app's **Connect** field, enter the Funnel endpoint as an `https://` URL (or with an explicit `:443`) so the app targets the public port instead of the LAN default of `8000`:

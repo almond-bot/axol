@@ -362,11 +362,6 @@ def _relay_main(
     camera path.
     """
     logging.basicConfig(level=log_level)
-    # aiortc/aioice emit ICE connectivity-check detail at INFO; make sure the
-    # relay subprocess actually surfaces them (they're the key signal when a
-    # media transport is stuck in "checking" off-LAN behind a TURN relay).
-    logging.getLogger("aioice").setLevel(log_level)
-    logging.getLogger("aiortc").setLevel(log_level)
 
     # Disable the cyclic garbage collector in the relay. aiortc sends WebRTC media
     # on this process's asyncio loop, and a stop-the-world gen2 GC pause freezes

@@ -59,9 +59,8 @@ from numpy.typing import NDArray
 
 from .hw_video import install_hw_encoder
 from .ice import (
-    bundle_candidates_onto_tag_mline,
-    candidates_by_mline,
     ice_servers,
+    replicate_candidates_across_mlines,
     summarize_candidates,
 )
 
@@ -409,70 +408,19 @@ class WebRTCManager:
             _logger.warning("webrtc answer for unknown client %d", client_id)
             return
         if ice_servers():
-            _logger.info("webrtc[%d] answer %s", client_id, summarize_candidates(sdp))
-            _logger.info(
-                "webrtc[%d] answer per-mline %s",
-                client_id,
-                candidates_by_mline(sdp),
-            )
-            # Work around aiortc's BUNDLE candidate-routing bug: with multiple
-            # bundled video m-lines it keeps only the first m-line's candidates,
-            # so a browser that puts them on another bundled m-line leaves the
-            # media transport with zero remote candidates (stuck in "checking").
-            fixed = bundle_candidates_onto_tag_mline(sdp)
+            # Work around an aiortc BUNDLE bug: it keeps only the bundle-tag
+            # m-line's transport, so ICE candidates the headset placed on a
+            # different bundled m-line get dropped and the media transport
+            # stalls in "checking". Replicate candidates onto every m-line so
+            # the surviving transport always has them. Only needed off-LAN
+            # (when TURN is configured); the LAN path is left untouched.
+            fixed = replicate_candidates_across_mlines(sdp)
             if fixed != sdp:
                 _logger.info(
-                    "webrtc[%d] consolidated answer candidates onto bundle-tag "
-                    "m-line (%s)",
-                    client_id,
-                    candidates_by_mline(fixed),
+                    "webrtc[%d] applied aiortc BUNDLE candidate workaround", client_id
                 )
                 sdp = fixed
-        try:
-            await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
-        except Exception:
-            _logger.exception("webrtc[%d] setRemoteDescription failed", client_id)
-            raise
-        _logger.info(
-            "webrtc[%d] remote answer applied (ICE checks start now)", client_id
-        )
-        asyncio.ensure_future(self._log_transport_state(client_id, pc))
-
-    async def _log_transport_state(self, client_id: int, pc: RTCPeerConnection) -> None:
-        """Log each transceiver's ICE/DTLS transport state a few seconds after the
-        answer. Reveals whether aiortc actually started ICE for the media
-        transport (``checking``/``completed``), never started it (``new``), or
-        closed it during BUNDLE collapse (``closed``)."""
-        await asyncio.sleep(4)
-        if self._pcs.get(client_id) is not pc:
-            return
-        try:
-            parts = []
-            for t in pc.getTransceivers():
-                dtls = t.receiver.transport
-                ice = dtls.transport
-                n = len(ice.iceGatherer.getLocalCandidates())
-                conn = getattr(ice, "_connection", None)
-                remote_user = getattr(conn, "remote_username", None)
-                remote_cands = len(getattr(conn, "_remote_candidates", []) or [])
-                check_list = getattr(conn, "_check_list", []) or []
-                pair_states = ",".join(
-                    sorted(
-                        {
-                            str(getattr(p, "state", "?")).split(".")[-1]
-                            for p in check_list
-                        }
-                    )
-                )
-                parts.append(
-                    f"mid={t.mid} dir={t.currentDirection} ice={ice.state} "
-                    f"dtls={dtls.state} transport_id={id(ice)} local_cands={n} "
-                    f"remote_cands={remote_cands} remote_ufrag={remote_user!r} "
-                    f"pairs={len(check_list)}[{pair_states}]"
-                )
-            _logger.info("webrtc[%d] transports: %s", client_id, " || ".join(parts))
-        except Exception:
-            _logger.exception("webrtc[%d] transport introspection failed", client_id)
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
 
     async def close(self, client_id: int) -> None:
         """Close and forget the peer connection for ``client_id``, if any."""

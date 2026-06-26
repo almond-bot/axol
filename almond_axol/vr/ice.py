@@ -85,65 +85,45 @@ def summarize_candidates(sdp: str) -> str:
     return "candidates: " + " ".join(f"{k}={counts[k]}" for k in keys)
 
 
-def candidates_by_mline(sdp: str) -> str:
-    """Per-m-line tally of ICE candidates in an SDP (which ``mid`` carries them).
-
-    aiortc routes embedded (non-trickle) candidates by m-line and, after BUNDLE
-    collapse, only keeps the bundle-tag (first) m-line's candidates. If a browser
-    puts its candidates on a non-tag bundled m-line, this shows it: e.g.
-    ``mid=0:0 mid=1:0 mid=2:4`` means all 4 candidates are on ``mid=2`` and the
-    bundled transport (``mid=0``) gets none.
-    """
-    sections: list[tuple[str, int]] = []
-    cur_mid = "session"
-    cur_count = 0
-    started = False
-    for raw in sdp.splitlines():
-        line = raw.strip()
-        if line.startswith("m="):
-            if started:
-                sections.append((cur_mid, cur_count))
-            started = True
-            cur_mid = "?"
-            cur_count = 0
-        elif line.startswith("a=mid:"):
-            cur_mid = line[len("a=mid:") :]
-        elif line.startswith("a=candidate:"):
-            cur_count += 1
-    if started:
-        sections.append((cur_mid, cur_count))
-    return " ".join(f"mid={m}:{c}" for m, c in sections) or "no-m-lines"
-
-
-def bundle_candidates_onto_tag_mline(sdp: str) -> str:
-    """Move every embedded ICE candidate onto the first (bundle-tag) m-line.
+def replicate_candidates_across_mlines(sdp: str) -> str:
+    """Copy every embedded ICE candidate onto *all* m-line sections.
 
     Works around an aiortc BUNDLE bug: when the local offer bundles several media
     onto one transport, ``setRemoteDescription`` routes the answer's remote
-    candidates by m-line and then, during BUNDLE collapse, discards every
-    non-tag m-line — so candidates a browser places on a non-tag bundled m-line
-    are dropped and the media transport stalls in ``checking`` with zero remote
-    candidates. Consolidating all ``a=candidate:`` lines onto the first m-line
-    (which is the one aiortc keeps) makes them survive the collapse.
+    candidates by m-line and then, during BUNDLE collapse, keeps only the
+    bundle-tag (``a=group:BUNDLE`` first) m-line's transport. If the browser put
+    its candidates on a different bundled m-line than the tag, they are discarded
+    and the media transport stalls in ``checking`` with zero remote candidates.
 
-    No-op when there is a single m-line, or when there are no embedded candidates
-    (LAN/trickle), and idempotent when candidates already sit on the first
-    m-line. Line endings are preserved.
+    Rather than guess which m-line is the tag, put the full candidate set on
+    every m-line so the surviving transport has them regardless. Candidates on
+    discarded m-lines are harmless. No-op for a single m-line or when there are
+    no embedded candidates (LAN/trickle). Line endings are preserved.
     """
     lines = sdp.split("\n")
-    m_indexes = [i for i, line in enumerate(lines) if line.startswith("m=")]
-    if len(m_indexes) < 2:
+    if sum(1 for line in lines if line.startswith("m=")) < 2:
         return sdp
     candidate_lines = [
         line for line in lines if line.lstrip().startswith("a=candidate:")
     ]
     if not candidate_lines:
         return sdp
-    kept = [line for line in lines if not line.lstrip().startswith("a=candidate:")]
-    # Re-insert all candidates at the end of the first m-line section (just
-    # before the second m-line), so they belong to the bundle-tag media.
-    insert_at = [i for i, line in enumerate(kept) if line.startswith("m=")][1]
-    return "\n".join(kept[:insert_at] + candidate_lines + kept[insert_at:])
+    body = [line for line in lines if not line.lstrip().startswith("a=candidate:")]
+    out: list[str] = []
+    seen_m = False
+    for line in body:
+        if line.startswith("m="):
+            if seen_m:
+                out.extend(candidate_lines)  # close the previous media section
+            seen_m = True
+        out.append(line)
+    # Close the final media section, inserting before any trailing blank lines.
+    tail = 0
+    while tail < len(out) and out[len(out) - 1 - tail].strip() == "":
+        tail += 1
+    insert_pos = len(out) - tail
+    out[insert_pos:insert_pos] = candidate_lines
+    return "\n".join(out)
 
 
 def client_ice_servers() -> list[dict[str, Any]]:

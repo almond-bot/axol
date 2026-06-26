@@ -98,8 +98,6 @@ class ControlChannelManager:
         if pc is None:
             _logger.warning("control answer for unknown client %d", client_id)
             return
-        if ice_servers():
-            _logger.info("control[%d] answer %s", client_id, summarize_candidates(sdp))
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
 
     async def close(self, client_id: int) -> None:
