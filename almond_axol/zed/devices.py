@@ -156,7 +156,9 @@ def list_zed_devices(timeout_s: float = _ENUMERATE_TIMEOUT_S) -> list[ZedDevice]
     if status == "ok":
         return payload[0]
     error_type, message = payload
-    if error_type == "ImportError":
+    # ModuleNotFoundError (raised when pyzed is absent) is an ImportError
+    # subclass; preserve it so callers' ``except ImportError`` paths still fire.
+    if error_type in ("ImportError", "ModuleNotFoundError"):
         raise ImportError(message)
     raise RuntimeError(f"{error_type}: {message}")
 
