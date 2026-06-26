@@ -122,17 +122,17 @@ right = stereo.right_view.read_latest()  # (H, W, 3) — right eye
 stereo.disconnect()
 ```
 
-When an `AxolRobot` camera config has `stereo=True`, the robot expands camera `X` into observation keys `X_left` / `X_right` automatically (see `AxolRobotConfig.observation_cameras()`), and `collect-data` records both eyes in the dataset.
+When an `AxolRobot` camera config has `stereo=True`, the observation keys depend on `eyes` (see `AxolRobotConfig.observation_cameras()`): `"both"` expands camera `X` into `X_left` / `X_right` (the head camera records both eyes in the dataset), while `"left"` / `"right"` exposes a single eye under the plain name `X` — indistinguishable downstream from a mono camera (the wrist convention). Stereo is auto-promoted from the serial by `AxolRobotConfig.apply_detected_stereo()` — `collect-data` / `run-policy` call it so a stereo ZED X opens correctly without setting `stereo` by hand.
 
 ### `ZedCameraConfig` fields
 
 | Field | Default | Description |
 |---|---|---|
-| `serial` | _required_ | Serial number of the camera to open — no default. List connected cameras with [`list_zed_devices()`](/api/zed). |
+| `serial` | `0` | Serial number of the camera to open. `0` is the "unassigned" sentinel: `collect-data` / `run-policy` seed all three slots and drop the ones left at `0` (`AxolRobotConfig.select_assigned_cameras()`), so you only assign the cameras you have (at least one). A real ZED serial is positive. List connected cameras with [`list_zed_devices()`](/api/zed). |
 | `fps` | `60` | Capture frame rate. `None` adopts the camera default on connect. |
 | `width` | `960` | Frame width (SVGA). With `height`, must name a supported ZED resolution (`SVGA` 960×600, `HD1080` 1920×1080, `HD1200` 1920×1200). `None` auto-detects on connect. |
 | `height` | `600` | Frame height (SVGA). |
 | `color_mode` | `RGB` | Output color channel order. |
 | `warmup_s` | `1` | Seconds to read frames during `connect()` before returning |
-| `stereo` | `False` | Open the camera as a stereo ZED X carrying both eyes. The robot expands camera `X` into observation keys `X_left` / `X_right` backed by a single grab. |
-| `eyes` | `"both"` | Which eye(s) of a stereo camera to expose as observations: `"both"` → `X_left` and `X_right`, `"left"` / `"right"` → only that eye. Ignored when `stereo=False`. |
+| `stereo` | `False` | Open the camera as a stereo ZED X carrying both eyes on one grab. Auto-detected from the serial at startup (`apply_detected_stereo()`), so it's rarely set by hand. |
+| `eyes` | `"both"` | Which eye(s) of a stereo camera to expose as observations: `"both"` → `X_left` and `X_right` (the head convention); `"left"` / `"right"` → that single eye under the **plain** name `X`, so it looks like a mono camera downstream (the wrist convention). `apply_detected_stereo()` sets this to `"both"` for the overhead and `"left"` for any other slot. Ignored when `stereo=False`. |

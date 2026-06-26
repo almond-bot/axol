@@ -64,7 +64,7 @@ vr.set_video_sources({
 })
 ```
 
-The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead is registered as two sources, `overhead_left` / `overhead_right`, which the VR app renders per-lens.
+The existing `/ws` channel is reused for SDP signaling (no extra ports): the headset sends `webrtc-request`, the server replies with a `webrtc-offer` carrying one video track per source (labelled by camera name), and the headset answers with `webrtc-answer`. A stereo overhead is registered as two sources, `overhead_left` / `overhead_right`, which the VR app renders per-lens; a stereo wrist is registered as a single source under its slot name (one feed, like a mono camera).
 
 Pass `None` or `{}` to turn video off. [`axol teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data) wire this up automatically.
 

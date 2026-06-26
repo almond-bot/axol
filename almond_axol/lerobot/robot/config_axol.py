@@ -104,6 +104,21 @@ class AxolRobotConfig(RobotConfig):
                 cfg.stereo = True
                 cfg.eyes = "both" if name == "overhead" else "left"
 
+    def prepare_capture_cameras(self, detected: set[int], *, minimum: int = 1) -> None:
+        """Finalize the camera set before any capture path opens it.
+
+        Single entry point for the camera setup that **must be identical**
+        between collect-data and run-policy: a policy only sees the observations
+        it was trained on if both commands prune and flag cameras the same way.
+        Prunes the unassigned slots (:meth:`select_assigned_cameras`) and then
+        auto-promotes physically-stereo ZED X units
+        (:meth:`apply_detected_stereo`) — order matters, so we only enumerate
+        stereo over the slots that survived. ``detected`` comes from
+        :func:`almond_axol.zed.stereo_serials`.
+        """
+        self.select_assigned_cameras(minimum=minimum)
+        self.apply_detected_stereo(detected)
+
     def observation_cameras(self) -> dict[str, tuple[CameraConfig, str | None]]:
         """Effective observation cameras keyed by dataset/obs name.
 
