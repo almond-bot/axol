@@ -1,6 +1,7 @@
 export { AxolVRClient } from "./AxolVRClient"
 export { useAxolVRClient } from "./useAxolVRClient"
 export { useAxolPoseSocket } from "./useAxolPoseSocket"
+export { useAxolControlChannel } from "./useAxolControlChannel"
 export { useAxolVideo } from "./useAxolVideo"
 export { useAxolTracking } from "./useAxolTracking"
 export { axolWsUrl, axolHttpsOrigin, resolveAuthority } from "./serverUrl"

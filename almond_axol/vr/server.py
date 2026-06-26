@@ -42,6 +42,7 @@ from fastapi.responses import HTMLResponse
 
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from .config import VRServerConfig
+from .control_channel import ControlChannelManager
 from .ice import client_ice_servers
 from .models import VRFrame
 
@@ -79,6 +80,9 @@ class VRServer:
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._webrtc: WebRTCManager | Any | None = None
+        # Dedicated pose data channel (low-latency control transport). Always
+        # available — independent of whether any cameras are streaming.
+        self._control = ControlChannelManager(self._ingest_pose_text)
 
     # ------------------------------------------------------------------
     # Public API
@@ -184,6 +188,7 @@ class VRServer:
         """Gracefully shut down the WSS server."""
         if self._webrtc is not None:
             await self._webrtc.close_all()
+        await self._control.close_all()
 
         if self._uvicorn_server is not None:
             try:
@@ -238,19 +243,60 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
+        self._ingest_frame_obj(obj)
+
+    def _ingest_frame_obj(self, obj: Any) -> None:
+        """Validate a decoded pose object and publish it to the consumer."""
         try:
             frame = VRFrame.model_validate(obj)
-            self._latest_frame = frame
-            if self._on_frame is not None:
-                self._on_frame(frame)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
+            return
+        self._latest_frame = frame
+        if self._on_frame is not None:
+            self._on_frame(frame)
+
+    def _ingest_pose_text(self, data: str) -> None:
+        """Ingest a pose frame from the control data channel (text message).
+
+        Mirrors the WebSocket pose path; signaling never arrives here, so a
+        message carrying a ``type`` field is ignored rather than validated.
+        """
+        try:
+            obj = json.loads(data)
+        except Exception as exc:
+            _logger.warning("invalid json on pose channel: %s", exc)
+            return
+        if isinstance(obj, dict) and "type" in obj:
+            return
+        self._ingest_frame_obj(obj)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
     ) -> None:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
+
+        # Control data channel (pose transport): negotiated independently of the
+        # cameras, so it's handled before the video-availability check below and
+        # works even when no video sources are registered.
+        if msg_type == "control-request":
+            sdp = await self._control.create_offer(client_id)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "control-offer",
+                        "sdp": sdp,
+                        "iceServers": client_ice_servers(),
+                    }
+                )
+            )
+            return
+        if msg_type == "control-answer":
+            sdp = obj.get("sdp")
+            if isinstance(sdp, str):
+                await self._control.set_answer(client_id, sdp)
+            return
 
         if self._webrtc is None:
             if msg_type == "webrtc-request":
@@ -320,5 +366,6 @@ class VRServer:
                 server._client_count = max(0, server._client_count - 1)
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
+                await server._control.close(client_id)
 
         return app

@@ -1,37 +1,11 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
+import { waitForIceGathering } from "./webrtc"
 
 /** Live camera streams keyed by camera name (e.g. "overhead", "left_arm"). */
 export type CameraStreams = Record<string, MediaStream>
 
 const POLL_MS = 300
-
-// Cap on how long we wait for ICE gathering before sending the answer. Host
-// candidates gather almost instantly; a TURN allocation is a quick round-trip.
-// The cap just prevents a stalled TURN server from hanging negotiation forever
-// (we then send whatever candidates we have).
-const ICE_GATHER_TIMEOUT_MS = 3000
-
-/**
- * Resolve once the peer connection has finished gathering ICE candidates, so a
- * non-trickle answer carries them all (crucially the TURN relay candidate).
- * Falls back after `ICE_GATHER_TIMEOUT_MS` if gathering stalls.
- */
-function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
-  if (pc.iceGatheringState === "complete") return Promise.resolve()
-  return new Promise((resolve) => {
-    const finish = () => {
-      pc.removeEventListener("icegatheringstatechange", onChange)
-      clearTimeout(timer)
-      resolve()
-    }
-    const onChange = () => {
-      if (pc.iceGatheringState === "complete") finish()
-    }
-    const timer = setTimeout(finish, ICE_GATHER_TIMEOUT_MS)
-    pc.addEventListener("icegatheringstatechange", onChange)
-  })
-}
 
 /**
  * Negotiates a WebRTC connection that receives the Axol cameras and exposes

@@ -6,9 +6,31 @@ import { AxolState } from "./types"
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 
+// Pose sinks (WebSocket and RTCDataChannel) both expose `.send(string)`; this is
+// the minimal shape AxolVRClient needs to ship a frame.
+type PoseSink = { send: (data: string) => void }
+
+/** Choose the pose transport: USB (exclusive) → data channel → WebSocket. */
+function pickPoseSink(
+  usbOnly: boolean,
+  poseWsRef: RefObject<WebSocket | null> | undefined,
+  poseChannelRef: RefObject<RTCDataChannel | null> | undefined,
+  wsRef: RefObject<WebSocket | null>
+): PoseSink | null {
+  if (usbOnly) {
+    const ws = poseWsRef?.current
+    return ws && ws.readyState === WebSocket.OPEN ? ws : null
+  }
+  const channel = poseChannelRef?.current
+  if (channel && channel.readyState === "open") return channel
+  const ws = wsRef.current
+  return ws && ws.readyState === WebSocket.OPEN ? ws : null
+}
+
 export function AxolVRClient({
   wsRef,
   poseWsRef,
+  poseChannelRef,
   usbOnly = false,
   onStateChange,
   onPendingRecording,
@@ -17,6 +39,9 @@ export function AxolVRClient({
   wsRef: RefObject<WebSocket | null>
   // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel.
   poseWsRef?: RefObject<WebSocket | null>
+  // Low-latency WebRTC pose data channel (see useAxolControlChannel). Preferred
+  // over the main WebSocket when open; the WebSocket remains the fallback.
+  poseChannelRef?: RefObject<RTCDataChannel | null>
   // When true, pose frames go ONLY over `poseWsRef` (USB); they are never sent
   // over the network WebSocket, so teleop pauses rather than silently falling
   // back to WiFi when the USB link isn't up.
@@ -155,12 +180,15 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    // Pick the pose transport. In USB mode poses go ONLY over the dedicated USB
-    // pose socket — never the network — so teleop pauses rather than silently
-    // falling back to WiFi when the cable link isn't up. Otherwise poses ride
-    // the main WebSocket.
-    const sink = usbOnly ? (poseWsRef?.current ?? null) : wsRef.current
-    if (sink == null || sink.readyState !== WebSocket.OPEN) return
+    // Pick the pose transport, in priority order:
+    //  1. USB mode: ONLY the dedicated USB pose socket — never the network — so
+    //     teleop pauses rather than silently falling back to WiFi when the cable
+    //     link isn't up.
+    //  2. The WebRTC pose data channel when open (UDP, low-latency; the right
+    //     path over a relayed Funnel and equal-or-better on a LAN).
+    //  3. The main WebSocket as the always-available fallback.
+    const sink: PoseSink | null = pickPoseSink(usbOnly, poseWsRef, poseChannelRef, wsRef)
+    if (sink == null) return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
