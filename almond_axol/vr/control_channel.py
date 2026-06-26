@@ -25,7 +25,7 @@ from collections.abc import Callable
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
-from .ice import ice_servers
+from .ice import ice_servers, summarize_candidates
 
 _logger = logging.getLogger(__name__)
 
@@ -84,6 +84,12 @@ class ControlChannelManager:
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
+        if servers:
+            _logger.info(
+                "control[%d] offer %s",
+                client_id,
+                summarize_candidates(pc.localDescription.sdp),
+            )
         return pc.localDescription.sdp
 
     async def set_answer(self, client_id: int, sdp: str) -> None:
@@ -92,6 +98,8 @@ class ControlChannelManager:
         if pc is None:
             _logger.warning("control answer for unknown client %d", client_id)
             return
+        if ice_servers():
+            _logger.info("control[%d] answer %s", client_id, summarize_candidates(sdp))
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
 
     async def close(self, client_id: int) -> None:

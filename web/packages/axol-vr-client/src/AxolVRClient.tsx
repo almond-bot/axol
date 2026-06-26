@@ -238,6 +238,10 @@ export function AxolVRClient({
         reset,
         state: stateRef.current,
         seq: ++seqRef.current,
+        // Capture timestamp (ms). The server's pose interpolator uses this to
+        // reconstruct the true motion cadence when frames arrive batched over a
+        // jittery/relayed link, so teleop stays smooth instead of stuttering.
+        t: performance.now(),
       })
     )
   })

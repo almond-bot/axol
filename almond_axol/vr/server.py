@@ -44,6 +44,7 @@ from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signe
 from .config import VRServerConfig
 from .control_channel import ControlChannelManager
 from .ice import client_ice_servers
+from .interp import PoseInterpolator
 from .models import VRFrame
 
 if TYPE_CHECKING:
@@ -75,6 +76,14 @@ class VRServer:
         self._keyfile = config.keyfile or KEYFILE
 
         self._latest_frame: VRFrame | None = None
+        # Adaptive playout buffer: reconstructs a smooth pose stream from
+        # batched/jittered network arrivals. Consumers that want smoothing read
+        # via get_render_frame(); get_frame() still returns the raw latest.
+        self._interp = PoseInterpolator(
+            enabled=config.interp_enabled,
+            min_delay_s=config.interp_min_delay_s,
+            max_delay_s=config.interp_max_delay_s,
+        )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
@@ -91,6 +100,17 @@ class VRServer:
     def get_frame(self) -> VRFrame | None:
         """Return the most recent frame received, or None if none yet."""
         return self._latest_frame
+
+    def get_render_frame(self) -> VRFrame | None:
+        """Return the smoothed playout frame for the current instant.
+
+        Renders the pose from the adaptive interpolation buffer (motion is held
+        slightly in the past and interpolated; control state is the latest
+        received). Falls back to the raw latest frame when interpolation is
+        disabled or there isn't enough history yet. The returned object is
+        identity-stable so the IK loop can skip redundant solves while idle.
+        """
+        return self._interp.sample()
 
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
@@ -253,6 +273,7 @@ class VRServer:
             _logger.warning("invalid frame: %s", exc)
             return
         self._latest_frame = frame
+        self._interp.push(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
 
@@ -326,6 +347,7 @@ class VRServer:
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
+                _logger.info("webrtc[%d] answer received from headset", client_id)
                 try:
                     await self._webrtc.set_answer(client_id, sdp)
                 except Exception as exc:

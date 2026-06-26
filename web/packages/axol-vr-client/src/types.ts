@@ -27,4 +27,8 @@ export type AxolPoseData = {
   r_grip: number
   reset: boolean
   state: AxolState
+  /** Monotonic per-connection frame counter. */
+  seq?: number
+  /** Capture timestamp (ms, `performance.now()`) for server-side interpolation. */
+  t?: number
 }
