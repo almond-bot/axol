@@ -835,9 +835,14 @@ def _run(
 
     # Keep only the camera slots the operator actually assigned a serial to
     # (overhead / left_arm / right_arm are all seeded as placeholders); at
-    # least one must be set. Assign the cameras the policy was trained on.
+    # least one must be set, and should be the cameras the policy was trained
+    # on. Then flag any physically-stereo ZED X so it opens on the stereo grab
+    # path (a mono open of a ZED X fails connect).
     if isinstance(robot_config, AxolRobotConfig):
+        from ..zed import stereo_serials
+
         robot_config.select_assigned_cameras(minimum=1)
+        robot_config.apply_detected_stereo(stereo_serials())
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()

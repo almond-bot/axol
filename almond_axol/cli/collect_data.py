@@ -168,13 +168,6 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     if not webrtc_available():
         return None
 
-    # Auto-detected stereo serials so a physically-stereo wrist is grabbed via
-    # the stereo element (a mono open would crash) even though it records as
-    # mono. Best-effort: enumeration failure treats every camera as mono.
-    from ..zed import stereo_serials
-
-    detected = stereo_serials()
-
     specs: dict[str, dict[str, Any]] = {}
     for name, camcfg in cameras.items():
         serial = int(camcfg.serial)
@@ -186,22 +179,18 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
         # Eye policy must match observation_cameras() so the relay exports exactly
-        # the keys the recorder expects. A camera flagged stereo in the config
-        # (the head camera) records the eye(s) its ``eyes`` selects, suffixed
-        # (overhead_left / overhead_right). A camera that's only *physically*
-        # stereo (a wrist left as mono in the config) is grabbed stereo but
-        # crops/encodes just its left eye, exported under the plain name — so it
-        # records one image like a mono camera. Both-eye recording is reserved
-        # for the head camera.
+        # the keys the recorder expects. Physically-stereo cameras are already
+        # flagged stereo on the config (see AxolRobotConfig.apply_detected_stereo,
+        # applied in _run before this), so here we just honour the flag: a
+        # ``eyes="both"`` camera (the head) records both eyes, suffixed
+        # (overhead_left / overhead_right); a single-eye stereo camera (a wrist)
+        # crops/encodes just that eye and exports it under the plain name, so it
+        # records one image like a mono camera.
         if bool(getattr(camcfg, "stereo", False)):
             eyes_cfg = getattr(camcfg, "eyes", "both")
             spec["stereo"] = True
             spec["eyes"] = ["left", "right"] if eyes_cfg == "both" else [eyes_cfg]
-            spec["eye_suffix"] = True
-        elif serial in detected:
-            spec["stereo"] = True
-            spec["eyes"] = ["left"]
-            spec["eye_suffix"] = False
+            spec["eye_suffix"] = eyes_cfg == "both"
         else:
             spec["stereo"] = False
         specs[name] = spec
@@ -300,9 +289,14 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
     # Keep only the camera slots the operator actually assigned a serial to
     # (overhead / left_arm / right_arm are all seeded as placeholders); at
-    # least one must be set. Done before the relay/robot open the cameras.
+    # least one must be set. Then flag any physically-stereo ZED X so the relay
+    # and the in-process fallback both open it on the stereo grab path. Both
+    # run before the relay/robot open the cameras.
     if isinstance(cfg.robot_config, AxolRobotConfig):
+        from ..zed import stereo_serials
+
         cfg.robot_config.select_assigned_cameras(minimum=1)
+        cfg.robot_config.apply_detected_stereo(stereo_serials())
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)

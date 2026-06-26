@@ -79,25 +79,56 @@ class AxolRobotConfig(RobotConfig):
             )
         self.cameras = assigned
 
+    def apply_detected_stereo(self, detected: set[int]) -> None:
+        """Flag physically-stereo ZED X cameras the config left as mono.
+
+        A ZED X is stereo hardware; opening it on the mono grab path
+        (``zedxonesrc`` / a mono ``ZedCamera``) fails. Rather than make
+        operators set ``stereo`` by hand, any assigned camera whose serial is in
+        ``detected`` (see :func:`almond_axol.zed.stereo_serials`) is promoted
+        here, so every capture path opens it identically — the collect-data
+        relay *and* the in-process robot used by run-policy and the collect-data
+        fallback. Without this, run-policy / the fallback would open a stereo
+        wrist as mono and fail ``connect``.
+
+        The eye policy follows the head/wrist convention: the overhead records
+        both eyes (``overhead_left`` / ``overhead_right``), while a wrist records
+        a single eye under its plain slot name, so a stereo wrist costs and
+        records exactly like a mono one. An explicit ``stereo`` flag (set in the
+        config) is left untouched so a deliberate eye choice still wins.
+        """
+        for name, cfg in self.cameras.items():
+            if getattr(cfg, "stereo", False):
+                continue
+            if int(getattr(cfg, "serial", 0) or 0) in detected:
+                cfg.stereo = True
+                cfg.eyes = "both" if name == "overhead" else "left"
+
     def observation_cameras(self) -> dict[str, tuple[CameraConfig, str | None]]:
         """Effective observation cameras keyed by dataset/obs name.
 
         A mono camera ``X`` maps to ``X -> (cfg, None)``. A stereo camera
-        (``ZedCameraConfig.stereo``) expands into one or both eyes depending on
-        ``ZedCameraConfig.eyes``: ``"both"`` -> ``X_left`` and ``X_right``,
-        ``"left"`` -> ``X_left`` only, ``"right"`` -> ``X_right`` only. Eyes of
-        the same camera share the same config object (one decode). Used to build
-        the camera set and the dataset observation features so both agree on the
-        keys.
+        (``ZedCameraConfig.stereo``) keyed by ``ZedCameraConfig.eyes``:
+
+        - ``"both"`` -> ``X_left`` and ``X_right`` (the head camera).
+        - ``"left"`` / ``"right"`` -> a single eye under the **plain** name
+          ``X`` (the wrist policy), so one feed is indistinguishable from a mono
+          camera downstream — matching the relay's ``eye_suffix=False`` export.
+
+        Eyes of the same camera share the same config object (one decode). Used
+        to build the camera set and the dataset observation features so both
+        agree on the keys.
         """
         out: dict[str, tuple[CameraConfig, str | None]] = {}
         for name, cfg in self.cameras.items():
             if getattr(cfg, "stereo", False):
                 eyes = getattr(cfg, "eyes", "both")
-                if eyes in ("both", "left"):
-                    out[f"{name}_left"] = (cfg, "left")
-                if eyes in ("both", "right"):
-                    out[f"{name}_right"] = (cfg, "right")
+                if eyes != "both":
+                    # Single-eye stereo records under the plain slot name.
+                    out[name] = (cfg, eyes)
+                    continue
+                out[f"{name}_left"] = (cfg, "left")
+                out[f"{name}_right"] = (cfg, "right")
             else:
                 out[name] = (cfg, None)
         return out
