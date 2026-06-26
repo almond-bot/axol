@@ -7,6 +7,7 @@ import threading
 
 import numpy as np
 
+from ..utils.ports import reclaim_port
 from ..utils.shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from .base import RobotBase
 
@@ -65,21 +66,52 @@ class Sim(RobotBase):
         self._latest_q: np.ndarray | None = None
         self._condition = threading.Condition()
         self._thread: threading.Thread | None = None
+        self._server: viser.ViserServer | None = None
+        self._stop = threading.Event()
         # Shape (8,): 7 arm joints then gripper, in Joint enum order
         self._last_left: np.ndarray = np.zeros(len(ARM_JOINTS) + 1, dtype=np.float32)
         self._last_right: np.ndarray = np.zeros(len(ARM_JOINTS) + 1, dtype=np.float32)
 
     async def enable(self) -> None:
-        """Start the viser server thread. No-op after the first call."""
+        """Start the viser server thread. No-op after the first call.
+
+        Reclaims the viewer port first so a leftover viser server from a
+        crashed/previous run (the URL is bookmarked, so the port is fixed)
+        doesn't make the new one fail to bind.
+        """
         if self._thread is not None:
             return
+        import asyncio
+
+        await asyncio.to_thread(reclaim_port, self._port)
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         _logger.info("Simulation server started at http://localhost:%d", self._port)
 
     async def disable(self) -> None:
-        """No-op — the daemon thread exits when the process ends."""
-        pass
+        """Stop the viser server and join its thread, freeing the viewer port.
+
+        A daemon thread would free the port when the *process* exits, but the
+        control panel runs sim teleop in-process and restarts it, so the server
+        has to be torn down on stop too — otherwise the next run can't bind 8002.
+        """
+        if self._thread is None:
+            return
+        import asyncio
+
+        self._stop.set()
+        with self._condition:
+            self._condition.notify_all()
+        server = self._server
+        if server is not None:
+            try:
+                await asyncio.to_thread(server.stop)
+            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                _logger.debug("viser stop failed: %s", exc)
+        await asyncio.to_thread(self._thread.join, 5.0)
+        self._server = None
+        self._thread = None
 
     async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Return the last commanded joint positions for both arms.
@@ -123,6 +155,7 @@ class Sim(RobotBase):
 
     def _run(self) -> None:
         server = viser.ViserServer(port=self._port)
+        self._server = server
 
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         viser_urdf = ViserUrdf(
@@ -165,9 +198,12 @@ class Sim(RobotBase):
 
         server.scene.add_grid("/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0))
 
-        while True:
+        while not self._stop.is_set():
             with self._condition:
-                self._condition.wait()
+                # Time out so a stop set between notifications is still observed.
+                self._condition.wait(timeout=0.5)
                 q = self._latest_q
+            if self._stop.is_set():
+                break
             if q is not None and q.size > 0:
                 viser_urdf.update_cfg(_to_viser(np.asarray(q, dtype=float)))

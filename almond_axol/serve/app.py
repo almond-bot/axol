@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
-from ..utils import adb
+from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import command_specs
 from .manager import Session, SessionManager
@@ -57,7 +57,7 @@ class EpisodeRequest(BaseModel):
 
 # Ports the launched commands expose on the serve host.
 _VIEWER_PORT = 8002  # viser sim 3D viewer
-_VR_PORT = 8000  # VR teleop WebSocket server
+_VR_PORT = ports.VR_PORT  # VR teleop WebSocket server (shared with the adb tunnel)
 
 
 def _lan_ip() -> str:
