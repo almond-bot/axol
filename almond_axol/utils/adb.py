@@ -14,11 +14,14 @@ This module is the single place that knows how to install adb (used by
 
 from __future__ import annotations
 
+import grp
 import logging
 import os
+import pwd
 import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from .sudo import prime_sudo, run_root
 
@@ -27,14 +30,25 @@ _logger = logging.getLogger(__name__)
 # The VR WebSocket server port; we forward the headset's loopback copy of it.
 VR_PORT = 8000
 
-# Meta/Oculus USB vendor id. The udev rule lets a non-root user in ``plugdev``
-# open the headset; the root ``axol serve`` process doesn't need it, but it
-# keeps interactive ``adb`` working too.
+# Meta/Oculus USB vendor id. The udev rule lets a non-root user open the
+# headset for interactive ``adb`` (the root ``axol serve`` process opens it
+# directly and doesn't need the rule).
+#
+# We hand the device node to ``dialout`` rather than the conventional
+# ``plugdev`` group: operators are already in ``dialout`` for CAN/serial
+# access, so ``adb`` works immediately without adding them to a new group and
+# forcing a re-login. ``install()`` still adds the operator to the group as a
+# safety net for hosts where they aren't a member yet.
+_QUEST_GROUP = "dialout"
 _OCULUS_RULE_PATH = "/etc/udev/rules.d/51-oculus.rules"
-_OCULUS_RULE = 'SUBSYSTEM=="usb", ATTR{idVendor}=="2833", MODE="0660", GROUP="plugdev"'
+_OCULUS_RULE = (
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="2833", '
+    'MODE="0660", GROUP="' + _QUEST_GROUP + '"'
+)
 
 # ``adb`` is the binary; ``android-sdk-platform-tools-common`` ships the base
-# Android udev rules (plugdev-group device nodes).
+# Android udev rules. Those use ``plugdev``; our Oculus rule above supersedes
+# them for the Quest's vendor id.
 _APT_PACKAGES = ("adb", "android-sdk-platform-tools-common")
 
 
@@ -42,12 +56,72 @@ def _adb() -> str | None:
     return shutil.which("adb")
 
 
-def install() -> None:
-    """Install adb + the Oculus udev rule (idempotent, best-effort, needs root).
+def _read_rule() -> str:
+    """Return the current Oculus udev rule contents (empty if absent)."""
+    try:
+        return Path(_OCULUS_RULE_PATH).read_text().strip()
+    except OSError:
+        return ""
 
-    No-op with a hint when apt-get is missing or root can't be obtained.
+
+def _operator_user() -> str | None:
+    """Best-effort operator login to grant headset (``dialout``) access.
+
+    ``axol serve`` runs as root under systemd with no ``SUDO_USER``, so fall
+    back to the owner of the first ``/home/*`` entry — the same heuristic the
+    hosted installer uses to locate the operator's account.
     """
-    if _adb() is not None and os.path.isfile(_OCULUS_RULE_PATH):
+    user = os.environ.get("SUDO_USER")
+    if user and user != "root":
+        return user
+    try:
+        homes = sorted(Path("/home").iterdir())
+    except OSError:
+        return None
+    for home in homes:
+        try:
+            return home.owner()
+        except (KeyError, OSError):
+            continue
+    return None
+
+
+def _in_group(user: str, group: str) -> bool:
+    """True when ``user`` already belongs to ``group`` (primary or secondary)."""
+    try:
+        gr = grp.getgrnam(group)
+    except KeyError:
+        return False
+    if user in gr.gr_mem:
+        return True
+    try:
+        return pwd.getpwnam(user).pw_gid == gr.gr_gid
+    except KeyError:
+        return False
+
+
+def _grant_operator_access() -> None:
+    """Add the operator to the headset group so interactive ``adb`` works.
+
+    No-op (and no ``sudo`` prompt) when the operator is already a member; the
+    change otherwise takes effect on their next login. Best-effort.
+    """
+    user = _operator_user()
+    if user is None or _in_group(user, _QUEST_GROUP):
+        return
+    run_root(["usermod", "-aG", _QUEST_GROUP, user])
+
+
+def install() -> None:
+    """Install adb + the Oculus udev rule and grant the operator headset access.
+
+    Idempotent and best-effort. No-ops with a hint when apt-get is missing or
+    root can't be obtained. Rewrites the udev rule when its contents drift
+    (e.g. an older rule that used a different group).
+    """
+    rule_ok = _read_rule() == _OCULUS_RULE
+    if _adb() is not None and rule_ok:
+        _grant_operator_access()
         _logger.info("adb already installed; Quest-over-USB ready")
         return
     if shutil.which("apt-get") is None:
@@ -74,9 +148,11 @@ def install() -> None:
                 " ".join(_APT_PACKAGES),
             )
             return
-    run_root(["tee", _OCULUS_RULE_PATH], input_text=_OCULUS_RULE + "\n")
-    run_root(["udevadm", "control", "--reload-rules"])
-    run_root(["udevadm", "trigger"])
+    if not rule_ok:
+        run_root(["tee", _OCULUS_RULE_PATH], input_text=_OCULUS_RULE + "\n")
+        run_root(["udevadm", "control", "--reload-rules"])
+        run_root(["udevadm", "trigger"])
+    _grant_operator_access()
     _logger.info("adb installed; Quest-over-USB ready")
 
 

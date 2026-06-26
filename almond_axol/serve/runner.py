@@ -347,12 +347,15 @@ class OperationRunner:
         if not serials:
             return
         cfg.cameras = serials
-        overhead = serials.get("overhead")
-        is_stereo = overhead is not None and overhead in stereo_serials()
+        # Any camera slot (overhead or a wrist) whose serial is a stereo ZED X
+        # is streamed per-lens; teleop auto-detects this per serial, so this is
+        # just the operator-facing note. See ``cli.teleop._stereo_serials_for``.
+        detected = stereo_serials()
+        stereo_slots = sorted(s for s, serial in serials.items() if serial in detected)
         resolution = str((cameras or {}).get("resolution") or "").strip()
         if resolution:
             cfg.resolution = resolution
-        stereo_note = " (overhead stereo)" if is_stereo else ""
+        stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
         resolution_note = f" @ {resolution}" if resolution else ""
         session.emit(
             "[serve] teleop: streaming cameras to the headset "

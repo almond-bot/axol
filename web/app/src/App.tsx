@@ -274,8 +274,8 @@ function PoseVisualizer() {
 //   - "default":  passthrough with the two wrist cams as bottom-corner PiPs
 //                 (left wrist → bottom-left, right wrist → bottom-right)
 //   - "overhead": fullscreen overhead (per-eye stereo when both eyes stream)
-//   - "left":     fullscreen left wrist
-//   - "right":    fullscreen right wrist
+//   - "left":     fullscreen left wrist (per-eye stereo when both eyes stream)
+//   - "right":    fullscreen right wrist (per-eye stereo when both eyes stream)
 //   - "split":    left + right wrists side-by-side, fullscreen
 // Stick directions map to where each camera roughly sits: up → overhead,
 // left → left wrist, right → right wrist, down → split.
@@ -320,8 +320,9 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const groupRef = useRef<THREE.Group>(null)
   const meshRef = useRef<THREE.Mesh>(null)
   const matRef = useRef<THREE.MeshBasicMaterial>(null)
-  // Per-eye planes for a stereo overhead: left on layer 1 (left lens only),
-  // right on layer 2 (right lens only). Unused for mono feeds.
+  // Per-eye planes for a fullscreen stereo camera (overhead or a wrist): left
+  // on layer 1 (left lens only), right on layer 2 (right lens only). Unused for
+  // mono feeds.
   const leftMeshRef = useRef<THREE.Mesh>(null)
   const leftMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const rightMeshRef = useRef<THREE.Mesh>(null)
@@ -495,12 +496,25 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       return t && v && v.videoWidth ? t : undefined
     }
 
+    // Resolve a camera to a stereo eye pair (both `${name}_left` and
+    // `${name}_right` streaming) or, failing that, a single mono texture. A
+    // stereo camera (overhead or a wrist) relays its two eyes as
+    // `${name}_left` / `${name}_right`; a mono camera relays the bare `${name}`.
+    // The mono fallback prefers a present left eye so a stereo cam still shows
+    // when only one eye has decoded a frame yet.
+    const stereoPair = (name: string) => {
+      const l = liveTex(`${name}_left`)
+      const r = liveTex(`${name}_right`)
+      return l && r ? { l, r } : undefined
+    }
+    const monoTex = (name: string) => liveTex(name) ?? liveTex(`${name}_left`)
+
     // Which cams a mode needs to be considered "live" (vs showing the spinner).
     let live: boolean
-    if (mode === "overhead") live = !!(liveTex("overhead_left") ?? liveTex("overhead"))
-    else if (mode === "left") live = !!liveTex("left_arm")
-    else if (mode === "right") live = !!liveTex("right_arm")
-    else live = !!(liveTex("left_arm") ?? liveTex("right_arm")) // default, split
+    if (mode === "overhead") live = !!monoTex("overhead")
+    else if (mode === "left") live = !!monoTex("left_arm")
+    else if (mode === "right") live = !!monoTex("right_arm")
+    else live = !!(monoTex("left_arm") ?? monoTex("right_arm")) // default, split
 
     group.visible = presenting && live
     // Spinner: presenting, frames not yet flowing, and the server hasn't said
@@ -552,37 +566,45 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       m.scale.x = width
     }
 
-    if (mode === "overhead") {
-      const oL = liveTex("overhead_left")
-      const oR = liveTex("overhead_right")
-      if (oL && oR) {
-        // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
-        fitHeight(leftMesh, leftMat, oL, FEED_HEIGHT, 0, FEED_Y)
-        fitHeight(rightMesh, rightMat, oR, FEED_HEIGHT, 0, FEED_Y)
+    // Fullscreen a single camera: true per-lens stereo when both eyes stream
+    // (left image on layer 1 → left lens only, right on layer 2 → right lens),
+    // else the mono texture on the shared plane. Used for overhead and each
+    // wrist when shown fullscreen, so any stereo ZED X renders in true 3D.
+    const fitFullscreen = (name: string) => {
+      const pair = stereoPair(name)
+      if (pair) {
+        fitHeight(leftMesh, leftMat, pair.l, FEED_HEIGHT, 0, FEED_Y)
+        fitHeight(rightMesh, rightMat, pair.r, FEED_HEIGHT, 0, FEED_Y)
         const eyes = (cam as THREE.ArrayCamera).cameras
         if (eyes && eyes.length >= 2) {
           eyes[0].layers.enable(1)
           eyes[1].layers.enable(2)
         }
-      } else {
-        const o = oL ?? liveTex("overhead")
-        if (o) fitHeight(mesh, mat, o, FEED_HEIGHT, 0, FEED_Y)
+        return
       }
+      const t = monoTex(name)
+      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
+    }
+
+    if (mode === "overhead") {
+      fitFullscreen("overhead")
     } else if (mode === "left") {
-      const t = liveTex("left_arm")
-      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
+      fitFullscreen("left_arm")
     } else if (mode === "right") {
-      const t = liveTex("right_arm")
-      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
+      fitFullscreen("right_arm")
     } else if (mode === "split") {
-      const l = liveTex("left_arm")
-      const r = liveTex("right_arm")
+      // Side-by-side wrist panes. The two shared planes are mono (a stereo
+      // wrist shows its left eye here); per-lens 3D is reserved for the
+      // fullscreen wrist views, where the coincident eye planes fuse.
+      const l = monoTex("left_arm")
+      const r = monoTex("right_arm")
       if (l) fitWidth(aMesh, aMat, l, SPLIT_WIDTH, -SPLIT_X, FEED_Y)
       if (r) fitWidth(bMesh, bMat, r, SPLIT_WIDTH, SPLIT_X, FEED_Y)
     } else {
-      // default: passthrough with the wrist cams pinned to the bottom corners.
-      const l = liveTex("left_arm")
-      const r = liveTex("right_arm")
+      // default: passthrough with the wrist cams pinned to the bottom corners
+      // (mono PiPs — per-lens 3D is reserved for the fullscreen wrist views).
+      const l = monoTex("left_arm")
+      const r = monoTex("right_arm")
       if (l) fitWidth(aMesh, aMat, l, PIP_WIDTH, -PIP_X, PIP_Y)
       if (r) fitWidth(bMesh, bMat, r, PIP_WIDTH, PIP_X, PIP_Y)
     }

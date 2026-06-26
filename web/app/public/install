@@ -91,6 +91,24 @@ say "axol installed at $(command -v axol)."
 say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
 axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
 
+# -- Quest-over-USB operator access -------------------------------------------
+
+# `axol provision` writes the Oculus udev rule, which hands the headset to the
+# `dialout` group -- the one operators already have for CAN/serial access, so
+# interactive `adb` works without a re-login. Make sure the operator is in it
+# (provision does this too, but be explicit here where the account is known):
+# SUDO_USER is whoever launched the installer (we re-exec under sudo above);
+# fall back to the first /home owner when run directly as root.
+QUEST_USER="${SUDO_USER:-}"
+if [ -z "${QUEST_USER}" ] || [ "${QUEST_USER}" = "root" ]; then
+    QUEST_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
+fi
+if [ -n "${QUEST_USER}" ] && [ "${QUEST_USER}" != "root" ]; then
+    usermod -aG dialout "${QUEST_USER}" 2>/dev/null \
+        && say "Added ${QUEST_USER} to 'dialout' for Quest-over-USB adb access." \
+        || true
+fi
+
 # -- Jetson clocks ------------------------------------------------------------
 
 # Pin the NVENC/VIC engine clocks (encode latency) and the CPU governor (IK
