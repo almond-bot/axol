@@ -388,5 +388,12 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
+                # Last operator gone: drop buffered pose state so a fresh
+                # session's capture timestamps aren't blended with this one's
+                # stale frames (which would drive IK with incoherent poses
+                # until the playout buffer drains).
+                if server._client_count == 0:
+                    server._latest_frame = None
+                    server._interp.reset()
 
         return app

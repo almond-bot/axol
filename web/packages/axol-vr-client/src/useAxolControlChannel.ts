@@ -4,6 +4,9 @@ import { AxolConnectionStatus } from "./types"
 import { waitForIceGathering } from "./webrtc"
 
 const POLL_MS = 300
+// After a failed negotiation, wait this long before re-requesting the channel
+// (the WebSocket pose path covers us meanwhile, so don't hammer it).
+const RETRY_MS = 3000
 
 /**
  * Negotiates a low-latency WebRTC data channel for pose frames, multiplexing
@@ -31,6 +34,8 @@ export function useAxolControlChannel(
   const attachedWsRef = useRef<WebSocket | null>(null)
   const listenerRef = useRef<((e: MessageEvent) => void) | null>(null)
   const requestedRef = useRef(false)
+  // Timestamp (ms) at which a failed negotiation may be retried, or null.
+  const retryAtRef = useRef<number | null>(null)
 
   useEffect(() => {
     if (!enabled) return
@@ -60,6 +65,7 @@ export function useAxolControlChannel(
       attachedWsRef.current = null
       listenerRef.current = null
       requestedRef.current = false
+      retryAtRef.current = null
       closePc()
       setStatus(AxolConnectionStatus.Idle)
     }
@@ -82,9 +88,15 @@ export function useAxolControlChannel(
         }
       }
       pc.onconnectionstatechange = () => {
+        // Ignore events from a superseded pc (e.g. closePc during a retry),
+        // so intentionally tearing one down doesn't schedule a spurious retry.
+        if (pcRef.current !== pc) return
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           poseChannelRef.current = null
           setStatus(AxolConnectionStatus.Error)
+          // Let the poll loop re-request a fresh channel after a backoff; a
+          // transient ICE/SDP failure shouldn't permanently block the channel.
+          retryAtRef.current = Date.now() + RETRY_MS
         }
       }
 
@@ -110,6 +122,7 @@ export function useAxolControlChannel(
       if (m.type === "control-offer" && typeof m.sdp === "string") {
         handleOffer(m.sdp, m.iceServers ?? []).catch(() => {
           setStatus(AxolConnectionStatus.Error)
+          retryAtRef.current = Date.now() + RETRY_MS
         })
       }
     }
@@ -125,6 +138,7 @@ export function useAxolControlChannel(
         attachedWsRef.current = null
         listenerRef.current = null
         requestedRef.current = false
+        retryAtRef.current = null
         closePc()
         setStatus(AxolConnectionStatus.Idle)
       }
@@ -133,6 +147,11 @@ export function useAxolControlChannel(
         listenerRef.current = onMessage
         attachedWsRef.current = ws
         ws.addEventListener("message", onMessage)
+      }
+      // A prior negotiation failed; once the backoff elapses, allow a re-request.
+      if (retryAtRef.current !== null && Date.now() >= retryAtRef.current) {
+        retryAtRef.current = null
+        requestedRef.current = false
       }
       if (!requestedRef.current) {
         requestedRef.current = true
