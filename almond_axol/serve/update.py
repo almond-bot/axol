@@ -4,9 +4,10 @@ The hosted installer (``curl https://axol.almond.bot/install | bash``) installs
 the package with ``uv tool install`` from GitHub and runs ``axol serve`` under
 a systemd service with ``Restart=always``. This module keeps that install in
 sync with ``main``: whenever the control panel talks to the server, a debounced
-background task runs ``uv tool upgrade almond-axol``, and if the installed git
-commit changed *and* nothing is running, the process exits so systemd restarts
-it on the new code.
+background task checks the tracked git ref with a read-only ``git ls-remote``
+and, only when it points at a new commit, runs ``uv tool upgrade almond-axol``;
+if the installed commit then changed *and* nothing is running, the process exits
+so systemd restarts it on the new code.
 
 Because ``uv tool upgrade`` rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
@@ -14,6 +15,12 @@ onto the new code (pyzed, PyGObject), along with the patched zedxonesrc/zedsrc
 plugins. Rather than enumerate those steps here, this just shells out to ``axol
 provision`` — the single provisioning path the hosted installer also runs, so
 the two can't drift. Every step there is idempotent and self-gating.
+
+That same pruning is why the ``git ls-remote`` pre-check matters: ``uv tool
+upgrade`` rebuilds (and so prunes pyzed/PyGObject from) the env on *every* run,
+even when the commit hasn't moved, so running it on an already-current install
+would strip the camera stack out from under the running server. Gating it on a
+genuinely new commit keeps a steady-state install untouched.
 
 ``axol provision`` runs both after an upgrade *and* once at startup. The startup
 run matters for a host that upgraded *into* the GStreamer-pipeline build from an
@@ -48,11 +55,14 @@ _DEBOUNCE_S = 5 * 60.0
 _RESTART_EXIT_CODE = 0
 
 
-def installed_commit() -> str | None:
-    """Git commit of the installed package, from PEP 610 ``direct_url.json``.
+def installed_origin() -> tuple[str, str | None, str] | None:
+    """``(git url, tracked revision | None, commit id)`` for a git tool install.
 
-    Returns ``None`` for dev checkouts (directory installs) or when the
-    metadata is missing.
+    Read from PEP 610 ``direct_url.json``. Returns ``None`` for dev checkouts
+    (directory installs) or when the metadata is missing. The tracked revision
+    is the branch/tag the install follows (``None`` for the default branch), and
+    the commit id is what is currently installed -- comparing the two against the
+    remote head is how the updater decides whether there is anything new.
     """
     try:
         dist = distribution(_PACKAGE)
@@ -66,7 +76,25 @@ def installed_commit() -> str | None:
     except ValueError:
         return None
     vcs = data.get("vcs_info") or {}
-    return vcs.get("commit_id")
+    commit = vcs.get("commit_id")
+    url = data.get("url")
+    if not commit or not url:
+        return None
+    # PEP 610 stores the plain repository URL, but strip a `git+` pip-scheme
+    # prefix defensively so `git ls-remote` gets a clean URL.
+    if url.startswith("git+"):
+        url = url[len("git+") :]
+    return url, vcs.get("requested_revision"), commit
+
+
+def installed_commit() -> str | None:
+    """Git commit of the installed package, from PEP 610 ``direct_url.json``.
+
+    Returns ``None`` for dev checkouts (directory installs) or when the
+    metadata is missing.
+    """
+    origin = installed_origin()
+    return origin[2] if origin is not None else None
 
 
 class SelfUpdater:
@@ -119,12 +147,60 @@ class SelfUpdater:
         self._last_check = now
         self._task = asyncio.create_task(self._check())
 
+    async def _remote_commit(self, url: str, revision: str | None) -> str | None:
+        """Commit the tracked git ref currently points at, via ``git ls-remote``.
+
+        Read-only and cheap. Resolving the remote head up front lets us skip the
+        *destructive* ``uv tool upgrade`` entirely when there is nothing new:
+        that upgrade rebuilds the tool env and prunes every non-PyPI dep (pyzed,
+        PyGObject) on each run, and `axol provision` only puts them back when we
+        actually move to new code -- so running it on an already-current install
+        would strip the camera stack out from under the running server (relay ->
+        ``ModuleNotFoundError: pyzed``) and never restore it.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "ls-remote",
+                url,
+                revision or "HEAD",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+        except OSError as exc:
+            _logger.warning("self-update: could not run git ls-remote: %s", exc)
+            return None
+        if proc.returncode != 0:
+            return None
+        first = out.decode("utf-8", "replace").split("\n", 1)[0].strip()
+        return first.split()[0] if first else None
+
     async def _check(self) -> None:
-        # `uv tool upgrade` rewrites the whole tool env, so it must not overlap
-        # an `axol provision` installing pyzed/PyGObject into that same env (a
-        # concurrent startup heal). Both take ``_env_lock``; we release it before
-        # the post-upgrade `_provision()` below, which re-acquires it (the lock
-        # is not reentrant).
+        # `uv tool upgrade` rebuilds the tool env and prunes the non-PyPI deps
+        # (pyzed, PyGObject) on *every* run, even when the tracked commit hasn't
+        # moved -- and we only reprovision them when we actually advance to new
+        # code. So resolve the remote head with a read-only `git ls-remote` first
+        # and only run the destructive upgrade when there is genuinely something
+        # new; otherwise an up-to-date install would lose its camera stack
+        # (relay -> ModuleNotFoundError: pyzed) and never get it back.
+        origin = installed_origin()
+        if origin is None:
+            return
+        url, revision, current = origin
+        remote = await self._remote_commit(url, revision)
+        if remote is None:
+            _logger.info("self-update: could not resolve remote commit; skipping")
+            return
+        if remote == current:
+            _logger.info("self-update: already up to date (%s)", current)
+            return
+
+        # New commit on the tracked ref. `uv tool upgrade` rewrites the whole
+        # tool env, so it must not overlap an `axol provision` installing
+        # pyzed/PyGObject into that same env (a concurrent startup heal). Both
+        # take ``_env_lock``; we release it before the post-upgrade
+        # `_provision()` below, which re-acquires it (the lock is not reentrant).
         async with self._env_lock:
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -153,6 +229,10 @@ class SelfUpdater:
             # running one (still under the lock, so it reflects this upgrade).
             new_commit = installed_commit()
 
+        # Always reprovision after an upgrade: it ran (so the env was rebuilt and
+        # pyzed/PyGObject pruned) whether or not the commit ended up advancing.
+        await self._provision()
+
         if new_commit is None or new_commit == self._commit:
             _logger.info("self-update: already up to date (%s)", self._commit)
             return
@@ -162,7 +242,6 @@ class SelfUpdater:
             self._commit,
             new_commit,
         )
-        await self._provision()
         self._restart_pending = True
         self._maybe_restart()
 
