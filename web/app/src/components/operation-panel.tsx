@@ -83,10 +83,10 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
-  // Collect-data / run-policy build their dataset/observation features from
-  // all three camera slots, so every serial must be assigned before starting.
-  if (meta.requiresCameras && camCount < 3) {
-    blockers.push("Assign all three camera serials in the Cameras dialog")
+  // Collect-data / run-policy record whichever camera slots are assigned, so
+  // at least one serial must be set before starting (the rest are optional).
+  if (meta.requiresCameras && camCount < 1) {
+    blockers.push("Assign at least one camera serial in the Cameras dialog")
   }
   for (const f of allFields) {
     if (f.required) {

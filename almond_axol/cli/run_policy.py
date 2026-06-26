@@ -1,7 +1,7 @@
 """
 axol run-policy
 
-Run a trained policy on the Axol robot with three ZED cameras using
+Run a trained policy on the Axol robot with its local ZED cameras using
 LeRobot's async inference (``lerobot.async_inference``). By default a
 ``PolicyServer`` is auto-launched in a child process on localhost; pass
 ``--server_host`` to use a remote inference server started with
@@ -49,16 +49,18 @@ _logger = logging.getLogger(__name__)
 
 
 def _default_robot_config() -> AxolRobotConfig:
-    """Default Axol robot config for inference: three local ZED cameras.
+    """Default Axol robot config for inference: local ZED cameras.
 
-    Each camera's serial number is **required** — draccus takes dict
-    fields as one inline YAML/JSON value, so pass
-    ``--robot_config.cameras "{overhead: {serial: 41234567}, left_arm:
-    {serial: 41234568}, right_arm: {serial: 41234569}}"`` (the zero
-    placeholders below are stripped from the config overlay so draccus
-    enforces the input). Other fields are overridable too, e.g.
-    ``--robot_config.axol_config.left_stiffness 0.8`` (match the stiffness
-    used at data-collection time).
+    All three slots (overhead, left_arm, right_arm) are seeded with the
+    unassigned sentinel serial ``0`` so each stays reachable as a dotted
+    ``--robot_config.cameras.<slot>.serial`` override (or control-panel field),
+    but only the slots you assign a serial to are used — the rest are pruned by
+    ``AxolRobotConfig.select_assigned_cameras`` (at least one must be assigned;
+    assign the cameras the policy was trained on). draccus takes dict fields as
+    one inline YAML/JSON value, so assign serials with e.g.
+    ``--robot_config.cameras "{overhead: {serial: 41234567}}"``. Other fields
+    are overridable too, e.g. ``--robot_config.axol_config.left_stiffness 0.8``
+    (match the stiffness used at data-collection time).
 
     Inference captures through the ZED Python SDK (``video_backend="sdk"``):
     run-policy streams no headset video, so the GPU-resident gst pipeline's
@@ -830,6 +832,17 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
+
+    # Keep only the camera slots the operator actually assigned a serial to
+    # (overhead / left_arm / right_arm are all seeded as placeholders); at
+    # least one must be set, and should be the cameras the policy was trained
+    # on. Then flag any physically-stereo ZED X so it opens on the stereo grab
+    # path (a mono open of a ZED X fails connect).
+    if isinstance(robot_config, AxolRobotConfig):
+        from ..zed import stereo_serials
+
+        robot_config.select_assigned_cameras(minimum=1)
+        robot_config.apply_detected_stereo(stereo_serials())
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()

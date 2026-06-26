@@ -67,8 +67,11 @@ def _step(label: str, fn: Callable[[], None]) -> None:
 
 def run(_args: object = None) -> None:
     """Run every provisioning step in order; each self-gates and is idempotent."""
-    # adb + the Oculus udev rule, for streaming Quest controller poses over a
-    # USB `adb reverse` tunnel (avoids WiFi latency). Self-gates on apt-get.
+    # adb + the Oculus udev rule (which hands the headset to the `dialout`
+    # group operators already have, so adb needs no extra group or re-login)
+    # and adds the operator to that group — for streaming Quest controller
+    # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
+    # on apt-get.
     _step("adb (Quest-over-USB)", adb.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:

@@ -77,22 +77,38 @@ def main(argv: list[str]) -> None:
     asyncio.run(_run(cfg))
 
 
-def _overhead_is_stereo(cfg: TeleopCmdConfig) -> bool:
-    """Whether the configured overhead camera is a stereo ZED X.
+def _stereo_serials_for(cfg: TeleopCmdConfig) -> set[int]:
+    """Serials among the configured cameras that are stereo ZED X units.
 
-    Auto-detected from the overhead serial's device kind (see
+    Auto-detected from each serial's device kind (see
     :func:`almond_axol.zed.stereo_serials`) so operators never flag stereo by
-    hand. Best-effort: any enumeration failure treats the overhead as mono.
+    hand — any camera slot (overhead or a wrist) opens through the stereo flow
+    when its serial is a stereo ZED X. Best-effort: any enumeration failure
+    treats every configured camera as mono.
     """
-    serial = cfg.cameras.get("overhead")
-    if serial is None:
-        return False
+    if not cfg.cameras:
+        return set()
     from ..zed import stereo_serials
 
-    return int(serial) in stereo_serials()
+    detected = stereo_serials()
+    return {int(s) for s in cfg.cameras.values() if int(s) in detected}
 
 
-def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | None:
+def _stereo_eyes_for(name: str) -> tuple[list[str], bool]:
+    """``(eyes, suffix)`` for a stereo camera slot under the wrist policy.
+
+    Only the head (``overhead``) camera streams both eyes — per-lens, exposed as
+    ``{name}_left`` / ``{name}_right`` (suffix). Every other slot (the wrists)
+    streams just its left eye under the plain ``{name}``, so a stereo wrist
+    encodes and ships exactly one feed, costing the same as a mono one. This is
+    what keeps the control loop's spare CPU regardless of wrist camera type.
+    """
+    if name == "overhead":
+        return ["left", "right"], True
+    return ["left"], False
+
+
+def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
     The relay subprocess opens the ZED cameras through the GPU-resident gst
@@ -119,8 +135,9 @@ def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | Non
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
         spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
-        if name == "overhead" and overhead_stereo:
+        if int(serial) in stereo_set:
             spec["stereo"] = True
+            spec["eyes"], spec["eye_suffix"] = _stereo_eyes_for(name)
         specs[name] = spec
 
     relay = VideoRelayProcess(specs)
@@ -131,17 +148,17 @@ def _start_video_relay(cfg: TeleopCmdConfig, overhead_stereo: bool) -> Any | Non
 
 
 def _connect_zed_cameras(
-    cfg: TeleopCmdConfig, overhead_stereo: bool
+    cfg: TeleopCmdConfig, stereo_set: set[int]
 ) -> list[tuple[str, Any]]:
     """Open the local ZED cameras selected by ``cfg`` → ``(slot, camera)`` pairs.
 
     Opens each camera through the ZED Python SDK (:class:`ZedCamera`, or
-    :class:`ZedStereoCamera` for a stereo overhead). Used for the in-process
-    fallback when the relay subprocess can't run; the frames are encoded +
-    sent by an in-process aiortc :class:`WebRTCManager`. Slots whose camera is
-    absent are skipped (best-effort preview). Returns an empty list when no
-    cameras are configured or no backend is available. Runs synchronously
-    (blocks on camera startup), so call it off the event loop.
+    :class:`ZedStereoCamera` for any camera whose serial is a stereo ZED X).
+    Used for the in-process fallback when the relay subprocess can't run; the
+    frames are encoded + sent by an in-process aiortc :class:`WebRTCManager`.
+    Slots whose camera is absent are skipped (best-effort preview). Returns an
+    empty list when no cameras are configured or no backend is available. Runs
+    synchronously (blocks on camera startup), so call it off the event loop.
     """
     if not cfg.cameras:
         return []
@@ -206,14 +223,18 @@ def _connect_zed_cameras(
 
     cameras: list[tuple[str, Any]] = []
     for name, serial in cfg.cameras.items():
-        # A stereo overhead carries both eyes on one grab; expose them as
-        # overhead_left / overhead_right so the headset can render per-lens.
-        if name == "overhead" and overhead_stereo:
+        # A stereo camera carries both eyes on one grab. The head camera exposes
+        # both per-lens ({name}_left / {name}_right); a wrist exposes only its
+        # left eye under the plain {name} (see _stereo_eyes_for) so it streams
+        # one feed like a mono camera.
+        if int(serial) in stereo_set:
             stereo = _connect(name, serial, stereo=True)
             if stereo is None:
                 continue
-            cameras.append(("overhead_left", stereo.left_view))
-            cameras.append(("overhead_right", stereo.right_view))
+            eyes, suffix = _stereo_eyes_for(name)
+            for side in eyes:
+                view = stereo.left_view if side == "left" else stereo.right_view
+                cameras.append((f"{name}_{side}" if suffix else name, view))
             continue
 
         cam = _connect(name, serial)
@@ -264,8 +285,8 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
         # in-process sources when it isn't applicable.
-        overhead_stereo = await asyncio.to_thread(_overhead_is_stereo, cfg)
-        relay = await asyncio.to_thread(_start_video_relay, cfg, overhead_stereo)
+        stereo_set = await asyncio.to_thread(_stereo_serials_for, cfg)
+        relay = await asyncio.to_thread(_start_video_relay, cfg, stereo_set)
         cameras: list[tuple[str, Any]] = []
         if relay is not None:
             teleop.set_video_manager(relay)
@@ -274,9 +295,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 ", ".join(relay.sources),
             )
         else:
-            cameras = await asyncio.to_thread(
-                _connect_zed_cameras, cfg, overhead_stereo
-            )
+            cameras = await asyncio.to_thread(_connect_zed_cameras, cfg, stereo_set)
             _register_zed_video(teleop, cameras)
         try:
             await teleop.run()

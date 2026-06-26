@@ -300,7 +300,7 @@ _FIELD_HELP: dict[str, str] = {
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
     "max_speed": "Max gripper joint speed (rad/s).",
-    "serial": "Required. Serial number of the ZED camera to open.",
+    "serial": "Serial number of the ZED camera to open (0 = slot unassigned).",
 }
 
 # Substrings that mark draccus inline help as mis-extracted source code.

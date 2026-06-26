@@ -128,7 +128,7 @@ export function ConnectionsBar({
 
   // -- cameras --
   const camCount = cameraCount(cameras)
-  const camDot: Dot = camCount === 3 ? "ok" : camCount > 0 ? "warn" : "idle"
+  const camDot: Dot = camCount > 0 ? "ok" : "idle"
   const camLabel = camCount === 0 ? "Not configured" : `${camCount}/3 configured`
 
   // -- quest usb (adb reverse pose tunnel) --

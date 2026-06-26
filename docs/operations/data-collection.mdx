@@ -3,14 +3,14 @@ title: "Data Collection"
 description: "Record VR teleoperation episodes to a LeRobot dataset — from the web control panel or the CLI."
 ---
 
-Data collection records teleoperation episodes — joint trajectories plus synchronized camera frames — into a [LeRobot](/api/lerobot) dataset you can later train on. Everything runs on **one machine**: the computer wired to the robot with the three ZED cameras attached (typically a ZED Box / Jetson). Because it owns the dataset, runs teleop, and captures the cameras locally, every recorded frame and joint sample shares the same clock — no time sync to set up.
+Data collection records teleoperation episodes — joint trajectories plus synchronized camera frames — into a [LeRobot](/api/lerobot) dataset you can later train on. Everything runs on **one machine**: the computer wired to the robot with the ZED cameras attached (typically a ZED Box / Jetson). Because it owns the dataset, runs teleop, and captures the cameras locally, every recorded frame and joint sample shares the same clock — no time sync to set up.
 
 You drive the arms over VR exactly as in [teleoperation](/operations/teleop); the extra **A** (record) and **B** (mode) controller buttons start and save takes. You can launch it from the **web control panel** or the **CLI** (`axol collect-data`).
 
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **The three ZED cameras connected** over GMSL, with their serial numbers on hand. (Camera serials are printed on the camera body, or read them from the Cameras dialog / Python — see the tip below.)
+- **At least one ZED camera connected** over GMSL (up to three: overhead / left arm / right arm), with their serial numbers on hand. (Camera serials are printed on the camera body, or read them from the Cameras dialog / Python — see the tip below.)
 - **The VR TLS certificate authorized** once — see [Teleoperation](/operations/teleop#authorize-the-tls-certificate).
 
 <Tip>
@@ -31,7 +31,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
 
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then open the **Cameras** dialog and assign each detected camera to its slot (overhead / left arm / right arm). Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then open the **Cameras** dialog and assign each detected camera to its slot (overhead / left arm / right arm) — at least one is required. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
@@ -58,7 +58,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
         --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Replace the serials with your cameras'. The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). If the overhead is a stereo ZED X, add `stereo: true` to its entry — the dataset then records `overhead_left` / `overhead_right`:
+    Replace the serials with your cameras'. Assign only the slots you have — at least one is required, and any you omit are simply not recorded (e.g. `--robot_config.cameras "{overhead: {serial: 41234567}}"` records the overhead alone). The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). If the overhead is a stereo ZED X, add `stereo: true` to its entry — the dataset then records `overhead_left` / `overhead_right`:
 
     ```bash
         --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"

@@ -1,7 +1,7 @@
 """
 axol collect-data
 
-Record teleoperation episodes with the Axol robot and three ZED cameras.
+Record teleoperation episodes with the Axol robot and its local ZED cameras.
 Episode boundaries are driven by VR controller commands:
   - DATA_COLLECTION → RECORDING:              start collecting frames
   - RECORDING → DATA_COLLECTION:              stop; save episode (success)
@@ -55,14 +55,16 @@ _logger = logging.getLogger(__name__)
 
 
 def _default_robot_config() -> AxolRobotConfig:
-    """Default Axol robot config for data collection: three local ZED cameras.
+    """Default Axol robot config for data collection: local ZED cameras.
 
-    Each camera's serial number is **required** — draccus takes dict
-    fields as one inline YAML/JSON value, so pass
-    ``--robot_config.cameras "{overhead: {serial: 41234567}, left_arm:
-    {serial: 41234568}, right_arm: {serial: 41234569}}"`` (the zero
-    placeholders below are stripped from the config overlay so draccus
-    enforces the input). Other fields are overridable too, e.g.
+    All three slots (overhead, left_arm, right_arm) are seeded with the
+    unassigned sentinel serial ``0`` so each stays reachable as a dotted
+    ``--robot_config.cameras.<slot>.serial`` override (or control-panel field),
+    but only the slots you assign a serial to are recorded — the rest are
+    pruned by ``AxolRobotConfig.select_assigned_cameras`` (at least one must be
+    assigned). draccus takes dict fields as one inline YAML/JSON value, so
+    assign serials with e.g. ``--robot_config.cameras "{overhead: {serial:
+    41234567}}"``. Other fields are overridable too, e.g.
     ``--robot_config.axol_config.left.elbow.kp 60``.
     """
     return AxolRobotConfig(
@@ -168,17 +170,29 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
 
     specs: dict[str, dict[str, Any]] = {}
     for name, camcfg in cameras.items():
-        spec: dict[str, Any] = {
-            "serial": int(camcfg.serial),
-            "fps": camcfg.fps or 60,
-            "stereo": bool(getattr(camcfg, "stereo", False)),
-        }
+        serial = int(camcfg.serial)
+        spec: dict[str, Any] = {"serial": serial, "fps": camcfg.fps or 60}
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
+        # Eye policy must match observation_cameras() so the relay exports exactly
+        # the keys the recorder expects. Physically-stereo cameras are already
+        # flagged stereo on the config (see AxolRobotConfig.apply_detected_stereo,
+        # applied in _run before this), so here we just honour the flag: a
+        # ``eyes="both"`` camera (the head) records both eyes, suffixed
+        # (overhead_left / overhead_right); a single-eye stereo camera (a wrist)
+        # crops/encodes just that eye and exports it under the plain name, so it
+        # records one image like a mono camera.
+        if bool(getattr(camcfg, "stereo", False)):
+            eyes_cfg = getattr(camcfg, "eyes", "both")
+            spec["stereo"] = True
+            spec["eyes"] = ["left", "right"] if eyes_cfg == "both" else [eyes_cfg]
+            spec["eye_suffix"] = eyes_cfg == "both"
+        else:
+            spec["stereo"] = False
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)
@@ -272,6 +286,17 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     except (AttributeError, OSError):
         _orig_affinity = None
     affinity.pin_realtime()
+
+    # Keep only the camera slots the operator actually assigned a serial to
+    # (overhead / left_arm / right_arm are all seeded as placeholders); at
+    # least one must be set. Then flag any physically-stereo ZED X so the relay
+    # and the in-process fallback both open it on the stereo grab path. Both
+    # run before the relay/robot open the cameras.
+    if isinstance(cfg.robot_config, AxolRobotConfig):
+        from ..zed import stereo_serials
+
+        cfg.robot_config.select_assigned_cameras(minimum=1)
+        cfg.robot_config.apply_detected_stereo(stereo_serials())
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
