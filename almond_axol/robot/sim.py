@@ -103,14 +103,19 @@ class Sim(RobotBase):
         self._stop.set()
         with self._condition:
             self._condition.notify_all()
-        server = self._server
-        if server is not None:
-            try:
-                await asyncio.to_thread(server.stop)
-            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
-                _logger.debug("viser stop failed: %s", exc)
+        # The worker stops its own server in _run's finally block, so we only
+        # need to wait for it to exit. Don't clear _thread if the join times
+        # out: the worker (and its in-process server on self._port) is still
+        # alive, and reclaim_port can't kill the current PID, so letting enable
+        # start a second server would collide on the port.
         await asyncio.to_thread(self._thread.join, 5.0)
-        self._server = None
+        if self._thread.is_alive():
+            _logger.warning(
+                "viser worker did not exit within timeout; leaving it running "
+                "so a restart doesn't collide on port %d",
+                self._port,
+            )
+            return
         self._thread = None
 
     async def get_positions(self) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -156,54 +161,67 @@ class Sim(RobotBase):
     def _run(self) -> None:
         server = viser.ViserServer(port=self._port)
         self._server = server
+        # Always tear the server down from the worker itself. disable() can't
+        # reliably do it: a fast disable() may snapshot self._server before it's
+        # assigned above, and a timed-out join would skip its stop() entirely.
+        # Stopping here guarantees the in-process port is freed whenever the
+        # loop exits, which is what makes the in-process restart reliable.
+        try:
+            urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
+            viser_urdf = ViserUrdf(
+                server,
+                urdf_or_path=urdf,
+                root_node_name="/robot",
+                load_meshes=True,
+                load_collision_meshes=False,
+            )
 
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-        viser_urdf = ViserUrdf(
-            server,
-            urdf_or_path=urdf,
-            root_node_name="/robot",
-            load_meshes=True,
-            load_collision_meshes=False,
-        )
+            # Build the robot-side joint ordering to match _build_q's output:
+            # left arm joint1-N, then right arm joint1-N.
+            robot_order = (
+                self._joint_names or urdf_arm_joint_names(is_left=True)
+            ) + urdf_arm_joint_names(is_left=False)
 
-        # Build the robot-side joint ordering to match _build_q's output:
-        # left arm joint1-N, then right arm joint1-N.
-        robot_order = (
-            self._joint_names or urdf_arm_joint_names(is_left=True)
-        ) + urdf_arm_joint_names(is_left=False)
+            # Map each viser joint to its index in robot_order (-1 for joints not
+            # in robot_order, e.g. finger joints, which stay at 0).
+            viser_order = viser_urdf.get_actuated_joint_names()
+            viser_to_robot: list[int] = []
+            for name in viser_order:
+                try:
+                    viser_to_robot.append(robot_order.index(name))
+                except ValueError:
+                    viser_to_robot.append(-1)
 
-        # Map each viser joint to its index in robot_order (-1 for joints not
-        # in robot_order, e.g. finger joints, which stay at 0).
-        viser_order = viser_urdf.get_actuated_joint_names()
-        viser_to_robot: list[int] = []
-        for name in viser_order:
+            def _to_viser(q_robot: np.ndarray) -> np.ndarray:
+                q_out = np.zeros(len(viser_order), dtype=float)
+                for vi, ri in enumerate(viser_to_robot):
+                    if ri >= 0:
+                        q_out[vi] = q_robot[ri]
+                return q_out
+
+            q0 = (
+                np.asarray(self._default_q, dtype=float)
+                if self._default_q is not None
+                else np.zeros(len(robot_order))
+            )
+            viser_urdf.update_cfg(_to_viser(q0))
+
+            server.scene.add_grid(
+                "/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0)
+            )
+
+            while not self._stop.is_set():
+                with self._condition:
+                    # Time out so a stop set between notifications is still observed.
+                    self._condition.wait(timeout=0.5)
+                    q = self._latest_q
+                if self._stop.is_set():
+                    break
+                if q is not None and q.size > 0:
+                    viser_urdf.update_cfg(_to_viser(np.asarray(q, dtype=float)))
+        finally:
             try:
-                viser_to_robot.append(robot_order.index(name))
-            except ValueError:
-                viser_to_robot.append(-1)
-
-        def _to_viser(q_robot: np.ndarray) -> np.ndarray:
-            q_out = np.zeros(len(viser_order), dtype=float)
-            for vi, ri in enumerate(viser_to_robot):
-                if ri >= 0:
-                    q_out[vi] = q_robot[ri]
-            return q_out
-
-        q0 = (
-            np.asarray(self._default_q, dtype=float)
-            if self._default_q is not None
-            else np.zeros(len(robot_order))
-        )
-        viser_urdf.update_cfg(_to_viser(q0))
-
-        server.scene.add_grid("/grid", width=2.0, height=2.0, position=(0.0, 0.0, 0.0))
-
-        while not self._stop.is_set():
-            with self._condition:
-                # Time out so a stop set between notifications is still observed.
-                self._condition.wait(timeout=0.5)
-                q = self._latest_q
-            if self._stop.is_set():
-                break
-            if q is not None and q.size > 0:
-                viser_urdf.update_cfg(_to_viser(np.asarray(q, dtype=float)))
+                server.stop()
+            except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+                _logger.debug("viser stop failed: %s", exc)
+            self._server = None
