@@ -1,0 +1,32 @@
+# Fly.io app for the Axol TURN relay (coturn). See README.md for deploy steps.
+# Rename `app` if you like; pick a `primary_region` near the robot/operator
+# (https://fly.io/docs/reference/regions/).
+app = "axol-turn"
+primary_region = "sjc"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TURN_REALM = "axol.turn"
+  # REAL_EXTERNAL_IP is set via `fly secrets` after allocating the dedicated
+  # IPv4 (see README) — it must equal the address clients connect to.
+
+# Declaring a single UDP port routes ALL inbound UDP for the dedicated IPv4 to
+# this machine, so coturn's 49152-65535 relay range is covered automatically.
+[[services]]
+  protocol = "udp"
+  internal_port = 3478
+  [[services.ports]]
+    port = 3478
+
+# TURN/STUN over TCP on the same port (fallback when a network blocks UDP).
+[[services]]
+  protocol = "tcp"
+  internal_port = 3478
+  [[services.ports]]
+    port = 3478
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

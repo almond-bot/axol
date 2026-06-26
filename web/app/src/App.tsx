@@ -15,6 +15,7 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  axolHttpsOrigin,
   useAxolPoseSocket,
   useAxolTracking,
   useAxolVideo,
@@ -1179,7 +1180,7 @@ export default function App() {
                     variant="outline"
                     className="w-full"
                     onClick={() =>
-                      authorizeCert(`https://${hostname.trim()}:${VR_WS_PORT}`).then(handleConnect)
+                      authorizeCert(axolHttpsOrigin(hostname, VR_WS_PORT)).then(handleConnect)
                     }
                   >
                     <ShieldCheck />

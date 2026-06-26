@@ -42,6 +42,7 @@ from typing import Any
 import av
 import numpy as np
 from aiortc import (
+    RTCConfiguration,
     RTCPeerConnection,
     RTCRtpSender,
     RTCSessionDescription,
@@ -57,6 +58,7 @@ from av import VideoFrame
 from numpy.typing import NDArray
 
 from .hw_video import install_hw_encoder
+from .ice import ice_servers
 
 _logger = logging.getLogger(__name__)
 
@@ -339,7 +341,15 @@ class WebRTCManager:
         """
         await self.close(client_id)
 
-        pc = RTCPeerConnection()
+        # With TURN/STUN configured (off-LAN operator via a tunnel), aiortc
+        # gathers a relay candidate and embeds it in the offer SDP below
+        # (non-trickle). Unconfigured, this is aiortc's default — the LAN path.
+        servers = ice_servers()
+        pc = (
+            RTCPeerConnection(RTCConfiguration(iceServers=servers))
+            if servers
+            else RTCPeerConnection()
+        )
         self._pcs[client_id] = pc
 
         @pc.on("connectionstatechange")

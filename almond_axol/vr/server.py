@@ -42,6 +42,7 @@ from fastapi.responses import HTMLResponse
 
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from .config import VRServerConfig
+from .ice import client_ice_servers
 from .models import VRFrame
 
 if TYPE_CHECKING:
@@ -264,7 +265,17 @@ class VRServer:
                 await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
                 return
             await websocket.send_text(
-                json.dumps({"type": "webrtc-offer", "sdp": sdp, "tracks": tracks})
+                json.dumps(
+                    {
+                        "type": "webrtc-offer",
+                        "sdp": sdp,
+                        "tracks": tracks,
+                        # Same TURN/STUN servers the aiortc peer used, so the
+                        # browser gathers a matching relay candidate. Empty on
+                        # a LAN (no env config) — harmless to the headset.
+                        "iceServers": client_ice_servers(),
+                    }
+                )
             )
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
