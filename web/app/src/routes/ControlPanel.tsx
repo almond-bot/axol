@@ -333,10 +333,37 @@ export default function ControlPanel() {
   const effectiveStatus = status ?? session
   const sources = [status, session].filter((s): s is SessionInfo => s != null)
   const isLive =
-    sources.some((s) => s.status === "running" || s.status === "starting") &&
-    !sources.some((s) => s.status === "exited" || s.status === "error")
+    sources.some(
+      (s) => s.status === "running" || s.status === "starting" || s.status === "stopping"
+    ) && !sources.some((s) => s.status === "exited" || s.status === "error")
+  // The op has been asked to stop and is unwinding (its worker thread is still
+  // tearing down / its children are being killed). The Stop button shows a
+  // disabled "Stopping…" until a terminal status flips the op back to idle.
+  const isStopping = isLive && sources.some((s) => s.status === "stopping")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
   const selectedLive = isLive && runningOp === selectedOp
+  const selectedStopping = isStopping && runningOp === selectedOp
+
+  // While an op is live (including the "stopping" window), poll the server's
+  // authoritative op status so the panel reliably catches the transition to
+  // exited even if the logs WebSocket drops its final status frame. The stop
+  // itself returns immediately server-side, so this is what flips the button
+  // back to Start once the op has actually torn down.
+  useEffect(() => {
+    if (conn.state !== "ok" || !isLive) return
+    let active = true
+    const t = setInterval(() => {
+      fetchOpStatus()
+        .then((op) => {
+          if (active && op.session) setSession(op.session)
+        })
+        .catch(() => {})
+    }, 1500)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, isLive])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -429,6 +456,7 @@ export default function ControlPanel() {
           cameras={cameras}
           robot={robot}
           live={selectedLive}
+          stopping={selectedStopping}
           busy={busy}
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}

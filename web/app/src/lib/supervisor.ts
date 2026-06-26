@@ -44,7 +44,7 @@ export interface CommandSpec {
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
 export const CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
 
-export type SessionStatus = "starting" | "running" | "exited" | "error"
+export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
 export interface SessionInfo {
   id: string
