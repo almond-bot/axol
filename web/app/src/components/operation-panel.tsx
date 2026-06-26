@@ -72,10 +72,22 @@ export function OperationPanel({
   // Required fields stay visible; every optional field lives in the dropdown.
   const allFields = useMemo(() => (spec ? flattenFields(spec.schema) : []), [spec])
   const requiredFields = useMemo(() => allFields.filter((f) => f.required), [allFields])
-  const optionalSchema = useMemo(
-    () => (spec ? filterSchema(spec.schema, new Set(requiredFields.map((f) => f.key))) : []),
-    [spec, requiredFields]
-  )
+  const optionalSchema = useMemo(() => {
+    if (!spec) return []
+    const exclude = new Set(requiredFields.map((f) => f.key))
+    // Per-slot camera config (serial / stereo / eyes / resolution / …) is owned
+    // by the Cameras dialog and auto-detected by the backend (stereo promotion in
+    // AxolRobotConfig.apply_detected_stereo). The advanced form renders the static
+    // schema defaults (serial 0, stereo off, eyes both), which never reflect the
+    // detected/assigned cameras — so for ops that use the dialog, hide the
+    // disconnected robot_config.cameras.* duplicate to keep the UI consistent.
+    if (meta.requiresCameras) {
+      for (const f of allFields) {
+        if (f.key.startsWith("robot_config.cameras.")) exclude.add(f.key)
+      }
+    }
+    return filterSchema(spec.schema, exclude)
+  }, [spec, requiredFields, allFields, meta.requiresCameras])
 
   const isSim = meta.id === "teleop" && Boolean(settings.sim)
   const robotOk = robot?.state === "connected"
