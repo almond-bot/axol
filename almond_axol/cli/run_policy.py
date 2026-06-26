@@ -833,16 +833,16 @@ def _run(
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
 
-    # Keep only the camera slots the operator actually assigned a serial to
-    # (overhead / left_arm / right_arm are all seeded as placeholders); at
-    # least one must be set, and should be the cameras the policy was trained
-    # on. Then flag any physically-stereo ZED X so it opens on the stereo grab
-    # path (a mono open of a ZED X fails connect).
+    # Finalize the camera set before the robot opens the cameras: prune the
+    # unassigned placeholder slots (at least one must be set, and should be the
+    # cameras the policy was trained on) and flag any physically-stereo ZED X so
+    # it opens on the stereo grab path (a mono open of a ZED X fails connect).
+    # Shared with collect-data via ``prepare_capture_cameras`` so a policy sees
+    # the same observation set it was trained on.
     if isinstance(robot_config, AxolRobotConfig):
         from ..zed import stereo_serials
 
-        robot_config.select_assigned_cameras(minimum=1)
-        robot_config.apply_detected_stereo(stereo_serials())
+        robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()

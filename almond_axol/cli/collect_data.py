@@ -287,16 +287,15 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         _orig_affinity = None
     affinity.pin_realtime()
 
-    # Keep only the camera slots the operator actually assigned a serial to
-    # (overhead / left_arm / right_arm are all seeded as placeholders); at
-    # least one must be set. Then flag any physically-stereo ZED X so the relay
-    # and the in-process fallback both open it on the stereo grab path. Both
-    # run before the relay/robot open the cameras.
+    # Finalize the camera set before the relay/robot open the cameras: prune the
+    # unassigned placeholder slots (at least one must be set) and flag any
+    # physically-stereo ZED X so the relay and the in-process fallback both open
+    # it on the stereo grab path. Shared with run-policy via
+    # ``prepare_capture_cameras`` so the two commands set cameras up identically.
     if isinstance(cfg.robot_config, AxolRobotConfig):
         from ..zed import stereo_serials
 
-        cfg.robot_config.select_assigned_cameras(minimum=1)
-        cfg.robot_config.apply_detected_stereo(stereo_serials())
+        cfg.robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)

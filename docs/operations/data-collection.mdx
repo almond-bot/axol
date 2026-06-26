@@ -58,7 +58,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
         --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    Replace the serials with your cameras'. Assign only the slots you have — at least one is required, and any you omit are simply not recorded (e.g. `--robot_config.cameras "{overhead: {serial: 41234567}}"` records the overhead alone). The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). If the overhead is a stereo ZED X, add `stereo: true` to its entry — the dataset then records `overhead_left` / `overhead_right`:
+    Replace the serials with your cameras'. Assign only the slots you have — at least one is required, and any you omit are simply not recorded (e.g. `--robot_config.cameras "{overhead: {serial: 41234567}}"` records the overhead alone). The `cameras` dict is one inline YAML value (see [Command configuration](/cli/configuration#field-name-conventions)). Stereo ZED X cameras are detected from their serial automatically: a stereo **overhead** records both eyes as `overhead_left` / `overhead_right`, while a stereo **wrist** records its left eye under the plain slot name (like a mono camera). To override the auto-detection, set `stereo: true` together with the eye policy you want — `eyes: both` records `X_left` / `X_right`, `eyes: left` (or `right`) records a single eye under the plain name `X` (so a forced wrist needs `eyes: left` to stay single-eye). For example, to force the overhead:
 
     ```bash
         --robot_config.cameras "{overhead: {serial: 41234567, stereo: true}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
