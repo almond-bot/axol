@@ -1,6 +1,6 @@
 """Configuration dataclass for the local ZED camera."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from lerobot.cameras.configs import CameraConfig, ColorMode
@@ -45,9 +45,12 @@ class ZedCameraConfig(CameraConfig):
     config).
 
     Args:
-        serial:     Serial number of the camera to open. Required — there is
-                    no default, so it must be supplied (on the CLI, inside the
-                    inline ``--robot_config.cameras`` dict value).
+        serial:     Serial number of the camera to open. Defaults to ``0``, an
+                    "unassigned" sentinel — collect-data / run-policy seed all
+                    three camera slots and then drop the ones left at ``0`` (see
+                    ``AxolRobotConfig.select_assigned_cameras``), so an operator
+                    only has to assign the cameras they actually have. A real
+                    ZED serial is always positive.
         fps:        Capture frame rate (default 60). ``None`` adopts the
                     camera default on connect.
         width:      Frame width in pixels (default 960, SVGA). Together with
@@ -66,10 +69,13 @@ class ZedCameraConfig(CameraConfig):
                     ``X_right``. Ignored when ``stereo`` is False.
     """
 
-    # Required: no default. The CLI/serve config overlay (see
-    # almond_axol.cli.config) strips ``required_input`` fields so draccus
-    # forces the operator to supply a value instead of falling back to one.
-    serial: int = field(kw_only=True, metadata={"required_input": True})
+    # 0 is the "unassigned" sentinel. collect-data / run-policy seed all three
+    # camera slots so each stays reachable as a dotted
+    # ``--robot_config.cameras.<slot>.serial`` override / control-panel field,
+    # then prune the slots left at 0 (see
+    # ``AxolRobotConfig.select_assigned_cameras``). A real ZED serial is
+    # positive, so 0 unambiguously marks a slot the operator didn't assign.
+    serial: int = 0
     fps: int | None = 60
     width: int | None = 960
     height: int | None = 600

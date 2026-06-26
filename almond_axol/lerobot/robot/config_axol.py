@@ -26,9 +26,11 @@ class AxolRobotConfig(RobotConfig):
 
     Args:
         cameras:          Camera configs keyed by name (e.g. "overhead",
-                          "left_arm", "right_arm"). Each ``ZedCameraConfig``
-                          requires the camera's serial number. On the CLI the
-                          dict is one inline YAML/JSON value (e.g.
+                          "left_arm", "right_arm"). collect-data / run-policy
+                          seed all three slots so each stays addressable, but
+                          only the slots given a serial are actually used —
+                          ``select_assigned_cameras`` drops the rest. On the
+                          CLI the dict is one inline YAML/JSON value (e.g.
                           ``--robot_config.cameras "{overhead: {serial:
                           41234567}}"``).
         axol_config:      Per-joint gain config forwarded to the Axol hardware driver.
@@ -51,6 +53,31 @@ class AxolRobotConfig(RobotConfig):
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
     video_backend: VideoBackend = "auto"
+
+    def select_assigned_cameras(self, *, minimum: int = 1) -> None:
+        """Drop unassigned camera slots (serial ``<= 0``), requiring ``minimum``.
+
+        collect-data / run-policy seed all three slots (overhead, left_arm,
+        right_arm) as placeholders so each is reachable as a dotted
+        ``--robot_config.cameras.<slot>.serial`` override / control-panel
+        field, but the operator only needs the cameras they actually have. This
+        prunes the slots still at the unassigned sentinel serial (``0``) in
+        place and raises if fewer than ``minimum`` real cameras remain.
+        """
+        assigned = {
+            name: cfg
+            for name, cfg in self.cameras.items()
+            if int(getattr(cfg, "serial", 0) or 0) > 0
+        }
+        if len(assigned) < minimum:
+            raise ValueError(
+                f"At least {minimum} camera serial must be assigned; got "
+                f"{len(assigned)}. Assign a ZED serial to a slot (overhead, "
+                "left_arm, or right_arm) — on the CLI pass e.g. "
+                '--robot_config.cameras "{overhead: {serial: 41234567}}", or '
+                "use the control panel's Cameras dialog."
+            )
+        self.cameras = assigned
 
     def observation_cameras(self) -> dict[str, tuple[CameraConfig, str | None]]:
         """Effective observation cameras keyed by dataset/obs name.

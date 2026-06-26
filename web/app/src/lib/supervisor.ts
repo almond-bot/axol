@@ -242,8 +242,8 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
  *
  * The serials map camera slots to the ZED cameras attached to the serve
  * machine; the runner folds them into the operation's config (collect-data /
- * run-policy require all three, teleop streams whichever are set to the
- * headset).
+ * run-policy record whichever slots are assigned and need at least one, teleop
+ * streams whichever are set to the headset).
  */
 export interface CameraSpec {
   serials: { overhead: string; left_arm: string; right_arm: string }
@@ -370,7 +370,7 @@ export interface OperationMeta {
   fields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
-  /** Needs all three camera serials configured (collect-data / run-policy). */
+  /** Needs at least one camera serial configured (collect-data / run-policy). */
   requiresCameras: boolean
   /** Can run in sim (no hardware) — only teleop today. */
   simCapable: boolean

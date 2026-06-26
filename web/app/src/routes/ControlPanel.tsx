@@ -357,7 +357,7 @@ export default function ControlPanel() {
     setError(null)
     try {
       // Send the camera spec whenever any serial is assigned — collect-data /
-      // run-policy need all three, while teleop streams whichever are set to
+      // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim).
       const spec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
       const result = await startOperation(selectedOp, settings, spec)

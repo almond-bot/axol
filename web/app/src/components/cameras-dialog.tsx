@@ -141,7 +141,7 @@ export function CamerasDialog({
         <div className="flex flex-col gap-5 p-5">
           <p className="text-xs text-white/45">
             Assign the ZED cameras connected to this machine to their slots. Collect data and run
-            policy need all three; teleop streams whichever are set to the headset.
+            policy need at least one; teleop streams whichever are set to the headset.
           </p>
 
           <div className="flex flex-col gap-2">

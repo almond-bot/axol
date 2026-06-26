@@ -3,7 +3,7 @@ title: "Run Policy"
 description: "Run a trained policy autonomously — from the web control panel or the CLI, locally or on a remote server."
 ---
 
-Run Policy executes a trained policy on the robot autonomously: it streams the robot's joint positions and camera frames to the policy, which returns action chunks that drive the arms. It runs on the same machine as [data collection](/operations/data-collection) — the computer wired to the robot with the three ZED cameras attached.
+Run Policy executes a trained policy on the robot autonomously: it streams the robot's joint positions and camera frames to the policy, which returns action chunks that drive the arms. It runs on the same machine as [data collection](/operations/data-collection) — the computer wired to the robot with the ZED cameras attached.
 
 By default, inference runs **locally** on that machine. Optionally, it can be **offloaded to a more powerful machine** on the network (e.g. a desktop with a discrete GPU): the robot machine sends observations over gRPC and receives actions back.
 
@@ -24,8 +24,8 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **The three ZED cameras connected**, with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them.
-- **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Use the **same** camera resolution, stereo setting, and fps the policy was trained on.
+- **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them.
+- **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Assign the **same** cameras, and use the **same** camera resolution, stereo setting, and fps the policy was trained on.
 - **For local GPU inference**, the `cuda` extra — not included by the install script. Add it on a [development install](/advanced/development-install) with `uv sync --extra lerobot --extra cuda`, or offload to a remote server (below).
 
 ## Run it
@@ -36,7 +36,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then assign the three cameras in the **Cameras** dialog. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** dialog (at least one). See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Run Policy and fill the fields">
@@ -68,7 +68,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
         --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
     ```
 
-    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. For CPU inference add `--device cpu`. Replace the serials with your cameras' (the `cameras` dict is one inline YAML value — see [Command configuration](/cli/configuration#field-name-conventions)).
+    A `PolicyServer` child process is launched on localhost; the parent streams observations to it and applies the returned action chunks. For CPU inference add `--device cpu`. Replace the serials with your cameras' — assign the same cameras the policy was trained on (at least one; omitted slots are dropped). The `cameras` dict is one inline YAML value — see [Command configuration](/cli/configuration#field-name-conventions).
 
     Control the rollout from stdin in the `run-policy` terminal:
 
