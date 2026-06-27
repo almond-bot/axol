@@ -29,11 +29,11 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
-    "run-policy": ("run_policy", "Run a trained policy on the robot."),
     "replay-dataset": (
         "replay_dataset",
         "Replay a recorded dataset episode on the robot.",
     ),
+    "run-policy": ("run_policy", "Run a trained policy on the robot."),
     "inference-server": (
         "inference_server",
         "Serve policy inference for run-policy --server_host.",

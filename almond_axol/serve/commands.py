@@ -75,16 +75,16 @@ def _collect_data() -> type:
     return CollectDataConfig
 
 
-def _run_policy() -> type:
-    from ..cli.run_policy import RunPolicyConfig
-
-    return RunPolicyConfig
-
-
 def _replay_dataset() -> type:
     from ..cli.replay_dataset import ReplayDatasetConfig
 
     return ReplayDatasetConfig
+
+
+def _run_policy() -> type:
+    from ..cli.run_policy import RunPolicyConfig
+
+    return RunPolicyConfig
 
 
 # -- argparse add_parser loaders --------------------------------------------
@@ -135,16 +135,6 @@ COMMANDS: dict[str, CommandDef] = {
         _collect_data,
         requires_hardware=True,
     ),
-    "run-policy": CommandDef(
-        "run-policy",
-        "run-policy",
-        "Run policy",
-        "Run a trained policy on the robot via LeRobot async inference.",
-        "Operate",
-        "draccus",
-        _run_policy,
-        requires_hardware=True,
-    ),
     "replay-dataset": CommandDef(
         "replay-dataset",
         "replay-dataset",
@@ -154,6 +144,16 @@ COMMANDS: dict[str, CommandDef] = {
         "Operate",
         "draccus",
         _replay_dataset,
+        requires_hardware=True,
+    ),
+    "run-policy": CommandDef(
+        "run-policy",
+        "run-policy",
+        "Run policy",
+        "Run a trained policy on the robot via LeRobot async inference.",
+        "Operate",
+        "draccus",
+        _run_policy,
         requires_hardware=True,
     ),
     # -- Cameras ------------------------------------------------------------
