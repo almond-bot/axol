@@ -25,8 +25,8 @@ from .robot_link import RobotLink
 from .runner import OperationRunner
 from .update import SelfUpdater
 
-# The four core operations run in-process via the OperationRunner.
-_OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
+# The core operations run in-process via the OperationRunner.
+_OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"}
 
 
 class RunRequest(BaseModel):

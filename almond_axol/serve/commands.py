@@ -75,6 +75,12 @@ def _collect_data() -> type:
     return CollectDataConfig
 
 
+def _replay_dataset() -> type:
+    from ..cli.replay_dataset import ReplayDatasetConfig
+
+    return ReplayDatasetConfig
+
+
 def _run_policy() -> type:
     from ..cli.run_policy import RunPolicyConfig
 
@@ -127,6 +133,17 @@ COMMANDS: dict[str, CommandDef] = {
         "Operate",
         "draccus",
         _collect_data,
+        requires_hardware=True,
+    ),
+    "replay-dataset": CommandDef(
+        "replay-dataset",
+        "replay-dataset",
+        "Replay dataset",
+        "Replay a recorded episode of a LeRobot dataset on the robot, then "
+        "return to rest.",
+        "Operate",
+        "draccus",
+        _replay_dataset,
         requires_hardware=True,
     ),
     "run-policy": CommandDef(

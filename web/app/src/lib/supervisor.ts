@@ -198,7 +198,12 @@ export async function usbConnect(): Promise<UsbStatus> {
 // In-process operations (teleop / gravity-comp / collect-data / run-policy)
 // ---------------------------------------------------------------------------
 
-export type OperationId = "teleop" | "gravity-comp" | "collect-data" | "run-policy"
+export type OperationId =
+  | "teleop"
+  | "gravity-comp"
+  | "collect-data"
+  | "run-policy"
+  | "replay-dataset"
 
 export interface OpStatus {
   running: boolean
@@ -432,6 +437,15 @@ export const OPERATIONS: OperationMeta[] = [
     fields: ["repo_id", "task", "fps", "push_to_hub"],
     requiresRobot: true,
     requiresCameras: true,
+    simCapable: false,
+  },
+  {
+    id: "replay-dataset",
+    label: "Replay Dataset",
+    description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
+    fields: ["repo_id", "episode", "fps", "loop"],
+    requiresRobot: true,
+    requiresCameras: false,
     simCapable: false,
   },
   {

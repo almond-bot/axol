@@ -1,9 +1,9 @@
 ---
 title: "Command configuration"
-description: "How the teleop, gravity-comp, collect-data, run-policy, and inference-server commands are configured with draccus."
+description: "How the teleop, gravity-comp, collect-data, replay-dataset, run-policy, and inference-server commands are configured with draccus."
 ---
 
-Five commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+Six commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
 
 The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `tune.*`, and `serve`) still use plain `argparse` flags and are unaffected by anything on this page.
 
