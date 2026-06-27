@@ -43,8 +43,8 @@ const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
   stream_resolution: "SVGA",
   record_resolution: "SVGA",
-  stream_eyes: {},
-  record_eyes: {},
+  stream: {},
+  record: {},
 }
 
 function loadCameras(): CameraSpec {
@@ -60,8 +60,9 @@ function loadCameras(): CameraSpec {
         stream_resolution:
           parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
         record_resolution: parsed.record_resolution ?? DEFAULT_CAMERAS.record_resolution,
-        stream_eyes: { ...(parsed.stream_eyes ?? {}) },
-        record_eyes: { ...(parsed.record_eyes ?? {}) },
+        // Migrate the earlier per-eye maps to the per-branch participation maps.
+        stream: { ...(parsed.stream ?? parsed.stream_eyes ?? {}) },
+        record: { ...(parsed.record ?? parsed.record_eyes ?? {}) },
       }
     }
   } catch {

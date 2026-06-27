@@ -208,6 +208,11 @@ def _open_gst_camera_raw(
             raw_w, raw_h = dw, dh
     raw_dims = (raw_w, raw_h)
     use_shm = socket_dir is not None
+    # A camera can opt out of either branch: stream-only (no raw / dataset) or
+    # record-only (no encoded / headset). This path is only entered when the
+    # camera records (see _relay_main), so the raw branch is always built; the
+    # encoded branch is gated on ``stream``.
+    wants_stream = bool(spec.get("stream", True))
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
@@ -216,7 +221,7 @@ def _open_gst_camera_raw(
                 # Encoded eyes feed the headset; raw eyes feed the dataset — they
                 # may differ (stream both, record one). Build the union; each eye
                 # is cropped once and tee'd into whichever branch wants it.
-                enc_plan = _eye_plan(name, spec)
+                enc_plan = _eye_plan(name, spec) if wants_stream else []
                 raw_plan = _raw_plan(name, spec)
                 enc_sides = [side for side, _ in enc_plan]
                 raw_sides = [side for side, _ in raw_plan]
@@ -251,7 +256,7 @@ def _open_gst_camera_raw(
                 }
                 return cam, sources, [], raw_meta
             if stereo:
-                enc_plan = _eye_plan(name, spec)
+                enc_plan = _eye_plan(name, spec) if wants_stream else []
                 raw_plan = _raw_plan(name, spec)
                 enc_sides = [side for side, _ in enc_plan]
                 raw_sides = [side for side, _ in raw_plan]
@@ -284,13 +289,16 @@ def _open_gst_camera_raw(
                     for side, src in raw_plan
                 }
                 return cam, sources, writers, raw_meta
+            # Mono: the camera streams only when ``stream`` is set; a record-only
+            # mono camera builds the raw branch alone (no encoded source, so it is
+            # not exposed to the headset).
             if use_shm:
                 sock = os.path.join(socket_dir, f"{name}.sock")
                 cam = ZedGstCamera(
                     serial,
                     resolution,
                     fps,
-                    want_encoded=True,
+                    want_encoded=wants_stream,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
                 )
@@ -299,21 +307,21 @@ def _open_gst_camera_raw(
                 meta = {
                     name: _gstshm_meta(sock, caps, raw_w, raw_h, fps, cam.raw_latency_s)
                 }
-                return cam, {name: cam}, [], meta
+                return cam, ({name: cam} if wants_stream else {}), [], meta
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
             cam = ZedGstCamera(
                 serial,
                 resolution,
                 fps,
-                want_encoded=True,
+                want_encoded=wants_stream,
                 raw_sink=writer.publish,
                 raw_dims=raw_dims,
             )
             cam.connect()
             return (
                 cam,
-                {name: cam},
+                {name: cam} if wants_stream else {},
                 writers,
                 {name: _pyshm_meta(writer.name, raw_w, raw_h, fps)},
             )
@@ -446,7 +454,14 @@ def _relay_main(
 
             socket_dir = tempfile.mkdtemp(prefix="axol-raw-")
     for name, spec in cameras.items():
-        if want_raw:
+        # A camera participates per its spec: ``stream`` adds it to the headset
+        # feed, ``record`` (only meaningful when the relay wants raw) adds it to
+        # the dataset. A camera in neither is skipped — never opened.
+        wants_stream = bool(spec.get("stream", True))
+        wants_record = want_raw and bool(spec.get("record", True))
+        if not (wants_stream or wants_record):
+            continue
+        if wants_record:
             raw = _open_gst_camera_raw(name, spec, raw_cond, socket_dir)
             if raw is not None:
                 cam, gst_sources, cam_writers, cam_meta = raw
@@ -455,7 +470,12 @@ def _relay_main(
                 writers.extend(cam_writers)
                 raw_meta.update(cam_meta)
                 continue
-            # No gst raw path for this camera; still stream it (encoded only).
+            # No gst raw path for this camera. If it also streams, fall through to
+            # the encoded-only path below; if it's record-only, there's nothing
+            # the relay can supply (SDK has no raw export), so skip it and let
+            # collect-data fall back to the in-process camera path.
+            if not wants_stream:
+                continue
         gst = _open_gst_camera(name, spec)
         if gst is not None:
             cam, gst_sources = gst

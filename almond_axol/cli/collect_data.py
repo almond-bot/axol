@@ -170,8 +170,19 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
 
     specs: dict[str, dict[str, Any]] = {}
     for name, camcfg in cameras.items():
+        # Each camera opts into either branch: ``stream`` (headset) and ``record``
+        # (dataset). A camera in neither is dropped — never opened by the relay.
+        wants_record = bool(getattr(camcfg, "record", True))
+        wants_stream = bool(getattr(camcfg, "stream", True))
+        if not (wants_record or wants_stream):
+            continue
         serial = int(camcfg.serial)
-        spec: dict[str, Any] = {"serial": serial, "fps": camcfg.fps or 60}
+        spec: dict[str, Any] = {
+            "serial": serial,
+            "fps": camcfg.fps or 60,
+            "record": wants_record,
+            "stream": wants_stream,
+        }
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
@@ -308,6 +319,13 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         from ..zed import stereo_serials
 
         cfg.robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
+        if not cfg.robot_config.observation_cameras():
+            raise ValueError(
+                "collect-data has no camera with recording enabled — every "
+                "assigned camera is set to stream-only (or recording is turned "
+                "off). Enable recording for at least one camera in the Cameras "
+                "dialog (or set its record_resolution / eyes)."
+            )
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)

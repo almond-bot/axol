@@ -136,6 +136,10 @@ class AxolRobotConfig(RobotConfig):
         """
         out: dict[str, tuple[CameraConfig, str | None]] = {}
         for name, cfg in self.cameras.items():
+            # A camera set to stream-only (record=False) is opened to feed the
+            # headset but kept out of the recorded dataset entirely.
+            if not getattr(cfg, "record", True):
+                continue
             if getattr(cfg, "stereo", False):
                 eyes = getattr(cfg, "eyes", "both")
                 if eyes != "both":

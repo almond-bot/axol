@@ -3,6 +3,8 @@ import { AlertTriangle, Camera, Loader2, RotateCw, X } from "lucide-react"
 import {
   detectCameras,
   restartCameraDaemon,
+  RESOLUTION_OFF,
+  type BranchSel,
   type CameraDevice,
   type CameraSlot,
   type CameraSpec,
@@ -13,7 +15,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 
 type Serials = CameraSpec["serials"]
-type EyeMap = Partial<Record<CameraSlot, StereoEyes>>
+type BranchMap = Partial<Record<CameraSlot, BranchSel>>
 
 const EMPTY_SERIALS: Serials = { overhead: "", left_arm: "", right_arm: "" }
 
@@ -27,29 +29,32 @@ const RESOLUTIONS: { value: string; label: string }[] = [
   { value: "SVGA", label: "SVGA (960×600)" },
   { value: "HD1080", label: "HD1080 (1920×1080)" },
   { value: "HD1200", label: "HD1200 (1920×1200)" },
+  { value: RESOLUTION_OFF, label: "Off" },
 ]
 
 const DEFAULT_RESOLUTION = "SVGA"
 
-// Default eye selection for a freshly-detected stereo slot, matching the
-// backend's head/wrist policy: the overhead streams/records both eyes (true
-// stereo / depth), a wrist a single (left) eye so it costs like a mono camera.
+// Default eye selection for a stereo slot, matching the backend's head/wrist
+// policy: the overhead uses both eyes (true stereo / depth), a wrist a single
+// (left) eye so it costs like a mono camera.
 const defaultEyes = (slot: CameraSlot): StereoEyes => (slot === "overhead" ? "both" : "left")
 
 const eyesLeft = (e: StereoEyes) => e !== "right"
 const eyesRight = (e: StereoEyes) => e !== "left"
-const eyesFromBools = (left: boolean, right: boolean): StereoEyes =>
-  left && right ? "both" : right ? "right" : "left"
+
+// A per-branch value is "enabled" unless explicitly false; its eye selection
+// (stereo only) is the stored eye name, else the slot default.
+const selEnabled = (v: BranchSel | undefined) => v === undefined || v !== false
+const selEyes = (v: BranchSel | undefined, slot: CameraSlot): StereoEyes =>
+  v === "both" || v === "left" || v === "right" ? v : defaultEyes(slot)
 
 /**
  * Local ZED camera setup dialog. The cameras are attached to the machine
- * running `axol serve`, so this assigns each camera slot a serial number (with
- * a detector to list what's plugged in) and configures capture/record settings
- * — no network link to manage. Streaming (the headset feed) and recording (the
- * dataset) are configured separately: each gets its own resolution, and for a
- * stereo camera its own eye selection (e.g. stream both eyes for depth while
- * recording only one). The spec is stored client-side and sent with each op
- * start.
+ * running `axol serve`. Streaming (the headset feed) and recording (the
+ * dataset) are configured independently: each has its own resolution (or Off to
+ * disable the whole branch), and each camera can be individually included in or
+ * excluded from streaming and recording — for a stereo camera, down to which
+ * eye(s). The spec is stored client-side and sent with each op start.
  */
 export function CamerasDialog({
   open,
@@ -70,8 +75,8 @@ export function CamerasDialog({
   const [recordResolution, setRecordResolution] = useState(
     initial.record_resolution || DEFAULT_RESOLUTION
   )
-  const [streamEyes, setStreamEyes] = useState<EyeMap>(initial.stream_eyes ?? {})
-  const [recordEyes, setRecordEyes] = useState<EyeMap>(initial.record_eyes ?? {})
+  const [stream, setStream] = useState<BranchMap>(initial.stream ?? {})
+  const [record, setRecord] = useState<BranchMap>(initial.record ?? {})
 
   const [devices, setDevices] = useState<CameraDevice[] | null>(null)
   const [detectError, setDetectError] = useState<string | null>(null)
@@ -123,37 +128,37 @@ export function CamerasDialog({
 
   // Stereo vs mono is determined from the detected device, so the operator
   // never flags it: surface the detected kind next to each assigned slot and
-  // gate the per-eye controls on it.
+  // shape the per-camera controls (mono = a single toggle; stereo = L/R).
   const kindBySerial = new Map((devices ?? []).map((d) => [String(d.serial), d.kind]))
-  const isStereo = (slot: CameraSlot) => kindBySerial.get(serials[slot].trim()) === "stereo"
 
-  function toggleEye(
-    map: EyeMap,
-    set: (m: EyeMap) => void,
+  const streamingOn = streamResolution !== RESOLUTION_OFF
+  const recordingOn = recordResolution !== RESOLUTION_OFF
+
+  // Toggle one camera's participation in a branch. Mono flips on/off; stereo
+  // flips the given eye, dropping to "off" when neither eye is left selected.
+  function toggle(
+    map: BranchMap,
+    set: (m: BranchMap) => void,
     slot: CameraSlot,
-    side: "left" | "right"
+    stereo: boolean,
+    side?: "left" | "right"
   ) {
-    const cur = map[slot] ?? defaultEyes(slot)
-    let left = eyesLeft(cur)
-    let right = eyesRight(cur)
+    const cur = map[slot]
+    if (!stereo) {
+      set({ ...map, [slot]: !selEnabled(cur) })
+      return
+    }
+    const enabled = selEnabled(cur)
+    const eyes = selEyes(cur, slot)
+    let left = enabled && eyesLeft(eyes)
+    let right = enabled && eyesRight(eyes)
     if (side === "left") left = !left
     else right = !right
-    // A stereo camera must expose at least one eye; ignore a toggle that would
-    // leave neither selected.
-    if (!left && !right) return
-    set({ ...map, [slot]: eyesFromBools(left, right) })
+    const next: BranchSel = left && right ? "both" : left ? "left" : right ? "right" : false
+    set({ ...map, [slot]: next })
   }
 
   function save() {
-    // Only persist eye selections for slots currently detected as stereo, so a
-    // stale per-eye choice can't linger on a slot that's now mono / unassigned.
-    const pickEyes = (map: EyeMap): EyeMap => {
-      const out: EyeMap = {}
-      for (const { key } of CAMERA_SLOTS) {
-        if (isStereo(key) && map[key]) out[key] = map[key]
-      }
-      return out
-    }
     onSave({
       serials: {
         overhead: serials.overhead.trim(),
@@ -162,8 +167,8 @@ export function CamerasDialog({
       },
       stream_resolution: streamResolution,
       record_resolution: recordResolution,
-      stream_eyes: pickEyes(streamEyes),
-      record_eyes: pickEyes(recordEyes),
+      stream,
+      record,
     })
     onClose()
   }
@@ -195,8 +200,9 @@ export function CamerasDialog({
 
         <div className="flex flex-col gap-5 p-5">
           <p className="text-xs text-white/45">
-            Assign the ZED cameras connected to this machine to their slots. Collect data and run
-            policy need at least one; teleop streams whichever are set to the headset.
+            Assign the ZED cameras connected to this machine to their slots, then choose what each
+            one is used for. Collect data and run policy need at least one camera recording; teleop
+            streams whichever are set to the headset.
           </p>
 
           <div className="flex flex-col gap-2">
@@ -260,24 +266,25 @@ export function CamerasDialog({
             <ResolutionSelect
               id="camera-stream-resolution"
               label="Streaming resolution"
-              hint="Capture resolution sent to the headset"
+              hint="Capture resolution sent to the headset (Off disables streaming)"
               value={streamResolution}
               onChange={setStreamResolution}
             />
             <ResolutionSelect
               id="camera-record-resolution"
               label="Recording resolution"
-              hint="Dataset video is downscaled to this"
+              hint="Dataset video is downscaled to this (Off disables recording)"
               value={recordResolution}
               onChange={setRecordResolution}
             />
           </div>
 
           <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-            <Label>Camera serials</Label>
+            <Label>Cameras</Label>
             {CAMERA_SLOTS.map((slot) => {
               const kind = kindBySerial.get(serials[slot.key].trim())
               const stereo = kind === "stereo"
+              const assignedSlot = serials[slot.key].trim() !== ""
               return (
                 <div key={slot.key} className="flex flex-col gap-2">
                   <div className="flex items-center justify-between gap-4">
@@ -307,17 +314,23 @@ export function CamerasDialog({
                       className="max-w-[180px]"
                     />
                   </div>
-                  {stereo && (
+                  {assignedSlot && kind && (
                     <div className="ml-1 flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-md border border-white/10 bg-white/[0.02] px-3 py-2">
-                      <EyeChoice
+                      <BranchControl
                         label="Stream"
-                        eyes={streamEyes[slot.key] ?? defaultEyes(slot.key)}
-                        onToggle={(side) => toggleEye(streamEyes, setStreamEyes, slot.key, side)}
+                        stereo={stereo}
+                        value={stream[slot.key]}
+                        slot={slot.key}
+                        disabled={!streamingOn}
+                        onToggle={(side) => toggle(stream, setStream, slot.key, stereo, side)}
                       />
-                      <EyeChoice
+                      <BranchControl
                         label="Record"
-                        eyes={recordEyes[slot.key] ?? defaultEyes(slot.key)}
-                        onToggle={(side) => toggleEye(recordEyes, setRecordEyes, slot.key, side)}
+                        stereo={stereo}
+                        value={record[slot.key]}
+                        slot={slot.key}
+                        disabled={!recordingOn}
+                        onToggle={(side) => toggle(record, setRecord, slot.key, stereo, side)}
                       />
                     </div>
                   )}
@@ -369,21 +382,46 @@ function ResolutionSelect({
   )
 }
 
-/** Left/right eye checkboxes for one branch (stream or record) of a stereo slot. */
-function EyeChoice({
+/** One branch (Stream/Record) toggle for a camera: mono = a single checkbox;
+ * stereo = L/R checkboxes (none checked = the camera is off for this branch). */
+function BranchControl({
   label,
-  eyes,
+  stereo,
+  value,
+  slot,
+  disabled,
   onToggle,
 }: {
   label: string
-  eyes: StereoEyes
-  onToggle: (side: "left" | "right") => void
+  stereo: boolean
+  value: BranchSel | undefined
+  slot: CameraSlot
+  disabled: boolean
+  onToggle: (side?: "left" | "right") => void
 }) {
+  const enabled = !disabled && selEnabled(value)
+  const eyes = selEyes(value, slot)
   return (
     <div className="flex items-center gap-2">
       <span className="text-[11px] font-medium uppercase tracking-wide text-white/45">{label}</span>
-      <EyeBox label="L" checked={eyesLeft(eyes)} onChange={() => onToggle("left")} />
-      <EyeBox label="R" checked={eyesRight(eyes)} onChange={() => onToggle("right")} />
+      {stereo ? (
+        <>
+          <EyeBox
+            label="L"
+            checked={enabled && eyesLeft(eyes)}
+            disabled={disabled}
+            onChange={() => onToggle("left")}
+          />
+          <EyeBox
+            label="R"
+            checked={enabled && eyesRight(eyes)}
+            disabled={disabled}
+            onChange={() => onToggle("right")}
+          />
+        </>
+      ) : (
+        <EyeBox label="On" checked={enabled} disabled={disabled} onChange={() => onToggle()} />
+      )}
     </div>
   )
 }
@@ -391,17 +429,25 @@ function EyeChoice({
 function EyeBox({
   label,
   checked,
+  disabled,
   onChange,
 }: {
   label: string
   checked: boolean
+  disabled?: boolean
   onChange: () => void
 }) {
   return (
-    <label className="flex cursor-pointer items-center gap-1 text-xs text-white/70 select-none">
+    <label
+      className={
+        "flex items-center gap-1 text-xs select-none " +
+        (disabled ? "cursor-not-allowed text-white/25" : "cursor-pointer text-white/70")
+      }
+    >
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={onChange}
         className="size-3.5 accent-[#eff483]"
       />

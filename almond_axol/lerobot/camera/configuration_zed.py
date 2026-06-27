@@ -76,6 +76,13 @@ class ZedCameraConfig(CameraConfig):
                     only ``"left"`` (or vice versa). Only the collect-data /
                     teleop relay honours this; run-policy streams no video.
                     Ignored when ``stereo`` is False.
+        record:     Whether this camera is recorded to the dataset at all.
+                    ``False`` drops it from the recorded observations
+                    (``observation_cameras``) while still allowing it to stream.
+                    Default True.
+        stream:     Whether this camera is streamed to the headset at all.
+                    ``False`` drops it from the relay's encoded feed while still
+                    allowing it to be recorded. Default True.
     """
 
     # 0 is the "unassigned" sentinel. collect-data / run-policy seed all three
@@ -93,6 +100,8 @@ class ZedCameraConfig(CameraConfig):
     stereo: bool = False
     eyes: StereoEyes = "both"
     stream_eyes: StereoEyes | None = None
+    record: bool = True
+    stream: bool = True
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
