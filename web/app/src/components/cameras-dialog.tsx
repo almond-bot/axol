@@ -159,6 +159,23 @@ export function CamerasDialog({
   }
 
   function save() {
+    // Persist exactly what each control displays. A slot the operator never
+    // touched still shows a default (e.g. overhead streams "both"); writing that
+    // default explicitly keeps the saved spec matching the dialog, so the
+    // backend never falls back to a different value (streaming would otherwise
+    // default to the recorded eyes). Materialized only for slots whose kind is
+    // known, so mono saves a boolean and stereo an eye selection.
+    const materialize = (map: BranchMap, slot: CameraSlot, stereo: boolean): BranchSel =>
+      !selEnabled(map[slot]) ? false : stereo ? selEyes(map[slot], slot) : true
+    const outStream: BranchMap = { ...stream }
+    const outRecord: BranchMap = { ...record }
+    for (const { key } of CAMERA_SLOTS) {
+      const kind = kindBySerial.get(serials[key].trim())
+      if (!kind) continue // unknown kind / unassigned: leave backend defaults
+      const stereo = kind === "stereo"
+      outStream[key] = materialize(stream, key, stereo)
+      outRecord[key] = materialize(record, key, stereo)
+    }
     onSave({
       serials: {
         overhead: serials.overhead.trim(),
@@ -167,8 +184,8 @@ export function CamerasDialog({
       },
       stream_resolution: streamResolution,
       record_resolution: recordResolution,
-      stream,
-      record,
+      stream: outStream,
+      record: outRecord,
     })
     onClose()
   }
