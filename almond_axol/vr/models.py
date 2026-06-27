@@ -71,6 +71,13 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
+        t:       Client capture timestamp in milliseconds (``performance.now()``).
+            Used by the server's pose interpolator to reconstruct the true motion
+            cadence when frames arrive batched/jittered over the network. Optional:
+            transports that don't stamp it (e.g. the USB link, or an older web
+            build) fall back to "latest-wins" with no interpolation.
+        seq:     Monotonic per-connection frame counter from the headset. Optional;
+            used only to order/deduplicate frames within a burst.
     """
 
     l_ee: VRPose
@@ -83,3 +90,5 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
+    t: float | None = None
+    seq: int | None = None

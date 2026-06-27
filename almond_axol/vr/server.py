@@ -44,6 +44,9 @@ from fastapi.responses import HTMLResponse
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
+from .control_channel import ControlChannelManager
+from .ice import client_ice_servers
+from .interp import PoseInterpolator
 from .models import VRFrame
 
 if TYPE_CHECKING:
@@ -75,12 +78,23 @@ class VRServer:
         self._keyfile = config.keyfile or KEYFILE
 
         self._latest_frame: VRFrame | None = None
+        # Adaptive playout buffer: reconstructs a smooth pose stream from
+        # batched/jittered network arrivals. Consumers that want smoothing read
+        # via get_render_frame(); get_frame() still returns the raw latest.
+        self._interp = PoseInterpolator(
+            enabled=config.interp_enabled,
+            min_delay_s=config.interp_min_delay_s,
+            max_delay_s=config.interp_max_delay_s,
+        )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
         self._webrtc: WebRTCManager | Any | None = None
+        # Dedicated pose data channel (low-latency control transport). Always
+        # available — independent of whether any cameras are streaming.
+        self._control = ControlChannelManager(self._ingest_pose_text)
 
     # ------------------------------------------------------------------
     # Public API
@@ -89,6 +103,17 @@ class VRServer:
     def get_frame(self) -> VRFrame | None:
         """Return the most recent frame received, or None if none yet."""
         return self._latest_frame
+
+    def get_render_frame(self) -> VRFrame | None:
+        """Return the smoothed playout frame for the current instant.
+
+        Renders the pose from the adaptive interpolation buffer (motion is held
+        slightly in the past and interpolated; control state is the latest
+        received). Falls back to the raw latest frame when interpolation is
+        disabled or there isn't enough history yet. The returned object is
+        identity-stable so the IK loop can skip redundant solves while idle.
+        """
+        return self._interp.sample()
 
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
@@ -197,6 +222,7 @@ class VRServer:
         """Gracefully shut down the WSS server."""
         if self._webrtc is not None:
             await self._webrtc.close_all()
+        await self._control.close_all()
 
         if self._uvicorn_server is not None:
             try:
@@ -261,19 +287,61 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
+        self._ingest_frame_obj(obj)
+
+    def _ingest_frame_obj(self, obj: Any) -> None:
+        """Validate a decoded pose object and publish it to the consumer."""
         try:
             frame = VRFrame.model_validate(obj)
-            self._latest_frame = frame
-            if self._on_frame is not None:
-                self._on_frame(frame)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
+            return
+        self._latest_frame = frame
+        self._interp.push(frame)
+        if self._on_frame is not None:
+            self._on_frame(frame)
+
+    def _ingest_pose_text(self, data: str) -> None:
+        """Ingest a pose frame from the control data channel (text message).
+
+        Mirrors the WebSocket pose path; signaling never arrives here, so a
+        message carrying a ``type`` field is ignored rather than validated.
+        """
+        try:
+            obj = json.loads(data)
+        except Exception as exc:
+            _logger.warning("invalid json on pose channel: %s", exc)
+            return
+        if isinstance(obj, dict) and "type" in obj:
+            return
+        self._ingest_frame_obj(obj)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
     ) -> None:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
+
+        # Control data channel (pose transport): negotiated independently of the
+        # cameras, so it's handled before the video-availability check below and
+        # works even when no video sources are registered.
+        if msg_type == "control-request":
+            sdp = await self._control.create_offer(client_id)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "control-offer",
+                        "sdp": sdp,
+                        "iceServers": client_ice_servers(),
+                    }
+                )
+            )
+            return
+        if msg_type == "control-answer":
+            sdp = obj.get("sdp")
+            if isinstance(sdp, str):
+                await self._control.set_answer(client_id, sdp)
+            return
 
         if self._webrtc is None:
             if msg_type == "webrtc-request":
@@ -288,7 +356,17 @@ class VRServer:
                 await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
                 return
             await websocket.send_text(
-                json.dumps({"type": "webrtc-offer", "sdp": sdp, "tracks": tracks})
+                json.dumps(
+                    {
+                        "type": "webrtc-offer",
+                        "sdp": sdp,
+                        "tracks": tracks,
+                        # Same TURN/STUN servers the aiortc peer used, so the
+                        # browser gathers a matching relay candidate. Empty on
+                        # a LAN (no env config) — harmless to the headset.
+                        "iceServers": client_ice_servers(),
+                    }
+                )
             )
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
@@ -333,5 +411,13 @@ class VRServer:
                 server._client_count = max(0, server._client_count - 1)
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
+                await server._control.close(client_id)
+                # Last operator gone: drop buffered pose state so a fresh
+                # session's capture timestamps aren't blended with this one's
+                # stale frames (which would drive IK with incoherent poses
+                # until the playout buffer drains).
+                if server._client_count == 0:
+                    server._latest_frame = None
+                    server._interp.reset()
 
         return app

@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 
+from ..utils.dotenv import load_local_env
 from . import provision as provision_cmd
 from . import serve as serve_cmd
 from .can import driver as can_driver
@@ -44,6 +45,10 @@ def _dispatch_draccus(command: str, argv: list[str]) -> None:
 
 def main() -> None:
     """Dispatch ``axol <command>`` to the matching CLI handler."""
+    # Load .env / .env.local (TURN credentials, etc.) before any command runs so
+    # the values are in os.environ for in-process ops and child subprocesses.
+    load_local_env()
+
     argv = sys.argv[1:]
     if argv and argv[0] in _DRACCUS_COMMANDS:
         _dispatch_draccus(argv[0], argv[1:])

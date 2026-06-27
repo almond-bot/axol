@@ -14,3 +14,8 @@ logs/
 
 # macOS
 .DS_Store
+
+# Local secrets / env (TURN credentials, etc.)
+.env
+.env.local
+.env.*.local

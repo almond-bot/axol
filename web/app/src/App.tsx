@@ -15,6 +15,8 @@ import {
   AxolConnectionStatus,
   AxolVRClient,
   AxolState,
+  axolHttpsOrigin,
+  useAxolControlChannel,
   useAxolPoseSocket,
   useAxolTracking,
   useAxolVideo,
@@ -1030,6 +1032,10 @@ export default function App() {
   const { poseWsRef, status: poseStatus } = useAxolPoseSocket(
     usbPoses && status === AxolConnectionStatus.Open
   )
+  // Low-latency WebRTC pose data channel — negotiated once the teleop
+  // connection is up (independent of cameras / presenting). AxolVRClient prefers
+  // it over the main WebSocket, which stays as the fallback.
+  const { poseChannelRef } = useAxolControlChannel(wsRef, status === AxolConnectionStatus.Open)
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
@@ -1179,7 +1185,7 @@ export default function App() {
                     variant="outline"
                     className="w-full"
                     onClick={() =>
-                      authorizeCert(`https://${hostname.trim()}:${VR_WS_PORT}`).then(handleConnect)
+                      authorizeCert(axolHttpsOrigin(hostname, VR_WS_PORT)).then(handleConnect)
                     }
                   >
                     <ShieldCheck />
@@ -1203,6 +1209,7 @@ export default function App() {
             <AxolVRClient
               wsRef={wsRef}
               poseWsRef={poseWsRef}
+              poseChannelRef={poseChannelRef}
               usbOnly={usbPoses}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}

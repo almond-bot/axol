@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { AxolConnectionStatus } from "./types"
+import { axolWsUrl } from "./serverUrl"
 
 const CONNECT_TIMEOUT_MS = 5000
 
@@ -54,7 +55,7 @@ export function useAxolVRClient(hostname: string, port = 8000, maxRetries = 3, r
     setStatus(AxolConnectionStatus.Connecting)
 
     try {
-      const ws = new WebSocket(`wss://${hostname}:${port}/ws`)
+      const ws = new WebSocket(axolWsUrl(hostname, port))
       wsRef.current = ws
 
       // Abort connections that stay in CONNECTING state (e.g. mDNS lookup hangs).
