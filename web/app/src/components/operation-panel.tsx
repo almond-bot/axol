@@ -41,6 +41,7 @@ export function OperationPanel({
   cameras,
   robot,
   live,
+  stopping,
   busy,
   session,
   host,
@@ -60,6 +61,7 @@ export function OperationPanel({
   cameras: CameraSpec
   robot: RobotStatus | null
   live: boolean
+  stopping: boolean
   busy: boolean
   session: SessionInfo | null
   host: string
@@ -129,7 +131,12 @@ export function OperationPanel({
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            {live ? (
+            {stopping ? (
+              <Button variant="destructive" disabled>
+                <Loader2 className="animate-spin" />
+                Stopping…
+              </Button>
+            ) : live ? (
               <Button variant="destructive" onClick={onStop} disabled={busy}>
                 {busy ? <Loader2 className="animate-spin" /> : <Square />}
                 Stop
@@ -354,6 +361,8 @@ function StatusBadge({ session }: { session: SessionInfo | null }) {
       return <Badge variant="warning">Starting</Badge>
     case "running":
       return <Badge variant="success">Running</Badge>
+    case "stopping":
+      return <Badge variant="warning">Stopping</Badge>
     case "error":
       return <Badge variant="destructive">Error</Badge>
     case "exited":

@@ -405,6 +405,14 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         else:
             _register_camera_video(robot, teleop)
     except BaseException:
+        # Tear down teleop too: if a stop interrupts teleop.connect() while the
+        # IK worker is still compiling JAX, its VR server thread is otherwise
+        # left running and keeps holding its WebSocket port, so the next run
+        # can't bind it. disconnect() is a no-op if connect() never ran.
+        try:
+            teleop.disconnect()
+        except Exception:
+            _logger.exception("teleop cleanup after failed setup failed")
         if relay is not None:
             relay.shutdown()
         raise

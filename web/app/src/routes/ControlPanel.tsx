@@ -330,13 +330,55 @@ export default function ControlPanel() {
   // serve host), leaving its last-seen status stuck at "running". So treat the
   // op as live only when a source reports it active AND neither source reports
   // it finished — a terminal state from either side flips the button to Start.
-  const effectiveStatus = status ?? session
   const sources = [status, session].filter((s): s is SessionInfo => s != null)
+  // Display the most-advanced status across the two sources. The logs
+  // WebSocket only ever reports "running" then "exited" — it never emits
+  // "stopping" — so during a stop the REST/poll session is ahead; ranking it
+  // higher makes the badge show "Stopping" instead of a stale "Running".
+  const STATUS_RANK: Record<string, number> = {
+    starting: 0,
+    running: 1,
+    stopping: 2,
+    exited: 3,
+    error: 3,
+  }
+  const rank = (s: SessionInfo) => STATUS_RANK[s.status] ?? 0
+  const effectiveStatus = sources.reduce<SessionInfo | null>(
+    (best, s) => (best && rank(best) >= rank(s) ? best : s),
+    null
+  )
   const isLive =
-    sources.some((s) => s.status === "running" || s.status === "starting") &&
-    !sources.some((s) => s.status === "exited" || s.status === "error")
+    sources.some(
+      (s) => s.status === "running" || s.status === "starting" || s.status === "stopping"
+    ) && !sources.some((s) => s.status === "exited" || s.status === "error")
+  // The op has been asked to stop and is unwinding (its worker thread is still
+  // tearing down / its children are being killed). The Stop button shows a
+  // disabled "Stopping…" until a terminal status flips the op back to idle.
+  const isStopping = isLive && sources.some((s) => s.status === "stopping")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
   const selectedLive = isLive && runningOp === selectedOp
+  const selectedStopping = isStopping && runningOp === selectedOp
+
+  // While an op is live (including the "stopping" window), poll the server's
+  // authoritative op status so the panel reliably catches the transition to
+  // exited even if the logs WebSocket drops its final status frame. The stop
+  // itself returns immediately server-side, so this is what flips the button
+  // back to Start once the op has actually torn down.
+  useEffect(() => {
+    if (conn.state !== "ok" || !isLive) return
+    let active = true
+    const t = setInterval(() => {
+      fetchOpStatus()
+        .then((op) => {
+          if (active && op.session) setSession(op.session)
+        })
+        .catch(() => {})
+    }, 1500)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, isLive])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -344,12 +386,27 @@ export default function ControlPanel() {
     [commands, selectedOp]
   )
 
-  // Stop the running task (if any) and wait for it to actually exit. The
-  // server-side stop joins the task thread before responding, so awaiting this
-  // guarantees the op is gone before a disconnect tears its connection down.
+  // Stop the running task (if any) and wait for it to actually exit before
+  // returning, so a disconnect never tears the host/robot link down mid-cleanup.
+  // The server-side stop now returns immediately with "stopping" (it force-kills
+  // a stuck op in the background), so we poll op status until the op is truly
+  // gone rather than relying on the stop response to block.
   async function stopRunningOp() {
     if (!isLive) return
     setSession(await stopOperation())
+    // Bounded so an unkillable op (abandoned server-side) can't wedge the UI;
+    // we proceed best-effort after the deadline.
+    const deadline = Date.now() + 30_000
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500))
+      try {
+        const op = await fetchOpStatus()
+        if (op.session) setSession(op.session)
+        if (!op.running) return
+      } catch {
+        return // host unreachable — nothing left to wait on
+      }
+    }
   }
 
   async function handleStart() {
@@ -371,6 +428,10 @@ export default function ControlPanel() {
 
   async function handleStop() {
     setBusy(true)
+    // Reflect "Stopping…" immediately — the server stop returns right away and
+    // teardown runs in the background, so don't wait for the response/next poll
+    // to flip the button.
+    setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
       setSession(await stopOperation())
     } catch (e) {
@@ -429,6 +490,7 @@ export default function ControlPanel() {
           cameras={cameras}
           robot={robot}
           live={selectedLive}
+          stopping={selectedStopping}
           busy={busy}
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import multiprocessing
 import re
 import sys
 import threading
@@ -35,6 +36,19 @@ from ..zed import stereo_serials
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
+
+# How long a stop waits for the op to unwind cleanly before force-killing the
+# op's child subprocesses, and how long it then waits for the freed-up worker
+# thread to finish. Kept short so Stop feels immediate: the worker thread can be
+# stuck for *minutes* on a child subprocess with no stop check in between —
+# either tearing down (``recorder.close()`` waits up to 180s for an in-flight
+# save; the video relay / IK joins add more) or still starting up (it blocks in
+# ``teleop.connect()`` on the IK worker's "ready" message, which only arrives
+# after JAX finishes compiling the IK solver — a cold compile is minutes). The
+# only reliable way to stop fast in all those cases is to kill the children out
+# from under it, which makes the blocked join/recv return.
+_STOP_GRACE_S = 6.0
+_FORCE_GRACE_S = 5.0
 
 # Operations that need exclusive ownership of the CAN bus (everything except
 # sim teleop, which is decided per-run from the ``sim`` arg).
@@ -166,6 +180,13 @@ class OperationRunner:
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        # Set once a stop has been kicked off for the current op, so a second
+        # Stop click (or a stop racing the op's own exit) is a no-op.
+        self._stopping = False
+        # multiprocessing children that already existed when the op started, so
+        # the force-kill only targets subprocesses this op spawned (relay,
+        # recorder, IK worker) and never anything the serve process owns.
+        self._baseline_children: set[int] = set()
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
@@ -190,8 +211,10 @@ class OperationRunner:
         session.subscribers.discard(q)
 
     def is_running(self) -> bool:
+        # "stopping" still counts as running: the op owns the CAN bus until its
+        # worker thread unwinds, so a new op must not start until it's gone.
         s = self._session
-        return s is not None and s.status in ("starting", "running")
+        return s is not None and s.status in ("starting", "running", "stopping")
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -213,6 +236,10 @@ class OperationRunner:
             session.loop = loop
             self._session = session
             self._stop_event = threading.Event()
+            self._stopping = False
+            # Snapshot pre-existing children so a later force-kill only targets
+            # the subprocesses this op is about to spawn.
+            self._baseline_children = {c.pid for c in multiprocessing.active_children()}
 
         # Fold the camera spec into the argv-style args for collect-data /
         # run-policy (their camera serials are required draccus inputs).
@@ -260,9 +287,50 @@ class OperationRunner:
         return session
 
     def stop(self) -> Session | None:
+        """Begin stopping the current op and return immediately.
+
+        Signals the op to unwind and hands off to a background watchdog that
+        force-kills the op's child subprocesses if it doesn't exit within the
+        grace period — so the HTTP request never blocks on a slow teardown
+        (e.g. a 180s dataset save). The session goes to ``stopping`` now and to
+        ``exited`` once the worker thread finishes (or is abandoned).
+        """
         session = self._session
         if session is None:
             return None
+        if not self.is_running():
+            # Already finished (or finishing): nothing to stop, and we must not
+            # flip a terminal session back to "stopping".
+            return session
+        if not self._begin_stop(session):
+            return session
+        thread = self._thread
+        watchdog = threading.Thread(
+            target=self._await_stop,
+            args=(session, thread),
+            name="axol-op-stop",
+            daemon=True,
+        )
+        watchdog.start()
+        return session
+
+    def _begin_stop(self, session: Session) -> bool:
+        """Signal the op to unwind. Returns ``False`` if there's nothing to stop.
+
+        The status check + flip happen under the lock, and the terminal
+        transitions (:meth:`_mark_terminal`) take the same lock, so a Stop that
+        races the op's own exit can't resurrect a finished session as
+        ``stopping``: either we flip a still-running op to ``stopping`` (and a
+        later ``_finish`` moves it to ``exited``), or the op already reached a
+        terminal state and we bail.
+        """
+        with self._lock:
+            if self._stopping:
+                return False
+            if session.status not in ("starting", "running"):
+                return False
+            self._stopping = True
+            session.status = "stopping"
         session.emit("[serve] stopping…")
         self._stop_event.set()
         loop, task = self._async_loop, self._async_task
@@ -271,10 +339,61 @@ class OperationRunner:
                 loop.call_soon_threadsafe(task.cancel)
             except RuntimeError:
                 pass
-        thread = self._thread
-        if thread is not None:
-            thread.join(timeout=20.0)
-        return self._session
+        return True
+
+    def _await_stop(self, session: Session, thread: threading.Thread | None) -> None:
+        """Wait for the op to exit, force-killing its children if it stalls."""
+        if thread is None:
+            return
+        thread.join(timeout=_STOP_GRACE_S)
+        if thread.is_alive():
+            session.emit(
+                f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
+                "force-killing the operation's child processes"
+            )
+            self._kill_op_children(session)
+            thread.join(timeout=_FORCE_GRACE_S)
+        if thread.is_alive():
+            # The thread is stuck on something we can't kill (an in-process
+            # native call); leave it abandoned rather than block forever. It
+            # still owns the CAN bus, so the session stays "running"/"stopping"
+            # and is_running() keeps a new op from clobbering it.
+            session.emit(
+                "[serve] operation did not exit after force-kill and is now "
+                "abandoned — restart axol serve if it persists"
+            )
+
+    def _kill_op_children(self, session: Session) -> None:
+        """SIGKILL every subprocess this op spawned (relay, recorder, IK worker).
+
+        The worker thread blocks on these children either while tearing down
+        (``recorder.close()`` / ``relay.shutdown()`` / ``teleop.disconnect()``
+        joins) or while starting up (waiting on the IK worker's "ready" message
+        across the pipe while it compiles JAX). Killing the children makes the
+        blocked join/recv return so the thread can finish.
+        """
+        # Snapshot the targets under the lock and only if this is still the
+        # op being stopped: a slow watchdog could otherwise wake after the
+        # stopped worker exited and a *new* op started, and SIGKILL the new
+        # op's subprocesses. ``start()`` swaps ``_session`` / ``_baseline_children``
+        # under the same lock, so either we see the old op (and its children) or
+        # we see the swap and bail — never a mix.
+        with self._lock:
+            if self._session is not session:
+                return
+            targets = [
+                c
+                for c in multiprocessing.active_children()
+                if c.pid not in self._baseline_children
+            ]
+        for child in targets:
+            session.emit(
+                f"[serve] killing child process {child.name} (pid {child.pid})"
+            )
+            try:
+                child.kill()
+            except Exception as exc:  # noqa: BLE001 - best-effort
+                session.emit(f"[serve] failed to kill pid {child.pid}: {exc}")
 
     def episode_command(self, command: str) -> bool:
         """Forward a run-policy episode command (start/s/r/q) to its control."""
@@ -285,8 +404,18 @@ class OperationRunner:
         return True
 
     async def shutdown(self) -> None:
+        # Server shutdown: stop and block until the op is actually gone (unlike
+        # the API stop, which returns early and lets the watchdog finish).
         if self.is_running():
-            await asyncio.to_thread(self.stop)
+            await asyncio.to_thread(self._stop_blocking)
+
+    def _stop_blocking(self) -> None:
+        session = self._session
+        thread = self._thread
+        if session is None:
+            return
+        self._begin_stop(session)
+        self._await_stop(session, thread)
 
     # -- config building ----------------------------------------------------
 
@@ -405,8 +534,9 @@ class OperationRunner:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:  # noqa: BLE001
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.status = "error"
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 try:
@@ -442,8 +572,9 @@ class OperationRunner:
                     self._policy_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
             except Exception as exc:  # noqa: BLE001
-                session.error = f"{type(exc).__name__}: {exc}"
-                session.status = "error"
+                self._mark_terminal(
+                    session, "error", error=f"{type(exc).__name__}: {exc}"
+                )
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 self._policy_control = None
@@ -451,10 +582,26 @@ class OperationRunner:
 
     # -- shared teardown ----------------------------------------------------
 
+    def _mark_terminal(
+        self, session: Session, status: str, *, error: str | None = None
+    ) -> None:
+        """Move a session to a terminal state (``exited`` / ``error``).
+
+        Taken under the lock so it can't interleave with :meth:`_begin_stop`'s
+        running-check-then-flip. Never downgrades an existing ``error`` (the
+        first failure wins, and a stop arriving after an error stays ``error``).
+        """
+        with self._lock:
+            if session.status == "error":
+                return
+            if error is not None:
+                session.error = error
+            session.status = status
+            if status == "exited":
+                session.exit_code = 0
+
     def _finish(self, session: Session, needs_robot: bool) -> None:
-        if session.status not in ("error",):
-            session.status = "exited"
-            session.exit_code = 0
+        self._mark_terminal(session, "exited")
         session.emit(f"[serve] {session.command_id} finished")
         session.close_stream()
         if needs_robot and self._robot_link is not None:
