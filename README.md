@@ -101,7 +101,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Teleoperation](https://docs.almond.bot/operations/teleop) — drive the robot live from a VR headset (or in sim)
 - [Gravity Compensation](https://docs.almond.bot/operations/gravity-comp) — hold the arms weightless for hand-guiding
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
-- [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot
+- [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
 
 ### Remote Teleop

@@ -14,7 +14,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | Flag | Description |
 |---|---|
 | `--repo_id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
-| `--episode INT` | Index of the episode to replay (required) |
+| `--episode INT` | Index of the episode to replay, 0-indexed — the first recorded episode is `0` (required) |
 | `--fps INT` | Playback frame rate. `0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. |
 | `--loop true` | Replay the episode continuously (returning to rest between takes) until stopped with `Ctrl+C` / **Stop**, then return to rest. Default: off (a single replay). |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
