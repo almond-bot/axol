@@ -80,6 +80,8 @@ The screens are **world-anchored** — like TVs placed where you were looking wh
 | Right | Fullscreen **right wrist** |
 | Down | **Split** — left + right wrist cams side-by-side |
 
+The headset only offers the views for cameras that are actually being streamed (set in the [control panel's Cameras dialog](/guides/control-panel#cameras) or via the relevant CLI flags). A flick toward a camera that isn't streamed is ignored, so streaming only the overhead, say, leaves the default passthrough view and the overhead view and nothing else. While video is still negotiating — or any streamed camera hasn't produced its first frame — a global **Connecting cameras…** indicator shows regardless of the current view; it clears once every streamed camera is live, and never appears when nothing is being streamed.
+
 ## Controller bindings
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
