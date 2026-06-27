@@ -33,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
+from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
 from .control_channel import ControlChannelManager
 from .ice import client_ice_servers
@@ -88,6 +90,7 @@ class VRServer:
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
+        self._listen_socket: socket.socket | None = None
         self._webrtc: WebRTCManager | Any | None = None
         # Dedicated pose data channel (low-latency control transport). Always
         # available — independent of whether any cameras are streaming.
@@ -183,13 +186,22 @@ class VRServer:
                 _logger.warning("Failed to send feedback to client: %s", exc)
 
     async def enable(self) -> None:
-        """Start the WSS server in the background."""
+        """Start the WSS server in the background.
+
+        The listening socket is bound *here* (reclaiming the port from a stale
+        listener if needed) so a bind failure raises synchronously instead of
+        being swallowed inside uvicorn's background task. uvicorn then adopts
+        the already-bound socket via ``serve(sockets=...)``.
+        """
         if self._server_task is not None:
             return
 
         if not os.path.isfile(self._certfile) or not os.path.isfile(self._keyfile):
             _logger.info("creating self-signed certificate")
             create_self_signed_cert(self._certfile, self._keyfile)
+
+        sock = await asyncio.to_thread(open_listen_socket, "0.0.0.0", self._port)
+        self._listen_socket = sock
 
         app = self._build_app()
         config = uvicorn.Config(
@@ -201,7 +213,9 @@ class VRServer:
             ssl_keyfile=self._keyfile,
         )
         self._uvicorn_server = uvicorn.Server(config)
-        self._server_task = asyncio.create_task(self._uvicorn_server.serve())
+        self._server_task = asyncio.create_task(
+            self._uvicorn_server.serve(sockets=[sock])
+        )
         _logger.info("listening on wss://0.0.0.0:%d/ws", self._port)
 
     async def disable(self) -> None:
@@ -227,6 +241,16 @@ class VRServer:
                 except asyncio.CancelledError:
                     pass
             self._server_task = None
+
+        # uvicorn closes the adopted socket on a clean shutdown, but close it
+        # ourselves too so a cancelled/timed-out shutdown still frees the port
+        # for the next ``enable()`` instead of leaking the bind.
+        if self._listen_socket is not None:
+            try:
+                self._listen_socket.close()
+            except OSError:
+                pass
+            self._listen_socket = None
 
         self._client_count = 0
         self._active_clients.clear()
