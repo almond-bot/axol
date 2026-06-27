@@ -109,7 +109,9 @@ This serves the control connection at `https://<your-machine>.tailXXXX.ts.net/` 
 
 ### 2. Add a TURN server for camera video
 
-Camera video is WebRTC, whose media is a separate peer-to-peer UDP stream — it does **not** travel through the Funnel. With both peers off each other's network, they need a publicly reachable **TURN** relay to bridge the media. Self-host [coturn](https://github.com/coturn/coturn) on a box with a public IP, or use a hosted TURN provider.
+Camera video is WebRTC, whose media is a separate peer-to-peer UDP stream — it does **not** travel through the Funnel. With both peers off each other's network, they need a publicly reachable **TURN** relay to bridge the media. Use a hosted TURN provider, or self-host [coturn](https://github.com/coturn/coturn) on a box with a public IP.
+
+The repo ships a ready-to-deploy coturn config for [Fly.io](https://fly.io) under [`deploy/turn/`](https://github.com/almond-bot/axol/tree/main/deploy/turn) — Fly supports the raw UDP that TURN needs (unlike most PaaS hosts), and the config handles the dedicated-IPv4 and `external-ip` gotchas for you. Follow [`deploy/turn/README.md`](https://github.com/almond-bot/axol/blob/main/deploy/turn/README.md) to launch your own relay in a few `flyctl` commands, then point Axol at it with the env vars below.
 
 Set these env vars on the machine running teleop **before** starting it (the VR server and its video relay read them at connect time):
 

@@ -5,7 +5,7 @@ description: "Command-line interface and Python SDK for the Almond Axol dual-arm
 
 <img src="/assets/axol.png" width="400" alt="Axol dual-arm robot" />
 
-The Axol SDK runs the Almond Axol dual-arm robot. Every core operation — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — can be driven two ways: from the **web control panel** in a browser, or from the **`axol` CLI** in a terminal. Each operation page below shows both.
+The Axol SDK runs the Almond Axol dual-arm robot. Every core operation — **teleoperation**, **gravity compensation**, **data collection**, **dataset replay**, and **policy inference** — can be driven two ways: from the **web control panel** in a browser, or from the **`axol` CLI** in a terminal. Each operation page below shows both.
 
 <Note>
   **New here?** [Install in one command](/installation), then head to [Teleoperation](/operations/teleop) to drive the robot from a VR headset.
@@ -24,6 +24,9 @@ Each page covers the same task from the **Control Panel** and the **CLI** — pi
   </Card>
   <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
     Record teleoperation episodes to a LeRobot dataset.
+  </Card>
+  <Card title="Replay Dataset" icon="play" href="/operations/replay-dataset">
+    Play a recorded dataset episode back onto the arms.
   </Card>
   <Card title="Run Policy" icon="robot" href="/operations/run-policy">
     Run a trained policy autonomously — locally or on a remote server.

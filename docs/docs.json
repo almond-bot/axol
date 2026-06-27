@@ -28,6 +28,7 @@
           "operations/teleop",
           "operations/gravity-comp",
           "operations/data-collection",
+          "operations/replay-dataset",
           "operations/run-policy"
         ]
       },
