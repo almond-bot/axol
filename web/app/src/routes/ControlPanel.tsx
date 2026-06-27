@@ -330,8 +330,23 @@ export default function ControlPanel() {
   // serve host), leaving its last-seen status stuck at "running". So treat the
   // op as live only when a source reports it active AND neither source reports
   // it finished — a terminal state from either side flips the button to Start.
-  const effectiveStatus = status ?? session
   const sources = [status, session].filter((s): s is SessionInfo => s != null)
+  // Display the most-advanced status across the two sources. The logs
+  // WebSocket only ever reports "running" then "exited" — it never emits
+  // "stopping" — so during a stop the REST/poll session is ahead; ranking it
+  // higher makes the badge show "Stopping" instead of a stale "Running".
+  const STATUS_RANK: Record<string, number> = {
+    starting: 0,
+    running: 1,
+    stopping: 2,
+    exited: 3,
+    error: 3,
+  }
+  const rank = (s: SessionInfo) => STATUS_RANK[s.status] ?? 0
+  const effectiveStatus = sources.reduce<SessionInfo | null>(
+    (best, s) => (best && rank(best) >= rank(s) ? best : s),
+    null
+  )
   const isLive =
     sources.some(
       (s) => s.status === "running" || s.status === "starting" || s.status === "stopping"
@@ -413,6 +428,10 @@ export default function ControlPanel() {
 
   async function handleStop() {
     setBusy(true)
+    // Reflect "Stopping…" immediately — the server stop returns right away and
+    // teardown runs in the background, so don't wait for the response/next poll
+    // to flip the button.
+    setSession((s) => (s ? { ...s, status: "stopping" } : s))
     try {
       setSession(await stopOperation())
     } catch (e) {
