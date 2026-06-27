@@ -3,7 +3,7 @@ title: "Web Control Panel"
 description: "Drive Axol from a browser — connect the Axol host and robot, assign the cameras, then run any operation without touching the terminal."
 ---
 
-The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors and the camera setup.
+The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the core operations — **teleoperation**, **gravity compensation**, **data collection**, **policy inference**, and **dataset replay** — behind connect/run buttons, with live status for the robot motors and the camera setup.
 
 It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
 
@@ -96,6 +96,7 @@ Pick an operation from the selector. Each has its own settings form; required fi
 | **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Collect Data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
 | **Run Policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
+| **Replay Dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. |
 
 ### Before you can start
 

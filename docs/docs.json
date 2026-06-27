@@ -64,6 +64,7 @@
               "cli/teleop",
               "cli/collect-data",
               "cli/run-policy",
+              "cli/replay-dataset",
               "cli/inference-server",
               "cli/provision",
               "cli/zed-install",

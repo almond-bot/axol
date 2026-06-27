@@ -1,10 +1,10 @@
-"""In-process runner for the four core operations.
+"""In-process runner for the core operations.
 
 Unlike :class:`~almond_axol.serve.manager.SessionManager` (which spawns the
-generic calibration/setup commands as ``axol <cmd>`` subprocesses), the four
-core operations — teleop, gravity-comp, collect-data, run-policy — run *inside*
-the serve process here, so they share the persistent robot connection instead
-of opening their own from a child process.
+generic calibration/setup commands as ``axol <cmd>`` subprocesses), the core
+operations — teleop, gravity-comp, collect-data, run-policy, replay-dataset —
+run *inside* the serve process here, so they share the persistent robot
+connection instead of opening their own from a child process.
 
 Only one operation runs at a time. Its ``logging`` output and ``print``s are
 captured into a :class:`~almond_axol.serve.manager.Session` ring buffer (the
@@ -14,9 +14,10 @@ it did for subprocesses.
 - teleop / gravity-comp are asyncio: they run on a dedicated event loop in a
   worker thread and are stopped by cancelling the task (both already tear down
   cleanly on ``CancelledError`` via their ``async with`` robot context).
-- collect-data / run-policy are blocking/threaded: they run on a worker thread
-  and are stopped via a ``threading.Event`` (run-policy additionally takes a
-  queue-backed episode control for save/rerecord/quit from the UI).
+- collect-data / run-policy / replay-dataset are blocking/threaded: they run on
+  a worker thread and are stopped via a ``threading.Event`` (run-policy
+  additionally takes a queue-backed episode control for save/rerecord/quit from
+  the UI).
 
 Before a hardware operation starts the runner releases the robot link's CAN
 bus; when the operation ends it hands the bus back.
@@ -52,9 +53,15 @@ _FORCE_GRACE_S = 5.0
 
 # Operations that need exclusive ownership of the CAN bus (everything except
 # sim teleop, which is decided per-run from the ``sim`` arg).
-_HARDWARE_OPS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
+_HARDWARE_OPS = {
+    "teleop",
+    "gravity-comp",
+    "collect-data",
+    "run-policy",
+    "replay-dataset",
+}
 _ASYNC_OPS = {"teleop", "gravity-comp"}
-_OP_IDS = {"teleop", "gravity-comp", "collect-data", "run-policy"}
+_OP_IDS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"}
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
@@ -642,7 +649,7 @@ class OperationRunner:
                 self._async_task = None
         self._finish(session, needs_robot)
 
-    # -- thread ops (collect-data / run-policy) -----------------------------
+    # -- thread ops (collect-data / run-policy / replay-dataset) ------------
 
     def _run_thread(
         self,
@@ -656,6 +663,10 @@ class OperationRunner:
             try:
                 if op_id == "collect-data":
                     from ..cli.collect_data import _run as core
+
+                    core(cfg, stop_event=self._stop_event)
+                elif op_id == "replay-dataset":
+                    from ..cli.replay_dataset import _run as core
 
                     core(cfg, stop_event=self._stop_event)
                 else:
