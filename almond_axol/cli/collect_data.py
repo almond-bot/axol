@@ -170,33 +170,62 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
 
     specs: dict[str, dict[str, Any]] = {}
     for name, camcfg in cameras.items():
+        # Each camera opts into either branch: ``stream`` (headset) and ``record``
+        # (dataset). A camera in neither is dropped — never opened by the relay.
+        wants_record = bool(getattr(camcfg, "record", True))
+        wants_stream = bool(getattr(camcfg, "stream", True))
+        if not (wants_record or wants_stream):
+            continue
         serial = int(camcfg.serial)
-        spec: dict[str, Any] = {"serial": serial, "fps": camcfg.fps or 60}
+        spec: dict[str, Any] = {
+            "serial": serial,
+            "fps": camcfg.fps or 60,
+            "record": wants_record,
+            "stream": wants_stream,
+        }
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
-        # Eye policy must match observation_cameras() so the relay exports exactly
-        # the keys the recorder expects. Physically-stereo cameras are already
-        # flagged stereo on the config (see AxolRobotConfig.apply_detected_stereo,
-        # applied in _run before this), so here we just honour the flag: a
-        # ``eyes="both"`` camera (the head) records both eyes, suffixed
-        # (overhead_left / overhead_right); a single-eye stereo camera (a wrist)
-        # crops/encodes just that eye and exports it under the plain name, so it
-        # records one image like a mono camera.
+        # The recorded eyes (``eyes``) must match observation_cameras() so the
+        # relay's raw branch exports exactly the keys the recorder expects; the
+        # streamed eyes (``stream_eyes``) drive the headset feed independently, so
+        # the operator can e.g. stream both eyes for depth while recording only
+        # one. Physically-stereo cameras are already flagged stereo on the config
+        # (see AxolRobotConfig.apply_detected_stereo, applied in _run before this).
+        # For each branch: ``"both"`` records/streams both eyes suffixed
+        # (overhead_left / overhead_right); a single eye is cropped and exported
+        # under the plain name, so it costs and reads like a mono camera.
         if bool(getattr(camcfg, "stereo", False)):
-            eyes_cfg = getattr(camcfg, "eyes", "both")
+            record_eyes = getattr(camcfg, "eyes", "both")
+            stream_eyes = (
+                camcfg.streaming_eyes()
+                if hasattr(camcfg, "streaming_eyes")
+                else getattr(camcfg, "stream_eyes", None) or record_eyes
+            )
             spec["stereo"] = True
-            spec["eyes"] = ["left", "right"] if eyes_cfg == "both" else [eyes_cfg]
-            spec["eye_suffix"] = eyes_cfg == "both"
+            spec["record_eyes"] = (
+                ["left", "right"] if record_eyes == "both" else [record_eyes]
+            )
+            spec["record_suffix"] = record_eyes == "both"
+            spec["stream_eyes"] = (
+                ["left", "right"] if stream_eyes == "both" else [stream_eyes]
+            )
+            spec["stream_suffix"] = stream_eyes == "both"
         else:
             spec["stereo"] = False
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)
-    if not relay.has_sources:
+    # Keep the relay if it can serve *either* branch: raw frames for the dataset
+    # (the primary purpose for collect-data) or encoded streams for the headset.
+    # A record-only setup (streaming disabled for every camera) has no encoded
+    # sources but still needs the relay's raw export, so don't discard it just
+    # because nothing streams — otherwise we fall back to the in-process path and
+    # open every camera a second time.
+    if not (relay.has_sources or relay.raw_cameras):
         relay.shutdown()
         return None
     return relay
@@ -296,6 +325,13 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         from ..zed import stereo_serials
 
         cfg.robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
+        if not cfg.robot_config.observation_cameras():
+            raise ValueError(
+                "collect-data has no camera with recording enabled — every "
+                "assigned camera is set to stream-only (or recording is turned "
+                "off). Enable recording for at least one camera in the Cameras "
+                "dialog (or set its record_resolution / eyes)."
+            )
 
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)

@@ -434,34 +434,114 @@ class OperationRunner:
                 serials[slot] = serial
         return serials
 
+    @staticmethod
+    def _resolution(
+        cameras: dict[str, Any] | None, key: str, legacy: str | None = None
+    ) -> str | None:
+        """Resolution name for a branch, or ``None`` when off/unset.
+
+        A value of ``"off"`` (or empty) disables the whole branch (streaming or
+        recording). ``legacy`` reads the old single ``resolution`` key as the
+        streaming resolution for back-compat.
+        """
+        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+
+        val = (cameras or {}).get(key)
+        if val is None and legacy:
+            val = (cameras or {}).get(legacy)
+        val = str(val or "").strip()
+        if not val or val.lower() == "off":
+            return None
+        if val not in ZED_RESOLUTION_DIMS:
+            raise ValueError(f"unknown ZED resolution {val!r}")
+        return val
+
+    @staticmethod
+    def _branch(
+        cameras: dict[str, Any] | None, key: str, slot: str, global_on: bool
+    ) -> tuple[bool, str | None]:
+        """``(enabled, eyes)`` for one camera in one branch (stream / record).
+
+        ``cameras[key][slot]`` is per-camera participation: ``False`` / ``"off"``
+        opts the camera out; an eye name (``"both"`` / ``"left"`` / ``"right"``)
+        opts a stereo camera in with that eye selection; ``True`` (or absent,
+        the default) opts a mono camera in. The branch is only enabled when its
+        global resolution is set (``global_on``).
+        """
+        raw = ((cameras or {}).get(key) or {}).get(slot, True)
+        enabled = raw not in (False, None, "off", "")
+        eyes = raw if raw in ("both", "left", "right") else None
+        return (global_on and enabled), eyes
+
     def _merge_camera_args(
         self, args: dict[str, Any], cameras: dict[str, Any]
     ) -> dict[str, Any]:
         """Fold a camera spec into collect-data / run-policy form args.
 
-        Serials and the capture resolution map to dotted
-        ``robot_config.cameras.*`` keys that the command schema already emits,
-        so the resulting argv is parsed like any CLI override. Whether the
-        overhead is stereo is auto-detected from its serial (see
-        :func:`almond_axol.zed.stereo_serials`) rather than flagged by hand.
+        Serials, capture resolution, stereo flag, per-branch enable, and per-eye
+        selection map to dotted ``robot_config.cameras.*`` keys the command
+        schema emits, so the result is parsed like any CLI override (those fields
+        are hidden from the UI's generated form — the Cameras dialog owns them).
+        Whether a slot is stereo is auto-detected from its serial (see
+        :func:`almond_axol.zed.stereo_serials`).
+
+        Streaming (the headset) and recording (the dataset) are configured
+        independently, globally and per camera:
+
+        - ``stream_resolution`` / ``record_resolution`` set the capture and
+          dataset-downscale resolutions; ``"off"`` (or unset) disables that whole
+          branch. ``record_resolution`` maps to collect-data's top-level
+          ``dataset_resolution`` (run-policy has no such field; ``build_argv``
+          drops the unknown key there).
+        - ``stream`` / ``record`` are per-slot maps deciding which cameras (and,
+          for stereo, which eyes) take part — mapping to ``cameras.<slot>.stream``
+          / ``.record`` plus ``.stream_eyes`` (headset) and ``.eyes`` (dataset).
+
+        A camera that takes part in neither branch is omitted entirely. Capture
+        resolution per camera is the streaming resolution when it streams, else
+        the recording resolution (no point grabbing larger than it records).
         """
+        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+
         merged = dict(args)
         serials = self._camera_serials(cameras)
-        for slot, serial in serials.items():
-            merged[f"robot_config.cameras.{slot}.serial"] = serial
-        overhead = serials.get("overhead")
-        if overhead is not None and overhead in stereo_serials():
-            merged["robot_config.cameras.overhead.stereo"] = True
-        resolution = str(cameras.get("resolution") or "").strip()
-        if resolution:
-            from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        stream_res = self._resolution(cameras, "stream_resolution", legacy="resolution")
+        record_res = self._resolution(cameras, "record_resolution")
+        detected = stereo_serials()
 
-            dims = ZED_RESOLUTION_DIMS.get(resolution)
-            if dims is None:
-                raise ValueError(f"unknown ZED resolution {resolution!r}")
-            for slot in serials or _CAMERA_SLOTS:
-                merged[f"robot_config.cameras.{slot}.width"] = dims[0]
-                merged[f"robot_config.cameras.{slot}.height"] = dims[1]
+        for slot, serial in serials.items():
+            streams, s_eyes = self._branch(
+                cameras, "stream", slot, stream_res is not None
+            )
+            records, r_eyes = self._branch(
+                cameras, "record", slot, record_res is not None
+            )
+            if not (streams or records):
+                continue  # disabled in both branches → don't open this camera
+            prefix = f"robot_config.cameras.{slot}"
+            merged[f"{prefix}.serial"] = serial
+            merged[f"{prefix}.stream"] = streams
+            merged[f"{prefix}.record"] = records
+            if serial in detected:
+                # Flag stereo explicitly so apply_detected_stereo leaves our eye
+                # selection untouched. Recorded eyes default to the head/wrist
+                # policy when omitted; stream eyes default to follow them.
+                merged[f"{prefix}.stereo"] = True
+                merged[f"{prefix}.eyes"] = r_eyes or (
+                    "both" if slot == "overhead" else "left"
+                )
+                if s_eyes is not None:
+                    merged[f"{prefix}.stream_eyes"] = s_eyes
+            # Capture at the streaming resolution when the camera streams,
+            # otherwise at the (smaller) recording resolution.
+            cap = stream_res if streams else record_res
+            if cap:
+                dims = ZED_RESOLUTION_DIMS[cap]
+                merged[f"{prefix}.width"] = dims[0]
+                merged[f"{prefix}.height"] = dims[1]
+
+        if record_res is not None:
+            merged["dataset_resolution"] = record_res
         return merged
 
     def _attach_cameras_to_teleop(
@@ -469,28 +549,42 @@ class OperationRunner:
     ) -> None:
         """Point teleop's headset video at the configured local ZED cameras.
 
-        Teleop's ``cameras`` field is a dict (not reachable via flat argv), so
-        the configured serials are written onto the built config directly.
+        Teleop only streams (no recording), so only the streaming branch applies:
+        cameras opted out of streaming (or all, when streaming is globally off)
+        are left off the headset feed. Teleop's ``cameras`` / ``camera_eyes``
+        fields are dicts (not reachable via flat argv), so they're written onto
+        the built config directly.
         """
         serials = self._camera_serials(cameras)
         if not serials:
             return
-        cfg.cameras = serials
-        # A stereo ZED X at the head streams both eyes per-lens; a stereo ZED X
-        # at a wrist streams only its left eye (one feed, like a mono camera) so
-        # wrist cost stays flat regardless of camera type. teleop auto-detects
-        # stereo per serial, so this is just the operator-facing note. See
-        # ``cli.teleop._stereo_serials_for`` / ``_stereo_eyes_for``.
+        stream_res = self._resolution(cameras, "stream_resolution", legacy="resolution")
         detected = stereo_serials()
-        stereo_slots = sorted(s for s, serial in serials.items() if serial in detected)
-        resolution = str((cameras or {}).get("resolution") or "").strip()
-        if resolution:
-            cfg.resolution = resolution
+        cam_map: dict[str, int] = {}
+        camera_eyes: dict[str, str] = {}
+        for slot, serial in serials.items():
+            streams, s_eyes = self._branch(
+                cameras, "stream", slot, stream_res is not None
+            )
+            if not streams:
+                continue
+            cam_map[slot] = serial
+            if serial in detected and s_eyes is not None:
+                camera_eyes[slot] = s_eyes
+        if not cam_map:
+            session.emit("[serve] teleop: streaming disabled (no cameras)")
+            return
+        cfg.cameras = cam_map
+        if camera_eyes:
+            cfg.camera_eyes = camera_eyes
+        if stream_res:
+            cfg.resolution = stream_res
+        stereo_slots = sorted(s for s in cam_map if cam_map[s] in detected)
         stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
-        resolution_note = f" @ {resolution}" if resolution else ""
+        resolution_note = f" @ {stream_res}" if stream_res else ""
         session.emit(
             "[serve] teleop: streaming cameras to the headset "
-            f"({', '.join(sorted(serials))}){stereo_note}{resolution_note}"
+            f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}"
         )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:

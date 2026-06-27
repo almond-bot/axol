@@ -843,6 +843,13 @@ def _run(
         from ..zed import stereo_serials
 
         robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
+        if not robot_config.observation_cameras():
+            raise ValueError(
+                "run-policy has no camera with recording enabled — every assigned "
+                "camera is set to stream-only (or recording is turned off). The "
+                "policy needs the cameras it was trained on; enable recording for "
+                "them in the Cameras dialog."
+            )
 
     robot = AxolRobot(robot_config)
     _, robot_action_proc, robot_obs_proc = make_default_processors()

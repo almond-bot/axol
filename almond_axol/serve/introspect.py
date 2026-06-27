@@ -267,6 +267,42 @@ def _make_node(
     }
 
 
+# Config fields the control panel's Cameras dialog owns end-to-end (serials,
+# stream/record resolution, per-eye stream/record selection). They are hidden
+# from the generated "optional config" form so there is a single source of
+# truth — but they must stay in the Schema's ``emit`` map (the runner still
+# folds the camera spec into these dotted overrides), so the hiding is a
+# display-only prune applied after ``emit`` is built. Matched as a full key or
+# a dotted prefix, covering teleop (``cameras`` / ``camera_eyes`` /
+# ``resolution``), collect-data (``dataset_resolution``), and collect-data /
+# run-policy (``robot_config.cameras`` and its per-camera leaves).
+_HIDDEN_FORM_KEYS: frozenset[str] = frozenset(
+    {
+        "cameras",
+        "camera_eyes",
+        "resolution",
+        "dataset_resolution",
+        "robot_config.cameras",
+    }
+)
+
+
+def _is_hidden_form_key(key: str) -> bool:
+    return any(key == k or key.startswith(k + ".") for k in _HIDDEN_FORM_KEYS)
+
+
+def _prune_hidden(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop camera-owned nodes from a form node tree (display only)."""
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        if _is_hidden_form_key(node["key"]):
+            continue
+        if node["kind"] == "group":
+            node = {**node, "children": _prune_hidden(node["children"])}
+        out.append(node)
+    return out
+
+
 def _collect_leaf_keys(nodes: list[dict[str, Any]], out: set[str]) -> None:
     for node in nodes:
         if node["kind"] == "group":
@@ -312,6 +348,11 @@ def build_schema(config_class: type) -> Schema:
             }
         else:
             emit[key] = {"t": "opt", "flag": f"--{key}"}
+    # Hide camera-owned fields from the displayed form, but keep every leaf in
+    # ``emit`` above so the runner can still translate the camera spec into the
+    # corresponding ``--robot_config.cameras.*`` / ``--dataset_resolution``
+    # overrides. None of the hidden fields are required.
+    nodes = _prune_hidden(nodes)
     return Schema(nodes=nodes, required=sorted(required), emit=emit)
 
 

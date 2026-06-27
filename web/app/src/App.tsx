@@ -439,6 +439,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const cam = gl.xr.getCamera()
     const textures = texturesRef.current
 
+    // A camera is "available" once the relay has offered a track for it (its
+    // texture exists). The relay only offers the cameras actually being streamed,
+    // so we use this to (a) refuse to switch to a view whose camera isn't
+    // streamed and (b) only show the connecting spinner for cameras we're
+    // genuinely waiting on — never ones that will never arrive (e.g. wrist views
+    // when only the overhead is streamed).
+    const has = (name: string) => !!textures[name]
+    const modeAvailable = (m: ViewMode): boolean => {
+      if (m === "overhead") return has("overhead_left") || has("overhead_right") || has("overhead")
+      if (m === "left") return has("left_arm")
+      if (m === "right") return has("right_arm")
+      if (m === "split") return has("left_arm") || has("right_arm")
+      return true // "default" passthrough needs no camera
+    }
+
     // World-anchor the screen group once per session: place it at the head
     // with a yaw-only orientation. After that the screens stay put like TVs —
     // the operator can look around freely. The loading spinner stays
@@ -473,8 +488,13 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       let target: ViewMode
       if (Math.abs(sy) > Math.abs(sx)) target = sy < 0 ? "overhead" : "split"
       else target = sx < 0 ? "left" : "right"
-      viewModeRef.current = viewModeRef.current === target ? "default" : target
-      grabRef.current = null
+      // Ignore a flick toward a camera that isn't being streamed, so the operator
+      // can't land on a view that would just sit on "Connecting camera…".
+      // "default" (passthrough) is always reachable.
+      if (modeAvailable(target)) {
+        viewModeRef.current = viewModeRef.current === target ? "default" : target
+        grabRef.current = null
+      }
     }
     rightStickActiveRef.current = stickActive
 
@@ -497,7 +517,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       return t && v && v.videoWidth ? t : undefined
     }
 
-    // Which cams a mode needs to be considered "live" (vs showing the spinner).
+    // Which cams the current mode needs decoded before it draws (otherwise the
+    // view is just passthrough). "default" shows the wrist PiPs when present.
     let live: boolean
     if (mode === "overhead") live = !!(liveTex("overhead_left") ?? liveTex("overhead"))
     else if (mode === "left") live = !!liveTex("left_arm")
@@ -505,9 +526,18 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     else live = !!(liveTex("left_arm") ?? liveTex("right_arm")) // default, split
 
     group.visible = presenting && live
-    // Spinner: presenting, frames not yet flowing, and the server hasn't said
-    // there's no video to expect.
-    spinner.visible = presenting && !live && available !== false
+
+    // "Connecting cameras…" is a global indicator, independent of the current
+    // view: show it while video is still being negotiated (available === null),
+    // or while any camera that IS being streamed hasn't produced its first frame
+    // yet. So streaming only the overhead still shows the spinner in the default
+    // view until the overhead appears, then it goes away. It's hidden once every
+    // streamed camera is live, and entirely when the server reports no video
+    // (available === false — nothing is streaming).
+    const streamed = Object.keys(textures)
+    const allLive = streamed.length > 0 && streamed.every((n) => !!liveTex(n))
+    const connecting = available === null || (available === true && !allLive)
+    spinner.visible = presenting && connecting
     if (spinner.visible && spinnerMeshRef.current) {
       spinnerMeshRef.current.rotation.z -= 0.12
     }
@@ -744,7 +774,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           material-depthTest={false}
           {...hudBg}
         >
-          Connecting camera…
+          Connecting cameras…
         </HudText>
       </group>
     </>

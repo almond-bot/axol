@@ -41,7 +41,10 @@ type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
-  resolution: "SVGA",
+  stream_resolution: "SVGA",
+  record_resolution: "SVGA",
+  stream: {},
+  record: {},
 }
 
 function loadCameras(): CameraSpec {
@@ -53,6 +56,13 @@ function loadCameras(): CameraSpec {
         ...DEFAULT_CAMERAS,
         ...parsed,
         serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
+        // Migrate the legacy single `resolution` to the streaming resolution.
+        stream_resolution:
+          parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
+        record_resolution: parsed.record_resolution ?? DEFAULT_CAMERAS.record_resolution,
+        // Migrate the earlier per-eye maps to the per-branch participation maps.
+        stream: { ...(parsed.stream ?? parsed.stream_eyes ?? {}) },
+        record: { ...(parsed.record ?? parsed.record_eyes ?? {}) },
       }
     }
   } catch {

@@ -38,6 +38,14 @@ VR_PORT = 8000
 _BIND_RETRIES = 12
 _BIND_RETRY_DELAY = 0.25  # seconds between attempts
 
+# Listening sockets we bound on a fixed port, kept so a later bind can reclaim a
+# port our *own* process leaked. The in-process servers (the VR server lives on
+# a worker thread inside ``axol serve``) are torn down between operations, but a
+# stopped/timed-out op can leave its uvicorn server still holding the socket —
+# and ``reclaim_port`` deliberately never SIGKILLs our own PID, so it can't
+# evict it. Closing the leaked socket fd here frees the bind for the next op.
+_owned_listen_sockets: dict[int, socket.socket] = {}
+
 
 def listening_pids(port: int) -> set[int]:
     """PIDs (other than our own) with a LISTEN socket on ``port``.
@@ -106,8 +114,9 @@ def open_listen_socket(host: str, port: int) -> socket.socket:
     yet; uvicorn/asyncio call ``listen()`` when they adopt it.
 
     The retry/reclaim sequence: bind immediately (the normal case), then retry
-    briefly to let a previous server finish releasing the socket, then evict any
-    process still holding it, then keep retrying until it's ours.
+    briefly to let a previous server finish releasing the socket, closing any
+    socket *we* still hold on the port (a leaked in-process server), then evict
+    any other process still holding it, then keep retrying until it's ours.
     """
     last_exc: OSError | None = None
     for attempt in range(_BIND_RETRIES):
@@ -122,12 +131,27 @@ def open_listen_socket(host: str, port: int) -> socket.socket:
             if exc.errno != errno.EADDRINUSE:
                 raise
             last_exc = exc
+            # First free a socket our own process leaked on this port — a
+            # previous op's server that didn't fully tear down (reclaim_port
+            # can't evict our own PID). Closing the fd releases the bind.
+            stale = _owned_listen_sockets.pop(port, None)
+            if stale is not None:
+                _logger.warning(
+                    "port %d still held by a previous in-process server; "
+                    "closing the leaked socket to reclaim it",
+                    port,
+                )
+                try:
+                    stale.close()
+                except OSError:
+                    pass
             # Attempt 0: just wait for a mid-shutdown server to let go.
-            # From attempt 1 on, actively evict the squatter.
+            # From attempt 1 on, actively evict any *other* process squatting.
             if attempt >= 1:
                 reclaim_port(port)
             time.sleep(_BIND_RETRY_DELAY)
             continue
+        _owned_listen_sockets[port] = sock
         return sock
     raise OSError(
         errno.EADDRINUSE,

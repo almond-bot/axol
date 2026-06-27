@@ -63,10 +63,26 @@ class ZedCameraConfig(CameraConfig):
         stereo:     Open the camera as a stereo ZED X. The robot expands a
                     stereo camera ``X`` into observation keys backed by a
                     single grab (see ``eyes``). Default False (mono ZED-X One).
-        eyes:       Which eye(s) of a stereo camera to expose as observations.
+        eyes:       Which eye(s) of a stereo camera to expose as **recorded**
+                    observations (the dataset / what a policy is trained on).
                     ``"both"`` (default) yields ``X_left`` and ``X_right``;
                     ``"left"`` yields only ``X_left``; ``"right"`` yields only
                     ``X_right``. Ignored when ``stereo`` is False.
+        stream_eyes: Which eye(s) of a stereo camera to **stream** to the VR
+                    headset, independently of ``eyes``. ``None`` (default) means
+                    follow ``eyes`` (the legacy coupled behaviour). Setting it
+                    decouples the headset feed from the recording — e.g. stream
+                    ``"both"`` for depth perception in teleop while recording
+                    only ``"left"`` (or vice versa). Only the collect-data /
+                    teleop relay honours this; run-policy streams no video.
+                    Ignored when ``stereo`` is False.
+        record:     Whether this camera is recorded to the dataset at all.
+                    ``False`` drops it from the recorded observations
+                    (``observation_cameras``) while still allowing it to stream.
+                    Default True.
+        stream:     Whether this camera is streamed to the headset at all.
+                    ``False`` drops it from the relay's encoded feed while still
+                    allowing it to be recorded. Default True.
     """
 
     # 0 is the "unassigned" sentinel. collect-data / run-policy seed all three
@@ -83,6 +99,9 @@ class ZedCameraConfig(CameraConfig):
     warmup_s: int = 1
     stereo: bool = False
     eyes: StereoEyes = "both"
+    stream_eyes: StereoEyes | None = None
+    record: bool = True
+    stream: bool = True
 
     def __post_init__(self) -> None:
         self.color_mode = ColorMode(self.color_mode)
@@ -90,6 +109,19 @@ class ZedCameraConfig(CameraConfig):
             raise ValueError(
                 f"eyes must be one of 'both', 'left', 'right'; got {self.eyes!r}."
             )
+        if self.stream_eyes is not None and self.stream_eyes not in (
+            "both",
+            "left",
+            "right",
+        ):
+            raise ValueError(
+                "stream_eyes must be None or one of 'both', 'left', 'right'; "
+                f"got {self.stream_eyes!r}."
+            )
+
+    def streaming_eyes(self) -> StereoEyes:
+        """Eye selection for the headset stream (falls back to ``eyes``)."""
+        return self.stream_eyes or self.eyes
 
     def resolution_name(self) -> str | None:
         """Resolution name for the configured dims (``None`` = auto-detect)."""

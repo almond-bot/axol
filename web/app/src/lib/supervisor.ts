@@ -238,15 +238,45 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
+/** Which eye(s) of a stereo ZED X to use, per branch. */
+export type StereoEyes = "both" | "left" | "right"
+
+export type CameraSlot = "overhead" | "left_arm" | "right_arm"
+
+/** Per-camera participation in a branch (streaming or recording):
+ * - `false` — camera opted out of this branch.
+ * - `true` — mono camera opted in.
+ * - an eye name — stereo camera opted in with that eye selection.
+ */
+export type BranchSel = boolean | StereoEyes
+
+/** "off" disables a whole branch (streaming or recording) globally. */
+export const RESOLUTION_OFF = "off"
+
 /** Local camera setup forwarded with op starts (see serve/runner.py).
  *
  * The serials map camera slots to the ZED cameras attached to the serve
- * machine; the runner folds them into the operation's config (collect-data /
- * run-policy record whichever slots are assigned and need at least one, teleop
- * streams whichever are set to the headset).
+ * machine. Streaming (the headset feed) and recording (the dataset) are
+ * configured independently — globally and per camera:
+ *
+ * - `stream_resolution` / `record_resolution` set the capture and dataset
+ *   resolutions; `"off"` disables that whole branch.
+ * - `stream` / `record` decide, per slot, whether the camera takes part (and,
+ *   for stereo, which eyes) — so an operator can stream both eyes for depth
+ *   while recording one, stream a camera without recording it (or vice versa),
+ *   or turn either branch off entirely.
  */
 export interface CameraSpec {
-  serials: { overhead: string; left_arm: string; right_arm: string }
+  serials: Record<CameraSlot, string>
+  /** Capture resolution → headset stream (full quality), or `"off"`. */
+  stream_resolution?: string
+  /** Dataset downscale target (collect-data recording), or `"off"`. */
+  record_resolution?: string
+  /** Per-slot streaming participation (headset feed). */
+  stream?: Partial<Record<CameraSlot, BranchSel>>
+  /** Per-slot recording participation (dataset). */
+  record?: Partial<Record<CameraSlot, BranchSel>>
+  /** @deprecated legacy single resolution; read as `stream_resolution`. */
   resolution?: string
 }
 
