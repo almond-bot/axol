@@ -34,7 +34,6 @@ import json
 import logging
 import os
 import socket
-import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -75,14 +74,14 @@ class VRServer:
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
-        # USB is the preferred pose transport; the network connection is a hot
-        # standby. The headset sends every frame over both, so we only switch to
-        # network frames once the wired (loopback) stream has gone quiet for
-        # longer than this, and switch straight back when USB resumes.
-        self._usb_fallback_timeout = config.usb_fallback_timeout_s
-        # Monotonic timestamp of the last frame received over the USB tunnel.
-        # ``-inf`` means "never", so a pure-network session falls back instantly.
-        self._last_usb_recv: float = float("-inf")
+        # The headset streams identical frames (same ``seq``) over both the USB
+        # tunnel and WiFi. We process each ``seq`` once, from whichever link
+        # delivers it first — the lower-latency one, i.e. USB while it is up and
+        # WiFi the instant USB goes quiet. ``_last_seq`` is the highest seq
+        # processed so far; later/duplicate copies (seq <= it) are dropped. Reset
+        # to ``None`` when all clients disconnect so a reloaded headset (whose
+        # counter restarts) isn't locked out.
+        self._last_seq: int | None = None
         # Which transport currently owns ``_latest_frame``; logged on switch.
         self._active_usb: bool | None = None
 
@@ -245,6 +244,10 @@ class VRServer:
 
         self._client_count = 0
         self._active_clients.clear()
+        # Fresh session next enable(): don't gate a reloaded headset's restarted
+        # seq counter against a stale high-water mark.
+        self._last_seq = None
+        self._active_usb = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -284,27 +287,25 @@ class VRServer:
             _logger.warning("invalid frame: %s", exc)
             return
 
-        # The headset streams identical frames over both the wired USB tunnel
-        # (which reaches us from loopback) and the WiFi connection. Prefer USB
-        # and treat the network as a hot standby: accept network frames only
-        # once the USB stream has gone quiet, so a USB drop fails over to WiFi
-        # without a reconnect, and USB reclaims the link the moment it resumes.
-        now = time.monotonic()
+        # The headset streams identical frames (same ``seq``) over both the
+        # wired USB tunnel (which reaches us from loopback) and WiFi. Process
+        # each seq once, from whichever link delivered it first: USB wins while
+        # it is live (lower latency), and the moment USB goes quiet the next
+        # WiFi frame is the first arrival for its seq and takes over with no
+        # reconnect. Dropping the slower duplicate also means ``on_frame`` (the
+        # reset/recording state-edge latches) fires exactly once per frame, and
+        # a link that resumes mid-stream can't rewind ``_latest_frame`` to a
+        # stale pose. Frames without a seq (non-headset senders) skip dedup.
+        seq = frame.seq
+        if seq is not None:
+            if self._last_seq is not None and seq <= self._last_seq:
+                return
+            self._last_seq = seq
+
         is_usb = self._is_usb_client(websocket)
-        if is_usb:
-            self._last_usb_recv = now
-            active = True
-        else:
-            active = (now - self._last_usb_recv) > self._usb_fallback_timeout
-
-        if not active:
-            return
-
         if self._active_usb is not is_usb:
             self._active_usb = is_usb
-            _logger.info(
-                "pose source -> %s", "USB" if is_usb else "network (USB quiet)"
-            )
+            _logger.info("pose source -> %s", "USB" if is_usb else "network")
 
         self._latest_frame = frame
         if self._on_frame is not None:
@@ -385,6 +386,13 @@ class VRServer:
             finally:
                 server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
+                # With no clients left, forget the seq high-water mark so a
+                # reconnecting/reloaded headset (whose counter restarts low)
+                # isn't dropped as stale. A USB→WiFi failover keeps one client
+                # connected, so it doesn't reset here.
+                if server._client_count == 0:
+                    server._last_seq = None
+                    server._active_usb = None
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
 

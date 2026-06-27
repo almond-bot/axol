@@ -89,6 +89,7 @@ Each frame sends a JSON message over the WebSocket:
   r_grip:  number    // right grip
   reset:   boolean   // true on the frame X was pressed
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
+  seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
 }
 ```
 

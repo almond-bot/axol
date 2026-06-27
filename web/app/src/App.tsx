@@ -1082,7 +1082,9 @@ export default function App() {
                       >
                         {poseStatus === AxolConnectionStatus.Open
                           ? "controller over cable"
-                          : "WiFi fallback — USB link down"}
+                          : poseStatus === AxolConnectionStatus.Connecting
+                            ? "connecting USB link… (on WiFi)"
+                            : "WiFi fallback — USB link down"}
                       </span>
                     </p>
                     {poseStatus !== AxolConnectionStatus.Open && (

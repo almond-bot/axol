@@ -71,6 +71,11 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
+        seq:     Monotonically increasing frame counter set by the headset. The
+            headset streams identical frames (same ``seq``) over both the USB
+            and WiFi links; the server uses ``seq`` to process each logical
+            frame exactly once, via whichever link delivers it first. ``None``
+            for senders that don't set it (then no cross-link de-duplication).
     """
 
     l_ee: VRPose
@@ -83,3 +88,4 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
+    seq: int | None = None
