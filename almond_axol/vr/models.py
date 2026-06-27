@@ -74,10 +74,13 @@ class VRFrame(BaseModel):
         t:       Client capture timestamp in milliseconds (``performance.now()``).
             Used by the server's pose interpolator to reconstruct the true motion
             cadence when frames arrive batched/jittered over the network. Optional:
-            transports that don't stamp it (e.g. the USB link, or an older web
-            build) fall back to "latest-wins" with no interpolation.
-        seq:     Monotonic per-connection frame counter from the headset. Optional;
-            used only to order/deduplicate frames within a burst.
+            transports that don't stamp it (an older web build) fall back to
+            "latest-wins" with no interpolation.
+        seq:     Monotonically increasing frame counter set by the headset. The
+            headset streams identical frames (same ``seq``) over both the USB
+            and network transports; the server processes each logical frame
+            exactly once, via whichever transport delivers it first. ``None``
+            for senders that don't set it (then no cross-transport de-duplication).
     """
 
     l_ee: VRPose

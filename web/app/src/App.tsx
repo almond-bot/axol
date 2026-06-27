@@ -1067,12 +1067,7 @@ export default function App() {
 
             {status === AxolConnectionStatus.Open ? (
               <div className="flex flex-col gap-2">
-                <Button
-                  size="lg"
-                  className="w-full"
-                  onClick={() => store.enterAR()}
-                  disabled={usbPoses && poseStatus !== AxolConnectionStatus.Open}
-                >
+                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
                   <Headset />
                   Enter VR
                 </Button>
@@ -1093,7 +1088,9 @@ export default function App() {
                       >
                         {poseStatus === AxolConnectionStatus.Open
                           ? "controller over cable"
-                          : "waiting for USB link…"}
+                          : poseStatus === AxolConnectionStatus.Connecting
+                            ? "connecting USB link… (on WiFi)"
+                            : "WiFi fallback — USB link down"}
                       </span>
                     </p>
                     {poseStatus !== AxolConnectionStatus.Open && (
@@ -1210,7 +1207,6 @@ export default function App() {
               wsRef={wsRef}
               poseWsRef={poseWsRef}
               poseChannelRef={poseChannelRef}
-              usbOnly={usbPoses}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
               onExit={() => store.getState().session?.end()}

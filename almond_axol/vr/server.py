@@ -77,6 +77,16 @@ class VRServer:
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
+        # The headset streams identical frames (same ``seq``) over both the USB
+        # tunnel and the network (WebRTC data channel / WebSocket). We process
+        # each ``seq`` once, from whichever transport delivers it first — the
+        # lower-latency one, i.e. USB while the cable is up and the network the
+        # instant USB goes quiet. ``_last_seq`` is the highest seq processed so
+        # far; later/duplicate copies (seq <= it) are dropped. Reset to ``None``
+        # when all clients disconnect so a reloaded headset (whose counter
+        # restarts) isn't locked out.
+        self._last_seq: int | None = None
+
         self._latest_frame: VRFrame | None = None
         # Adaptive playout buffer: reconstructs a smooth pose stream from
         # batched/jittered network arrivals. Consumers that want smoothing read
@@ -101,7 +111,12 @@ class VRServer:
     # ------------------------------------------------------------------
 
     def get_frame(self) -> VRFrame | None:
-        """Return the most recent frame received, or None if none yet."""
+        """Return the most recent frame received, or None if none yet.
+
+        When the headset streams over both USB and the network, this is the
+        first-arriving copy of each frame — USB while the cable is up, the
+        network fallback once USB goes quiet (see :meth:`_ingest_frame_obj`).
+        """
         return self._latest_frame
 
     def get_render_frame(self) -> VRFrame | None:
@@ -254,6 +269,9 @@ class VRServer:
 
         self._client_count = 0
         self._active_clients.clear()
+        # Fresh session next enable(): don't gate a reloaded headset's restarted
+        # seq counter against a stale high-water mark.
+        self._last_seq = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -296,6 +314,23 @@ class VRServer:
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
             return
+
+        # The headset streams identical frames (same ``seq``) over both the
+        # wired USB tunnel and the network (WebRTC data channel / WebSocket).
+        # Process each seq once, from whichever transport delivered it first:
+        # USB wins while the cable is up (lower latency), and the moment USB
+        # goes quiet the next network frame is the first arrival for its seq and
+        # takes over with no reconnect. Dropping the slower duplicate also means
+        # ``on_frame`` (the reset/recording state-edge latches) fires exactly
+        # once per frame, the interpolator buffers each capture once, and a
+        # transport that resumes mid-stream can't rewind to a stale pose. Frames
+        # without a seq (non-headset senders) skip dedup.
+        seq = frame.seq
+        if seq is not None:
+            if self._last_seq is not None and seq <= self._last_seq:
+                return
+            self._last_seq = seq
+
         self._latest_frame = frame
         self._interp.push(frame)
         if self._on_frame is not None:
@@ -415,9 +450,13 @@ class VRServer:
                 # Last operator gone: drop buffered pose state so a fresh
                 # session's capture timestamps aren't blended with this one's
                 # stale frames (which would drive IK with incoherent poses
-                # until the playout buffer drains).
+                # until the playout buffer drains), and forget the seq
+                # high-water mark so a reloaded headset (whose counter restarts
+                # low) isn't dropped as stale. A USB→network failover keeps one
+                # client connected, so it doesn't reset here.
                 if server._client_count == 0:
                     server._latest_frame = None
+                    server._last_seq = None
                     server._interp.reset()
 
         return app

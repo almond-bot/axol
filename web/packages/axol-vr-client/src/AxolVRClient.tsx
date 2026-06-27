@@ -10,20 +10,22 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 // the minimal shape AxolVRClient needs to ship a frame.
 type PoseSink = { send: (data: string) => void }
 
-/** Choose the pose transport: USB (exclusive) → data channel → WebSocket. */
-function pickPoseSink(
-  usbOnly: boolean,
-  poseWsRef: RefObject<WebSocket | null> | undefined,
+/** Best open network pose transport: the low-latency WebRTC data channel when
+ *  open (UDP; right path over a relayed Funnel, equal-or-better on a LAN),
+ *  otherwise the main WebSocket. Null when neither is up. */
+function pickNetworkSink(
   poseChannelRef: RefObject<RTCDataChannel | null> | undefined,
   wsRef: RefObject<WebSocket | null>
 ): PoseSink | null {
-  if (usbOnly) {
-    const ws = poseWsRef?.current
-    return ws && ws.readyState === WebSocket.OPEN ? ws : null
-  }
   const channel = poseChannelRef?.current
   if (channel && channel.readyState === "open") return channel
   const ws = wsRef.current
+  return ws && ws.readyState === WebSocket.OPEN ? ws : null
+}
+
+/** USB pose transport (the Quest-over-USB `adb reverse` WebSocket) when open. */
+function pickUsbSink(poseWsRef: RefObject<WebSocket | null> | undefined): PoseSink | null {
+  const ws = poseWsRef?.current
   return ws && ws.readyState === WebSocket.OPEN ? ws : null
 }
 
@@ -31,21 +33,20 @@ export function AxolVRClient({
   wsRef,
   poseWsRef,
   poseChannelRef,
-  usbOnly = false,
   onStateChange,
   onPendingRecording,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
-  // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel.
+  // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel. When
+  // present and open, each frame is sent over BOTH this and the best network
+  // transport below: the server de-dupes by seq and prefers the low-latency
+  // USB stream, falling back to the network frames the instant USB goes quiet,
+  // so a USB drop fails over with no reconnect.
   poseWsRef?: RefObject<WebSocket | null>
   // Low-latency WebRTC pose data channel (see useAxolControlChannel). Preferred
-  // over the main WebSocket when open; the WebSocket remains the fallback.
+  // network transport when open; the main WebSocket is the network fallback.
   poseChannelRef?: RefObject<RTCDataChannel | null>
-  // When true, pose frames go ONLY over `poseWsRef` (USB); they are never sent
-  // over the network WebSocket, so teleop pauses rather than silently falling
-  // back to WiFi when the USB link isn't up.
-  usbOnly?: boolean
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
   onExit?: () => void
@@ -180,15 +181,16 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    // Pick the pose transport, in priority order:
-    //  1. USB mode: ONLY the dedicated USB pose socket — never the network — so
-    //     teleop pauses rather than silently falling back to WiFi when the cable
-    //     link isn't up.
-    //  2. The WebRTC pose data channel when open (UDP, low-latency; the right
-    //     path over a relayed Funnel and equal-or-better on a LAN).
-    //  3. The main WebSocket as the always-available fallback.
-    const sink: PoseSink | null = pickPoseSink(usbOnly, poseWsRef, poseChannelRef, wsRef)
-    if (sink == null) return
+    // Send each frame over every open transport: the wired USB `adb reverse`
+    // tunnel for low latency, and the best network path (the WebRTC data
+    // channel when open, else the main WebSocket) as an always-live standby.
+    // The server de-dupes by seq and uses whichever arrives first — USB while
+    // the cable is up, the network the instant USB goes quiet — so a USB drop
+    // fails over with no reconnect. Bail early if neither is up so we skip
+    // reading poses.
+    const usbSink = pickUsbSink(poseWsRef)
+    const netSink = pickNetworkSink(poseChannelRef, wsRef)
+    if (usbSink == null && netSink == null) return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -225,25 +227,28 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    sink.send(
-      JSON.stringify({
-        l_ee,
-        r_ee,
-        l_elbow,
-        r_elbow,
-        l_lock,
-        r_lock,
-        l_grip,
-        r_grip,
-        reset,
-        state: stateRef.current,
-        seq: ++seqRef.current,
-        // Capture timestamp (ms). The server's pose interpolator uses this to
-        // reconstruct the true motion cadence when frames arrive batched over a
-        // jittery/relayed link, so teleop stays smooth instead of stuttering.
-        t: performance.now(),
-      })
-    )
+    // Serialise once so both transports carry the identical frame (same seq),
+    // letting the server treat them as one stream and de-dupe to whichever
+    // arrives first.
+    const payload = JSON.stringify({
+      l_ee,
+      r_ee,
+      l_elbow,
+      r_elbow,
+      l_lock,
+      r_lock,
+      l_grip,
+      r_grip,
+      reset,
+      state: stateRef.current,
+      seq: ++seqRef.current,
+      // Capture timestamp (ms). The server's pose interpolator uses this to
+      // reconstruct the true motion cadence when frames arrive batched over a
+      // jittery/relayed link, so teleop stays smooth instead of stuttering.
+      t: performance.now(),
+    })
+    usbSink?.send(payload)
+    netSink?.send(payload)
   })
 
   return null
