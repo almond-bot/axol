@@ -1,0 +1,59 @@
+---
+title: "Replay Dataset"
+description: "Replay a recorded LeRobot dataset episode on the arms — from the web control panel or the CLI."
+---
+
+Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight back onto the arms: the episode's recorded `action` column is streamed to the motors frame by frame, then the robot returns to its rest pose. It's the inverse of [data collection](/operations/data-collection) — instead of recording teleop actions it reproduces an already-recorded take on the hardware. You can launch it from the **web control panel** or the **CLI** (`axol replay-dataset`).
+
+No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.
+
+<Warning>
+  Replay drives the arms **open-loop** from the recorded actions — it does not watch the scene. Make sure the workspace is clear and roughly matches what the episode was recorded in before starting, and keep **Stop** (or `Ctrl+C`) within reach. Match the stiffness used at collection time so the arm tracks the same way it did when recorded.
+</Warning>
+
+## Before you start
+
+- **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
+- **A recorded dataset** to replay — either local under `--root` (`$HF_LEROBOT_HOME` by default) or pullable from the HuggingFace Hub by its `repo_id`. See [Data Collection](/operations/data-collection) to record one.
+
+## Run it
+
+<Tabs>
+  <Tab title="Control Panel">
+    <Steps>
+      <Step title="Connect the robot">
+        Connect the **Axol Host** and **Axol**. No cameras are needed for replay.
+      </Step>
+
+      <Step title="Select Replay Dataset and fill the fields">
+        Pick **Replay Dataset**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`) and the **episode** index (0-indexed). Playback fps, stiffness, and **loop** live under the **Optional** dropdown.
+      </Step>
+
+      <Step title="Start">
+        Clear the workspace, then press **Start**. The arm moves to rest, replays the episode at the recorded timing, and returns to rest. With **loop** on it repeats (returning to rest between takes) until you press **Stop**.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="CLI">
+    On the robot machine:
+
+    ```bash
+    axol replay-dataset --repo_id myorg/pick-place --episode 0
+    axol replay-dataset --repo_id myorg/pick-place --episode 0 --loop true   # loop until Ctrl+C
+    ```
+
+    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. Press `Ctrl+C` to stop — the arm returns to rest before exiting. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
+  </Tab>
+</Tabs>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
+    Record the episodes you replay here.
+  </Card>
+  <Card title="replay-dataset reference" icon="terminal" href="/cli/replay-dataset">
+    Every flag and the replay internals.
+  </Card>
+</CardGroup>

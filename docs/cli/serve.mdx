@@ -3,7 +3,7 @@ title: "serve"
 description: "Run the Axol web control panel — drive the robot from a browser instead of the terminal."
 ---
 
-Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, and policy inference — in-process.
+Runs the **Axol web control panel**: a small local server that lets you drive the robot from a browser instead of a terminal. It serves the built web UI and a JSON/WebSocket API that starts, streams, and stops the core operations — teleoperation, gravity compensation, data collection, dataset replay, and policy inference — in-process.
 
 With the [one-command install](/installation), this command already runs as a root systemd service (`axol.service`) that starts at boot, restarts automatically, and keeps itself in sync with the latest release — you don't run it by hand. Manual invocation is for development installs:
 

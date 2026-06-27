@@ -52,12 +52,14 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Stored-video bitrate budget, in bits per pixel-second (width*height*fps*bpp),
-# clamped to a sane range. Higher than the headset relay's ~0.12 bpp since this
-# is the training data we keep, not a bandwidth-constrained LAN stream.
-_BITRATE_BPP = 0.25
-_BITRATE_MIN = 6_000_000
-_BITRATE_MAX = 40_000_000
+# Constant-quality quantizer for the stored video, mirroring LeRobot's libx264
+# default (``crf=30``). nvv4l2h264enc has no CRF, so we disable rate control and
+# pin a fixed QP: the bitrate is then content-adaptive (a mostly-static teleop
+# scene stays small) instead of being padded to a fixed bitrate budget, which is
+# what made on-Jetson datasets several times larger than the upper-computer ones.
+# H.264 QP and x264 CRF share the same 0-51 scale, so 30 matches the CRF value;
+# nudge down for higher quality / larger files, up for smaller. See ALM-1164.
+_QP = 30
 
 # Per-camera feed-queue depth (frames). LeRobot's default is 30 (0.5 s at 60 fps),
 # too shallow to ride out the gst pipeline's spin-up: gst-launch takes ~1 s to
@@ -91,15 +93,7 @@ def hw_dataset_encoder_available() -> bool:
     return hw_h264_available()
 
 
-def _bitrate_for(width: int, height: int, fps: int) -> int:
-    return max(
-        _BITRATE_MIN, min(_BITRATE_MAX, int(width * height * fps * _BITRATE_BPP))
-    )
-
-
-def _gst_argv(
-    width: int, height: int, fps: int, bitrate: int, out_path: Path
-) -> list[str]:
+def _gst_argv(width: int, height: int, fps: int, qp: int, out_path: Path) -> list[str]:
     """``gst-launch-1.0`` argv: packed RGBA on stdin -> H.264 mp4 file.
 
     ``nvvidconv`` does the RGBA->NV12 colorspace conversion on the VIC and
@@ -131,7 +125,12 @@ def _gst_argv(
         "video/x-raw(memory:NVMM),format=NV12",
         "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         (
-            f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
+            # Constant-quality (fixed QP), not fixed-bitrate: ratecontrol-enable=false
+            # makes the quant-*-frames the encoder's constant quantizer, so bitrate
+            # tracks scene complexity like libx264's crf (see _QP). preset-level=1 is
+            # the fast NVENC preset; idrinterval keeps a ~1 s keyframe cadence.
+            f"nvv4l2h264enc ratecontrol-enable=false quant-i-frames={qp} "
+            f"quant-p-frames={qp} quant-b-frames={qp} preset-level=1 "
             f"insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
         ),
         "h264parse",
@@ -328,9 +327,8 @@ class _CameraNvencEncoder:
 
     def _start(self, width: int, height: int) -> None:
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
-        bitrate = _bitrate_for(width, height, self._fps)
         self._proc = subprocess.Popen(
-            _gst_argv(width, height, self._fps, bitrate, self.video_path),
+            _gst_argv(width, height, self._fps, _QP, self.video_path),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -342,12 +340,12 @@ class _CameraNvencEncoder:
         self._rgba = np.empty((height, width, 4), dtype=np.uint8)
         self._rgba[:, :, 3] = 255
         _logger.info(
-            "NVENC mp4 pipeline started: %s %dx%d@%dfps %.1f Mbps (pid %d)",
+            "NVENC mp4 pipeline started: %s %dx%d@%dfps qp=%d (pid %d)",
             self.video_path.name,
             width,
             height,
             self._fps,
-            bitrate / 1e6,
+            _QP,
             self._proc.pid,
         )
 

@@ -7,9 +7,6 @@ The **web control panel** is a browser UI for driving Axol without the terminal.
 
 It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
 
-{/* SCREENSHOT: control-panel-overview.png — full control panel (connections bar on top, an operation selected below) */}
-<img src="/assets/control-panel-overview.png" alt="Axol web control panel" />
-
 ## Start the server
 
 With the [one-command install](/installation), the server is already running on the robot machine (the computer wired to the robot, with the ZED cameras attached) as a root systemd service that starts at boot and restarts automatically — open [axol.almond.bot](https://axol.almond.bot) and connect to the host.
@@ -41,9 +38,6 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 ## Connections
 
 The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**, and **Quest USB** — each with a colored status dot.
-
-{/* SCREENSHOT: control-panel-connections.png — close-up of the connection tiles (Axol Host / Axol / Cameras / Quest USB) */}
-<img src="/assets/control-panel-connections.png" alt="Connection tiles: Axol Host, Axol, Cameras, Quest USB" />
 
 ### Axol Host
 
@@ -86,9 +80,6 @@ The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-
 ## Operations
 
 Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown. Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
-
-{/* SCREENSHOT: control-panel-operation.png — an operation (e.g. Collect Data) showing the settings form, the "Before you can start" blockers, and the Start button */}
-<img src="/assets/control-panel-operation.png" alt="Operation settings and start blockers" />
 
 | Operation | Needs | Notes |
 |---|---|---|
