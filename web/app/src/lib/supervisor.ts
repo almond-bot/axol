@@ -443,7 +443,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "replay-dataset",
     label: "Replay Dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
-    fields: ["repo_id", "episode", "fps"],
+    fields: ["repo_id", "episode", "fps", "loop"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,

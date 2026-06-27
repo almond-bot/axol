@@ -15,6 +15,10 @@ same place every episode does in ``collect-data`` (episodes are recorded from
 rest, so the first replayed action is ~rest and there's no jump). Each frame's
 action is sent at the dataset's recorded fps to reproduce the original timing,
 then a final return-to-rest leaves the arm parked.
+
+With ``--loop`` the episode replays continuously (returning to rest between
+takes) until stopped with Ctrl+C, or Stop in the control panel; either way the
+arm returns to the rest pose before the operation exits.
 """
 
 from __future__ import annotations
@@ -64,6 +68,10 @@ class ReplayDatasetConfig:
     # Playback rate. ``0`` (the default) replays at the dataset's recorded fps,
     # reproducing the original timing; set a positive value to override it.
     fps: int = 0
+    # Replay the episode on a loop until stopped (Ctrl+C, or Stop in the UI),
+    # returning to rest between takes. Off by default (a single replay). Either
+    # way the arm returns to the rest pose before the operation exits.
+    loop: bool = False
     log_level: LogLevel = "INFO"
 
 
@@ -156,49 +164,84 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
+    # Tracks whether the arm is currently parked at rest, so the teardown only
+    # adds a return-to-rest when one is actually needed (and not a redundant one
+    # right after a loop iteration already ended at rest).
+    rested = False
+
+    def _go_to_rest(message: str = "Returning to rest pose.") -> None:
+        nonlocal rested
+        log_say(message)
+        reset_controller.return_to_rest(robot)
+        rested = True
+
+    def _stopped() -> bool:
+        return stop_event.is_set()
+
     try:
         log_say("Connecting robot...")
         robot.connect()
 
-        log_say("Returning to rest pose.")
-        reset_controller.return_to_rest(robot)
-        if stop_event.is_set():
-            return
+        # Start every take from rest, the same place collect-data records from,
+        # so the first replayed action is ~rest and there's no jump.
+        _go_to_rest()
 
-        log_say(f"Replaying episode {episode}: {num_frames} frames at {fps} fps.")
+        loop = bool(cfg.loop)
         period = 1.0 / fps
-        completed = True
-        for idx in range(num_frames):
-            if stop_event.is_set():
-                log_say("Replay interrupted.")
-                completed = False
-                break
-            t0 = time.perf_counter()
-            action_array = actions[idx][ACTION]
-            action = {
-                name: float(action_array[i]) for i, name in enumerate(action_names)
-            }
-            robot.send_action(action)
-            time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+        iteration = 0
+        # Replay once, or repeatedly when ``loop`` is set, until stopped (Ctrl+C
+        # or the UI's Stop). The arm is parked at rest before the op exits — on a
+        # clean finish and on a stop alike — by the teardown below.
+        while not _stopped():
+            iteration += 1
+            rested = False
+            if loop:
+                log_say(
+                    f"Replaying episode {episode} (loop {iteration}): "
+                    f"{num_frames} frames at {fps} fps."
+                )
+            else:
+                log_say(
+                    f"Replaying episode {episode}: {num_frames} frames at {fps} fps."
+                )
+            for idx in range(num_frames):
+                if _stopped():
+                    break
+                t0 = time.perf_counter()
+                action_array = actions[idx][ACTION]
+                action = {
+                    name: float(action_array[i]) for i, name in enumerate(action_names)
+                }
+                robot.send_action(action)
+                time.sleep(max(0.0, period - (time.perf_counter() - t0)))
 
-        # Park the arm at rest on a clean finish (skip it on an interrupt: a stop
-        # force-kills the IK worker after a short grace, so don't start a move
-        # we can't complete — mirrors collect-data, which skips the rest move on
-        # stop too).
-        if completed:
-            log_say("Replay complete. Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            if not loop or _stopped():
+                break
+            # Looping: return to rest between takes so the next replay restarts
+            # smoothly from the recorded start pose.
+            _go_to_rest()
     except KeyboardInterrupt:
         pass
     finally:
         # Ignore SIGINT during cleanup so a second Ctrl+C can't abort partway
-        # through teardown (mirrors run-policy). Restored at the end.
+        # through the return-to-rest or teardown (mirrors run-policy).
         import signal
 
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except (ValueError, OSError):
             pass
+
+        # Park the arm at rest before killing the operation, unless it's already
+        # there (a loop iteration just ended at rest) or never moved (connect
+        # failed). The reset is planned by the IK worker (a quick round-trip) and
+        # then played locally, so it still completes if a slow stop's watchdog
+        # force-kills the worker mid-move.
+        if robot.is_connected and not rested:
+            try:
+                _go_to_rest("Replay finished. Returning to rest pose.")
+            except Exception:  # noqa: BLE001 - best-effort; still tear down
+                _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
         log_say("Stopping.")
         try:

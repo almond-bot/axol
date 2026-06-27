@@ -7,6 +7,8 @@ Replays one episode of an existing [LeRobot](https://github.com/huggingface/lero
 
 No cameras, teleop, or policy server are involved: replay only drives the arms, so the robot config carries no cameras. The robot is first moved to the rest pose (the same collision-aware return-to-rest [`run-policy`](/cli/run-policy) uses) so the arm starts where every recorded episode does — episodes are recorded from rest, so the first replayed action is ~rest and there's no jump. Each frame is sent at the dataset's recorded fps to reproduce the original timing, and a final return-to-rest leaves the arm parked.
 
+Pass `--loop` to replay the episode continuously (returning to rest between takes) until you stop it with `Ctrl+C` (or **Stop** in the [control panel](/guides/control-panel)); either way the arm returns to the rest pose before the operation exits.
+
 This command is configured via draccus. The robot subsystem is exposed as the nested `robot_config` config (CAN channels, per-joint gains) — nest into it with dots or pass a whole-config file. See [Command configuration](/cli/configuration).
 
 | Flag | Description |
@@ -14,6 +16,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--repo_id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
 | `--episode INT` | Index of the episode to replay (required) |
 | `--fps INT` | Playback frame rate. `0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. |
+| `--loop true` | Replay the episode continuously (returning to rest between takes) until stopped with `Ctrl+C` / **Stop**, then return to rest. Default: off (a single replay). |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Use `right_stiffness` for the right arm. Match the stiffness used at data-collection time so the arm tracks the recorded actions the same way. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
@@ -21,6 +24,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 
 ```bash
 axol replay-dataset --repo_id myorg/pick-place --episode 0
+axol replay-dataset --repo_id myorg/pick-place --episode 0 --loop true   # loop until Ctrl+C
 axol replay-dataset --repo_id myorg/pick-place --episode 3 --fps 30 \
     --robot_config.axol_config.left_stiffness 1.0 --robot_config.axol_config.right_stiffness 1.0
 ```
