@@ -17,7 +17,7 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--task TEXT` | Natural language task description (required) |
 | `--fps INT` | Dataset recording frame rate — camera frames captured at this rate (default: 60) |
 | `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600), downscaled from the camera capture on the GPU's VIC. SVGA is ~4× lighter to encode and store than `HD1200` while the **headset still gets the full-resolution stream**. Resuming an existing dataset keeps its original resolution regardless of this flag. |
-| `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Accepts any LeRobot codec (e.g. `auto`, `h264`, `libsvtav1`). On the Jetson `h264` is encoded on the NVENC hardware via GStreamer. |
+| `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Accepts any LeRobot codec (e.g. `auto`, `h264`, `libsvtav1`). On the Jetson `h264` is encoded on the NVENC hardware via GStreamer, in **constant-quality** mode (fixed QP 30, mirroring LeRobot's libx264 `crf=30`) so the bitrate tracks scene complexity and dataset sizes match a non-Jetson host's instead of a fixed bitrate budget. |
 | `--teleop_hz INT` | Motor command rate in Hz; decoupled from `--fps` for smooth control (default: 120) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push to HuggingFace Hub when done |
