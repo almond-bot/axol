@@ -3,7 +3,7 @@ axol gst.install
 
 Install the host-side GStreamer support the unified ZED camera pipeline needs
 (``teleop --cameras`` / ``collect-data``): the GStreamer introspection typelibs
-and **PyGObject**, so the in-process pipeline (:mod:`almond_axol.vr.gst_zed`)
+and **PyGObject**, so the in-process pipeline (:mod:`almond_axol.video.gst_zed`)
 can pull encoded + raw frames from an ``appsink``. The NVENC encoder
 (``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP, and the
 patched zed-gstreamer source elements (``zedxonesrc`` / ``zedsrc``) are built
@@ -97,7 +97,7 @@ def _gi_elements_ok(elements: tuple[str, ...]) -> bool:
     Checked in a subprocess so the result reflects a PyGObject that was just
     installed (importing it in this process would hit a stale import state).
     """
-    from ...vr.gst_zed import _set_typelib_path
+    from ...video.gst_zed import _set_typelib_path
 
     _set_typelib_path()  # ensure the child inherits the typelib search path
     els = ",".join(repr(e) for e in elements)

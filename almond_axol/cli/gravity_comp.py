@@ -23,8 +23,8 @@ import asyncio
 import logging
 import time
 
+from ..constants import ARM_JOINTS, Joint
 from ..robot import Axol
-from ..utils.shared import ARM_JOINTS, Joint
 from .config import GravityCompCmdConfig, parse
 
 

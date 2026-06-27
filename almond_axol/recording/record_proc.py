@@ -10,7 +10,7 @@ remaining jitter after the SVGA downscale + stats-off-hot-path fixes).
 This module moves all of that into a dedicated **recorder subprocess**
 (:class:`DatasetRecorderProcess`) so the control process only writes a tiny
 joint/action snapshot per tick (via
-:class:`~almond_axol.vr.shm_frames.SnapshotWriter`) and sends episode-lifecycle
+:class:`~almond_axol.video.shm_frames.SnapshotWriter`) and sends episode-lifecycle
 commands. The recorder pulls each camera's raw frames from the relay — via a gst
 ``shmsrc`` consumer (the relay's ``shmsink`` exports frames in C, so the relay
 does no Python per frame and its WebRTC send keeps its GIL), or, when gst's shm
@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-_logger = logging.getLogger("almond_axol.cli.collect_data")
+_logger = logging.getLogger("almond_axol.recording.record_proc")
 
 # Per-stream encoder thread count (three cameras each spawn their own encoder
 # thread); a small inner libx264 pool leaves cores for the control loop.
@@ -292,7 +292,7 @@ class _SnapshotPublisher:
 
     The control loop calls :meth:`write` every tick; the capture thread reads the
     latest via :meth:`read_latest`. Returns ``None`` before the first write. The
-    method names mirror :class:`~almond_axol.vr.shm_frames.SnapshotReader` so the
+    method names mirror :class:`~almond_axol.video.shm_frames.SnapshotReader` so the
     capture loop is identical in both paths.
     """
 
@@ -595,7 +595,7 @@ def _recorder_main(
 
     from lerobot.processor import make_default_processors
 
-    from ..vr.shm_frames import GstShmFrameReader, RawFrameReader, SnapshotReader
+    from ..video.shm_frames import GstShmFrameReader, RawFrameReader, SnapshotReader
 
     install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
@@ -731,7 +731,7 @@ class DatasetRecorderProcess:
         action_keys: list[str],
         config: dict,
     ) -> None:
-        from ..vr.shm_frames import SnapshotWriter
+        from ..video.shm_frames import SnapshotWriter
 
         self._snap = SnapshotWriter(obs_keys, action_keys)
         ctx = multiprocessing.get_context("spawn")

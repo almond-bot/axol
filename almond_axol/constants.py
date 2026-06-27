@@ -28,9 +28,7 @@ CAN_RIGHT = "can_alm_axol_r"
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
 
-URDF_PATH: Path = (
-    Path(__file__).resolve().parent.parent / "kinematics" / "urdf" / "axol.urdf"
-)
+URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"
 
 
 # Single source of truth for URDF joint and body names. All helpers

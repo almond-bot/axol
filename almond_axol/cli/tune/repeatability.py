@@ -32,14 +32,16 @@ import time
 
 import numpy as np
 
+from ...constants import ARM_JOINTS, Joint
 from ...kinematics.solver import KinematicsSolver
 from ...robot import Axol, closer_end_stop
 from ...robot.config import AxolConfig
 from ...teleop.config import VRTeleopConfig
 from ...teleop.trajectory import plan_collision_aware_trajectory
-from ...utils.shared import ARM_JOINTS, Joint
 
-_RATE_HZ = 250.0  # waypoint density — high for smooth playback (speed is set by --speed)
+_RATE_HZ = (
+    250.0  # waypoint density — high for smooth playback (speed is set by --speed)
+)
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — joint-space speed for planned trajectories
 _PLAN_MIN_DURATION = 0.5  # seconds — floor on planned trajectory duration
 

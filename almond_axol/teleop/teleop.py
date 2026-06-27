@@ -271,7 +271,7 @@ class VRTeleop:
         """Stream camera video via a pre-built WebRTC manager.
 
         Used with the out-of-process video relay
-        (:class:`almond_axol.vr.video_proc.VideoRelayProcess`) so encoding
+        (:class:`almond_axol.video.video_proc.VideoRelayProcess`) so encoding
         and RTP traffic never contend with the teleop control loops. Must
         be called after :meth:`enable`. Safe to call from any thread.
         """

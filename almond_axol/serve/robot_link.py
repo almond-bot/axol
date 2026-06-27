@@ -22,8 +22,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..constants import CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, Motor, MotorError
-from ..utils.shared import CAN_LEFT, CAN_RIGHT
 
 _logger = logging.getLogger(__name__)
 

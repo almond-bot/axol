@@ -7,7 +7,7 @@ Build and install the **patched** Stereolabs zed-gstreamer plugins
 Two reasons this exists rather than relying on a stock plugin install:
 
 1. A fresh Jetson has no zed-gstreamer plugins at all, so the GPU-resident
-   camera path (:mod:`almond_axol.vr.gst_zed`) silently falls back to the
+   camera path (:mod:`almond_axol.video.gst_zed`) silently falls back to the
    slower ZED SDK grab. Building them here makes the fast path available.
 2. The **stock** ``zedxonesrc`` / ``zedsrc`` stamp each buffer's PTS with a
    host-side software clock sampled right after ``grab()`` returns -- i.e.

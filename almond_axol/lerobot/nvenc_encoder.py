@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..vr.hw_video import hw_h264_available
+from ..video.hw_video import hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray

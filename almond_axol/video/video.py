@@ -11,7 +11,7 @@ Why aiortc (and not gstreamer ``webrtcbin``): aiortc owns the ICE / DTLS /
 SRTP transport in Python, which connects reliably on this multi-homed LAN
 (Tailscale + IPv6 link-local + two LAN NICs) where ``webrtcbin``'s libnice
 stalls in ICE "checking". On the SDK path, encoding still runs on the Jetson's
-hardware NVENC via :mod:`almond_axol.vr.hw_video` (a ``gst-launch``
+hardware NVENC via :mod:`almond_axol.video.hw_video` (a ``gst-launch``
 subprocess); pre-encoded sources skip it. Either way aiortc never encodes in
 software — it only packetizes and ships RTP.
 
@@ -57,12 +57,12 @@ from aiortc.mediastreams import (
 from av import VideoFrame
 from numpy.typing import NDArray
 
-from .hw_video import install_hw_encoder
-from .ice import (
+from ..vr.ice import (
     ice_servers,
     replicate_candidates_across_mlines,
     summarize_candidates,
 )
+from .hw_video import install_hw_encoder
 
 _logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def webrtc_available() -> bool:
     """True when aiortc + av import (the WebRTC transport stack is present).
 
     Hardware NVENC is best-effort on top of this (see
-    :func:`~almond_axol.vr.hw_video.install_hw_encoder`); when it is missing
+    :func:`~almond_axol.video.hw_video.install_hw_encoder`); when it is missing
     aiortc still streams via software H.264, just slower.
     """
     return True  # importing this module already required aiortc + av
@@ -253,7 +253,7 @@ def _track_for_source(source: Any) -> MediaStreamTrack:
     callers can hand in whatever they already have:
 
     * a pre-encoded source exposing ``subscribe()`` (the GPU-resident
-      :mod:`~almond_axol.vr.gst_zed` cameras) → :class:`PrecodedVideoTrack`,
+      :mod:`~almond_axol.video.gst_zed` cameras) → :class:`PrecodedVideoTrack`,
       whose H.264 access units go straight to RTP with no Python encode;
     * a connected ``ZedCamera`` / stereo eye (exposes ``read_bgra_at_or_after``
       but not ``wait_next``) → wrapped in :class:`ZedFrameSource` so a bare
@@ -440,7 +440,7 @@ class WebRTCManager:
         """No-op: peer connections are closed via ``close_all`` (async).
 
         Present so this in-process manager is a drop-in for the out-of-process
-        relay (:class:`~almond_axol.vr.video_proc.VideoRelayProcess`), whose
+        relay (:class:`~almond_axol.video.video_proc.VideoRelayProcess`), whose
         ``shutdown`` tears down the subprocess; callers can invoke ``shutdown``
         unconditionally on either.
         """

@@ -12,7 +12,7 @@ import asyncio
 from dataclasses import dataclass
 from enum import Enum
 
-from ..utils.shared import Joint
+from ..constants import Joint
 from .bus import CanBus
 from .damiao import DamiaoMotor
 from .driver import MotorDriver

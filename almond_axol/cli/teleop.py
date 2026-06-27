@@ -138,8 +138,8 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
     if not cfg.cameras:
         return None
     try:
-        from ..vr.video import webrtc_available
-        from ..vr.video_proc import VideoRelayProcess
+        from ..video.video import webrtc_available
+        from ..video.video_proc import VideoRelayProcess
     except Exception as exc:  # noqa: BLE001 - aiortc missing
         _logger.debug("video relay unavailable: %s", exc)
         return None
@@ -267,7 +267,7 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
 
     The bare ``ZedCamera`` / stereo eyes are registered directly; the in-process
     aiortc relay adapts each one to a frame-driven source (NVENC encode + aiortc
-    RTP send) — see :func:`almond_axol.vr.video._track_for_source`.
+    RTP send) — see :func:`almond_axol.video.video._track_for_source`.
     """
     if not cameras:
         return

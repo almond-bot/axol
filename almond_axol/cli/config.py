@@ -50,10 +50,10 @@ import draccus
 import mergedeep
 import numpy as np
 
+from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
-from ..utils.shared import CAN_LEFT, CAN_RIGHT
 from ..vr.config import VRServerConfig
 
 T = TypeVar("T")

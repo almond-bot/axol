@@ -3,7 +3,7 @@
 ``collect-data`` needs the ZED cameras' raw frames in the **control** process
 (to write the dataset), but running the camera grab + NVENC encode + aiortc
 WebRTC in that process starves the teleop/IK loops (see
-:mod:`almond_axol.vr.video_proc`). The relay subprocess therefore owns the
+:mod:`almond_axol.video.video_proc`). The relay subprocess therefore owns the
 cameras and does all the heavy work; this module ships the raw RGB frames it
 produces back to the control process through ``multiprocessing`` shared memory,
 so the control process only ever copies a frame out of shared memory at the
@@ -226,7 +226,7 @@ class GstShmFrameReader:
     Shared memory carries no buffer PTS, so each frame is stamped
     ``recv_perf - latency_s`` (``latency_s`` a relay-reported pipeline-latency
     scalar) on the shared ``perf_counter`` clock — an approximation of the
-    per-frame :meth:`~almond_axol.vr.gst_zed._GstPipelineBase._cap_perf_from_pts`
+    per-frame :meth:`~almond_axol.video.gst_zed._GstPipelineBase._cap_perf_from_pts`
     compensation. A small constant bias only shifts all images uniformly vs the
     joint samples, within the capture loop's frame tolerance.
     """

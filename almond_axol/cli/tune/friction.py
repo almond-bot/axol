@@ -36,11 +36,11 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import curve_fit
 
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s

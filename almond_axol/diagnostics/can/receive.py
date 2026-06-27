@@ -1,11 +1,11 @@
 """Live terminal display of all motor positions.
 
 Run directly:
-    uv run -m almond_axol.test.can.receive --l
-    uv run -m almond_axol.test.can.receive --r
-    uv run -m almond_axol.test.can.receive            # both arms, log only
-    uv run -m almond_axol.test.can.receive --l --hz 50
-    uv run -m almond_axol.test.can.receive --l --hz 250 --log-file can_diag.log
+    uv run -m almond_axol.diagnostics.can.receive --l
+    uv run -m almond_axol.diagnostics.can.receive --r
+    uv run -m almond_axol.diagnostics.can.receive            # both arms, log only
+    uv run -m almond_axol.diagnostics.can.receive --l --hz 50
+    uv run -m almond_axol.diagnostics.can.receive --l --hz 250 --log-file can_diag.log
 """
 
 from __future__ import annotations
@@ -23,11 +23,11 @@ from datetime import datetime
 
 import numpy as np
 
+from ...constants import CAN_LEFT, CAN_RIGHT, Joint
 from ...motor import CanBus
 from ...robot.axol import AxolArm, arm_limits
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...utils.shared import CAN_LEFT, CAN_RIGHT, Joint
 
 _BAR_WIDTH = 24
 _TAU = 2 * math.pi

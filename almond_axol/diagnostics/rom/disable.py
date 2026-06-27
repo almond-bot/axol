@@ -14,7 +14,7 @@ Instead it only starts the CAN reader loops and talks to the gripper motors
 directly in raw motor radians, leaving the arms holding their last command.
 
 Run (right after rom.enable, while the motors are still enabled):
-    uv run -m almond_axol.test.rom.disable
+    uv run -m almond_axol.diagnostics.rom.disable
 """
 
 import argparse
@@ -22,9 +22,9 @@ import asyncio
 import math
 import time
 
+from ...constants import Joint
 from ...motor import ControlMode
 from ...robot.axol import GRIPPER_TRAVEL, Axol, AxolArm
-from ...utils.shared import Joint
 
 RATE_HZ = 100.0  # Hz
 OPEN_SPEED = 0.2 * 2 * math.pi  # rad/s — gradual, so the operator can catch the item

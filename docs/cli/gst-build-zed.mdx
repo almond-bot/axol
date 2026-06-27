@@ -3,7 +3,7 @@ title: "gst.build-zed"
 description: "Build and install the patched zed-gstreamer plugins (sensor-accurate timestamps) on a Jetson."
 ---
 
-Builds and installs the **patched** Stereolabs zed-gstreamer source plugins (`zedxonesrc` mono / `zedsrc` stereo) that the GPU-resident camera pipeline ([`almond_axol.vr.gst_zed`](/api/vr)) uses for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). This is the companion to [`gst.install`](/cli/gst-install): `gst.install` sets up the host GStreamer support and PyGObject, while `gst.build-zed` provides the ZED **source elements** themselves.
+Builds and installs the **patched** Stereolabs zed-gstreamer source plugins (`zedxonesrc` mono / `zedsrc` stereo) that the GPU-resident camera pipeline ([`almond_axol.video.gst_zed`](/api/vr)) uses for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). This is the companion to [`gst.install`](/cli/gst-install): `gst.install` sets up the host GStreamer support and PyGObject, while `gst.build-zed` provides the ZED **source elements** themselves.
 
 ```bash
 axol gst.build-zed

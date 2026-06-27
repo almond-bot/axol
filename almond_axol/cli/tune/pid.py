@@ -20,12 +20,12 @@ import time
 
 import numpy as np
 
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.control import Differentiator, compute_friction
 from ...robot.gravity import GravityCompensator
-from ...utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 
 # Default sine amplitude / step size (rad). 0.175 rad ≈ 10° — well above
 # the encoder noise floor and the ``5%`` settling threshold (≈0.5°), well

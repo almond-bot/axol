@@ -9,8 +9,8 @@ from lerobot.cameras.configs import CameraConfig
 from lerobot.robots.config import RobotConfig
 
 from ...cli.config import register_literal
+from ...constants import CAN_LEFT, CAN_RIGHT
 from ...robot.config import AxolConfig
-from ...utils.shared import CAN_LEFT, CAN_RIGHT
 
 # Camera capture backend. "gst" is the GPU-resident zed-gstreamer pipeline
 # (low latency, shared with teleop); "sdk" is the ZED Python SDK; "auto"
