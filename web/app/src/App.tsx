@@ -515,7 +515,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       return t && v && v.videoWidth ? t : undefined
     }
 
-    // Which cams a mode needs to be considered "live" (vs showing the spinner).
+    // Which cams the current mode needs decoded before it draws (otherwise the
+    // view is just passthrough). "default" shows the wrist PiPs when present.
     let live: boolean
     if (mode === "overhead") live = !!(liveTex("overhead_left") ?? liveTex("overhead"))
     else if (mode === "left") live = !!liveTex("left_arm")
@@ -523,13 +524,18 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     else live = !!(liveTex("left_arm") ?? liveTex("right_arm")) // default, split
 
     group.visible = presenting && live
-    // Spinner only while genuinely waiting on a camera that IS being streamed
-    // (its track exists but hasn't decoded its first frame yet). Never for the
-    // default passthrough view, and never for a camera that isn't streamed at
-    // all — so streaming just the overhead no longer leaves the wrist views
-    // stuck on "Connecting camera…".
-    const expecting = mode !== "default" && modeAvailable(mode)
-    spinner.visible = presenting && expecting && !live && available !== false
+
+    // "Connecting cameras…" is a global indicator, independent of the current
+    // view: show it while video is still being negotiated (available === null),
+    // or while any camera that IS being streamed hasn't produced its first frame
+    // yet. So streaming only the overhead still shows the spinner in the default
+    // view until the overhead appears, then it goes away. It's hidden once every
+    // streamed camera is live, and entirely when the server reports no video
+    // (available === false — nothing is streaming).
+    const streamed = Object.keys(textures)
+    const allLive = streamed.length > 0 && streamed.every((n) => !!liveTex(n))
+    const connecting = available === null || (available === true && !allLive)
+    spinner.visible = presenting && connecting
     if (spinner.visible && spinnerMeshRef.current) {
       spinnerMeshRef.current.rotation.z -= 0.12
     }
@@ -766,7 +772,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           material-depthTest={false}
           {...hudBg}
         >
-          Connecting camera…
+          Connecting cameras…
         </HudText>
       </group>
     </>
