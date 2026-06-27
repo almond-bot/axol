@@ -1016,6 +1016,14 @@ def _run(
         log_say("Connecting robot...")
         robot.connect()
 
+        # A Cartesian-action policy resolves each action to joints via IK in
+        # send_action. Build that solver now, before the control loop, so its
+        # one-time JIT warmup overlaps the return-to-rest + scene-reset prompt
+        # below instead of stalling the first policy action.
+        if getattr(robot.config, "observe_cartesian", False):
+            log_say("Preparing Cartesian action solver (IK)...")
+            robot.prepare_cartesian_actions()
+
         log_say("Returning to rest pose.")
         reset_controller.return_to_rest(robot)
         if not control.await_continue(

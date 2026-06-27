@@ -192,6 +192,13 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         log_say("Connecting robot...")
         robot.connect()
 
+        # A Cartesian dataset resolves each recorded EE pose to joints via IK in
+        # send_action. Build that solver now so its one-time JIT warmup overlaps
+        # the return-to-rest below instead of stalling the first replayed frame.
+        if recorded_cartesian:
+            log_say("Preparing Cartesian action solver (IK)...")
+            robot.prepare_cartesian_actions()
+
         # Start every take from rest, the same place collect-data records from,
         # so the first replayed action is ~rest and there's no jump.
         _go_to_rest()

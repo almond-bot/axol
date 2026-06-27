@@ -566,6 +566,20 @@ class AxolRobot(Robot):
             _logger.info("IK solver ready for Cartesian actions.")
         return self._ik
 
+    def prepare_cartesian_actions(self) -> None:
+        """Pre-build the Cartesian-action IK solver before the control loop runs.
+
+        ``send_action`` builds the solver lazily on the first Cartesian action,
+        but its URDF load + JIT warmup (tens of seconds) would otherwise stall
+        the caller's real-time control loop on that first action. Consumers that
+        will stream Cartesian actions (run-policy, replay-dataset) call this once
+        after :meth:`connect` — overlapping the build with the policy load /
+        return-to-rest — so the first action dispatches immediately. A no-op once
+        built, and never called by collect-data, which commands joint targets and
+        so never needs IK.
+        """
+        self._ensure_ik()
+
     def _cartesian_action_to_targets(
         self, action: RobotAction
     ) -> tuple[np.ndarray, np.ndarray]:
