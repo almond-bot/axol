@@ -9,18 +9,16 @@ const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
 export function AxolVRClient({
   wsRef,
   poseWsRef,
-  usbOnly = false,
   onStateChange,
   onPendingRecording,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
-  // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel.
+  // Dedicated pose WebSocket — the Quest-over-USB `adb reverse` tunnel. When
+  // present and open, each frame is sent over BOTH this and `wsRef`: the server
+  // prefers the low-latency USB stream and falls back to the network frames
+  // only while USB is quiet, so a USB drop fails over to WiFi instantly.
   poseWsRef?: RefObject<WebSocket | null>
-  // When true, pose frames go ONLY over `poseWsRef` (USB); they are never sent
-  // over the network WebSocket, so teleop pauses rather than silently falling
-  // back to WiFi when the USB link isn't up.
-  usbOnly?: boolean
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
   onExit?: () => void
@@ -155,12 +153,16 @@ export function AxolVRClient({
       onPendingRecording?.(null)
     }
 
-    // Pick the pose transport. In USB mode poses go ONLY over the dedicated USB
-    // pose socket — never the network — so teleop pauses rather than silently
-    // falling back to WiFi when the cable link isn't up. Otherwise poses ride
-    // the main WebSocket.
-    const sink = usbOnly ? (poseWsRef?.current ?? null) : wsRef.current
-    if (sink == null || sink.readyState !== WebSocket.OPEN) return
+    // Send each frame over every open transport: the wired USB `adb reverse`
+    // tunnel (poseWsRef) for low latency and the main network socket (wsRef) as
+    // a hot standby. The server prefers USB and only uses the network frames
+    // once USB goes quiet, so a USB disconnect fails over to WiFi with no
+    // reconnect. Bail early if neither link is up so we skip reading poses.
+    const usbSink = poseWsRef?.current ?? null
+    const netSink = wsRef.current
+    const usbOpen = usbSink != null && usbSink.readyState === WebSocket.OPEN
+    const netOpen = netSink != null && netSink.readyState === WebSocket.OPEN
+    if (!usbOpen && !netOpen) return
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -197,21 +199,23 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
-    sink.send(
-      JSON.stringify({
-        l_ee,
-        r_ee,
-        l_elbow,
-        r_elbow,
-        l_lock,
-        r_lock,
-        l_grip,
-        r_grip,
-        reset,
-        state: stateRef.current,
-        seq: ++seqRef.current,
-      })
-    )
+    // Serialise once so both transports carry the identical frame (same seq),
+    // letting the server treat them as one stream when it switches sources.
+    const payload = JSON.stringify({
+      l_ee,
+      r_ee,
+      l_elbow,
+      r_elbow,
+      l_lock,
+      r_lock,
+      l_grip,
+      r_grip,
+      reset,
+      state: stateRef.current,
+      seq: ++seqRef.current,
+    })
+    if (usbSink != null && usbSink.readyState === WebSocket.OPEN) usbSink.send(payload)
+    if (netSink != null && netSink.readyState === WebSocket.OPEN) netSink.send(payload)
   })
 
   return null

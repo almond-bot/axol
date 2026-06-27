@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -74,6 +75,17 @@ class VRServer:
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
+        # USB is the preferred pose transport; the network connection is a hot
+        # standby. The headset sends every frame over both, so we only switch to
+        # network frames once the wired (loopback) stream has gone quiet for
+        # longer than this, and switch straight back when USB resumes.
+        self._usb_fallback_timeout = config.usb_fallback_timeout_s
+        # Monotonic timestamp of the last frame received over the USB tunnel.
+        # ``-inf`` means "never", so a pure-network session falls back instantly.
+        self._last_usb_recv: float = float("-inf")
+        # Which transport currently owns ``_latest_frame``; logged on switch.
+        self._active_usb: bool | None = None
+
         self._latest_frame: VRFrame | None = None
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
@@ -87,7 +99,12 @@ class VRServer:
     # ------------------------------------------------------------------
 
     def get_frame(self) -> VRFrame | None:
-        """Return the most recent frame received, or None if none yet."""
+        """Return the most recent frame received, or None if none yet.
+
+        When the headset streams over both USB and WiFi, this is the frame from
+        the active transport — USB while it is live, the network fallback once
+        USB goes quiet (see :meth:`_handle_message`).
+        """
         return self._latest_frame
 
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
@@ -263,11 +280,48 @@ class VRServer:
 
         try:
             frame = VRFrame.model_validate(obj)
-            self._latest_frame = frame
-            if self._on_frame is not None:
-                self._on_frame(frame)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
+            return
+
+        # The headset streams identical frames over both the wired USB tunnel
+        # (which reaches us from loopback) and the WiFi connection. Prefer USB
+        # and treat the network as a hot standby: accept network frames only
+        # once the USB stream has gone quiet, so a USB drop fails over to WiFi
+        # without a reconnect, and USB reclaims the link the moment it resumes.
+        now = time.monotonic()
+        is_usb = self._is_usb_client(websocket)
+        if is_usb:
+            self._last_usb_recv = now
+            active = True
+        else:
+            active = (now - self._last_usb_recv) > self._usb_fallback_timeout
+
+        if not active:
+            return
+
+        if self._active_usb is not is_usb:
+            self._active_usb = is_usb
+            _logger.info(
+                "pose source -> %s", "USB" if is_usb else "network (USB quiet)"
+            )
+
+        self._latest_frame = frame
+        if self._on_frame is not None:
+            self._on_frame(frame)
+
+    @staticmethod
+    def _is_usb_client(websocket: WebSocket) -> bool:
+        """True if the connection arrived over the Quest-over-USB tunnel.
+
+        ``adb reverse`` forwards the headset's loopback to the robot, so USB
+        frames reach us from ``127.0.0.1``/``::1`` while WiFi frames come from
+        the headset's LAN address. (Running the web app directly on the robot's
+        own loopback would also look like USB, but the Quest never does that.)
+        """
+        client = websocket.client
+        host = client.host if client is not None else None
+        return host in ("127.0.0.1", "::1", "localhost")
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
