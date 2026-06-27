@@ -3,13 +3,13 @@ title: "Quest over USB"
 description: "Stream Quest controller poses to the robot over a USB cable instead of Wi-Fi for a low-latency teleop link."
 ---
 
-By default the Quest streams controller pose to the robot over Wi-Fi. On some networks the headset's Wi-Fi power-save buffering holds pose packets and releases them in bursts, adding **~150 ms gaps** between updates that show up as stair-stepped, laggy arm motion. **Quest over USB** removes Wi-Fi from the controller path entirely: poses ride a USB cable via an [`adb reverse`](https://developer.android.com/tools/adb) tunnel, so the link is wired and deterministic.
+By default the Quest streams controller pose to the robot over Wi-Fi. On some networks the headset's Wi-Fi power-save buffering holds pose packets and releases them in bursts, adding **~150 ms gaps** between updates that show up as stair-stepped, laggy arm motion. **Quest over USB** moves the active pose link onto a USB cable via an [`adb reverse`](https://developer.android.com/tools/adb) tunnel, so the link is wired and deterministic — while keeping Wi-Fi as an automatic standby if the cable drops.
 
 <Note>
   USB carries **controller poses only**. Camera video still streams over the LAN — WebRTC can't cross the `adb` TCP forward — so you connect to the robot's address as usual and the cameras keep working over Wi-Fi/Ethernet. USB just takes over the pose link.
 </Note>
 
-When USB is selected, poses go **only** over the cable — the app never falls back to Wi-Fi (that would reintroduce the latency USB exists to avoid). If the cable link isn't up, teleop simply pauses until it is.
+When USB is selected, the headset sends every pose frame over **both** the cable and Wi-Fi. The robot prefers the wired stream and uses the Wi-Fi frames only while the cable goes quiet, so a mid-session USB drop (or a yanked cable) **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link the moment it comes back. You get the wired link's low latency whenever it's up, without teleop stalling when it isn't.
 
 ## One-time setup
 
@@ -43,11 +43,11 @@ When USB is selected, poses go **only** over the cable — the app never falls b
   </Step>
 
   <Step title="Authorize the USB certificate">
-    The USB link uses `wss://localhost:8000`, whose self-signed certificate is a **separate origin** from the host cert you already approved. While the link is pending, the app shows *waiting for USB link…* and an **Authorize USB certificate** button — tap it and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser and proceed). The status then flips to *controller over cable*.
+    The USB link uses `wss://localhost:8000`, whose self-signed certificate is a **separate origin** from the host cert you already approved. Until it's approved the app runs on Wi-Fi and shows *WiFi fallback — USB link down* with an **Authorize USB certificate** button — tap it and proceed past the warning (equivalently, open `https://localhost:8000` in the headset browser and proceed). The status then flips to *controller over cable*.
   </Step>
 
   <Step title="Enter VR">
-    With USB selected, **Enter VR** stays disabled until the USB pose link is live, so you never start a session that can't drive the arm. Once it's connected, press **Enter VR** and teleoperate as usual.
+    Press **Enter VR** and teleoperate as usual. You don't have to wait for the USB link — Wi-Fi drives the arm until the cable comes up, then the robot switches to the wired stream automatically.
   </Step>
 </Steps>
 
