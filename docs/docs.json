@@ -63,6 +63,7 @@
               "cli/motor-set-zero-pos",
               "cli/teleop",
               "cli/collect-data",
+              "cli/replay-dataset",
               "cli/run-policy",
               "cli/inference-server",
               "cli/provision",

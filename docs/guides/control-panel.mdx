@@ -3,7 +3,7 @@ title: "Web Control Panel"
 description: "Drive Axol from a browser — connect the Axol host and robot, assign the cameras, then run any operation without touching the terminal."
 ---
 
-The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the four core operations — **teleoperation**, **gravity compensation**, **data collection**, and **policy inference** — behind connect/run buttons, with live status for the robot motors and the camera setup.
+The **web control panel** is a browser UI for driving Axol without the terminal. It wraps the core operations — **teleoperation**, **gravity compensation**, **data collection**, **dataset replay**, and **policy inference** — behind connect/run buttons, with live status for the robot motors and the camera setup.
 
 It's served by [`axol serve`](/cli/serve) and runs each operation **in-process** inside that server, so it's a drop-in alternative to the per-command CLI workflow.
 
@@ -62,13 +62,22 @@ The server runs as root under the one-command install's systemd service, so CAN 
 
 Data collection and policy inference also need the ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
 
-The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually. A stereo **overhead** captures both eyes from one grab (recorded as `overhead_left` / `overhead_right` during data collection); a stereo **wrist** (left/right arm) records just its left eye under the plain slot name, so it captures and records exactly like a mono camera. A **resolution** dropdown sets the capture resolution for all cameras (`SVGA` / `HD1080` / `HD1200`) — this is what the cameras grab and what the headset sees. Data collection records the **dataset** video at its own resolution (`dataset_resolution`, default `SVGA`), downscaled from the capture independently of the headset stream — see [`collect-data`](/cli/collect-data).
+The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
 
-The assignments persist in your browser and are sent along when you start an operation — collect data and run policy record whichever slots you assign and need at least one; teleop streams whichever are assigned to the headset.
+The dialog is the single source of truth for all camera settings — these fields no longer appear in an operation's **Optional** form. It controls two independent branches:
+
+- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop, collect-data, and run-policy preview).
+- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream).
+
+Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
+
+A stereo **overhead** captures both eyes from one grab; with both eyes selected it's exposed as `overhead_left` / `overhead_right` (rendered per-lens in the headset, two observation keys in the dataset). A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
+
+The assignments and stream/record selection persist in your browser and are sent along when you start an operation. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on).
 
 ### Quest USB
 
-The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the tile sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only.
+The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the tile sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. The headset sends every pose over both the cable and Wi-Fi, so a dropped cable **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link when it returns.
 
 <Warning>
   Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
@@ -86,6 +95,7 @@ Pick an operation from the selector. Each has its own settings form; required fi
 | **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
 | **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Collect Data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Replay Dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**. |
 | **Run Policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
 ### Before you can start
@@ -98,7 +108,7 @@ Each operation's settings are saved to your browser automatically, so they reapp
 
 ### Running, logs, and stopping
 
-Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it; the robot link returns to idle 1 Hz polling.
+Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Host** / **Robot Disconnect** likewise wait for the running op to finish tearing down before proceeding.
 
 ## Run Policy episode controls
 

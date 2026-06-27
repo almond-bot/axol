@@ -4,6 +4,7 @@ Changes landed since the v0.1.0 release, focused on data-collection reliability 
 
 ## New
 
+- **`replay-dataset` command** — Replays a recorded LeRobot episode on the robot: pick a dataset and episode index and it returns to rest, streams the episode's recorded actions onto the arms at the dataset's fps, then parks at rest. It's the inverse of `collect-data` and needs no cameras. Pass `--loop` (a toggle in the control panel) to replay continuously — returning to rest between takes — until stopped with `Ctrl+C` or the UI's **Stop**, then return to rest. Available from the web control panel under **Operate**, between Collect Data and Run Policy.
 - **`motor.health` command** — Probes all 16 motors (8 per arm), running the same status reads as `motor.info` on each joint and printing `OK` or the error string per motor. Exits with status `1` if any motor fails to respond, so it works in scripts and provisioning checks. Also available from the web control panel under **Calibrate**.
 
 ## Improvements

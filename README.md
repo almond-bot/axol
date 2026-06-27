@@ -101,6 +101,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Teleoperation](https://docs.almond.bot/operations/teleop) — drive the robot live from a VR headset (or in sim)
 - [Gravity Compensation](https://docs.almond.bot/operations/gravity-comp) — hold the arms weightless for hand-guiding
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
+- [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
 
 ### Remote Teleop
@@ -119,7 +120,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -130,6 +131,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
+- [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`provision`](https://docs.almond.bot/cli/provision)

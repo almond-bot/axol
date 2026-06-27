@@ -541,7 +541,7 @@ function OperationSelector({
   onSelect: (op: OperationId) => void
 }) {
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
       {OPERATIONS.map((op) => {
         const active = op.id === selected
         const running = op.id === runningOp

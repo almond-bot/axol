@@ -45,6 +45,14 @@ async with VRServer() as vr:
 | `l_lock` / `r_lock` | `bool` | Grip toggles (engage/disengage tracking) |
 | `reset` | `bool` | Rising edge triggers a reset move |
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
+| `t` | `float \| None` | Client capture timestamp in ms (`performance.now()`), used by the pose interpolator. `None` falls back to latest-wins |
+| `seq` | `int \| None` | Monotonic frame counter set by the headset. The same `seq` arrives over both the USB and network transports; the server processes each logical frame once, via whichever transport delivers it first. `None` disables cross-transport de-duplication |
+
+### Pose transports & USB/Wi-Fi fallback
+
+The headset can stream pose over more than one transport at once — the network WebSocket, a USB `adb reverse` tunnel ([Quest over USB](/guides/quest-over-usb)), and a dedicated WebRTC data channel ([remote teleop](/guides/remote-teleop)). Each frame carries a shared `seq`; the server keeps a monotonic high-water mark and processes each `seq` exactly once, from whichever link delivers it first — so `on_frame` fires once per logical frame, a quiet USB link fails over to Wi-Fi instantly, and a resuming link can't rewind to a stale pose. The high-water mark resets when the last client disconnects and on `disable()`, so a reloaded headset (its counter restarted) isn't gated against a stale value.
+
+The WebRTC pose data channel (`almond_axol.vr.control_channel`) shares the same ICE/TURN path as the camera video, so an operator off your tailnet can drive over a relay. ICE servers are read from the environment (`AXOL_TURN_URL` / `AXOL_TURN_USERNAME` / `AXOL_TURN_PASSWORD`; see `almond_axol.vr.ice`) — on a LAN or plain tailnet they're unset and the direct path is used. If the data channel fails to negotiate (or the peer connection drops), the headset re-requests it after a backoff rather than permanently falling back to the WebSocket.
 
 ## Server → headset feedback
 
