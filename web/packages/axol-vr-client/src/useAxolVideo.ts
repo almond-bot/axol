@@ -1,5 +1,6 @@
 import type { RefObject } from "react"
 import { useEffect, useRef, useState } from "react"
+import { waitForIceGathering } from "./webrtc"
 
 /** Live camera streams keyed by camera name (e.g. "overhead", "left_arm"). */
 export type CameraStreams = Record<string, MediaStream>
@@ -12,9 +13,11 @@ const POLL_MS = 300
  *
  * Signaling is multiplexed over the existing teleop WebSocket (no new ports):
  * we send `{type:"webrtc-request"}`, the server answers with an SDP offer plus a
- * `mid → cameraName` map, and we reply with an SDP answer. ICE is non-trickle
- * (candidates are embedded in the SDP), so on a LAN no candidate exchange is
- * needed.
+ * `mid → cameraName` map (and, for off-LAN operators, the `iceServers` to use),
+ * and we reply with an SDP answer. ICE is non-trickle (candidates are embedded
+ * in the SDP), so on a LAN no candidate exchange is needed; with a TURN server
+ * we must wait for gathering to finish so our relay candidate lands in the
+ * answer SDP.
  *
  * A `message` *listener* is used (not `ws.onmessage`) so this coexists with the
  * pose client's own `onmessage` handler on the same socket.
@@ -58,9 +61,15 @@ export function useAxolVideo(
       closePc()
     }
 
-    async function handleOffer(sdp: string, trackMap: Record<string, string>) {
+    async function handleOffer(
+      sdp: string,
+      trackMap: Record<string, string>,
+      iceServers: RTCIceServer[]
+    ) {
       closePc()
-      const pc = new RTCPeerConnection()
+      // Off-LAN operators get TURN/STUN servers from the server; on a LAN the
+      // list is empty and we use the browser default (direct host candidates).
+      const pc = new RTCPeerConnection(iceServers.length > 0 ? { iceServers } : undefined)
       pcRef.current = pc
 
       // Accumulate streams as tracks arrive, matching each transceiver's mid to
@@ -95,7 +104,11 @@ export function useAxolVideo(
       await pc.setRemoteDescription({ type: "offer", sdp })
       const answer = await pc.createAnswer()
       await pc.setLocalDescription(answer)
-      attachedWsRef.current?.send(JSON.stringify({ type: "webrtc-answer", sdp: answer.sdp }))
+      // Non-trickle: wait for gathering so the (TURN relay) candidate is in the
+      // SDP we signal back. On a LAN this completes immediately.
+      await waitForIceGathering(pc)
+      const answerSdp = pc.localDescription?.sdp ?? answer.sdp
+      attachedWsRef.current?.send(JSON.stringify({ type: "webrtc-answer", sdp: answerSdp }))
     }
 
     function onMessage(e: MessageEvent) {
@@ -106,10 +119,15 @@ export function useAxolVideo(
         return
       }
       if (typeof msg !== "object" || msg === null) return
-      const m = msg as { type?: string; sdp?: string; tracks?: Record<string, string> }
+      const m = msg as {
+        type?: string
+        sdp?: string
+        tracks?: Record<string, string>
+        iceServers?: RTCIceServer[]
+      }
       if (m.type === "webrtc-offer" && typeof m.sdp === "string") {
         setAvailable(true)
-        handleOffer(m.sdp, m.tracks ?? {}).catch(() => {
+        handleOffer(m.sdp, m.tracks ?? {}, m.iceServers ?? []).catch(() => {
           /* negotiation failed; leave streams empty */
         })
       } else if (m.type === "webrtc-unavailable") {

@@ -44,6 +44,9 @@ from fastapi.responses import HTMLResponse
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
+from .control_channel import ControlChannelManager
+from .ice import client_ice_servers
+from .interp import PoseInterpolator
 from .models import VRFrame
 
 if TYPE_CHECKING:
@@ -75,23 +78,33 @@ class VRServer:
         self._keyfile = config.keyfile or KEYFILE
 
         # The headset streams identical frames (same ``seq``) over both the USB
-        # tunnel and WiFi. We process each ``seq`` once, from whichever link
-        # delivers it first — the lower-latency one, i.e. USB while it is up and
-        # WiFi the instant USB goes quiet. ``_last_seq`` is the highest seq
-        # processed so far; later/duplicate copies (seq <= it) are dropped. Reset
-        # to ``None`` when all clients disconnect so a reloaded headset (whose
-        # counter restarts) isn't locked out.
+        # tunnel and the network (WebRTC data channel / WebSocket). We process
+        # each ``seq`` once, from whichever transport delivers it first — the
+        # lower-latency one, i.e. USB while the cable is up and the network the
+        # instant USB goes quiet. ``_last_seq`` is the highest seq processed so
+        # far; later/duplicate copies (seq <= it) are dropped. Reset to ``None``
+        # when all clients disconnect so a reloaded headset (whose counter
+        # restarts) isn't locked out.
         self._last_seq: int | None = None
-        # Which transport currently owns ``_latest_frame``; logged on switch.
-        self._active_usb: bool | None = None
 
         self._latest_frame: VRFrame | None = None
+        # Adaptive playout buffer: reconstructs a smooth pose stream from
+        # batched/jittered network arrivals. Consumers that want smoothing read
+        # via get_render_frame(); get_frame() still returns the raw latest.
+        self._interp = PoseInterpolator(
+            enabled=config.interp_enabled,
+            min_delay_s=config.interp_min_delay_s,
+            max_delay_s=config.interp_max_delay_s,
+        )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
         self._webrtc: WebRTCManager | Any | None = None
+        # Dedicated pose data channel (low-latency control transport). Always
+        # available — independent of whether any cameras are streaming.
+        self._control = ControlChannelManager(self._ingest_pose_text)
 
     # ------------------------------------------------------------------
     # Public API
@@ -100,11 +113,22 @@ class VRServer:
     def get_frame(self) -> VRFrame | None:
         """Return the most recent frame received, or None if none yet.
 
-        When the headset streams over both USB and WiFi, this is the frame from
-        the active transport — USB while it is live, the network fallback once
-        USB goes quiet (see :meth:`_handle_message`).
+        When the headset streams over both USB and the network, this is the
+        first-arriving copy of each frame — USB while the cable is up, the
+        network fallback once USB goes quiet (see :meth:`_ingest_frame_obj`).
         """
         return self._latest_frame
+
+    def get_render_frame(self) -> VRFrame | None:
+        """Return the smoothed playout frame for the current instant.
+
+        Renders the pose from the adaptive interpolation buffer (motion is held
+        slightly in the past and interpolated; control state is the latest
+        received). Falls back to the raw latest frame when interpolation is
+        disabled or there isn't enough history yet. The returned object is
+        identity-stable so the IK loop can skip redundant solves while idle.
+        """
+        return self._interp.sample()
 
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
@@ -213,6 +237,7 @@ class VRServer:
         """Gracefully shut down the WSS server."""
         if self._webrtc is not None:
             await self._webrtc.close_all()
+        await self._control.close_all()
 
         if self._uvicorn_server is not None:
             try:
@@ -247,7 +272,6 @@ class VRServer:
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
         self._last_seq = None
-        self._active_usb = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -281,6 +305,10 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
+        self._ingest_frame_obj(obj)
+
+    def _ingest_frame_obj(self, obj: Any) -> None:
+        """Validate a decoded pose object and publish it to the consumer."""
         try:
             frame = VRFrame.model_validate(obj)
         except Exception as exc:
@@ -288,47 +316,67 @@ class VRServer:
             return
 
         # The headset streams identical frames (same ``seq``) over both the
-        # wired USB tunnel (which reaches us from loopback) and WiFi. Process
-        # each seq once, from whichever link delivered it first: USB wins while
-        # it is live (lower latency), and the moment USB goes quiet the next
-        # WiFi frame is the first arrival for its seq and takes over with no
-        # reconnect. Dropping the slower duplicate also means ``on_frame`` (the
-        # reset/recording state-edge latches) fires exactly once per frame, and
-        # a link that resumes mid-stream can't rewind ``_latest_frame`` to a
-        # stale pose. Frames without a seq (non-headset senders) skip dedup.
+        # wired USB tunnel and the network (WebRTC data channel / WebSocket).
+        # Process each seq once, from whichever transport delivered it first:
+        # USB wins while the cable is up (lower latency), and the moment USB
+        # goes quiet the next network frame is the first arrival for its seq and
+        # takes over with no reconnect. Dropping the slower duplicate also means
+        # ``on_frame`` (the reset/recording state-edge latches) fires exactly
+        # once per frame, the interpolator buffers each capture once, and a
+        # transport that resumes mid-stream can't rewind to a stale pose. Frames
+        # without a seq (non-headset senders) skip dedup.
         seq = frame.seq
         if seq is not None:
             if self._last_seq is not None and seq <= self._last_seq:
                 return
             self._last_seq = seq
 
-        is_usb = self._is_usb_client(websocket)
-        if self._active_usb is not is_usb:
-            self._active_usb = is_usb
-            _logger.info("pose source -> %s", "USB" if is_usb else "network")
-
         self._latest_frame = frame
+        self._interp.push(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
 
-    @staticmethod
-    def _is_usb_client(websocket: WebSocket) -> bool:
-        """True if the connection arrived over the Quest-over-USB tunnel.
+    def _ingest_pose_text(self, data: str) -> None:
+        """Ingest a pose frame from the control data channel (text message).
 
-        ``adb reverse`` forwards the headset's loopback to the robot, so USB
-        frames reach us from ``127.0.0.1``/``::1`` while WiFi frames come from
-        the headset's LAN address. (Running the web app directly on the robot's
-        own loopback would also look like USB, but the Quest never does that.)
+        Mirrors the WebSocket pose path; signaling never arrives here, so a
+        message carrying a ``type`` field is ignored rather than validated.
         """
-        client = websocket.client
-        host = client.host if client is not None else None
-        return host in ("127.0.0.1", "::1", "localhost")
+        try:
+            obj = json.loads(data)
+        except Exception as exc:
+            _logger.warning("invalid json on pose channel: %s", exc)
+            return
+        if isinstance(obj, dict) and "type" in obj:
+            return
+        self._ingest_frame_obj(obj)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
     ) -> None:
         """Handle a WebRTC signaling message from the headset."""
         msg_type = obj.get("type")
+
+        # Control data channel (pose transport): negotiated independently of the
+        # cameras, so it's handled before the video-availability check below and
+        # works even when no video sources are registered.
+        if msg_type == "control-request":
+            sdp = await self._control.create_offer(client_id)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "control-offer",
+                        "sdp": sdp,
+                        "iceServers": client_ice_servers(),
+                    }
+                )
+            )
+            return
+        if msg_type == "control-answer":
+            sdp = obj.get("sdp")
+            if isinstance(sdp, str):
+                await self._control.set_answer(client_id, sdp)
+            return
 
         if self._webrtc is None:
             if msg_type == "webrtc-request":
@@ -343,7 +391,17 @@ class VRServer:
                 await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
                 return
             await websocket.send_text(
-                json.dumps({"type": "webrtc-offer", "sdp": sdp, "tracks": tracks})
+                json.dumps(
+                    {
+                        "type": "webrtc-offer",
+                        "sdp": sdp,
+                        "tracks": tracks,
+                        # Same TURN/STUN servers the aiortc peer used, so the
+                        # browser gathers a matching relay candidate. Empty on
+                        # a LAN (no env config) — harmless to the headset.
+                        "iceServers": client_ice_servers(),
+                    }
+                )
             )
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
@@ -386,14 +444,19 @@ class VRServer:
             finally:
                 server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
-                # With no clients left, forget the seq high-water mark so a
-                # reconnecting/reloaded headset (whose counter restarts low)
-                # isn't dropped as stale. A USB→WiFi failover keeps one client
-                # connected, so it doesn't reset here.
-                if server._client_count == 0:
-                    server._last_seq = None
-                    server._active_usb = None
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
+                await server._control.close(client_id)
+                # Last operator gone: drop buffered pose state so a fresh
+                # session's capture timestamps aren't blended with this one's
+                # stale frames (which would drive IK with incoherent poses
+                # until the playout buffer drains), and forget the seq
+                # high-water mark so a reloaded headset (whose counter restarts
+                # low) isn't dropped as stale. A USB→network failover keeps one
+                # client connected, so it doesn't reset here.
+                if server._client_count == 0:
+                    server._latest_frame = None
+                    server._last_seq = None
+                    server._interp.reset()
 
         return app

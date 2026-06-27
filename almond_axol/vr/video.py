@@ -42,6 +42,7 @@ from typing import Any
 import av
 import numpy as np
 from aiortc import (
+    RTCConfiguration,
     RTCPeerConnection,
     RTCRtpSender,
     RTCSessionDescription,
@@ -57,6 +58,11 @@ from av import VideoFrame
 from numpy.typing import NDArray
 
 from .hw_video import install_hw_encoder
+from .ice import (
+    ice_servers,
+    replicate_candidates_across_mlines,
+    summarize_candidates,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -339,7 +345,15 @@ class WebRTCManager:
         """
         await self.close(client_id)
 
-        pc = RTCPeerConnection()
+        # With TURN/STUN configured (off-LAN operator via a tunnel), aiortc
+        # gathers a relay candidate and embeds it in the offer SDP below
+        # (non-trickle). Unconfigured, this is aiortc's default — the LAN path.
+        servers = ice_servers()
+        pc = (
+            RTCPeerConnection(RTCConfiguration(iceServers=servers))
+            if servers
+            else RTCPeerConnection()
+        )
         self._pcs[client_id] = pc
 
         @pc.on("connectionstatechange")
@@ -372,6 +386,12 @@ class WebRTCManager:
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
+        if servers:
+            _logger.info(
+                "webrtc[%d] offer %s",
+                client_id,
+                summarize_candidates(pc.localDescription.sdp),
+            )
 
         tracks: dict[str, str] = {}
         for transceiver in pc.getTransceivers():
@@ -387,6 +407,19 @@ class WebRTCManager:
         if pc is None:
             _logger.warning("webrtc answer for unknown client %d", client_id)
             return
+        if ice_servers():
+            # Work around an aiortc BUNDLE bug: it keeps only the bundle-tag
+            # m-line's transport, so ICE candidates the headset placed on a
+            # different bundled m-line get dropped and the media transport
+            # stalls in "checking". Replicate candidates onto every m-line so
+            # the surviving transport always has them. Only needed off-LAN
+            # (when TURN is configured); the LAN path is left untouched.
+            fixed = replicate_candidates_across_mlines(sdp)
+            if fixed != sdp:
+                _logger.info(
+                    "webrtc[%d] applied aiortc BUNDLE candidate workaround", client_id
+                )
+                sdp = fixed
         await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="answer"))
 
     async def close(self, client_id: int) -> None:

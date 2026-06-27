@@ -234,7 +234,21 @@ class VRTeleop:
         await self._robot.disable()
 
     async def __aenter__(self) -> VRTeleop:
-        await self.enable()
+        # If enable() is interrupted partway — e.g. the operation is stopped
+        # while the IK worker is still compiling JAX, cancelling enable()'s wait
+        # for its "ready" message — __aexit__ never runs (the context never
+        # finished entering). Without cleanup here the already-started VR server
+        # thread leaks and keeps holding its WebSocket port, so the next teleop
+        # fails to bind it ("address already in use"). Tear down what enable()
+        # started before propagating.
+        try:
+            await self.enable()
+        except BaseException:
+            try:
+                await self.disable()
+            except Exception:
+                _logger.exception("teleop startup cleanup failed")
+            raise
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -436,7 +450,7 @@ class VRTeleop:
         assert self._parent_conn is not None
         self._core.run_ik_loop(
             self._parent_conn,
-            self._vr_server.get_frame,
+            self._vr_server.get_render_frame,
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,

@@ -521,7 +521,7 @@ class AxolVRTeleop(Teleoperator):
         assert self._parent_conn is not None
         self._core.run_ik_loop(
             self._parent_conn,
-            self._vr_server.get_frame,  # type: ignore[union-attr]
+            self._vr_server.get_render_frame,  # type: ignore[union-attr]
             self._ik_stop,
             lambda: self._ik_process is None or self._ik_process.is_alive(),
             self._note_ik_sample,
