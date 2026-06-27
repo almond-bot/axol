@@ -9,8 +9,8 @@ the same URDF and pyroki robot and nothing else, exposing only
 
 It is built in the control process (where the IK solver otherwise runs
 out-of-process in a ``spawn`` child) only when ``observe_cartesian`` is set, so
-the caller pins JAX to the CPU before importing this module to stay off the GPU
-that the camera relay / policy server need.
+the caller calls :func:`pin_jax_to_cpu` before the first FK op to stay off the
+GPU that the camera relay / policy server need.
 """
 
 from __future__ import annotations
@@ -31,6 +31,25 @@ from ..utils.shared import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def pin_jax_to_cpu() -> None:
+    """Pin in-process JAX (the FK/IK used for Cartesian mode) to the CPU backend.
+
+    The CLI imports JAX early — ``cli.config`` pulls in ``KinematicsConfig``,
+    which loads ``kinematics.__init__`` -> ``solver`` -> ``import jax`` — and JAX
+    reads ``JAX_PLATFORMS`` into ``jax.config`` at import time. So setting that
+    env var at ``connect()`` time is too late: the value is already latched. We
+    update ``jax.config`` directly instead, before any backend is initialized
+    (i.e. before the first FK/IK op), so the forward/inverse kinematics stay off
+    the GPU that the camera relay (NVENC) and policy server need. An explicit
+    operator ``JAX_PLATFORMS`` (already reflected in the config) is honored.
+    """
+    import jax
+
+    if not jax.config.jax_platforms:
+        jax.config.update("jax_platforms", "cpu")
+
 
 # 6-axis end-effector pose layout: Cartesian position (metres) followed by an
 # axis-angle rotation vector (radians), both in the robot's world frame (FLU).

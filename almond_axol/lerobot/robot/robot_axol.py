@@ -301,13 +301,14 @@ class AxolRobot(Robot):
         asyncio.run_coroutine_threadsafe(self._connect_async(), loop).result(timeout=30)
 
         if self.config.observe_cartesian and self._fk is None:
-            # Pin JAX to the CPU before the first kinematics import so the
-            # forward-kinematics model stays off the GPU that the camera relay
+            # Keep the forward-kinematics model off the GPU that the camera relay
             # (NVENC) and policy server need; the teleop IK runs CPU-only too.
-            os.environ.setdefault("JAX_PLATFORMS", "cpu")
+            # pin_jax_to_cpu() must run before the first FK op (the warmup in
+            # the constructor) — see its docstring for why an env var is too late.
             os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-            from ...kinematics.fk import AxolForwardKinematics
+            from ...kinematics.fk import AxolForwardKinematics, pin_jax_to_cpu
 
+            pin_jax_to_cpu()
             self._fk = AxolForwardKinematics()
 
         for cam in self.cameras.values():
@@ -537,10 +538,13 @@ class AxolRobot(Robot):
         model, and IK JIT warmup. Pins JAX to the CPU (see :meth:`connect`).
         """
         if self._ik is None:
-            os.environ.setdefault("JAX_PLATFORMS", "cpu")
+            # Pin JAX to the CPU before the solver's first op (its IK warmup) —
+            # see pin_jax_to_cpu() for why an env var here is too late.
             os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+            from ...kinematics.fk import pin_jax_to_cpu
             from ...kinematics.solver import KinematicsSolver
 
+            pin_jax_to_cpu()
             _logger.info("Building IK solver for Cartesian actions...")
             self._ik = KinematicsSolver()
         return self._ik
