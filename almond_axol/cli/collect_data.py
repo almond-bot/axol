@@ -178,19 +178,31 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
-        # Eye policy must match observation_cameras() so the relay exports exactly
-        # the keys the recorder expects. Physically-stereo cameras are already
-        # flagged stereo on the config (see AxolRobotConfig.apply_detected_stereo,
-        # applied in _run before this), so here we just honour the flag: a
-        # ``eyes="both"`` camera (the head) records both eyes, suffixed
-        # (overhead_left / overhead_right); a single-eye stereo camera (a wrist)
-        # crops/encodes just that eye and exports it under the plain name, so it
-        # records one image like a mono camera.
+        # The recorded eyes (``eyes``) must match observation_cameras() so the
+        # relay's raw branch exports exactly the keys the recorder expects; the
+        # streamed eyes (``stream_eyes``) drive the headset feed independently, so
+        # the operator can e.g. stream both eyes for depth while recording only
+        # one. Physically-stereo cameras are already flagged stereo on the config
+        # (see AxolRobotConfig.apply_detected_stereo, applied in _run before this).
+        # For each branch: ``"both"`` records/streams both eyes suffixed
+        # (overhead_left / overhead_right); a single eye is cropped and exported
+        # under the plain name, so it costs and reads like a mono camera.
         if bool(getattr(camcfg, "stereo", False)):
-            eyes_cfg = getattr(camcfg, "eyes", "both")
+            record_eyes = getattr(camcfg, "eyes", "both")
+            stream_eyes = (
+                camcfg.streaming_eyes()
+                if hasattr(camcfg, "streaming_eyes")
+                else getattr(camcfg, "stream_eyes", None) or record_eyes
+            )
             spec["stereo"] = True
-            spec["eyes"] = ["left", "right"] if eyes_cfg == "both" else [eyes_cfg]
-            spec["eye_suffix"] = eyes_cfg == "both"
+            spec["record_eyes"] = (
+                ["left", "right"] if record_eyes == "both" else [record_eyes]
+            )
+            spec["record_suffix"] = record_eyes == "both"
+            spec["stream_eyes"] = (
+                ["left", "right"] if stream_eyes == "both" else [stream_eyes]
+            )
+            spec["stream_suffix"] = stream_eyes == "both"
         else:
             spec["stereo"] = False
         specs[name] = spec

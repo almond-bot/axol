@@ -38,10 +38,20 @@ class OpStartRequest(BaseModel):
     """Start one of the four in-process core operations.
 
     ``cameras`` (optional) carries the local ZED camera setup for teleop /
-    collect-data / run-policy: ``{"serials": {"overhead": 41234567, ...},
-    "resolution": "SVGA" | None}``. The runner folds it into the operation's
-    config (per-camera serials, capture resolution); whether the overhead is
-    stereo is auto-detected from its serial, not passed in.
+    collect-data / run-policy, e.g.::
+
+        {
+          "serials": {"overhead": 41234567, "left_arm": ..., "right_arm": ...},
+          "stream_resolution": "HD1200",   # capture res → headset feed
+          "record_resolution": "SVGA",     # dataset downscale (collect-data)
+          "stream_eyes": {"overhead": "both"},   # per stereo slot, headset
+          "record_eyes": {"overhead": "left"}    # per stereo slot, dataset
+        }
+
+    The runner folds it into the operation's config (per-camera serials,
+    capture/record resolution, per-eye stream/record selection). Whether a
+    slot is stereo is auto-detected from its serial, not passed in. The legacy
+    ``"resolution"`` key is still accepted as the streaming resolution.
     """
 
     op: str

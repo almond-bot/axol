@@ -108,6 +108,22 @@ def _stereo_eyes_for(name: str) -> tuple[list[str], bool]:
     return ["left"], False
 
 
+def _stream_eyes_for(cfg: TeleopCmdConfig, name: str) -> tuple[list[str], bool]:
+    """``(eyes, suffix)`` for a stereo slot's headset stream.
+
+    Honours an explicit per-slot ``--camera_eyes`` override (``both`` streams
+    both eyes per-lens, suffixed; ``left`` / ``right`` streams that single eye
+    under the plain name), falling back to the default head/wrist policy
+    (:func:`_stereo_eyes_for`) for slots the operator left unset.
+    """
+    eyes = (cfg.camera_eyes or {}).get(name)
+    if eyes == "both":
+        return ["left", "right"], True
+    if eyes in ("left", "right"):
+        return [eyes], False
+    return _stereo_eyes_for(name)
+
+
 def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None:
     """Start the out-of-process video relay for the configured cameras.
 
@@ -137,7 +153,7 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
         spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
         if int(serial) in stereo_set:
             spec["stereo"] = True
-            spec["eyes"], spec["eye_suffix"] = _stereo_eyes_for(name)
+            spec["eyes"], spec["eye_suffix"] = _stream_eyes_for(cfg, name)
         specs[name] = spec
 
     relay = VideoRelayProcess(specs)
@@ -231,7 +247,7 @@ def _connect_zed_cameras(
             stereo = _connect(name, serial, stereo=True)
             if stereo is None:
                 continue
-            eyes, suffix = _stereo_eyes_for(name)
+            eyes, suffix = _stream_eyes_for(cfg, name)
             for side in eyes:
                 view = stereo.left_view if side == "left" else stereo.right_view
                 cameras.append((f"{name}_{side}" if suffix else name, view))

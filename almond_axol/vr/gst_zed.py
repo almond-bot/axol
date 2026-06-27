@@ -792,6 +792,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
         right_raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
         eyes: str = "both",
+        encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
+        raw_eyes: "list[str] | tuple[str, ...] | None" = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -806,8 +808,6 @@ class ZedGstStereoCamera(_GstPipelineBase):
         # builds the full per-eye pair.
         if eyes not in ("both", "left", "right"):
             raise ValueError(f"eyes must be 'both', 'left', or 'right'; got {eyes!r}.")
-        self.eyes = eyes
-        self._sides: tuple[str, ...] = ("left", "right") if eyes == "both" else (eyes,)
         # A per-eye raw sink (the relay's shared-memory writer) or a shmsink socket
         # path implies that eye's raw branch and replaces its in-process _RawBuffer.
         want_raw = (
@@ -817,6 +817,35 @@ class ZedGstStereoCamera(_GstPipelineBase):
             or left_raw_socket_path is not None
             or right_raw_socket_path is not None
         )
+        # The encoded (headset stream) and raw (dataset recording) branches can
+        # select different eyes — e.g. stream both eyes for depth while recording
+        # only the left. ``encoded_eyes`` / ``raw_eyes`` override per branch; when
+        # unset each falls back to ``eyes`` (the legacy coupled behaviour, gated by
+        # the corresponding ``want_*``). Each eye is cropped once and tee'd into
+        # whichever branch(es) want it, so a side present in neither is never built.
+        base_sides = ("left", "right") if eyes == "both" else (eyes,)
+
+        def _order(sides: "list[str] | tuple[str, ...]") -> tuple[str, ...]:
+            for s in sides:
+                if s not in ("left", "right"):
+                    raise ValueError(f"eye must be 'left' or 'right'; got {s!r}.")
+            return tuple(s for s in ("left", "right") if s in sides)
+
+        self._encoded_sides = _order(
+            encoded_eyes
+            if encoded_eyes is not None
+            else (base_sides if want_encoded else ())
+        )
+        self._raw_sides = _order(
+            raw_eyes if raw_eyes is not None else (base_sides if want_raw else ())
+        )
+        want_encoded = bool(self._encoded_sides)
+        want_raw = bool(self._raw_sides)
+        # Build (crop) every eye either branch needs, ordered left-then-right.
+        self._sides: tuple[str, ...] = _order(
+            tuple(self._encoded_sides) + tuple(self._raw_sides)
+        )
+        self.eyes = eyes
         if not (want_encoded or want_raw):
             raise ValueError("ZedGstStereoCamera needs at least one of encoded/raw")
         self.serial = serial
@@ -836,12 +865,14 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.raw_latency_s = 0.0
 
         def eye(
-            raw_sink: Any, socket_path: str | None
+            side: str, raw_sink: Any, socket_path: str | None
         ) -> tuple[_AUChannel | None, _RawBuffer | None, _GstEye]:
-            enc = _AUChannel(lambda: self.alive) if want_encoded else None
+            enc = (
+                _AUChannel(lambda: self.alive) if side in self._encoded_sides else None
+            )
             raw = (
                 _RawBuffer(self.raw_width, self.raw_height)
-                if want_raw and raw_sink is None and socket_path is None
+                if side in self._raw_sides and raw_sink is None and socket_path is None
                 else None
             )
             view = _GstEye(self, enc, raw, self.width, self.height, self.fps)
@@ -855,18 +886,26 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.right_view: _GstEye | None = None
         if "left" in self._sides:
             self._left_enc, self._left_raw, self.left_view = eye(
-                left_raw_sink, left_raw_socket_path
+                "left", left_raw_sink, left_raw_socket_path
             )
         if "right" in self._sides:
             self._right_enc, self._right_raw, self.right_view = eye(
-                right_raw_sink, right_raw_socket_path
+                "right", right_raw_sink, right_raw_socket_path
             )
 
     def __repr__(self) -> str:
         return f"ZedGstStereoCamera(serial={self.serial})"
 
     def _eye_branch(self, side: str, sink_suffix: str) -> str:
-        """One eye: crop its half on the VIC, then encode and/or raw appsink."""
+        """One eye: crop its half on the VIC, then encode and/or raw appsink.
+
+        Encode and raw are gated per eye (``self._encoded_sides`` /
+        ``self._raw_sides``), so this eye may be encode-only (headset),
+        raw-only (dataset), or both (tee'd) depending on which branch asked
+        for it.
+        """
+        want_encoded = side in self._encoded_sides
+        want_raw = side in self._raw_sides
         eye_w, eye_h = self.width, self.height
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
@@ -876,7 +915,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
             "pixel-aspect-ratio=1/1"
         )
         crop = f"{_QUEUE} ! nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
-        if self._want_encoded and self._want_raw:
+        if want_encoded and want_raw:
             enc = (
                 f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! "
                 f"{_enc_appsink('enc_' + sink_suffix)}"
@@ -895,7 +934,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 f"width={self.raw_width},height={self.raw_height} ! {raw_tail}"
             )
             return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
-        if self._want_encoded:
+        if want_encoded:
             return f"{crop} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc_' + sink_suffix)}"
         return (
             f"{crop} ! nvvidconv ! video/x-raw,format=RGBA,"
@@ -911,7 +950,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         """
         if not self._want_raw or self._pipeline is None:
             return
-        for side in self._sides:
+        for side in self._raw_sides:
             valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
             if valve is not None:
                 valve.set_property("drop", not enabled)
@@ -959,7 +998,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
                 )
             # shmsink writes the frame in C; only the appsink path needs a Python
             # pull thread (which would contend with the relay's send — the bug).
-            if self._want_raw and sock is None:
+            if side in self._raw_sides and sock is None:
                 sink = raw_sink or self._buffer_sink(raw)
                 self._start_pull(
                     f"zedgst-{self.serial}-raw{suffix}",

@@ -469,6 +469,12 @@ class TeleopCmdConfig:
     the capture resolution for all cameras (``SVGA`` / ``HD1080`` /
     ``HD1200``); ``null`` (the default) keeps each camera's SDK default.
 
+    ``--camera_eyes`` overrides which eye(s) of a stereo slot are streamed to
+    the headset, keyed by slot (``both`` / ``left`` / ``right``) — e.g.
+    ``--camera_eyes "{overhead: both, left_arm: left}"``. Unset slots fall
+    back to the default policy (overhead streams both eyes per-lens, wrists
+    stream their left eye).
+
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
     """
@@ -481,6 +487,7 @@ class TeleopCmdConfig:
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)
+    camera_eyes: dict[str, str] = field(default_factory=dict)
     resolution: str | None = None
     log_level: LogLevel = "INFO"
 

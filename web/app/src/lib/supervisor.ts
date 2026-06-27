@@ -238,15 +238,37 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
+/** Which eye(s) of a stereo ZED X to use, per branch. */
+export type StereoEyes = "both" | "left" | "right"
+
+export type CameraSlot = "overhead" | "left_arm" | "right_arm"
+
 /** Local camera setup forwarded with op starts (see serve/runner.py).
  *
  * The serials map camera slots to the ZED cameras attached to the serve
  * machine; the runner folds them into the operation's config (collect-data /
  * run-policy record whichever slots are assigned and need at least one, teleop
  * streams whichever are set to the headset).
+ *
+ * Streaming (the headset feed) and recording (the dataset) are configured
+ * separately: ``stream_resolution`` is the capture resolution shown in the
+ * headset at full quality, while ``record_resolution`` is the downscale target
+ * for the recorded dataset (collect-data only). For a stereo camera the eyes
+ * are likewise independent — ``stream_eyes`` vs ``record_eyes`` per slot — so
+ * the operator can e.g. stream both eyes for depth perception while recording
+ * only one (or vice versa). Eye maps only apply to slots detected as stereo.
  */
 export interface CameraSpec {
-  serials: { overhead: string; left_arm: string; right_arm: string }
+  serials: Record<CameraSlot, string>
+  /** Capture resolution → headset stream (full quality). */
+  stream_resolution?: string
+  /** Dataset downscale target (collect-data recording). */
+  record_resolution?: string
+  /** Per-stereo-slot eye selection for the headset stream. */
+  stream_eyes?: Partial<Record<CameraSlot, StereoEyes>>
+  /** Per-stereo-slot eye selection for the recorded dataset. */
+  record_eyes?: Partial<Record<CameraSlot, StereoEyes>>
+  /** @deprecated legacy single resolution; read as ``stream_resolution``. */
   resolution?: string
 }
 

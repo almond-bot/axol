@@ -119,18 +119,40 @@ def _pyshm_meta(shm_name: str, width: int, height: int, fps: int) -> dict:
     }
 
 
-def _eye_plan(name: str, spec: dict) -> list[tuple[str, str]]:
-    """``[(eye_side, source_name)]`` for a stereo camera spec.
+def _plan(name: str, eyes: list[str], suffix: bool) -> list[tuple[str, str]]:
+    """``[(eye_side, source_name)]`` from an eye list + naming flag.
 
-    ``spec["eyes"]`` lists the eyes to build (default both); ``spec["eye_suffix"]``
-    (default True) decides naming. The head camera streams/records both eyes as
-    ``{name}_left`` / ``{name}_right``; a wrist stereo camera builds only its left
-    eye and exposes it under the plain ``{name}`` (``eye_suffix=False``), so it is
-    indistinguishable from a mono wrist downstream — one encode, one source.
+    With ``suffix`` the eyes are exposed as ``{name}_left`` / ``{name}_right``
+    (the head camera, rendered per-lens); without it a single eye is exposed
+    under the plain ``{name}`` so it is indistinguishable from a mono camera
+    downstream — one encode/record, one source.
     """
-    eyes = spec.get("eyes") or ["left", "right"]
-    suffix = spec.get("eye_suffix", True)
     return [(side, f"{name}_{side}" if suffix else name) for side in eyes]
+
+
+def _eye_plan(name: str, spec: dict) -> list[tuple[str, str]]:
+    """Encoded (headset stream) ``[(eye_side, source_name)]`` for a stereo spec.
+
+    Prefers the stream-specific keys (``stream_eyes`` / ``stream_suffix``) and
+    falls back to the legacy coupled keys (``eyes`` / ``eye_suffix``) so an
+    encoded-only spec (teleop) keeps working unchanged.
+    """
+    eyes = spec.get("stream_eyes") or spec.get("eyes") or ["left", "right"]
+    suffix = spec.get("stream_suffix", spec.get("eye_suffix", True))
+    return _plan(name, eyes, suffix)
+
+
+def _raw_plan(name: str, spec: dict) -> list[tuple[str, str]]:
+    """Raw (dataset recording) ``[(eye_side, source_name)]`` for a stereo spec.
+
+    Independent of :func:`_eye_plan`: the recorded eyes (``record_eyes`` /
+    ``record_suffix``) can differ from the streamed eyes — e.g. stream both
+    eyes for depth while recording only the left. Falls back to the legacy
+    coupled keys so a spec that only sets ``eyes`` records what it streams.
+    """
+    eyes = spec.get("record_eyes") or spec.get("eyes") or ["left", "right"]
+    suffix = spec.get("record_suffix", spec.get("eye_suffix", True))
+    return _plan(name, eyes, suffix)
 
 
 def _open_gst_camera_raw(
@@ -191,10 +213,16 @@ def _open_gst_camera_raw(
         writers: list = []
         try:
             if stereo and use_shm:
-                plan = _eye_plan(name, spec)
-                gst_eyes = "both" if len(plan) == 2 else plan[0][0]
+                # Encoded eyes feed the headset; raw eyes feed the dataset — they
+                # may differ (stream both, record one). Build the union; each eye
+                # is cropped once and tee'd into whichever branch wants it.
+                enc_plan = _eye_plan(name, spec)
+                raw_plan = _raw_plan(name, spec)
+                enc_sides = [side for side, _ in enc_plan]
+                raw_sides = [side for side, _ in raw_plan]
                 socks = {
-                    side: os.path.join(socket_dir, f"{src}.sock") for side, src in plan
+                    side: os.path.join(socket_dir, f"{src}.sock")
+                    for side, src in raw_plan
                 }
                 eye_kwargs: dict = {}
                 if "left" in socks:
@@ -205,27 +233,31 @@ def _open_gst_camera_raw(
                     serial,
                     resolution,
                     fps,
-                    want_encoded=True,
                     raw_dims=raw_dims,
-                    eyes=gst_eyes,
+                    encoded_eyes=enc_sides,
+                    raw_eyes=raw_sides,
                     **eye_kwargs,
                 )
                 cam.connect()
                 caps = _raw_caps(raw_w, raw_h, fps)
                 lat = cam.raw_latency_s
-                sources = {}
-                raw_meta = {}
-                for side, src in plan:
-                    sources[src] = cam.left_view if side == "left" else cam.right_view
-                    raw_meta[src] = _gstshm_meta(
-                        socks[side], caps, raw_w, raw_h, fps, lat
-                    )
+                sources = {
+                    src: (cam.left_view if side == "left" else cam.right_view)
+                    for side, src in enc_plan
+                }
+                raw_meta = {
+                    src: _gstshm_meta(socks[side], caps, raw_w, raw_h, fps, lat)
+                    for side, src in raw_plan
+                }
                 return cam, sources, [], raw_meta
             if stereo:
-                plan = _eye_plan(name, spec)
-                gst_eyes = "both" if len(plan) == 2 else plan[0][0]
+                enc_plan = _eye_plan(name, spec)
+                raw_plan = _raw_plan(name, spec)
+                enc_sides = [side for side, _ in enc_plan]
+                raw_sides = [side for side, _ in raw_plan]
                 eye_writers = {
-                    side: RawFrameWriter.create(raw_w, raw_h, cond) for side, _ in plan
+                    side: RawFrameWriter.create(raw_w, raw_h, cond)
+                    for side, _ in raw_plan
                 }
                 writers = list(eye_writers.values())
                 eye_kwargs = {}
@@ -237,19 +269,20 @@ def _open_gst_camera_raw(
                     serial,
                     resolution,
                     fps,
-                    want_encoded=True,
                     raw_dims=raw_dims,
-                    eyes=gst_eyes,
+                    encoded_eyes=enc_sides,
+                    raw_eyes=raw_sides,
                     **eye_kwargs,
                 )
                 cam.connect()
-                sources = {}
-                raw_meta = {}
-                for side, src in plan:
-                    sources[src] = cam.left_view if side == "left" else cam.right_view
-                    raw_meta[src] = _pyshm_meta(
-                        eye_writers[side].name, raw_w, raw_h, fps
-                    )
+                sources = {
+                    src: (cam.left_view if side == "left" else cam.right_view)
+                    for side, src in enc_plan
+                }
+                raw_meta = {
+                    src: _pyshm_meta(eye_writers[side].name, raw_w, raw_h, fps)
+                    for side, src in raw_plan
+                }
                 return cam, sources, writers, raw_meta
             if use_shm:
                 sock = os.path.join(socket_dir, f"{name}.sock")
