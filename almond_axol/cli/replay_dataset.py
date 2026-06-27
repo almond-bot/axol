@@ -39,7 +39,7 @@ _logger = logging.getLogger(__name__)
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for replay: arms only, no cameras.
 
-    Replay neither records nor streams video — it just plays recorded joint
+    Replay neither records nor streams video — it just plays recorded
     actions back onto the arms — so no camera slots are seeded (an empty
     ``cameras`` dict opens the arms only). ``telemetry_hz=0`` skips the
     background poll loop: like ``collect-data``, a ``motion_control`` command
@@ -144,10 +144,20 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # Playback fps: the dataset's recorded fps unless overridden.
     fps = cfg.fps if cfg.fps and cfg.fps > 0 else dataset.fps
 
-    # The recorded action layout must cover the robot's action keys (the dataset
-    # stores one column per `{side}_{joint}.pos`). Validate up front so a
-    # mismatched dataset fails clearly instead of KeyError-ing inside send_action.
+    # The recorded action layout must cover the robot's action keys. A joint
+    # dataset stores one column per `{side}_{joint}.pos`; a Cartesian dataset
+    # (observe_cartesian) stores per-arm `{side}_ee.{axis}` end-effector poses
+    # plus gripper. Match the robot to whichever the dataset recorded so its
+    # action_features line up and send_action picks the right path — joints go
+    # straight out, Cartesian poses are resolved to joints via IK (as in
+    # run-policy). Validate up front so a mismatched dataset fails clearly
+    # instead of KeyError-ing inside send_action.
     action_names = list(dataset.features[ACTION]["names"])
+    recorded_cartesian = any("_ee." in name for name in action_names)
+    if isinstance(cfg.robot_config, AxolRobotConfig):
+        cfg.robot_config.observe_cartesian = recorded_cartesian
+    if recorded_cartesian:
+        log_say("Cartesian dataset: replaying EE poses via inverse kinematics.")
     robot = AxolRobot(cfg.robot_config)
     missing = [k for k in robot.action_features if k not in action_names]
     if missing:
@@ -181,6 +191,13 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     try:
         log_say("Connecting robot...")
         robot.connect()
+
+        # A Cartesian dataset resolves each recorded EE pose to joints via IK in
+        # send_action. Build that solver now so its one-time JIT warmup overlaps
+        # the return-to-rest below instead of stalling the first replayed frame.
+        if recorded_cartesian:
+            log_say("Preparing Cartesian action solver (IK)...")
+            robot.prepare_cartesian_actions()
 
         # Start every take from rest, the same place collect-data records from,
         # so the first replayed action is ~rest and there's no jump.

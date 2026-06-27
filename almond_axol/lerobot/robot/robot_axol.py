@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
@@ -41,6 +43,10 @@ from ...robot.axol import Axol
 from ...utils.shared import Joint
 from .config_axol import AxolRobotConfig
 
+if TYPE_CHECKING:
+    from ...kinematics.fk import AxolForwardKinematics
+    from ...kinematics.solver import KinematicsSolver
+
 _logger = logging.getLogger(__name__)
 
 _JOINTS = list(Joint)
@@ -48,6 +54,18 @@ _LEFT_POS_KEYS = [f"left_{j.value}.pos" for j in _JOINTS]
 _RIGHT_POS_KEYS = [f"right_{j.value}.pos" for j in _JOINTS]
 _LEFT_TRQ_KEYS = [f"left_{j.value}.trq" for j in _JOINTS]
 _RIGHT_TRQ_KEYS = [f"right_{j.value}.trq" for j in _JOINTS]
+
+# The gripper position is observed in both joint and Cartesian modes — it is the
+# last entry of each arm's position vector (Joint.GRIPPER is last in the enum).
+_LEFT_GRIPPER_KEY = _LEFT_POS_KEYS[-1]
+_RIGHT_GRIPPER_KEY = _RIGHT_POS_KEYS[-1]
+
+# Cartesian observation keys (observe_cartesian): a 6-axis end-effector pose per
+# arm, replacing that arm's 7 joint-angle keys. Axis order matches
+# AxolForwardKinematics.ee_poses (position x/y/z then rotation vector rx/ry/rz).
+_EE_AXES = ("x", "y", "z", "rx", "ry", "rz")
+_LEFT_EE_KEYS = [f"left_ee.{a}" for a in _EE_AXES]
+_RIGHT_EE_KEYS = [f"right_ee.{a}" for a in _EE_AXES]
 
 
 class AxolRobot(Robot):
@@ -72,6 +90,13 @@ class AxolRobot(Robot):
         self.cameras, self._stereo_cameras = self._build_cameras()
         self._observation_features: dict[str, type | tuple] | None = None
         self._action_features: dict[str, type | tuple] | None = None
+        # Built on connect() only when observe_cartesian is set; turns cached
+        # joint angles into end-effector poses for the observation.
+        self._fk: AxolForwardKinematics | None = None
+        # Full IK solver, built lazily the first time a Cartesian action is sent
+        # (run-policy). Collect-data commands joint targets, so it never builds
+        # this; only the cheap forward-kinematics helper above runs there.
+        self._ik: KinematicsSolver | None = None
 
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
@@ -210,9 +235,19 @@ class AxolRobot(Robot):
         if self._observation_features is not None:
             return self._observation_features
 
-        features: dict[str, type | tuple] = {
-            key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS
-        }
+        if self.config.observe_cartesian:
+            # Each arm's 7 joint angles become a 6-axis EE pose; the gripper
+            # position is kept (it has no Cartesian equivalent).
+            state_keys = (
+                _LEFT_EE_KEYS
+                + [_LEFT_GRIPPER_KEY]
+                + _RIGHT_EE_KEYS
+                + [_RIGHT_GRIPPER_KEY]
+            )
+        else:
+            state_keys = _LEFT_POS_KEYS + _RIGHT_POS_KEYS
+
+        features: dict[str, type | tuple] = {key: float for key in state_keys}
         if self.config.observe_torques:
             for key in _LEFT_TRQ_KEYS + _RIGHT_TRQ_KEYS:
                 features[key] = float
@@ -235,9 +270,18 @@ class AxolRobot(Robot):
     @property
     def action_features(self) -> dict:
         if self._action_features is None:
-            self._action_features = {
-                key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS
-            }
+            if self.config.observe_cartesian:
+                # Mirror the observation: command each arm by a 6-axis EE pose
+                # (resolved to joints via IK in send_action) plus gripper.
+                keys = (
+                    _LEFT_EE_KEYS
+                    + [_LEFT_GRIPPER_KEY]
+                    + _RIGHT_EE_KEYS
+                    + [_RIGHT_GRIPPER_KEY]
+                )
+            else:
+                keys = _LEFT_POS_KEYS + _RIGHT_POS_KEYS
+            self._action_features = {key: float for key in keys}
         return self._action_features
 
     # ------------------------------------------------------------------
@@ -255,6 +299,17 @@ class AxolRobot(Robot):
         self._loop_thread.start()
 
         asyncio.run_coroutine_threadsafe(self._connect_async(), loop).result(timeout=30)
+
+        if self.config.observe_cartesian and self._fk is None:
+            # Keep the forward-kinematics model off the GPU that the camera relay
+            # (NVENC) and policy server need; the teleop IK runs CPU-only too.
+            # pin_jax_to_cpu() must run before the first FK op (the warmup in
+            # the constructor) — see its docstring for why an env var is too late.
+            os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+            from ...kinematics.fk import AxolForwardKinematics, pin_jax_to_cpu
+
+            pin_jax_to_cpu()
+            self._fk = AxolForwardKinematics()
 
         for cam in self.cameras.values():
             cam.connect()
@@ -307,6 +362,8 @@ class AxolRobot(Robot):
 
         self._loop = None
         self._loop_thread = None
+        self._fk = None
+        self._ik = None
         _logger.info("AxolRobot disconnected.")
 
     async def _disconnect_async(self) -> None:
@@ -355,13 +412,51 @@ class AxolRobot(Robot):
     # Observation / action
     # ------------------------------------------------------------------
 
-    @check_if_not_connected
-    def get_joint_observation(self) -> RobotObservation:
-        """Return cached joint positions only — no camera reads.
+    def _joints_to_cartesian(
+        self, left_pos: np.ndarray, right_pos: np.ndarray
+    ) -> dict[str, float]:
+        """Map per-arm joint positions to the Cartesian state/action dict.
 
-        Use this in the high-frequency teleop path to avoid copying large
-        camera frames on every step.  Call :meth:`get_observation` only when
-        a full observation (joints + cameras) is actually needed.
+        Runs forward kinematics on the 7 arm joints to get each end-effector's
+        6-axis pose and keeps the gripper position. Shared by the cartesian
+        observation (current joints) and the recorded cartesian action
+        (commanded joints), so both stay in exactly the same representation.
+        """
+        assert self._fk is not None
+        left_ee, right_ee = self._fk.ee_poses(left_pos, right_pos)
+        out: dict[str, float] = {}
+        for key, val in zip(_LEFT_EE_KEYS, left_ee):
+            out[key] = float(val)
+        out[_LEFT_GRIPPER_KEY] = float(left_pos[-1])
+        for key, val in zip(_RIGHT_EE_KEYS, right_ee):
+            out[key] = float(val)
+        out[_RIGHT_GRIPPER_KEY] = float(right_pos[-1])
+        return out
+
+    def action_to_dataset(self, action: RobotAction) -> RobotAction:
+        """Express a joint-position action in the configured action space.
+
+        The teleop produces joint-position targets; in cartesian mode the
+        *recorded* action must match :attr:`action_features`, so the joint
+        targets are mapped through forward kinematics to per-arm end-effector
+        poses (+ gripper). Identity when ``observe_cartesian`` is off. This does
+        not touch what is commanded to the arm — only the value stored in the
+        dataset — so teleop keeps its exact joint fidelity.
+        """
+        if not self.config.observe_cartesian:
+            return action
+        left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
+        right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
+        return dict(self._joints_to_cartesian(left, right))
+
+    def _joint_state(self) -> RobotObservation:
+        """Build the non-camera part of an observation from the telemetry cache.
+
+        Emits either the 16 joint positions (default) or, when
+        ``observe_cartesian`` is set, each arm's 6-axis end-effector pose plus
+        gripper position. Joint torques are appended when ``observe_torques`` is
+        set, independent of the position representation. Keys match
+        :attr:`observation_features`.
         """
         assert self._axol is not None
         assert self._axol.left is not None
@@ -371,10 +466,13 @@ class AxolRobot(Robot):
         right_pos = self._axol.right.positions
 
         obs: RobotObservation = {}
-        for i, key in enumerate(_LEFT_POS_KEYS):
-            obs[key] = float(left_pos[i])
-        for i, key in enumerate(_RIGHT_POS_KEYS):
-            obs[key] = float(right_pos[i])
+        if self.config.observe_cartesian:
+            obs.update(self._joints_to_cartesian(left_pos, right_pos))
+        else:
+            for i, key in enumerate(_LEFT_POS_KEYS):
+                obs[key] = float(left_pos[i])
+            for i, key in enumerate(_RIGHT_POS_KEYS):
+                obs[key] = float(right_pos[i])
 
         if self.config.observe_torques:
             left_trq = self._axol.left.torques
@@ -387,8 +485,18 @@ class AxolRobot(Robot):
         return obs
 
     @check_if_not_connected
+    def get_joint_observation(self) -> RobotObservation:
+        """Return cached joint state only — no camera reads.
+
+        Use this in the high-frequency teleop path to avoid copying large
+        camera frames on every step.  Call :meth:`get_observation` only when
+        a full observation (joint state + cameras) is actually needed.
+        """
+        return self._joint_state()
+
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Return cached joint positions and timestamp-aligned camera frames.
+        """Return cached joint state and timestamp-aligned camera frames.
 
         Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
         shared ``time.perf_counter()`` target so every frame in the
@@ -398,28 +506,9 @@ class AxolRobot(Robot):
         fall back to ``read_latest()`` so a single stale camera doesn't stall
         inference.
         """
-        assert self._axol is not None
-        assert self._axol.left is not None
-        assert self._axol.right is not None
-
         target_ts = time.perf_counter()
 
-        left_pos = self._axol.left.positions  # np.ndarray (8,), from telemetry cache
-        right_pos = self._axol.right.positions
-
-        obs: RobotObservation = {}
-        for i, key in enumerate(_LEFT_POS_KEYS):
-            obs[key] = float(left_pos[i])
-        for i, key in enumerate(_RIGHT_POS_KEYS):
-            obs[key] = float(right_pos[i])
-
-        if self.config.observe_torques:
-            left_trq = self._axol.left.torques
-            right_trq = self._axol.right.torques
-            for i, key in enumerate(_LEFT_TRQ_KEYS):
-                obs[key] = float(left_trq[i])
-            for i, key in enumerate(_RIGHT_TRQ_KEYS):
-                obs[key] = float(right_trq[i])
+        obs = self._joint_state()
 
         for cam_key, cam in self.cameras.items():
             cam_fps = getattr(cam, "fps", None) or 30
@@ -441,9 +530,104 @@ class AxolRobot(Robot):
 
         return obs
 
+    def _ensure_ik(self) -> KinematicsSolver:
+        """Lazily build the IK solver used to resolve Cartesian action targets.
+
+        Built on first use rather than on connect so the joint-action paths
+        (collect-data, teleop) never pay for the solver's URDF load, collision
+        model, and IK JIT warmup. Pins JAX to the CPU (see :meth:`connect`).
+        """
+        if self._ik is None:
+            # Pin JAX to the CPU before the solver's first op (its IK warmup) —
+            # see pin_jax_to_cpu() for why an env var here is too late.
+            os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+            from ...kinematics.fk import pin_jax_to_cpu
+            from ...kinematics.solver import KinematicsSolver
+
+            pin_jax_to_cpu()
+            _logger.info("Building IK solver for Cartesian actions...")
+            self._ik = KinematicsSolver()
+
+            # The solver warms up its *with-elbow* IK graph, but our Cartesian
+            # sends pass no elbow hint — a distinct graph that would otherwise
+            # JIT-compile on the first real send, blocking the event loop past
+            # send_action's timeout (and clogging it for the rest of the run).
+            # Compile that exact no-elbow variant here, on the caller thread,
+            # with a dummy reachable target. Best-effort: warmup only compiles.
+            dummy_pose = (
+                np.array([0.0, 0.0, 0.3], dtype=np.float32),
+                np.eye(3, dtype=np.float32),
+            )
+            q0 = np.zeros(self._ik.num_joints, dtype=np.float32)
+            try:
+                self._ik.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
+            except Exception:  # noqa: BLE001 - warmup just triggers compilation
+                _logger.warning("Cartesian IK warmup failed", exc_info=True)
+            _logger.info("IK solver ready for Cartesian actions.")
+        return self._ik
+
+    def prepare_cartesian_actions(self) -> None:
+        """Pre-build the Cartesian-action IK solver before the control loop runs.
+
+        ``send_action`` builds the solver lazily on the first Cartesian action,
+        but its URDF load + JIT warmup (tens of seconds) would otherwise stall
+        the caller's real-time control loop on that first action. Consumers that
+        will stream Cartesian actions (run-policy, replay-dataset) call this once
+        after :meth:`connect` — overlapping the build with the policy load /
+        return-to-rest — so the first action dispatches immediately. A no-op once
+        built, and never called by collect-data, which commands joint targets and
+        so never needs IK.
+        """
+        self._ensure_ik()
+
+    def _cartesian_action_to_targets(
+        self, action: RobotAction
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Resolve a Cartesian action to per-arm joint targets via IK.
+
+        Each arm's 6-axis end-effector pose is solved to joint angles, seeded
+        with the arm's current cached position so the solve tracks from where
+        the arm actually is. The gripper passes straight through. Returns
+        ``(left, right)`` 8-vectors (7 arm joints + gripper) in Joint order.
+        """
+        from ...kinematics.fk import pose6_to_pos_rot
+
+        solver = self._ensure_ik()
+        assert self._axol is not None
+        assert self._axol.left is not None
+        assert self._axol.right is not None
+
+        left_cur = self._axol.left.positions
+        right_cur = self._axol.right.positions
+        q = np.zeros(solver.num_joints, dtype=np.float32)
+        for i, gi in enumerate(solver.left_indices):
+            q[gi] = left_cur[i]
+        for i, gi in enumerate(solver.right_indices):
+            q[gi] = right_cur[i]
+
+        left_pose = pose6_to_pos_rot(np.array([action[k] for k in _LEFT_EE_KEYS]))
+        right_pose = pose6_to_pos_rot(np.array([action[k] for k in _RIGHT_EE_KEYS]))
+        q_out = solver.ik(q, left_pose=left_pose, right_pose=right_pose)
+
+        left = np.empty(len(_JOINTS), dtype=np.float32)
+        right = np.empty(len(_JOINTS), dtype=np.float32)
+        for i, gi in enumerate(solver.left_indices):
+            left[i] = q_out[gi]
+        for i, gi in enumerate(solver.right_indices):
+            right[i] = q_out[gi]
+        left[-1] = action[_LEFT_GRIPPER_KEY]
+        right[-1] = action[_RIGHT_GRIPPER_KEY]
+        return left, right
+
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Send joint position targets via impedance control (arm joints) and position-force control (gripper).
+        """Send an action to the arms, running IK first for Cartesian actions.
+
+        Accepts either joint-position targets or — when ``observe_cartesian``
+        is on and the policy emits them — per-arm Cartesian end-effector poses
+        (+ gripper), which are resolved to joint targets via inverse
+        kinematics. Either way the arm joints go out via impedance control and
+        the gripper via position-force control.
 
         Synchronous wrapper for callers not running on :attr:`event_loop`
         (e.g. ``run-policy``): it hops to the robot's loop and blocks on the
@@ -451,16 +635,27 @@ class AxolRobot(Robot):
         :meth:`send_action_async` instead to avoid that cross-thread wait.
 
         Args:
-            action: Dict with keys matching action_features, values in radians.
+            action: Dict with keys matching action_features, values in radians
+                (joint mode) or metres + axis-angle radians (Cartesian mode).
 
         Returns:
             The action as sent (unmodified).
         """
         assert self._loop is not None
 
+        # Build the IK solver here, on the caller's thread, so the one-time
+        # URDF load + JIT warmup never blocks the robot's event loop (telemetry).
+        # A Cartesian send then runs a (warmed) IK solve inline on the loop
+        # before motion_control, so give it more headroom than a bare joint
+        # command — the solve is milliseconds warmed, but loop contention or a
+        # cold path shouldn't surface as a spurious timeout that aborts replay.
+        is_cartesian = _LEFT_EE_KEYS[0] in action
+        if is_cartesian:
+            self._ensure_ik()
+
         asyncio.run_coroutine_threadsafe(
             self.send_action_async(action), self._loop
-        ).result(timeout=1.0)
+        ).result(timeout=5.0 if is_cartesian else 1.0)
 
         return action
 
@@ -473,16 +668,24 @@ class AxolRobot(Robot):
         is dispatched inline (cooperatively with telemetry) with no
         cross-thread ``.result()`` block.
 
+        A Cartesian action (per-arm EE pose, as emitted by a cartesian policy)
+        is resolved to joint targets via IK; a joint action — what teleop and
+        collect-data always send — is dispatched directly with no IK. The two
+        are told apart by their keys, so collect-data never triggers a solve.
+
         Args:
-            action: Dict with keys matching action_features, values in radians.
+            action: Dict with keys matching action_features.
 
         Returns:
             The action as sent (unmodified).
         """
         assert self._axol is not None
 
-        left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
-        right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
+        if _LEFT_EE_KEYS[0] in action:
+            left, right = self._cartesian_action_to_targets(action)
+        else:
+            left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
+            right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
 
         await self._axol.motion_control(left=left, right=right)
 
