@@ -547,6 +547,23 @@ class AxolRobot(Robot):
             pin_jax_to_cpu()
             _logger.info("Building IK solver for Cartesian actions...")
             self._ik = KinematicsSolver()
+
+            # The solver warms up its *with-elbow* IK graph, but our Cartesian
+            # sends pass no elbow hint — a distinct graph that would otherwise
+            # JIT-compile on the first real send, blocking the event loop past
+            # send_action's timeout (and clogging it for the rest of the run).
+            # Compile that exact no-elbow variant here, on the caller thread,
+            # with a dummy reachable target. Best-effort: warmup only compiles.
+            dummy_pose = (
+                np.array([0.0, 0.0, 0.3], dtype=np.float32),
+                np.eye(3, dtype=np.float32),
+            )
+            q0 = np.zeros(self._ik.num_joints, dtype=np.float32)
+            try:
+                self._ik.ik(q0, left_pose=dummy_pose, right_pose=dummy_pose)
+            except Exception:  # noqa: BLE001 - warmup just triggers compilation
+                _logger.warning("Cartesian IK warmup failed", exc_info=True)
+            _logger.info("IK solver ready for Cartesian actions.")
         return self._ik
 
     def _cartesian_action_to_targets(
@@ -614,12 +631,17 @@ class AxolRobot(Robot):
 
         # Build the IK solver here, on the caller's thread, so the one-time
         # URDF load + JIT warmup never blocks the robot's event loop (telemetry).
-        if _LEFT_EE_KEYS[0] in action:
+        # A Cartesian send then runs a (warmed) IK solve inline on the loop
+        # before motion_control, so give it more headroom than a bare joint
+        # command — the solve is milliseconds warmed, but loop contention or a
+        # cold path shouldn't surface as a spurious timeout that aborts replay.
+        is_cartesian = _LEFT_EE_KEYS[0] in action
+        if is_cartesian:
             self._ensure_ik()
 
         asyncio.run_coroutine_threadsafe(
             self.send_action_async(action), self._loop
-        ).result(timeout=1.0)
+        ).result(timeout=5.0 if is_cartesian else 1.0)
 
         return action
 
