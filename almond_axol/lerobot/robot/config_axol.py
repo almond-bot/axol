@@ -42,6 +42,14 @@ class AxolRobotConfig(RobotConfig):
                           step (e.g. ``collect-data``); otherwise the cache goes
                           stale between commands.
         observe_torques:  Include joint torques in observations. Default False.
+        observe_cartesian: Use Cartesian space for both observations and
+                          actions: each arm's end-effector is a 6-axis pose
+                          (position + axis-angle rotation, world frame FLU) plus
+                          gripper position, instead of the 7 arm joint angles
+                          (the gripper is kept either way). Observations run
+                          forward kinematics on the joint state; Cartesian
+                          actions are resolved back to joint targets via inverse
+                          kinematics in send_action. Default False.
         left_channel:     SocketCAN interface for the left arm.
         right_channel:    SocketCAN interface for the right arm.
     """
@@ -50,6 +58,7 @@ class AxolRobotConfig(RobotConfig):
     axol_config: AxolConfig = field(default_factory=AxolConfig)
     telemetry_hz: float = 120.0
     observe_torques: bool = False
+    observe_cartesian: bool = False
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
     video_backend: VideoBackend = "auto"

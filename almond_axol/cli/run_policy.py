@@ -419,11 +419,6 @@ def _build_axol_robot_client(
         EMA + trapezoidal-filtered in ``collect_data``.
         """
 
-        # Indices of the gripper joints in the 16-element action vector.
-        # ``_temporal_ensemble_aggregate`` snaps these to the newest
-        # contributing chunk so bang-bang grasps aren't smeared.
-        _GRIPPER_INDICES = (7, 15)
-
         def __init__(  # type: ignore[no-untyped-def]
             self,
             config,
@@ -447,6 +442,16 @@ def _build_axol_robot_client(
 
             self.config = config
             self.robot = robot
+            # Indices of the gripper entries in the flat action vector, derived
+            # from the robot's action space so it tracks both the joint layout
+            # (16-dim, grippers at 7/15) and the Cartesian layout (14-dim,
+            # grippers at 6/13). ``_temporal_ensemble_aggregate`` snaps these to
+            # the newest contributing chunk so bang-bang grasps aren't smeared.
+            self._gripper_indices = tuple(
+                i
+                for i, key in enumerate(robot.action_features)
+                if key.endswith("gripper.pos")
+            )
             self._publisher = publisher
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
@@ -550,7 +555,7 @@ def _build_axol_robot_client(
             Each future timestep ``ts > latest_action`` covered by at
             least one buffered chunk gets ``commanded[ts] = Σ wᵢ ·
             chunkᵢ[ts] / Σ wᵢ`` with ``wᵢ = exp(-coeff · i)`` and
-            ``i = 0`` the oldest chunk. ``_GRIPPER_INDICES`` bypass the
+            ``i = 0`` the oldest chunk. ``_gripper_indices`` bypass the
             average and snap to the newest contributing chunk's value.
             The rebuild is one batched op over an
             ``(n_chunks, n_ts, action_dim)`` grid, sub-ms even with
@@ -652,7 +657,7 @@ def _build_axol_robot_client(
             # CPU tensors).
             reverse_cumsum = mask.flip(0).cumsum(dim=0).flip(0)
             newest_mask = mask * (reverse_cumsum == 1).to(dtype)
-            for gidx in self._GRIPPER_INDICES:
+            for gidx in self._gripper_indices:
                 ensembled[:, gidx] = (action_grid[:, :, gidx] * newest_mask).sum(dim=0)
 
             contributed_indices = (

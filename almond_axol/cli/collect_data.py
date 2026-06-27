@@ -634,7 +634,11 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             sect["proc"] += t_proc - t_act
             sect["send"] += t_send - t_proc
 
-            recorder.publish(joint_obs, act_processed, t0)
+            # Record the action in the configured action space: identity for
+            # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
+            # arm is still commanded with the teleop joint targets above, so its
+            # motion is unchanged — only the stored representation differs.
+            recorder.publish(joint_obs, robot.action_to_dataset(act_processed), t0)
 
             events = teleop.get_teleop_events()
 
