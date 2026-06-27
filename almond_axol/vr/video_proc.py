@@ -498,7 +498,18 @@ def _relay_main(
     manager = WebRTCManager(sources) if sources else None
     conn.send(("ready", sorted(sources), raw_meta))
     if manager is None:
-        _logger.warning("video relay opened no cameras; nothing to stream")
+        if raw_meta:
+            # Record-only: every camera has streaming disabled, so there's no
+            # headset feed — but the raw branch still exports frames for the
+            # dataset. Not an error.
+            _logger.info(
+                "video relay: recording only (%d raw source(s), no headset streams)",
+                len(raw_meta),
+            )
+        else:
+            _logger.warning(
+                "video relay opened no cameras; nothing to stream or record"
+            )
 
     async def _loop_lag_monitor() -> None:
         """Log the relay event-loop's worst scheduling lag each second.
@@ -695,8 +706,13 @@ class VideoRelayProcess:
                 raw_meta = msg[2] if len(msg) > 2 else {}
                 self.raw_meta = dict(raw_meta)
                 self._attach_raw_readers(raw_meta)
-        if not self.sources:
-            _logger.warning("video relay started no camera streams")
+        if not self.sources and not self.raw_cameras:
+            _logger.warning("video relay started no camera streams or raw sources")
+        elif not self.sources:
+            _logger.info(
+                "video relay: recording only (%d raw source(s), no headset streams)",
+                len(self.raw_cameras),
+            )
 
     @property
     def raw_cond(self) -> object:

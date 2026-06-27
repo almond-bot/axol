@@ -219,7 +219,13 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
         specs[name] = spec
 
     relay = VideoRelayProcess(specs, want_raw=True)
-    if not relay.has_sources:
+    # Keep the relay if it can serve *either* branch: raw frames for the dataset
+    # (the primary purpose for collect-data) or encoded streams for the headset.
+    # A record-only setup (streaming disabled for every camera) has no encoded
+    # sources but still needs the relay's raw export, so don't discard it just
+    # because nothing streams — otherwise we fall back to the in-process path and
+    # open every camera a second time.
+    if not (relay.has_sources or relay.raw_cameras):
         relay.shutdown()
         return None
     return relay
