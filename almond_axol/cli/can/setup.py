@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ...utils.shared import CAN_LEFT, CAN_RIGHT
+from ...constants import CAN_LEFT, CAN_RIGHT
 from ...utils.sudo import run_root
 from . import driver
 

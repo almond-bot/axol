@@ -11,9 +11,9 @@ Examples:
 import argparse
 import asyncio
 
+from ...constants import CAN_LEFT, CAN_RIGHT, Joint
 from ...motor.bus import CanBus
 from ...motor.motor import Motor
-from ...utils.shared import CAN_LEFT, CAN_RIGHT, Joint
 
 # CAN IDs 0x01–0x08 in Joint control order.
 _MOTOR_IDS: dict[Joint, int] = {

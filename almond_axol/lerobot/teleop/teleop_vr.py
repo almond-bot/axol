@@ -51,9 +51,9 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
+from ...constants import Joint
 from ...teleop.core import VRTeleopCore
 from ...teleop.worker import run_ik_worker
-from ...utils.shared import Joint
 from ...vr.models import VRFrame, VRState
 from ...vr.server import VRServer
 from .config_vr import AxolVRTeleopConfig
@@ -354,7 +354,7 @@ class AxolVRTeleop(Teleoperator):
         """Stream to the headset via a pre-built WebRTC manager (e.g. a relay).
 
         ``manager`` implements the ``WebRTCManager`` signaling interface and is
-        normally an out-of-process :class:`~almond_axol.vr.video_proc.VideoRelayProcess`,
+        normally an out-of-process :class:`~almond_axol.video.video_proc.VideoRelayProcess`,
         so all camera grab/encode and RTP traffic stays off the control process
         — see :meth:`almond_axol.vr.server.VRServer.set_video_manager`. Must be
         called after :meth:`connect`. Pass ``None`` to disable video.

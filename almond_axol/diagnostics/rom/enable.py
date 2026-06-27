@@ -11,13 +11,13 @@ Pass --robot to select the backend:
           gripper onto the item and loops the sweep for two hours. When the
           soak finishes (or on Ctrl-C) the robot returns home but keeps
           holding the item with the motors left enabled — run
-          ``almond_axol.test.rom.disable`` afterwards to open the grippers
+          ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
           and retrieve the item. A predicted collision aborts the run, returns
           the robot home, and disables the motors.
 
 Run:
-    uv run -m almond_axol.test.rom.enable --robot sim
-    uv run -m almond_axol.test.rom.enable --robot axol
+    uv run -m almond_axol.diagnostics.rom.enable --robot sim
+    uv run -m almond_axol.diagnostics.rom.enable --robot axol
 """
 
 import argparse
@@ -31,6 +31,7 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
+from ...constants import URDF_PATH, Joint
 from ...kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
@@ -43,7 +44,6 @@ from ...robot.axol import (
 )
 from ...robot.config import AxolConfig
 from ...robot.sim import Sim
-from ...utils.shared import URDF_PATH, Joint
 
 CONTROL_RATE_HZ = 100.0  # Hz
 
@@ -735,7 +735,7 @@ async def run_axol() -> None:
             await close_buses(axol)
             print(
                 "\nMotors left enabled — robot is holding the item.\n"
-                "Run `uv run -m almond_axol.test.rom.disable` to open the "
+                "Run `uv run -m almond_axol.diagnostics.rom.disable` to open the "
                 "grippers and retrieve it."
             )
         else:

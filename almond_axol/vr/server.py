@@ -50,7 +50,7 @@ from .interp import PoseInterpolator
 from .models import VRFrame
 
 if TYPE_CHECKING:
-    from .video import WebRTCManager
+    from ..video.video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ class VRServer:
         directly — the relay adapts it to BGRA frames), a pre-encoded
         ``gst_zed`` camera, or any raw-frame source exposing ``width`` /
         ``height`` / ``fps`` + ``wait_next``; the manager picks the right
-        WebRTC track per source (see :mod:`almond_axol.vr.video`). The headset
+        WebRTC track per source (see :mod:`almond_axol.video.video`). The headset
         negotiates a WebRTC connection over the existing ``/ws`` channel and
         receives one video track per source, encoded on the Jetson's hardware
         NVENC and shipped by aiortc.
@@ -157,7 +157,7 @@ class VRServer:
             self._webrtc = None
             return
         try:
-            from .video import WebRTCManager, webrtc_available
+            from ..video.video import WebRTCManager, webrtc_available
 
             if not webrtc_available():
                 raise RuntimeError("aiortc unavailable")
@@ -180,7 +180,7 @@ class VRServer:
         ``manager`` must implement the ``WebRTCManager`` signaling interface
         (``create_offer`` / ``set_answer`` / ``close`` / ``close_all``).
         Used by teleop to keep all video encoding and RTP traffic in a
-        separate process (``almond_axol.vr.video_proc``) so it cannot
+        separate process (``almond_axol.video.video_proc``) so it cannot
         contend with the control loops. Pass ``None`` to disable video.
         """
         self._webrtc = manager

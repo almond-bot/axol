@@ -3,7 +3,7 @@ title: "gst.install"
 description: "Install the host-side GStreamer + PyGObject support for the GPU-resident ZED camera pipeline."
 ---
 
-Installs the host-side GStreamer support — the GObject-introspection typelibs and **PyGObject** — that the unified ZED camera pipeline needs for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). Both commands grab and encode the cameras entirely on the GPU via [`almond_axol.vr.gst_zed`](/api/vr): the zed-gstreamer source elements (`zedxonesrc` / `zedsrc`) feed the Jetson hardware **NVENC** (`nvvidconv` / `nvv4l2h264enc`), and an in-process `appsink` pulls the encoded H.264 access units (for the headset view) and raw frames (for the dataset). WebRTC transport itself stays on **aiortc** (a normal Python dependency) — this command does **not** install the `webrtcbin`/libnice path.
+Installs the host-side GStreamer support — the GObject-introspection typelibs and **PyGObject** — that the unified ZED camera pipeline needs for [`teleop --cameras`](/cli/teleop) and [`collect-data`](/cli/collect-data). Both commands grab and encode the cameras entirely on the GPU via [`almond_axol.video.gst_zed`](/api/vr): the zed-gstreamer source elements (`zedxonesrc` / `zedsrc`) feed the Jetson hardware **NVENC** (`nvvidconv` / `nvv4l2h264enc`), and an in-process `appsink` pulls the encoded H.264 access units (for the headset view) and raw frames (for the dataset). WebRTC transport itself stays on **aiortc** (a normal Python dependency) — this command does **not** install the `webrtcbin`/libnice path.
 
 ```bash
 axol gst.install

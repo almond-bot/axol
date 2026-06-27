@@ -15,7 +15,7 @@ Recording continues until Ctrl+C.
 The teleop loop runs at ``--teleop_hz`` and publishes the latest
 ``(joint_obs, action)`` snapshot every tick. The dataset itself — frame
 capture, row assembly, encoding, ``save_episode`` — is owned by a separate
-recorder (see :mod:`almond_axol.cli.record_proc`): a subprocess when the video
+recorder (see :mod:`almond_axol.recording.record_proc`): a subprocess when the video
 relay is up (so the per-frame work never shares the GIL with the control loop),
 or in-process as a fallback when there is no relay. Either way each recorded
 frame is aligned to the joint sample by its shared ``perf_counter`` capture
@@ -38,15 +38,15 @@ from lerobot.teleoperators.config import TeleoperatorConfig
 from ..lerobot.camera.configuration_zed import ZedCameraConfig, resolution_for_dims
 from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
-from ..utils import affinity
-from ..utils.jetson_diag import TegraStatsDiag
-from ..utils.proc_diag import SystemDiag
-from .config import DatasetResolution, LogLevel, parse
-from .record_proc import (
+from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
     default_vcodec,
 )
+from ..utils import affinity
+from ..utils.jetson_diag import TegraStatsDiag
+from ..utils.proc_diag import SystemDiag
+from .config import DatasetResolution, LogLevel, parse
 
 if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -87,7 +87,7 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
     Relays every camera the robot exposes (overhead — or ``overhead_left`` /
     ``overhead_right`` when stereo — plus both wrist cameras) so the headset can
     show them. Each camera is registered bare and the relay picks the right
-    WebRTC track per source (see :func:`almond_axol.vr.video._track_for_source`):
+    WebRTC track per source (see :func:`almond_axol.video.video._track_for_source`):
     a gst camera/eye already produces GPU-encoded H.264 access units (its
     ``subscribe()`` feeds a pre-encoded track — the same grab/encode serves the
     dataset), while an SDK camera is adapted to a frame-driven source that
@@ -143,7 +143,7 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     The relay subprocess opens the ZED cameras on the GPU-resident gst pipeline,
     streams the headset view over WebRTC (aiortc), **and** publishes each
     camera's raw RGB frames back to this process through shared memory for the
-    dataset (see :mod:`almond_axol.vr.shm_frames`). This keeps the control
+    dataset (see :mod:`almond_axol.video.shm_frames`). This keeps the control
     process off the camera grab/encode/RTP path entirely, so the teleop and IK
     loops stay as fast as ``axol teleop`` — even while recording.
 
@@ -160,8 +160,8 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     if not cameras:
         return None
     try:
-        from ..vr.video import webrtc_available
-        from ..vr.video_proc import VideoRelayProcess
+        from ..video.video import webrtc_available
+        from ..video.video_proc import VideoRelayProcess
     except Exception as exc:  # noqa: BLE001 - aiortc / gst module missing
         _logger.debug("video relay unavailable: %s", exc)
         return None

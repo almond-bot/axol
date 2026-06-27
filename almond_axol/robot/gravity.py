@@ -26,7 +26,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 
-from ..utils.shared import (
+from ..constants import (
     ARM_JOINTS,
     URDF_PATH,
     urdf_arm_joint_names,
@@ -58,7 +58,7 @@ def _body_inertials_from_config(
     """Flatten an AxolConfig into a ``{body_name: (mass, com)}`` dict.
 
     Each arm joint drives exactly one URDF body (see
-    :func:`almond_axol.utils.shared.urdf_body_name`); the mass and CoM are pulled
+    :func:`almond_axol.constants.urdf_body_name`); the mass and CoM are pulled
     straight off the corresponding :class:`JointConfig`.
     """
     out: dict[str, tuple[float, tuple[float, float, float]]] = {}
@@ -138,7 +138,7 @@ class GravityCompensator:
         """Return ``(left_gravity, right_gravity)`` torques (Nm) for the 7 arm joints.
 
         Each input is a ``(7,)`` array of joint positions in radians, in
-        :data:`almond_axol.utils.shared.ARM_JOINTS` order (``SHOULDER_1`` →
+        :data:`almond_axol.constants.ARM_JOINTS` order (``SHOULDER_1`` →
         ``WRIST_3``); pass ``None`` to skip an arm. Gripper position is
         irrelevant — the gripper joint is fixed in the URDF and its mass is
         already lumped into ``left_w2`` / ``right_w2``.

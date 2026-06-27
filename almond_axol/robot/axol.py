@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ..motor import (
     CanBus,
     ControlMode,
@@ -21,7 +22,6 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
-from ..utils.shared import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_friction

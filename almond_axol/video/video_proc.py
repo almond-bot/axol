@@ -7,7 +7,7 @@ headset connects. The same isolation pattern used for the IK solver
 applies here — video runs in a dedicated subprocess and the control
 process never touches it.
 
-The subprocess owns the ZED cameras through :mod:`almond_axol.vr.gst_zed`:
+The subprocess owns the ZED cameras through :mod:`almond_axol.video.gst_zed`:
 the ``zedxonesrc`` / ``zedsrc`` GStreamer elements grab and NVENC-encode
 entirely on the GPU, and Python only ever sees the encoded H.264 access
 units, which aiortc forwards as pre-encoded packets (no Python encode step).
@@ -669,7 +669,7 @@ class VideoRelayProcess:
             want_raw: Also publish each camera's raw RGB frames to shared memory
                 for the control process (data collection). Successfully exported
                 sources appear in :attr:`raw_cameras` as
-                :class:`~almond_axol.vr.shm_frames.RawFrameReader` proxies.
+                :class:`~almond_axol.video.shm_frames.RawFrameReader` proxies.
         """
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
@@ -719,7 +719,7 @@ class VideoRelayProcess:
         """The shared ``multiprocessing.Condition`` guarding the raw shm blocks.
 
         Must be passed at spawn time to any other process that attaches a
-        :class:`~almond_axol.vr.shm_frames.RawFrameReader` to these blocks.
+        :class:`~almond_axol.video.shm_frames.RawFrameReader` to these blocks.
         """
         return self._raw_cond
 

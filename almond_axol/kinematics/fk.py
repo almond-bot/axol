@@ -23,7 +23,7 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ..utils.shared import (
+from ..constants import (
     URDF_PATH,
     Joint,
     urdf_arm_joint_names,

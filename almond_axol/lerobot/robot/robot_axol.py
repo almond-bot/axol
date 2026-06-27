@@ -39,8 +39,8 @@ from lerobot.robots.robot import Robot
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
+from ...constants import Joint
 from ...robot.axol import Axol
-from ...utils.shared import Joint
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
@@ -103,7 +103,7 @@ class AxolRobot(Robot):
 
         The ``video_backend`` config selects the capture path. ``"gst"`` (or
         ``"auto"`` when the stack is installed) opens each camera through the
-        GPU-resident zed-gstreamer pipeline (:mod:`almond_axol.vr.gst_zed`):
+        GPU-resident zed-gstreamer pipeline (:mod:`almond_axol.video.gst_zed`):
         one grab/encode on the GPU serves both the dataset (raw frames, via
         ``read_at_or_after``) and the headset view (encoded AUs, via
         ``subscribe``), at far lower latency than the SDK's host round trip.
@@ -133,7 +133,7 @@ class AxolRobot(Robot):
         if backend == "sdk":
             return False
         try:
-            from ...vr.gst_zed import zed_gst_available, zed_stereo_gst_available
+            from ...video.gst_zed import zed_gst_available, zed_stereo_gst_available
         except Exception:  # noqa: BLE001 - gst module import failed
             if backend == "gst":
                 _logger.warning("video_backend='gst' but gst_zed is unimportable")
@@ -175,7 +175,7 @@ class AxolRobot(Robot):
 
     def _build_gst_cameras(self) -> tuple[dict, list]:
         """Build cameras on the gst pipeline (raw for dataset + encoded view)."""
-        from ...vr.gst_zed import ZedGstCamera, ZedGstStereoCamera
+        from ...video.gst_zed import ZedGstCamera, ZedGstStereoCamera
 
         obs_cams = self.config.observation_cameras()
         cameras: dict = {}
@@ -205,8 +205,8 @@ class AxolRobot(Robot):
         """Replace the camera set with externally-owned cameras.
 
         Used by ``collect-data`` when the ZED cameras live in the out-of-process
-        video relay (:mod:`almond_axol.vr.video_proc`) and are exposed to this
-        process as shared-memory readers (:mod:`almond_axol.vr.shm_frames`).
+        video relay (:mod:`almond_axol.video.video_proc`) and are exposed to this
+        process as shared-memory readers (:mod:`almond_axol.video.shm_frames`).
         Must be called before :meth:`connect`: the robot then treats them as
         ordinary cameras (``read_at_or_after`` / ``read_latest``; ``connect`` is
         a no-op on a proxy) and never opens the physical devices itself, so the

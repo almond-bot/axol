@@ -366,7 +366,7 @@ def _raw_shmsink(socket_path: str) -> str:
     raw frame — keeping its GIL free for the latency-critical aiortc send (the
     Python pull loop is what halved the send during recording). The recorder
     process reads these frames with a matching ``shmsrc`` (see
-    :class:`~almond_axol.vr.shm_frames.GstShmFrameReader`). ``wait-for-connection
+    :class:`~almond_axol.video.shm_frames.GstShmFrameReader`). ``wait-for-connection
     =false`` so the relay never blocks when the recorder isn't attached yet.
     """
     return (

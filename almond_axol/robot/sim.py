@@ -7,8 +7,8 @@ import threading
 
 import numpy as np
 
+from ..constants import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from ..utils.ports import reclaim_port
-from ..utils.shared import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
 from .base import RobotBase
 
 _logger = logging.getLogger(__name__)
