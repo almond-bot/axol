@@ -77,6 +77,38 @@ def _parse_joints(spec: str | None) -> list[Joint]:
     return selected or list(Joint)
 
 
+def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
+    """Convert a raw motor-frame reading to the public joint-frame value.
+
+    Mirrors the transform in ``AxolArm.positions`` (per-joint offset for arm
+    joints, [0, 1] normalization for the gripper) so per-motor reads agree
+    with ``arm.positions`` and the joint-space bars/rev display.
+    """
+    if joint == Joint.GRIPPER:
+        gi = arm._gripper_i
+        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+    return raw + float(arm._joint_offsets[idx])
+
+
+def _read_positions(
+    arm: AxolArm, monitored: set[Joint], fallback: np.ndarray
+) -> np.ndarray:
+    """Read cached joint-frame positions without raising on absent motors.
+
+    Monitored motors that have reported use their transformed cached position;
+    every other entry falls back to ``fallback`` (so unmonitored joints and
+    motors still awaiting their first frame do not blow up the whole read).
+    """
+    vals: list[float] = []
+    for i, j in enumerate(Joint):
+        m = arm.motors[j]
+        if j in monitored and m.has_position:
+            vals.append(_joint_frame(arm, i, j, m.position))
+        else:
+            vals.append(float(fallback[i]))
+    return np.array(vals, dtype=np.float32)
+
+
 def _make_logger(log_file: str, name: str) -> logging.Logger:
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     fmt = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(message)s"
@@ -114,7 +146,9 @@ def _read_can_stats(channel: str) -> str:
         return f"(failed to read stats: {exc})"
 
 
-async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> None:
+async def _stats_monitor(
+    channel: str, arm: AxolArm, log: logging.Logger, monitored: set[Joint]
+) -> None:
     """Background task: log CAN interface stats and position staleness every second."""
     prev_positions: np.ndarray | None = None
     stale_count = 0
@@ -127,7 +161,12 @@ async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> Non
         elapsed = now - interval_start
         interval_start = now
 
-        positions = arm.positions
+        fallback = (
+            prev_positions
+            if prev_positions is not None
+            else np.zeros(len(list(Joint)), dtype=np.float32)
+        )
+        positions = _read_positions(arm, monitored, fallback)
 
         if prev_positions is not None:
             if np.allclose(positions, prev_positions, atol=1e-6):
@@ -246,7 +285,8 @@ async def _run(
             arm = AxolArm(bus, cfg, GravityCompensator(cfg), is_left=is_left)
 
             stats_task = asyncio.create_task(
-                _stats_monitor(channel, arm, log), name="can_stats_monitor"
+                _stats_monitor(channel, arm, log, monitored_set),
+                name="can_stats_monitor",
             )
 
             try:
@@ -279,25 +319,9 @@ async def _run(
                     cycle_count += 1
                     t_iter = time.perf_counter()
 
-                    try:
-                        positions = np.array(
-                            [
-                                arm.motors[j].position
-                                if (j in monitored_set and arm.motors[j].has_position)
-                                else 0.0
-                                for j in joints
-                            ],
-                            dtype=np.float32,
-                        )
-                    except Exception as exc:
-                        other_error_count += 1
-                        log.error(
-                            "position read failed (cycle=%d): %s\n%s",
-                            cycle_count,
-                            exc,
-                            traceback.format_exc(),
-                        )
-                        positions = np.zeros(len(joints), dtype=np.float32)
+                    positions = _read_positions(
+                        arm, monitored_set, np.zeros(len(joints), dtype=np.float32)
+                    )
 
                     now = t_iter
 
