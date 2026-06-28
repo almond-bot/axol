@@ -6,6 +6,7 @@ Run directly:
     uv run -m almond_axol.diagnostics.can.receive            # both arms, log only
     uv run -m almond_axol.diagnostics.can.receive --l --hz 50
     uv run -m almond_axol.diagnostics.can.receive --l --hz 250 --log-file can_diag.log
+    uv run -m almond_axol.diagnostics.can.receive --l --joints shoulder_1,elbow
 """
 
 from __future__ import annotations
@@ -53,6 +54,27 @@ class _ArmSnapshot:
     send_error_count: int = 0
     timeout_error_count: int = 0
     other_error_count: int = 0
+
+
+def _parse_joints(spec: str | None) -> list[Joint]:
+    """Parse a comma-separated joint spec into a list of :class:`Joint`.
+
+    ``None`` or empty selects every joint. Names match the joint enum values
+    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
+    """
+    if not spec:
+        return list(Joint)
+    by_value = {j.value: j for j in Joint}
+    selected: list[Joint] = []
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in by_value:
+            valid = ", ".join(by_value)
+            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
+        selected.append(by_value[name])
+    return selected or list(Joint)
 
 
 def _make_logger(log_file: str, name: str) -> logging.Logger:
@@ -177,8 +199,10 @@ async def _run(
     log_file: str,
     display: bool = True,
     snapshot: _ArmSnapshot | None = None,
+    monitored: list[Joint] | None = None,
 ) -> None:
     side = "left" if is_left else "right"
+    monitored_set = set(monitored) if monitored is not None else set(Joint)
     log = _make_logger(log_file, f"{__name__}.{side}")
 
     # Catch unhandled exceptions from background asyncio tasks.
@@ -196,7 +220,13 @@ async def _run(
     joints = list(Joint)
     channel = CAN_LEFT if is_left else CAN_RIGHT
 
-    log.info("Starting  side=%s  channel=%s  hz=%d", side, channel, hz)
+    log.info(
+        "Starting  side=%s  channel=%s  hz=%d  joints=%s",
+        side,
+        channel,
+        hz,
+        ",".join(j.value for j in joints if j in monitored_set),
+    )
     log.info("Initial CAN stats:\n%s", _read_can_stats(channel))
 
     t_start = time.perf_counter()
@@ -220,7 +250,13 @@ async def _run(
             )
 
             try:
-                await arm.start_telemetry(hz)
+                await asyncio.gather(
+                    *[
+                        arm.motors[j].start_telemetry(hz)
+                        for j in joints
+                        if j in monitored_set
+                    ]
+                )
                 log.info("Telemetry started at %d Hz", hz)
             except Exception as exc:
                 log.error(
@@ -244,11 +280,19 @@ async def _run(
                     t_iter = time.perf_counter()
 
                     try:
-                        positions = arm.positions
+                        positions = np.array(
+                            [
+                                arm.motors[j].position
+                                if (j in monitored_set and arm.motors[j].has_position)
+                                else 0.0
+                                for j in joints
+                            ],
+                            dtype=np.float32,
+                        )
                     except Exception as exc:
                         other_error_count += 1
                         log.error(
-                            "arm.positions failed (cycle=%d): %s\n%s",
+                            "position read failed (cycle=%d): %s\n%s",
                             cycle_count,
                             exc,
                             traceback.format_exc(),
@@ -351,7 +395,14 @@ def main() -> None:
         default=f"logs/can_receive_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
+    parser.add_argument(
+        "--joints",
+        default=None,
+        help="Comma-separated joints to poll (e.g. shoulder_1,elbow). "
+        "Default: all joints. Useful for bench-testing a subset of motors.",
+    )
     args = parser.parse_args()
+    monitored = _parse_joints(args.joints)
 
     try:
         if not args.l and not args.r:
@@ -388,6 +439,7 @@ def main() -> None:
                             log_file=left_log,
                             display=False,
                             snapshot=left_snap,
+                            monitored=monitored,
                         ),
                         _run(
                             is_left=False,
@@ -395,6 +447,7 @@ def main() -> None:
                             log_file=right_log,
                             display=False,
                             snapshot=right_snap,
+                            monitored=monitored,
                         ),
                     )
                 finally:
@@ -406,7 +459,14 @@ def main() -> None:
 
             asyncio.run(_run_both())
         else:
-            asyncio.run(_run(is_left=args.l, hz=args.hz, log_file=args.log_file))
+            asyncio.run(
+                _run(
+                    is_left=args.l,
+                    hz=args.hz,
+                    log_file=args.log_file,
+                    monitored=monitored,
+                )
+            )
     except KeyboardInterrupt:
         pass
 
