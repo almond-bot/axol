@@ -6,6 +6,7 @@ Run directly:
     uv run -m almond_axol.diagnostics.can.send --joint elbow        # both arms, log only
     uv run -m almond_axol.diagnostics.can.send --l --joint wrist_2 --hz 50
     uv run -m almond_axol.diagnostics.can.send --l --joint gripper --hz 100 --log-file can_send.log
+    uv run -m almond_axol.diagnostics.can.send --l --joint shoulder_1 --joints shoulder_1
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ from datetime import datetime
 
 import numpy as np
 
-from ...constants import CAN_LEFT, CAN_RIGHT, Joint
-from ...motor import CanBus
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
+from ...motor import CanBus, ControlMode
 from ...robot.axol import GRIPPER_TRAVEL, AxolArm, arm_limits
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
@@ -37,6 +38,124 @@ _COL_GAP = 2
 
 # Consistent with home.py and gripper.py.
 _SPEED = 0.2 * _TAU  # rad/s
+
+
+def _parse_joints(spec: str | None) -> set[Joint]:
+    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
+
+    ``None`` or empty selects every joint. Names match the joint enum values
+    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
+    """
+    if not spec:
+        return set(Joint)
+    by_value = {j.value: j for j in Joint}
+    selected: set[Joint] = set()
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in by_value:
+            valid = ", ".join(by_value)
+            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
+        selected.add(by_value[name])
+    return selected or set(Joint)
+
+
+def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
+    """Convert a raw motor-frame reading to the public joint-frame value."""
+    if joint == Joint.GRIPPER:
+        gi = arm._gripper_i
+        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+    return raw + float(arm._joint_offsets[idx])
+
+
+async def _enable(arm: AxolArm, present: set[Joint]) -> None:
+    """Enable motors. Full arm uses ``arm.enable()``; a subset enables only
+    the present motors so absent ones are not waited on."""
+    if present == set(Joint):
+        await arm.enable()
+        return
+    await asyncio.gather(*[arm.motors[j].enable() for j in present])
+    await asyncio.gather(
+        *[arm.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in present]
+    )
+    if Joint.GRIPPER in present:
+        await arm._calibrate_gripper()
+        await arm.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
+
+
+async def _disable(arm: AxolArm, present: set[Joint]) -> None:
+    """Disable motors, limited to the present subset."""
+    if present == set(Joint):
+        await arm.disable()
+        return
+    await asyncio.gather(*[arm.motors[j].disable() for j in present])
+
+
+async def _read_hold_q(arm: AxolArm, present: set[Joint]) -> np.ndarray:
+    """Read start positions (joint frame). Absent motors are reported as 0."""
+    if present == set(Joint):
+        return await arm.get_positions()
+    q = np.zeros(len(list(Joint)), dtype=np.float32)
+    for i, j in enumerate(Joint):
+        if j in present:
+            q[i] = _joint_frame(arm, i, j, await arm.motors[j].get_position())
+    return q
+
+
+def _read_positions(
+    arm: AxolArm, present: set[Joint], fallback: np.ndarray
+) -> np.ndarray:
+    """Read cached positions (joint frame) without raising on absent motors."""
+    if present == set(Joint):
+        try:
+            return arm.positions
+        except Exception:
+            return fallback
+    vals: list[float] = []
+    for i, j in enumerate(Joint):
+        m = arm.motors[j]
+        if j in present and m.has_position:
+            vals.append(_joint_frame(arm, i, j, m.position))
+        else:
+            vals.append(float(fallback[i]))
+    return np.array(vals, dtype=np.float32)
+
+
+async def _command(arm: AxolArm, q: np.ndarray, present: set[Joint]) -> None:
+    """Send control commands. The full arm uses ``arm.motion_control`` (with its
+    full feedforward stack); a subset sends gravity-compensated impedance holds
+    to the present arm joints and a position-force command to the gripper."""
+    if present == set(Joint):
+        await arm.motion_control(q)
+        return
+    q = q.copy()
+    arm_q = q[: len(ARM_JOINTS)].astype(np.float32)
+    gravity = arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)
+    offsets = arm._joint_offsets
+    tasks = []
+    for i, j in enumerate(ARM_JOINTS):
+        if j not in present:
+            continue
+        gains = getattr(arm._arm_config, j.value)
+        tasks.append(
+            arm.motors[j].set_impedance(
+                float(q[i] - offsets[i]), 0.0, gains.kp, gains.kd, float(gravity[i])
+            )
+        )
+    if Joint.GRIPPER in present:
+        gi = arm._gripper_i
+        gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
+            arm._limits_lo[gi] - arm._limits_hi[gi]
+        )
+        tasks.append(
+            arm.motors[Joint.GRIPPER].set_position_force(
+                gripper_pos,
+                arm._arm_config.gripper.max_speed,
+                arm._arm_config.gripper.torque_limit,
+            )
+        )
+    await asyncio.gather(*tasks)
 
 
 def _make_logger(log_file: str, name: str) -> logging.Logger:
@@ -76,7 +195,9 @@ def _read_can_stats(channel: str) -> str:
         return f"(failed to read stats: {exc})"
 
 
-async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> None:
+async def _stats_monitor(
+    channel: str, arm: AxolArm, log: logging.Logger, present: set[Joint]
+) -> None:
     """Background task: log CAN interface stats and position staleness every second."""
     prev_positions: np.ndarray | None = None
     stale_count = 0
@@ -89,7 +210,12 @@ async def _stats_monitor(channel: str, arm: AxolArm, log: logging.Logger) -> Non
         elapsed = now - interval_start
         interval_start = now
 
-        positions = arm.positions
+        fallback = (
+            prev_positions
+            if prev_positions is not None
+            else np.zeros(len(list(Joint)), dtype=np.float32)
+        )
+        positions = _read_positions(arm, present, fallback)
 
         if prev_positions is not None:
             if np.allclose(positions, prev_positions, atol=1e-6):
@@ -194,8 +320,10 @@ async def _run(
     log_file: str,
     display: bool = True,
     snapshot: _SendSnapshot | None = None,
+    present: set[Joint] | None = None,
 ) -> None:
     side = "left" if is_left else "right"
+    present = set(Joint) if present is None else present
     log = _make_logger(log_file, f"{__name__}.{side}")
 
     def _asyncio_exc_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
@@ -220,13 +348,15 @@ async def _run(
         lo_api, hi_api = arm_limits(cycle_joint, is_left=is_left)
 
     log.info(
-        "Starting  side=%s  channel=%s  joint=%s  hz=%d  limits=[%.4f, %.4f]",
+        "Starting  side=%s  channel=%s  joint=%s  hz=%d  limits=[%.4f, %.4f]"
+        "  present=%s",
         side,
         channel,
         cycle_joint.value,
         hz,
         lo_api,
         hi_api,
+        ",".join(j.value for j in joints if j in present),
     )
     log.info("Initial CAN stats:\n%s", _read_can_stats(channel))
 
@@ -247,17 +377,17 @@ async def _run(
             arm = AxolArm(bus, cfg, GravityCompensator(cfg), is_left=is_left)
 
             stats_task = asyncio.create_task(
-                _stats_monitor(channel, arm, log), name="can_stats_monitor"
+                _stats_monitor(channel, arm, log, present), name="can_stats_monitor"
             )
 
             try:
-                await arm.enable()
+                await _enable(arm, present)
                 log.info("Motors enabled")
             except Exception as exc:
                 log.error("enable failed: %s\n%s", exc, traceback.format_exc())
                 raise
 
-            hold_q = await arm.get_positions()
+            hold_q = await _read_hold_q(arm, present)
             cycle_start = float(hold_q[joint_idx])
             log.info(
                 "Initial positions read. cycle_joint=%s  start=%.4f",
@@ -301,7 +431,7 @@ async def _run(
                     q[joint_idx] = cycle_pos
 
                     try:
-                        await arm.motion_control(q)
+                        await _command(arm, q, present)
                     except Exception as exc:
                         send_error_count += 1
                         log.error(
@@ -312,11 +442,8 @@ async def _run(
                         )
 
                     # Read back positions for display; fall back to hold_q until
-                    # motion_control feedback has arrived for all motors.
-                    try:
-                        positions = arm.positions
-                    except Exception:
-                        positions = hold_q
+                    # control feedback has arrived for the present motors.
+                    positions = _read_positions(arm, present, hold_q)
 
                     if snapshot is not None:
                         snapshot.positions = positions.copy()
@@ -400,7 +527,7 @@ async def _run(
             finally:
                 if display:
                     print("\033[?25h")
-                await arm.disable()
+                await _disable(arm, present)
 
     except Exception as exc:
         log.error("Fatal error in _run: %s\n%s", exc, traceback.format_exc())
@@ -451,9 +578,24 @@ def main() -> None:
         default=f"logs/can_send_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
         help="Path for the diagnostic log file",
     )
+    parser.add_argument(
+        "--joints",
+        default=None,
+        help="Comma-separated joints present on the bus (e.g. shoulder_1,elbow). "
+        "Only these motors are enabled and commanded. Default: all joints. "
+        "The --joint being cycled must be included. Useful for bench-testing a "
+        "subset of motors.",
+    )
     args = parser.parse_args()
 
     cycle_joint = Joint(args.joint)
+    present = _parse_joints(args.joints)
+    if cycle_joint not in present:
+        present_names = ", ".join(j.value for j in Joint if j in present)
+        raise SystemExit(
+            f"Cycled joint '{cycle_joint.value}' is not in --joints ({present_names}). "
+            f"Include it in --joints."
+        )
 
     try:
         if not args.l and not args.r:
@@ -493,6 +635,7 @@ def main() -> None:
                             log_file=left_log,
                             display=False,
                             snapshot=left_snap,
+                            present=present,
                         ),
                         _run(
                             is_left=False,
@@ -501,6 +644,7 @@ def main() -> None:
                             log_file=right_log,
                             display=False,
                             snapshot=right_snap,
+                            present=present,
                         ),
                     )
                 finally:
@@ -518,6 +662,7 @@ def main() -> None:
                     cycle_joint=cycle_joint,
                     hz=args.hz,
                     log_file=args.log_file,
+                    present=present,
                 )
             )
     except KeyboardInterrupt:
