@@ -66,28 +66,6 @@
             </geometry>
         </collision>
     </link>
-    <link name="left_gripper">
-        <inertial>
-            <mass value="0.00042575" />
-            <origin xyz="2.77556e-17 -2.48688e-18 -0.0651013" rpy="0 -0 0" />
-            <inertia ixx="7.39091e-07" ixy="0" ixz="0" iyy="7.8757e-07" iyz="0" izz="2.25874e-07" />
-        </inertial>
-        <visual>
-            <origin xyz="-0.19958 0 0.711946" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="package://assembly/meshes/Left_Gripper.stl" scale="1 1 1" />
-            </geometry>
-            <material name="0.615686_0.811765_0.929412_0.000000_0.000000">
-                <color rgba="0.615686 0.811765 0.929412 1" />
-            </material>
-        </visual>
-        <collision>
-            <origin xyz="-0.19958 0 0.711946" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="package://assembly/meshes/Left_Gripper.stl" scale="1 1 1" />
-            </geometry>
-        </collision>
-    </link>
     <link name="left_s2">
         <inertial>
             <mass value="0.00108759" />
@@ -239,28 +217,6 @@
             <origin xyz="0.24187 0 0.362735" rpy="0 -0 0" />
             <geometry>
                 <mesh filename="package://assembly/meshes/Right_E2.stl" scale="1 1 1" />
-            </geometry>
-        </collision>
-    </link>
-    <link name="right_gripper">
-        <inertial>
-            <mass value="0.00042575" />
-            <origin xyz="-2.77556e-17 -1.49213e-18 -0.0651013" rpy="0 -0 0" />
-            <inertia ixx="7.39091e-07" ixy="0" ixz="0" iyy="7.8757e-07" iyz="0" izz="2.25874e-07" />
-        </inertial>
-        <visual>
-            <origin xyz="0.19958 0 0.711946" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="package://assembly/meshes/Right_Gripper.stl" scale="1 1 1" />
-            </geometry>
-            <material name="0.615686_0.811765_0.929412_0.000000_0.000000">
-                <color rgba="0.615686 0.811765 0.929412 1" />
-            </material>
-        </visual>
-        <collision>
-            <origin xyz="0.19958 0 0.711946" rpy="0 -0 0" />
-            <geometry>
-                <mesh filename="package://assembly/meshes/Right_Gripper.stl" scale="1 1 1" />
             </geometry>
         </collision>
     </link>
@@ -423,12 +379,6 @@
         <child link="left_w0" />
         <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="left_gripper_0" type="fixed">
-        <origin xyz="-0.0285 -7.09742e-18 -0.032251" rpy="9.71445e-17 -2.22045e-16 2.77556e-17" />
-        <axis xyz="0 0 1" />
-        <parent link="left_w2" />
-        <child link="left_gripper" />
-    </joint>
     <joint name="left_s1_0" type="revolute">
         <origin xyz="0.13 9.40122e-18 0.06" rpy="2.77556e-17 -1.02798e-15 1.32751e-21" />
         <axis xyz="-1 0 0" />
@@ -478,12 +428,6 @@
         <child link="right_w0" />
         <limit lower="-2.3562" upper="2.3562" velocity="30.0" effort="87.0" />
     </joint>
-    <joint name="right_gripper_0" type="fixed">
-        <origin xyz="0.0285 -7.09742e-18 -0.032251" rpy="0 -0 0" />
-        <axis xyz="0 0 1" />
-        <parent link="right_w2" />
-        <child link="right_gripper" />
-    </joint>
     <joint name="right_s1_0" type="revolute">
         <origin xyz="-0.13 2.46215e-18 0.06" rpy="-4.76873e-49 -2.31296e-16 7.65788e-33" />
         <axis xyz="1 0 0" />
@@ -518,5 +462,213 @@
         <parent link="right_w1" />
         <child link="right_w2" />
         <limit lower="-1.5708" upper="1.5708" velocity="30.0" effort="87.0" />
+    </joint>
+    <!-- End-effector / control frame: aligned with left_w2 (the pre-actuated-
+         gripper convention) so the teleop controller axes are preserved. The
+         rotated gripper body + fingers hang off this frame via
+         left_gripper_body_0. -->
+    <link name="left_gripper">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+    </link>
+    <link name="left_gripper_body">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="1.05098e-15 0.110598 -0.164102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Base.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="1.05098e-15 0.110598 -0.164102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Base.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <link name="left_gripper_finger_a">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="0.0125619 0.161598 -0.198102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0.0125619 0.161598 -0.198102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <link name="left_gripper_finger_b">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="0.0125619 0.161598 -0.196602" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0.0125619 0.161598 -0.196602" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="left_gripper_0" type="fixed">
+        <origin xyz="-0.0285 -2.55776e-17 -0.032251" rpy="0 0 0" />
+        <axis xyz="0 0 1" />
+        <parent link="left_w2" />
+        <child link="left_gripper" />
+    </joint>
+    <joint name="left_gripper_body_0" type="fixed">
+        <origin xyz="0 0 0" rpy="1.5708 0 0" />
+        <axis xyz="0 0 1" />
+        <parent link="left_gripper" />
+        <child link="left_gripper_body" />
+    </joint>
+    <joint name="left_gripper_joint_a" type="prismatic">
+        <origin xyz="0.01256 -0.0508 -0.034" rpy="3.14159 -1.0297e-14 3.14159" />
+        <axis xyz="1 -8.38667e-15 1.67733e-14" />
+        <parent link="left_gripper_body" />
+        <child link="left_gripper_finger_a" />
+        <limit lower="0.0" upper="0.058804" velocity="1.0" effort="20.0" />
+    </joint>
+    <joint name="left_gripper_joint_b" type="prismatic">
+        <origin xyz="-0.01256 -0.0508 0.0325" rpy="0 1.12222e-14 -2.71556e-15" />
+        <axis xyz="1 -8.38667e-15 1.67733e-14" />
+        <parent link="left_gripper_body" />
+        <child link="left_gripper_finger_b" />
+        <limit lower="0.0" upper="0.058804" velocity="1.0" effort="20.0" />
+        <mimic joint="left_gripper_joint_a" multiplier="1.0" offset="0.0" />
+    </joint>
+    <!-- End-effector / control frame: aligned with right_w2 (the pre-actuated-
+         gripper convention) so the teleop controller axes are preserved. The
+         rotated gripper body + fingers hang off this frame via
+         right_gripper_body_0. -->
+    <link name="right_gripper">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+    </link>
+    <link name="right_gripper_body">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="1.05098e-15 0.110598 -0.164102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Base.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="1.05098e-15 0.110598 -0.164102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Base.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <link name="right_gripper_finger_a">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="0.0125619 0.161598 -0.198102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0.0125619 0.161598 -0.198102" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <link name="right_gripper_finger_b">
+        <inertial>
+            <mass value="0.001" />
+            <origin xyz="0 0 0" rpy="0 -0 0" />
+            <inertia ixx="1e-06" ixy="0" ixz="0" iyy="1e-06" iyz="0" izz="1e-06" />
+        </inertial>
+        <visual>
+            <origin xyz="0.0125619 0.161598 -0.196602" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+            <material name="0.600000_0.600000_0.600000_0.000000_0.000000">
+                <color rgba="0.6 0.6 0.6 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0.0125619 0.161598 -0.196602" rpy="0 -0 0" />
+            <geometry>
+                <mesh filename="package://assembly/meshes/Gripper_Tip.stl" scale="1 1 1" />
+            </geometry>
+        </collision>
+    </link>
+    <joint name="right_gripper_0" type="fixed">
+        <origin xyz="0.0285 -1.5279e-17 -0.032251" rpy="0 0 0" />
+        <axis xyz="0 0 1" />
+        <parent link="right_w2" />
+        <child link="right_gripper" />
+    </joint>
+    <joint name="right_gripper_body_0" type="fixed">
+        <origin xyz="0 0 0" rpy="1.5708 0 0" />
+        <axis xyz="0 0 1" />
+        <parent link="right_gripper" />
+        <child link="right_gripper_body" />
+    </joint>
+    <joint name="right_gripper_joint_a" type="prismatic">
+        <origin xyz="0.01256 -0.0508 -0.034" rpy="3.14159 -1.0297e-14 3.14159" />
+        <axis xyz="1 -8.38667e-15 1.67733e-14" />
+        <parent link="right_gripper_body" />
+        <child link="right_gripper_finger_a" />
+        <limit lower="0.0" upper="0.058804" velocity="1.0" effort="20.0" />
+    </joint>
+    <joint name="right_gripper_joint_b" type="prismatic">
+        <origin xyz="-0.01256 -0.0508 0.0325" rpy="0 1.12222e-14 -2.71556e-15" />
+        <axis xyz="1 -8.38667e-15 1.67733e-14" />
+        <parent link="right_gripper_body" />
+        <child link="right_gripper_finger_b" />
+        <limit lower="0.0" upper="0.058804" velocity="1.0" effort="20.0" />
+        <mimic joint="right_gripper_joint_a" multiplier="1.0" offset="0.0" />
     </joint>
 </robot>
