@@ -1,6 +1,9 @@
-import { Download, Loader2 } from "lucide-react"
+import { Download, ExternalLink, Loader2 } from "lucide-react"
 import type { UpdateStatus } from "@/lib/supervisor"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
+
+const RELEASE_NOTES_URL = "https://github.com/almond-bot/axol/blob/main/RELEASE_NOTES.md"
 
 /** First 7 chars of a git commit, the conventional short form. */
 function short(commit: string | null): string {
@@ -35,16 +38,30 @@ export function UpdateBanner({
         </span>
         {blocked && !updating && <span className="text-amber-200/60">{hint} to update.</span>}
       </div>
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={onUpdate}
-        disabled={blocked || updating}
-        title={blocked ? `${hint} first` : undefined}
-      >
-        {updating ? <Loader2 className="animate-spin" /> : <Download />}
-        {updating ? "Updating…" : "Update"}
-      </Button>
+      <div className="flex items-center gap-2">
+        <a
+          href={RELEASE_NOTES_URL}
+          target="_blank"
+          rel="noreferrer"
+          className={cn(
+            buttonVariants({ variant: "ghost", size: "sm" }),
+            "text-amber-200/80 hover:bg-amber-400/10 hover:text-amber-200"
+          )}
+        >
+          Release notes
+          <ExternalLink />
+        </a>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onUpdate}
+          disabled={blocked || updating}
+          title={blocked ? `${hint} first` : undefined}
+        >
+          {updating ? <Loader2 className="animate-spin" /> : <Download />}
+          {updating ? "Updating…" : "Update"}
+        </Button>
+      </div>
     </div>
   )
 }
