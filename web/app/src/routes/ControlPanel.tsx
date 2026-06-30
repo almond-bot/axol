@@ -402,6 +402,19 @@ export default function ControlPanel() {
   const selectedLive = isLive && runningOp === selectedOp
   const selectedStopping = isStopping && runningOp === selectedOp
 
+  // What's keeping the server from being idle (and so blocking an update), in
+  // UI-visible terms: a running op and/or the live robot link. Mirrors the
+  // server's _is_idle so the update banner names the actual blocker rather than
+  // assuming an operation is running. Capitalized clause, no trailing period.
+  const updateBusyReason = (() => {
+    const parts: string[] = []
+    if (isLive) parts.push("stop the running operation")
+    if (robot?.connected) parts.push("disconnect Axol")
+    if (parts.length === 0) return "The server is busy"
+    const clause = parts.join(" and ")
+    return clause.charAt(0).toUpperCase() + clause.slice(1)
+  })()
+
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to
   // exited even if the logs WebSocket drops its final status frame. The stop
@@ -541,7 +554,12 @@ export default function ControlPanel() {
       <SiteNav current="control" />
       <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-8">
         {update?.updateAvailable && (
-          <UpdateBanner update={update} updating={updating} onUpdate={handleUpdate} />
+          <UpdateBanner
+            update={update}
+            updating={updating}
+            busyReason={updateBusyReason}
+            onUpdate={handleUpdate}
+          />
         )}
 
         <ConnectionsBar

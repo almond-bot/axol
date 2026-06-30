@@ -15,13 +15,17 @@ function short(commit: string | null): string {
 export function UpdateBanner({
   update,
   updating,
+  busyReason,
   onUpdate,
 }: {
   update: UpdateStatus
   updating: boolean
+  /** Why a restart is currently unsafe, e.g. "Disconnect Axol" (no period). */
+  busyReason?: string
   onUpdate: () => void
 }) {
   const blocked = !update.idle
+  const hint = busyReason ?? "The server is busy"
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
       <div className="flex min-w-0 flex-col gap-0.5">
@@ -29,18 +33,14 @@ export function UpdateBanner({
         <span className="font-mono text-amber-200/60">
           {short(update.commit)} &rarr; {short(update.remoteCommit)}
         </span>
-        {blocked && !updating && (
-          <span className="text-amber-200/60">
-            Stop the running operation and disconnect Axol to update.
-          </span>
-        )}
+        {blocked && !updating && <span className="text-amber-200/60">{hint} to update.</span>}
       </div>
       <Button
         variant="outline"
         size="sm"
         onClick={onUpdate}
         disabled={blocked || updating}
-        title={blocked ? "Server busy — stop the operation and disconnect Axol first" : undefined}
+        title={blocked ? `${hint} first` : undefined}
       >
         {updating ? <Loader2 className="animate-spin" /> : <Download />}
         {updating ? "Updating…" : "Update"}
