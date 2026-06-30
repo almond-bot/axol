@@ -1,7 +1,14 @@
 import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power, Usb } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { cameraCount, type CameraSpec, type RobotStatus, type UsbStatus } from "@/lib/supervisor"
+import {
+  cameraCount,
+  missingCameraSerials,
+  type CameraDevice,
+  type CameraSpec,
+  type RobotStatus,
+  type UsbStatus,
+} from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -67,6 +74,8 @@ export function ConnectionsBar({
   onRobotConnect,
   onRobotDisconnect,
   cameras,
+  cameraDevices,
+  cameraDetectError,
   onConfigureCameras,
   usb,
   usbBusy,
@@ -82,6 +91,10 @@ export function ConnectionsBar({
   onRobotConnect: () => void
   onRobotDisconnect: () => void
   cameras: CameraSpec
+  /** Detected ZED devices on the serve host (null until first detection). */
+  cameraDevices: CameraDevice[] | null
+  /** Why detection couldn't run (SDK/daemon issue), else null. */
+  cameraDetectError: string | null
   onConfigureCameras: () => void
   usb: UsbStatus | null
   usbBusy: boolean
@@ -127,9 +140,30 @@ export function ConnectionsBar({
             : "Disconnected"
 
   // -- cameras --
+  // "Configured" only counts assigned serials; the green badge must also mean
+  // those cameras are actually *connected*. Once we have a detection result we
+  // cross-check the assigned serials against it: any that aren't physically
+  // present flip the badge red (x/N connected) instead of a misleading N/3.
   const camCount = cameraCount(cameras)
-  const camDot: Dot = camCount > 0 ? "ok" : "idle"
-  const camLabel = camCount === 0 ? "Not configured" : `${camCount}/3 configured`
+  const camMissing =
+    camCount > 0 && cameraDevices ? missingCameraSerials(cameras, cameraDevices) : []
+  let camDot: Dot
+  let camLabel: string
+  if (camCount === 0) {
+    camDot = "idle"
+    camLabel = "Not configured"
+  } else if (cameraDetectError) {
+    // Detection itself couldn't run (SDK not installed, daemon hung): we can't
+    // confirm the cameras, so warn rather than claim they're connected.
+    camDot = "warn"
+    camLabel = "Can't detect cameras"
+  } else if (camMissing.length > 0) {
+    camDot = "err"
+    camLabel = `${camCount - camMissing.length}/${camCount} connected`
+  } else {
+    camDot = "ok"
+    camLabel = `${camCount}/3 configured`
+  }
 
   // -- quest usb (adb reverse pose tunnel) --
   const usbDot: Dot = !usb
