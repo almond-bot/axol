@@ -24,8 +24,18 @@ class KinematicsConfig:
             preventing slow null-space drift (e.g. unnecessary shoulder twist).
         manipulability_weight: Weight rewarding configurations with high manipulability.
         limit_weight: Weight penalising joint-limit violations.
-        self_collision_margin: Minimum clearance (m) enforced between collision bodies.
-        self_collision_weight: Weight on the self-collision penalty.
+        lower_arm_collision_margin: Extra clearance (m), measured relative to the
+            home-pose distance, kept between the lower forearm/elbow links
+            (``*_s3``/``*_e1``/``*_e2``) and the torso (``base``/``s1``). This is
+            the knob that keeps the elbow off the base. Because it is referenced
+            to the home pose it only bites as the elbow approaches the base and
+            does not push the whole arm outward.
+        lower_arm_collision_weight: Weight on the lower-arm self-collision penalty.
+        distal_collision_margin: Extra clearance (m), relative to the home-pose
+            distance, for the distal links (``*_w0``/``*_w1``/``*_w2``/``*_gripper``)
+            vs the torso. Kept small so the arm's outward range of motion is
+            preserved.
+        distal_collision_weight: Weight on the distal self-collision penalty.
         max_iterations: Maximum solver iterations per call.
         cost_tolerance: Solver convergence tolerance.
         max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call, in radians.
@@ -39,8 +49,10 @@ class KinematicsConfig:
     posture_weight: float = 5.0
     manipulability_weight: float = 0.05
     limit_weight: float = 75.0
-    self_collision_margin: float = 0.1
-    self_collision_weight: float = 75.0
+    lower_arm_collision_margin: float = 0.04
+    lower_arm_collision_weight: float = 100.0
+    distal_collision_margin: float = 0.02
+    distal_collision_weight: float = 75.0
     max_iterations: int = 8
     cost_tolerance: float = 1e-2
     max_joint_delta: float = 0.0055 * 2 * math.pi
