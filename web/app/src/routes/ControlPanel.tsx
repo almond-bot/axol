@@ -8,6 +8,7 @@ import {
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchUpdateStatus,
   fetchUsbStatus,
   loadOpSettings,
   operationMeta,
@@ -18,6 +19,7 @@ import {
   sendEpisodeCommand,
   setServerBase,
   startOperation,
+  startUpdate,
   stopOperation,
   usbConnect,
   useSessionLogs,
@@ -28,8 +30,10 @@ import {
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
+import { UpdateBanner } from "@/components/update-banner"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
@@ -86,6 +90,9 @@ export default function ControlPanel() {
   )
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
+  const [update, setUpdate] = useState<UpdateStatus | null>(null)
+  // Drives the banner's "Updating…" state while the server upgrades + restarts.
+  const [updating, setUpdating] = useState(false)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
@@ -125,6 +132,9 @@ export default function ControlPanel() {
         setViewerPort(info.viewerPort)
         setHostInfo(info)
       })
+      .catch(() => {})
+    fetchUpdateStatus()
+      .then(setUpdate)
       .catch(() => {})
     fetchRobotStatus()
       .then(setRobot)
@@ -172,6 +182,27 @@ export default function ControlPanel() {
       clearInterval(t)
     }
   }, [conn.state])
+
+  // Poll the update indicator slowly while online (its server-side `ls-remote`
+  // is debounced, so a tight interval would buy nothing). Paused while an
+  // update is in flight — handleUpdate drives its own faster restart-watch poll.
+  useEffect(() => {
+    if (conn.state !== "ok" || updating) return
+    let active = true
+    const poll = () => {
+      fetchUpdateStatus()
+        .then((u) => {
+          if (active) setUpdate(u)
+        })
+        .catch(() => {})
+    }
+    poll()
+    const t = setInterval(poll, 60_000)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, updating])
 
   // Auto-connect Axol once after the host comes online, if it's sitting idle.
   // The ref makes it fire at most once per host session, so a manual robot
@@ -234,6 +265,8 @@ export default function ControlPanel() {
     setCommands([])
     setRobot(null)
     setSession(null)
+    setUpdate(null)
+    setUpdating(false)
     autoRobotRef.current = false
   }
 
@@ -455,16 +488,67 @@ export default function ControlPanel() {
     sendEpisodeCommand(command).catch((e) => setError(String(e)))
   }
 
+  // Apply the available update, then hard-reload once the server is back on the
+  // new commit. The server upgrades and exits (systemd relaunches it), so the
+  // start request and the watch polls below tolerate it briefly going away.
+  async function handleUpdate() {
+    const target = update?.remoteCommit
+    if (!target) return
+    setError(null)
+    setUpdating(true)
+    try {
+      await startUpdate()
+    } catch (e) {
+      setError(`Update failed to start: ${e}`)
+      setUpdating(false)
+      return
+    }
+    // The hosted UI is served by Vercel, so a hard reload also pulls the latest
+    // front-end; reconnecting to the restarted backend re-runs loadServer.
+    const reload = () => window.location.reload()
+    const deadline = Date.now() + 5 * 60_000
+    const watch = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(watch)
+        setUpdating(false)
+        setError("Update is taking longer than expected. Reload to retry.")
+        return
+      }
+      try {
+        const u = await fetchUpdateStatus()
+        setUpdate(u)
+        if (u.state === "error") {
+          clearInterval(watch)
+          setUpdating(false)
+          setError(u.error ?? "Update failed.")
+          return
+        }
+        // Server is back and now running the target commit — done.
+        if (u.commit === target) {
+          clearInterval(watch)
+          reload()
+        }
+      } catch {
+        // Server is mid-restart (or briefly unreachable); keep watching.
+      }
+    }, 2000)
+  }
+
   const viewerHost = serverHost || hostInfo?.lanIp || ""
 
   return (
     <div className="min-h-screen">
       <SiteNav current="control" />
       <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-8">
+        {update?.updateAvailable && (
+          <UpdateBanner update={update} updating={updating} onUpdate={handleUpdate} />
+        )}
+
         <ConnectionsBar
           conn={conn.state}
           host={serverHost}
           hostName={hostInfo?.hostname}
+          commit={update?.commit ?? hostInfo?.commit ?? null}
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
           robot={robot}

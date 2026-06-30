@@ -115,6 +115,37 @@ export async function fetchInfo(): Promise<ServerInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// Self-update (read-only commit check + user-initiated upgrade)
+// ---------------------------------------------------------------------------
+
+export type UpdateState = "idle" | "updating" | "error"
+
+export interface UpdateStatus {
+  /** Updatable: installed from git as a uv tool with uv available. */
+  enabled: boolean
+  /** Installed git commit (null for dev checkouts). */
+  commit: string | null
+  /** Latest commit on the tracked ref, or null until first resolved/offline. */
+  remoteCommit: string | null
+  /** remoteCommit is known and differs from the installed commit. */
+  updateAvailable: boolean
+  /** Safe to restart now (no op running, robot disconnected). */
+  idle: boolean
+  state: UpdateState
+  /** Last update failure, surfaced to the operator; null otherwise. */
+  error: string | null
+}
+
+export async function fetchUpdateStatus(): Promise<UpdateStatus> {
+  return json(await fetch(apiUrl("/api/update/status")))
+}
+
+/** Trigger the on-demand upgrade; the server restarts onto new code when idle. */
+export async function startUpdate(): Promise<{ started: boolean }> {
+  return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
 
