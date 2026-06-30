@@ -339,6 +339,10 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
   const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
+  // Cameras that have decoded at least one real frame. Used to keep the last
+  // good frame on screen through brief dropouts instead of cutting to
+  // passthrough (see `liveTex`).
+  const shownRef = useRef<Record<string, boolean>>({})
   // The current view mode; only changes on a thumbstick flick (edge), so the
   // operator doesn't have to hold the stick.
   const viewModeRef = useRef<ViewMode>("default")
@@ -365,8 +369,17 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
   const stickClickPrevRef = useRef(false)
 
-  // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
-  // textures whose stream has gone away.
+  // Wrap each incoming MediaStream in a <video> + VideoTexture.
+  //
+  // We deliberately do NOT tear down a camera's <video>/texture when its stream
+  // momentarily disappears from `streams`. A `THREE.VideoTexture` keeps the last
+  // decoded frame uploaded on the GPU, so as long as we keep the texture alive
+  // and the plane visible, a brief WebRTC blip (a transient `failed`/`closed`,
+  // a socket swap, or a re-offer — all of which clear `streams` upstream) shows
+  // the frozen last frame instead of cutting to passthrough. When the stream
+  // returns we just re-point the existing <video> at the new MediaStream, so the
+  // texture keeps streaming into the same object with no flash. Textures are
+  // only released on unmount (below).
   useEffect(() => {
     const videos = videosRef.current
     const textures = texturesRef.current
@@ -389,16 +402,6 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         textures[name] = tex
       }
     }
-    for (const name of Object.keys(textures)) {
-      if (streams[name]) continue
-      textures[name].dispose()
-      delete textures[name]
-      const video = videos[name]
-      if (video) {
-        video.srcObject = null
-        delete videos[name]
-      }
-    }
   }, [streams])
 
   // Release GPU textures / video elements when the feed unmounts.
@@ -408,6 +411,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     return () => {
       for (const tex of Object.values(textures)) tex.dispose()
       for (const video of Object.values(videos)) video.srcObject = null
+      shownRef.current = {}
     }
   }, [])
 
@@ -510,11 +514,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     const mode = viewModeRef.current
 
-    // A texture is usable only once its <video> has decoded real frames.
+    // A texture is usable once its <video> has decoded at least one real frame.
+    // Once that's happened we keep returning it (the texture still holds that
+    // last frame on the GPU) even if `videoWidth` momentarily reads 0 during a
+    // stall or stream reconnect — that's what stops the feed from flickering to
+    // passthrough and back. It only becomes unusable again if the texture itself
+    // is gone (i.e. on unmount).
     const liveTex = (name: string) => {
       const t = textures[name]
-      const v = t?.image as HTMLVideoElement | undefined
-      return t && v && v.videoWidth ? t : undefined
+      if (!t) return undefined
+      const v = t.image as HTMLVideoElement | undefined
+      if (v && v.videoWidth) {
+        shownRef.current[name] = true
+        return t
+      }
+      return shownRef.current[name] ? t : undefined
     }
 
     // Which cams the current mode needs decoded before it draws (otherwise the
