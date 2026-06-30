@@ -120,6 +120,9 @@ export async function fetchInfo(): Promise<ServerInfo> {
 
 export type UpdateState = "idle" | "updating" | "error"
 
+/** Current step while an update is applying; null when not updating. */
+export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
+
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
   enabled: boolean
@@ -129,9 +132,11 @@ export interface UpdateStatus {
   remoteCommit: string | null
   /** remoteCommit is known and differs from the installed commit. */
   updateAvailable: boolean
-  /** Safe to restart now (no op running, robot disconnected). */
+  /** Safe to restart now (no op running). */
   idle: boolean
   state: UpdateState
+  /** Step while state is "updating" (upgrading/provisioning/restarting); else null. */
+  phase: UpdatePhase | null
   /** Last update failure, surfaced to the operator; null otherwise. */
   error: string | null
 }

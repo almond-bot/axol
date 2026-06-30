@@ -30,6 +30,7 @@ import {
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type UpdatePhase,
   type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
@@ -93,6 +94,10 @@ export default function ControlPanel() {
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
   // Drives the banner's "Updating…" state while the server upgrades + restarts.
   const [updating, setUpdating] = useState(false)
+  // Current step shown in the banner while updating (so it isn't an opaque
+  // spinner). Sourced from the server's reported phase, except "restarting"
+  // which we infer locally once the server stops responding (it exited).
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
@@ -269,6 +274,7 @@ export default function ControlPanel() {
     setSession(null)
     setUpdate(null)
     setUpdating(false)
+    setUpdatePhase(null)
     autoRobotRef.current = false
   }
 
@@ -519,11 +525,13 @@ export default function ControlPanel() {
     if (!target) return
     setError(null)
     setUpdating(true)
+    setUpdatePhase("upgrading")
     try {
       await startUpdate()
     } catch (e) {
       setError(`Update failed to start: ${e}`)
       setUpdating(false)
+      setUpdatePhase(null)
       return
     }
     // The hosted UI is served by Vercel, so a hard reload also pulls the latest
@@ -534,6 +542,7 @@ export default function ControlPanel() {
       if (Date.now() > deadline) {
         clearInterval(watch)
         setUpdating(false)
+        setUpdatePhase(null)
         setError("Update is taking longer than expected. Reload to retry.")
         return
       }
@@ -543,16 +552,22 @@ export default function ControlPanel() {
         if (u.state === "error") {
           clearInterval(watch)
           setUpdating(false)
+          setUpdatePhase(null)
           setError(u.error ?? "Update failed.")
           return
         }
+        // Reflect the server's current step (upgrading/provisioning) so the
+        // banner shows progress rather than an opaque spinner.
+        if (u.phase) setUpdatePhase(u.phase)
         // Server is back and now running the target commit — done.
         if (u.commit === target) {
           clearInterval(watch)
           reload()
         }
       } catch {
-        // Server is mid-restart (or briefly unreachable); keep watching.
+        // Server stopped responding: it exited to restart (or is briefly
+        // unreachable). Show "restarting" and keep watching for it to return.
+        setUpdatePhase("restarting")
       }
     }, 2000)
   }
@@ -567,6 +582,7 @@ export default function ControlPanel() {
           <UpdateBanner
             update={update}
             updating={updating}
+            phase={updatePhase}
             blocked={updateBlocked}
             busyReason={updateBusyReason}
             onUpdate={handleUpdate}

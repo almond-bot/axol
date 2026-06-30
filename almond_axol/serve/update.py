@@ -127,6 +127,10 @@ class SelfUpdater:
         # Update lifecycle surfaced to the UI: "idle" | "updating" | "error".
         self._state = "idle"
         self._error: str | None = None
+        # Current step while ``state == "updating"`` so the UI can show progress
+        # instead of an opaque spinner: "upgrading" | "provisioning" |
+        # "restarting" (``None`` when not updating).
+        self._phase: str | None = None
         self._update_task: asyncio.Task[None] | None = None
         # Set when an upgrade landed but the server was busy; restart at the
         # next idle opportunity (a subsequent status poll re-checks).
@@ -189,6 +193,7 @@ class SelfUpdater:
             "updateAvailable": update_available,
             "idle": self._is_idle(),
             "state": self._state,
+            "phase": self._phase,
             "error": self._error,
         }
 
@@ -282,6 +287,7 @@ class SelfUpdater:
         _logger.warning("self-update: %s", message)
         self._error = message
         self._state = "error"
+        self._phase = None
 
     async def _run_update(self) -> None:
         # The destructive part of the flow, run only on an explicit request.
@@ -291,6 +297,7 @@ class SelfUpdater:
         # release it before the post-upgrade `_provision()` below, which
         # re-acquires it (the lock is not reentrant).
         try:
+            self._phase = "upgrading"
             async with self._env_lock:
                 try:
                     proc = await asyncio.create_subprocess_exec(
@@ -319,12 +326,14 @@ class SelfUpdater:
 
             # Always reprovision after an upgrade: it ran (so the env was rebuilt
             # and pyzed/PyGObject pruned) whether or not the commit advanced.
+            self._phase = "provisioning"
             await self._provision()
 
             if new_commit is None or new_commit == self._commit:
                 # The ref didn't actually advance the install; nothing to restart
                 # onto. Clear the spinner and report up to date.
                 self._state = "idle"
+                self._phase = None
                 _logger.info("self-update: already up to date (%s)", self._commit)
                 return
 
@@ -333,6 +342,7 @@ class SelfUpdater:
                 self._commit,
                 new_commit,
             )
+            self._phase = "restarting"
             self._restart_pending = True
             self._maybe_restart()
         except Exception as exc:  # noqa: BLE001 - surface to the UI

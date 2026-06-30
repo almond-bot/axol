@@ -1,9 +1,16 @@
 import { Download, ExternalLink, Loader2 } from "lucide-react"
-import type { UpdateStatus } from "@/lib/supervisor"
+import type { UpdatePhase, UpdateStatus } from "@/lib/supervisor"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
 const RELEASE_NOTES_URL = "https://github.com/almond-bot/axol/blob/main/RELEASE_NOTES.md"
+
+/** Human-readable label for the current update step (shown on the button). */
+const PHASE_LABEL: Record<UpdatePhase, string> = {
+  upgrading: "Upgrading…",
+  provisioning: "Installing deps…",
+  restarting: "Restarting…",
+}
 
 /** First 7 chars of a git commit, the conventional short form. */
 function short(commit: string | null): string {
@@ -18,12 +25,15 @@ function short(commit: string | null): string {
 export function UpdateBanner({
   update,
   updating,
+  phase,
   blocked,
   busyReason,
   onUpdate,
 }: {
   update: UpdateStatus
   updating: boolean
+  /** Current update step, for the button label while updating. */
+  phase: UpdatePhase | null
   /** Whether a restart is currently unsafe (e.g. an operation is running). */
   blocked: boolean
   /** Why a restart is currently unsafe, e.g. "Stop the running operation" (no period). */
@@ -31,6 +41,7 @@ export function UpdateBanner({
   onUpdate: () => void
 }) {
   const hint = busyReason ?? "The server is busy"
+  const updatingLabel = (phase && PHASE_LABEL[phase]) || "Updating…"
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
       <div className="flex min-w-0 flex-col gap-0.5">
@@ -61,7 +72,7 @@ export function UpdateBanner({
           title={blocked ? `${hint} first` : undefined}
         >
           {updating ? <Loader2 className="animate-spin" /> : <Download />}
-          {updating ? "Updating…" : "Update"}
+          {updating ? updatingLabel : "Update"}
         </Button>
       </div>
     </div>
