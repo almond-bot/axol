@@ -18,16 +18,18 @@ function short(commit: string | null): string {
 export function UpdateBanner({
   update,
   updating,
+  blocked,
   busyReason,
   onUpdate,
 }: {
   update: UpdateStatus
   updating: boolean
-  /** Why a restart is currently unsafe, e.g. "Disconnect Axol" (no period). */
+  /** Whether a restart is currently unsafe (e.g. an operation is running). */
+  blocked: boolean
+  /** Why a restart is currently unsafe, e.g. "Stop the running operation" (no period). */
   busyReason?: string
   onUpdate: () => void
 }) {
-  const blocked = !update.idle
   const hint = busyReason ?? "The server is busy"
   return (
     <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">

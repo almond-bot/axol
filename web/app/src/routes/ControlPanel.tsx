@@ -404,9 +404,14 @@ export default function ControlPanel() {
   const selectedLive = isLive && runningOp === selectedOp
   const selectedStopping = isStopping && runningOp === selectedOp
 
-  // What's keeping the server from being idle (and so blocking an update).
-  // Mirrors the server's _is_idle: only a running operation blocks a restart (a
-  // connected robot is fine). Capitalized clause, no trailing period.
+  // Whether an update is currently unsafe to apply. `isLive` is the immediate,
+  // local signal (reacts the instant an op starts/stops) so the banner blocks
+  // without waiting for the slow status poll; the server's `update.idle` is the
+  // backstop for any other non-idle reason (and the server guards the request
+  // regardless). Mirrors the server's _is_idle: only a running operation blocks
+  // a restart (a connected robot is fine).
+  const updateBlocked = isLive || !(update?.idle ?? true)
+  // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
 
   // While an op is live (including the "stopping" window), poll the server's
@@ -429,6 +434,17 @@ export default function ControlPanel() {
       clearInterval(t)
     }
   }, [conn.state, isLive])
+
+  // Refresh the update status the moment an operation starts or stops, so the
+  // server's idle state (and thus the banner's blocked state) becomes current
+  // without waiting for the slow 60s poll. Skipped while an update is applying
+  // (handleUpdate drives its own watch poll then).
+  useEffect(() => {
+    if (conn.state !== "ok" || updating) return
+    fetchUpdateStatus()
+      .then(setUpdate)
+      .catch(() => {})
+  }, [conn.state, updating, isLive])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -551,6 +567,7 @@ export default function ControlPanel() {
           <UpdateBanner
             update={update}
             updating={updating}
+            blocked={updateBlocked}
             busyReason={updateBusyReason}
             onUpdate={handleUpdate}
           />
