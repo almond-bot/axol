@@ -148,9 +148,13 @@ export function AxolVRClient({
       }
     }
 
-    // Y (left) — exit XR
+    // Y (left) — return home, disable, then exit XR. Piggy-back a reset on this
+    // frame (same as X) so the backend plans a move back to rest and disengages
+    // before we end the session; otherwise the arms hold the last commanded pose
+    // and jerk when teleop is next entered. The session is ended only after the
+    // frame carrying this reset is sent below (see the exit-on-send paths).
     if (yEdge) {
-      onExit?.()
+      reset = true
     }
 
     // B (right) — swap teleop ↔ data_collection (disabled when recording, pending, or saving)
@@ -190,7 +194,11 @@ export function AxolVRClient({
     // reading poses.
     const usbSink = pickUsbSink(poseWsRef)
     const netSink = pickNetworkSink(poseChannelRef, wsRef)
-    if (usbSink == null && netSink == null) return
+    if (usbSink == null && netSink == null) {
+      // No transport to carry the reset — just leave XR (nothing to update).
+      if (yEdge) onExit?.()
+      return
+    }
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -214,13 +222,20 @@ export function AxolVRClient({
     const l_ee = getPose(leftSource?.targetRaySpace)
     const r_ee = getPose(rightSource?.targetRaySpace)
 
-    if (!l_ee || !r_ee) return
+    if (!l_ee || !r_ee) {
+      // Lost controller tracking — can't ship a pose frame; leave XR anyway.
+      if (yEdge) onExit?.()
+      return
+    }
 
     const body = (frame as XRFrame & { body?: XRBody }).body
     const l_elbow = getPosition(body?.get(L_ELBOW_JOINT))
     const r_elbow = getPosition(body?.get(R_ELBOW_JOINT))
 
-    if (!l_elbow || !r_elbow) return
+    if (!l_elbow || !r_elbow) {
+      if (yEdge) onExit?.()
+      return
+    }
 
     const l_grip = 1 - (leftSource?.gamepad?.buttons[0]?.value ?? 0)
     const r_grip = 1 - (rightSource?.gamepad?.buttons[0]?.value ?? 0)
@@ -249,6 +264,10 @@ export function AxolVRClient({
     })
     usbSink?.send(payload)
     netSink?.send(payload)
+
+    // End the XR session only now that the Y-press reset frame has been sent, so
+    // the backend receives the return-to-rest before the pose stream stops.
+    if (yEdge) onExit?.()
   })
 
   return null
