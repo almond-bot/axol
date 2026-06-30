@@ -136,8 +136,13 @@ export interface UpdateStatus {
   error: string | null
 }
 
-export async function fetchUpdateStatus(): Promise<UpdateStatus> {
-  return json(await fetch(apiUrl("/api/update/status")))
+/**
+ * Fetch the update indicator. Pass `force` on connect / page load to make the
+ * server resolve the remote head synchronously (bypassing its debounce), so the
+ * result is immediately current rather than a stale cached value.
+ */
+export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
+  return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
 }
 
 /** Trigger the on-demand upgrade; the server restarts onto new code when idle. */

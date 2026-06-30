@@ -133,7 +133,9 @@ export default function ControlPanel() {
         setHostInfo(info)
       })
       .catch(() => {})
-    fetchUpdateStatus()
+    // Force a synchronous remote check on connect/page load so the banner
+    // reflects reality immediately; the steady-state poll below stays cheap.
+    fetchUpdateStatus(true)
       .then(setUpdate)
       .catch(() => {})
     fetchRobotStatus()

@@ -153,17 +153,31 @@ class SelfUpdater:
         """Run the once-per-process ``axol provision`` startup heal (see below)."""
         self._ensure_provision_once()
 
-    def status(self) -> dict[str, object]:
-        """Snapshot for the control panel; schedules a debounced remote refresh.
+    async def status(self, *, force: bool = False) -> dict[str, object]:
+        """Snapshot for the control panel.
 
-        Returns immediately with the cached remote head (``None`` until the
-        first ``git ls-remote`` resolves). Reads ``is_idle`` live so the UI can
-        gate the Update button on a safe-to-restart server. If an upgrade landed
-        while the server was busy, this also re-attempts the deferred restart.
+        With ``force`` (a fresh page load / explicit check), resolve the remote
+        head synchronously -- bypassing the debounce -- so the response reflects
+        reality immediately rather than a cached value up to a debounce window
+        stale. Otherwise schedule a debounced background refresh and return the
+        cached head (``None`` until the first ``git ls-remote`` resolves), which
+        keeps the steady-state poll cheap.
+
+        Reads ``is_idle`` live so the UI can gate the Update button on a
+        safe-to-restart server. If an upgrade landed while the server was busy,
+        this also re-attempts the deferred restart.
         """
         if self._restart_pending:
             self._maybe_restart()
-        self._schedule_remote_refresh()
+        if force:
+            # Await an in-flight background check rather than racing a second
+            # ls-remote against it; otherwise resolve now.
+            if self._remote_task is not None and not self._remote_task.done():
+                await self._remote_task
+            else:
+                await self.refresh_remote()
+        else:
+            self._schedule_remote_refresh()
         remote = self._remote_commit
         update_available = bool(
             self.enabled and remote is not None and remote != self._commit

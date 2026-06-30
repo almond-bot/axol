@@ -182,9 +182,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         }
 
     @app.get("/api/update/status")
-    async def update_status() -> dict[str, Any]:
-        """Installed vs. tracked-ref commit so the UI can offer an update."""
-        return updater.status()
+    async def update_status(refresh: bool = False) -> dict[str, Any]:
+        """Installed vs. tracked-ref commit so the UI can offer an update.
+
+        ``refresh=1`` forces a synchronous remote check (used on connect / page
+        load) so the result is current; the steady-state poll omits it and gets
+        the cheap debounced/cached value.
+        """
+        return await updater.status(force=refresh)
 
     @app.post("/api/update/start")
     async def update_start() -> JSONResponse:
