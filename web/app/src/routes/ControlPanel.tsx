@@ -402,18 +402,10 @@ export default function ControlPanel() {
   const selectedLive = isLive && runningOp === selectedOp
   const selectedStopping = isStopping && runningOp === selectedOp
 
-  // What's keeping the server from being idle (and so blocking an update), in
-  // UI-visible terms: a running op and/or the live robot link. Mirrors the
-  // server's _is_idle so the update banner names the actual blocker rather than
-  // assuming an operation is running. Capitalized clause, no trailing period.
-  const updateBusyReason = (() => {
-    const parts: string[] = []
-    if (isLive) parts.push("stop the running operation")
-    if (robot?.connected) parts.push("disconnect Axol")
-    if (parts.length === 0) return "The server is busy"
-    const clause = parts.join(" and ")
-    return clause.charAt(0).toUpperCase() + clause.slice(1)
-  })()
+  // What's keeping the server from being idle (and so blocking an update).
+  // Mirrors the server's _is_idle: only a running operation blocks a restart (a
+  // connected robot is fine). Capitalized clause, no trailing period.
+  const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
 
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to

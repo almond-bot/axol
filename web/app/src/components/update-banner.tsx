@@ -9,8 +9,8 @@ function short(commit: string | null): string {
 
 /**
  * Banner shown above the connections bar when the tracked ref has moved past
- * the installed commit. The Update button is disabled unless the server is idle
- * (no op running, robot disconnected), since applying it restarts the server.
+ * the installed commit. The Update button is disabled while an operation is
+ * running (a connected robot is fine), since applying it restarts the server.
  */
 export function UpdateBanner({
   update,

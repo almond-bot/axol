@@ -128,12 +128,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     runner = OperationRunner(robot)
 
     def _is_idle() -> bool:
-        """Safe to restart: nothing running and no live robot link."""
+        """Safe to restart: no operation running.
+
+        A connected robot is fine -- restarting drops the CAN link, which simply
+        reconnects after the relaunch; only an in-flight operation must not be
+        interrupted.
+        """
         if runner.is_running():
             return False
-        if any(s["status"] in ("starting", "running") for s in manager.list()):
-            return False
-        return not robot.status()["connected"]
+        return not any(s["status"] in ("starting", "running") for s in manager.list())
 
     # Surfaces "update available" (read-only `git ls-remote`) to the control
     # panel via /api/update/status and applies an on-demand `uv tool upgrade`

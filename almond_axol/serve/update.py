@@ -110,8 +110,8 @@ class SelfUpdater:
     and whether the tracked ref has advanced) and triggers :meth:`start` from an
     Update button. Nothing upgrades automatically.
 
-    ``is_idle`` reports whether it is safe to restart (no operation running, no
-    live robot link). The restart is a plain ``os._exit``; systemd's
+    ``is_idle`` reports whether it is safe to restart (no operation running; a
+    connected robot is fine). The restart is a plain ``os._exit``; systemd's
     ``Restart=always`` brings the server back on the upgraded code.
     """
 
@@ -183,10 +183,10 @@ class SelfUpdater:
 
         Refuses (``started=False`` with a human-readable reason) for a dev
         checkout, when nothing new is known, when an update is already running,
-        or when the server is busy (an op running / robot connected). The UI
-        disables the button in those cases, but guard here too. On success the
-        upgrade + provision run in the background and the process exits when idle
-        so systemd relaunches the new code.
+        or when an operation is running. The UI disables the button in those
+        cases, but guard here too. On success the upgrade + provision run in the
+        background and the process exits when idle so systemd relaunches the new
+        code.
         """
         if not self.enabled:
             return False, "not a git tool install"
