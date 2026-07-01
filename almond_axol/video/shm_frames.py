@@ -392,6 +392,35 @@ class GstShmFrameReader:
     close = disconnect
 
 
+def _au_has_coded_slice(au: bytes) -> bool:
+    """True if the Annex-B access unit contains a VCL (coded-picture) NAL.
+
+    The relay's encoder can emit access units that carry only non-VCL NALs
+    (access-unit delimiter / SPS / PPS / SEI / end-of-sequence) with no coded
+    slice — notably a trailing boundary AU when the dataset valve closes at
+    episode end. Such an AU decodes to *no* picture, so muxing it as a dataset
+    frame leaves the video one frame short of the row count and the final row
+    then fails LeRobot's exact-timestamp decode. Delivering only AUs with a coded
+    slice keeps frame-count == row-count (the capture loop re-muxes the previous
+    real frame for that row instead). VCL NAL types are 1-5 (non-IDR .. IDR).
+    """
+    i, n = 0, len(au)
+    while i + 3 < n:
+        if au[i] == 0 and au[i + 1] == 0:
+            if au[i + 2] == 1:
+                if 1 <= (au[i + 3] & 0x1F) <= 5:
+                    return True
+                i += 4
+                continue
+            if au[i + 2] == 0 and i + 4 < n and au[i + 3] == 1:
+                if 1 <= (au[i + 4] & 0x1F) <= 5:
+                    return True
+                i += 5
+                continue
+        i += 1
+    return False
+
+
 class EncodedAuReader:
     """Recorder-side source of the relay's pre-encoded H.264 access units.
 
@@ -499,6 +528,11 @@ class EncodedAuReader:
                 au = bytes(mapinfo.data)
             finally:
                 buf.unmap(mapinfo)
+            # Drop non-VCL boundary AUs (no coded picture, e.g. the trailing AU
+            # emitted when the valve closes): muxing one would make the video one
+            # frame short of the dataset rows. See _au_has_coded_slice.
+            if not _au_has_coded_slice(au):
+                continue
             with self._cond:
                 if self._await_keyframe:
                     if not is_keyframe:
