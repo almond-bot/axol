@@ -4,20 +4,29 @@ rom.enable
 Range of motion test for the Axol robot. Sweeps every joint through its full
 range while checking each waypoint for self-collision via pyroki.
 
-Pass --robot to select the backend:
-  - sim: launches a viser visualizer at http://localhost:8002 and runs the
-         sweep once. Collisions are skipped with a warning.
-  - axol: enables the motors, eases to home, then prompts to close each
-          gripper onto the item and loops the sweep for two hours. When the
-          soak finishes (or on Ctrl-C) the robot returns home but keeps
-          holding the item with the motors left enabled — run
-          ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
-          and retrieve the item. A predicted collision aborts the run, returns
-          the robot home, and disables the motors.
+Enables the motors, eases to home, then prompts to close each gripper onto the
+item and loops the sweep for two hours. When the soak finishes (or on Ctrl-C)
+the robot returns home but keeps holding the item with the motors left enabled
+— run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
+and retrieve the item. A predicted collision aborts the run, returns the robot
+home, and disables the motors.
+
+Select a subset of joints and/or a single arm:
+  --joints    Comma-separated joints present on the CAN bus (e.g.
+              wrist_1,wrist_2,wrist_3). Only these motors are enabled and
+              swept; every other joint is left untouched at home. Default: all.
+  --no-left / --no-right
+              Skip an arm entirely. Only the remaining arm is opened, enabled,
+              and swept. Cannot skip both.
+
+When the gripper is not among the selected joints (or its arm is skipped) the
+run drops the grasp-an-item step and simply loops the range-of-motion sweeps
+for the selected joints.
 
 Run:
-    uv run -m almond_axol.diagnostics.rom.enable --robot sim
-    uv run -m almond_axol.diagnostics.rom.enable --robot axol
+    uv run -m almond_axol.diagnostics.rom.enable
+    uv run -m almond_axol.diagnostics.rom.enable --no-right
+    uv run -m almond_axol.diagnostics.rom.enable --joints wrist_1,wrist_2,wrist_3
 """
 
 import argparse
@@ -31,8 +40,9 @@ import numpy as np
 import pyroki as pk
 import yourdfpy
 
-from ...constants import URDF_PATH, Joint
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, URDF_PATH, Joint
 from ...kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
+from ...motor import ControlMode
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
     ELBOW_RIGHT_LIMITS,
@@ -41,15 +51,11 @@ from ...robot.axol import (
     SHOULDER_2_LEFT_LIMITS,
     SHOULDER_2_RIGHT_LIMITS,
     Axol,
+    AxolArm,
 )
 from ...robot.config import AxolConfig
-from ...robot.sim import Sim
 
 CONTROL_RATE_HZ = 100.0  # Hz
-
-SIM_SPEED = 3.0  # rad/s
-SIM_PRE_POSE_SPEED = 0.8  # rad/s
-SIM_WAYPOINT_PAUSE = 0.5  # seconds
 
 AXOL_SPEED = 1.0  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
@@ -74,6 +80,37 @@ GRIPPER_SPEED = 1.0  # normalized [0, 1] per second — open/close speed
 
 JOINT_INDEX: dict[Joint, int] = {j: i for i, j in enumerate(Joint)}
 NUM_JOINTS = len(list(Joint))
+
+FULL_JOINT_SET: frozenset[Joint] = frozenset(Joint)
+
+
+def parse_joints(spec: str | None) -> set[Joint]:
+    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
+
+    ``None`` or empty selects every joint. Names match the joint enum values
+    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
+    """
+    if not spec:
+        return set(Joint)
+    by_value = {j.value: j for j in Joint}
+    selected: set[Joint] = set()
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in by_value:
+            valid = ", ".join(by_value)
+            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
+        selected.add(by_value[name])
+    return selected or set(Joint)
+
+
+def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
+    """Convert a raw motor-frame reading to the public joint-frame value."""
+    if joint == Joint.GRIPPER:
+        gi = arm._gripper_i
+        return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
+    return raw + float(arm._joint_offsets[idx])
 
 
 class CollisionChecker:
@@ -130,8 +167,139 @@ def home_pose() -> np.ndarray:
     return np.zeros(NUM_JOINTS, dtype=np.float32)
 
 
+class HardwareController:
+    """Motion facade over :class:`Axol` that restricts commands to a joint subset.
+
+    Presents the same ``enable`` / ``disable`` / ``get_positions`` /
+    ``motion_control`` surface the ROM cycle drives on both backends, but only
+    ever touches the joints in ``present`` on hardware. When ``present`` is the
+    full joint set this delegates straight to :class:`Axol` so a normal run
+    keeps its full feedforward stack and max-step safety check; otherwise absent
+    motors are never enabled, commanded, or read (so they may be off the bus).
+    """
+
+    def __init__(self, axol: Axol, present: set[Joint]) -> None:
+        self._axol = axol
+        self._present = set(present)
+        self._full = self._present == set(Joint)
+
+    def _arms(self) -> list[AxolArm]:
+        return [a for a in (self._axol.left, self._axol.right) if a is not None]
+
+    async def enable(self) -> None:
+        if self._full:
+            await self._axol.enable()
+            return
+        bus_tasks = []
+        if self._axol.left is not None:
+            bus_tasks.append(self._axol._left_bus.start())
+        if self._axol.right is not None:
+            bus_tasks.append(self._axol._right_bus.start())
+        await asyncio.gather(*bus_tasks)
+        await asyncio.gather(*[self._enable_arm(a) for a in self._arms()])
+
+    async def _enable_arm(self, arm: AxolArm) -> None:
+        motors = [arm.motors[j] for j in self._present]
+        await asyncio.gather(*[m.enable() for m in motors])
+        await asyncio.gather(
+            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
+        )
+        if Joint.GRIPPER in self._present:
+            await arm._calibrate_gripper()
+            await arm.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
+
+    async def disable(self) -> None:
+        if self._full:
+            await self._axol.disable()
+            return
+        tasks = []
+        for arm in self._arms():
+            tasks.extend(arm.motors[j].disable() for j in self._present)
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            pass
+        finally:
+            close_tasks = []
+            if self._axol.left is not None:
+                close_tasks.append(self._axol._left_bus.close())
+            if self._axol.right is not None:
+                close_tasks.append(self._axol._right_bus.close())
+            await asyncio.gather(*close_tasks)
+
+    async def get_positions(self) -> tuple[np.ndarray, np.ndarray]:
+        """Current positions as (left, right); an absent arm reports home."""
+        left = (
+            await self._read_arm(self._axol.left)
+            if self._axol.left is not None
+            else home_pose()
+        )
+        right = (
+            await self._read_arm(self._axol.right)
+            if self._axol.right is not None
+            else home_pose()
+        )
+        return left, right
+
+    async def _read_arm(self, arm: AxolArm) -> np.ndarray:
+        if self._full:
+            return await arm.get_positions()
+        q = home_pose()
+        for i, j in enumerate(Joint):
+            if j in self._present:
+                q[i] = _joint_frame(arm, i, j, await arm.motors[j].get_position())
+        return q
+
+    async def motion_control(
+        self,
+        left: np.ndarray | None = None,
+        right: np.ndarray | None = None,
+    ) -> None:
+        if self._full:
+            await self._axol.motion_control(left=left, right=right)
+            return
+        tasks = []
+        if left is not None and self._axol.left is not None:
+            tasks.append(self._command_arm(self._axol.left, left))
+        if right is not None and self._axol.right is not None:
+            tasks.append(self._command_arm(self._axol.right, right))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _command_arm(self, arm: AxolArm, q: np.ndarray) -> None:
+        """Gravity-compensated impedance hold for the present arm joints, plus a
+        position-force command to the gripper when it is present."""
+        q = q.copy()
+        arm_q = q[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = arm._gravity_comp.gravity_arm(arm_q, is_left=arm._is_left)
+        offsets = arm._joint_offsets
+        tasks = []
+        for i, j in enumerate(ARM_JOINTS):
+            if j not in self._present:
+                continue
+            gains = getattr(arm._arm_config, j.value)
+            tasks.append(
+                arm.motors[j].set_impedance(
+                    float(q[i] - offsets[i]), 0.0, gains.kp, gains.kd, float(gravity[i])
+                )
+            )
+        if Joint.GRIPPER in self._present:
+            gi = arm._gripper_i
+            gripper_pos = arm._limits_hi[gi] + float(q[gi]) * (
+                arm._limits_lo[gi] - arm._limits_hi[gi]
+            )
+            tasks.append(
+                arm.motors[Joint.GRIPPER].set_position_force(
+                    gripper_pos,
+                    arm._arm_config.gripper.max_speed,
+                    arm._arm_config.gripper.torque_limit,
+                )
+            )
+        await asyncio.gather(*tasks)
+
+
 async def move_grippers(
-    robot: Axol | Sim,
+    robot: Axol | HardwareController,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_grip: float,  # normalized [0, 1] — 0 closed, 1 open
@@ -169,7 +337,7 @@ async def move_grippers(
 
 
 async def sweep_to_target(
-    robot: Axol | Sim,
+    robot: Axol | HardwareController,
     checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
@@ -215,7 +383,7 @@ async def sweep_to_target(
 
 
 async def sweep_unchecked(
-    robot: Axol | Sim,
+    robot: Axol | HardwareController,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
@@ -253,7 +421,7 @@ def with_joint(
 
 
 async def sweep_joint_range(
-    robot: Axol | Sim,
+    robot: Axol | HardwareController,
     checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
@@ -314,7 +482,7 @@ async def sweep_joint_range(
 
 
 async def run_rom_cycle(
-    robot: Axol | Sim,
+    robot: Axol | HardwareController,
     checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
@@ -323,255 +491,131 @@ async def run_rom_cycle(
     pause: float,  # seconds
     abort_on_collision: bool,
     shoulder3_mirror: bool,
+    present: set[Joint] = FULL_JOINT_SET,
+    run_left: bool = True,
+    run_right: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # Shoulder_1 limits are mirrored across arms: the right arm's range is the
-    # negation of the left's, so sweep both arms simultaneously in mirror.
-    s1_left_low, s1_left_high = SHOULDER_1_LEFT_LIMITS
-    print(
-        f"  SHOULDER_1  (both, mirrored)  "
-        f"[{round(s1_left_high, 3)}, {round(s1_left_low, 3)}] → 0"
-    )
-    for value in (s1_left_high, s1_left_low, 0.0):
+    """Sweep the selected joints through their ranges on the selected arms.
+
+    Only joints in ``present`` are moved; every other joint stays at its
+    current value. ``run_left`` / ``run_right`` gate which arm each mirrored
+    sweep drives. Pre-poses that reposition a helper joint (shoulder_1 before
+    shoulder_3, elbow before the wrists) are skipped when that joint is absent.
+    """
+    arm_sel = "both" if run_left and run_right else ("left" if run_left else "right")
+
+    async def step(
+        joint: Joint,
+        left_val: float,  # rad
+        right_val: float,  # rad
+        spd: float = speed,  # rad/s
+    ) -> None:
+        nonlocal left_q, right_q
+        left_target = with_joint(left_q, joint, left_val) if run_left else left_q.copy()
+        right_target = (
+            with_joint(right_q, joint, right_val) if run_right else right_q.copy()
+        )
         left_q, right_q = await sweep_to_target(
             robot,
             checker,
             left_q,
             right_q,
-            with_joint(left_q, Joint.SHOULDER_1, value),
-            with_joint(right_q, Joint.SHOULDER_1, -value),
+            left_target,
+            right_target,
+            spd,
+            pause,
+            abort_on_collision,
+        )
+
+    # Shoulder_1 limits are mirrored across arms: the right arm's range is the
+    # negation of the left's, so sweep both arms simultaneously in mirror.
+    if Joint.SHOULDER_1 in present:
+        s1_left_low, s1_left_high = SHOULDER_1_LEFT_LIMITS
+        print(
+            f"  SHOULDER_1  ({arm_sel}, mirrored)  "
+            f"[{round(s1_left_high, 3)}, {round(s1_left_low, 3)}] → 0"
+        )
+        for value in (s1_left_high, s1_left_low, 0.0):
+            await step(Joint.SHOULDER_1, value, -value)
+
+    if Joint.SHOULDER_2 in present:
+        _, right_high = SHOULDER_2_RIGHT_LIMITS
+        left_low, _ = SHOULDER_2_LEFT_LIMITS
+        print(
+            f"  SHOULDER_2  ({arm_sel})  → [{round(left_low, 3)}, {round(right_high, 3)}] → 0"
+        )
+        await step(Joint.SHOULDER_2, left_low, right_high)
+        await step(Joint.SHOULDER_2, 0.0, 0.0)
+
+    if Joint.SHOULDER_3 in present:
+        # The forward pre-pose uses shoulder_1; skip it when shoulder_1 is
+        # absent and sweep shoulder_3 in place instead.
+        s3_prepose = Joint.SHOULDER_1 in present
+        if s3_prepose:
+            print(
+                f"  SHOULDER_3 pre-pose: arms forward "
+                f"{round(math.degrees(SHOULDER_PRE_POSE_ANGLE), 1)}°"
+            )
+            await step(
+                Joint.SHOULDER_1,
+                -SHOULDER_PRE_POSE_ANGLE,
+                SHOULDER_PRE_POSE_ANGLE,
+                pre_pose_speed,
+            )
+        low, high = LIMITS[Joint.SHOULDER_3]
+        print(f"  SHOULDER_3  ({arm_sel} fwd)  [{round(low, 3)}, {round(high, 3)}] → 0")
+        shoulder3_left_low = low if shoulder3_mirror else -low
+        shoulder3_left_high = high if shoulder3_mirror else -high
+        await step(Joint.SHOULDER_3, shoulder3_left_low, -low)
+        await step(Joint.SHOULDER_3, shoulder3_left_high, -high)
+        await step(Joint.SHOULDER_3, 0.0, 0.0)
+        if s3_prepose:
+            await step(Joint.SHOULDER_1, 0.0, 0.0, pre_pose_speed)
+
+    if Joint.ELBOW in present:
+        _, elbow_left_high = ELBOW_LEFT_LIMITS
+        elbow_right_low, _ = ELBOW_RIGHT_LIMITS
+        print(
+            f"  ELBOW       ({arm_sel})  "
+            f"[{round(elbow_right_low, 3)}, {round(elbow_left_high, 3)}] → 0"
+        )
+        await step(Joint.ELBOW, elbow_left_high, elbow_right_low)
+        await step(Joint.ELBOW, 0.0, 0.0)
+
+    # The wrists are swept with the elbows bent to 90° so they clear the body;
+    # skip that pre-pose (and its return) when the elbow is off the bus.
+    wrist_joints = [
+        j for j in (Joint.WRIST_1, Joint.WRIST_2, Joint.WRIST_3) if j in present
+    ]
+    elbow_prepose = Joint.ELBOW in present and bool(wrist_joints)
+    if elbow_prepose:
+        print("  Pre-pose: elbows at 90°")
+        await step(Joint.ELBOW, +WRIST_TEST_ELBOW_ANGLE, -WRIST_TEST_ELBOW_ANGLE)
+
+    for wrist in wrist_joints:
+        low, high = LIMITS[wrist]
+        label = f"{wrist.value.replace('_', ' ').upper():<11} ({arm_sel})"
+        left_q, right_q = await sweep_joint_range(
+            robot,
+            checker,
+            left_q,
+            right_q,
+            wrist,
+            arm_sel,
+            [high, low],
+            label,
             speed,
             pause,
             abort_on_collision,
         )
 
-    _, right_high = SHOULDER_2_RIGHT_LIMITS
-    left_low, _ = SHOULDER_2_LEFT_LIMITS
-    print(f"  SHOULDER_2  (both)  → [{round(left_low, 3)}, {round(right_high, 3)}] → 0")
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_2, left_low),
-        with_joint(right_q, Joint.SHOULDER_2, right_high),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_2, 0.0),
-        with_joint(right_q, Joint.SHOULDER_2, 0.0),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    print(
-        f"  SHOULDER_3 pre-pose: arms forward {round(math.degrees(SHOULDER_PRE_POSE_ANGLE), 1)}°"
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_1, -SHOULDER_PRE_POSE_ANGLE),
-        with_joint(right_q, Joint.SHOULDER_1, SHOULDER_PRE_POSE_ANGLE),
-        pre_pose_speed,
-        pause,
-        abort_on_collision,
-    )
-    low, high = LIMITS[Joint.SHOULDER_3]
-    print(f"  SHOULDER_3  (both fwd)  [{round(low, 3)}, {round(high, 3)}] → 0")
-    shoulder3_left_low = low if shoulder3_mirror else -low
-    shoulder3_left_high = high if shoulder3_mirror else -high
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_3, shoulder3_left_low),
-        with_joint(right_q, Joint.SHOULDER_3, -low),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_3, shoulder3_left_high),
-        with_joint(right_q, Joint.SHOULDER_3, -high),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_3, 0.0),
-        with_joint(right_q, Joint.SHOULDER_3, 0.0),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.SHOULDER_1, 0.0),
-        with_joint(right_q, Joint.SHOULDER_1, 0.0),
-        pre_pose_speed,
-        pause,
-        abort_on_collision,
-    )
-
-    _, elbow_left_high = ELBOW_LEFT_LIMITS
-    elbow_right_low, _ = ELBOW_RIGHT_LIMITS
-    print(
-        f"  ELBOW       (both)  [{round(elbow_right_low, 3)}, {round(elbow_left_high, 3)}] → 0"
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.ELBOW, elbow_left_high),
-        with_joint(right_q, Joint.ELBOW, elbow_right_low),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.ELBOW, 0.0),
-        with_joint(right_q, Joint.ELBOW, 0.0),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    print("  Pre-pose: elbows at 90°")
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.ELBOW, +WRIST_TEST_ELBOW_ANGLE),
-        with_joint(right_q, Joint.ELBOW, -WRIST_TEST_ELBOW_ANGLE),
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    low, high = LIMITS[Joint.WRIST_1]
-    left_q, right_q = await sweep_joint_range(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        Joint.WRIST_1,
-        "both",
-        [high, low],
-        "WRIST 1     (both)",
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    low, high = LIMITS[Joint.WRIST_2]
-    left_q, right_q = await sweep_joint_range(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        Joint.WRIST_2,
-        "both",
-        [high, low],
-        "WRIST 2     (both)",
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    low, high = LIMITS[Joint.WRIST_3]
-    left_q, right_q = await sweep_joint_range(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        Joint.WRIST_3,
-        "both",
-        [high, low],
-        "WRIST 3     (both)",
-        speed,
-        pause,
-        abort_on_collision,
-    )
-
-    left_q, right_q = await sweep_to_target(
-        robot,
-        checker,
-        left_q,
-        right_q,
-        with_joint(left_q, Joint.ELBOW, 0.0),
-        with_joint(right_q, Joint.ELBOW, 0.0),
-        speed,
-        pause,
-        abort_on_collision,
-    )
+    if elbow_prepose:
+        await step(Joint.ELBOW, 0.0, 0.0)
 
     return left_q, right_q
 
 
-async def run_sim() -> None:
-    checker = CollisionChecker()
-
-    sim = Sim()
-    await sim.enable()
-    try:
-        print("=== ROM TEST — simulation ===")
-        print("Viser server running at  http://localhost:8002")
-        print("Open that URL in a browser, then come back here.\n")
-        await asyncio.to_thread(input, "Press Enter to start the ROM sweep ...")
-
-        left_q = home_pose()
-        right_q = home_pose()
-
-        await sim.motion_control(left=left_q, right=right_q)
-        await asyncio.sleep(0.5)
-        print("\nStarting ROM sweep ...\n")
-
-        await run_rom_cycle(
-            sim,
-            checker,
-            left_q,
-            right_q,
-            speed=SIM_SPEED,
-            pre_pose_speed=SIM_PRE_POSE_SPEED,
-            pause=SIM_WAYPOINT_PAUSE,
-            abort_on_collision=False,
-            shoulder3_mirror=True,
-        )
-
-        print("\nROM sweep complete. Robot is at home position.")
-        print("Viser server still running — press Ctrl+C to exit.\n")
-        await asyncio.Event().wait()
-    finally:
-        await sim.disable()
-
-
-async def return_home(robot: Axol) -> None:
+async def return_home(robot: Axol | HardwareController) -> None:
     """Ease the arms back to home from their current pose, keeping the grippers shut.
 
     Used to bring the robot to a safe home position while it stays clamped on
@@ -606,17 +650,42 @@ async def close_buses(robot: Axol) -> None:
     await asyncio.gather(*(bus.close() for bus in buses))
 
 
-async def run_axol() -> None:
+async def run_axol(
+    present: set[Joint] = FULL_JOINT_SET,
+    no_left: bool = False,
+    no_right: bool = False,
+) -> None:
     checker = CollisionChecker()
 
+    run_left = not no_left
+    run_right = not no_right
+    has_gripper = Joint.GRIPPER in present
+
     print("=== ROM TEST — PHYSICAL ROBOT ===")
-    print("Make sure the area is clear.\n")
+    print("Make sure the area is clear.")
+    arms_desc = (
+        "both arms"
+        if run_left and run_right
+        else ("left arm" if run_left else "right arm")
+    )
+    joints_desc = (
+        "all joints"
+        if present == set(Joint)
+        else ", ".join(j.value for j in Joint if j in present)
+    )
+    print(f"Running {arms_desc}  |  joints: {joints_desc}\n")
 
     config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
-    config.left.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
-    config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
-    axol = Axol(config=config)
-    await axol.enable()
+    if has_gripper:
+        config.left.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
+        config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
+    axol = Axol(
+        config=config,
+        left_channel=None if no_left else CAN_LEFT,
+        right_channel=None if no_right else CAN_RIGHT,
+    )
+    robot = HardwareController(axol, present)
+    await robot.enable()
     print("Motors enabled.")
     await asyncio.sleep(2.0)
 
@@ -627,9 +696,10 @@ async def run_axol() -> None:
         assert closed_left_q is not None and closed_right_q is not None
         return closed_left_q.copy(), closed_right_q.copy()
 
-    # When True (normal soak completion or Ctrl-C) the motors are left enabled
-    # and the item stays gripped; otherwise (collision / unexpected error) the
-    # motors are disabled in the finally block.
+    # Only meaningful when a gripper is holding an item: on a normal soak
+    # completion or Ctrl-C the motors are left enabled so the grasp is kept and
+    # ``rom.disable`` can release it later. Without a gripper in the run there is
+    # nothing to hold, so the motors are always disabled in the finally block.
     keep_enabled = False
 
     try:
@@ -641,27 +711,38 @@ async def run_axol() -> None:
         # otherwise command home as a single stiff (s=1) impedance setpoint and
         # snap the arms there; sweep_unchecked ramps them in with a smoothstep
         # trajectory instead.
-        cur_left, cur_right = await axol.get_positions()
+        cur_left, cur_right = await robot.get_positions()
         ready_left = home.copy()
         ready_right = home.copy()
-        ready_left[gripper_i] = 1.0
-        ready_right[gripper_i] = 1.0
-        print("Easing to home position (grippers open) ...")
+        if has_gripper:
+            ready_left[gripper_i] = 1.0
+            ready_right[gripper_i] = 1.0
+            print("Easing to home position (grippers open) ...")
+        else:
+            print("Easing to home position ...")
         await sweep_unchecked(
-            axol, cur_left, cur_right, ready_left, ready_right, speed=AXOL_HOME_SPEED
+            robot, cur_left, cur_right, ready_left, ready_right, speed=AXOL_HOME_SPEED
         )
         left_q, right_q = ready_left, ready_right
 
-        await asyncio.to_thread(input, "Press Enter to close the RIGHT gripper ...")
-        left_q, right_q = await move_grippers(
-            axol, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
-        )
-
-        await asyncio.to_thread(input, "Press Enter to close the LEFT gripper ...")
-        left_q, right_q = await move_grippers(
-            axol, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
-        )
-        print("Both grippers closed.")
+        # Grasp the item only when the gripper is part of the run; a partial run
+        # without it just sweeps the selected joints (see module docstring).
+        if has_gripper:
+            if run_right:
+                await asyncio.to_thread(
+                    input, "Press Enter to close the RIGHT gripper ..."
+                )
+                left_q, right_q = await move_grippers(
+                    robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
+                )
+            if run_left:
+                await asyncio.to_thread(
+                    input, "Press Enter to close the LEFT gripper ..."
+                )
+                left_q, right_q = await move_grippers(
+                    robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
+                )
+            print("Grippers closed.")
 
         closed_left_q = left_q.copy()
         closed_right_q = right_q.copy()
@@ -680,7 +761,7 @@ async def run_axol() -> None:
             left_q, right_q = home_with_grippers_closed()
 
             left_q, right_q = await run_rom_cycle(
-                axol,
+                robot,
                 checker,
                 left_q,
                 right_q,
@@ -689,6 +770,9 @@ async def run_axol() -> None:
                 pause=AXOL_WAYPOINT_PAUSE,
                 abort_on_collision=True,
                 shoulder3_mirror=False,
+                present=present,
+                run_left=run_left,
+                run_right=run_right,
             )
 
             print(f"\nCycle {cycle} complete.")
@@ -701,7 +785,7 @@ async def run_axol() -> None:
         print("Returning to home position ...")
         home_left, home_right = home_with_grippers_closed()
         left_q, right_q = await sweep_to_target(
-            axol,
+            robot,
             checker,
             left_q,
             right_q,
@@ -712,23 +796,27 @@ async def run_axol() -> None:
             abort_on_collision=True,
         )
 
-        # Leave the robot holding the item with the motors enabled. The operator
-        # runs rom.disable to open the grippers and retrieve the item.
-        keep_enabled = True
+        # With a gripper grasping the item, leave the robot holding it with the
+        # motors enabled; the operator runs rom.disable to open the grippers and
+        # retrieve it. Otherwise there is nothing to hold and we disable.
+        keep_enabled = has_gripper
 
     except CollisionAbort as e:
         print(f"\n⚠  COLLISION ABORT: {e}")
         print("Returning to home position ...")
         safe_left, safe_right = home_with_grippers_closed()
         await sweep_unchecked(
-            axol, e.left_q, e.right_q, safe_left, safe_right, speed=AXOL_SPEED
+            robot, e.left_q, e.right_q, safe_left, safe_right, speed=AXOL_SPEED
         )
         print("Home reached.")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\nInterrupted — returning home, keeping the item gripped ...")
-        await return_home(axol)
-        keep_enabled = True
+        if has_gripper:
+            print("\nInterrupted — returning home, keeping the item gripped ...")
+        else:
+            print("\nInterrupted — returning home ...")
+        await return_home(robot)
+        keep_enabled = has_gripper
 
     finally:
         if keep_enabled:
@@ -739,26 +827,31 @@ async def run_axol() -> None:
                 "grippers and retrieve it."
             )
         else:
-            await axol.disable()
+            await robot.disable()
             print("Motors disabled.")
 
 
 def main() -> None:
+    valid_joints = [j.value for j in Joint]
     parser = argparse.ArgumentParser(
         description="Range of motion test for the Axol robot."
     )
     parser.add_argument(
-        "--robot",
-        choices=["axol", "sim"],
-        required=True,
-        help="Robot backend: 'axol' for hardware, 'sim' for visualizer.",
+        "--joints",
+        default=None,
+        help="Comma-separated joints present on the bus (e.g. wrist_1,wrist_2,wrist_3). "
+        f"Only these are enabled and swept. Default: all. One of: {', '.join(valid_joints)}.",
     )
+    parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
+    parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     args = parser.parse_args()
 
-    if args.robot == "sim":
-        asyncio.run(run_sim())
-    else:
-        asyncio.run(run_axol())
+    if args.no_left and args.no_right:
+        parser.error("Cannot skip both arms.")
+
+    present = parse_joints(args.joints)
+
+    asyncio.run(run_axol(present=present, no_left=args.no_left, no_right=args.no_right))
 
 
 if __name__ == "__main__":
