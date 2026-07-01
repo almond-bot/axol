@@ -432,6 +432,24 @@ def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
     )
 
 
+# While an episode records, the relay runs an extra per-camera NVENC dataset
+# branch (GPU encode + shmsink) on top of the headset send, so the aiortc send
+# loop has less headroom and a full-bitrate headset feed jitters/stutters. The
+# headset stream is only a live monitor, so we drop its encoder bitrate while
+# recording: fewer bits -> fewer RTP packets -> proportionally less SRTP/send CPU,
+# handing the event loop back its headroom. The recorded dataset video is a
+# separate NVENC pipeline at full (constant-QP) quality, so training data is
+# unaffected.
+_RECORDING_ENC_BITRATE_SCALE = 0.5
+
+
+def _set_enc_bitrate(pipeline: Any, name: str, bitrate: int) -> None:
+    """Set a named ``nvv4l2h264enc``'s target bitrate at runtime (best-effort)."""
+    enc = pipeline.get_by_name(name)
+    if enc is not None:
+        enc.set_property("bitrate", int(bitrate))
+
+
 class _GstPipelineBase:
     """Common pipeline lifecycle: build, pull threads, ready-wait, teardown."""
 
@@ -692,6 +710,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
 
     def _pipeline_str(self) -> str:
         bitrate = _bitrate_for(self.width, self.height, self.fps)
+        self._enc_bitrate = bitrate
         src = (
             f"zedxonesrc camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
@@ -740,13 +759,18 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         encode (shmsink path) or VIC RGBA convert + appsink copy (in-process path)
         never runs, so the relay costs no more than the encode-only (``axol
         teleop``) path. ``collect-data`` opens this only while an episode is
-        recording.
+        recording. While open, the headset encoder's bitrate is also scaled down
+        (see ``_RECORDING_ENC_BITRATE_SCALE``) to free send-loop CPU; it is
+        restored to full quality when recording stops.
         """
         if not self._want_raw or self._pipeline is None:
             return
         valve = self._pipeline.get_by_name("rawvalve")
         if valve is not None:
             valve.set_property("drop", not enabled)
+        if self._want_encoded:
+            scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
+            _set_enc_bitrate(self._pipeline, "venc", self._enc_bitrate * scale)
 
     def connect(self, warmup: bool = True) -> None:
         """Open the camera, start the pipeline, and block until it streams."""
@@ -970,6 +994,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
         bitrate = _bitrate_for(eye_w, eye_h, self.fps)
+        self._enc_bitrate = bitrate
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
@@ -1020,7 +1045,9 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
         See :meth:`ZedGstCamera.set_raw_enabled`: gates the per-eye ``valve``s so
         each eye's dataset encode (or VIC convert + appsink copy) only runs while
-        recording.
+        recording. The headset (encoded) eyes' bitrate is scaled down while
+        recording and restored after, for the same send-loop-headroom reason as
+        the mono path.
         """
         if not self._want_raw or self._pipeline is None:
             return
@@ -1028,6 +1055,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
             valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
             if valve is not None:
                 valve.set_property("drop", not enabled)
+        scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
+        for side in self._encoded_sides:
+            _set_enc_bitrate(
+                self._pipeline, f"venc_{side[0]}", self._enc_bitrate * scale
+            )
 
     def _pipeline_str(self) -> str:
         src = (
