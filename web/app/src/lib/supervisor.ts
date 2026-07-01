@@ -115,6 +115,47 @@ export async function fetchInfo(): Promise<ServerInfo> {
 }
 
 // ---------------------------------------------------------------------------
+// Self-update (read-only commit check + user-initiated upgrade)
+// ---------------------------------------------------------------------------
+
+export type UpdateState = "idle" | "updating" | "error"
+
+/** Current step while an update is applying; null when not updating. */
+export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
+
+export interface UpdateStatus {
+  /** Updatable: installed from git as a uv tool with uv available. */
+  enabled: boolean
+  /** Installed git commit (null for dev checkouts). */
+  commit: string | null
+  /** Latest commit on the tracked ref, or null until first resolved/offline. */
+  remoteCommit: string | null
+  /** remoteCommit is known and differs from the installed commit. */
+  updateAvailable: boolean
+  /** Safe to restart now (no op running). */
+  idle: boolean
+  state: UpdateState
+  /** Step while state is "updating" (upgrading/provisioning/restarting); else null. */
+  phase: UpdatePhase | null
+  /** Last update failure, surfaced to the operator; null otherwise. */
+  error: string | null
+}
+
+/**
+ * Fetch the update indicator. Pass `force` on connect / page load to make the
+ * server resolve the remote head synchronously (bypassing its debounce), so the
+ * result is immediately current rather than a stale cached value.
+ */
+export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
+  return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
+}
+
+/** Trigger the on-demand upgrade; the server restarts onto new code when idle. */
+export async function startUpdate(): Promise<{ started: boolean }> {
+  return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
+}
+
+// ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
 

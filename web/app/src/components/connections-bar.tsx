@@ -67,6 +67,7 @@ export function ConnectionsBar({
   conn,
   host,
   hostName,
+  commit,
   onOpenSetup,
   onHostDisconnect,
   robot,
@@ -84,6 +85,8 @@ export function ConnectionsBar({
   conn: ConnState
   host: string
   hostName?: string
+  /** Installed git commit of the serve host (null for dev checkouts). */
+  commit?: string | null
   onOpenSetup: () => void
   onHostDisconnect: () => void
   robot: RobotStatus | null
@@ -197,6 +200,13 @@ export function ConnectionsBar({
         dot={wsDot}
         label={wsLabel}
         pulse={conn === "loading"}
+        extra={
+          online && commit ? (
+            <span className="font-mono text-[0.7rem] text-white/35" title={commit}>
+              axol @ {commit.slice(0, 7)}
+            </span>
+          ) : undefined
+        }
       >
         {online ? (
           <Button
