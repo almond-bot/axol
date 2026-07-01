@@ -113,6 +113,7 @@ export default function ControlPanel() {
   // verify the assigned serials are actually connected before a task starts.
   const [cameraDevices, setCameraDevices] = useState<CameraDevice[] | null>(null)
   const [cameraDetectError, setCameraDetectError] = useState<string | null>(null)
+  const [cameraDetecting, setCameraDetecting] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -121,6 +122,10 @@ export default function ControlPanel() {
 
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [busy, setBusy] = useState(false)
+  // Short label shown on the Start button while a start is being prepared (e.g.
+  // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
+  // update banner's phase display.
+  const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
   const [camerasDialogOpen, setCamerasDialogOpen] = useState(false)
 
@@ -130,6 +135,7 @@ export default function ControlPanel() {
   // the assigned serials are actually connected (best-effort: failures leave the
   // last known state and surface as a "can't detect" warning).
   const refreshCameras = useCallback(async () => {
+    setCameraDetecting(true)
     try {
       const result = await detectCameras()
       setCameraDevices(result.devices)
@@ -137,6 +143,8 @@ export default function ControlPanel() {
     } catch (e) {
       setCameraDevices(null)
       setCameraDetectError(String(e).replace(/^Error:\s*/, ""))
+    } finally {
+      setCameraDetecting(false)
     }
   }, [])
 
@@ -506,30 +514,36 @@ export default function ControlPanel() {
   async function handleStart() {
     setBusy(true)
     try {
-      // The op will use cameras when it requires them (collect-data / run-policy)
-      // or when any serial is assigned (teleop streams those to the headset).
-      // Sim never touches real cameras.
+      // Only ops that actually require cameras (collect-data / run-policy) are
+      // gated on them. Teleop streams whatever cameras are configured but must
+      // never be blocked by camera detection, and sim never touches hardware.
       const isSimSelected = selectedOp === "teleop" && Boolean(settings.sim)
-      const usesCameras = (meta.requiresCameras || cameraCount(cameras) > 0) && !isSimSelected
-
-      // Verify every assigned camera is actually connected before starting —
-      // a fresh detection is authoritative (the badge can be a poll behind). A
-      // missing or undetectable camera blocks the start and surfaces an alert
-      // rather than failing deep inside the op.
-      if (usesCameras) {
-        const detect = await detectCameras()
-        setCameraDevices(detect.devices)
-        setCameraDetectError(detect.error)
-        if (detect.error) {
-          toast.error(`Can't verify cameras: ${detect.error}`)
+      if (meta.requiresCameras && !isSimSelected) {
+        // Reuse the detection we already ran (on connect / when the Cameras
+        // dialog closed) instead of spawning a fresh enumeration on every start
+        // — re-detecting isn't more accurate anyway (the ZED daemon caches its
+        // device list until it's restarted), and the subprocess spawn is what
+        // made "Starting" hang. Only detect on demand if we have no result yet.
+        let devices = cameraDevices
+        let detErr = cameraDetectError
+        if (devices === null) {
+          setStartPhase("Checking cameras…")
+          const detect = await detectCameras()
+          setCameraDevices(detect.devices)
+          setCameraDetectError(detect.error)
+          devices = detect.devices
+          detErr = detect.error
+        }
+        if (detErr) {
+          toast.error(`Can't verify cameras: ${detErr}`)
           return
         }
-        const missing = missingCameraSerials(cameras, detect.devices)
+        const missing = missingCameraSerials(cameras, devices ?? [])
         if (missing.length > 0) {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
               ", "
-            )}. Check the connections (or restart the ZED daemon) before starting.`
+            )}. Reconnect, then Refresh (or Restart daemon) in the Cameras dialog.`
           )
           return
         }
@@ -544,6 +558,7 @@ export default function ControlPanel() {
     } catch (e) {
       toast.error(String(e))
     } finally {
+      setStartPhase(null)
       setBusy(false)
     }
   }
@@ -652,6 +667,7 @@ export default function ControlPanel() {
           cameras={cameras}
           cameraDevices={cameraDevices}
           cameraDetectError={cameraDetectError}
+          cameraDetecting={cameraDetecting}
           onConfigureCameras={() => setCamerasDialogOpen(true)}
           usb={usb}
           usbBusy={usbBusy}
@@ -684,6 +700,7 @@ export default function ControlPanel() {
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}
           viewerPort={viewerPort}
+          startPhase={startPhase}
           onStart={handleStart}
           onStop={handleStop}
           onEpisode={handleEpisode}

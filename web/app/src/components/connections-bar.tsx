@@ -77,6 +77,7 @@ export function ConnectionsBar({
   cameras,
   cameraDevices,
   cameraDetectError,
+  cameraDetecting,
   onConfigureCameras,
   usb,
   usbBusy,
@@ -98,6 +99,8 @@ export function ConnectionsBar({
   cameraDevices: CameraDevice[] | null
   /** Why detection couldn't run (SDK/daemon issue), else null. */
   cameraDetectError: string | null
+  /** A ZED enumeration is currently in flight. */
+  cameraDetecting: boolean
   onConfigureCameras: () => void
   usb: UsbStatus | null
   usbBusy: boolean
@@ -155,6 +158,10 @@ export function ConnectionsBar({
   if (camCount === 0) {
     camDot = "idle"
     camLabel = "Not configured"
+  } else if (cameraDetecting && cameraDevices == null) {
+    // First detection still in flight (nothing to verify against yet).
+    camDot = "busy"
+    camLabel = "Detecting…"
   } else if (cameraDetectError) {
     // Detection itself couldn't run (SDK not installed, daemon hung): we can't
     // confirm the cameras, so warn rather than claim they're connected.
@@ -260,7 +267,13 @@ export function ConnectionsBar({
         )}
       </Tile>
 
-      <Tile icon={<Camera className="size-3.5" />} title="Cameras" dot={camDot} label={camLabel}>
+      <Tile
+        icon={<Camera className="size-3.5" />}
+        title="Cameras"
+        dot={camDot}
+        label={camLabel}
+        pulse={camDot === "busy"}
+      >
         <Button variant="outline" size="sm" onClick={onConfigureCameras} disabled={!online}>
           <Settings2 />
           Configure

@@ -231,6 +231,7 @@ export function CamerasDialog({
                   size="sm"
                   onClick={refresh}
                   disabled={detecting || restarting}
+                  title="Re-query the ZED daemon's current device list. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
                 >
                   {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
                   Refresh
@@ -240,7 +241,7 @@ export function CamerasDialog({
                   size="sm"
                   onClick={restartDaemon}
                   disabled={detecting || restarting}
-                  title="Restart the ZED X daemon so cameras plugged in after boot show up"
+                  title="Restart the ZED X daemon so it re-scans the GMSL links — needed to pick up any camera plugged in or unplugged since boot"
                 >
                   {restarting ? <Loader2 className="animate-spin" /> : null}
                   Restart daemon
