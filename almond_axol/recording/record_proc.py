@@ -57,6 +57,21 @@ _READY_TIMEOUT_S = 60.0
 # may take.
 _SAVE_TIMEOUT_S = 180.0
 
+# --- Encoded (relay-side H.264) capture-loop tuning ---
+# How long to wait for the *first* access unit of an episode from each camera
+# (relay valve open + forced IDR + shmsrc spin-up). If a camera produces nothing
+# in this window its dataset branch never came up, so the episode is aborted.
+_ENCODED_START_TIMEOUT_S = 15.0
+# Per-row budget: how long to wait for a fresh AU before duplicating the previous
+# one for that camera. Deliberately generous — the blocking read paces the loop
+# to the slowest camera and stays frame-accurate, so a brief hiccup is absorbed
+# by *waiting*, not by inserting a duplicate; only a genuine multi-frame stall
+# duplicates (and a duplicate AU decodes to the same image, keeping the mp4
+# valid and frame-count == row-count).
+_ENCODED_ROW_TIMEOUT_S = 1.0
+# How often the blocking AU read wakes to re-check stop_event.
+_ENCODED_POLL_MS = 100
+
 
 # ---------------------------------------------------------------------------
 # Encoder selection (applied in whichever process owns the dataset)
@@ -240,6 +255,71 @@ def _patch_video_concat() -> None:
     )
 
 
+def _patch_frame_validation() -> None:
+    """Let ``add_frame`` accept packed NV12 video frames from the relay.
+
+    LeRobot's ``validate_frame`` requires each video feature's value to be a 3-D
+    ``(H, W, C)`` / ``(C, H, W)`` array (or PIL image). The NVENC encoder is fed
+    the relay's packed **NV12** buffers — a 2-D ``(H*3//2, W)`` uint8 array — which
+    would otherwise be rejected before ``feed_frame`` ever sees them. Relax only
+    the image/video shape check, and only for an array whose shape is exactly the
+    NV12 layout of the declared ``(H, W, C)`` feature (so a genuinely malformed
+    frame is still caught); everything else (feature presence, state/action dtype
+    and shape, the RGB fallback path) is unchanged. Idempotent.
+    """
+    import numpy as np
+
+    import lerobot.datasets.feature_utils as _fu
+
+    if getattr(_fu, "_axol_nv12_validation", False):
+        return
+    _orig = _fu.validate_feature_image_or_video
+
+    def _lenient(name, expected_shape, value):  # type: ignore[no-untyped-def]
+        if (
+            isinstance(value, np.ndarray)
+            and value.ndim == 2
+            and value.dtype == np.uint8
+            and len(expected_shape) == 3
+            and value.shape == (expected_shape[0] * 3 // 2, expected_shape[1])
+        ):
+            return ""  # packed NV12 — shape is correct for the feature by construction
+        return _orig(name, expected_shape, value)
+
+    _fu.validate_feature_image_or_video = _lenient
+    _fu._axol_nv12_validation = True
+    _logger.info("relaxed LeRobot frame validation to accept packed NV12 video frames")
+
+
+def _patch_frame_validation_encoded() -> None:
+    """Let ``add_frame`` accept a pre-encoded H.264 access unit as a video value.
+
+    On the encoded (``gstshm-h264``) transport the recorder never holds a raw
+    frame — the relay already encoded it and the recorder only muxes the bytes.
+    The capture loop injects the AU (``bytes``) as the video feature's value so
+    LeRobot's ``feed_frame`` receives it verbatim, but ``validate_frame`` would
+    reject a non-array video value first. Accept ``bytes``/``bytearray`` for
+    image/video features (everything else — presence, state/action dtype+shape,
+    the array/PIL path — is unchanged). Idempotent.
+    """
+    import lerobot.datasets.feature_utils as _fu
+
+    if getattr(_fu, "_axol_au_validation", False):
+        return
+    _orig = _fu.validate_feature_image_or_video
+
+    def _lenient_bytes(name, expected_shape, value):  # type: ignore[no-untyped-def]
+        if isinstance(value, (bytes, bytearray)):
+            return ""  # a pre-encoded access unit — muxed as-is, not shape-checked
+        return _orig(name, expected_shape, value)
+
+    _fu.validate_feature_image_or_video = _lenient_bytes
+    _fu._axol_au_validation = True
+    _logger.info(
+        "relaxed LeRobot frame validation to accept pre-encoded H.264 access units"
+    )
+
+
 def install_dataset_encoder() -> bool:
     """Prefer the Jetson NVENC encoder for dataset video; else tune libx264.
 
@@ -271,6 +351,10 @@ def install_dataset_encoder() -> bool:
         _tune_software_encoder()
         return False
 
+    # The relay ships NV12 to the recorder, which the NVENC encoder feeds straight
+    # through; teach LeRobot's frame validation to accept that packed layout.
+    _patch_frame_validation()
+
     def _build_nvenc(fps, vcodec, encoder_queue_maxsize, encoder_threads):
         # Ignore LeRobot's shallow default (30); NvencStreamingEncoder uses its own
         # deeper feed queue to ride out gst pipeline spin-up. See _FEED_QUEUE_MAXSIZE.
@@ -279,6 +363,49 @@ def install_dataset_encoder() -> bool:
     LeRobotDataset._build_streaming_encoder = staticmethod(_build_nvenc)
     LeRobotDataset._axol_nvenc_installed = True
     _logger.info("using Jetson NVENC hardware video encoder for dataset recording")
+    return True
+
+
+def install_encoded_dataset_encoder() -> bool:
+    """Install the mux-only encoder for the relay-encoded (gstshm-h264) transport.
+
+    On this path the relay already H.264-encoded each dataset frame, so the
+    recorder must *not* re-encode: swap ``_build_streaming_encoder`` for one that
+    returns :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`
+    (``appsrc -> h264parse -> mp4mux``, constant-fps PTS), teach frame validation
+    to accept the AU ``bytes``, and keep the timestamp-rebasing concat (episode
+    append still stitches per-key mp4 segments). Raises if the gst mux stack is
+    missing — the relay wouldn't have chosen this transport without it, so a miss
+    here is a real misconfiguration rather than something to silently downgrade.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    from ..lerobot.h264_mux_encoder import (
+        H264MuxStreamingEncoder,
+        hw_mux_encoder_available,
+    )
+
+    _patch_video_concat()
+
+    if getattr(LeRobotDataset, "_axol_h264mux_installed", False):
+        return True
+
+    if not hw_mux_encoder_available():
+        raise RuntimeError(
+            "encoded (gstshm-h264) transport selected but the GStreamer H.264 "
+            "mux stack is unavailable in the recorder"
+        )
+
+    _patch_frame_validation_encoded()
+
+    def _build_mux(fps, vcodec, encoder_queue_maxsize, encoder_threads):
+        return H264MuxStreamingEncoder(fps=fps)
+
+    LeRobotDataset._build_streaming_encoder = staticmethod(_build_mux)
+    LeRobotDataset._axol_h264mux_installed = True
+    _logger.info(
+        "using relay-encoded H.264 mux (no recorder re-encode) for dataset video"
+    )
     return True
 
 
@@ -312,6 +439,32 @@ class _SnapshotPublisher:
 # ---------------------------------------------------------------------------
 # Capture loop (shared by both recorders, runs on its own thread)
 # ---------------------------------------------------------------------------
+
+
+def _obs_for_rerun(obs: dict[str, Any], cam_keys: Any) -> dict[str, Any]:
+    """Copy ``obs`` with any packed-NV12 camera frames converted to RGB.
+
+    The gstshm path delivers camera frames as 2-D ``(H*3//2, W)`` NV12 (fed
+    straight to NVENC), which rerun can't display; convert just those for the
+    (opt-in, debug-only) rerun log. Other transports already deliver RGB, so this
+    is a no-op there. Only touched when ``rerun_ip`` is set.
+    """
+    import numpy as np
+
+    out = dict(obs)
+    for key in cam_keys:
+        val = out.get(key)
+        if isinstance(val, np.ndarray) and val.ndim == 2 and val.dtype == np.uint8:
+            try:
+                import cv2
+
+                h = (val.shape[0] * 2) // 3
+                out[key] = cv2.cvtColor(
+                    val.reshape(h * 3 // 2, val.shape[1]), cv2.COLOR_YUV2RGB_NV12
+                )
+            except Exception:  # noqa: BLE001 - rerun is best-effort/debug-only
+                pass
+    return out
 
 
 def run_capture_loop(
@@ -440,11 +593,168 @@ def run_capture_loop(
             ticks_window += 1
 
             if rerun_ip:
-                log_rerun_data(observation=obs_processed, action=action)
+                log_rerun_data(
+                    observation=_obs_for_rerun(obs_processed, frames.keys()),
+                    action=action,
+                )
 
             tick += 1
     except Exception as exc:  # noqa: BLE001 - surface instead of dying silently
         _logger.error("capture loop failed: %s", exc)
+        if on_error is not None:
+            on_error(str(exc))
+
+
+def run_encoded_capture_loop(
+    *,
+    cameras: dict[str, Any],
+    read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    dataset: "LeRobotDataset",
+    robot_obs_proc: Callable[[Any], Any],
+    fps: int,
+    task: str,
+    rerun_ip: str | None,
+    stop_event: threading.Event,
+    on_error: Callable[[str], None] | None = None,
+) -> None:
+    """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
+
+    Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
+    frame nearest each tick and dropping the rest), an encoded stream cannot drop
+    frames — every P-frame depends on its predecessor — so this loop is driven by
+    the **arrival** of access units: it consumes exactly one AU per camera per
+    dataset row and pairs it with the latest joint/action snapshot. The blocking
+    per-camera read naturally paces the loop to the camera cadence and keeps the
+    cameras mutually frame-aligned; a genuine per-camera stall (no fresh AU within
+    :data:`_ENCODED_ROW_TIMEOUT_S`) re-muxes that camera's previous AU so every
+    mp4 keeps frame-count == row-count (the encoded analog of "reuse last frame").
+
+    The muxer assigns each AU a constant-fps PTS (``k / fps``), so the mp4
+    timeline is exact regardless of arrival jitter; ``recv_ts`` is used only for
+    the (best-effort) snapshot pairing. The first delivered AU per camera is
+    always an IDR (:meth:`EncodedAuReader.flush` re-arms keyframe-wait), so each
+    episode's mp4 is decodable from frame 0.
+    """
+    try:
+        from lerobot.utils.constants import ACTION, OBS_STR
+        from lerobot.utils.feature_utils import build_dataset_frame
+        from lerobot.utils.visualization_utils import log_rerun_data
+
+        # Wait for the first snapshot (the control loop publishes every tick).
+        first_deadline = time.perf_counter() + 5.0
+        while read_snapshot() is None:
+            if stop_event.wait(0.02):
+                return
+            if time.perf_counter() > first_deadline:
+                _logger.warning(
+                    "encoded capture loop saw no snapshot within 5s; exiting."
+                )
+                return
+        if stop_event.is_set():
+            return
+
+        # Arm each reader: drop stragglers from the previous episode and require
+        # the next delivered AU to be a keyframe.
+        for cam in cameras.values():
+            cam.flush()
+
+        def read_au(cam: Any, budget_s: float) -> bytes | None:
+            """Block for the next AU, waking every poll to honor stop_event."""
+            waited = 0.0
+            while not stop_event.is_set():
+                try:
+                    au, _recv = cam.read_next_au(timeout_ms=_ENCODED_POLL_MS)
+                    return au
+                except TimeoutError:
+                    waited += _ENCODED_POLL_MS / 1000.0
+                    if waited >= budget_s:
+                        return None
+            return None
+
+        last_au: dict[str, bytes] = {}
+        primed = False
+        rows_added = 0
+        repeats = 0
+        max_pending = 0
+        last_log = time.perf_counter()
+
+        while not stop_event.is_set():
+            budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
+            aus: dict[str, bytes] = {}
+            missing_first = False
+            for cam_key, cam in cameras.items():
+                au = read_au(cam, budget)
+                if au is not None:
+                    aus[cam_key] = au
+                    last_au[cam_key] = au
+                elif cam_key in last_au:
+                    aus[cam_key] = last_au[cam_key]
+                    repeats += 1
+                else:
+                    missing_first = True
+                    break
+                pending = cam.pending
+                if pending > max_pending:
+                    max_pending = pending
+
+            if stop_event.is_set():
+                return
+            if missing_first:
+                # A camera produced no encoded frame within the startup budget —
+                # its relay dataset branch never came up. Abort rather than record
+                # a dataset with a missing/short video for that camera.
+                raise RuntimeError(
+                    f"camera produced no encoded frames within {budget:.0f}s"
+                )
+            primed = True
+
+            snap = read_snapshot()
+            if snap is None:
+                continue
+            joint_obs, action, _snap_ts = snap
+
+            # Process joint obs alone, then inject the AU bytes as the video
+            # values: build_dataset_frame copies video values verbatim, so each
+            # AU reaches feed_frame unmodified (the obs processor never sees, and
+            # so never mangles, the encoded bytes).
+            obs_processed = robot_obs_proc(dict(joint_obs))
+            for cam_key, au in aus.items():
+                obs_processed[cam_key] = au
+
+            obs_frame = build_dataset_frame(
+                dataset.features, obs_processed, prefix=OBS_STR
+            )
+            act_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
+            if stop_event.is_set():
+                return
+            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            rows_added += 1
+
+            if rerun_ip:
+                # No decoded frames on this path; log joints/action only.
+                log_rerun_data(
+                    observation={
+                        k: v for k, v in obs_processed.items() if k not in aus
+                    },
+                    action=action,
+                )
+
+            now = time.perf_counter()
+            if now - last_log >= 1.0:
+                dt = now - last_log
+                _logger.debug(
+                    "encoded capture: %.1f fps  rows(win)=%d repeats=%d backlog=%d",
+                    rows_added / dt,
+                    rows_added,
+                    repeats,
+                    max_pending,
+                )
+                rows_added = 0
+                repeats = 0
+                max_pending = 0
+                last_log = now
+    except Exception as exc:  # noqa: BLE001 - surface instead of dying silently
+        _logger.error("encoded capture loop failed: %s", exc)
         if on_error is not None:
             on_error(str(exc))
 
@@ -595,21 +905,46 @@ def _recorder_main(
 
     from lerobot.processor import make_default_processors
 
-    from ..video.shm_frames import GstShmFrameReader, RawFrameReader, SnapshotReader
+    from ..video.shm_frames import (
+        EncodedAuReader,
+        GstShmFrameReader,
+        RawFrameReader,
+        SnapshotReader,
+    )
 
-    install_dataset_encoder()
+    # The relay uses one transport for all dataset sources: "gstshm-h264" ships
+    # already-encoded H.264 (recorder only muxes), the others ship raw frames
+    # (recorder encodes). Pick the matching encoder + capture loop from that.
+    raw_meta = config["raw_meta"]
+    encoded_mode = bool(raw_meta) and all(
+        m["transport"] == "gstshm-h264" for m in raw_meta.values()
+    )
+    if encoded_mode:
+        install_encoded_dataset_encoder()
+    else:
+        install_dataset_encoder()
     _, _, robot_obs_proc = make_default_processors()
 
-    # Build a per-source raw-frame reader matching the relay's chosen transport.
-    # gstshm: a shmsrc → appsink consumer pulling on THIS process's GIL (so the
-    # relay's send is never starved — the fix). pyshm: the older RawFrameReader
-    # over a shared-memory block the relay's Python pull loop fills. Started here
-    # (before "ready") and torn down in the finally; the relay's rawvalve gates
-    # episode on/off, so the consumers can run continuously and just idle when
-    # the valve is closed.
+    # Build a per-source frame reader matching the relay's chosen transport.
+    # gstshm-h264: an EncodedAuReader (shmsrc → h264parse → appsink) pulling
+    # pre-encoded access units in order. gstshm: a shmsrc → appsink consumer
+    # pulling raw frames on THIS process's GIL (so the relay's send is never
+    # starved). pyshm: the older RawFrameReader over a shared-memory block the
+    # relay's Python pull loop fills. Started here (before "ready") and torn down
+    # in the finally; the relay's rawvalve gates episode on/off, so the consumers
+    # can run continuously and just idle when the valve is closed.
     cameras: dict[str, Any] = {}
-    for source, meta in config["raw_meta"].items():
-        if meta["transport"] == "gstshm":
+    for source, meta in raw_meta.items():
+        if meta["transport"] == "gstshm-h264":
+            cam = EncodedAuReader(
+                meta["socket_path"],
+                meta["width"],
+                meta["height"],
+                meta["fps"],
+            )
+            cam.connect()
+            cameras[source] = cam
+        elif meta["transport"] == "gstshm":
             cam = GstShmFrameReader(
                 meta["socket_path"],
                 meta["caps"],
@@ -670,7 +1005,9 @@ def _recorder_main(
                 capture_error["v"] = None
                 stop = threading.Event()
                 thread = threading.Thread(
-                    target=run_capture_loop,
+                    target=(
+                        run_encoded_capture_loop if encoded_mode else run_capture_loop
+                    ),
                     kwargs=dict(
                         cameras=cameras,
                         read_snapshot=snap_reader.read_latest,

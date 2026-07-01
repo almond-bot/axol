@@ -19,14 +19,26 @@ The Jetson's hardware encoder is only reachable through GStreamer
 (``h264_nvenc``, ``h264_v4l2m2m``) or are software (libx264). So each camera gets
 its own ``gst-launch`` pipeline:
 
-    fdsrc -> rawvideoparse(rgba) -> nvvidconv -> NV12(NVMM) ->
+    # NV12 in (the relay's shmsink path — the common case on Jetson):
+    fdsrc -> rawvideoparse(nv12) -> nvvidconv -> NV12(NVMM) ->
     nvv4l2h264enc -> h264parse -> mp4mux -> filesink
+
+    # RGB in (in-process / pyshm fallback, and the SDK-camera recorder):
+    fdsrc -> rawvideoparse(rgba) -> nvvidconv -> NV12(NVMM) -> ...
 
 The control process only writes raw frame bytes to a pipe (the ``os.write``
 releases the GIL), so the encode cost — colorspace convert on the VIC and H.264
 on NVENC — lands on dedicated hardware blocks, not the CPU cores the control loop
-needs. ``nvvidconv`` rejects packed 24-bit RGB, so frames are padded RGB->RGBA
-(the alpha byte is ignored by the BGRx/RGBA path) before being fed in.
+needs.
+
+The relay already produces NV12 (the camera's native format) and ships it across
+shared memory, so the recorder feeds those bytes straight in: no colorspace
+round-trip and no per-frame channel copy on the recorder's GIL — which is what
+was saturating the recorder's cores and dropping frames. The RGB path is kept for
+the fallbacks that still deliver packed frames (``nvvidconv`` rejects packed
+24-bit RGB, so those are padded RGB->RGBA — the alpha byte is ignored by the
+RGBA path — before being fed in). The input format is detected per frame from the
+array shape: 2-D ``(h*3//2, w)`` is packed NV12, 3-D ``(h, w, c)`` is RGB.
 """
 
 from __future__ import annotations
@@ -93,13 +105,18 @@ def hw_dataset_encoder_available() -> bool:
     return hw_h264_available()
 
 
-def _gst_argv(width: int, height: int, fps: int, qp: int, out_path: Path) -> list[str]:
-    """``gst-launch-1.0`` argv: packed RGBA on stdin -> H.264 mp4 file.
+def _gst_argv(
+    width: int, height: int, fps: int, qp: int, out_path: Path, nv12: bool
+) -> list[str]:
+    """``gst-launch-1.0`` argv: packed frames on stdin -> H.264 mp4 file.
 
-    ``nvvidconv`` does the RGBA->NV12 colorspace conversion on the VIC and
-    ``nvv4l2h264enc`` encodes on NVENC, so no CPU ``videoconvert`` is involved.
-    ``h264parse`` + ``mp4mux`` produce a standard mp4; closing stdin sends EOS so
-    ``mp4mux`` finalizes the moov atom and ``filesink`` flushes the file.
+    ``nv12`` selects the input format: packed NV12 (1.5 B/px, the relay's shmsink
+    path — fed straight through, so ``nvvidconv`` only imports it into NVMM) or
+    packed RGBA (4 B/px, the fallback path — ``nvvidconv`` does the RGBA->NV12
+    colorspace convert on the VIC). Either way ``nvv4l2h264enc`` encodes on NVENC,
+    so no CPU ``videoconvert`` is involved. ``h264parse`` + ``mp4mux`` produce a
+    standard mp4; closing stdin sends EOS so ``mp4mux`` finalizes the moov atom
+    and ``filesink`` flushes the file.
 
     The two ``queue`` elements are load-bearing, not cosmetic. Without them the
     whole chain runs in ``fdsrc``'s single streaming thread, so ``fdsrc`` only
@@ -114,10 +131,12 @@ def _gst_argv(width: int, height: int, fps: int, qp: int, out_path: Path) -> lis
     queues are non-leaky (back-pressure is fine; real drops are counted/logged in
     Python ``feed``) and bounded by buffer count to cap latency and memory.
     """
+    fmt = "nv12" if nv12 else "rgba"
+    blocksize = width * height * 3 // 2 if nv12 else width * height * 4
     pipeline = [
-        f"fdsrc fd=0 blocksize={width * height * 4}",
+        f"fdsrc fd=0 blocksize={blocksize}",
         (
-            "rawvideoparse use-sink-caps=false format=rgba "
+            f"rawvideoparse use-sink-caps=false format={fmt} "
             f"width={width} height={height} framerate={fps}/1"
         ),
         "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
@@ -153,11 +172,15 @@ class _CameraNvencEncoder:
     """One camera's NVENC pipeline plus the thread that feeds it.
 
     ``feed`` (called from the capture thread) only enqueues; a dedicated writer
-    thread pads RGB->RGBA, writes the bytes to the gst subprocess, and folds each
-    frame into a running image-stats accumulator (the same per-frame stats
-    LeRobot's streaming encoder does). ``finish()`` just returns the accumulated
-    stats, so save_episode no longer re-decodes the whole mp4. This work runs in
-    the recorder subprocess, off the control loop and the relay's WebRTC send.
+    thread writes the frame bytes to the gst subprocess and folds a sampled subset
+    into a running image-stats accumulator (the same per-frame stats LeRobot's
+    streaming encoder does). Packed NV12 frames (the relay's shmsink path) are
+    written straight through; packed RGB frames (the fallbacks) are padded
+    RGB->RGBA first, since ``nvvidconv`` rejects packed 24-bit RGB. The input
+    format is inferred from the array shape on the first frame and must not change
+    within an episode. ``finish()`` just returns the accumulated stats, so
+    save_episode no longer re-decodes the whole mp4. This work runs in the
+    recorder subprocess, off the control loop and the relay's WebRTC send.
     """
 
     def __init__(self, video_path: Path, fps: int, queue_maxsize: int) -> None:
@@ -167,6 +190,7 @@ class _CameraNvencEncoder:
         self._proc: subprocess.Popen | None = None
         self._stdin_fd: int | None = None
         self._rgba: NDArray | None = None
+        self._nv12: bool | None = None
         self._dims: tuple[int, int] | None = None
         self._frame_count = 0
         self._dropped = 0
@@ -211,6 +235,11 @@ class _CameraNvencEncoder:
     @property
     def alive(self) -> bool:
         return self._thread.is_alive()
+
+    @property
+    def dropped(self) -> int:
+        """Frames this episode that overflowed the feed queue (never encoded)."""
+        return self._dropped
 
     def feed(self, image: "NDArray") -> None:
         if not self._thread.is_alive():
@@ -275,22 +304,51 @@ class _CameraNvencEncoder:
 
     def _encode(self, image: "NDArray") -> None:
         t0 = time.perf_counter()
-        frame = _to_hwc_rgb_uint8(image)
-        h, w = frame.shape[:2]
-        if self._proc is None:
-            self._start(w, h)
-        assert self._rgba is not None and self._stdin_fd is not None
-        self._rgba[:, :, :3] = frame
-        self._write(self._rgba)
         # Sample stats every _stats_stride-th frame to keep the GIL-bound quantile
         # update off the per-frame hot path (see _STATS_SAMPLE_HZ). frame 0 is
         # always sampled so even short episodes contribute.
-        if self._stats is not None and self._frame_count % self._stats_stride == 0:
-            self._update_stats(frame)
+        sample = self._stats is not None and self._frame_count % self._stats_stride == 0
+        if image.ndim == 2:
+            # Packed NV12 from the relay: (h*3//2, w). Written straight through —
+            # no per-frame channel copy — and converted to RGB only when sampled.
+            h = (image.shape[0] * 2) // 3
+            w = image.shape[1]
+            if self._proc is None:
+                self._start(w, h, nv12=True)
+            self._write(image)
+            if sample:
+                rgb = self._nv12_to_rgb(image, w, h)
+                if rgb is not None:
+                    self._update_stats(rgb)
+        else:
+            frame = _to_hwc_rgb_uint8(image)
+            h, w = frame.shape[:2]
+            if self._proc is None:
+                self._start(w, h, nv12=False)
+            assert self._rgba is not None
+            self._rgba[:, :, :3] = frame
+            self._write(self._rgba)
+            if sample:
+                self._update_stats(frame)
         self._t_copy += time.perf_counter() - t0
         self._frame_count += 1
         self._frames_window += 1
         self._maybe_log()
+
+    def _nv12_to_rgb(self, nv12: "NDArray", w: int, h: int) -> "NDArray | None":
+        """Convert one packed NV12 frame to HWC RGB uint8 (for sampled stats).
+
+        Only runs on the ~``_STATS_SAMPLE_HZ`` sampled frames, so the cost stays
+        off the per-frame hot path. Returns ``None`` (stats skipped for this
+        frame) if OpenCV isn't importable, rather than failing the encode.
+        """
+        try:
+            import cv2
+
+            return cv2.cvtColor(nv12.reshape(h * 3 // 2, w), cv2.COLOR_YUV2RGB_NV12)
+        except Exception as exc:  # noqa: BLE001 - never kill encode over stats
+            _logger.debug("nv12->rgb failed for %s: %s", self.video_path.name, exc)
+            return None
 
     def _update_stats(self, frame: "NDArray") -> None:
         """Fold one (HWC RGB uint8) frame into the running image stats.
@@ -312,7 +370,7 @@ class _CameraNvencEncoder:
             return
         n = self._frames_window
         copy_ms = 1e3 * self._t_copy / n if n else 0.0
-        _logger.debug(
+        _logger.info(
             "nvenc %s: %.1f fps  copy+write=%.1fms  qdepth=%d/%d dropped=%d",
             self.video_path.stem,
             n / dt,
@@ -325,10 +383,10 @@ class _CameraNvencEncoder:
         self._frames_window = 0
         self._last_log = now
 
-    def _start(self, width: int, height: int) -> None:
+    def _start(self, width: int, height: int, nv12: bool) -> None:
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
         self._proc = subprocess.Popen(
-            _gst_argv(width, height, self._fps, _QP, self.video_path),
+            _gst_argv(width, height, self._fps, _QP, self.video_path, nv12),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -337,15 +395,20 @@ class _CameraNvencEncoder:
         assert self._proc.stdin is not None
         self._stdin_fd = self._proc.stdin.fileno()
         self._dims = (width, height)
-        self._rgba = np.empty((height, width, 4), dtype=np.uint8)
-        self._rgba[:, :, 3] = 255
+        self._nv12 = nv12
+        # Reusable RGB->RGBA scratch only for the packed-RGB fallback path; the
+        # NV12 path writes the frame bytes straight through with no scratch.
+        if not nv12:
+            self._rgba = np.empty((height, width, 4), dtype=np.uint8)
+            self._rgba[:, :, 3] = 255
         _logger.info(
-            "NVENC mp4 pipeline started: %s %dx%d@%dfps qp=%d (pid %d)",
+            "NVENC mp4 pipeline started: %s %dx%d@%dfps QP=%d %s (pid %d)",
             self.video_path.name,
             width,
             height,
             self._fps,
             _QP,
+            "nv12" if nv12 else "rgba",
             self._proc.pid,
         )
 
@@ -419,8 +482,24 @@ class NvencStreamingEncoder:
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
         results: dict[str, tuple[Path, dict | None]] = {}
+        dropped: dict[str, int] = {}
         for video_key, cam in self._cams.items():
             results[video_key] = cam.finish()
+            if cam.dropped:
+                dropped[video_key] = cam.dropped
+        if dropped:
+            # A dropped frame is never encoded, but its dataset row (state/action)
+            # still exists, so the mp4 ends up shorter than the action track and —
+            # since the survivors are muxed at a constant fps with no gap markers —
+            # every frame after a drop slides onto an earlier timestamp. The result
+            # is a silent, progressive video<->action (and camera<->camera)
+            # misalignment, so flag the episode as suspect for the operator.
+            _logger.warning(
+                "episode dropped encoder frames (%s) — the recorded video is "
+                "misaligned with the recorded actions and with the other cameras; "
+                "consider discarding and re-recording this episode.",
+                ", ".join(f"{k}={v}" for k, v in dropped.items()),
+            )
         self._cams = {}
         self._episode_active = False
         return results

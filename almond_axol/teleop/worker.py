@@ -489,11 +489,18 @@ def run_ik_worker(
     except (AttributeError, OSError):
         pass
 
-    # Share the control loop's dedicated cores (away from the video relay /
-    # recorder / encoders) so IK isn't preempted by background recording work.
+    # IK affinity is applied in two phases. The one-time startup that follows —
+    # JAX/XLA compile, the rest-pose settle, and the collision-aware startup
+    # trajectory — is heavy and must finish inside the caller's 60s connect
+    # handshake, so it runs *widened* across the control-side cores (safe: the
+    # control loop and recording haven't started yet). Confining it to the single
+    # dedicated IK core instead roughly triples its wall time and blows that
+    # handshake. Only the steady-state solve loop is narrowed to the dedicated IK
+    # core (below, right after the ready handshake) so recording load can't preempt
+    # it mid-solve.
     from ..utils import affinity
 
-    affinity.pin_realtime()
+    affinity.pin_ik_startup()
 
     worker = IKWorker(config, kinematics_config)
     q_rest = worker.get_rest_q()
@@ -512,6 +519,11 @@ def run_ik_worker(
     conn.send(
         ("ready", q.copy(), worker.left_indices, worker.right_indices, startup_traj)
     )
+
+    # Startup compile/settle/trajectory are done and the handshake is sent: narrow
+    # to the dedicated IK core so per-frame solves aren't preempted by recording
+    # load (on <8-core hosts this collapses onto the realtime cores).
+    affinity.pin_ik()
 
     while True:
         try:

@@ -85,27 +85,21 @@ def _open_sdk_camera(name: str, spec: dict) -> object | None:
     return None
 
 
-def _raw_caps(width: int, height: int, fps: int) -> str:
-    """gst caps for the raw RGBA frames the recorder's shmsrc must declare.
+def _gsth264_meta(socket_path: str, width: int, height: int, fps: int) -> dict:
+    """Describe the encoded-H.264 shared-memory transport for one dataset source.
 
-    Shared memory carries no caps, so the recorder's ``shmsrc`` needs these
-    explicitly to interpret the bytes; they must match the relay's shmsink input
-    (the ``nvvidconv`` RGBA output at the downscaled dataset dims).
+    The relay encodes the dataset stream on the GPU and writes AU-aligned H.264
+    to ``socket_path`` via ``shmsink``; the recorder attaches an
+    :class:`~almond_axol.video.shm_frames.EncodedAuReader` and muxes it. Shared
+    memory carries no caps, but H.264 dimensions come from the SPS, so only the
+    dims (to size the dataset observation feature) and fps need to cross.
     """
-    return f"video/x-raw,format=RGBA,width={width},height={height},framerate={fps}/1"
-
-
-def _gstshm_meta(
-    socket_path: str, caps: str, width: int, height: int, fps: int, latency_s: float
-) -> dict:
     return {
-        "transport": "gstshm",
+        "transport": "gstshm-h264",
         "socket_path": socket_path,
-        "caps": caps,
         "width": width,
         "height": height,
         "fps": fps,
-        "latency_s": latency_s,
     }
 
 
@@ -244,14 +238,12 @@ def _open_gst_camera_raw(
                     **eye_kwargs,
                 )
                 cam.connect()
-                caps = _raw_caps(raw_w, raw_h, fps)
-                lat = cam.raw_latency_s
                 sources = {
                     src: (cam.left_view if side == "left" else cam.right_view)
                     for side, src in enc_plan
                 }
                 raw_meta = {
-                    src: _gstshm_meta(socks[side], caps, raw_w, raw_h, fps, lat)
+                    src: _gsth264_meta(socks[side], raw_w, raw_h, fps)
                     for side, src in raw_plan
                 }
                 return cam, sources, [], raw_meta
@@ -303,10 +295,7 @@ def _open_gst_camera_raw(
                     raw_dims=raw_dims,
                 )
                 cam.connect()
-                caps = _raw_caps(raw_w, raw_h, fps)
-                meta = {
-                    name: _gstshm_meta(sock, caps, raw_w, raw_h, fps, cam.raw_latency_s)
-                }
+                meta = {name: _gsth264_meta(sock, raw_w, raw_h, fps)}
                 return cam, ({name: cam} if wants_stream else {}), [], meta
             writer = RawFrameWriter.create(raw_w, raw_h, cond)
             writers = [writer]
@@ -583,11 +572,13 @@ def _relay_main(
         if manager is not None:
             await manager.close_all()
 
-    # Dedicate one relay core to the WebRTC send: aiortc does the whole send on
-    # this (the main) thread, and it's CPU-bound. Done here — after the cameras'
-    # gst pull threads were created (so they keep the full relay group and land on
-    # the other relay core) and right before the event loop runs on this thread.
-    affinity.pin_relay_send_thread()
+    # Split the relay across its two cores: all Python threads (this WebRTC-send
+    # main thread + the encoded-AU pull loops) onto one, GStreamer's C threads
+    # (camera/NVENC and the recording raw-branch shm copy) onto the other, so the
+    # recording workload can't preempt the send. Done here — after the cameras'
+    # gst pipelines are PLAYING (all their threads exist) and right before the
+    # event loop runs on this thread.
+    affinity.isolate_relay_cpu()
 
     try:
         asyncio.run(serve())
@@ -737,7 +728,7 @@ class VideoRelayProcess:
 
         for source, meta in raw_meta.items():
             try:
-                if meta["transport"] == "gstshm":
+                if str(meta["transport"]).startswith("gstshm"):
                     self.raw_cameras[source] = _RawCameraStub(
                         meta["width"], meta["height"], meta["fps"]
                     )
