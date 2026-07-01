@@ -19,9 +19,11 @@ Select a subset of joints and/or a single arm:
               Skip an arm entirely. Only the remaining arm is opened, enabled,
               and swept. Cannot skip both.
 
-When the gripper is not among the selected joints (or its arm is skipped) the
-run drops the grasp-an-item step and simply loops the range-of-motion sweeps
-for the selected joints.
+The grasp-an-item clamp (hold with force, then soak while holding) only runs on
+the full robot. Any subset run drops the grasp step and simply loops the
+range-of-motion sweeps for the selected joints; if the gripper is one of them it
+is cycled through its full open↔close range like any other joint (holding
+nothing, at the default gentle torque).
 
 Run:
     uv run -m almond_axol.diagnostics.rom.enable
@@ -494,6 +496,7 @@ async def run_rom_cycle(
     present: set[Joint] = FULL_JOINT_SET,
     run_left: bool = True,
     run_right: bool = True,
+    sweep_gripper: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Sweep the selected joints through their ranges on the selected arms.
 
@@ -501,6 +504,10 @@ async def run_rom_cycle(
     current value. ``run_left`` / ``run_right`` gate which arm each mirrored
     sweep drives. Pre-poses that reposition a helper joint (shoulder_1 before
     shoulder_3, elbow before the wrists) are skipped when that joint is absent.
+
+    When ``sweep_gripper`` is set the gripper is cycled through its full
+    open↔close range at the end (holding nothing). This is left off for a
+    full-robot grasp run, where the gripper is instead clamped on the item.
     """
     arm_sel = "both" if run_left and run_right else ("left" if run_left else "right")
 
@@ -612,6 +619,14 @@ async def run_rom_cycle(
     if elbow_prepose:
         await step(Joint.ELBOW, 0.0, 0.0)
 
+    # Gripper full range of motion (normalized 1 = open, 0 = closed). Only when
+    # not grasping an item; the position-force controller caps speed and torque,
+    # so closing on nothing simply drives gently to the closed stop.
+    if sweep_gripper and Joint.GRIPPER in present:
+        print(f"  GRIPPER     ({arm_sel})  open ↔ close")
+        await step(Joint.GRIPPER, 0.0, 0.0)
+        await step(Joint.GRIPPER, 1.0, 1.0)
+
     return left_q, right_q
 
 
@@ -660,6 +675,11 @@ async def run_axol(
     run_left = not no_left
     run_right = not no_right
     has_gripper = Joint.GRIPPER in present
+    # The grasp-an-item clamp (hold with force, soak while holding) only runs on
+    # the full robot. Any subset that includes the gripper instead sweeps it
+    # through its full open↔close range like any other joint (holding nothing).
+    grasp = present == set(Joint)
+    sweep_gripper = has_gripper and not grasp
 
     print("=== ROM TEST — PHYSICAL ROBOT ===")
     print("Make sure the area is clear.")
@@ -676,7 +696,9 @@ async def run_axol(
     print(f"Running {arms_desc}  |  joints: {joints_desc}\n")
 
     config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
-    if has_gripper:
+    if grasp:
+        # Raised grasp force is only needed to hold the item; a bare gripper
+        # ROM sweep keeps the default (gentle) torque cap.
         config.left.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
         config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
     axol = Axol(
@@ -696,10 +718,10 @@ async def run_axol(
         assert closed_left_q is not None and closed_right_q is not None
         return closed_left_q.copy(), closed_right_q.copy()
 
-    # Only meaningful when a gripper is holding an item: on a normal soak
-    # completion or Ctrl-C the motors are left enabled so the grasp is kept and
-    # ``rom.disable`` can release it later. Without a gripper in the run there is
-    # nothing to hold, so the motors are always disabled in the finally block.
+    # Only meaningful on a full-robot grasp run, where the gripper is holding an
+    # item: on a normal soak completion or Ctrl-C the motors are left enabled so
+    # the grasp is kept and ``rom.disable`` can release it later. Any subset run
+    # holds nothing, so the motors are always disabled in the finally block.
     keep_enabled = False
 
     try:
@@ -725,9 +747,10 @@ async def run_axol(
         )
         left_q, right_q = ready_left, ready_right
 
-        # Grasp the item only when the gripper is part of the run; a partial run
-        # without it just sweeps the selected joints (see module docstring).
-        if has_gripper:
+        # Grasp the item only on a full-robot run; any subset (including one
+        # that contains the gripper) skips the grasp and sweeps the selected
+        # joints instead (see module docstring).
+        if grasp:
             if run_right:
                 await asyncio.to_thread(
                     input, "Press Enter to close the RIGHT gripper ..."
@@ -773,6 +796,7 @@ async def run_axol(
                 present=present,
                 run_left=run_left,
                 run_right=run_right,
+                sweep_gripper=sweep_gripper,
             )
 
             print(f"\nCycle {cycle} complete.")
@@ -796,10 +820,10 @@ async def run_axol(
             abort_on_collision=True,
         )
 
-        # With a gripper grasping the item, leave the robot holding it with the
+        # On a full-robot grasp run, leave the robot holding the item with the
         # motors enabled; the operator runs rom.disable to open the grippers and
         # retrieve it. Otherwise there is nothing to hold and we disable.
-        keep_enabled = has_gripper
+        keep_enabled = grasp
 
     except CollisionAbort as e:
         print(f"\n⚠  COLLISION ABORT: {e}")
@@ -811,12 +835,12 @@ async def run_axol(
         print("Home reached.")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
-        if has_gripper:
+        if grasp:
             print("\nInterrupted — returning home, keeping the item gripped ...")
         else:
             print("\nInterrupted — returning home ...")
         await return_home(robot)
-        keep_enabled = has_gripper
+        keep_enabled = grasp
 
     finally:
         if keep_enabled:
