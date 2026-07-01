@@ -2,14 +2,13 @@
 rom.enable
 
 Range of motion test for the Axol robot. Sweeps every joint through its full
-range while checking each waypoint for self-collision via pyroki.
+range.
 
 Enables the motors, eases to home, then prompts to close each gripper onto the
 item and loops the sweep for two hours. When the soak finishes (or on Ctrl-C)
 the robot returns home but keeps holding the item with the motors left enabled
 — run ``almond_axol.diagnostics.rom.disable`` afterwards to open the grippers
-and retrieve the item. A predicted collision aborts the run, returns the robot
-home, and disables the motors.
+and retrieve the item.
 
 Select a subset of joints and/or a single arm:
   --joints    Comma-separated joints present on the CAN bus (e.g.
@@ -36,14 +35,9 @@ import asyncio
 import math
 import time
 
-import jax
-import jax.numpy as jnp
 import numpy as np
-import pyroki as pk
-import yourdfpy
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, URDF_PATH, Joint
-from ...kinematics.solver import _LEFT_JOINT_NAMES, _RIGHT_JOINT_NAMES
+from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 from ...motor import ControlMode
 from ...robot.axol import (
     ELBOW_LEFT_LIMITS,
@@ -113,56 +107,6 @@ def _joint_frame(arm: AxolArm, idx: int, joint: Joint, raw: float) -> float:
         gi = arm._gripper_i
         return (raw - arm._limits_hi[gi]) / (arm._limits_lo[gi] - arm._limits_hi[gi])
     return raw + float(arm._joint_offsets[idx])
-
-
-class CollisionChecker:
-    def __init__(self, margin: float = 0.01) -> None:  # margin in meters
-        print("Loading collision model (pyroki) ...")
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-        robot = pk.Robot.from_urdf(urdf)
-        robot_collision = pk.collision.RobotCollision.from_urdf(urdf)
-
-        actuated = list(robot.joints.actuated_names)
-        name_to_index = {n: i for i, n in enumerate(actuated)}
-        self.left_indices = [name_to_index[n] for n in _LEFT_JOINT_NAMES]
-        self.right_indices = [name_to_index[n] for n in _RIGHT_JOINT_NAMES]
-        self.num_actuated = robot.joints.num_actuated_joints
-        self.margin = margin
-
-        @jax.jit
-        def check_collision(q: jax.Array) -> jax.Array:
-            return robot_collision.compute_self_collision_distance(robot, q)
-
-        home_distances = np.asarray(
-            check_collision(jnp.zeros(self.num_actuated, dtype=jnp.float32))
-        )
-        self.baseline = float(home_distances.min())
-        self.check_collision = check_collision
-        print(f"Collision model ready. Home baseline: {self.baseline:.4f} m\n")
-
-    def is_safe(
-        self,
-        left_q: np.ndarray,  # rad
-        right_q: np.ndarray,  # rad
-    ) -> tuple[bool, float]:
-        full_q = np.zeros(self.num_actuated, dtype=np.float32)
-        full_q[self.left_indices] = left_q[:7]
-        full_q[self.right_indices] = right_q[:7]
-        distances = np.asarray(self.check_collision(jnp.asarray(full_q)))
-        min_distance = float(distances.min())
-        return min_distance > self.baseline - self.margin, min_distance
-
-
-class CollisionAbort(Exception):
-    def __init__(
-        self,
-        msg: str,
-        left_q: np.ndarray,  # rad
-        right_q: np.ndarray,  # rad
-    ) -> None:
-        super().__init__(msg)
-        self.left_q = left_q
-        self.right_q = right_q
 
 
 def home_pose() -> np.ndarray:
@@ -340,28 +284,13 @@ async def move_grippers(
 
 async def sweep_to_target(
     robot: Axol | HardwareController,
-    checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     left_target: np.ndarray,  # rad
     right_target: np.ndarray,  # rad
     speed: float,  # rad/s
     pause: float,  # seconds
-    abort_on_collision: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    safe, min_distance = checker.is_safe(left_target, right_target)
-    if not safe:
-        if abort_on_collision:
-            raise CollisionAbort(
-                f"collision detected (min dist {min_distance:.4f} m)",
-                left_q,
-                right_q,
-            )
-        print(
-            f"    ⚠  collision detected (min dist {min_distance:.4f} m) — waypoint skipped"
-        )
-        return left_q, right_q
-
     max_joint_delta = max(
         float(np.max(np.abs(left_target - left_q))),
         float(np.max(np.abs(right_target - right_q))),
@@ -424,7 +353,6 @@ def with_joint(
 
 async def sweep_joint_range(
     robot: Axol | HardwareController,
-    checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     joint: Joint,
@@ -433,7 +361,6 @@ async def sweep_joint_range(
     label: str,
     speed: float,  # rad/s
     pause: float,  # seconds
-    abort_on_collision: bool,
     home_value: float = 0.0,  # rad
 ) -> tuple[np.ndarray, np.ndarray]:
     print(f"  {label}  {[round(w, 3) for w in waypoints]} → {round(home_value, 3)}")
@@ -450,14 +377,12 @@ async def sweep_joint_range(
         )
         left_q, right_q = await sweep_to_target(
             robot,
-            checker,
             left_q,
             right_q,
             left_target,
             right_target,
             speed,
             pause,
-            abort_on_collision,
         )
     left_target = (
         with_joint(left_q, joint, home_value)
@@ -471,27 +396,23 @@ async def sweep_joint_range(
     )
     left_q, right_q = await sweep_to_target(
         robot,
-        checker,
         left_q,
         right_q,
         left_target,
         right_target,
         speed,
         pause,
-        abort_on_collision,
     )
     return left_q, right_q
 
 
 async def run_rom_cycle(
     robot: Axol | HardwareController,
-    checker: CollisionChecker,
     left_q: np.ndarray,  # rad
     right_q: np.ndarray,  # rad
     speed: float,  # rad/s
     pre_pose_speed: float,  # rad/s
     pause: float,  # seconds
-    abort_on_collision: bool,
     shoulder3_mirror: bool,
     present: set[Joint] = FULL_JOINT_SET,
     run_left: bool = True,
@@ -524,14 +445,12 @@ async def run_rom_cycle(
         )
         left_q, right_q = await sweep_to_target(
             robot,
-            checker,
             left_q,
             right_q,
             left_target,
             right_target,
             spd,
             pause,
-            abort_on_collision,
         )
 
     # Shoulder_1 limits are mirrored across arms: the right arm's range is the
@@ -604,7 +523,6 @@ async def run_rom_cycle(
         label = f"{wrist.value.replace('_', ' ').upper():<11} ({arm_sel})"
         left_q, right_q = await sweep_joint_range(
             robot,
-            checker,
             left_q,
             right_q,
             wrist,
@@ -613,7 +531,6 @@ async def run_rom_cycle(
             label,
             speed,
             pause,
-            abort_on_collision,
         )
 
     if elbow_prepose:
@@ -670,8 +587,6 @@ async def run_axol(
     no_left: bool = False,
     no_right: bool = False,
 ) -> None:
-    checker = CollisionChecker()
-
     run_left = not no_left
     run_right = not no_right
     has_gripper = Joint.GRIPPER in present
@@ -785,13 +700,11 @@ async def run_axol(
 
             left_q, right_q = await run_rom_cycle(
                 robot,
-                checker,
                 left_q,
                 right_q,
                 speed=AXOL_SPEED,
                 pre_pose_speed=AXOL_PRE_POSE_SPEED,
                 pause=AXOL_WAYPOINT_PAUSE,
-                abort_on_collision=True,
                 shoulder3_mirror=False,
                 present=present,
                 run_left=run_left,
@@ -810,29 +723,18 @@ async def run_axol(
         home_left, home_right = home_with_grippers_closed()
         left_q, right_q = await sweep_to_target(
             robot,
-            checker,
             left_q,
             right_q,
             home_left,
             home_right,
             AXOL_HOME_SPEED,
             AXOL_WAYPOINT_PAUSE,
-            abort_on_collision=True,
         )
 
         # On a full-robot grasp run, leave the robot holding the item with the
         # motors enabled; the operator runs rom.disable to open the grippers and
         # retrieve it. Otherwise there is nothing to hold and we disable.
         keep_enabled = grasp
-
-    except CollisionAbort as e:
-        print(f"\n⚠  COLLISION ABORT: {e}")
-        print("Returning to home position ...")
-        safe_left, safe_right = home_with_grippers_closed()
-        await sweep_unchecked(
-            robot, e.left_q, e.right_q, safe_left, safe_right, speed=AXOL_SPEED
-        )
-        print("Home reached.")
 
     except (KeyboardInterrupt, asyncio.CancelledError):
         if grasp:
