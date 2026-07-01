@@ -395,14 +395,19 @@ class GstShmFrameReader:
 def _au_has_coded_slice(au: bytes) -> bool:
     """True if the Annex-B access unit contains a VCL (coded-picture) NAL.
 
-    The relay's encoder can emit access units that carry only non-VCL NALs
-    (access-unit delimiter / SPS / PPS / SEI / end-of-sequence) with no coded
-    slice — notably a trailing boundary AU when the dataset valve closes at
-    episode end. Such an AU decodes to *no* picture, so muxing it as a dataset
-    frame leaves the video one frame short of the row count and the final row
-    then fails LeRobot's exact-timestamp decode. Delivering only AUs with a coded
-    slice keeps frame-count == row-count (the capture loop re-muxes the previous
-    real frame for that row instead). VCL NAL types are 1-5 (non-IDR .. IDR).
+    Integrity guard for the one-AU-per-row contract: the relay's encoder could
+    emit an access unit carrying only non-VCL NALs (access-unit delimiter / SPS /
+    PPS / SEI / end-of-sequence) with no coded slice — e.g. a boundary AU when
+    the dataset valve closes. Such an AU decodes to *no* picture, so muxing it as
+    a dataset frame would occupy a PTS slot without yielding a retrievable frame
+    and desync frame-count from row-count. Delivering only AUs with a coded slice
+    keeps them aligned (the capture loop re-muxes the previous real frame for a
+    starved row instead). VCL NAL types are 1-5 (non-IDR .. IDR).
+
+    Note: this is *not* the fix for the observed last-row failure — that was a
+    mux/decode tail artifact (the final muxed sample is not timestamp-retrievable
+    even for an all-VCL stream), handled by the trailing guard frame in
+    :meth:`~almond_axol.lerobot.h264_mux_encoder._CameraH264Muxer.finish`.
     """
     i, n = 0, len(au)
     while i + 3 < n:

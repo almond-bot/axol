@@ -31,7 +31,9 @@ encoder assigns the PTS itself: the *k*-th access unit fed for a camera is muxed
 at ``pts = k / fps`` (``dts`` and ``duration`` to match). The caller
 (:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) guarantees
 exactly one ``feed_frame`` per camera per dataset row (re-feeding the previous
-AU on a per-camera stall), so frame-count == row-count by construction.
+AU on a per-camera stall), so frame-count == row-count by construction, and
+:meth:`_CameraH264Muxer.finish` re-feeds one throwaway trailing AU so the last
+real frame survives the mux/decode tail drop (see there).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
 an IDR or the mp4 is undecodable from frame 0; the relay forces a keyframe when
@@ -264,7 +266,21 @@ class _CameraH264Muxer:
             _logger.debug("stats sample failed for %s: %s", self.video_path.name, exc)
 
     def finish(self) -> tuple[Path, dict | None]:
-        """EOS the pipeline (flush the moov), then return the path + stats."""
+        """EOS the pipeline (flush the moov), then return the path + stats.
+
+        Tail guard: mp4mux/the decoder drop the *final* sample on EOS (the last
+        frame has no successor to bound its duration), so a stream of N real AUs
+        yields only N-1 timestamp-retrievable frames — one short of the dataset
+        rows, which trips LeRobot's per-row timestamp load on the very last row.
+        Re-feed the last AU once before EOS so the sample that gets dropped is
+        this throwaway duplicate: it sits at ``pts = N / fps``, beyond the last
+        row's ``(N-1) / fps`` timestamp, so LeRobot never queries it, and every
+        real frame stays retrievable. (If a given run does *not* drop the tail,
+        the extra frame is simply ignored — the contract only needs frames >=
+        rows.)
+        """
+        if self._last_au is not None:
+            self.feed(self._last_au)
         stats = self._teardown(finalize=True)
         return self.video_path, stats
 
