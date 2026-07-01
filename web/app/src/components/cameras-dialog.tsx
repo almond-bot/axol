@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useState } from "react"
-import { AlertTriangle, Camera, Loader2, RotateCw, X } from "lucide-react"
+import { useEffect, useState } from "react"
+import { Camera, Loader2, RotateCw, X } from "lucide-react"
 import {
-  detectCameras,
   restartCameraDaemon,
   RESOLUTION_OFF,
   type BranchSel,
@@ -13,6 +12,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useToast } from "@/components/ui/toast"
 
 type Serials = CameraSpec["serials"]
 type BranchMap = Partial<Record<CameraSlot, BranchSel>>
@@ -61,12 +61,21 @@ export function CamerasDialog({
   onClose,
   initial,
   onSave,
+  devices,
+  detecting,
+  onRefresh,
 }: {
   open: boolean
   onClose: () => void
   /** Persisted camera spec to prefill. */
   initial: CameraSpec
   onSave: (spec: CameraSpec) => void
+  /** Detected ZED devices (shared with the badge; null until first detection). */
+  devices: CameraDevice[] | null
+  /** A shared detection is currently in flight. */
+  detecting: boolean
+  /** Re-run detection, updating the shared state (and the badge). */
+  onRefresh: () => void
 }) {
   const [serials, setSerials] = useState<Serials>(initial.serials ?? EMPTY_SERIALS)
   const [streamResolution, setStreamResolution] = useState(
@@ -78,31 +87,15 @@ export function CamerasDialog({
   const [stream, setStream] = useState<BranchMap>(initial.stream ?? {})
   const [record, setRecord] = useState<BranchMap>(initial.record ?? {})
 
-  const [devices, setDevices] = useState<CameraDevice[] | null>(null)
-  const [detectError, setDetectError] = useState<string | null>(null)
-  const [detecting, setDetecting] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const toast = useToast()
 
-  const refresh = useCallback(async () => {
-    setDetecting(true)
-    try {
-      const result = await detectCameras()
-      setDevices(result.devices)
-      setDetectError(result.error)
-    } catch (e) {
-      setDevices(null)
-      setDetectError(String(e).replace(/^Error:\s*/, ""))
-    } finally {
-      setDetecting(false)
-    }
-  }, [])
-
-  // Detect once when the dialog opens; after that it's manual (Refresh /
-  // Restart daemon). Keyed on `open` only — `onClose` is an inline prop that
-  // changes identity on every parent render, so it must not retrigger this.
+  // The parent already detects on connect and shares the result, so opening the
+  // dialog shouldn't re-enumerate every time. Only kick a detection here if we
+  // somehow have no result yet; after that it's manual (Refresh / Restart daemon).
   useEffect(() => {
-    if (open) refresh()
-  }, [open, refresh])
+    if (open && devices == null && !detecting) onRefresh()
+  }, [open, devices, detecting, onRefresh])
 
   useEffect(() => {
     if (!open) return
@@ -117,10 +110,10 @@ export function CamerasDialog({
     setRestarting(true)
     try {
       const result = await restartCameraDaemon()
-      if (result.error) setDetectError(result.error)
-      else await refresh()
+      if (result.error) toast.error(result.error)
+      else onRefresh()
     } catch (e) {
-      setDetectError(String(e).replace(/^Error:\s*/, ""))
+      toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
       setRestarting(false)
     }
@@ -229,8 +222,9 @@ export function CamerasDialog({
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={refresh}
+                  onClick={onRefresh}
                   disabled={detecting || restarting}
+                  title="Re-query the ZED daemon's current device list. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
                 >
                   {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
                   Refresh
@@ -240,19 +234,14 @@ export function CamerasDialog({
                   size="sm"
                   onClick={restartDaemon}
                   disabled={detecting || restarting}
-                  title="Restart the ZED X daemon so cameras plugged in after boot show up"
+                  title="Restart the ZED X daemon so it re-scans the GMSL links — needed to pick up any camera plugged in or unplugged since boot"
                 >
                   {restarting ? <Loader2 className="animate-spin" /> : null}
                   Restart daemon
                 </Button>
               </div>
             </div>
-            {detectError ? (
-              <p className="flex items-center gap-1.5 text-xs text-red-400">
-                <AlertTriangle className="size-3 shrink-0" />
-                {detectError}
-              </p>
-            ) : devices == null ? (
+            {devices == null ? (
               <p className="text-xs text-white/35">Detecting…</p>
             ) : devices.length === 0 ? (
               <p className="text-xs text-white/35">
