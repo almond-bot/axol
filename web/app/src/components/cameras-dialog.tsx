@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { AlertTriangle, Camera, Loader2, RotateCw, X } from "lucide-react"
+import { Camera, Loader2, RotateCw, X } from "lucide-react"
 import {
   detectCameras,
   restartCameraDaemon,
@@ -13,6 +13,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useToast } from "@/components/ui/toast"
 
 type Serials = CameraSpec["serials"]
 type BranchMap = Partial<Record<CameraSlot, BranchSel>>
@@ -79,23 +80,25 @@ export function CamerasDialog({
   const [record, setRecord] = useState<BranchMap>(initial.record ?? {})
 
   const [devices, setDevices] = useState<CameraDevice[] | null>(null)
-  const [detectError, setDetectError] = useState<string | null>(null)
   const [detecting, setDetecting] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const toast = useToast()
 
   const refresh = useCallback(async () => {
     setDetecting(true)
     try {
       const result = await detectCameras()
       setDevices(result.devices)
-      setDetectError(result.error)
+      if (result.error) toast.error(result.error)
     } catch (e) {
-      setDevices(null)
-      setDetectError(String(e).replace(/^Error:\s*/, ""))
+      // Keep the last-known list so a transient failure (e.g. host briefly
+      // unreachable) doesn't wipe the dialog; surface the reason as an alert.
+      setDevices((d) => d ?? [])
+      toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
       setDetecting(false)
     }
-  }, [])
+  }, [toast])
 
   // Detect once when the dialog opens; after that it's manual (Refresh /
   // Restart daemon). Keyed on `open` only — `onClose` is an inline prop that
@@ -117,10 +120,10 @@ export function CamerasDialog({
     setRestarting(true)
     try {
       const result = await restartCameraDaemon()
-      if (result.error) setDetectError(result.error)
+      if (result.error) toast.error(result.error)
       else await refresh()
     } catch (e) {
-      setDetectError(String(e).replace(/^Error:\s*/, ""))
+      toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
       setRestarting(false)
     }
@@ -248,12 +251,7 @@ export function CamerasDialog({
                 </Button>
               </div>
             </div>
-            {detectError ? (
-              <p className="flex items-center gap-1.5 text-xs text-red-400">
-                <AlertTriangle className="size-3 shrink-0" />
-                {detectError}
-              </p>
-            ) : devices == null ? (
+            {devices == null ? (
               <p className="text-xs text-white/35">Detecting…</p>
             ) : devices.length === 0 ? (
               <p className="text-xs text-white/35">
