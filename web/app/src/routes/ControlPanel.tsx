@@ -719,14 +719,12 @@ export default function ControlPanel() {
       />
       <CamerasDialog
         open={camerasDialogOpen}
-        onClose={() => {
-          setCamerasDialogOpen(false)
-          // Re-verify against whatever's physically connected now that the
-          // operator may have changed serials or (re)plugged a camera.
-          refreshCameras()
-        }}
+        onClose={() => setCamerasDialogOpen(false)}
         initial={cameras}
         onSave={saveCameras}
+        devices={cameraDevices}
+        detecting={cameraDetecting}
+        onRefresh={refreshCameras}
       />
     </div>
   )
