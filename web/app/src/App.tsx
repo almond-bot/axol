@@ -415,6 +415,27 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     }
   }, [])
 
+  // Fully release the cameras when the XR session ends. This component stays
+  // mounted across sessions, and we intentionally keep the last frame through
+  // *in-session* dropouts (see the `[streams]` effect), but a session end is a
+  // clean teardown: without this, the sticky textures/videos/shownRef would
+  // survive and a later re-entry would treat last session's frozen GPU frames
+  // as live (hiding the connecting spinner) until fresh tracks arrive.
+  useEffect(() => {
+    if (session) return
+    const videos = videosRef.current
+    const textures = texturesRef.current
+    for (const name of Object.keys(textures)) {
+      textures[name].dispose()
+      delete textures[name]
+    }
+    for (const name of Object.keys(videos)) {
+      videos[name].srcObject = null
+      delete videos[name]
+    }
+    shownRef.current = {}
+  }, [session])
+
   // Confine the stereo eye planes to their lens via three.js layers: an object
   // on layer 1 renders to the left eye only, layer 2 to the right eye only.
   useEffect(() => {
