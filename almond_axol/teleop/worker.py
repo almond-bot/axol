@@ -1,7 +1,7 @@
 """
 IK subprocess worker for VR teleoperation.
 
-Runs in a separate process to keep JAX/CUDA off the main asyncio event loop.
+Runs in a separate process to keep JAX off the main asyncio event loop.
 All intermediate computations stay in NumPy; the single JAX boundary is the
 ``solver.ik`` call itself (matching the arm-repo pattern).
 """
