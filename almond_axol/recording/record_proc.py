@@ -940,12 +940,60 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     )
 
 
+def _verify_videos_decodable(dataset_root: "Path | str") -> list[tuple[str, int, int]]:
+    """Safety net: assert every recorded video frame is actually decodable.
+
+    The exact-``k/fps`` timestamp grid means LeRobot's save-time validation only
+    checks *packet* timestamps — so if an upstream stall drops a keyframe, the
+    orphaned frames are muxed (packet present, correct PTS) yet fail to *decode*,
+    producing a dataset that validates on save but raises ``FrameTimestampError``
+    at train time. This re-decodes every video file end to end and, for any file
+    whose decoded-frame count is short of its packet count, logs a loud error
+    naming the file (so the operator re-records the affected episode). Best-effort:
+    a probe failure never breaks finalize. Returns the list of bad files.
+    """
+    import av
+
+    root = Path(dataset_root)
+    videos_root = root / "videos"
+    if not videos_root.exists():
+        return []
+    bad: list[tuple[str, int, int]] = []
+    for mp4 in sorted(videos_root.glob("observation.images.*/chunk-*/file-*.mp4")):
+        try:
+            with av.open(str(mp4)) as container:
+                packets = sum(1 for p in container.demux(video=0) if p.pts is not None)
+            with av.open(str(mp4)) as container:
+                decoded = sum(1 for _ in container.decode(video=0))
+        except Exception as exc:  # noqa: BLE001 - probe must never break finalize
+            _logger.warning("video integrity: could not verify %s: %s", mp4, exc)
+            continue
+        if decoded != packets:
+            rel = str(mp4.relative_to(root))
+            bad.append((rel, packets, decoded))
+            _logger.error(
+                "video integrity: %s has %d frames but only %d decode (%d "
+                "undecodable) — an upstream drop cost a keyframe; those dataset "
+                "rows will fail to load, re-record the affected episode(s)",
+                rel,
+                packets,
+                decoded,
+                packets - decoded,
+            )
+    if not bad:
+        _logger.info("video integrity: all recorded frames decodable")
+    return bad
+
+
 def _finalize_dataset(
     dataset: "LeRobotDataset", config: dict, episodes_recorded: int
 ) -> None:
     from lerobot.utils.utils import log_say
 
     dataset.finalize()
+    if episodes_recorded > 0:
+        with contextlib.suppress(Exception):
+            _verify_videos_decodable(config["dataset_root"])
     if config["push_to_hub"] and episodes_recorded > 0:
         dataset.push_to_hub()
     dataset_root = Path(config["dataset_root"])
@@ -1091,6 +1139,7 @@ def _recorder_main(
                 meta["width"],
                 meta["height"],
                 meta["fps"],
+                name=source,
             )
             cam.connect()
             cameras[source] = cam

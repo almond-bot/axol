@@ -31,6 +31,7 @@ the dataset relies on.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
@@ -41,6 +42,8 @@ import numpy as np
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
+
+_logger = logging.getLogger(__name__)
 
 # Meta header: a single structured record at the front of each block. Padded to
 # 64 bytes so the frame buffers start cache-line aligned.
@@ -459,19 +462,42 @@ class EncodedAuReader:
     assigns, independent of ``recv_ts``.
     """
 
-    def __init__(self, socket_path: str, width: int, height: int, fps: int) -> None:
-        from .gst_zed import _require_gst
+    def __init__(
+        self,
+        socket_path: str,
+        width: int,
+        height: int,
+        fps: int,
+        name: str | None = None,
+    ) -> None:
+        from .gst_zed import _DATASET_IDR_INTERVAL_S, _require_gst
 
         self._gst, _ = _require_gst()
         self.width = width
         self.height = height
         self.fps = fps
+        self._name = name or socket_path
         self._queue: deque[tuple[bytes, float]] = deque()
         self._cond = threading.Condition()
         self._await_keyframe = True
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._sink: Any = None
+        # Keyframe-cadence integrity guard. The relay forces an IDR every
+        # ``_DATASET_IDR_INTERVAL_S`` (see gst_zed), so a run of more than
+        # ~1.5x that many frames without a keyframe means a *keyframe was lost
+        # upstream* — and every frame muxed until the next IDR references that
+        # missing reference, so those dataset rows won't decode. We can't undo it
+        # here (the orphaned frames are already delivered), but logging it loudly
+        # turns a silent, train-time-only corruption into a diagnosable signal
+        # (which camera, which frame). ``_delivered`` is the running AU index for
+        # the log; ``_gap_warnings`` counts detections for the disconnect summary.
+        self._expected_gop = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
+        self._gop_warn_at = self._expected_gop + max(2, self._expected_gop // 2)
+        self._since_keyframe = 0
+        self._delivered = 0
+        self._gap_warnings = 0
+        self._seen_first_au = False
         # shmsrc carries no caps, so the downstream capsfilter must be fully fixed
         # (width/height/framerate as well as the h264 layout) or it won't link;
         # h264parse re-derives the real dimensions from the SPS regardless.
@@ -516,6 +542,7 @@ class EncodedAuReader:
         with self._cond:
             self._queue.clear()
             self._await_keyframe = True
+            self._since_keyframe = 0
 
     def _pull_loop(self) -> None:
         Gst = self._gst
@@ -526,6 +553,7 @@ class EncodedAuReader:
             recv_perf = time.perf_counter()
             buf = sample.get_buffer()
             is_keyframe = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+            discont = buf.has_flags(Gst.BufferFlags.DISCONT)
             ok, mapinfo = buf.map(Gst.MapFlags.READ)
             if not ok:
                 continue
@@ -543,8 +571,40 @@ class EncodedAuReader:
                     if not is_keyframe:
                         continue  # wait for the episode's first IDR
                     self._await_keyframe = False
+                    self._since_keyframe = 0
+                elif is_keyframe:
+                    self._since_keyframe = 0
+                else:
+                    self._since_keyframe += 1
+                    if self._since_keyframe == self._gop_warn_at:
+                        self._warn_keyframe_gap()
+                # A shmsrc DISCONT after the first AU means an upstream buffer was
+                # dropped between the relay and here — the following frames can lose
+                # their reference. Surface it (the first AU legitimately carries it).
+                if discont and self._seen_first_au:
+                    _logger.warning(
+                        "encoded-AU discontinuity on %s near frame %d — an upstream "
+                        "buffer was dropped; following frames may not decode",
+                        self._name,
+                        self._delivered,
+                    )
+                self._seen_first_au = True
                 self._queue.append((au, recv_perf))
+                self._delivered += 1
                 self._cond.notify()
+
+    def _warn_keyframe_gap(self) -> None:
+        """Log a suspected upstream keyframe drop (see the guard in __init__)."""
+        self._gap_warnings += 1
+        _logger.warning(
+            "encoded-AU keyframe gap on %s near frame %d: %d frames since the last "
+            "keyframe (the relay forces an IDR every ~%d) — a reference frame was "
+            "likely dropped upstream, so those dataset rows may not decode",
+            self._name,
+            self._delivered,
+            self._since_keyframe,
+            self._expected_gop,
+        )
 
     def read_next_au(self, timeout_ms: float = 500) -> tuple[bytes, float]:
         """Pop the next access unit in order; block up to ``timeout_ms``.
