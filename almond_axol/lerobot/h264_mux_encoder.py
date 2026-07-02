@@ -46,23 +46,30 @@ non-IDR AUs, so the first fed AU is always a keyframe.
 Image stats
 -----------
 LeRobot folds a sampled subset of frames into running image-normalization stats.
-Here the recorder no longer has raw frames, so — once the episode's mp4 is
-finalized — :meth:`_CameraH264Muxer.finish` decodes the *already-written* file's
-keyframes (~4/s given the relay's IDR cadence; the decoder skips every P-frame)
-and feeds the same ``RunningQuantileStats`` the raw path uses. Decoding a
-finished file (rather than a live tee branch during muxing) sidesteps the Jetson
-``nvv4l2decoder`` EOS-drain that used to stall the mp4 finalize, and it runs
-between episodes (recording paused) so it never competes with the live capture
-loop. If decoding or lerobot is unavailable the encoder still records correctly
-and returns ``None`` stats (recomputable offline).
+Here the recorder no longer has raw frames, so each camera decodes its **IDR
+access units as they are fed** on a per-camera background thread
+(:class:`_StatsWorker`): an IDR is self-contained (the relay muxes SPS/PPS into
+every keyframe), so a plain software decoder fed only keyframes (~4/s given the
+relay's IDR cadence) yields the same sampled subset the old post-finalize file
+decode produced, but the cost is amortized across the episode instead of being
+paid as a lump inside ``save_episode``. The worker folds decoded frames into the
+same ``RunningQuantileStats`` the raw path uses (batched updates — the per-call
+histogram build dominates otherwise); :meth:`_CameraH264Muxer.finish` just joins
+the worker and reads the result. If the worker produced nothing (deps missing,
+decode errors), finish falls back to decoding the finalized file's keyframes
+(:meth:`_CameraH264Muxer._compute_stats_from_file`); if that fails too the
+encoder still records correctly and returns ``None`` stats (recomputable
+offline).
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import logging
+import queue
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -74,6 +81,136 @@ _logger = logging.getLogger(__name__)
 # How long finish() waits for a muxer pipeline to flush EOS (write the moov atom)
 # before giving up on that camera's mp4.
 _EOS_TIMEOUT_S = 30.0
+
+# How long finish() waits for the live stats worker to drain its queue. The
+# worker decodes keyframes as they arrive (~4/s), so the queue is near-empty at
+# episode end; this only bounds a wedged decoder.
+_STATS_JOIN_TIMEOUT_S = 10.0
+
+# Live stats decode queue depth. Keyframes arrive ~4/s and decode in ~10 ms, so
+# this never fills in practice; if it does (decoder wedged), further keyframes
+# are dropped — stats are a sampled estimate, losing samples is harmless.
+_STATS_QUEUE_MAX = 64
+
+# Fold decoded stats samples into RunningQuantileStats in batches of this many
+# frames: per-update overhead (histogram build) dominates single-frame updates,
+# while batching everything to the end would move the whole cost into finish().
+_STATS_BATCH_FRAMES = 48
+
+
+def _au_is_idr(au: bytes) -> bool:
+    """True if the Annex-B access unit contains an IDR (type-5 VCL) NAL."""
+    i, n = 0, len(au)
+    while i + 3 < n:
+        if au[i] == 0 and au[i + 1] == 0:
+            if au[i + 2] == 1:
+                if (au[i + 3] & 0x1F) == 5:
+                    return True
+                i += 4
+                continue
+            if au[i + 2] == 0 and i + 4 < n and au[i + 3] == 1:
+                if (au[i + 4] & 0x1F) == 5:
+                    return True
+                i += 5
+                continue
+        i += 1
+    return False
+
+
+class _StatsWorker:
+    """Decode a camera's IDR AUs on a background thread and fold image stats.
+
+    ``feed`` is called from the capture path with keyframe AUs only; the actual
+    decode/convert/downsample/update runs on this worker's thread (PyAV and
+    numpy release the GIL for the heavy parts), so the per-row cost on the
+    capture loop is one non-blocking queue put every IDR interval. ``result``
+    joins the worker and returns the LeRobot-shaped stats dict, or ``None`` if
+    nothing was decoded (caller falls back to the post-finalize file decode).
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._queue: queue.Queue[bytes | None] = queue.Queue(_STATS_QUEUE_MAX)
+        self._failed = False
+        self._stats = None
+        self._pending: list[Any] = []
+        self._decoded = 0
+        self._thread = threading.Thread(
+            target=self._run, name=f"stats-{name}", daemon=True
+        )
+        self._thread.start()
+
+    def feed(self, au: bytes) -> None:
+        if self._failed:
+            return
+        try:
+            self._queue.put_nowait(au)
+        except queue.Full:
+            pass  # sampled stats: dropping a sample is harmless
+
+    def _run(self) -> None:
+        try:
+            import av
+            import numpy as np
+            from lerobot.datasets.compute_stats import (
+                RunningQuantileStats,
+                auto_downsample_height_width,
+            )
+
+            codec = av.CodecContext.create("h264", "r")
+            self._stats = RunningQuantileStats()
+        except Exception as exc:  # noqa: BLE001 - deps missing -> no live stats
+            _logger.warning("live video stats unavailable for %s: %s", self._name, exc)
+            self._failed = True
+            # Drain until the sentinel so feeders/join never block.
+            while self._queue.get() is not None:
+                pass
+            return
+
+        def _flush() -> None:
+            if self._pending:
+                self._stats.update(np.concatenate(self._pending, axis=0))
+                self._pending.clear()
+
+        while True:
+            au = self._queue.get()
+            if au is None:
+                break
+            try:
+                for frame in codec.decode(av.Packet(au)):
+                    rgb = frame.to_ndarray(format="rgb24")  # H, W, C
+                    ds = auto_downsample_height_width(
+                        np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
+                    )
+                    self._pending.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
+                    self._decoded += 1
+                if len(self._pending) >= _STATS_BATCH_FRAMES:
+                    _flush()
+            except Exception as exc:  # noqa: BLE001 - stats must never kill capture
+                _logger.warning("live stats decode failed for %s: %s", self._name, exc)
+                self._failed = True
+                while self._queue.get() is not None:
+                    pass
+                return
+        # An open GOP is impossible here (IDR-only feed); no draining decode
+        # needed — flush the remainder and compute the result.
+        try:
+            _flush()
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("live stats flush failed for %s: %s", self._name, exc)
+            self._failed = True
+
+    def result(self) -> dict | None:
+        """Stop the worker, wait for the drain, and return the stats (or None)."""
+        self._queue.put(None)
+        self._thread.join(timeout=_STATS_JOIN_TIMEOUT_S)
+        if self._thread.is_alive() or self._failed or self._decoded == 0:
+            return None
+        return self._stats.get_statistics()
+
+    def cancel(self) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=1.0)
 
 
 def hw_mux_encoder_available() -> bool:
@@ -92,8 +229,8 @@ class _CameraH264Muxer:
     ``feed`` pushes one pre-encoded access unit and assigns it the next
     constant-fps PTS; all work is on gst's own threads / hardware blocks, so the
     recorder does no per-frame encode or copy. Image-normalization stats are
-    computed after the fact in :meth:`finish` by decoding a sampled subset of the
-    finalized mp4 (see the module "Image stats" note).
+    decoded live from the fed IDR AUs on a background thread (see the module
+    "Image stats" note); :meth:`finish` just collects the result.
     """
 
     def __init__(self, video_path: Path, fps: int, want_stats: bool = True) -> None:
@@ -113,9 +250,10 @@ class _CameraH264Muxer:
         self._error: str | None = None
         self._last_au: bytes | None = None
 
-        # Image stats are computed post-finalize from the file's keyframes
-        # (see _compute_stats_from_file).
+        # Live per-keyframe stats decode (see _StatsWorker); the post-finalize
+        # file decode (_compute_stats_from_file) remains as the fallback.
         self._want_stats = want_stats
+        self._stats_worker = _StatsWorker(video_path.name) if want_stats else None
 
         video_path.parent.mkdir(parents=True, exist_ok=True)
         self._pipeline, self._src = self._build()
@@ -174,6 +312,8 @@ class _CameraH264Muxer:
             )
         self._last_au = au
         self._count += 1
+        if self._stats_worker is not None and _au_is_idr(au):
+            self._stats_worker.feed(au)
 
     def feed_repeat(self) -> None:
         """Re-mux the previous AU (a duplicate frame) to keep counts aligned.
@@ -267,12 +407,20 @@ class _CameraH264Muxer:
         t0 = time.perf_counter()
         self._teardown(finalize=True)
         if self._error:
+            if self._stats_worker is not None:
+                self._stats_worker.cancel()
             raise RuntimeError(
                 f"H264 muxer for {self.video_path.name} failed to finalize: "
                 f"{self._error}"
             )
         t_eos = time.perf_counter()
-        stats = self._compute_stats_from_file()
+        stats = None
+        if self._stats_worker is not None:
+            stats = self._stats_worker.result()
+        if stats is None and self._want_stats:
+            # Live worker produced nothing (deps/decode failure): fall back to
+            # decoding the finalized file's keyframes.
+            stats = self._compute_stats_from_file()
         _logger.info(
             "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames)",
             self.video_path.name,
@@ -283,6 +431,8 @@ class _CameraH264Muxer:
         return self.video_path, stats
 
     def cancel(self) -> None:
+        if self._stats_worker is not None:
+            self._stats_worker.cancel()
         self._teardown(finalize=False)
 
     def _teardown(self, finalize: bool) -> None:

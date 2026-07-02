@@ -118,16 +118,29 @@ def _tune_software_encoder() -> None:
     )
 
 
-def _concat_probe_constant_fps(input_video_paths: list) -> "Fraction | None":
-    """Return the common frame rate if the inputs are safe to re-stamp onto an
-    exact constant-fps grid, else ``None`` (caller falls back to shift-rebase).
+# How many leading packets of the first input the fps probe reads. The chunk
+# file is read in full by the remux pass anyway; reading it a second time just
+# to infer fps doubled the concat's I/O, which dominates save_episode once the
+# accumulating chunk grows (it is rewritten on *every* save).
+_CONCAT_PROBE_PACKETS = 121
 
-    Safe means every input is a single video stream (no audio/subtitle) with no
-    B-frames (every packet ``pts == dts``), i.e. our recorder's IPPP mp4 segments,
-    where demux order equals display order so frame *k* can be stamped at exactly
-    ``k / fps``. The rate is inferred from the first segment's median PTS delta
-    (our muxer's mp4 timescale rounds ``1/fps``, so no single delta is exact, but
-    the median is), falling back to the stream's advertised ``average_rate``.
+
+class _BFramesDetected(Exception):
+    """Raised mid-remux when an input turns out to have B-frames."""
+
+
+def _concat_probe_constant_fps(input_video_paths: list) -> "Fraction | None":
+    """Return the frame rate to re-stamp onto, or ``None`` for shift-rebase.
+
+    Cheap checks only: every input must be a single video stream (no
+    audio/subtitle — stream *metadata*, no demux), and the rate is inferred
+    from the first input's leading packets' median PTS delta (our muxer's mp4
+    timescale rounds ``1/fps``, so no single delta is exact, but the median
+    is), falling back to the stream's advertised ``average_rate``. The
+    no-B-frames requirement (every packet ``pts == dts``, so demux order is
+    display order) is *not* pre-scanned here — the remux pass verifies it on
+    every packet as it copies and falls back if violated — so the whole
+    chunk is read once per concat, not twice.
     """
     import statistics
 
@@ -141,6 +154,8 @@ def _concat_probe_constant_fps(input_video_paths: list) -> "Fraction | None":
                 s.type in ("audio", "subtitle") for s in src.streams
             ):
                 return None
+            if fps is not None:
+                continue
             vstream = videos[0]
             secs: list[float] = []
             tb = vstream.time_base
@@ -150,19 +165,20 @@ def _concat_probe_constant_fps(input_video_paths: list) -> "Fraction | None":
                 if packet.pts != packet.dts:
                     return None  # B-frames present -> can't reindex by demux order
                 secs.append(float(packet.pts * tb))
-            if fps is None:
-                if len(secs) >= 2:
-                    secs.sort()
-                    med = statistics.median(
-                        secs[i + 1] - secs[i] for i in range(len(secs) - 1)
-                    )
-                    if med <= 0:
-                        return None
-                    fps = Fraction(round(1.0 / med), 1)
-                elif vstream.average_rate:
-                    fps = Fraction(vstream.average_rate)
-                else:
+                if len(secs) >= _CONCAT_PROBE_PACKETS:
+                    break
+            if len(secs) >= 2:
+                secs.sort()
+                med = statistics.median(
+                    secs[i + 1] - secs[i] for i in range(len(secs) - 1)
+                )
+                if med <= 0:
                     return None
+                fps = Fraction(round(1.0 / med), 1)
+            elif vstream.average_rate:
+                fps = Fraction(vstream.average_rate)
+            else:
+                return None
     return fps
 
 
@@ -222,6 +238,12 @@ def _concat_constant_fps(
                     for packet in src.demux(in_stream):
                         if packet.dts is None:  # demux flushing packet
                             continue
+                        if packet.pts != packet.dts:
+                            # B-frames: demux order is not display order, so
+                            # index-based re-stamping would scramble frames.
+                            # The probe only samples leading packets; this is
+                            # the full-stream check.
+                            raise _BFramesDetected(str(input_path))
                         last_payload = bytes(packet)
                         packet.pts = frame_idx * step
                         packet.dts = frame_idx * step
@@ -379,7 +401,16 @@ def _concatenate_video_files_rebased(
     t0 = time.perf_counter()
     fps = _concat_probe_constant_fps(input_video_paths)
     if fps is not None:
-        _concat_constant_fps(input_video_paths, output_video_path, fps)
+        try:
+            _concat_constant_fps(input_video_paths, output_video_path, fps)
+        except _BFramesDetected as exc:
+            _logger.warning(
+                "concat: B-frames found mid-stream in %s; "
+                "falling back to shift-rebase — per-row timestamp tolerance "
+                "may suffer.",
+                exc,
+            )
+            _concat_shift_rebased(input_video_paths, output_video_path)
     else:
         _logger.warning(
             "concat: constant-fps re-stamp unavailable (B-frames or extra streams); "
@@ -499,6 +530,35 @@ def _patch_video_concat() -> None:
     )
 
 
+def _patch_embed_images_skip() -> None:
+    """Skip the per-save ``embed_images`` map when no image columns exist.
+
+    ``_save_episode_data`` runs every episode row through
+    ``embed_images``'s ``Dataset.map(embed_table_storage)`` before the parquet
+    write. With video features (our only camera dtype) excluded from the hf
+    schema there is nothing to embed, yet the map still copies every row
+    through Python at ~1.6k rows/s — ~1.5 s of pure overhead per save for a
+    one-minute episode. Delegate to the real ``embed_images`` only when the
+    dataset actually has an ``Image`` column. Idempotent.
+    """
+    import datasets as hf_datasets
+
+    import lerobot.datasets.dataset_writer as _dw
+
+    if getattr(_dw, "_axol_embed_images_skip", False):
+        return
+    _orig = _dw.embed_images
+
+    def _embed_if_needed(dataset):  # type: ignore[no-untyped-def]
+        if any(isinstance(f, hf_datasets.Image) for f in dataset.features.values()):
+            return _orig(dataset)
+        return dataset
+
+    _dw.embed_images = _embed_if_needed
+    _dw._axol_embed_images_skip = True
+    _logger.info("skipping no-op embed_images map on episode save")
+
+
 def _patch_frame_validation() -> None:
     """Let ``add_frame`` accept packed NV12 video frames from the relay.
 
@@ -588,6 +648,7 @@ def install_dataset_encoder() -> bool:
     # Episode-append concat re-bases timestamps regardless of which encoder writes
     # the segments, so patch it on every path (NVENC and the libx264 fallback).
     _patch_video_concat()
+    _patch_embed_images_skip()
 
     if getattr(LeRobotDataset, "_axol_nvenc_installed", False):
         return True
@@ -631,6 +692,7 @@ def install_encoded_dataset_encoder() -> bool:
     )
 
     _patch_video_concat()
+    _patch_embed_images_skip()
 
     if getattr(LeRobotDataset, "_axol_h264mux_installed", False):
         return True
