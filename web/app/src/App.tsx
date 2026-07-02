@@ -764,7 +764,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
           visible={false}
         >
           <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
+          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={true} />
         </mesh>
         <mesh
           ref={leftMeshRef}
@@ -777,7 +777,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={leftMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
         <mesh
@@ -791,7 +791,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={rightMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
         {/* Wrist-cam planes shown as bottom-corner PiPs (A = left, B = right).
@@ -804,7 +804,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={dualAMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
         <mesh ref={dualBMeshRef} renderOrder={3} visible={false}>
@@ -813,7 +813,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={dualBMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
       </group>
