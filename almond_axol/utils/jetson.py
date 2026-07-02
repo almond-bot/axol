@@ -45,6 +45,14 @@ _CPU_GOVERNOR = "performance"
 # Jetson, so the governor and engine pins can reach the real max clocks.
 _MAXN_MODE = "0"
 
+# Where nvpmodel persists the active mode across reboots (``pmode:%.4d``).
+# The nvpmodel boot service runs ``nvpmodel -f /etc/nvpmodel.conf`` with no
+# ``-m``, which reads the mode from this file and applies it — before the GPU
+# golden context exists, so no reboot prompt. Writing the desired mode here is
+# therefore the way to make a mode take effect on the next boot without
+# rebooting now (see :func:`_set_max_power_mode`).
+_NVPMODEL_STATUS = Path("/var/lib/nvpmodel/status")
+
 # Canonical L4T marker present on every Jetson. CPU-governor pinning is gated
 # on Jetson detection so ``jetson.setup`` on a non-Tegra Linux host never
 # touches that machine's system-wide cpufreq governor (engine pinning is
@@ -147,6 +155,19 @@ class _RootEscalator:
         return False, _combine_output(sudo) or detail
 
 
+def _query_power_mode(nvpmodel: str) -> str | None:
+    """Return the mode id ``nvpmodel -q`` reports, or ``None`` when unreadable.
+
+    ``nvpmodel -q`` prints the active mode id on its last non-empty line.
+    """
+    try:
+        query = subprocess.run([nvpmodel, "-q"], capture_output=True, text=True)
+    except OSError:
+        return None
+    lines = [ln.strip() for ln in query.stdout.splitlines() if ln.strip()]
+    return lines[-1] if lines else None
+
+
 def _set_max_power_mode(escalator: _RootEscalator) -> None:
     """Select the MAXN ``nvpmodel`` power mode (uncaps the clock ceiling).
 
@@ -163,33 +184,48 @@ def _set_max_power_mode(escalator: _RootEscalator) -> None:
     if nvpmodel is None:
         _logger.debug("nvpmodel not found; leaving the power mode unchanged")
         return
-    # ``nvpmodel -q`` prints the active mode id on its last non-empty line;
-    # skip the (root-only) switch when it already reports MAXN.
-    try:
-        query = subprocess.run([nvpmodel, "-q"], capture_output=True, text=True)
-        lines = [ln.strip() for ln in query.stdout.splitlines() if ln.strip()]
-        if lines and lines[-1] == _MAXN_MODE:
-            return
-    except OSError:
-        pass
-    # Answer "n" to any confirmation prompt. On some Jetsons switching to MAXN
-    # warns that it needs a reboot and asks to reboot *now* ([y/N]); we must
-    # never reboot the box here -- jetson.setup runs mid-install (over the
-    # operator's SSH session) and at boot, and an in-place reboot would drop
-    # that session and restart the robot. "n" declines the reboot; nvpmodel
-    # still records the pending mode, which applies on the next *natural* reboot
-    # (when the boot service re-pins the clocks). Feeding stdin also stops the
+    # Skip the (root-only) switch when the mode already reports MAXN — either
+    # live, or persisted for the next boot by a previous run (see below).
+    if _query_power_mode(nvpmodel) == _MAXN_MODE:
+        return
+    # Answer "n" to any confirmation prompt. Once the GPU golden context
+    # exists (always, by the time the installer or the boot ExecStartPre gets
+    # here — nvpmodel.service runs earlier in boot), switching to MAXN asks to
+    # reboot *now* (``DO YOU WANT TO REBOOT NOW? enter YES/yes to confirm:``).
+    # We must never reboot the box here -- jetson.setup runs mid-install (over
+    # the operator's SSH session) and at boot, and an in-place reboot would
+    # drop that session and restart the robot. Feeding stdin also stops the
     # interactive `axol jetson.setup` run from blocking on the prompt.
     ok, detail = escalator.run([nvpmodel, "-m", _MAXN_MODE], input_text="n\n")
-    if ok:
+    if _query_power_mode(nvpmodel) == _MAXN_MODE:
         _logger.info("set Jetson power mode to MAXN (nvpmodel -m %s)", _MAXN_MODE)
-    elif "reboot" in detail.lower():
-        _logger.warning(
-            "Jetson power mode MAXN needs a reboot to take effect — declined the "
-            "in-place reboot so this session/robot isn't restarted. It will apply "
-            "on the next reboot (the boot service re-pins the clocks then); the "
-            "engine/CPU pins below still help at the current mode's ceiling.",
-        )
+        return
+    if ok or "reboot" in detail.lower():
+        # Declining the reboot prompt CANCELS the switch — nvpmodel records
+        # nothing, so left alone the mode would never change, on this boot or
+        # any later one. Persist the mode ourselves in nvpmodel's status file:
+        # the boot service applies the mode saved there before the GPU golden
+        # context exists, so MAXN takes effect cleanly on the next *natural*
+        # reboot (and the earlier -q short-circuit keeps re-runs quiet).
+        pending = f"pmode:{int(_MAXN_MODE):04d}"
+        wrote, write_detail = escalator.write(_NVPMODEL_STATUS, pending)
+        if wrote:
+            _logger.warning(
+                "Jetson power mode MAXN needs a reboot to take effect — declined "
+                "the in-place reboot so this session/robot isn't restarted, and "
+                "recorded MAXN in %s so it applies on the next reboot (the boot "
+                "service re-pins the clocks then). The engine/CPU pins below "
+                "still help at the current mode's ceiling.",
+                _NVPMODEL_STATUS,
+            )
+        else:
+            _logger.warning(
+                "Jetson power mode MAXN needs a reboot, and recording it for the "
+                "next boot failed (%s) — fix manually with: sudo nvpmodel -m %s "
+                "(confirm the reboot prompt, or reboot afterwards).",
+                write_detail or "write failed",
+                _MAXN_MODE,
+            )
     else:
         _logger.warning(
             "cannot set the Jetson power mode to MAXN (nvpmodel -m %s failed%s) — "
