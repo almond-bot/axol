@@ -29,7 +29,7 @@ from ..constants import (
     urdf_arm_joint_names,
     urdf_body_name,
 )
-from .jax_cache import enable_persistent_compilation_cache
+from .jax_cache import disable_gpu_preallocation, enable_persistent_compilation_cache
 
 _logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class AxolForwardKinematics:
     """
 
     def __init__(self) -> None:
+        disable_gpu_preallocation()
         enable_persistent_compilation_cache()
         _logger.info("Loading Axol URDF for forward kinematics...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))

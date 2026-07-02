@@ -337,6 +337,11 @@ def _gpu_jax_ok() -> bool:
         "import jax, jax.numpy as jnp;"
         "assert jax.default_backend() == 'gpu', jax.default_backend();"
         "jnp.any(jnp.arange(4)).block_until_ready();"
+        # Also exercise cuSolver/cuBLAS (what the IK solver needs): plain XLA
+        # kernels run fine with a broken cuBLAS (e.g. the SBSA pip wheel on
+        # Tegra), which fails only at cublasCreate with 'cuSolver internal
+        # error', so a compute-only probe would pass while IK crashes.
+        "jnp.linalg.solve(jnp.eye(4), jnp.arange(4.0)).block_until_ready();"
         "print('ok')"
     )
     try:
@@ -546,12 +551,35 @@ def _install_cuda_runtime_deps(wheels: list[str]) -> None:
     if not reqs:
         return
     uv = shutil.which("uv")
+    tegra = is_tegra()
+    if tegra:
+        reqs = [r for r in reqs if not r.startswith("nvidia-cublas")]
     if uv is not None:
         cmd = [uv, "pip", "install", "--python", sys.executable, *reqs]
     else:
         cmd = [sys.executable, "-m", "pip", "install", *reqs]
     print("Installing CUDA runtime libs (nvidia-*-cu12):\n  " + " ".join(reqs))
     subprocess.check_call(cmd)
+    if tegra:
+        # The pip nvidia-cublas aarch64 wheels are SBSA (server ARM) builds
+        # with no Tegra kernels: on a Jetson cublasCreate fails ("may be
+        # because this binary was not built with support for the GPU in your
+        # machine"), which the plugin surfaces as "cuSolver internal error" as
+        # soon as anything hits cuBLAS (e.g. the IK solver). JetPack's
+        # /usr/local/cuda ships a Tegra cuBLAS, on the plugin's patched RPATH
+        # and the ld cache, so remove the pip one — it would otherwise shadow
+        # the system lib (the RPATHs list the pip dirs first). Must run *after*
+        # the install above: nvidia-cusolver/cudnn depend on nvidia-cublas, so
+        # the resolver drags it back in.
+        uninstall = (
+            [uv, "pip", "uninstall", "--python", sys.executable]
+            if uv is not None
+            else [sys.executable, "-m", "pip", "uninstall", "-y"]
+        )
+        subprocess.run(
+            [*uninstall, "nvidia-cublas-cu12"], capture_output=True, check=False
+        )
+        print("Tegra: removed pip cuBLAS (SBSA-only); using JetPack's system cuBLAS.")
 
 
 def _site_packages() -> Path:
@@ -596,10 +624,17 @@ def _patch_plugin_rpath() -> None:
     site = _site_packages()
     # Patch whichever xla_cudaNN plugin actually got installed (glob rather than
     # recomputing the major, which could differ from the wheels under --cuda-
-    # version and leave the real plugin unpatched).
+    # version and leave the real plugin unpatched). Also patch the
+    # jax_cudaNN_plugin extension libs (_solver.so etc.), which dlopen the CUDA
+    # libs themselves.
     so_files = [
         so
         for plugin_dir in (site / "jax_plugins").glob("xla_cuda*")
+        for so in plugin_dir.glob("*.so")
+    ]
+    so_files += [
+        so
+        for plugin_dir in site.glob("jax_cuda*_plugin")
         for so in plugin_dir.glob("*.so")
     ]
     nvidia = site / "nvidia"

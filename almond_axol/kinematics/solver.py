@@ -25,7 +25,7 @@ from ..constants import (
     urdf_body_name,
 )
 from .config import KinematicsConfig
-from .jax_cache import enable_persistent_compilation_cache
+from .jax_cache import disable_gpu_preallocation, enable_persistent_compilation_cache
 
 _logger = logging.getLogger(__name__)
 
@@ -349,6 +349,7 @@ class KinematicsSolver:
         """
         self.config = config
 
+        disable_gpu_preallocation()
         enable_persistent_compilation_cache()
 
         _logger.info("Loading Axol URDF...")
