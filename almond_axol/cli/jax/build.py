@@ -45,6 +45,7 @@ import subprocess
 import sys
 import sysconfig
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from importlib.metadata import PackageNotFoundError
@@ -719,7 +720,9 @@ def _try_install_prebuilt(jax_version: str, cuda_major: str, compute: str) -> bo
     _WHEEL_CACHE.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
     for url in urls:
-        dest = _WHEEL_CACHE / url.rsplit("/", 1)[-1]
+        # The asset URL percent-encodes the local-version `+` as %2B; decode it
+        # back so the cached filename is a valid wheel name installers accept.
+        dest = _WHEEL_CACHE / urllib.parse.unquote(url.rsplit("/", 1)[-1])
         if not dest.exists():
             _download(url, dest)
         paths.append(str(dest))
