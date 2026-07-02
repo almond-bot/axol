@@ -284,7 +284,6 @@ function PoseVisualizer() {
 type GrabSlot = "overhead" | "left" | "right"
 
 const FEED_DISTANCE = 1 // metres from the anchor point to the screens
-const FEED_HEIGHT = 1.05 // overhead plane height in metres (width from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
 // rather than sitting high in view.
 const FEED_Y = -0.175
@@ -292,6 +291,9 @@ const FEED_Y = -0.175
 const PIP_WIDTH = 0.5 // metres (height derives from aspect)
 const PIP_X = 0.72 // horizontal offset of each corner PiP
 const PIP_Y = -0.52 // vertical offset (lower corners)
+// Overhead plane width in metres (height derives from aspect). Kept to ~2× the
+// wrist PiP width so it reads as the primary feed without dominating the view.
+const OVERHEAD_WIDTH = PIP_WIDTH * 2
 // Per-screen resize limits, relative to each screen's default size.
 const MIN_SCALE = 0.3
 const MAX_SCALE = 4
@@ -301,6 +303,7 @@ const _raycaster = new THREE.Raycaster()
 _raycaster.layers.enableAll() // the stereo eye planes live on layers 1/2
 const _rayMatrix = new THREE.Matrix4()
 const _grabTarget = new THREE.Vector3()
+const _dragDelta = new THREE.Vector3()
 const _yawFwd = new THREE.Vector3()
 const _yAxis = new THREE.Vector3(0, 1, 0)
 // Per-hand controller ray (origin + forward), refreshed each frame so both the
@@ -344,9 +347,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const anchoredRef = useRef(false)
   // Per-hand active grab (trigger held while pointing at a plane), if any.
   // When both hands hold the same slot we resize it instead of dragging.
+  // `lastLocal` is the group-local point along the hand's ray (at the captured
+  // hit distance) as of the previous frame; dragging moves the screen by the
+  // frame-to-frame delta so the grab never snaps the screen onto the controller.
   const grabsRef = useRef<{
-    left: { slot: GrabSlot; distance: number } | null
-    right: { slot: GrabSlot; distance: number } | null
+    left: { slot: GrabSlot; distance: number; lastLocal: THREE.Vector3 } | null
+    right: { slot: GrabSlot; distance: number; lastLocal: THREE.Vector3 } | null
   }>({ left: null, right: null })
   // Active two-hand resize: the slot being scaled plus the hand separation and
   // screen scale captured when the second hand grabbed on.
@@ -591,28 +597,19 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // Overhead in the centre.
     if (oL && oR) {
       // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
-      fitHeight(leftMesh, leftMat, oL, FEED_HEIGHT, 0, FEED_Y, scaleOf("overhead"))
-      fitHeight(rightMesh, rightMat, oR, FEED_HEIGHT, 0, FEED_Y, scaleOf("overhead"))
+      fitWidth(leftMesh, leftMat, oL, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
+      fitWidth(rightMesh, rightMat, oR, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
       const eyes = (cam as THREE.ArrayCamera).cameras
       if (eyes && eyes.length >= 2) {
         eyes[0].layers.enable(1)
         eyes[1].layers.enable(2)
       }
     } else if (overheadMono) {
-      fitHeight(mesh, mat, overheadMono, FEED_HEIGHT, 0, FEED_Y, scaleOf("overhead"))
+      fitWidth(mesh, mat, overheadMono, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
     }
     // Wrist cams as bottom-corner PiPs (left → bottom-left, right → bottom-right).
     if (leftTex) fitWidth(aMesh, aMat, leftTex, PIP_WIDTH, -PIP_X, PIP_Y, scaleOf("left"))
     if (rightTex) fitWidth(bMesh, bMat, rightTex, PIP_WIDTH, PIP_X, PIP_Y, scaleOf("right"))
-
-    // The layout above set each visible plane's *base* (group-local) position;
-    // snapshot them before drag offsets are applied. The stereo eye planes are
-    // coincident, so "overhead" covers both.
-    const bases: Partial<Record<GrabSlot, THREE.Vector3>> = {}
-    if (mesh.visible) bases.overhead = mesh.position.clone()
-    if (leftMesh.visible) bases.overhead = leftMesh.position.clone()
-    if (aMesh.visible) bases.left = aMesh.position.clone()
-    if (bMesh.visible) bases.right = bMesh.position.clone()
 
     // Refresh each hand's pointing ray (origin + forward) in world space, so
     // both the single-hand drag and the two-hand resize can read either hand.
@@ -668,14 +665,35 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         const hit = hits[0]
         if (hit) {
           const slot = candidates.find((c) => c[0] === hit.object)?.[1]
-          if (slot) grabs[hand] = { slot, distance: hit.distance }
+          if (slot) {
+            // Anchor the drag at the current controller ray point (group-local)
+            // so dragging tracks relative motion instead of snapping the screen
+            // centre to wherever the ray happens to hit.
+            _grabTarget
+              .copy(_handRay[hand].origin)
+              .addScaledVector(_handRay[hand].dir, hit.distance)
+            group.worldToLocal(_grabTarget)
+            grabs[hand] = { slot, distance: hit.distance, lastLocal: _grabTarget.clone() }
+          }
         }
       }
     }
 
+    // Current group-local point along a hand's ray at its captured grab
+    // distance. Returns the shared `_grabTarget` scratch — copy before reuse.
+    const localRayPoint = (hand: "left" | "right", distance: number) => {
+      const ray = _handRay[hand]
+      _grabTarget.copy(ray.origin).addScaledVector(ray.dir, distance)
+      return group.worldToLocal(_grabTarget)
+    }
+
     // Two hands on the same screen → resize it by how far apart they are now
     // relative to when the second hand grabbed on. Otherwise each grabbing hand
-    // drags its screen along the ray at the captured distance.
+    // drags its screen by how far the controller moved since last frame.
+    //
+    // Either way we refresh every held hand's `lastLocal` each frame, so that
+    // transitioning between one and two hands (starting or ending a resize)
+    // never replays a stale delta that would snap the screen onto a controller.
     if (
       grabs.left &&
       grabs.right &&
@@ -692,17 +710,20 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         const next = rz.startScale * (sep / rz.startSep)
         scalesRef.current[slot] = Math.min(MAX_SCALE, Math.max(MIN_SCALE, next))
       }
+      // Keep drag anchors current without moving the screen while resizing.
+      grabs.left.lastLocal.copy(localRayPoint("left", grabs.left.distance))
+      grabs.right.lastLocal.copy(localRayPoint("right", grabs.right.distance))
     } else {
       resizeRef.current = null
       for (const hand of ["left", "right"] as const) {
         const grab = grabs[hand]
         const ray = _handRay[hand]
         if (!grab || !ray.valid) continue
-        const base = bases[grab.slot]
-        if (!base) continue
-        _grabTarget.copy(ray.origin).addScaledVector(ray.dir, grab.distance)
-        group.worldToLocal(_grabTarget)
-        dragOffsetsRef.current[grab.slot] = _grabTarget.clone().sub(base)
+        const cur = localRayPoint(hand, grab.distance) // shared scratch
+        _dragDelta.copy(cur).sub(grab.lastLocal)
+        grab.lastLocal.copy(cur)
+        const off = dragOffsetsRef.current[grab.slot] ?? new THREE.Vector3()
+        dragOffsetsRef.current[grab.slot] = off.add(_dragDelta)
       }
     }
 
@@ -724,7 +745,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   return (
     <>
       <group ref={groupRef} visible={false}>
-        <mesh ref={meshRef} position={[0, FEED_Y, -FEED_DISTANCE]} renderOrder={1}>
+        <mesh
+          ref={meshRef}
+          position={[0, FEED_Y, -FEED_DISTANCE]}
+          renderOrder={1}
+          visible={false}
+        >
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
         </mesh>
@@ -756,8 +782,11 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             depthWrite={false}
           />
         </mesh>
-        {/* Wrist-cam planes shown as bottom-corner PiPs (A = left, B = right). */}
-        <mesh ref={dualAMeshRef} renderOrder={1} visible={false}>
+        {/* Wrist-cam planes shown as bottom-corner PiPs (A = left, B = right).
+            Distinct renderOrders keep the paint order deterministic where the
+            PiPs overlap the overhead — without depth testing, equal orders let
+            three.js's distance sort flip coplanar planes and flicker. */}
+        <mesh ref={dualAMeshRef} renderOrder={2} visible={false}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={dualAMatRef}
@@ -766,7 +795,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             depthWrite={false}
           />
         </mesh>
-        <mesh ref={dualBMeshRef} renderOrder={1} visible={false}>
+        <mesh ref={dualBMeshRef} renderOrder={3} visible={false}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={dualBMatRef}
