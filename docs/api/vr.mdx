@@ -58,7 +58,9 @@ The WebRTC pose data channel (`almond_axol.vr.control_channel`) shares the same 
 
 The server can push a state override to all connected headsets at any time using `VRServer.broadcast_text()`. The headset interprets messages of the form `{"type": "state", "value": "saving"}` as a state override that blocks recording controls. `{"type": "state", "value": "error"}` shows an error indicator in the headset UI. `{"type": "state", "value": "data_collection"}` re-enables controls after saving. The `AxolVRTeleop.send_feedback_state(state)` helper wraps this for all `VRState` values.
 
-Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning the camera screens (a trigger gesture) while tracking is disengaged.
+On connect the server also announces its **operating mode** — `{"type": "mode", "value": "teleop" | "data_collection"}` — set via `VRServer.set_mode()`. The web UI uses it to **lock the HUD** to a single mode: [`axol teleop`](/cli/teleop) sends `teleop` (recording controls hidden), while [`axol collect-data`](/cli/collect-data) sends `data_collection` (recording enabled, but no switching back to plain teleop). The message is pushed once per client in the WebSocket accept handler, so a headset that joins mid-session still gets it.
+
+Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
 
 ## Camera video to the headset
 

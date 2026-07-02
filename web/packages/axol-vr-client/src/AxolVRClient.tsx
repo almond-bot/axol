@@ -2,6 +2,7 @@ import type { RefObject } from "react"
 import { useRef } from "react"
 import { useFrame, useThree } from "@react-three/fiber"
 import { AxolState } from "./types"
+import type { AxolMode } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
@@ -35,6 +36,7 @@ export function AxolVRClient({
   poseChannelRef,
   onStateChange,
   onPendingRecording,
+  onMode,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -49,6 +51,8 @@ export function AxolVRClient({
   poseChannelRef?: RefObject<RTCDataChannel | null>
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
+  // Called when the server announces its operating mode (once per connection).
+  onMode?: (mode: AxolMode) => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -62,6 +66,12 @@ export function AxolVRClient({
   const recordingPendingAtRef = useRef<number | null>(null)
   // Server-pushed state override (e.g. "saving"). Applied at start of each frame.
   const serverStateRef = useRef<AxolState | null>(null)
+  // Operating mode the server locked us to (null until announced). "teleop"
+  // hides mode-toggle + recording; "data_collection" allows recording but not
+  // toggling back to teleop.
+  const modeRef = useRef<AxolMode | null>(null)
+  // Server-pushed mode announcement, applied at the start of the next frame.
+  const serverModeRef = useRef<AxolMode | null>(null)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
 
@@ -77,6 +87,8 @@ export function AxolVRClient({
             const msg = JSON.parse(event.data as string) as { type: string; value: string }
             if (msg.type === "state") {
               serverStateRef.current = msg.value as AxolState
+            } else if (msg.type === "mode") {
+              serverModeRef.current = msg.value as AxolMode
             }
           } catch {
             // ignore malformed messages
@@ -114,6 +126,30 @@ export function AxolVRClient({
     prevARef.current = aPressed
     prevBRef.current = bPressed
 
+    const state0 = stateRef.current
+
+    function setState(next: AxolState) {
+      stateRef.current = next
+      onStateChange?.(next)
+    }
+
+    // Apply the server's mode announcement: lock the session to it. Teleop can
+    // never enter data collection / recording; data collection can't fall back
+    // to plain teleop. Done before the state override + button handling below.
+    if (serverModeRef.current !== null) {
+      const mode = serverModeRef.current
+      serverModeRef.current = null
+      modeRef.current = mode
+      if (mode === "teleop") {
+        if (state0 !== AxolState.Teleop) setState(AxolState.Teleop)
+        recordingPendingAtRef.current = null
+        onPendingRecording?.(null)
+      } else if (mode === "data_collection" && state0 === AxolState.Teleop) {
+        setState(AxolState.DataCollection)
+      }
+      onMode?.(mode)
+    }
+
     // Apply server-pushed state override before processing button presses.
     if (serverStateRef.current !== null) {
       const next = serverStateRef.current
@@ -129,11 +165,10 @@ export function AxolVRClient({
 
     const state = stateRef.current
     const isSaving = state === AxolState.Saving
-
-    function setState(next: AxolState) {
-      stateRef.current = next
-      onStateChange?.(next)
-    }
+    // Recording (and thus the data-collection state machine) only exists in
+    // data-collection mode. In teleop mode A/B do nothing. Until the server
+    // announces a mode we keep the legacy behaviour (recording allowed).
+    const canRecord = modeRef.current !== "teleop"
 
     const isPending = recordingPendingAtRef.current !== null
 
@@ -148,18 +183,22 @@ export function AxolVRClient({
       }
     }
 
-    // Y (left) — exit XR
+    // Y (left) — return home, disable, then exit XR. Piggy-back a reset on this
+    // frame (same as X) so the backend plans a move back to rest and disengages
+    // before we end the session; otherwise the arms hold the last commanded pose
+    // and jerk when teleop is next entered. The session is ended only after the
+    // frame carrying this reset is sent below (see the exit-on-send paths).
     if (yEdge) {
-      onExit?.()
+      reset = true
     }
 
-    // B (right) — swap teleop ↔ data_collection (disabled when recording, pending, or saving)
-    if (bEdge && state !== AxolState.Recording && !isPending && !isSaving) {
-      setState(state === AxolState.Teleop ? AxolState.DataCollection : AxolState.Teleop)
-    }
+    // B (right) — previously toggled teleop ↔ data_collection. The mode is now
+    // fixed by the server (see modeRef), so B is intentionally inert.
+    void bEdge
 
     // A — start pending (3s countdown) or stop recording; blocked while saving
-    if (aEdge && !isSaving) {
+    // and entirely unavailable in teleop mode (nothing records there).
+    if (aEdge && !isSaving && canRecord) {
       if (state === AxolState.Recording) {
         setState(AxolState.DataCollection)
       } else if (state === AxolState.DataCollection && !isPending) {
@@ -190,7 +229,11 @@ export function AxolVRClient({
     // reading poses.
     const usbSink = pickUsbSink(poseWsRef)
     const netSink = pickNetworkSink(poseChannelRef, wsRef)
-    if (usbSink == null && netSink == null) return
+    if (usbSink == null && netSink == null) {
+      // No transport to carry the reset — just leave XR (nothing to update).
+      if (yEdge) onExit?.()
+      return
+    }
 
     function getPose(space: XRSpace | null | undefined) {
       if (!space) return null
@@ -214,13 +257,20 @@ export function AxolVRClient({
     const l_ee = getPose(leftSource?.targetRaySpace)
     const r_ee = getPose(rightSource?.targetRaySpace)
 
-    if (!l_ee || !r_ee) return
+    if (!l_ee || !r_ee) {
+      // Lost controller tracking — can't ship a pose frame; leave XR anyway.
+      if (yEdge) onExit?.()
+      return
+    }
 
     const body = (frame as XRFrame & { body?: XRBody }).body
     const l_elbow = getPosition(body?.get(L_ELBOW_JOINT))
     const r_elbow = getPosition(body?.get(R_ELBOW_JOINT))
 
-    if (!l_elbow || !r_elbow) return
+    if (!l_elbow || !r_elbow) {
+      if (yEdge) onExit?.()
+      return
+    }
 
     const l_grip = 1 - (leftSource?.gamepad?.buttons[0]?.value ?? 0)
     const r_grip = 1 - (rightSource?.gamepad?.buttons[0]?.value ?? 0)
@@ -249,6 +299,10 @@ export function AxolVRClient({
     })
     usbSink?.send(payload)
     netSink?.send(payload)
+
+    // End the XR session only now that the Y-press reset frame has been sent, so
+    // the backend receives the return-to-rest before the pose stream stops.
+    if (yEdge) onExit?.()
   })
 
   return null
