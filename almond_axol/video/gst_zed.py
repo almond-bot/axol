@@ -427,7 +427,7 @@ def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
 # headset stream is only a live monitor, so we drop its encoder bitrate while
 # recording: fewer bits -> fewer RTP packets -> proportionally less SRTP/send CPU,
 # handing the event loop back its headroom. The recorded dataset video is a
-# separate NVENC pipeline at full (constant-QP) quality, so training data is
+# separate NVENC pipeline at full (capped-VBR) quality, so training data is
 # unaffected.
 _RECORDING_ENC_BITRATE_SCALE = 0.5
 
