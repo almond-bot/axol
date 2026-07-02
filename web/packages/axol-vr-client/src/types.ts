@@ -8,6 +8,14 @@ export enum AxolState {
   Error = "error",
 }
 
+/**
+ * Operating mode the server locks the headset HUD to, pushed once on connect as
+ * `{"type":"mode","value":...}`. "teleop" (from `axol teleop`) hides the
+ * data-collection + recording controls; "data_collection" (from `axol
+ * collect-data`) allows recording but not switching back to plain teleop.
+ */
+export type AxolMode = "teleop" | "data_collection"
+
 export enum AxolConnectionStatus {
   Idle = "idle",
   Connecting = "connecting",

@@ -204,6 +204,9 @@ class AxolVRTeleop(Teleoperator):
     ) -> None:
         self._vr_server = VRServer(self.config.vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
+        # Lock the headset HUD to data collection: the operator can record
+        # episodes but can't switch back to plain teleop.
+        self._vr_server.set_mode("data_collection")
         await self._vr_server.enable()
 
         ctx = multiprocessing.get_context("spawn")

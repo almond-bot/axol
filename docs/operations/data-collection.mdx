@@ -5,7 +5,7 @@ description: "Record VR teleoperation episodes to a LeRobot dataset — from the
 
 Data collection records teleoperation episodes — joint trajectories plus synchronized camera frames — into a [LeRobot](/api/lerobot) dataset you can later train on. Everything runs on **one machine**: the computer wired to the robot with the ZED cameras attached (typically a ZED Box / Jetson). Because it owns the dataset, runs teleop, and captures the cameras locally, every recorded frame and joint sample shares the same clock — no time sync to set up.
 
-You drive the arms over VR exactly as in [teleoperation](/operations/teleop); the extra **A** (record) and **B** (mode) controller buttons start and save takes. You can launch it from the **web control panel** or the **CLI** (`axol collect-data`).
+You drive the arms over VR exactly as in [teleoperation](/operations/teleop); the session runs in **data collection** mode, where the **A** (record) controller button starts and saves takes. You can launch it from the **web control panel** or the **CLI** (`axol collect-data`).
 
 ## Before you start
 
@@ -42,7 +42,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
     </Steps>
 
     <Note>
-      **Collect Data has no on-screen episode buttons** — takes are driven from the VR controller (**A** to record/save, **X** to discard, **B** to switch modes).
+      **Collect Data has no on-screen episode buttons** — takes are driven from the VR controller (**A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle.
     </Note>
   </Tab>
 
@@ -68,7 +68,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
 
 ## Controller layout
 
-Episodes are driven entirely from the Quest controllers. The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** (record) and **B** (mode) buttons.
+Episodes are driven entirely from the Quest controllers. The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** (record) button. The session is locked to data collection mode, so there's no mode toggle to worry about.
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 
@@ -76,13 +76,12 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 |---|---|---|
 | 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** (toggle, not hold) |
 | 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper |
-| 4 | Right trigger | Actuate right gripper |
+| 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
+| 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
 | 5 | X | **Reset** to rest pose. During a recording, stops and **discards** the take; during the start countdown, cancels it |
 | 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
 | 7 | Y | **Exit** the VR session |
-| 8 | B | Toggle between **Teleop** and **Data Collection** mode (disabled while recording or counting down) |
-| — | Right thumbstick | Flick to **switch camera view** (overhead / wrists / split); click to reset the screens — see [Camera views](/guides/vr-interface#camera-views) |
+| — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes; see [Camera views](/guides/vr-interface#camera-views) |
 
 <Note>
   The camera feeds are relayed to the headset during collection, so you can line up takes from the robot's point of view.
@@ -91,8 +90,8 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 ## Recording an episode
 
 <Steps>
-  <Step title="Enter Data Collection mode">
-    Press **B** to switch from Teleop into Data Collection. You can drive the arms in either mode, but a take can only be started from Data Collection.
+  <Step title="Drive to the start pose">
+    The session is already in **Data Collection** — put on the headset, engage tracking, and drive the arms to where you want the take to begin.
   </Step>
 
   <Step title="Start a take">
@@ -109,7 +108,6 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 
 | Headset state | Meaning |
 |---|---|
-| `Teleop` | Driving the arms; recording not armed |
 | `Data Collection` | Driving the arms; ready to record |
 | `Recording` | Capturing frames to the dataset |
 | `Saving` | Episode being written to disk; controls blocked |
