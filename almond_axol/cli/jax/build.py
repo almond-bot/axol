@@ -183,8 +183,13 @@ def _compute_capability(override: str | None) -> str | None:
         return override
     soc = _tegra_soc()
     if soc is not None:
-        return _TEGRA_SM.get(soc)
-    # Discrete GPU: nvidia-smi reports e.g. "8.7".
+        sm = _TEGRA_SM.get(soc)
+        if sm is not None:
+            return sm
+        # Unmapped / newer Tegra: fall through to nvidia-smi below rather than
+        # giving up (some boards do report compute_cap); else run() errors with
+        # a clear "pass --compute" message.
+    # Discrete GPU (or unmapped Tegra): nvidia-smi reports e.g. "8.7".
     smi = shutil.which("nvidia-smi")
     if smi is not None:
         try:
@@ -432,6 +437,12 @@ def _run_build(
     src: Path, *, compute: str, cuda: str, cudnn: str, clang: str, jobs: int
 ) -> None:
     """Invoke ``build/build.py`` to produce the three CUDA wheels."""
+    # The source tree (and its dist/) is reused across runs, so clear any wheels
+    # from an earlier JAX version / CUDA major first — otherwise _built_wheels
+    # would glob them in and install a conflicting mix.
+    dist = src / "dist"
+    for stale in dist.glob("*.whl"):
+        stale.unlink()
     cmd = [
         sys.executable,
         str(src / "build" / "build.py"),
@@ -582,8 +593,14 @@ def _patch_plugin_rpath() -> None:
     both freshly-built and downloaded-prebuilt wheels regardless of venv path.
     """
     site = _site_packages()
-    plugin_dir = site / "jax_plugins" / f"xla_cuda{_cuda_major(None) or '12'}"
-    so_files = list(plugin_dir.glob("*.so"))
+    # Patch whichever xla_cudaNN plugin actually got installed (glob rather than
+    # recomputing the major, which could differ from the wheels under --cuda-
+    # version and leave the real plugin unpatched).
+    so_files = [
+        so
+        for plugin_dir in (site / "jax_plugins").glob("xla_cuda*")
+        for so in plugin_dir.glob("*.so")
+    ]
     nvidia = site / "nvidia"
     if not so_files or not nvidia.is_dir():
         return

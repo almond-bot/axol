@@ -148,9 +148,16 @@ def _detect_cuda_major() -> int | None:
     return None
 
 
-def _extra_for_major(major: int) -> int:
-    """Clamp a detected CUDA major to the nearest JAX pip extra we can install."""
-    return max(_MIN_CUDA_MAJOR, min(major, _MAX_CUDA_MAJOR))
+def _extra_for_major(major: int) -> int | None:
+    """JAX pip extra major for a detected CUDA major, or ``None`` if too old.
+
+    Below the minimum there's no usable wheel, so skip the GPU install (CPU).
+    Above the maximum, install the newest extra — a newer driver is forward-
+    compatible with the bundled CUDA runtime.
+    """
+    if major < _MIN_CUDA_MAJOR:
+        return None
+    return min(major, _MAX_CUDA_MAJOR)
 
 
 def _plugin_installed(major: int) -> bool:
@@ -195,6 +202,12 @@ def run(_args: object = None) -> None:
         return
 
     major = _extra_for_major(detected)
+    if major is None:
+        print(
+            f"Detected CUDA {detected}, but JAX needs CUDA >= {_MIN_CUDA_MAJOR}; "
+            "skipping JAX GPU install. JAX will run on CPU."
+        )
+        return
     if major != detected:
         print(
             f"Detected CUDA {detected}; installing the nearest supported JAX "
