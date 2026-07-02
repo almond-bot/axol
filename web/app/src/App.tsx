@@ -1161,19 +1161,17 @@ export default function App() {
   // blips are unaffected: the retry loop keeps the session alive unless all
   // retries are exhausted. (Y itself is no help here — its exit path still
   // works, but the user doesn't know they need to press it.)
-  //
-  // Mirrors `status` for the XR-store subscription below: that callback fires
-  // synchronously on store changes, which can land after a reconnect flipped
-  // the status but before React has re-run the effect cleanup — reading the
-  // ref at call time stops a stale subscription from ending a healthy session.
-  const statusRef = useRef(status)
-  useEffect(() => {
-    statusRef.current = status
-  }, [status])
   useEffect(() => {
     if (status !== AxolConnectionStatus.Failed) return
     const endSessionOnDeadLink = () => {
-      if (statusRef.current !== AxolConnectionStatus.Failed) return
+      // Re-check the live transport at call time, not React state: the store
+      // subscription below fires synchronously and can land after a reconnect
+      // began but before React has re-rendered `status` and cleaned up this
+      // effect (any mirror of React state is equally stale in that window).
+      // `useAxolVRClient` assigns `wsRef.current` synchronously the moment a
+      // connect starts and guarantees it is null in the Failed state, so a
+      // non-null socket means the link is recovering — don't end the session.
+      if (wsRef.current !== null) return
       void store.getState().session?.end()
     }
     // End an already-presenting session now, and subscribe for one appearing
@@ -1183,7 +1181,7 @@ export default function App() {
     // link and be stuck exactly the way this exit is meant to prevent.
     endSessionOnDeadLink()
     return store.subscribe(endSessionOnDeadLink)
-  }, [status])
+  }, [status, wsRef])
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
