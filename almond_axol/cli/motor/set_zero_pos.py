@@ -1,9 +1,11 @@
 """
 axol motor.set-zero-pos
 
-Set the zero position of a single motor, or walk every arm joint with
-``--guided`` and zero each one against its closer end stop. The current
-mechanical position becomes the new zero reference (persisted to flash).
+Set the zero position of a single motor, or use ``--guided`` to zero every
+arm joint against its closer end stop. Guided mode first captures an in-range
+start reference for all joints at once, then walks each joint to its end stop
+and zeros it. The current mechanical position becomes the new zero reference
+(persisted to flash).
 
 Note: each motor's encoder zero is calibrated at one of the joint's
 mechanical END STOPS, not at the robot's rest position. ``AxolArm`` adds a
@@ -120,22 +122,17 @@ def _fmt(rad: float) -> str:
 
 
 async def _calibrate_joint(
-    motor: Motor, joint: Joint, target_rad: float, expected_sign: int
+    motor: Motor, joint: Joint, p_start: float, target_rad: float, expected_sign: int
 ) -> bool:
-    """Zero one joint at its closer end stop. Returns ``True`` on success."""
+    """Zero one joint at its closer end stop, measured from a pre-captured
+    in-range ``p_start`` reference. Returns ``True`` on success."""
     target_deg = math.degrees(target_rad)
     direction = "−" if expected_sign < 0 else "+"
     print(f"\n— {joint.name}  →  end stop {target_deg:+.1f}° ({direction} motion) —")
+    print(f"     start: {_fmt(p_start)}")
 
     while True:
-        if not _prompt("  1) hold the joint inside its range, then Enter: "):
-            return False
-        p_start = await motor.get_position()
-        print(f"     start: {_fmt(p_start)}")
-
-        if not _prompt(
-            f"  2) move to the END STOP at {target_deg:+.1f}°, then Enter: "
-        ):
+        if not _prompt(f"  move to the END STOP at {target_deg:+.1f}°, then Enter: "):
             return False
         p_end = await motor.get_position()
         print(f"     end:   {_fmt(p_end)}")
@@ -179,13 +176,32 @@ async def _run_guided(args: argparse.Namespace) -> None:
     print(f"\nset-zero-pos --guided — {side} arm  ({channel})")
 
     async with CanBus(channel) as bus:
+        motors = {joint: Motor(bus, joint) for joint in ARM_JOINTS}
+
+        # Capture an in-range start reference for every joint up front, so the
+        # operator positions the whole arm once rather than once per joint.
+        if not _prompt(
+            "\nhold EVERY joint somewhere inside its range (away from the end"
+            " stops), then Enter: "
+        ):
+            print("\naborted.")
+            return
+        starts = dict(
+            zip(
+                ARM_JOINTS,
+                await asyncio.gather(*[motors[j].get_position() for j in ARM_JOINTS]),
+            )
+        )
+        for joint in ARM_JOINTS:
+            print(f"  {joint.name:<12} start: {_fmt(starts[joint])}")
+
         results: list[tuple[Joint, bool]] = []
         any_damiao = False
         for joint in ARM_JOINTS:
             target, sign = closer_end_stop(joint, is_left)
-            motor = Motor(bus, joint)
+            motor = motors[joint]
             try:
-                ok = await _calibrate_joint(motor, joint, target, sign)
+                ok = await _calibrate_joint(motor, joint, starts[joint], target, sign)
             except KeyboardInterrupt:
                 print("\naborted.")
                 break
