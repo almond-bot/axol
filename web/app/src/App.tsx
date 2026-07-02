@@ -343,6 +343,10 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // good frame on screen through brief dropouts instead of cutting to
   // passthrough (see `liveTex`).
   const shownRef = useRef<Record<string, boolean>>({})
+  // Last known good aspect ratio per texture. During a brief stall `videoWidth`
+  // reads 0, so we reuse the cached aspect instead of falling back to 16:9 —
+  // otherwise the plane resizes for a frame and its edges flash passthrough.
+  const aspectRef = useRef<Record<string, number>>({})
   // Whether the screen group has been world-anchored for this XR session.
   const anchoredRef = useRef(false)
   // Per-hand active grab (trigger held while pointing at a plane), if any.
@@ -419,6 +423,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       for (const tex of Object.values(textures)) tex.dispose()
       for (const video of Object.values(videos)) video.srcObject = null
       shownRef.current = {}
+      aspectRef.current = {}
     }
   }, [])
 
@@ -441,6 +446,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       delete videos[name]
     }
     shownRef.current = {}
+    aspectRef.current = {}
   }, [session])
 
   // Confine the stereo eye planes to their lens via three.js layers: an object
@@ -566,6 +572,19 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     bMesh.visible = false
     if (!group.visible) return
 
+    // Aspect ratio of a feed's video, cached per texture. While a stream stalls
+    // `videoWidth`/`videoHeight` read 0; reuse the last good aspect so the plane
+    // keeps its size (and its edges don't flash passthrough) until the sticky
+    // texture resumes. Falls back to 16:9 only before the first decoded frame.
+    const aspectOf = (t: THREE.VideoTexture) => {
+      const v = t.image as HTMLVideoElement | undefined
+      if (v && v.videoWidth && v.videoHeight) {
+        const a = v.videoWidth / v.videoHeight
+        aspectRef.current[t.uuid] = a
+        return a
+      }
+      return aspectRef.current[t.uuid] ?? 16 / 9
+    }
     // Place a plane sized to a target height (width from the video aspect),
     // times the slot's user resize factor.
     const fitHeight = (
@@ -577,8 +596,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       y: number,
       scale: number
     ) => {
-      const v = t.image as HTMLVideoElement | undefined
-      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
+      const aspect = aspectOf(t)
       if (mt.map !== t) {
         mt.map = t
         mt.needsUpdate = true
@@ -598,8 +616,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       y: number,
       scale: number
     ) => {
-      const v = t.image as HTMLVideoElement | undefined
-      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
+      const aspect = aspectOf(t)
       fitHeight(m, mt, t, width / aspect, x, y, scale)
       m.scale.x = width * scale
     }
