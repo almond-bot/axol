@@ -47,8 +47,10 @@ _ARM_JOINT_URDF_SUFFIX: dict[Joint, str] = {
     Joint.WRIST_3: "w2_0",
 }
 
-# Body driven by each joint. ``Joint.GRIPPER`` maps to the (fixed-jointed)
-# gripper link itself; MuJoCo merges this body into ``*_w2`` at load time.
+# Body driven by each joint. ``Joint.GRIPPER`` maps to the gripper *base* link
+# (``*_gripper``), which is fixed-jointed to ``*_w2`` and carries the two
+# prismatic finger links as children. It is also the end-effector frame used by
+# the IK solver and forward kinematics.
 _BODY_URDF_SUFFIX: dict[Joint, str] = {
     Joint.SHOULDER_1: "s2",
     Joint.SHOULDER_2: "s3",
@@ -59,6 +61,12 @@ _BODY_URDF_SUFFIX: dict[Joint, str] = {
     Joint.WRIST_3: "w2",
     Joint.GRIPPER: "gripper",
 }
+
+# Actuated (non-mimic) prismatic finger joint that drives each gripper open and
+# closed in the URDF. The opposing finger mimics this joint. ``GRIPPER_URDF_OPEN``
+# is its travel limit (m): 0 = fully closed, ``GRIPPER_URDF_OPEN`` = fully open.
+_GRIPPER_JOINT_SUFFIX: str = "gripper_joint_a"
+GRIPPER_URDF_OPEN: float = 0.058804
 
 
 def urdf_joint_name(joint: Joint, *, is_left: bool) -> str:
@@ -84,6 +92,21 @@ def urdf_body_name(joint: Joint, *, is_left: bool) -> str:
     """
     side = "left" if is_left else "right"
     return f"{side}_{_BODY_URDF_SUFFIX[joint]}"
+
+
+def urdf_gripper_joint_name(*, is_left: bool) -> str:
+    """URDF prismatic finger joint that actuates the gripper on the given arm.
+
+    This is the single non-mimic finger joint (the opposing finger mimics it);
+    driving it from ``0`` to :data:`GRIPPER_URDF_OPEN` moves the gripper from
+    fully closed to fully open.
+
+    Example::
+
+        urdf_gripper_joint_name(is_left=True) == "left_gripper_joint_a"
+    """
+    side = "left" if is_left else "right"
+    return f"{side}_{_GRIPPER_JOINT_SUFFIX}"
 
 
 def urdf_arm_joint_names(*, is_left: bool) -> list[str]:
