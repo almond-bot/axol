@@ -35,10 +35,23 @@ _TORSO_LINKS: tuple[str, ...] = ("base", "s1")
 Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 """
 
+_LOWER_ARM_BODY_SUFFIXES: tuple[str, ...] = ("s3", "e1", "e2")
+"""Arm-link suffixes for the lower forearm / elbow region.
+
+These links sit closest to the torso when the arm folds inward and are the
+ones that drive into the ``base``. Pairs involving these links get a larger
+self-collision margin so the elbow keeps real clearance from the base, while
+the distal links (``w0``/``w1``/``w2``/``gripper``) keep a smaller margin so
+the arm's outward range of motion is preserved.
+"""
+
 
 def _build_robot_collision(
-    urdf: yourdfpy.URDF, robot: pk.Robot
-) -> pk.collision.RobotCollision:
+    urdf: yourdfpy.URDF,
+    robot: pk.Robot,
+    *,
+    prune_home_penetration: bool = True,
+) -> tuple[pk.collision.RobotCollision, np.ndarray]:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
     Each Axol arm is a serial chain attached to a static torso (``base`` +
@@ -51,10 +64,25 @@ def _build_robot_collision(
     pairs are filtered out (cross-arm contacts are unreachable, within-arm
     is constrained by joint limits, and torso<->torso is rigidly fixed).
 
-    A second pass excludes any remaining pair that is already penetrating
-    at the home pose — those are over-conservative capsule fits the IK
-    can never separate (e.g. ``base <-> shoulder`` capsules that overlap
-    by construction because the arms mount onto the torso).
+    When ``prune_home_penetration`` is ``True`` a second pass excludes any
+    remaining pair that is already penetrating at the home pose. Those are
+    over-conservative capsule fits a plain (absolute-margin) self-collision
+    cost can never separate (e.g. ``base <-> shoulder`` capsules that overlap
+    by construction because the arms mount onto the torso). This mode is used
+    for the reset trajectory planner, which uses pyroki's absolute-margin
+    cost.
+
+    When ``prune_home_penetration`` is ``False`` *all* torso<->arm pairs are
+    kept active — including the lower-arm pairs (``*_e1``/``*_e2``/``*_s3``
+    vs ``base``/``s1``) that the home-pose prune would otherwise drop. This
+    mode is used by the IK solver, which references each pair's distance
+    against its (collision-free) home-pose distance, so the capsule-fit bias
+    that makes those pairs look penetrating at home is cancelled out.
+
+    Returns:
+        Tuple ``(rc, home_distances)`` where ``home_distances`` is the per-pair
+        signed distance at the home pose, aligned to ``rc.active_idx_i`` /
+        ``rc.active_idx_j``.
     """
     link_names = [link.name for link in urdf.robot.links]
 
@@ -74,17 +102,51 @@ def _build_robot_collision(
     rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
     q0 = jnp.zeros(robot.joints.num_actuated_joints)
     d = np.asarray(rc.compute_self_collision_distance(robot, q0))
+
+    if prune_home_penetration:
+        ai = np.asarray(rc.active_idx_i)
+        aj = np.asarray(rc.active_idx_j)
+        for k in np.where(d < 0.0)[0]:
+            ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
+        rc = pk.collision.RobotCollision.from_urdf(
+            urdf, user_ignore_pairs=tuple(ignore)
+        )
+        d = np.asarray(rc.compute_self_collision_distance(robot, q0))
+
+    _logger.info(
+        "RobotCollision: %d torso<->arm pairs%s.",
+        len(rc.active_idx_i),
+        " (home-pose penetrating pairs pruned)" if prune_home_penetration else "",
+    )
+    return rc, d.astype(np.float32)
+
+
+def _build_pair_collision_params(
+    rc: pk.collision.RobotCollision, config: KinematicsConfig
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pair self-collision margins/weights aligned to ``rc.active_idx_i/j``.
+
+    Lower-arm pairs (forearm/elbow vs torso) get the larger
+    ``lower_arm_collision_*`` knobs; everything else gets the
+    ``distal_collision_*`` knobs. Margins are interpreted relative to each
+    pair's home-pose distance by :func:`_home_referenced_self_collision_cost`.
+    """
     ai = np.asarray(rc.active_idx_i)
     aj = np.asarray(rc.active_idx_j)
-    for k in np.where(d < 0.0)[0]:
-        ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
-
-    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
-    _logger.info(
-        "RobotCollision: restricted to %d torso<->arm pairs.",
-        len(rc.active_idx_i),
-    )
-    return rc
+    margins = np.empty(len(ai), dtype=np.float32)
+    weights = np.empty(len(ai), dtype=np.float32)
+    for k in range(len(ai)):
+        a = rc.link_names[ai[k]]
+        b = rc.link_names[aj[k]]
+        arm = b if a in _TORSO_LINKS else a
+        suffix = arm.split("_", 1)[1] if "_" in arm else arm
+        if suffix in _LOWER_ARM_BODY_SUFFIXES:
+            margins[k] = config.lower_arm_collision_margin
+            weights[k] = config.lower_arm_collision_weight
+        else:
+            margins[k] = config.distal_collision_margin
+            weights[k] = config.distal_collision_weight
+    return margins, weights
 
 
 # Convenience aliases for URDF link / joint names. The single source of
@@ -102,6 +164,41 @@ _RIGHT_SHOULDER = urdf_body_name(Joint.SHOULDER_1, is_left=False)
 # match the ordering assumed by rest_pose / motion_control.
 _LEFT_JOINT_NAMES = urdf_arm_joint_names(is_left=True)
 _RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
+
+
+# ---------------------------------------------------------------------------
+# Home-referenced self-collision cost
+# ---------------------------------------------------------------------------
+
+
+def _home_referenced_self_collision_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
+    joint_var: jaxls.Var,
+    home_distances: jax.Array,
+    margins: jax.Array,
+    weights: jax.Array,
+) -> jax.Array:
+    """Self-collision residual measured relative to the home-pose distance.
+
+    pyroki's single-capsule-per-link PCA fit has a systematic per-pair bias:
+    some torso<->arm capsule pairs read as slightly penetrating at the
+    (physically collision-free) home pose. Subtracting each pair's home
+    distance cancels that bias, so a per-pair ``margin`` becomes meaningful
+    clearance *beyond* the home configuration regardless of the raw capsule
+    fit. The residual is ``>0`` when a pair is closer than ``margin`` beyond
+    its home distance.
+    """
+    cfg = vals[joint_var]
+    active = robot_coll.compute_self_collision_distance(robot, cfg)
+    referenced = active - home_distances
+    return -(pk.collision.colldist_from_sdf(referenced, margins) * weights).flatten()
+
+
+_home_referenced_self_collision_cost = jaxls.Cost.factory(
+    _home_referenced_self_collision_residual
+)
 
 
 # ---------------------------------------------------------------------------
@@ -129,8 +226,9 @@ def _solve_ik(
     posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
-    self_collision_margin: float,
-    self_collision_weight: float,
+    coll_home_distances: jax.Array,
+    coll_margins: jax.Array,
+    coll_weights: jax.Array,
     elbow_weight: float,
     max_iterations: int,
     cost_tolerance: float,
@@ -198,12 +296,13 @@ def _solve_ik(
 
     costs.append(pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight))
     costs.append(
-        pk.costs.self_collision_cost(
+        _home_referenced_self_collision_cost(
             robot,
             robot_coll,
             JointVar(0),
-            margin=self_collision_margin,
-            weight=self_collision_weight,
+            coll_home_distances,
+            coll_margins,
+            coll_weights,
         )
     )
 
@@ -351,7 +450,26 @@ class KinematicsSolver:
         _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
-        self.robot_coll = _build_robot_collision(urdf, self.robot)
+
+        # Reset trajectory planner uses pyroki's absolute-margin self-collision
+        # cost, so it relies on the home-pose prune to stay feasible at rest.
+        self.robot_coll, _ = _build_robot_collision(
+            urdf, self.robot, prune_home_penetration=True
+        )
+
+        # The IK solver keeps every torso<->arm pair active (including the
+        # lower forearm/elbow pairs the prune would drop) and references each
+        # pair against its home-pose distance, so the elbow is constrained
+        # against the base without pushing the whole arm outward.
+        self._ik_robot_coll, ik_home_distances = _build_robot_collision(
+            urdf, self.robot, prune_home_penetration=False
+        )
+        self._coll_home_distances = jnp.asarray(ik_home_distances, dtype=jnp.float32)
+        ik_margins, ik_weights = _build_pair_collision_params(
+            self._ik_robot_coll, config
+        )
+        self._coll_margins = jnp.asarray(ik_margins, dtype=jnp.float32)
+        self._coll_weights = jnp.asarray(ik_weights, dtype=jnp.float32)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -488,7 +606,7 @@ class KinematicsSolver:
 
         q_result = _solve_ik(
             self.robot,
-            self.robot_coll,
+            self._ik_robot_coll,
             target_L,
             target_R,
             self._l_ee_idx_jax,
@@ -505,8 +623,9 @@ class KinematicsSolver:
             cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
-            cfg.self_collision_margin,
-            cfg.self_collision_weight,
+            self._coll_home_distances,
+            self._coll_margins,
+            self._coll_weights,
             cfg.elbow_weight,
             cfg.max_iterations,
             cfg.cost_tolerance,
