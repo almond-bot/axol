@@ -398,7 +398,9 @@ class _CameraH264Muxer:
         :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`),
         so no trailing guard frame is added here — an extra frame would shift the
         index-based alignment of every later episode in the concatenated file.
-        Image-normalization stats are then decoded from the just-written file.
+        Image-normalization stats come from the live keyframe-decode worker,
+        falling back to decoding the just-written file if the worker produced
+        nothing.
 
         Raises if the pipeline errored or never delivered EOS: the mp4 may be
         truncated (moov missing or short), and returning it as a success would

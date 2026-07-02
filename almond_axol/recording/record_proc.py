@@ -542,7 +542,6 @@ def _patch_embed_images_skip() -> None:
     dataset actually has an ``Image`` column. Idempotent.
     """
     import datasets as hf_datasets
-
     import lerobot.datasets.dataset_writer as _dw
 
     if getattr(_dw, "_axol_embed_images_skip", False):
@@ -571,9 +570,8 @@ def _patch_frame_validation() -> None:
     frame is still caught); everything else (feature presence, state/action dtype
     and shape, the RGB fallback path) is unchanged. Idempotent.
     """
-    import numpy as np
-
     import lerobot.datasets.feature_utils as _fu
+    import numpy as np
 
     if getattr(_fu, "_axol_nv12_validation", False):
         return
