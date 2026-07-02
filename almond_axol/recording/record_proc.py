@@ -35,6 +35,7 @@ import platform
 import shutil
 import threading
 import time
+from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -115,49 +116,116 @@ def _tune_software_encoder() -> None:
     )
 
 
-def _concatenate_video_files_rebased(
-    input_video_paths: list,
-    output_video_path: "Path | str",
-    overwrite: bool = True,
-    compatibility_check: bool = False,
-) -> None:
-    """Stream-copy concat that re-bases each segment's timestamps (drop-in for
-    LeRobot's ``concatenate_video_files``).
+def _concat_probe_constant_fps(input_video_paths: list) -> "Fraction | None":
+    """Return the common frame rate if the inputs are safe to re-stamp onto an
+    exact constant-fps grid, else ``None`` (caller falls back to shift-rebase).
 
-    LeRobot appends each new episode's video to the running per-key chunk file
-    (``save_episode`` on episode index >= 1). Its stock implementation feeds both
-    segments through PyAV's ``concat`` demuxer and copies packets verbatim, trusting
-    the demuxer to offset the later segment past the first. With our NVENC mp4
-    segments that offset isn't applied, so at the segment boundary the muxer's DTS
-    jumps backwards (e.g. ``734200 >= 367200``) and libav aborts:
-
-        non monotonically increasing dts to muxer in stream 0
-        [Errno 22] Invalid argument: '/tmp/tmpXXXX.mp4'
-
-    which surfaces as ``recorder save_episode failed`` and loses the episode.
-
-    Instead, open each input independently and shift every packet so each segment
-    starts exactly where the previous one ended (per output stream, in the output
-    stream's time_base). Within a segment timestamps are already monotonic, so the
-    concatenated stream is monotonic by construction — independent of whatever
-    start offset / duration metadata the source segments carry. PTS-vs-DTS
-    spacing is preserved, so B-frame reordering survives.
+    Safe means every input is a single video stream (no audio/subtitle) with no
+    B-frames (every packet ``pts == dts``), i.e. our recorder's IPPP mp4 segments,
+    where demux order equals display order so frame *k* can be stamped at exactly
+    ``k / fps``. The rate is inferred from the first segment's median PTS delta
+    (our muxer's mp4 timescale rounds ``1/fps``, so no single delta is exact, but
+    the median is), falling back to the stream's advertised ``average_rate``.
     """
-    import tempfile
-    from fractions import Fraction
-    from pathlib import Path
+    import statistics
 
     import av
 
-    output_video_path = Path(output_video_path)
-    if output_video_path.exists() and not overwrite:
-        _logger.warning(
-            "Video file already exists: %s. Skipping concatenation.", output_video_path
-        )
-        return
-    if len(input_video_paths) == 0:
-        raise FileNotFoundError("No input video paths provided.")
-    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    fps: Fraction | None = None
+    for input_path in input_video_paths:
+        with av.open(str(input_path), mode="r") as src:
+            videos = [s for s in src.streams if s.type == "video"]
+            if len(videos) != 1 or any(
+                s.type in ("audio", "subtitle") for s in src.streams
+            ):
+                return None
+            vstream = videos[0]
+            secs: list[float] = []
+            tb = vstream.time_base
+            for packet in src.demux(vstream):
+                if packet.pts is None or packet.dts is None:
+                    continue  # demux flushing packet
+                if packet.pts != packet.dts:
+                    return None  # B-frames present -> can't reindex by demux order
+                secs.append(float(packet.pts * tb))
+            if fps is None:
+                if len(secs) >= 2:
+                    secs.sort()
+                    med = statistics.median(
+                        secs[i + 1] - secs[i] for i in range(len(secs) - 1)
+                    )
+                    if med <= 0:
+                        return None
+                    fps = Fraction(round(1.0 / med), 1)
+                elif vstream.average_rate:
+                    fps = Fraction(vstream.average_rate)
+                else:
+                    return None
+    return fps
+
+
+def _concat_constant_fps(
+    input_video_paths: list, output_video_path: "Path", fps: "Fraction"
+) -> None:
+    """Concatenate segments, stamping every frame onto an exact ``k / fps`` grid.
+
+    Ignores the source PTS entirely and assigns frame *k* (demux order, global
+    across segments) ``pts = dts = k`` in a timebase whose unit is ``1 / fps`` —
+    concretely ``time_base = 1 / (fps * 1000)`` with a per-frame step of 1000, so
+    every frame lands on ``k / fps`` with zero rounding error. Bitstream packets
+    are copied verbatim (no re-encode); only container timing is rewritten.
+    """
+    import tempfile
+
+    import av
+
+    step = 1000
+    time_base = Fraction(fps.denominator, fps.numerator * step)
+
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+        tmp_output_video_path = tmp_named_file.name
+    try:
+        with av.open(
+            tmp_output_video_path, mode="w", options={"movflags": "faststart"}
+        ) as dst:
+            out_stream = None
+            frame_idx = 0
+            for input_path in input_video_paths:
+                with av.open(str(input_path), mode="r") as src:
+                    in_stream = next(s for s in src.streams if s.type == "video")
+                    if out_stream is None:
+                        out_stream = dst.add_stream_from_template(
+                            template=in_stream, opaque=True
+                        )
+                        out_stream.time_base = time_base
+                    for packet in src.demux(in_stream):
+                        if packet.dts is None:  # demux flushing packet
+                            continue
+                        packet.pts = frame_idx * step
+                        packet.dts = frame_idx * step
+                        packet.duration = step
+                        packet.stream = out_stream
+                        dst.mux(packet)
+                        frame_idx += 1
+        shutil.move(tmp_output_video_path, str(output_video_path))
+    except Exception:
+        Path(tmp_output_video_path).unlink(missing_ok=True)
+        raise
+
+
+def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") -> None:
+    """Stream-copy concat that shifts each segment past the previous one.
+
+    Fallback for inputs that :func:`_concat_constant_fps` can't re-stamp (B-frames
+    or extra streams): open each input independently and shift every packet so each
+    segment starts exactly where the previous one ended (per output stream, in the
+    output stream's time_base). Within a segment timestamps are already monotonic,
+    so the concatenated stream is monotonic by construction, and PTS-vs-DTS spacing
+    is preserved so B-frame reordering survives.
+    """
+    import tempfile
+
+    import av
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
@@ -171,12 +239,8 @@ def _concatenate_video_files_rebased(
 
             for file_idx, input_path in enumerate(input_video_paths):
                 with av.open(str(input_path), mode="r") as src:
-                    seg_start: dict[
-                        object, int
-                    ] = {}  # out stream -> first dts (out tb)
-                    seg_end: dict[
-                        object, int
-                    ] = {}  # out stream -> last dts+dur (out tb)
+                    seg_start: dict[object, int] = {}
+                    seg_end: dict[object, int] = {}
                     for in_stream in src.streams:
                         if in_stream.type not in ("video", "audio", "subtitle"):
                             continue
@@ -194,8 +258,6 @@ def _concatenate_video_files_rebased(
                         out_stream = out_streams.get(packet.stream.index)
                         if out_stream is None:
                             continue
-                        # Rescale into the output stream's time_base (a no-op for our
-                        # homogeneous segments, correct if a segment ever differs).
                         ratio = Fraction(packet.stream.time_base) / Fraction(
                             out_stream.time_base
                         )
@@ -228,6 +290,59 @@ def _concatenate_video_files_rebased(
     except Exception:
         Path(tmp_output_video_path).unlink(missing_ok=True)
         raise
+
+
+def _concatenate_video_files_rebased(
+    input_video_paths: list,
+    output_video_path: "Path | str",
+    overwrite: bool = True,
+    compatibility_check: bool = False,
+) -> None:
+    """Concatenate per-episode video segments (drop-in for LeRobot's
+    ``concatenate_video_files``).
+
+    LeRobot appends each new episode's video to the running per-key chunk file
+    (``save_episode`` on episode index >= 1). Its stock implementation feeds both
+    segments through PyAV's ``concat`` demuxer and copies packets verbatim, trusting
+    the demuxer to offset the later segment past the first. With our mp4 segments
+    that offset isn't applied, so at the segment boundary the muxer's DTS jumps
+    backwards (e.g. ``734200 >= 367200``) and libav aborts with ``non monotonically
+    increasing dts to muxer``, losing the episode.
+
+    Beyond just making the boundary monotonic, the concatenated video must be a
+    perfect constant-fps grid: LeRobot indexes dataset rows to video *by timestamp*
+    (row *i* -> ``i / fps``) with a razor-thin ``tolerance_s`` (``1e-4`` s), so a
+    frame whose PTS is even ~0.15 ms off its ideal ``i / fps`` fails to load. Our
+    per-episode mp4 muxer stamps frames in a timescale that can't represent
+    ``1 / fps`` exactly (e.g. mp4 timescale 10000 for 60 fps), so ~0.2 ms of PTS
+    rounding jitter accumulates and a large fraction of rows would violate the
+    tolerance. So for the common case — our recorder's single-stream, B-frame-free
+    (IPPP) segments — re-stamp every frame onto an exact ``k / fps`` grid
+    (:func:`_concat_constant_fps`); this requires exactly one packet per dataset
+    row (guaranteed upstream by the one-AU-per-row capture loop and the non-VCL AU
+    filter — no guard/duplicate frames, which would shift the index-based
+    alignment of every later episode). Anything we can't safely reindex (B-frames,
+    extra streams) falls back to a plain monotonic shift (:func:`_concat_shift_rebased`).
+    """
+    output_video_path = Path(output_video_path)
+    if output_video_path.exists() and not overwrite:
+        _logger.warning(
+            "Video file already exists: %s. Skipping concatenation.", output_video_path
+        )
+        return
+    if len(input_video_paths) == 0:
+        raise FileNotFoundError("No input video paths provided.")
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fps = _concat_probe_constant_fps(input_video_paths)
+    if fps is not None:
+        _concat_constant_fps(input_video_paths, output_video_path, fps)
+    else:
+        _logger.warning(
+            "concat: constant-fps re-stamp unavailable (B-frames or extra streams); "
+            "falling back to shift-rebase — per-row timestamp tolerance may suffer."
+        )
+        _concat_shift_rebased(input_video_paths, output_video_path)
 
     if not output_video_path.exists():
         raise OSError(

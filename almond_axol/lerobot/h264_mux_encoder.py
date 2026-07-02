@@ -31,9 +31,11 @@ encoder assigns the PTS itself: the *k*-th access unit fed for a camera is muxed
 at ``pts = k / fps`` (``dts`` and ``duration`` to match). The caller
 (:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) guarantees
 exactly one ``feed_frame`` per camera per dataset row (re-feeding the previous
-AU on a per-camera stall), so frame-count == row-count by construction, and
-:meth:`_CameraH264Muxer.finish` re-feeds one throwaway trailing AU so the last
-real frame survives the mux/decode tail drop (see there).
+AU on a per-camera stall), so frame-count == row-count by construction. The mp4
+this muxer writes carries small per-frame PTS rounding (its timescale cannot
+represent ``1/fps`` exactly); the concat step re-stamps every frame onto an
+exact constant-fps grid so LeRobot's razor-thin per-row timestamp lookup holds
+(see :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
 an IDR or the mp4 is undecodable from frame 0; the relay forces a keyframe when
@@ -116,6 +118,12 @@ class _CameraH264Muxer:
         self.video_path = video_path
         self._fps = fps
         self._dur = self._gst.SECOND // fps
+        # mp4 media timescale: a multiple of fps so each sample's duration
+        # (SECOND // fps ns) converts to an *exact* integer tick and cumulative
+        # PTS lands precisely on k / fps. mp4mux's default (10000 for 60 fps)
+        # can't represent 1/fps, leaving ~0.05 ms of per-frame rounding that,
+        # compounded across the concat, breaks LeRobot's 1e-4 s per-row lookup.
+        self._mux_timescale = fps * 1000
         self._count = 0
         self._dropped = 0
         self._error: str | None = None
@@ -158,7 +166,8 @@ class _CameraH264Muxer:
         decoder = (
             _decoder_element() if (want_stats and self._stats is not None) else None
         )
-        mux = f"mp4mux ! filesink location={self.video_path} sync=false"
+        mp4mux = f"mp4mux trak-timescale={self._mux_timescale}"
+        mux = f"{mp4mux} ! filesink location={self.video_path} sync=false"
         if decoder is not None:
             # tee: one non-leaky branch muxes every AU (integrity), one leaky
             # branch decodes for sampled stats (drops are fine — stats only need a
@@ -166,7 +175,7 @@ class _CameraH264Muxer:
             desc = (
                 "appsrc name=src is-live=false format=time do-timestamp=false "
                 "! tee name=t "
-                "t. ! queue max-size-buffers=8 ! h264parse ! mp4mux "
+                f"t. ! queue max-size-buffers=8 ! h264parse ! {mp4mux} "
                 f"! filesink location={self.video_path} sync=false "
                 "t. ! queue leaky=downstream max-size-buffers=4 ! h264parse "
                 f"! {decoder} ! nvvidconv ! video/x-raw,format=RGBA "
@@ -268,19 +277,13 @@ class _CameraH264Muxer:
     def finish(self) -> tuple[Path, dict | None]:
         """EOS the pipeline (flush the moov), then return the path + stats.
 
-        Tail guard: mp4mux/the decoder drop the *final* sample on EOS (the last
-        frame has no successor to bound its duration), so a stream of N real AUs
-        yields only N-1 timestamp-retrievable frames — one short of the dataset
-        rows, which trips LeRobot's per-row timestamp load on the very last row.
-        Re-feed the last AU once before EOS so the sample that gets dropped is
-        this throwaway duplicate: it sits at ``pts = N / fps``, beyond the last
-        row's ``(N-1) / fps`` timestamp, so LeRobot never queries it, and every
-        real frame stays retrievable. (If a given run does *not* drop the tail,
-        the extra frame is simply ignored — the contract only needs frames >=
-        rows.)
+        Feeds exactly one muxed frame per fed AU (== one dataset row); the
+        constant-fps PTS grid that keeps the mp4 aligned with the rows is
+        re-asserted by the concat step (see
+        :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`),
+        so no trailing guard frame is added here — an extra frame would shift the
+        index-based alignment of every later episode in the concatenated file.
         """
-        if self._last_au is not None:
-            self.feed(self._last_au)
         stats = self._teardown(finalize=True)
         return self.video_path, stats
 

@@ -153,7 +153,11 @@ def _gst_argv(
             f"insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
         ),
         "h264parse",
-        "mp4mux",
+        # trak-timescale a multiple of fps so each sample duration is an exact
+        # integer tick and PTS lands precisely on k / fps (mp4mux's default can't
+        # represent 1/fps, and that rounding breaks LeRobot's per-row timestamp
+        # lookup — see H264MuxStreamingEncoder / the concat re-stamp).
+        f"mp4mux trak-timescale={fps * 1000}",
         f"filesink location={out_path} sync=false",
     ]
     return ["gst-launch-1.0", "-q", *" ! ".join(pipeline).split()]

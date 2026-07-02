@@ -404,10 +404,10 @@ def _au_has_coded_slice(au: bytes) -> bool:
     keeps them aligned (the capture loop re-muxes the previous real frame for a
     starved row instead). VCL NAL types are 1-5 (non-IDR .. IDR).
 
-    Note: this is *not* the fix for the observed last-row failure — that was a
-    mux/decode tail artifact (the final muxed sample is not timestamp-retrievable
-    even for an all-VCL stream), handled by the trailing guard frame in
-    :meth:`~almond_axol.lerobot.h264_mux_encoder._CameraH264Muxer.finish`.
+    Note: this only guards the one-AU-per-row count. The separate per-row
+    timestamp precision the dataset needs (frame *k* within LeRobot's tolerance
+    of ``k / fps``) is handled by the constant-fps re-stamp in the concat step
+    (:func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
     """
     i, n = 0, len(au)
     while i + 3 < n:
