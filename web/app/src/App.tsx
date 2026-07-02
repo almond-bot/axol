@@ -1161,10 +1161,28 @@ export default function App() {
   // blips are unaffected: the retry loop keeps the session alive unless all
   // retries are exhausted. (Y itself is no help here — its exit path still
   // works, but the user doesn't know they need to press it.)
+  //
+  // Mirrors `status` for the XR-store subscription below: that callback fires
+  // synchronously on store changes, which can land after a reconnect flipped
+  // the status but before React has re-run the effect cleanup — reading the
+  // ref at call time stops a stale subscription from ending a healthy session.
+  const statusRef = useRef(status)
   useEffect(() => {
-    if (status === AxolConnectionStatus.Failed) {
+    statusRef.current = status
+  }, [status])
+  useEffect(() => {
+    if (status !== AxolConnectionStatus.Failed) return
+    const endSessionOnDeadLink = () => {
+      if (statusRef.current !== AxolConnectionStatus.Failed) return
       void store.getState().session?.end()
     }
+    // End an already-presenting session now, and subscribe for one appearing
+    // later: XR entry is async (permission prompt, enterAR still resolving),
+    // so the session may materialise after the status already went Failed —
+    // without the subscription the operator could still enter VR on a dead
+    // link and be stuck exactly the way this exit is meant to prevent.
+    endSessionOnDeadLink()
+    return store.subscribe(endSessionOnDeadLink)
   }, [status])
 
   const handleConnect = () => {
