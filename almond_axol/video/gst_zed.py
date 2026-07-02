@@ -10,9 +10,12 @@ buffer to two consumers:
   the encoded H.264 access units, which the WebRTC relay forwards as
   pre-encoded packets (aiortc ``encoder.pack``). This is the headset view for
   both teleop and data collection.
-* **raw branch** — ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Only built when
-  raw frames are needed (data collection's dataset, policy inference). Each
-  frame carries a ``capture_perf_ts`` derived from the buffer PTS. We run a
+* **dataset branch** — only built when the dataset / a policy needs the frames.
+  For the recorder it is a second GPU encode -> ``shmsink`` carrying H.264 AUs
+  (``_dataset_enc_shmsink``): the recorder just muxes them, so no raw copy or
+  re-encode crosses the boundary. For in-process consumers (inference, or the
+  pyshm fallback) it is instead ``nvvidconv`` -> RGBA ``appsink`` -> numpy. Each
+  RGBA frame carries a ``capture_perf_ts`` derived from the buffer PTS. We run a
   patched ``zedxonesrc``/``zedsrc`` (``do-timestamp=false``) that stamps the
   PTS at the true sensor-exposure instant (``TIME_REFERENCE::IMAGE``) instead
   of host-receive time; :meth:`_cap_perf_from_pts` maps that running-time onto
@@ -45,7 +48,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from .hw_video import _bitrate_for, hw_h264_available
+from .hw_video import _bitrate_for, dataset_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -359,15 +362,14 @@ def _raw_appsink(name: str) -> str:
 
 
 def _raw_shmsink(socket_path: str) -> str:
-    """Write raw RGBA frames to shared memory via gst's native (C) ``shmsink``.
+    """Write raw NV12 frames to shared memory via gst's native (C) ``shmsink``.
 
-    Replaces the Python appsink-pull on the relay's raw branch: ``shmsink`` does
-    the per-frame work in C, so the relay's interpreter does **zero** Python per
-    raw frame — keeping its GIL free for the latency-critical aiortc send (the
-    Python pull loop is what halved the send during recording). The recorder
-    process reads these frames with a matching ``shmsrc`` (see
-    :class:`~almond_axol.video.shm_frames.GstShmFrameReader`). ``wait-for-connection
-    =false`` so the relay never blocks when the recorder isn't attached yet.
+    Legacy raw transport (kept for reference / the NV12
+    :class:`~almond_axol.video.shm_frames.GstShmFrameReader`). The encoded
+    dataset path (:func:`_dataset_enc_shmsink`) supersedes it: shipping H.264
+    instead of raw NV12 cuts the boundary bandwidth ~50x and removes the
+    recorder's re-encode. ``wait-for-connection=false`` so the relay never
+    blocks when the recorder isn't attached yet.
     """
     return (
         f"shmsink socket-path={socket_path} wait-for-connection=false "
@@ -375,12 +377,66 @@ def _raw_shmsink(socket_path: str) -> str:
     )
 
 
-def _enc_branch(bitrate: int, fps: int) -> str:
+# The dataset branch keeps a short keyframe interval (~0.25s): frequent IDRs let
+# LeRobot seek/decode the recorded video cheaply, and bound how long the recorder
+# waits for the first keyframe when an episode's valve opens. The encoder can't
+# be force-keyframed on demand on this L4T (the ``force-IDR`` signal segfaults and
+# force-key-unit events are ignored), so each episode simply begins at the next
+# periodic IDR; the reader drops the leading P-frames until then.
+_DATASET_IDR_INTERVAL_S = 0.25
+
+
+def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) -> str:
+    """Encode the dataset stream on the GPU and ship H.264 AUs over ``shmsink``.
+
+    This replaces the raw-NV12 shmsink on the relay's dataset branch: the relay
+    already holds the frame in NVMM, so a second NVENC branch (a GPU block, ~free
+    on the CPU) hands the recorder a compressed stream (a fraction of the ~51 MB/s
+    raw copy) — and the recorder only *muxes* it (see
+    :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`) rather
+    than re-encoding. ``nvvidconv`` must output NVMM for ``nvv4l2h264enc``; the
+    AU-aligned byte-stream is what the recorder's
+    :class:`~almond_axol.video.shm_frames.EncodedAuReader` expects. Runs in VBR
+    with a peak cap so the recorded dataset stays bounded and uniformly sized
+    across cameras even when one sensor is very noisy (see ``dataset_vbr_bitrate``).
+    """
+    idr = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
+    target, peak = dataset_vbr_bitrate(w, h, fps)
     return (
-        f"nvv4l2h264enc control-rate=1 bitrate={bitrate} preset-level=1 "
+        f"nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width={w},height={h} "
+        f"! nvv4l2h264enc name={name} control-rate=0 "
+        f"bitrate={target} peak-bitrate={peak} preset-level=1 "
+        f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
+        "! video/x-h264,stream-format=byte-stream,alignment=au "
+        f"! shmsink socket-path={socket_path} wait-for-connection=false "
+        "sync=false async=false"
+    )
+
+
+def _enc_branch(bitrate: int, fps: int, name: str = "venc") -> str:
+    return (
+        f"nvv4l2h264enc name={name} control-rate=1 bitrate={bitrate} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={fps} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream"
     )
+
+
+# While an episode records, the relay runs an extra per-camera NVENC dataset
+# branch (GPU encode + shmsink) on top of the headset send, so the aiortc send
+# loop has less headroom and a full-bitrate headset feed jitters/stutters. The
+# headset stream is only a live monitor, so we drop its encoder bitrate while
+# recording: fewer bits -> fewer RTP packets -> proportionally less SRTP/send CPU,
+# handing the event loop back its headroom. The recorded dataset video is a
+# separate NVENC pipeline at full (capped-VBR) quality, so training data is
+# unaffected.
+_RECORDING_ENC_BITRATE_SCALE = 0.5
+
+
+def _set_enc_bitrate(pipeline: Any, name: str, bitrate: int) -> None:
+    """Set a named ``nvv4l2h264enc``'s target bitrate at runtime (best-effort)."""
+    enc = pipeline.get_by_name(name)
+    if enc is not None:
+        enc.set_property("bitrate", int(bitrate))
 
 
 class _GstPipelineBase:
@@ -643,6 +699,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
 
     def _pipeline_str(self) -> str:
         bitrate = _bitrate_for(self.width, self.height, self.fps)
+        self._enc_bitrate = bitrate
         src = (
             f"zedxonesrc camera-sn={self.serial} "
             f"camera-resolution={_RESOLUTION_ENUM[self.resolution]} "
@@ -651,23 +708,33 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
             "! video/x-raw(memory:NVMM),format=NV12"
         )
         enc = f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc')}"
-        # The raw branch sits behind a `valve` so it can be gated shut at
-        # runtime (see set_raw_enabled): the VIC convert + appsink copy are the
-        # bulk of the relay's CPU, and they're only needed while recording.
-        # Defaults open so the SDK-less raw consumers (inference/run-policy) are
+        # The dataset branch sits behind a `valve` so it can be gated shut at
+        # runtime (see set_raw_enabled): its work is only needed while recording.
+        # Defaults open so the SDK-less consumers (inference/run-policy) are
         # unchanged; `collect-data` explicitly closes it until an episode records.
-        # nvvidconv (the VIC) resizes for free on the GPU, so a smaller raw caps
-        # downscales here without touching the CPU or the encoded branch.
-        raw_tail = (
-            _raw_shmsink(self._raw_socket_path)
-            if self._raw_socket_path
-            else _raw_appsink("raw")
-        )
-        raw = (
-            f"{_QUEUE} ! valve name=rawvalve drop=false "
-            f"! nvvidconv ! video/x-raw,format=RGBA,"
-            f"width={self.raw_width},height={self.raw_height} ! {raw_tail}"
-        )
+        # nvvidconv (the VIC) resizes for free on the GPU, so the smaller dataset
+        # dims downscale here without touching the CPU or the headset branch.
+        # Recorder (shmsink) path: encode the dataset stream on the GPU and ship
+        # H.264 AUs — no raw copy, no recorder re-encode (see
+        # _dataset_enc_shmsink). In-process raw consumers (inference/run-policy,
+        # or the pyshm RawFrameWriter fallback) still take RGBA off an appsink.
+        if self._raw_socket_path:
+            raw = (
+                f"{_QUEUE} ! valve name=rawvalve drop=false ! "
+                + _dataset_enc_shmsink(
+                    self._raw_socket_path,
+                    self.raw_width,
+                    self.raw_height,
+                    self.fps,
+                    "dsenc",
+                )
+            )
+        else:
+            raw = (
+                f"{_QUEUE} ! valve name=rawvalve drop=false "
+                f"! nvvidconv ! video/x-raw,format=RGBA,"
+                f"width={self.raw_width},height={self.raw_height} ! {_raw_appsink('raw')}"
+            )
         if self._want_encoded and self._want_raw:
             return f"{src} ! tee name=t  t. ! {enc}  t. ! {raw}"
         if self._want_encoded:
@@ -675,18 +742,24 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return f"{src} ! {raw}"
 
     def set_raw_enabled(self, enabled: bool) -> None:
-        """Open or close the raw dataset branch at runtime (no pipeline reconfig).
+        """Open or close the dataset branch at runtime (no pipeline reconfig).
 
-        Toggles the raw branch's ``valve``: when dropped, the VIC RGBA convert
-        and the appsink copy to shared memory never run, so the relay costs no
-        more than the encode-only (``axol teleop``) path. ``collect-data`` opens
-        this only while an episode is recording.
+        Toggles the dataset branch's ``valve``: when dropped, its GPU dataset
+        encode (shmsink path) or VIC RGBA convert + appsink copy (in-process path)
+        never runs, so the relay costs no more than the encode-only (``axol
+        teleop``) path. ``collect-data`` opens this only while an episode is
+        recording. While open, the headset encoder's bitrate is also scaled down
+        (see ``_RECORDING_ENC_BITRATE_SCALE``) to free send-loop CPU; it is
+        restored to full quality when recording stops.
         """
         if not self._want_raw or self._pipeline is None:
             return
         valve = self._pipeline.get_by_name("rawvalve")
         if valve is not None:
             valve.set_property("drop", not enabled)
+        if self._want_encoded:
+            scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
+            _set_enc_bitrate(self._pipeline, "venc", self._enc_bitrate * scale)
 
     def connect(self, warmup: bool = True) -> None:
         """Open the camera, start the pipeline, and block until it streams."""
@@ -910,43 +983,60 @@ class ZedGstStereoCamera(_GstPipelineBase):
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
         bitrate = _bitrate_for(eye_w, eye_h, self.fps)
+        self._enc_bitrate = bitrate
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
             "pixel-aspect-ratio=1/1"
         )
         crop = f"{_QUEUE} ! nvvidconv left={left} right={right} top=0 bottom={eye_h} ! {caps}"
-        if want_encoded and want_raw:
-            enc = (
-                f"{_QUEUE} ! {_enc_branch(bitrate, self.fps)} ! "
-                f"{_enc_appsink('enc_' + sink_suffix)}"
+        sock = (
+            self._left_raw_socket_path
+            if sink_suffix == "l"
+            else self._right_raw_socket_path
+        )
+        # This eye's dataset branch: encode->shmsink (recorder) when it has a
+        # socket, else RGBA appsink (in-process writer / inference). Both sit
+        # behind a per-eye valve so set_raw_enabled can gate them while not
+        # recording. See the mono _pipeline_str note.
+        if sock:
+            raw = (
+                f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false ! "
+                + _dataset_enc_shmsink(
+                    sock,
+                    self.raw_width,
+                    self.raw_height,
+                    self.fps,
+                    "dsenc_" + sink_suffix,
+                )
             )
-            sock = (
-                self._left_raw_socket_path
-                if sink_suffix == "l"
-                else self._right_raw_socket_path
-            )
-            raw_tail = (
-                _raw_shmsink(sock) if sock else _raw_appsink("raw_" + sink_suffix)
-            )
+        else:
             raw = (
                 f"{_QUEUE} ! valve name=rawvalve_{sink_suffix} drop=false "
                 f"! nvvidconv ! video/x-raw,format=RGBA,"
-                f"width={self.raw_width},height={self.raw_height} ! {raw_tail}"
+                f"width={self.raw_width},height={self.raw_height} ! "
+                f"{_raw_appsink('raw_' + sink_suffix)}"
+            )
+        if want_encoded and want_raw:
+            enc = (
+                f"{_QUEUE} ! {_enc_branch(bitrate, self.fps, 'venc_' + sink_suffix)} ! "
+                f"{_enc_appsink('enc_' + sink_suffix)}"
             )
             return f"{crop} ! tee name=t{sink_suffix}  t{sink_suffix}. ! {enc}  t{sink_suffix}. ! {raw}"
         if want_encoded:
-            return f"{crop} ! {_enc_branch(bitrate, self.fps)} ! {_enc_appsink('enc_' + sink_suffix)}"
-        return (
-            f"{crop} ! nvvidconv ! video/x-raw,format=RGBA,"
-            f"width={self.raw_width},height={self.raw_height} ! "
-            f"{_raw_appsink('raw_' + sink_suffix)}"
-        )
+            return (
+                f"{crop} ! {_enc_branch(bitrate, self.fps, 'venc_' + sink_suffix)} ! "
+                f"{_enc_appsink('enc_' + sink_suffix)}"
+            )
+        return f"{crop} ! {raw}"
 
     def set_raw_enabled(self, enabled: bool) -> None:
-        """Open or close both eyes' raw dataset branches at runtime.
+        """Open or close both eyes' dataset branches at runtime.
 
         See :meth:`ZedGstCamera.set_raw_enabled`: gates the per-eye ``valve``s so
-        the raw VIC convert + appsink copies only run while recording.
+        each eye's dataset encode (or VIC convert + appsink copy) only runs while
+        recording. The headset (encoded) eyes' bitrate is scaled down while
+        recording and restored after, for the same send-loop-headroom reason as
+        the mono path.
         """
         if not self._want_raw or self._pipeline is None:
             return
@@ -954,6 +1044,11 @@ class ZedGstStereoCamera(_GstPipelineBase):
             valve = self._pipeline.get_by_name(f"rawvalve_{side[0]}")
             if valve is not None:
                 valve.set_property("drop", not enabled)
+        scale = _RECORDING_ENC_BITRATE_SCALE if enabled else 1.0
+        for side in self._encoded_sides:
+            _set_enc_bitrate(
+                self._pipeline, f"venc_{side[0]}", self._enc_bitrate * scale
+            )
 
     def _pipeline_str(self) -> str:
         src = (
