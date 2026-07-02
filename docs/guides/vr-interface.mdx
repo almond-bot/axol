@@ -68,19 +68,15 @@ The hosted app is built on Vercel; `vercel.json` builds the client package first
 
 When the host has camera video enabled ([`axol teleop --cameras`](/cli/teleop), [`collect-data`](/cli/collect-data), or the [control panel](/guides/control-panel) with camera slots assigned), the robot's camera feeds stream to the headset over WebRTC and render as screens over passthrough.
 
-The screens are **world-anchored** — like TVs placed where you were looking when the session started, so you can move your head freely while they stay put. While arm tracking is disengaged, point a controller at a screen and hold the trigger to grab and reposition it (positions are remembered per view). Click the right thumbstick to re-anchor everything to your current gaze and reset moved screens.
+**All streamed feeds are shown at once** — the overhead centered (rendered per-eye in true stereo when the overhead is a stereo ZED X) with the left and right wrist cams as bottom-corner picture-in-picture panes. There's no view to switch between; you arrange the screens to taste instead.
 
-**Flick the right thumbstick** to switch views (a latched toggle — no holding; flicking the active direction returns to the default):
+The screens are **world-anchored** — like TVs placed where you were looking when the session started, so you can move your head freely while they stay put. While arm tracking is disengaged you can rearrange them:
 
-| Flick | View |
-|---|---|
-| — | **Default** — passthrough with the left/right wrist cams as bottom-corner picture-in-picture |
-| Up | Fullscreen **overhead** (rendered per-eye in true stereo when the overhead is a stereo ZED X) |
-| Left | Fullscreen **left wrist** |
-| Right | Fullscreen **right wrist** |
-| Down | **Split** — left + right wrist cams side-by-side |
+- **Move** a screen — point a controller at it and hold the trigger, then move the controller to reposition it. Each screen remembers its own spot.
+- **Resize** a screen — grab the *same* screen with **both** triggers and move your hands apart to make it bigger or together to make it smaller.
+- **Reset** — click the right thumbstick to re-anchor every screen to your current gaze and clear all moves and resizes.
 
-The headset only offers the views for cameras that are actually being streamed (set in the [control panel's Cameras dialog](/guides/control-panel#cameras) or via the relevant CLI flags). A flick toward a camera that isn't streamed is ignored, so streaming only the overhead, say, leaves the default passthrough view and the overhead view and nothing else. While video is still negotiating — or any streamed camera hasn't produced its first frame — a global **Connecting cameras…** indicator shows regardless of the current view; it clears once every streamed camera is live, and never appears when nothing is being streamed.
+The headset only shows the feeds for cameras that are actually being streamed (set in the [control panel's Cameras dialog](/guides/control-panel#cameras) or via the relevant CLI flags), so streaming only the overhead, say, shows just the overhead. While video is still negotiating — or any streamed camera hasn't produced its first frame — a global **Connecting cameras…** indicator shows; it clears once every streamed camera is live, and never appears when nothing is being streamed.
 
 ## Controller bindings
 
@@ -90,25 +86,27 @@ The headset only offers the views for cameras that are actually being streamed (
 |---|---|---|
 | 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
 | 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it |
-| 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it |
+| 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
+| 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
 | 5 | X | **Reset** pose; cancels a recording countdown; stops and discards an in-progress take |
-| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
+| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take — **data collection only** (no effect during plain teleop) |
 | 7 | Y | **Exit** the XR session |
-| 8 | B | Toggle between **Teleop** and **Data Collection** (disabled while recording or counting down) |
-| — | Right thumbstick (flick) | **Switch camera view** — see [Camera views](#camera-views) |
-| — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moved positions |
+| — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes |
+
+<Note>
+  The session's **mode is fixed by the command that launched it** — there's no in-headset toggle between the two. [`axol teleop`](/cli/teleop) runs plain teleop (recording is unavailable, so **A** does nothing and the HUD stays on `Teleop`), while [`axol collect-data`](/cli/collect-data) runs data collection (recording enabled, HUD starts on `Data Collection`).
+</Note>
 
 ## State machine
 
+In **teleop** mode the headset stays in `Teleop` with the recording controls inert. In **data collection** mode it starts in `Data Collection` and drives episodes with **A** / **X**:
+
 ```
-Teleop ──[B]──► DataCollection ──[A]──► (3s countdown) ──► Recording
-   ▲                 ▲                                          │
-   └────────[B]──────┘                                    [A or X]
-                                                               │
-                                                          (server push)
-                                                               │
-                                                             Saving ──► DataCollection
+DataCollection ──[A]──► (3s countdown) ──► Recording
+      ▲                                          │
+      │                                     [A or X]
+      │                                          │
+      └──────────── Saving ◄────────────── (server push)
 ```
 
 During the countdown the state sent to the server stays `DataCollection`; it becomes `Recording` once the countdown completes.

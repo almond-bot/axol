@@ -8,6 +8,7 @@ import "@fontsource-variable/inter/index.css"
 import "@fontsource-variable/geist/index.css"
 import "./index.css"
 import { isHeadsetBrowser } from "./lib/headset"
+import { ToastProvider } from "./components/ui/toast"
 
 // Lazy-loaded so the control panel route doesn't pull in the heavy
 // three.js / @react-three/xr bundle (and vice versa). Without this, opening
@@ -32,14 +33,16 @@ function RouteFallback() {
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <BrowserRouter>
-      <Suspense fallback={<RouteFallback />}>
-        <Routes>
-          <Route path="/" element={<RootRedirect />} />
-          <Route path="/vr" element={<VrApp />} />
-          <Route path="/control" element={<ControlPanel />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </Suspense>
+      <ToastProvider>
+        <Suspense fallback={<RouteFallback />}>
+          <Routes>
+            <Route path="/" element={<RootRedirect />} />
+            <Route path="/vr" element={<VrApp />} />
+            <Route path="/control" element={<ControlPanel />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Suspense>
+      </ToastProvider>
     </BrowserRouter>
   </StrictMode>
 )

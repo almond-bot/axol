@@ -89,6 +89,9 @@ class VRTeleop:
         self._kinematics_config = kinematics_config
         self._vr_server = VRServer(vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
+        # Lock the headset HUD to plain teleop: no data-collection toggle and no
+        # recording controls, since this flow never records.
+        self._vr_server.set_mode("teleop")
 
         # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)

@@ -13,6 +13,7 @@ import { createXRStore, XR, useXR } from "@react-three/xr"
 import * as THREE from "three"
 import {
   AxolConnectionStatus,
+  type AxolMode,
   AxolVRClient,
   AxolState,
   axolHttpsOrigin,
@@ -260,56 +261,57 @@ function PoseVisualizer() {
 
 // Cameras streamed from the robot, shown immersively over passthrough.
 //
-// The screens behave like TVs: they are anchored in the world where the
-// operator was looking when the session started, so the head can move freely
-// while the frames stay put. Pointing a controller at a screen and holding the
-// rear trigger grabs it — move the controller to reposition, release to drop.
-// Positions are remembered per view mode. Because the trigger doubles as the
-// gripper control, grabbing is only allowed while robot tracking is
-// disengaged — the teleop server broadcasts its engage toggle over the
-// WebSocket (`{"type": "tracking"}`), covering grips, X/reset, and saving.
-// Clicking the right thumbstick re-anchors all screens to the current gaze
-// and resets dragged positions.
+// All three feeds are shown at once: the overhead in the centre (per-eye stereo
+// when both eyes stream) with the two wrist cams as bottom-corner picture-in-
+// picture panes (left wrist → bottom-left, right wrist → bottom-right). There
+// is no view picker — the operator tailors the layout directly instead:
+//   - Move a screen: point a controller at it and hold the rear trigger, then
+//     move the controller; release to drop. Each screen remembers its spot.
+//   - Resize a screen: grab the *same* screen with both controllers' triggers
+//     and move your hands apart (bigger) or together (smaller).
+//   - Reset: click the right thumbstick to re-anchor every screen to the
+//     current gaze and clear all moves + resizes.
 //
-// View modes (the right thumbstick is a latched 4-way picker — flick once, no
-// holding; flicking the *active* direction returns to the default):
-//   - "default":  passthrough with the two wrist cams as bottom-corner PiPs
-//                 (left wrist → bottom-left, right wrist → bottom-right)
-//   - "overhead": fullscreen overhead (per-eye stereo when both eyes stream)
-//   - "left":     fullscreen left wrist
-//   - "right":    fullscreen right wrist
-//   - "split":    left + right wrists side-by-side, fullscreen
-// Stick directions map to where each camera roughly sits: up → overhead,
-// left → left wrist, right → right wrist, down → split.
-type ViewMode = "default" | "overhead" | "left" | "right" | "split"
+// The screens behave like TVs: they are world-anchored where the operator was
+// looking when the session started, so the head can move freely while the
+// frames stay put. Because the trigger doubles as the gripper control, grabbing
+// is only allowed while robot tracking is disengaged — the teleop server
+// broadcasts its engage toggle over the WebSocket (`{"type": "tracking"}`),
+// covering grips, X/reset, and saving.
 
-// Which draggable screen a plane belongs to: the fullscreen/stereo plane
-// ("main") or one of the two wrist-cam planes ("a" = left, "b" = right).
-type GrabSlot = "main" | "a" | "b"
+// Which draggable screen a plane belongs to: the overhead (its mono plane or
+// its two stereo eye planes, both "overhead") or a wrist-cam plane.
+type GrabSlot = "overhead" | "left" | "right"
 
 const FEED_DISTANCE = 1 // metres from the anchor point to the screens
-const FEED_HEIGHT = 1.05 // fullscreen plane height in metres (width from aspect)
 // Drop the feed slightly so its centre lands on the operator's natural gaze
 // rather than sitting high in view.
 const FEED_Y = -0.175
-const STICK_DEADZONE = 0.6
-// Bottom-corner picture-in-picture wrist cams shown in the default view.
+// Bottom-corner picture-in-picture wrist cams flanking the overhead.
 const PIP_WIDTH = 0.5 // metres (height derives from aspect)
-const PIP_X = 0.38 // horizontal offset of each corner PiP
-const PIP_Y = -0.44 // vertical offset (lower corners)
-// Side-by-side wrist cams in the split view.
-const SPLIT_WIDTH = 0.92 // metres per pane
-const SPLIT_X = 0.48 // horizontal offset of each pane from centre
+const PIP_X = 0.72 // horizontal offset of each corner PiP
+const PIP_Y = -0.52 // vertical offset (lower corners)
+// Overhead plane width in metres (height derives from aspect). Kept to ~2× the
+// wrist PiP width so it reads as the primary feed without dominating the view.
+const OVERHEAD_WIDTH = PIP_WIDTH * 2
+// Per-screen resize limits, relative to each screen's default size.
+const MIN_SCALE = 0.3
+const MAX_SCALE = 4
 
 // Scratch objects for the per-frame grab raycast (avoid allocations).
 const _raycaster = new THREE.Raycaster()
 _raycaster.layers.enableAll() // the stereo eye planes live on layers 1/2
 const _rayMatrix = new THREE.Matrix4()
-const _rayOrigin = new THREE.Vector3()
-const _rayDir = new THREE.Vector3()
 const _grabTarget = new THREE.Vector3()
+const _dragDelta = new THREE.Vector3()
 const _yawFwd = new THREE.Vector3()
 const _yAxis = new THREE.Vector3(0, 1, 0)
+// Per-hand controller ray (origin + forward), refreshed each frame so both the
+// single-hand drag and the two-hand resize can read either hand's pointing ray.
+const _handRay = {
+  left: { origin: new THREE.Vector3(), dir: new THREE.Vector3(), valid: false },
+  right: { origin: new THREE.Vector3(), dir: new THREE.Vector3(), valid: false },
+}
 
 function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
   const { gl } = useThree()
@@ -328,9 +330,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const leftMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const rightMeshRef = useRef<THREE.Mesh>(null)
   const rightMatRef = useRef<THREE.MeshBasicMaterial>(null)
-  // Two shared planes (layer 0) reused for the two wrist cams in both the split
-  // view (side-by-side) and the default view (bottom-corner PiPs); the two modes
-  // never render at once. A = left wrist, B = right wrist.
+  // The two wrist-cam planes (layer 0): A = left wrist, B = right wrist.
   const dualAMeshRef = useRef<THREE.Mesh>(null)
   const dualAMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const dualBMeshRef = useRef<THREE.Mesh>(null)
@@ -339,23 +339,34 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
   const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
-  // The current view mode; only changes on a thumbstick flick (edge), so the
-  // operator doesn't have to hold the stick.
-  const viewModeRef = useRef<ViewMode>("default")
-  // Whether the right stick was deflected last frame, for rising-edge detection.
-  const rightStickActiveRef = useRef(false)
+  // Cameras that have decoded at least one real frame. Used to keep the last
+  // good frame on screen through brief dropouts instead of cutting to
+  // passthrough (see `liveTex`).
+  const shownRef = useRef<Record<string, boolean>>({})
+  // Last known good aspect ratio per texture. During a brief stall `videoWidth`
+  // reads 0, so we reuse the cached aspect instead of falling back to 16:9 —
+  // otherwise the plane resizes for a frame and its edges flash passthrough.
+  const aspectRef = useRef<Record<string, number>>({})
   // Whether the screen group has been world-anchored for this XR session.
   const anchoredRef = useRef(false)
-  // Active screen grab (trigger held while pointing at a plane), if any.
-  const grabRef = useRef<{
-    hand: "left" | "right"
-    slot: GrabSlot
-    distance: number
-    mode: ViewMode
-  } | null>(null)
-  // User-dragged position offsets, keyed `${mode}:${slot}` so each view mode
-  // remembers its own arrangement.
+  // Per-hand active grab (trigger held while pointing at a plane), if any.
+  // When both hands hold the same slot we resize it instead of dragging.
+  // `lastLocal` is the group-local point along the hand's ray (at the captured
+  // hit distance) as of the previous frame; dragging moves the screen by the
+  // frame-to-frame delta so the grab never snaps the screen onto the controller.
+  const grabsRef = useRef<{
+    left: { slot: GrabSlot; distance: number; lastLocal: THREE.Vector3 } | null
+    right: { slot: GrabSlot; distance: number; lastLocal: THREE.Vector3 } | null
+  }>({ left: null, right: null })
+  // Active two-hand resize: the slot being scaled plus the hand separation and
+  // screen scale captured when the second hand grabbed on.
+  const resizeRef = useRef<{ slot: GrabSlot; startSep: number; startScale: number } | null>(
+    null
+  )
+  // User-dragged position offsets, keyed by slot (group-local).
   const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
+  // Per-slot size multipliers (default 1), driven by the two-hand resize.
+  const scalesRef = useRef<Record<string, number>>({})
   // Per-hand trigger state last frame, for rising-edge grab detection.
   const triggerPrevRef = useRef({ left: false, right: false })
   // Whether robot tracking is engaged (the server owns this toggle and pushes
@@ -364,9 +375,22 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const robotEngagedRef = useAxolTracking(wsRef)
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
   const stickClickPrevRef = useRef(false)
+  // Seconds the feed has been continuously "connecting". Used to debounce the
+  // connecting spinner so a transient reconnect blip (a single-frame spike
+  // after we've already gone live) doesn't flash the arc over the feed.
+  const connectingHeldRef = useRef(0)
 
-  // Wrap each incoming MediaStream in a <video> + VideoTexture, and tear down
-  // textures whose stream has gone away.
+  // Wrap each incoming MediaStream in a <video> + VideoTexture.
+  //
+  // We deliberately do NOT tear down a camera's <video>/texture when its stream
+  // momentarily disappears from `streams`. A `THREE.VideoTexture` keeps the last
+  // decoded frame uploaded on the GPU, so as long as we keep the texture alive
+  // and the plane visible, a brief WebRTC blip (a transient `failed`/`closed`,
+  // a socket swap, or a re-offer — all of which clear `streams` upstream) shows
+  // the frozen last frame instead of cutting to passthrough. When the stream
+  // returns we just re-point the existing <video> at the new MediaStream, so the
+  // texture keeps streaming into the same object with no flash. Textures are
+  // only released on unmount (below).
   useEffect(() => {
     const videos = videosRef.current
     const textures = texturesRef.current
@@ -389,16 +413,6 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         textures[name] = tex
       }
     }
-    for (const name of Object.keys(textures)) {
-      if (streams[name]) continue
-      textures[name].dispose()
-      delete textures[name]
-      const video = videos[name]
-      if (video) {
-        video.srcObject = null
-        delete videos[name]
-      }
-    }
   }, [streams])
 
   // Release GPU textures / video elements when the feed unmounts.
@@ -408,8 +422,32 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     return () => {
       for (const tex of Object.values(textures)) tex.dispose()
       for (const video of Object.values(videos)) video.srcObject = null
+      shownRef.current = {}
+      aspectRef.current = {}
     }
   }, [])
+
+  // Fully release the cameras when the XR session ends. This component stays
+  // mounted across sessions, and we intentionally keep the last frame through
+  // *in-session* dropouts (see the `[streams]` effect), but a session end is a
+  // clean teardown: without this, the sticky textures/videos/shownRef would
+  // survive and a later re-entry would treat last session's frozen GPU frames
+  // as live (hiding the connecting spinner) until fresh tracks arrive.
+  useEffect(() => {
+    if (session) return
+    const videos = videosRef.current
+    const textures = texturesRef.current
+    for (const name of Object.keys(textures)) {
+      textures[name].dispose()
+      delete textures[name]
+    }
+    for (const name of Object.keys(videos)) {
+      videos[name].srcObject = null
+      delete videos[name]
+    }
+    shownRef.current = {}
+    aspectRef.current = {}
+  }, [session])
 
   // Confine the stereo eye planes to their lens via three.js layers: an object
   // on layer 1 renders to the left eye only, layer 2 to the right eye only.
@@ -418,7 +456,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     rightMeshRef.current?.layers.set(2)
   }, [])
 
-  useFrame((_state, _delta, frame) => {
+  useFrame((_state, delta, frame) => {
     const group = groupRef.current
     const mesh = meshRef.current
     const mat = matRef.current
@@ -439,19 +477,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const cam = gl.xr.getCamera()
     const textures = texturesRef.current
 
-    // A camera is "available" once the relay has offered a track for it (its
-    // texture exists). The relay only offers the cameras actually being streamed,
-    // so we use this to (a) refuse to switch to a view whose camera isn't
-    // streamed and (b) only show the connecting spinner for cameras we're
-    // genuinely waiting on — never ones that will never arrive (e.g. wrist views
-    // when only the overhead is streamed).
-    const has = (name: string) => !!textures[name]
-    const modeAvailable = (m: ViewMode): boolean => {
-      if (m === "overhead") return has("overhead_left") || has("overhead_right") || has("overhead")
-      if (m === "left") return has("left_arm")
-      if (m === "right") return has("right_arm")
-      if (m === "split") return has("left_arm") || has("right_arm")
-      return true // "default" passthrough needs no camera
+    // A texture is usable once its <video> has decoded at least one real frame.
+    // Once that's happened we keep returning it (the texture still holds that
+    // last frame on the GPU) even if `videoWidth` momentarily reads 0 during a
+    // stall or stream reconnect — that's what stops the feed from flickering to
+    // passthrough and back. It only becomes unusable again if the texture itself
+    // is gone (i.e. on unmount).
+    const liveTex = (name: string) => {
+      const t = textures[name]
+      if (!t) return undefined
+      const v = t.image as HTMLVideoElement | undefined
+      if (v && v.videoWidth) {
+        shownRef.current[name] = true
+        return t
+      }
+      return shownRef.current[name] ? t : undefined
     }
 
     // World-anchor the screen group once per session: place it at the head
@@ -460,8 +500,10 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // head-locked so it's always seen.
     if (presenting && !anchoredRef.current) {
       anchoredRef.current = true
-      grabRef.current = null
+      grabsRef.current = { left: null, right: null }
+      resizeRef.current = null
       dragOffsetsRef.current = {}
+      scalesRef.current = {}
       group.position.copy(cam.position)
       _yawFwd.set(0, 0, -1).applyQuaternion(cam.quaternion)
       group.quaternion.setFromAxisAngle(_yAxis, Math.atan2(-_yawFwd.x, -_yawFwd.z))
@@ -473,76 +515,56 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinner.quaternion.copy(cam.quaternion)
     }
 
-    // Right thumbstick = latched 4-way view picker. axes[2]/[0] = X, axes[3]/[1]
-    // = Y (up is negative). The dominant axis picks a direction → target mode;
-    // only a rising edge (neutral → deflected) acts, so the view stays put when
-    // the stick recentres. Flicking the active direction returns to "default".
     const xrSession = gl.xr.getSession()
     const sources = xrSession ? Array.from(xrSession.inputSources) : []
     const right = sources.find((s) => s.handedness === "right")
-    const axes = right?.gamepad?.axes
-    const sx = axes?.[2] ?? axes?.[0] ?? 0
-    const sy = axes?.[3] ?? axes?.[1] ?? 0
-    const stickActive = Math.max(Math.abs(sx), Math.abs(sy)) > STICK_DEADZONE
-    if (stickActive && !rightStickActiveRef.current) {
-      let target: ViewMode
-      if (Math.abs(sy) > Math.abs(sx)) target = sy < 0 ? "overhead" : "split"
-      else target = sx < 0 ? "left" : "right"
-      // Ignore a flick toward a camera that isn't being streamed, so the operator
-      // can't land on a view that would just sit on "Connecting camera…".
-      // "default" (passthrough) is always reachable.
-      if (modeAvailable(target)) {
-        viewModeRef.current = viewModeRef.current === target ? "default" : target
-        grabRef.current = null
-      }
-    }
-    rightStickActiveRef.current = stickActive
 
     // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
-    // current gaze and resets any dragged positions.
+    // current gaze and clears every move + resize.
     const stickClicked = right?.gamepad?.buttons?.[3]?.pressed ?? false
     if (stickClicked && !stickClickPrevRef.current) {
       anchoredRef.current = false
-      grabRef.current = null
+      grabsRef.current = { left: null, right: null }
+      resizeRef.current = null
       dragOffsetsRef.current = {}
+      scalesRef.current = {}
     }
     stickClickPrevRef.current = stickClicked
 
-    const mode = viewModeRef.current
+    // All available feeds are shown at once: the overhead centred (true per-eye
+    // stereo when both eyes stream, else a single mono plane) with the wrist
+    // cams as bottom-corner PiPs.
+    const oL = liveTex("overhead_left")
+    const oR = liveTex("overhead_right")
+    const overheadMono = oL && oR ? undefined : (oL ?? liveTex("overhead"))
+    const leftTex = liveTex("left_arm")
+    const rightTex = liveTex("right_arm")
+    const anyLive = !!(oL || overheadMono || leftTex || rightTex)
 
-    // A texture is usable only once its <video> has decoded real frames.
-    const liveTex = (name: string) => {
-      const t = textures[name]
-      const v = t?.image as HTMLVideoElement | undefined
-      return t && v && v.videoWidth ? t : undefined
-    }
+    group.visible = presenting && anyLive
 
-    // Which cams the current mode needs decoded before it draws (otherwise the
-    // view is just passthrough). "default" shows the wrist PiPs when present.
-    let live: boolean
-    if (mode === "overhead") live = !!(liveTex("overhead_left") ?? liveTex("overhead"))
-    else if (mode === "left") live = !!liveTex("left_arm")
-    else if (mode === "right") live = !!liveTex("right_arm")
-    else live = !!(liveTex("left_arm") ?? liveTex("right_arm")) // default, split
-
-    group.visible = presenting && live
-
-    // "Connecting cameras…" is a global indicator, independent of the current
-    // view: show it while video is still being negotiated (available === null),
-    // or while any camera that IS being streamed hasn't produced its first frame
-    // yet. So streaming only the overhead still shows the spinner in the default
-    // view until the overhead appears, then it goes away. It's hidden once every
-    // streamed camera is live, and entirely when the server reports no video
+    // "Connecting cameras…" is a global indicator: show it while video is still
+    // being negotiated (available === null), or while any camera that IS being
+    // streamed hasn't produced its first frame yet. Hidden once every streamed
+    // camera is live, and entirely when the server reports no video
     // (available === false — nothing is streaming).
     const streamed = Object.keys(textures)
     const allLive = streamed.length > 0 && streamed.every((n) => !!liveTex(n))
     const connecting = available === null || (available === true && !allLive)
-    spinner.visible = presenting && connecting
-    if (spinner.visible && spinnerMeshRef.current) {
+    connectingHeldRef.current = connecting ? connectingHeldRef.current + delta : 0
+    // Show the spinner immediately during the initial connect (nothing live
+    // yet), but once we've had a live feed require the connecting state to
+    // persist briefly. That way a momentary pipeline blip — which the frozen
+    // last frame already covers — never flashes the arc near the top of the
+    // frame, while a genuine sustained dropout still surfaces feedback.
+    const spinnerVisible =
+      presenting && connecting && (!anyLive || connectingHeldRef.current > 0.4)
+    spinner.visible = spinnerVisible
+    if (spinnerVisible && spinnerMeshRef.current) {
       spinnerMeshRef.current.rotation.z -= 0.12
     }
 
-    // Hide every plane up front; each mode re-enables only what it draws.
+    // Hide every plane up front; the layout below re-enables what it draws.
     mesh.visible = false
     leftMesh.visible = false
     rightMesh.visible = false
@@ -550,22 +572,37 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     bMesh.visible = false
     if (!group.visible) return
 
-    // Place a plane sized to a target height (width from the video aspect).
+    // Aspect ratio of a feed's video, cached per texture. While a stream stalls
+    // `videoWidth`/`videoHeight` read 0; reuse the last good aspect so the plane
+    // keeps its size (and its edges don't flash passthrough) until the sticky
+    // texture resumes. Falls back to 16:9 only before the first decoded frame.
+    const aspectOf = (t: THREE.VideoTexture) => {
+      const v = t.image as HTMLVideoElement | undefined
+      if (v && v.videoWidth && v.videoHeight) {
+        const a = v.videoWidth / v.videoHeight
+        aspectRef.current[t.uuid] = a
+        return a
+      }
+      return aspectRef.current[t.uuid] ?? 16 / 9
+    }
+    // Place a plane sized to a target height (width from the video aspect),
+    // times the slot's user resize factor.
     const fitHeight = (
       m: THREE.Mesh,
       mt: THREE.MeshBasicMaterial,
       t: THREE.VideoTexture,
       height: number,
       x: number,
-      y: number
+      y: number,
+      scale: number
     ) => {
-      const v = t.image as HTMLVideoElement | undefined
-      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
+      const aspect = aspectOf(t)
       if (mt.map !== t) {
         mt.map = t
         mt.needsUpdate = true
       }
-      m.scale.set(height * aspect, height, 1)
+      const h = height * scale
+      m.scale.set(h * aspect, h, 1)
       m.position.set(x, y, -FEED_DISTANCE)
       m.visible = true
     }
@@ -576,96 +613,80 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       t: THREE.VideoTexture,
       width: number,
       x: number,
-      y: number
+      y: number,
+      scale: number
     ) => {
-      const v = t.image as HTMLVideoElement | undefined
-      const aspect = v && v.videoWidth ? v.videoWidth / v.videoHeight : 16 / 9
-      fitHeight(m, mt, t, width / aspect, x, y)
-      m.scale.x = width
+      const aspect = aspectOf(t)
+      fitHeight(m, mt, t, width / aspect, x, y, scale)
+      m.scale.x = width * scale
     }
 
-    if (mode === "overhead") {
-      const oL = liveTex("overhead_left")
-      const oR = liveTex("overhead_right")
-      if (oL && oR) {
-        // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
-        fitHeight(leftMesh, leftMat, oL, FEED_HEIGHT, 0, FEED_Y)
-        fitHeight(rightMesh, rightMat, oR, FEED_HEIGHT, 0, FEED_Y)
-        const eyes = (cam as THREE.ArrayCamera).cameras
-        if (eyes && eyes.length >= 2) {
-          eyes[0].layers.enable(1)
-          eyes[1].layers.enable(2)
-        }
-      } else {
-        const o = oL ?? liveTex("overhead")
-        if (o) fitHeight(mesh, mat, o, FEED_HEIGHT, 0, FEED_Y)
+    const scaleOf = (slot: GrabSlot) => scalesRef.current[slot] ?? 1
+
+    // Overhead in the centre.
+    if (oL && oR) {
+      // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
+      fitWidth(leftMesh, leftMat, oL, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
+      fitWidth(rightMesh, rightMat, oR, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
+      const eyes = (cam as THREE.ArrayCamera).cameras
+      if (eyes && eyes.length >= 2) {
+        eyes[0].layers.enable(1)
+        eyes[1].layers.enable(2)
       }
-    } else if (mode === "left") {
-      const t = liveTex("left_arm")
-      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
-    } else if (mode === "right") {
-      const t = liveTex("right_arm")
-      if (t) fitHeight(mesh, mat, t, FEED_HEIGHT, 0, FEED_Y)
-    } else if (mode === "split") {
-      const l = liveTex("left_arm")
-      const r = liveTex("right_arm")
-      if (l) fitWidth(aMesh, aMat, l, SPLIT_WIDTH, -SPLIT_X, FEED_Y)
-      if (r) fitWidth(bMesh, bMat, r, SPLIT_WIDTH, SPLIT_X, FEED_Y)
-    } else {
-      // default: passthrough with the wrist cams pinned to the bottom corners.
-      const l = liveTex("left_arm")
-      const r = liveTex("right_arm")
-      if (l) fitWidth(aMesh, aMat, l, PIP_WIDTH, -PIP_X, PIP_Y)
-      if (r) fitWidth(bMesh, bMat, r, PIP_WIDTH, PIP_X, PIP_Y)
+    } else if (overheadMono) {
+      fitWidth(mesh, mat, overheadMono, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
     }
+    // Wrist cams as bottom-corner PiPs (left → bottom-left, right → bottom-right).
+    if (leftTex) fitWidth(aMesh, aMat, leftTex, PIP_WIDTH, -PIP_X, PIP_Y, scaleOf("left"))
+    if (rightTex) fitWidth(bMesh, bMat, rightTex, PIP_WIDTH, PIP_X, PIP_Y, scaleOf("right"))
 
-    // The layout above set each visible plane's *base* (group-local) position;
-    // snapshot them before drag offsets are applied. The stereo eye planes are
-    // coincident, so "main" covers both.
-    const bases: Partial<Record<GrabSlot, THREE.Vector3>> = {}
-    if (mesh.visible) bases.main = mesh.position.clone()
-    if (leftMesh.visible) bases.main = leftMesh.position.clone()
-    if (aMesh.visible) bases.a = aMesh.position.clone()
-    if (bMesh.visible) bases.b = bMesh.position.clone()
-
-    // Build the controller's pointing ray (origin + forward) in world space.
+    // Refresh each hand's pointing ray (origin + forward) in world space, so
+    // both the single-hand drag and the two-hand resize can read either hand.
     const refSpace = gl.xr.getReferenceSpace()
-    const computeRay = (src: XRInputSource): boolean => {
-      if (!frame || !refSpace || !src.targetRaySpace) return false
+    const computeRay = (hand: "left" | "right") => {
+      const r = _handRay[hand]
+      r.valid = false
+      const src = sources.find((s) => s.handedness === hand)
+      if (!src || !frame || !refSpace || !src.targetRaySpace) return
       const pose = frame.getPose(src.targetRaySpace, refSpace)
-      if (!pose) return false
+      if (!pose) return
       _rayMatrix.fromArray(pose.transform.matrix)
-      _rayOrigin.setFromMatrixPosition(_rayMatrix)
+      r.origin.setFromMatrixPosition(_rayMatrix)
       const e = _rayMatrix.elements
-      _rayDir.set(-e[8], -e[9], -e[10]).normalize() // ray forward = -Z
-      return true
+      r.dir.set(-e[8], -e[9], -e[10]).normalize() // ray forward = -Z
+      r.valid = true
     }
+    computeRay("left")
+    computeRay("right")
 
-    // Grab handling: a rising-edge trigger press while pointing at a screen
-    // grabs it at the hit distance; while held, the screen follows the ray
-    // (offset from its layout base is remembered per `${mode}:${slot}`).
-    // Disabled while robot tracking is engaged — the trigger drives the
-    // gripper then, and a grab would fight the teleop.
-    if (robotEngagedRef.current) grabRef.current = null
-    for (const src of sources) {
-      const hand = src.handedness
-      if (hand !== "left" && hand !== "right") continue
-      const pressed = src.gamepad?.buttons?.[0]?.pressed ?? false
+    // Grab handling. Pointing at a screen and pressing the trigger grabs it at
+    // the hit distance. One hand grabbing drags the screen along its ray; both
+    // hands grabbing the *same* screen resize it by their separation. Disabled
+    // while robot tracking is engaged — the trigger drives the gripper then, and
+    // a grab would fight the teleop.
+    const grabs = grabsRef.current
+    if (robotEngagedRef.current) {
+      grabs.left = null
+      grabs.right = null
+      resizeRef.current = null
+    }
+    for (const hand of ["left", "right"] as const) {
+      const src = sources.find((s) => s.handedness === hand)
+      const pressed = src?.gamepad?.buttons?.[0]?.pressed ?? false
       const wasPressed = triggerPrevRef.current[hand]
       triggerPrevRef.current[hand] = pressed
       if (robotEngagedRef.current) continue
-
       if (!pressed) {
-        if (grabRef.current?.hand === hand) grabRef.current = null
+        grabs[hand] = null
         continue
       }
-      if (pressed && !wasPressed && !grabRef.current && computeRay(src)) {
+      if (!wasPressed && !grabs[hand] && _handRay[hand].valid) {
         const candidates: [THREE.Mesh, GrabSlot][] = []
-        if (mesh.visible) candidates.push([mesh, "main"])
-        if (leftMesh.visible) candidates.push([leftMesh, "main"])
-        if (aMesh.visible) candidates.push([aMesh, "a"])
-        if (bMesh.visible) candidates.push([bMesh, "b"])
-        _raycaster.set(_rayOrigin, _rayDir)
+        if (mesh.visible) candidates.push([mesh, "overhead"])
+        if (leftMesh.visible) candidates.push([leftMesh, "overhead"])
+        if (aMesh.visible) candidates.push([aMesh, "left"])
+        if (bMesh.visible) candidates.push([bMesh, "right"])
+        _raycaster.set(_handRay[hand].origin, _handRay[hand].dir)
         const hits = _raycaster.intersectObjects(
           candidates.map((c) => c[0]),
           false
@@ -673,17 +694,65 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         const hit = hits[0]
         if (hit) {
           const slot = candidates.find((c) => c[0] === hit.object)?.[1]
-          if (slot) grabRef.current = { hand, slot, distance: hit.distance, mode }
+          if (slot) {
+            // Anchor the drag at the current controller ray point (group-local)
+            // so dragging tracks relative motion instead of snapping the screen
+            // centre to wherever the ray happens to hit.
+            _grabTarget
+              .copy(_handRay[hand].origin)
+              .addScaledVector(_handRay[hand].dir, hit.distance)
+            group.worldToLocal(_grabTarget)
+            grabs[hand] = { slot, distance: hit.distance, lastLocal: _grabTarget.clone() }
+          }
         }
       }
-      const grab = grabRef.current
-      if (grab && grab.hand === hand && grab.mode === mode && computeRay(src)) {
-        const base = bases[grab.slot]
-        if (base) {
-          _grabTarget.copy(_rayOrigin).addScaledVector(_rayDir, grab.distance)
-          group.worldToLocal(_grabTarget)
-          dragOffsetsRef.current[`${mode}:${grab.slot}`] = _grabTarget.clone().sub(base)
-        }
+    }
+
+    // Current group-local point along a hand's ray at its captured grab
+    // distance. Returns the shared `_grabTarget` scratch — copy before reuse.
+    const localRayPoint = (hand: "left" | "right", distance: number) => {
+      const ray = _handRay[hand]
+      _grabTarget.copy(ray.origin).addScaledVector(ray.dir, distance)
+      return group.worldToLocal(_grabTarget)
+    }
+
+    // Two hands on the same screen → resize it by how far apart they are now
+    // relative to when the second hand grabbed on. Otherwise each grabbing hand
+    // drags its screen by how far the controller moved since last frame.
+    //
+    // Either way we refresh every held hand's `lastLocal` each frame, so that
+    // transitioning between one and two hands (starting or ending a resize)
+    // never replays a stale delta that would snap the screen onto a controller.
+    if (
+      grabs.left &&
+      grabs.right &&
+      grabs.left.slot === grabs.right.slot &&
+      _handRay.left.valid &&
+      _handRay.right.valid
+    ) {
+      const slot = grabs.left.slot
+      const sep = _handRay.left.origin.distanceTo(_handRay.right.origin)
+      const rz = resizeRef.current
+      if (!rz || rz.slot !== slot) {
+        resizeRef.current = { slot, startSep: sep, startScale: scaleOf(slot) }
+      } else if (rz.startSep > 1e-3) {
+        const next = rz.startScale * (sep / rz.startSep)
+        scalesRef.current[slot] = Math.min(MAX_SCALE, Math.max(MIN_SCALE, next))
+      }
+      // Keep drag anchors current without moving the screen while resizing.
+      grabs.left.lastLocal.copy(localRayPoint("left", grabs.left.distance))
+      grabs.right.lastLocal.copy(localRayPoint("right", grabs.right.distance))
+    } else {
+      resizeRef.current = null
+      for (const hand of ["left", "right"] as const) {
+        const grab = grabs[hand]
+        const ray = _handRay[hand]
+        if (!grab || !ray.valid) continue
+        const cur = localRayPoint(hand, grab.distance) // shared scratch
+        _dragDelta.copy(cur).sub(grab.lastLocal)
+        grab.lastLocal.copy(cur)
+        const off = dragOffsetsRef.current[grab.slot] ?? new THREE.Vector3()
+        dragOffsetsRef.current[grab.slot] = off.add(_dragDelta)
       }
     }
 
@@ -691,23 +760,28 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // operator's head (a world-anchored panel viewed edge-on is useless).
     const orient = (m: THREE.Mesh, slot: GrabSlot) => {
       if (!m.visible) return
-      const off = dragOffsetsRef.current[`${mode}:${slot}`]
+      const off = dragOffsetsRef.current[slot]
       if (off) m.position.add(off)
       m.lookAt(cam.position)
     }
-    orient(mesh, "main")
-    orient(leftMesh, "main")
-    orient(rightMesh, "main")
-    orient(aMesh, "a")
-    orient(bMesh, "b")
+    orient(mesh, "overhead")
+    orient(leftMesh, "overhead")
+    orient(rightMesh, "overhead")
+    orient(aMesh, "left")
+    orient(bMesh, "right")
   })
 
   return (
     <>
       <group ref={groupRef} visible={false}>
-        <mesh ref={meshRef} position={[0, FEED_Y, -FEED_DISTANCE]} renderOrder={1}>
+        <mesh
+          ref={meshRef}
+          position={[0, FEED_Y, -FEED_DISTANCE]}
+          renderOrder={1}
+          visible={false}
+        >
           <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={false} />
+          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={true} />
         </mesh>
         <mesh
           ref={leftMeshRef}
@@ -720,7 +794,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={leftMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
         <mesh
@@ -734,26 +808,29 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             ref={rightMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
-        {/* Shared wrist-cam planes: split panes or default-view corner PiPs. */}
-        <mesh ref={dualAMeshRef} renderOrder={1} visible={false}>
+        {/* Wrist-cam planes shown as bottom-corner PiPs (A = left, B = right).
+            Distinct renderOrders keep the paint order deterministic where the
+            PiPs overlap the overhead — without depth testing, equal orders let
+            three.js's distance sort flip coplanar planes and flicker. */}
+        <mesh ref={dualAMeshRef} renderOrder={2} visible={false}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={dualAMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
-        <mesh ref={dualBMeshRef} renderOrder={1} visible={false}>
+        <mesh ref={dualBMeshRef} renderOrder={3} visible={false}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial
             ref={dualBMatRef}
             toneMapped={false}
             depthTest={false}
-            depthWrite={false}
+            depthWrite={true}
           />
         </mesh>
       </group>
@@ -863,10 +940,15 @@ function StateDisplay({
   )
 }
 
-function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
+function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
   const W = 0.44
   const H = 0.133
   const col = 0.11
+  // Recording only exists in data collection; teleop drops the [A] hint.
+  const rightRows =
+    mode === "teleop"
+      ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[Stick Click]  Reset Screens"
+      : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[Stick Click]  Reset Screens"
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -941,13 +1023,13 @@ function HelpPanel({ onDismiss }: { onDismiss: () => void }) {
         material-depthTest={false}
         lineHeight={1.6}
       >
-        {`[B]  Toggle Mode\n[A]  Start / Stop Rec\n[Stick]  Switch View\n[Trigger]  Move Screen\n[Stick Click]  Reset Screens`}
+        {rightRows}
       </HudText>
     </group>
   )
 }
 
-function HelpIcon() {
+function HelpIcon({ mode }: { mode: AxolMode | null }) {
   const [open, setOpen] = useState(false)
 
   return (
@@ -965,7 +1047,7 @@ function HelpIcon() {
       >
         ?
       </HudText>
-      {open && <HelpPanel onDismiss={() => setOpen(false)} />}
+      {open && <HelpPanel onDismiss={() => setOpen(false)} mode={mode} />}
     </group>
   )
 }
@@ -1055,6 +1137,9 @@ export default function App() {
   const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
+  // Operating mode the server locked us to (null until it announces one on
+  // connect). Drives which HUD/hint controls are shown.
+  const [vrMode, setVrMode] = useState<AxolMode | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
@@ -1066,6 +1151,21 @@ export default function App() {
   // connection is up (independent of cameras / presenting). AxolVRClient prefers
   // it over the main WebSocket, which stays as the fallback.
   const { poseChannelRef } = useAxolControlChannel(wsRef, status === AxolConnectionStatus.Open)
+
+  // If the server connection is lost while the headset is presenting (the
+  // socket closes and every reconnect attempt fails → Failed), end the XR
+  // session — the same exit the Y button performs. Without this the operator
+  // is stuck in-headset on a frozen feed or an eternal "Connecting cameras…"
+  // spinner with no way to know the server is gone; ending the session drops
+  // them back to the app, which shows the connection-failed card. Transient
+  // blips are unaffected: the retry loop keeps the session alive unless all
+  // retries are exhausted. (Y itself is no help here — its exit path still
+  // works, but the user doesn't know they need to press it.)
+  useEffect(() => {
+    if (status === AxolConnectionStatus.Failed) {
+      void store.getState().session?.end()
+    }
+  }, [status])
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
@@ -1190,11 +1290,12 @@ export default function App() {
                 <ControlHints
                   title="Right"
                   rows={[
-                    ["B", "Toggle mode"],
-                    ["A", "Start / stop rec"],
-                    ["Stick", "Switch view"],
-                    ["Stick click", "Reset screens"],
+                    ...(vrMode === "teleop"
+                      ? []
+                      : ([["A", "Start / stop rec"]] as [string, string][])),
                     ["Trigger", "Move screen"],
+                    ["2× Trigger", "Resize screen"],
+                    ["Stick click", "Reset screens"],
                   ]}
                 />
               </div>
@@ -1239,12 +1340,13 @@ export default function App() {
               poseChannelRef={poseChannelRef}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
+              onMode={setVrMode}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
             <XRHud>
               <ExitButton />
-              <HelpIcon />
+              <HelpIcon mode={vrMode} />
               <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
             </XRHud>

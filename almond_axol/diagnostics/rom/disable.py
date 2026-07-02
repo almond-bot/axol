@@ -13,8 +13,15 @@ grippers (forcing them open and dropping the item) and reset the arm motors.
 Instead it only starts the CAN reader loops and talks to the gripper motors
 directly in raw motor radians, leaving the arms holding their last command.
 
+If ``rom.enable`` was run on a subset of joints (via ``--joints``), pass the
+same ``--joints`` here so only those motors are talked to and disabled. When
+the gripper is not among them there is nothing to release, so this just powers
+the selected motors down.
+
 Run (right after rom.enable, while the motors are still enabled):
     uv run -m almond_axol.diagnostics.rom.disable
+    uv run -m almond_axol.diagnostics.rom.disable --no-left
+    uv run -m almond_axol.diagnostics.rom.disable --joints wrist_1,wrist_2,wrist_3
 """
 
 import argparse
@@ -30,6 +37,27 @@ RATE_HZ = 100.0  # Hz
 OPEN_SPEED = 0.2 * 2 * math.pi  # rad/s — gradual, so the operator can catch the item
 OPEN_MAX_SPEED = 10.0  # rad/s — POSITION_FORCE velocity cap (smoothstep paces it)
 OPEN_TORQUE = 2.0  # Nm — POSITION_FORCE output cap while opening
+
+
+def parse_joints(spec: str | None) -> set[Joint]:
+    """Parse a comma-separated joint spec into a set of present :class:`Joint`.
+
+    ``None`` or empty selects every joint. Names match the joint enum values
+    (e.g. ``shoulder_1``, ``elbow``, ``gripper``).
+    """
+    if not spec:
+        return set(Joint)
+    by_value = {j.value: j for j in Joint}
+    selected: set[Joint] = set()
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name not in by_value:
+            valid = ", ".join(by_value)
+            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
+        selected.add(by_value[name])
+    return selected or set(Joint)
 
 
 async def open_gripper(arm: AxolArm, side: str) -> None:
@@ -66,8 +94,35 @@ async def open_gripper(arm: AxolArm, side: str) -> None:
     print(f"  {side} gripper open.")
 
 
-async def run(no_left: bool, no_right: bool) -> None:
-    """Open each gripper sequentially, then disable all motors."""
+async def _disable(axol: Axol, present: set[Joint]) -> None:
+    """Disable the motors and close the buses, limited to the present joints.
+
+    A full set delegates to ``Axol.disable`` (its usual all-motor shutdown);
+    a subset only disables the motors that are actually on the bus so absent
+    ones are not waited on, then closes the buses.
+    """
+    if present == set(Joint):
+        await axol.disable()
+        return
+    tasks = []
+    for arm in (axol.left, axol.right):
+        if arm is not None:
+            tasks.extend(arm.motors[j].disable() for j in present)
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        pass
+    finally:
+        close_tasks = []
+        if axol.left is not None:
+            close_tasks.append(axol._left_bus.close())
+        if axol.right is not None:
+            close_tasks.append(axol._right_bus.close())
+        await asyncio.gather(*close_tasks)
+
+
+async def run(no_left: bool, no_right: bool, present: set[Joint]) -> None:
+    """Open each present gripper sequentially, then disable the present motors."""
     kwargs = {}
     if no_left:
         kwargs["left_channel"] = None
@@ -75,6 +130,7 @@ async def run(no_left: bool, no_right: bool) -> None:
         kwargs["right_channel"] = None
 
     axol = Axol(**kwargs)
+    has_gripper = Joint.GRIPPER in present
 
     # The motors are already enabled and holding (rom.enable left them up); only
     # start the CAN reader loops so we can command them. Do NOT call enable().
@@ -86,38 +142,50 @@ async def run(no_left: bool, no_right: bool) -> None:
     await asyncio.gather(*bus_tasks)
 
     try:
-        targets: list[tuple[str, AxolArm]] = []
-        if axol.right is not None:
-            targets.append(("RIGHT", axol.right))
-        if axol.left is not None:
-            targets.append(("LEFT", axol.left))
+        if has_gripper:
+            targets: list[tuple[str, AxolArm]] = []
+            if axol.right is not None:
+                targets.append(("RIGHT", axol.right))
+            if axol.left is not None:
+                targets.append(("LEFT", axol.left))
 
-        for side, arm in targets:
-            await asyncio.to_thread(
-                input, f"Press Enter to open the {side} gripper ..."
-            )
-            await open_gripper(arm, side)
+            for side, arm in targets:
+                await asyncio.to_thread(
+                    input, f"Press Enter to open the {side} gripper ..."
+                )
+                await open_gripper(arm, side)
 
-        print("\nBoth grippers open — item released.")
+            print("\nGrippers open — item released.")
+        else:
+            print("\nNo gripper in this run — nothing to release.")
     finally:
         print("Disabling motors ...")
-        await axol.disable()
+        await _disable(axol, present)
         print("Motors disabled.")
 
 
 def main() -> None:
     """Parse CLI arguments and run the gripper release routine."""
+    valid_joints = [j.value for j in Joint]
     parser = argparse.ArgumentParser(
         description="Open the grippers from rom.enable and disable the robot."
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
+    parser.add_argument(
+        "--joints",
+        default=None,
+        help="Comma-separated joints present on the bus (must match the rom.enable run). "
+        f"Only these are talked to and disabled. Default: all. One of: {', '.join(valid_joints)}.",
+    )
     args = parser.parse_args()
 
     if args.no_left and args.no_right:
         parser.error("Cannot disable both arms.")
 
-    asyncio.run(run(no_left=args.no_left, no_right=args.no_right))
+    present = parse_joints(args.joints)
+
+    asyncio.run(run(no_left=args.no_left, no_right=args.no_right, present=present))
 
 
 if __name__ == "__main__":
