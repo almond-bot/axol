@@ -7,6 +7,16 @@ export type CameraStreams = Record<string, MediaStream>
 
 const POLL_MS = 300
 
+// Receiver jitter-buffer target (ms). A *zero* buffer minimises latency but
+// leaves no time for a NACK retransmit of a dropped/reordered RTP packet, so
+// the decoder presents an incomplete frame — corrupt macroblocks that flash as
+// a garbled band (usually near the top of the image) until the next keyframe
+// ~1s later. A small buffer lets the retransmit land before playout and clears
+// that up. Kept low for LAN teleop, where the NACK round trip is ~1ms so this
+// recovers essentially all loss; raise it on a lossier link, lower toward 0 to
+// shave latency at the cost of the tearing returning.
+const JITTER_BUFFER_MS = 100
+
 /**
  * Negotiates a WebRTC connection that receives the Axol cameras and exposes
  * them as `MediaStream`s keyed by camera name.
@@ -76,16 +86,17 @@ export function useAxolVideo(
       // its camera name from the server's map.
       const acc: CameraStreams = {}
       pc.ontrack = (e: RTCTrackEvent) => {
-        // Ask the receiver to render with minimal buffering: this is a live
-        // LAN teleop feed, so trade jitter resilience for latency (Chromium
-        // jitter buffers can otherwise hold frames for tens of ms).
+        // Keep the receiver buffer small for low-latency LAN teleop, but not
+        // zero: a tiny buffer still lets a NACK retransmit recover a lost or
+        // reordered packet before playout, instead of decoding an incomplete
+        // frame and flashing corrupt macroblocks until the next keyframe.
         const receiver = e.receiver as RTCRtpReceiver & {
           playoutDelayHint?: number
           jitterBufferTarget?: number | null
         }
         try {
-          receiver.jitterBufferTarget = 0 // standard, milliseconds
-          receiver.playoutDelayHint = 0 // legacy Chromium, seconds
+          receiver.jitterBufferTarget = JITTER_BUFFER_MS // standard, milliseconds
+          receiver.playoutDelayHint = JITTER_BUFFER_MS / 1000 // legacy Chromium, seconds
         } catch {
           // best-effort; older browsers may reject the setters
         }

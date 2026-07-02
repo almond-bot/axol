@@ -77,6 +77,13 @@ class VRServer:
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
 
+        # Operating mode announced to each headset on connect ("teleop" or
+        # "data_collection"). The web UI uses it to lock its HUD to a single
+        # mode: teleop can't switch to data collection or record, and data
+        # collection can't switch back to plain teleop. ``None`` leaves the UI
+        # in its legacy free-toggle behaviour (older backends that never set it).
+        self._mode: str | None = None
+
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
         # each ``seq`` once, from whichever transport delivers it first — the
@@ -133,6 +140,17 @@ class VRServer:
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
+
+    def set_mode(self, mode: str | None) -> None:
+        """Set the operating mode announced to headsets on connect.
+
+        ``mode`` is ``"teleop"`` for ``axol teleop`` or ``"data_collection"``
+        for ``axol collect-data``; the web UI locks its HUD accordingly (see
+        ``self._mode``). Applies to clients that connect *after* this call — the
+        mode is pushed once per client in the WebSocket accept handler. Safe to
+        call before :meth:`enable`.
+        """
+        self._mode = mode
 
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Register per-camera video sources to stream to the headset.
@@ -429,6 +447,17 @@ class VRServer:
             server._client_count += 1
             server._active_clients.add(websocket)
             client_id = id(websocket)
+            # Announce the operating mode so the UI can lock its HUD (teleop vs
+            # data collection). Sent per client on connect since a client may
+            # join after set_mode(); best-effort so a send failure never blocks
+            # the receive loop below.
+            if server._mode is not None:
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "mode", "value": server._mode})
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send mode to client: %s", exc)
             try:
                 while True:
                     data = await websocket.receive_text()

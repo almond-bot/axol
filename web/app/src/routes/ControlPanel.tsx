@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
   cameraCount,
+  detectCameras,
   exportOpSettings,
   fetchCommands,
   fetchInfo,
@@ -11,6 +12,7 @@ import {
   fetchUpdateStatus,
   fetchUsbStatus,
   loadOpSettings,
+  missingCameraSerials,
   operationMeta,
   parseImportedSettings,
   robotConnect,
@@ -23,6 +25,7 @@ import {
   stopOperation,
   usbConnect,
   useSessionLogs,
+  type CameraDevice,
   type CameraSpec,
   type CommandSpec,
   type FormValue,
@@ -41,6 +44,7 @@ import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { CamerasDialog } from "@/components/cameras-dialog"
 import { SiteNav } from "@/components/site-nav"
+import { useToast } from "@/components/ui/toast"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
@@ -84,6 +88,7 @@ function loadAllOpSettings(): OpSettings {
 }
 
 export default function ControlPanel() {
+  const toast = useToast()
   const [commands, setCommands] = useState<CommandSpec[]>([])
   const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
@@ -104,6 +109,11 @@ export default function ControlPanel() {
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  // Last ZED detection from the serve host (null until first detected), used to
+  // verify the assigned serials are actually connected before a task starts.
+  const [cameraDevices, setCameraDevices] = useState<CameraDevice[] | null>(null)
+  const [cameraDetectError, setCameraDetectError] = useState<string | null>(null)
+  const [cameraDetecting, setCameraDetecting] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -112,49 +122,72 @@ export default function ControlPanel() {
 
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // Short label shown on the Start button while a start is being prepared (e.g.
+  // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
+  // update banner's phase display.
+  const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
   const [camerasDialogOpen, setCamerasDialogOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
-  const loadServer = useCallback(async (host: string) => {
-    setServerBase(host)
-    setConn({ state: "loading" })
-    setError(null)
+  // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
+  // the assigned serials are actually connected (best-effort: failures leave the
+  // last known state and surface as a "can't detect" warning).
+  const refreshCameras = useCallback(async () => {
+    setCameraDetecting(true)
     try {
-      const cmds = await fetchCommands()
-      setCommands(cmds)
-      setConn({ state: "ok" })
-      setSetupOpen(false)
+      const result = await detectCameras()
+      setCameraDevices(result.devices)
+      setCameraDetectError(result.error)
     } catch (e) {
-      setCommands([])
-      setConn({ state: "err", message: String(e) })
-      return
+      setCameraDevices(null)
+      setCameraDetectError(String(e).replace(/^Error:\s*/, ""))
+    } finally {
+      setCameraDetecting(false)
     }
-    fetchInfo()
-      .then((info) => {
-        setViewerPort(info.viewerPort)
-        setHostInfo(info)
-      })
-      .catch(() => {})
-    // Force a synchronous remote check on connect/page load so the banner
-    // reflects reality immediately; the steady-state poll below stays cheap.
-    fetchUpdateStatus(true)
-      .then(setUpdate)
-      .catch(() => {})
-    fetchRobotStatus()
-      .then(setRobot)
-      .catch(() => {})
-    fetchOpStatus()
-      .then((op) => {
-        if (op.running && op.session) {
-          setSession(op.session)
-          setSelectedOp(op.session.command as OperationId)
-        }
-      })
-      .catch(() => {})
   }, [])
+
+  const loadServer = useCallback(
+    async (host: string) => {
+      setServerBase(host)
+      setConn({ state: "loading" })
+      try {
+        const cmds = await fetchCommands()
+        setCommands(cmds)
+        setConn({ state: "ok" })
+        setSetupOpen(false)
+      } catch (e) {
+        setCommands([])
+        setConn({ state: "err", message: String(e) })
+        return
+      }
+      refreshCameras()
+      fetchInfo()
+        .then((info) => {
+          setViewerPort(info.viewerPort)
+          setHostInfo(info)
+        })
+        .catch(() => {})
+      // Force a synchronous remote check on connect/page load so the banner
+      // reflects reality immediately; the steady-state poll below stays cheap.
+      fetchUpdateStatus(true)
+        .then(setUpdate)
+        .catch(() => {})
+      fetchRobotStatus()
+        .then(setRobot)
+        .catch(() => {})
+      fetchOpStatus()
+        .then((op) => {
+          if (op.running && op.session) {
+            setSession(op.session)
+            setSelectedOp(op.session.command as OperationId)
+          }
+        })
+        .catch(() => {})
+    },
+    [refreshCameras]
+  )
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -259,11 +292,10 @@ export default function ControlPanel() {
     // so disconnecting never leaves an orphaned op running server-side. Only
     // then tear down the (client-side) host connection.
     setBusy(true)
-    setError(null)
     try {
       await stopRunningOp()
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
       setBusy(false)
       return
     }
@@ -272,6 +304,8 @@ export default function ControlPanel() {
     setCommands([])
     setRobot(null)
     setSession(null)
+    setCameraDevices(null)
+    setCameraDetectError(null)
     setUpdate(null)
     setUpdating(false)
     setUpdatePhase(null)
@@ -296,7 +330,6 @@ export default function ControlPanel() {
   function selectOp(op: OperationId) {
     setSelectedOp(op)
     localStorage.setItem("axolOp", op)
-    setError(null)
   }
 
   // -- per-operation settings --
@@ -324,9 +357,8 @@ export default function ControlPanel() {
   function importSettings(text: string) {
     try {
       updateSettings(selectedOp, parseImportedSettings(text))
-      setError(null)
     } catch (e) {
-      setError(`Import failed: ${e}`)
+      toast.error(`Import failed: ${e}`)
     }
   }
 
@@ -336,7 +368,7 @@ export default function ControlPanel() {
     try {
       setRobot(await robotConnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
@@ -344,14 +376,13 @@ export default function ControlPanel() {
 
   async function robotDisconnectClick() {
     setRobotBusy(true)
-    setError(null)
     try {
       // Kill any running task and wait for it to exit before releasing the
       // robot connection out from under it, then disconnect.
       await stopRunningOp()
       setRobot(await robotDisconnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
@@ -360,13 +391,12 @@ export default function ControlPanel() {
   // -- quest over usb (adb reverse pose tunnel) --
   async function usbConnectClick() {
     setUsbBusy(true)
-    setError(null)
     try {
       // Runs `adb reverse`; the first touch also pops the USB-debugging
       // authorization prompt on the headset.
       setUsb(await usbConnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setUsbBusy(false)
     }
@@ -483,8 +513,42 @@ export default function ControlPanel() {
 
   async function handleStart() {
     setBusy(true)
-    setError(null)
     try {
+      // Only ops that actually require cameras (collect-data / run-policy) are
+      // gated on them. Teleop streams whatever cameras are configured but must
+      // never be blocked by camera detection, and sim never touches hardware.
+      const isSimSelected = selectedOp === "teleop" && Boolean(settings.sim)
+      if (meta.requiresCameras && !isSimSelected) {
+        // Reuse the detection we already ran (on connect / when the Cameras
+        // dialog closed) instead of spawning a fresh enumeration on every start
+        // — re-detecting isn't more accurate anyway (the ZED daemon caches its
+        // device list until it's restarted), and the subprocess spawn is what
+        // made "Starting" hang. Only detect on demand if we have no result yet.
+        let devices = cameraDevices
+        let detErr = cameraDetectError
+        if (devices === null) {
+          setStartPhase("Checking cameras…")
+          const detect = await detectCameras()
+          setCameraDevices(detect.devices)
+          setCameraDetectError(detect.error)
+          devices = detect.devices
+          detErr = detect.error
+        }
+        if (detErr) {
+          toast.error(`Can't verify cameras: ${detErr}`)
+          return
+        }
+        const missing = missingCameraSerials(cameras, devices ?? [])
+        if (missing.length > 0) {
+          toast.error(
+            `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
+              ", "
+            )}. Reconnect, then Refresh (or Restart daemon) in the Cameras dialog.`
+          )
+          return
+        }
+      }
+
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim).
@@ -492,8 +556,9 @@ export default function ControlPanel() {
       const result = await startOperation(selectedOp, settings, spec)
       setSession(result)
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
+      setStartPhase(null)
       setBusy(false)
     }
   }
@@ -507,14 +572,14 @@ export default function ControlPanel() {
     try {
       setSession(await stopOperation())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setBusy(false)
     }
   }
 
   function handleEpisode(command: string) {
-    sendEpisodeCommand(command).catch((e) => setError(String(e)))
+    sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
   }
 
   // Apply the available update, then hard-reload once the server is back on the
@@ -523,13 +588,12 @@ export default function ControlPanel() {
   async function handleUpdate() {
     const target = update?.remoteCommit
     if (!target) return
-    setError(null)
     setUpdating(true)
     setUpdatePhase("upgrading")
     try {
       await startUpdate()
     } catch (e) {
-      setError(`Update failed to start: ${e}`)
+      toast.error(`Update failed to start: ${e}`)
       setUpdating(false)
       setUpdatePhase(null)
       return
@@ -543,7 +607,7 @@ export default function ControlPanel() {
         clearInterval(watch)
         setUpdating(false)
         setUpdatePhase(null)
-        setError("Update is taking longer than expected. Reload to retry.")
+        toast.error("Update is taking longer than expected. Reload to retry.")
         return
       }
       try {
@@ -553,7 +617,7 @@ export default function ControlPanel() {
           clearInterval(watch)
           setUpdating(false)
           setUpdatePhase(null)
-          setError(u.error ?? "Update failed.")
+          toast.error(u.error ?? "Update failed.")
           return
         }
         // Reflect the server's current step (upgrading/provisioning) so the
@@ -601,6 +665,9 @@ export default function ControlPanel() {
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
           cameras={cameras}
+          cameraDevices={cameraDevices}
+          cameraDetectError={cameraDetectError}
+          cameraDetecting={cameraDetecting}
           onConfigureCameras={() => setCamerasDialogOpen(true)}
           usb={usb}
           usbBusy={usbBusy}
@@ -615,7 +682,6 @@ export default function ControlPanel() {
             it before starting another operation.
           </p>
         )}
-        {error && <p className="text-sm text-red-400">{error}</p>}
 
         <OperationPanel
           meta={meta}
@@ -634,6 +700,7 @@ export default function ControlPanel() {
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}
           viewerPort={viewerPort}
+          startPhase={startPhase}
           onStart={handleStart}
           onStop={handleStop}
           onEpisode={handleEpisode}
@@ -655,6 +722,9 @@ export default function ControlPanel() {
         onClose={() => setCamerasDialogOpen(false)}
         initial={cameras}
         onSave={saveCameras}
+        devices={cameraDevices}
+        detecting={cameraDetecting}
+        onRefresh={refreshCameras}
       />
     </div>
   )
