@@ -1121,60 +1121,97 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     )
 
 
-def _verify_videos_decodable(dataset_root: "Path | str") -> list[tuple[str, int, int]]:
+def _verify_videos_decodable(
+    dataset_root: "Path | str", since: float | None = None
+) -> list[tuple[str, int, int]]:
     """Safety net: assert every recorded video frame is actually decodable.
 
     The exact-``k/fps`` timestamp grid means LeRobot's save-time validation only
     checks *packet* timestamps — so if an upstream stall drops a keyframe, the
     orphaned frames are muxed (packet present, correct PTS) yet fail to *decode*,
     producing a dataset that validates on save but raises ``FrameTimestampError``
-    at train time. This re-decodes every video file end to end and, for any file
+    at train time. This re-decodes video files end to end and, for any file
     whose decoded-frame count is short of its packet count, logs a loud error
     naming the file (so the operator re-records the affected episode). Best-effort:
     a probe failure never breaks finalize. Returns the list of bad files.
+
+    ``since`` (wall-clock epoch) limits the scan to files modified after it —
+    i.e. the files this session actually wrote (an append rewrites the whole
+    chunk file, so its mtime is fresh). Without the filter the verify decodes
+    the *entire* dataset on every shutdown, which grows with total dataset
+    size and makes Ctrl+C appear hung on a large resumed dataset (earlier
+    sessions' files were already verified when they were written).
     """
+    import concurrent.futures
+
     import av
 
     root = Path(dataset_root)
     videos_root = root / "videos"
     if not videos_root.exists():
         return []
+    mp4s = sorted(videos_root.glob("observation.images.*/chunk-*/file-*.mp4"))
+    if since is not None:
+        mp4s = [p for p in mp4s if p.stat().st_mtime >= since]
+    if not mp4s:
+        return []
+    _logger.info(
+        "video integrity: verifying %d file(s)%s (%.0f MB)",
+        len(mp4s),
+        " written this session" if since is not None else "",
+        sum(p.stat().st_size for p in mp4s) / 1e6,
+    )
+
+    def _probe(mp4: "Path") -> tuple[int, int] | None:
+        with av.open(str(mp4)) as container:
+            packets = sum(1 for p in container.demux(video=0) if p.pts is not None)
+        with av.open(str(mp4)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            decoded = sum(1 for _ in container.decode(stream))
+        return packets, decoded
+
     bad: list[tuple[str, int, int]] = []
-    for mp4 in sorted(videos_root.glob("observation.images.*/chunk-*/file-*.mp4")):
-        try:
-            with av.open(str(mp4)) as container:
-                packets = sum(1 for p in container.demux(video=0) if p.pts is not None)
-            with av.open(str(mp4)) as container:
-                decoded = sum(1 for _ in container.decode(video=0))
-        except Exception as exc:  # noqa: BLE001 - probe must never break finalize
-            _logger.warning("video integrity: could not verify %s: %s", mp4, exc)
-            continue
-        if decoded != packets:
-            rel = str(mp4.relative_to(root))
-            bad.append((rel, packets, decoded))
-            _logger.error(
-                "video integrity: %s has %d frames but only %d decode (%d "
-                "undecodable) — an upstream drop cost a keyframe; those dataset "
-                "rows will fail to load, re-record the affected episode(s)",
-                rel,
-                packets,
-                decoded,
-                packets - decoded,
-            )
+    # Decode files in parallel (PyAV releases the GIL), so shutdown waits for
+    # the slowest file rather than the sum of all cameras.
+    workers = min(len(mp4s), os.cpu_count() or 4)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_probe, mp4): mp4 for mp4 in mp4s}
+        for fut, mp4 in futures.items():
+            try:
+                packets, decoded = fut.result()
+            except Exception as exc:  # noqa: BLE001 - probe must never break finalize
+                _logger.warning("video integrity: could not verify %s: %s", mp4, exc)
+                continue
+            if decoded != packets:
+                rel = str(mp4.relative_to(root))
+                bad.append((rel, packets, decoded))
+                _logger.error(
+                    "video integrity: %s has %d frames but only %d decode (%d "
+                    "undecodable) — an upstream drop cost a keyframe; those dataset "
+                    "rows will fail to load, re-record the affected episode(s)",
+                    rel,
+                    packets,
+                    decoded,
+                    packets - decoded,
+                )
     if not bad:
         _logger.info("video integrity: all recorded frames decodable")
     return bad
 
 
 def _finalize_dataset(
-    dataset: "LeRobotDataset", config: dict, episodes_recorded: int
+    dataset: "LeRobotDataset",
+    config: dict,
+    episodes_recorded: int,
+    session_start: float | None = None,
 ) -> None:
     from lerobot.utils.utils import log_say
 
     dataset.finalize()
     if episodes_recorded > 0:
         with contextlib.suppress(Exception):
-            _verify_videos_decodable(config["dataset_root"])
+            _verify_videos_decodable(config["dataset_root"], since=session_start)
     if config["push_to_hub"] and episodes_recorded > 0:
         dataset.push_to_hub()
     dataset_root = Path(config["dataset_root"])
@@ -1210,6 +1247,7 @@ class InProcessRecorder:
         self._thread: threading.Thread | None = None
         self._stop: threading.Event | None = None
         self._episodes_recorded = 0
+        self._session_start = time.time()
 
     def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
         self._publisher.write(joint_obs, action, ts)
@@ -1255,7 +1293,12 @@ class InProcessRecorder:
 
     def close(self) -> None:
         self._stop_capture()
-        _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
+        _finalize_dataset(
+            self._dataset,
+            self._config,
+            self._episodes_recorded,
+            session_start=self._session_start,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1313,9 @@ def _recorder_main(
 ) -> None:
     """Recorder subprocess entry: own the dataset, capture from shared memory."""
     logging.basicConfig(level=config["log_level"])
+    # Finalize's decode-verify scans only files written after this (a resumed
+    # dataset's earlier files were verified by the sessions that wrote them).
+    session_start = time.time()
 
     # Keep the recorder (+ its NVENC gst children, which inherit this) off the
     # control loop's cores; fall back to a positive nice where affinity isn't
@@ -1426,7 +1472,9 @@ def _recorder_main(
     finally:
         stop_capture()
         with contextlib.suppress(Exception):
-            _finalize_dataset(dataset, config, episodes_recorded)
+            _finalize_dataset(
+                dataset, config, episodes_recorded, session_start=session_start
+            )
         for cam in cameras.values():
             with contextlib.suppress(Exception):
                 cam.close()
