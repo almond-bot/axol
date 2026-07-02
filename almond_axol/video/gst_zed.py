@@ -48,7 +48,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
-from .hw_video import _bitrate_for, hw_h264_available
+from .hw_video import _bitrate_for, dataset_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -385,17 +385,6 @@ def _raw_shmsink(socket_path: str) -> str:
 # periodic IDR; the reader drops the leading P-frames until then.
 _DATASET_IDR_INTERVAL_S = 0.25
 
-# Constant-quality quantizer for the *recorded* dataset video, mirroring LeRobot's
-# libx264 default (``crf=30``). nvv4l2h264enc has no CRF, so we disable rate
-# control and pin a fixed QP: the bitrate is then content-adaptive (a mostly-static
-# teleop scene stays small) instead of being padded to a fixed bitrate budget,
-# which is what made on-Jetson datasets several times larger than the upper-computer
-# ones. H.264 QP and x264 CRF share the same 0-51 scale, so 30 matches the CRF
-# value; nudge down for higher quality / larger files, up for smaller. See
-# ALM-1164. (The headset stream, by contrast, is a bandwidth-constrained LAN
-# monitor and stays on a fixed bitrate — see ``_enc_branch``.)
-_DATASET_QP = 30
-
 
 def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) -> str:
     """Encode the dataset stream on the GPU and ship H.264 AUs over ``shmsink``.
@@ -407,16 +396,16 @@ def _dataset_enc_shmsink(socket_path: str, w: int, h: int, fps: int, name: str) 
     :class:`~almond_axol.lerobot.h264_mux_encoder.H264MuxStreamingEncoder`) rather
     than re-encoding. ``nvvidconv`` must output NVMM for ``nvv4l2h264enc``; the
     AU-aligned byte-stream is what the recorder's
-    :class:`~almond_axol.video.shm_frames.EncodedAuReader` expects. Runs in
-    constant-quality (fixed-QP) mode so the recorded dataset stays small and
-    content-adaptive (see ``_DATASET_QP``).
+    :class:`~almond_axol.video.shm_frames.EncodedAuReader` expects. Runs in VBR
+    with a peak cap so the recorded dataset stays bounded and uniformly sized
+    across cameras even when one sensor is very noisy (see ``dataset_vbr_bitrate``).
     """
     idr = max(1, round(fps * _DATASET_IDR_INTERVAL_S))
+    target, peak = dataset_vbr_bitrate(w, h, fps)
     return (
         f"nvvidconv ! video/x-raw(memory:NVMM),format=NV12,width={w},height={h} "
-        f"! nvv4l2h264enc name={name} ratecontrol-enable=false "
-        f"quant-i-frames={_DATASET_QP} quant-p-frames={_DATASET_QP} "
-        f"quant-b-frames={_DATASET_QP} preset-level=1 "
+        f"! nvv4l2h264enc name={name} control-rate=0 "
+        f"bitrate={target} peak-bitrate={peak} preset-level=1 "
         f"insert-sps-pps=true insert-aud=true idrinterval={idr} maxperf-enable=true "
         "! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! shmsink socket-path={socket_path} wait-for-connection=false "

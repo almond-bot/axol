@@ -57,21 +57,12 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..video.hw_video import hw_h264_available
+from ..video.hw_video import dataset_vbr_bitrate, hw_h264_available
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 _logger = logging.getLogger(__name__)
-
-# Constant-quality quantizer for the stored video, mirroring LeRobot's libx264
-# default (``crf=30``). nvv4l2h264enc has no CRF, so we disable rate control and
-# pin a fixed QP: the bitrate is then content-adaptive (a mostly-static teleop
-# scene stays small) instead of being padded to a fixed bitrate budget, which is
-# what made on-Jetson datasets several times larger than the upper-computer ones.
-# H.264 QP and x264 CRF share the same 0-51 scale, so 30 matches the CRF value;
-# nudge down for higher quality / larger files, up for smaller. See ALM-1164.
-_QP = 30
 
 # Per-camera feed-queue depth (frames). LeRobot's default is 30 (0.5 s at 60 fps),
 # too shallow to ride out the gst pipeline's spin-up: gst-launch takes ~1 s to
@@ -106,7 +97,7 @@ def hw_dataset_encoder_available() -> bool:
 
 
 def _gst_argv(
-    width: int, height: int, fps: int, qp: int, out_path: Path, nv12: bool
+    width: int, height: int, fps: int, out_path: Path, nv12: bool
 ) -> list[str]:
     """``gst-launch-1.0`` argv: packed frames on stdin -> H.264 mp4 file.
 
@@ -133,6 +124,7 @@ def _gst_argv(
     """
     fmt = "nv12" if nv12 else "rgba"
     blocksize = width * height * 3 // 2 if nv12 else width * height * 4
+    target, peak = dataset_vbr_bitrate(width, height, fps)
     pipeline = [
         f"fdsrc fd=0 blocksize={blocksize}",
         (
@@ -144,13 +136,14 @@ def _gst_argv(
         "video/x-raw(memory:NVMM),format=NV12",
         "queue max-size-buffers=8 max-size-bytes=0 max-size-time=0",
         (
-            # Constant-quality (fixed QP), not fixed-bitrate: ratecontrol-enable=false
-            # makes the quant-*-frames the encoder's constant quantizer, so bitrate
-            # tracks scene complexity like libx264's crf (see _QP). preset-level=1 is
-            # the fast NVENC preset; idrinterval keeps a ~1 s keyframe cadence.
-            f"nvv4l2h264enc ratecontrol-enable=false quant-i-frames={qp} "
-            f"quant-p-frames={qp} quant-b-frames={qp} preset-level=1 "
-            f"insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
+            # VBR with a peak cap (control-rate=0): NVENC's rate control targets the
+            # average bitrate, bounding each camera's size uniformly and compressing
+            # a noisy sensor down instead of letting it balloon the dataset — while
+            # keyframes may burst up to the peak (see dataset_vbr_bitrate).
+            # preset-level=1 is the fast NVENC preset; idrinterval keeps a ~1 s
+            # keyframe cadence.
+            f"nvv4l2h264enc control-rate=0 bitrate={target} peak-bitrate={peak} "
+            f"preset-level=1 insert-sps-pps=true idrinterval={fps} maxperf-enable=true"
         ),
         "h264parse",
         # trak-timescale a multiple of fps so each sample duration is an exact
@@ -390,7 +383,7 @@ class _CameraNvencEncoder:
     def _start(self, width: int, height: int, nv12: bool) -> None:
         self.video_path.parent.mkdir(parents=True, exist_ok=True)
         self._proc = subprocess.Popen(
-            _gst_argv(width, height, self._fps, _QP, self.video_path, nv12),
+            _gst_argv(width, height, self._fps, self.video_path, nv12),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -405,13 +398,15 @@ class _CameraNvencEncoder:
         if not nv12:
             self._rgba = np.empty((height, width, 4), dtype=np.uint8)
             self._rgba[:, :, 3] = 255
+        target, peak = dataset_vbr_bitrate(width, height, self._fps)
         _logger.info(
-            "NVENC mp4 pipeline started: %s %dx%d@%dfps QP=%d %s (pid %d)",
+            "NVENC mp4 pipeline started: %s %dx%d@%dfps VBR %.1f/%.1f Mbps %s (pid %d)",
             self.video_path.name,
             width,
             height,
             self._fps,
-            _QP,
+            target / 1e6,
+            peak / 1e6,
             "nv12" if nv12 else "rgba",
             self._proc.pid,
         )

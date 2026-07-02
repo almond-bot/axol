@@ -77,6 +77,25 @@ def _bitrate_for(width: int, height: int, fps: int) -> int:
     return max(4_000_000, min(20_000_000, int(width * height * fps * 0.12)))
 
 
+# Recorded-dataset VBR budget. Unlike the headset (a bandwidth-constrained live
+# monitor), the dataset encode is tuned for a bounded, uniform per-camera size:
+# NVENC's rate control (both CBR and VBR on L4T) targets the *average* bitrate,
+# so this target is effectively each camera's bitrate — quiet cameras pad up to
+# it, and a pathologically noisy camera (measured: one arm sensor hit ~50 Mbps at
+# constant QP 30, ~6x its mirror) is compressed *down* to it instead of ballooning
+# the dataset and fragmenting into many video files. VBR (not CBR) lets keyframes
+# burst up to the peak. ~0.17 bpp ≈ 6 Mbps at SVGA (960x600 @ 60), clamped so
+# other resolutions stay sane. Lower _DATASET_BPP for smaller files / less detail.
+_DATASET_BPP = 0.17
+_DATASET_PEAK_MULT = 2.0
+
+
+def dataset_vbr_bitrate(width: int, height: int, fps: int) -> tuple[int, int]:
+    """(target, peak) VBR bitrate (bits/s) for the recorded dataset encode."""
+    target = max(3_000_000, min(16_000_000, int(width * height * fps * _DATASET_BPP)))
+    return target, int(target * _DATASET_PEAK_MULT)
+
+
 def _gst_argv(width: int, height: int, fps: int, bitrate: int) -> list[str]:
     """``gst-launch-1.0`` argv: BGRA on stdin -> H.264 byte stream on stdout.
 

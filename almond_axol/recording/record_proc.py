@@ -477,10 +477,11 @@ def install_dataset_encoder() -> bool:
     or the control process for the in-process fallback). Returns True when NVENC
     is in use.
 
-    The NVENC encoder runs in **constant-quality** mode (a fixed quantizer, see
-    ``nvenc_encoder._QP``) to mirror LeRobot's libx264 ``crf=30`` — the bitrate is
-    content-adaptive, so a mostly-static teleop scene stays small instead of being
-    padded to a fixed bitrate budget.
+    The NVENC encoder runs in **VBR with a peak cap** (see
+    ``hw_video.dataset_vbr_bitrate``): NVENC targets the average bitrate, so every
+    camera's dataset video stays bounded and uniformly sized — a noisy sensor is
+    compressed down to the target instead of ballooning the dataset and fragmenting
+    it into many video files.
     """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
