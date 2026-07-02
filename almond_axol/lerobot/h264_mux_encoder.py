@@ -59,9 +59,11 @@ and returns ``None`` stats (recomputable offline).
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -219,8 +221,9 @@ class _CameraH264Muxer:
         batches: list = []
         # The yuv420p -> rgb24 conversion has no SIMD path in this ffmpeg build,
         # so libswscale logs a WARNING per scaler context; silence ffmpeg below
-        # ERROR for the decode so it doesn't flood the recorder console.
-        prev_level = av.logging.get_level()
+        # ERROR so it doesn't flood the recorder console. Set (not save/restore):
+        # cameras finalize concurrently and a restore would race across threads;
+        # the recorder subprocess has no other use for ffmpeg's non-error logs.
         av.logging.set_level(av.logging.ERROR)
         try:
             with av.open(str(self.video_path)) as container:
@@ -240,8 +243,6 @@ class _CameraH264Muxer:
                 exc,
             )
             return None
-        finally:
-            av.logging.set_level(prev_level)
         if not batches:
             return None
         stats = RunningQuantileStats()
@@ -263,13 +264,23 @@ class _CameraH264Muxer:
         truncated (moov missing or short), and returning it as a success would
         let LeRobot append/move a corrupt segment into the dataset.
         """
+        t0 = time.perf_counter()
         self._teardown(finalize=True)
         if self._error:
             raise RuntimeError(
                 f"H264 muxer for {self.video_path.name} failed to finalize: "
                 f"{self._error}"
             )
-        return self.video_path, self._compute_stats_from_file()
+        t_eos = time.perf_counter()
+        stats = self._compute_stats_from_file()
+        _logger.info(
+            "H264 mux finalize %s: eos=%.2fs stats=%.2fs (%d frames)",
+            self.video_path.name,
+            t_eos - t0,
+            time.perf_counter() - t_eos,
+            self._count,
+        )
+        return self.video_path, stats
 
     def cancel(self) -> None:
         self._teardown(finalize=False)
@@ -355,14 +366,24 @@ class H264MuxStreamingEncoder:
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
         """Finalize every camera's mp4; raises if any muxer failed to finalize.
 
+        Cameras finalize in parallel (one thread each): the EOS flush waits on
+        gst's own threads and the stats decode releases the GIL inside
+        PyAV/numpy, so the wall time is one camera's finalize instead of the
+        sum over cameras — this is the bulk of ``save_episode`` latency.
+
         A raise leaves ``_episode_active`` set; the next ``start_episode``
         cancels (and cleans up) the half-finished episode first.
         """
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
-        results: dict[str, tuple[Path, dict | None]] = {}
-        for video_key, cam in self._cams.items():
-            results[video_key] = cam.finish()
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self._cams) or 1
+        ) as pool:
+            futures = {
+                video_key: pool.submit(cam.finish)
+                for video_key, cam in self._cams.items()
+            }
+            results = {video_key: fut.result() for video_key, fut in futures.items()}
         self._cams = {}
         self._episode_active = False
         return results

@@ -176,6 +176,13 @@ def _concat_constant_fps(
     concretely ``time_base = 1 / (fps * 1000)`` with a per-frame step of 1000, so
     every frame lands on ``k / fps`` with zero rounding error. Bitstream packets
     are copied verbatim (no re-encode); only container timing is rewritten.
+
+    The temp file lives next to the output (rename, never a cross-fs copy) and
+    is muxed without ``faststart``: this runs once per camera on *every*
+    ``save_episode``, rewriting the whole accumulating chunk file, and the
+    faststart pass reads + rewrites that file *again* just to front-load the
+    moov atom — pure overhead for a file that is appended to on the next save
+    and only ever read locally (seekable either way).
     """
     import tempfile
 
@@ -184,12 +191,12 @@ def _concat_constant_fps(
     step = 1000
     time_base = Fraction(fps.denominator, fps.numerator * step)
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+    with tempfile.NamedTemporaryFile(
+        suffix=".mp4", delete=False, dir=output_video_path.parent
+    ) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
     try:
-        with av.open(
-            tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-        ) as dst:
+        with av.open(tmp_output_video_path, mode="w") as dst:
             out_stream = None
             frame_idx = 0
             for input_path in input_video_paths:
@@ -229,13 +236,14 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
 
     import av
 
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_named_file:
+    # Same-dir temp + no faststart, for the same reasons as _concat_constant_fps.
+    with tempfile.NamedTemporaryFile(
+        suffix=".mp4", delete=False, dir=output_video_path.parent
+    ) as tmp_named_file:
         tmp_output_video_path = tmp_named_file.name
 
     try:
-        with av.open(
-            tmp_output_video_path, mode="w", options={"movflags": "faststart"}
-        ) as dst:
+        with av.open(tmp_output_video_path, mode="w") as dst:
             out_streams: dict[int, object] = {}  # input stream index -> output stream
             offsets: dict[object, int] = {}  # output stream -> next start dts (out tb)
 
@@ -336,6 +344,7 @@ def _concatenate_video_files_rebased(
         raise FileNotFoundError("No input video paths provided.")
     output_video_path.parent.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.perf_counter()
     fps = _concat_probe_constant_fps(input_video_paths)
     if fps is not None:
         _concat_constant_fps(input_video_paths, output_video_path, fps)
@@ -345,6 +354,12 @@ def _concatenate_video_files_rebased(
             "falling back to shift-rebase — per-row timestamp tolerance may suffer."
         )
         _concat_shift_rebased(input_video_paths, output_video_path)
+    _logger.info(
+        "concat re-stamp -> %s (%.0f MB) in %.2fs",
+        output_video_path.name,
+        output_video_path.stat().st_size / 1e6 if output_video_path.exists() else 0,
+        time.perf_counter() - t0,
+    )
 
     if not output_video_path.exists():
         raise OSError(
@@ -1254,7 +1269,11 @@ def _recorder_main(
                     conn.send(("error", capture_error["v"]))
                 else:
                     try:
+                        t_save = time.perf_counter()
                         dataset.save_episode()
+                        _logger.info(
+                            "save_episode took %.1fs", time.perf_counter() - t_save
+                        )
                         episodes_recorded += 1
                         conn.send(("saved", dataset.num_episodes))
                     except Exception as exc:  # noqa: BLE001 - report to control proc
