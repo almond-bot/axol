@@ -112,7 +112,6 @@ class _CameraH264Muxer:
         # compounded across the concat, breaks LeRobot's 1e-4 s per-row lookup.
         self._mux_timescale = fps * 1000
         self._count = 0
-        self._dropped = 0
         self._error: str | None = None
         self._last_au: bytes | None = None
 
@@ -154,12 +153,15 @@ class _CameraH264Muxer:
         src.set_property("block", True)
         return pipeline, src
 
-    @property
-    def dropped(self) -> int:
-        return self._dropped
-
     def feed(self, au: bytes) -> None:
-        """Mux one access unit at the next constant-fps PTS."""
+        """Mux one access unit at the next constant-fps PTS.
+
+        Raises on a rejected push: the appsrc is blocking, so a non-OK flow
+        return means the pipeline is flushing or errored — the mp4 can no
+        longer contain one sample per fed AU, and continuing would silently
+        desync the video from the dataset rows. Aborting the episode (the
+        capture loop surfaces the error) is the only honest outcome.
+        """
         Gst = self._gst
         buf = Gst.Buffer.new_wrapped(au)
         pts = self._count * self._dur
@@ -168,14 +170,11 @@ class _CameraH264Muxer:
         buf.duration = self._dur
         ret = self._src.emit("push-buffer", buf)
         if ret != Gst.FlowReturn.OK:
-            self._dropped += 1
-            if self._dropped == 1 or self._dropped % 10 == 0:
-                _logger.warning(
-                    "H264 muxer push returned %s for %s (dropped %d)",
-                    ret,
-                    self.video_path.name,
-                    self._dropped,
-                )
+            raise RuntimeError(
+                f"H264 muxer push returned {ret} for {self.video_path.name} at "
+                f"frame {self._count} — pipeline is flushing/errored, aborting "
+                "the episode"
+            )
         self._last_au = au
         self._count += 1
 
@@ -261,10 +260,18 @@ class _CameraH264Muxer:
         so no trailing guard frame is added here — an extra frame would shift the
         index-based alignment of every later episode in the concatenated file.
         Image-normalization stats are then decoded from the just-written file.
+
+        Raises if the pipeline errored or never delivered EOS: the mp4 may be
+        truncated (moov missing or short), and returning it as a success would
+        let LeRobot append/move a corrupt segment into the dataset.
         """
         self._teardown(finalize=True)
-        stats = None if self._error else self._compute_stats_from_file()
-        return self.video_path, stats
+        if self._error:
+            raise RuntimeError(
+                f"H264 muxer for {self.video_path.name} failed to finalize: "
+                f"{self._error}"
+            )
+        return self.video_path, self._compute_stats_from_file()
 
     def cancel(self) -> None:
         self._teardown(finalize=False)
@@ -282,6 +289,10 @@ class _CameraH264Muxer:
                     Gst.MessageType.EOS | Gst.MessageType.ERROR,
                 )
                 if msg is None:
+                    # A wedged muxer that never flushes the moov atom: the file
+                    # on disk is not a complete mp4. Record it so finish()
+                    # raises instead of handing the truncated file to LeRobot.
+                    self._error = f"no EOS within {_EOS_TIMEOUT_S:.0f}s"
                     _logger.error(
                         "H264 muxer for %s did not EOS in %.0fs",
                         self.video_path.name,
@@ -344,20 +355,16 @@ class H264MuxStreamingEncoder:
             self._cams[video_key].feed_repeat()
 
     def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        """Finalize every camera's mp4; raises if any muxer failed to finalize.
+
+        A raise leaves ``_episode_active`` set; the next ``start_episode``
+        cancels (and cleans up) the half-finished episode first.
+        """
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
         results: dict[str, tuple[Path, dict | None]] = {}
-        dropped: dict[str, int] = {}
         for video_key, cam in self._cams.items():
             results[video_key] = cam.finish()
-            if cam.dropped:
-                dropped[video_key] = cam.dropped
-        if dropped:
-            _logger.warning(
-                "episode dropped muxer frames (%s) — recorded video may be "
-                "misaligned with actions; consider re-recording.",
-                ", ".join(f"{k}={v}" for k, v in dropped.items()),
-            )
         self._cams = {}
         self._episode_active = False
         return results

@@ -59,16 +59,18 @@ _READY_TIMEOUT_S = 60.0
 _SAVE_TIMEOUT_S = 180.0
 
 # --- Encoded (relay-side H.264) capture-loop tuning ---
-# How long to wait for the *first* access unit of an episode from each camera
-# (relay valve open + forced IDR + shmsrc spin-up). If a camera produces nothing
-# in this window its dataset branch never came up, so the episode is aborted.
+# How long the first row waits for each camera's first access unit (relay valve
+# open + forced IDR + shmsrc spin-up). If a camera produces nothing in this
+# window its dataset branch never came up, so the episode is aborted.
 _ENCODED_START_TIMEOUT_S = 15.0
-# Per-row budget: how long to wait for a fresh AU before duplicating the previous
-# one for that camera. Deliberately generous — the blocking read paces the loop
-# to the slowest camera and stays frame-accurate, so a brief hiccup is absorbed
-# by *waiting*, not by inserting a duplicate; only a genuine multi-frame stall
-# duplicates (and a duplicate AU decodes to the same image, keeping the mp4
-# valid and frame-count == row-count).
+# Row-wide budget shared by all cameras: how long one row may wait for fresh AUs
+# before duplicating a stalled camera's previous one. Deliberately generous —
+# the blocking read paces the loop to the slowest camera and stays
+# frame-accurate, so a brief hiccup is absorbed by *waiting*, not by inserting a
+# duplicate; only a genuine multi-frame stall duplicates (and a duplicate AU
+# decodes to the same image, keeping the mp4 valid and frame-count == row-count).
+# Shared (not per-camera) so serial reads can't compound the wait, and a camera
+# whose AU is already queued still advances after the deadline (see read_au).
 _ENCODED_ROW_TIMEOUT_S = 1.0
 # How often the blocking AU read wakes to re-check stop_event.
 _ENCODED_POLL_MS = 100
@@ -791,8 +793,10 @@ def run_encoded_capture_loop(
         from lerobot.utils.visualization_utils import log_rerun_data
 
         # Wait for the first snapshot (the control loop publishes every tick).
+        # Keep it: rows whose seqlock read later misses reuse the last good one.
         first_deadline = time.perf_counter() + 5.0
-        while read_snapshot() is None:
+        last_snap = read_snapshot()
+        while last_snap is None:
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
@@ -800,6 +804,7 @@ def run_encoded_capture_loop(
                     "encoded capture loop saw no snapshot within 5s; exiting."
                 )
                 return
+            last_snap = read_snapshot()
         if stop_event.is_set():
             return
 
@@ -808,16 +813,23 @@ def run_encoded_capture_loop(
         for cam in cameras.values():
             cam.flush()
 
-        def read_au(cam: Any, budget_s: float) -> bytes | None:
-            """Block for the next AU, waking every poll to honor stop_event."""
-            waited = 0.0
+        def read_au(cam: Any, deadline: float) -> bytes | None:
+            """Pop the next AU by ``deadline``, waking every poll for stop_event.
+
+            Once the deadline has passed, still makes one non-blocking attempt:
+            a camera whose AU is already queued must advance even when an
+            earlier camera consumed the whole row budget (repeating it would
+            leave the queued AU to a later row and skew that camera's timeline).
+            """
             while not stop_event.is_set():
+                remaining_ms = (deadline - time.perf_counter()) * 1000.0
                 try:
-                    au, _recv = cam.read_next_au(timeout_ms=_ENCODED_POLL_MS)
+                    au, _recv = cam.read_next_au(
+                        timeout_ms=min(_ENCODED_POLL_MS, max(remaining_ms, 0.0))
+                    )
                     return au
                 except TimeoutError:
-                    waited += _ENCODED_POLL_MS / 1000.0
-                    if waited >= budget_s:
+                    if remaining_ms <= 0:
                         return None
             return None
 
@@ -830,10 +842,18 @@ def run_encoded_capture_loop(
 
         while not stop_event.is_set():
             budget = _ENCODED_START_TIMEOUT_S if not primed else _ENCODED_ROW_TIMEOUT_S
+            # One shared deadline for the whole row: with per-camera budgets the
+            # serial reads compound (a stalled first camera would hand every
+            # later camera an extra full budget of implicit wait), and the
+            # repeat-vs-advance decision would be made against a different
+            # clock per camera. A row-wide deadline keeps the cameras on the
+            # same clock; read_au's post-deadline non-blocking attempt still
+            # advances any camera whose AU is already queued.
+            row_deadline = time.perf_counter() + budget
             aus: dict[str, bytes] = {}
             missing_first = False
             for cam_key, cam in cameras.items():
-                au = read_au(cam, budget)
+                au = read_au(cam, row_deadline)
                 if au is not None:
                     aus[cam_key] = au
                     last_au[cam_key] = au
@@ -860,7 +880,13 @@ def run_encoded_capture_loop(
 
             snap = read_snapshot()
             if snap is None:
-                continue
+                # Seqlock retry miss (writer mid-update). Reuse the previous
+                # tick's snapshot rather than skipping the row: the AUs are
+                # already dequeued, and discarding them would punch a hole in
+                # each camera's H.264 stream (later P-frames reference the
+                # dropped picture) while later rows kept advancing.
+                snap = last_snap
+            last_snap = snap
             joint_obs, action, _snap_ts = snap
 
             # Process joint obs alone, then inject the AU bytes as the video
