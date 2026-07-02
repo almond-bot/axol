@@ -371,6 +371,10 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const robotEngagedRef = useAxolTracking(wsRef)
   // Right-thumbstick click last frame, for rising-edge re-anchor detection.
   const stickClickPrevRef = useRef(false)
+  // Seconds the feed has been continuously "connecting". Used to debounce the
+  // connecting spinner so a transient reconnect blip (a single-frame spike
+  // after we've already gone live) doesn't flash the arc over the feed.
+  const connectingHeldRef = useRef(0)
 
   // Wrap each incoming MediaStream in a <video> + VideoTexture.
   //
@@ -446,7 +450,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     rightMeshRef.current?.layers.set(2)
   }, [])
 
-  useFrame((_state, _delta, frame) => {
+  useFrame((_state, delta, frame) => {
     const group = groupRef.current
     const mesh = meshRef.current
     const mat = matRef.current
@@ -541,8 +545,16 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const streamed = Object.keys(textures)
     const allLive = streamed.length > 0 && streamed.every((n) => !!liveTex(n))
     const connecting = available === null || (available === true && !allLive)
-    spinner.visible = presenting && connecting
-    if (spinner.visible && spinnerMeshRef.current) {
+    connectingHeldRef.current = connecting ? connectingHeldRef.current + delta : 0
+    // Show the spinner immediately during the initial connect (nothing live
+    // yet), but once we've had a live feed require the connecting state to
+    // persist briefly. That way a momentary pipeline blip — which the frozen
+    // last frame already covers — never flashes the arc near the top of the
+    // frame, while a genuine sustained dropout still surfaces feedback.
+    const spinnerVisible =
+      presenting && connecting && (!anyLive || connectingHeldRef.current > 0.4)
+    spinner.visible = spinnerVisible
+    if (spinnerVisible && spinnerMeshRef.current) {
       spinnerMeshRef.current.rotation.z -= 0.12
     }
 
