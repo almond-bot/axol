@@ -355,6 +355,23 @@ export function cameraCount(spec: CameraSpec): number {
   return Object.values(spec.serials).filter((s) => s.trim()).length
 }
 
+/** Non-empty, trimmed serials assigned across the camera slots. */
+export function configuredSerials(spec: CameraSpec): string[] {
+  return Object.values(spec.serials)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+/**
+ * Configured camera serials that are NOT among the detected ZED devices — i.e.
+ * cameras the operator assigned but that aren't physically connected. An empty
+ * result means every assigned camera was found.
+ */
+export function missingCameraSerials(spec: CameraSpec, detected: CameraDevice[]): string[] {
+  const present = new Set(detected.map((d) => String(d.serial)))
+  return configuredSerials(spec).filter((s) => !present.has(s))
+}
+
 // ---------------------------------------------------------------------------
 // Schema helpers
 // ---------------------------------------------------------------------------
