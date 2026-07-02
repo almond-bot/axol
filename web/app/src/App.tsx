@@ -1152,6 +1152,21 @@ export default function App() {
   // it over the main WebSocket, which stays as the fallback.
   const { poseChannelRef } = useAxolControlChannel(wsRef, status === AxolConnectionStatus.Open)
 
+  // If the server connection is lost while the headset is presenting (the
+  // socket closes and every reconnect attempt fails → Failed), end the XR
+  // session — the same exit the Y button performs. Without this the operator
+  // is stuck in-headset on a frozen feed or an eternal "Connecting cameras…"
+  // spinner with no way to know the server is gone; ending the session drops
+  // them back to the app, which shows the connection-failed card. Transient
+  // blips are unaffected: the retry loop keeps the session alive unless all
+  // retries are exhausted. (Y itself is no help here — its exit path still
+  // works, but the user doesn't know they need to press it.)
+  useEffect(() => {
+    if (status === AxolConnectionStatus.Failed) {
+      void store.getState().session?.end()
+    }
+  }, [status])
+
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
     connect()
