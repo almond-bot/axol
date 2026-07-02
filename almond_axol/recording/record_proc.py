@@ -350,12 +350,45 @@ def _concatenate_video_files_rebased(
         )
 
 
-def _patch_video_concat() -> None:
-    """Replace LeRobot's ``concatenate_video_files`` with the re-basing version.
+class _RemuxOnMoveShutil:
+    """``shutil`` stand-in for ``dataset_writer`` that re-muxes moved mp4 segments.
 
-    Idempotent. Patches the name where it's *called* (``dataset_writer``, which does
-    ``from .video_utils import concatenate_video_files``) as well as its definition
-    module, so every code path picks up the fix.
+    LeRobot writes a fresh per-key video file (episode 0, and whenever a new
+    episode would push the current file past ``video_files_size_in_mb``) by a plain
+    ``shutil.move`` of the gst-muxed episode segment — the append path, by
+    contrast, goes through our re-stamping :func:`_concatenate_video_files_rebased`.
+    The gst muxer leaves the segment's *final* frame undecodable (mp4mux writes N
+    samples but the decoder only emits N-1), so an episode that lands as its own
+    file has its last dataset row fail to load. Routing the move through the same
+    single-input av re-mux rewrites a decodable, exact-fps-grid file; every other
+    attribute delegates to the real ``shutil`` so the module is otherwise
+    unchanged. (Leaving the source behind is fine — the writer removes the temp
+    dir right after.)
+    """
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def move(self, src: Any, dst: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(dst).endswith(".mp4"):
+            _concatenate_video_files_rebased([src], dst)
+            return dst
+        return self._real.move(src, dst, *args, **kwargs)
+
+
+def _patch_video_concat() -> None:
+    """Route every dataset video write through the re-stamping av mux.
+
+    Idempotent. Patches ``concatenate_video_files`` where it's *called*
+    (``dataset_writer``, which does ``from .video_utils import
+    concatenate_video_files``) and at its definition, so the episode-append path
+    re-bases + re-stamps. Also swaps ``dataset_writer``'s ``shutil`` for a shim
+    that re-muxes the "move segment to a fresh file" path (episode 0 / size
+    rollover) through the same mux — otherwise those files keep the gst muxer's
+    undecodable final frame and their episode's last row won't load.
     """
     import lerobot.datasets.dataset_writer as _dw
     import lerobot.datasets.video_utils as _vu
@@ -364,9 +397,10 @@ def _patch_video_concat() -> None:
         return
     _vu.concatenate_video_files = _concatenate_video_files_rebased
     _dw.concatenate_video_files = _concatenate_video_files_rebased
+    _dw.shutil = _RemuxOnMoveShutil(_dw.shutil)
     _vu._axol_concat_rebased = True
     _logger.info(
-        "patched LeRobot concatenate_video_files to re-base segment timestamps"
+        "patched LeRobot video writes: re-stamp concat + re-mux moved segments"
     )
 
 
