@@ -27,5 +27,5 @@ axol run-policy --server_host <server-ip> --policy_path myorg/pick-place-policy 
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 <Note>
-  Requires the `lerobot` extra and, for GPU inference, the `cuda` extra plus a CUDA-capable PyTorch install on the server machine. Without `--server_host`, `run-policy` spawns its own local `PolicyServer` child process — this command is only needed when inference runs on a different machine.
+  Requires the `lerobot` extra and, for GPU inference, a CUDA-capable PyTorch install on the server machine. Without `--server_host`, `run-policy` spawns its own local `PolicyServer` child process — this command is only needed when inference runs on a different machine.
 </Note>

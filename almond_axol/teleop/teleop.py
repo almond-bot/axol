@@ -3,7 +3,7 @@ VR teleoperation for the Axol robot.
 
 VRTeleop connects a VRServer (headset input) and a MotionControl implementation
 (Axol hardware or Sim visualizer) into a single runnable teleop session. IK
-runs in a separate subprocess so JAX/CUDA never blocks the asyncio event loop.
+runs in a separate subprocess so JAX never blocks the asyncio event loop.
 
 Typical usage::
 
