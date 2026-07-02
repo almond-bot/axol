@@ -46,11 +46,14 @@ non-IDR AUs, so the first fed AU is always a keyframe.
 Image stats
 -----------
 LeRobot folds a sampled subset of frames into running image-normalization stats.
-Here the recorder no longer has raw frames, so — best-effort — a *second* tee
-branch decodes the same stream on NVDEC (hardware, ~free CPU) and a sampled
-subset of the decoded RGBA frames feeds the same ``RunningQuantileStats`` the
-raw path uses. If the decoder is unavailable the encoder still records correctly
-and returns ``None`` stats (video normalization can be recomputed offline).
+Here the recorder no longer has raw frames, so — once the episode's mp4 is
+finalized — :meth:`_CameraH264Muxer.finish` decodes a sampled subset of that
+*already-written* file and feeds the same ``RunningQuantileStats`` the raw path
+uses. Decoding a finished file (rather than a live tee branch during muxing)
+sidesteps the Jetson ``nvv4l2decoder`` EOS-drain that used to stall the mp4
+finalize, and it runs between episodes (recording paused) so it never competes
+with the live capture loop. If decoding or lerobot is unavailable the encoder
+still records correctly and returns ``None`` stats (recomputable offline).
 """
 
 from __future__ import annotations
@@ -85,30 +88,14 @@ def hw_mux_encoder_available() -> bool:
     return hw_h264_available()
 
 
-def _decoder_element() -> str | None:
-    """Pick a hardware H.264 decoder for the (best-effort) stats branch.
-
-    Prefer NVDEC (``nvv4l2decoder``); it decodes on a dedicated block so the
-    stats branch costs the recorder's cores almost nothing. Never fall back to a
-    software decoder here: decoding every frame in libav would burn the very CPU
-    this whole path exists to save, so if NVDEC is absent we simply record
-    without inline stats.
-    """
-    from ..video.gst_zed import _element_available
-
-    if _element_available("nvv4l2decoder"):
-        return "nvv4l2decoder"
-    return None
-
-
 class _CameraH264Muxer:
     """One camera's ``appsrc -> h264parse -> mp4mux -> filesink`` pipeline.
 
     ``feed`` pushes one pre-encoded access unit and assigns it the next
-    constant-fps PTS. A second (leaky, best-effort) tee branch decodes the stream
-    on NVDEC so a sampled subset of frames can feed running image stats. All work
-    is on gst's own threads / hardware blocks; ``feed`` only wraps the bytes and
-    pushes, so the recorder does no per-frame encode or copy.
+    constant-fps PTS; all work is on gst's own threads / hardware blocks, so the
+    recorder does no per-frame encode or copy. Image-normalization stats are
+    computed after the fact in :meth:`finish` by decoding a sampled subset of the
+    finalized mp4 (see the module "Image stats" note).
     """
 
     def __init__(self, video_path: Path, fps: int, want_stats: bool = True) -> None:
@@ -129,72 +116,32 @@ class _CameraH264Muxer:
         self._error: str | None = None
         self._last_au: bytes | None = None
 
-        # Running image stats from the decoded sample (mirrors the raw encoder).
-        self._stats: Any = None
-        self._downsample: Any = None
-        self._stats_samples = 0
+        # Image stats are computed post-finalize (see finish()); sample every
+        # ``_stats_stride``-th decoded frame to hit ~_STATS_SAMPLE_HZ.
+        self._want_stats = want_stats
         self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
-        if want_stats:
-            try:
-                from lerobot.datasets.compute_stats import (
-                    RunningQuantileStats,
-                    auto_downsample_height_width,
-                )
-
-                self._stats = RunningQuantileStats()
-                self._downsample = auto_downsample_height_width
-            except Exception as exc:  # noqa: BLE001 - no lerobot -> no stats
-                _logger.warning(
-                    "video stats unavailable for %s, recording without them: %s",
-                    video_path.name,
-                    exc,
-                )
 
         video_path.parent.mkdir(parents=True, exist_ok=True)
-        self._pipeline, self._src, self._stats_sink = self._build(want_stats)
+        self._pipeline, self._src = self._build()
         self._pipeline.set_state(self._gst.State.PLAYING)
         _logger.info(
             "H264 mux pipeline started: %s @ %dfps (stats=%s)",
             video_path.name,
             fps,
-            self._stats_sink is not None,
+            self._want_stats,
         )
 
-    def _build(self, want_stats: bool) -> tuple[Any, Any, Any]:
-        """Build the muxer pipeline; add the decode/stats tee branch if possible."""
+    def _build(self) -> tuple[Any, Any]:
+        """Build the ``appsrc -> h264parse -> mp4mux -> filesink`` pipeline."""
         Gst = self._gst
-        decoder = (
-            _decoder_element() if (want_stats and self._stats is not None) else None
+        mux = (
+            f"mp4mux trak-timescale={self._mux_timescale} "
+            f"! filesink location={self.video_path} sync=false"
         )
-        mp4mux = f"mp4mux trak-timescale={self._mux_timescale}"
-        mux = f"{mp4mux} ! filesink location={self.video_path} sync=false"
-        if decoder is not None:
-            # tee: one non-leaky branch muxes every AU (integrity), one leaky
-            # branch decodes for sampled stats (drops are fine — stats only need a
-            # sample, and a stalled stats pull must never back-pressure the mux).
-            desc = (
-                "appsrc name=src is-live=false format=time do-timestamp=false "
-                "! tee name=t "
-                f"t. ! queue max-size-buffers=8 ! h264parse ! {mp4mux} "
-                f"! filesink location={self.video_path} sync=false "
-                "t. ! queue leaky=downstream max-size-buffers=4 ! h264parse "
-                f"! {decoder} ! nvvidconv ! video/x-raw,format=RGBA "
-                "! appsink name=stats emit-signals=false max-buffers=2 drop=true "
-                "sync=false wait-on-eos=false"
-            )
-        else:
-            desc = (
-                "appsrc name=src is-live=false format=time do-timestamp=false "
-                f"! h264parse ! {mux}"
-            )
-        try:
-            pipeline = Gst.parse_launch(desc)
-        except Exception:  # noqa: BLE001 - fall back to a mux-only pipeline
-            self._stats = None
-            pipeline = Gst.parse_launch(
-                "appsrc name=src is-live=false format=time do-timestamp=false "
-                f"! h264parse ! {mux}"
-            )
+        pipeline = Gst.parse_launch(
+            "appsrc name=src is-live=false format=time do-timestamp=false "
+            f"! h264parse ! {mux}"
+        )
         src = pipeline.get_by_name("src")
         src.set_property(
             "caps",
@@ -205,15 +152,14 @@ class _CameraH264Muxer:
         # encoded frame.
         src.set_property("max-bytes", 8 * 1024 * 1024)
         src.set_property("block", True)
-        stats_sink = pipeline.get_by_name("stats")
-        return pipeline, src, stats_sink
+        return pipeline, src
 
     @property
     def dropped(self) -> int:
         return self._dropped
 
     def feed(self, au: bytes) -> None:
-        """Mux one access unit at the next constant-fps PTS; sample it for stats."""
+        """Mux one access unit at the next constant-fps PTS."""
         Gst = self._gst
         buf = Gst.Buffer.new_wrapped(au)
         pts = self._count * self._dur
@@ -231,8 +177,6 @@ class _CameraH264Muxer:
                     self._dropped,
                 )
         self._last_au = au
-        if self._stats_sink is not None and self._count % self._stats_stride == 0:
-            self._sample_stats()
         self._count += 1
 
     def feed_repeat(self) -> None:
@@ -246,33 +190,66 @@ class _CameraH264Muxer:
         if self._last_au is not None:
             self.feed(self._last_au)
 
-    def _sample_stats(self) -> None:
-        """Pull the latest decoded frame (if any) and fold it into image stats."""
-        try:
-            import numpy as np
+    def _compute_stats_from_file(self) -> dict | None:
+        """Decode a sampled subset of the finalized mp4 for image-norm stats.
 
-            sample = self._stats_sink.emit("try-pull-sample", 0)
-            if sample is None:
-                return
-            buf = sample.get_buffer()
-            caps = sample.get_caps().get_structure(0)
-            w = caps.get_value("width")
-            h = caps.get_value("height")
-            ok, mapinfo = buf.map(self._gst.MapFlags.READ)
-            if not ok:
-                return
-            try:
-                arr = np.frombuffer(mapinfo.data, dtype=np.uint8)
-                if arr.size < w * h * 4:
-                    return
-                rgb = arr[: w * h * 4].reshape(h, w, 4)[:, :, :3]
-                ds = self._downsample(np.ascontiguousarray(rgb).transpose(2, 0, 1))
-                self._stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
-                self._stats_samples += 1
-            finally:
-                buf.unmap(mapinfo)
-        except Exception as exc:  # noqa: BLE001 - never kill mux over stats
-            _logger.debug("stats sample failed for %s: %s", self.video_path.name, exc)
+        Runs once per episode after the file is written (recording paused between
+        episodes), so it never competes with the live capture loop. Folds every
+        ``_stats_stride``-th decoded frame into the same ``RunningQuantileStats``
+        the raw encoder uses, matching that path's downsample + (H*W, C) layout so
+        LeRobot consumes the result identically. Best-effort: any failure (no
+        lerobot, no PyAV, an unreadable file) logs and returns ``None`` rather
+        than aborting the episode save.
+        """
+        if not self._want_stats or not self.video_path.exists():
+            return None
+        try:
+            import av
+            import numpy as np
+            from lerobot.datasets.compute_stats import (
+                RunningQuantileStats,
+                auto_downsample_height_width,
+            )
+        except Exception as exc:  # noqa: BLE001 - deps missing -> no stats
+            _logger.warning(
+                "video stats unavailable for %s, recording without them: %s",
+                self.video_path.name,
+                exc,
+            )
+            return None
+
+        stats = RunningQuantileStats()
+        samples = 0
+        # The yuv420p -> rgb24 conversion has no SIMD path in this ffmpeg build,
+        # so libswscale logs a WARNING per scaler context; silence ffmpeg below
+        # ERROR for the decode so it doesn't flood the recorder console.
+        prev_level = av.logging.get_level()
+        av.logging.set_level(av.logging.ERROR)
+        try:
+            with av.open(str(self.video_path)) as container:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                for i, frame in enumerate(container.decode(stream)):
+                    if i % self._stats_stride:
+                        continue
+                    rgb = frame.to_ndarray(format="rgb24")  # H, W, C
+                    ds = auto_downsample_height_width(
+                        np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
+                    )
+                    stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
+                    samples += 1
+        except Exception as exc:  # noqa: BLE001 - never fail the save over stats
+            _logger.warning(
+                "post-finalize stats decode failed for %s: %s",
+                self.video_path.name,
+                exc,
+            )
+            return None
+        finally:
+            av.logging.set_level(prev_level)
+        if samples < 2:
+            return None
+        return stats.get_statistics()
 
     def finish(self) -> tuple[Path, dict | None]:
         """EOS the pipeline (flush the moov), then return the path + stats.
@@ -283,17 +260,19 @@ class _CameraH264Muxer:
         :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`),
         so no trailing guard frame is added here — an extra frame would shift the
         index-based alignment of every later episode in the concatenated file.
+        Image-normalization stats are then decoded from the just-written file.
         """
-        stats = self._teardown(finalize=True)
+        self._teardown(finalize=True)
+        stats = None if self._error else self._compute_stats_from_file()
         return self.video_path, stats
 
     def cancel(self) -> None:
         self._teardown(finalize=False)
 
-    def _teardown(self, finalize: bool) -> dict | None:
+    def _teardown(self, finalize: bool) -> None:
         Gst = self._gst
         if self._pipeline is None:
-            return None
+            return
         try:
             if finalize:
                 self._src.emit("end-of-stream")
@@ -317,13 +296,6 @@ class _CameraH264Muxer:
         finally:
             self._pipeline.set_state(Gst.State.NULL)
             self._pipeline = None
-        if not finalize:
-            return None
-        return (
-            self._stats.get_statistics()
-            if self._stats is not None and self._stats_samples >= 2
-            else None
-        )
 
 
 class H264MuxStreamingEncoder:
@@ -335,12 +307,13 @@ class H264MuxStreamingEncoder:
     pre-encoded access unit (``bytes``) rather than a raw frame array.
     """
 
-    # Inline stats decode the stream on NVDEC for image-normalization stats, but
-    # nvv4l2decoder does not reliably propagate EOS on Jetson (it stalls the mp4
-    # finalize), so it is off by default: the dataset records correctly with
-    # ``None`` video stats, which LeRobot accepts and which can be recomputed
-    # offline. Flip to True only once the decoder-EOS drain is sorted.
-    def __init__(self, fps: int, want_stats: bool = False) -> None:
+    # Image-normalization stats are decoded from each finalized episode mp4 (see
+    # _CameraH264Muxer._compute_stats_from_file), which happens between episodes
+    # with recording paused, so it costs nothing on the live loop and avoids the
+    # Jetson nvv4l2decoder EOS-drain that an inline decode branch used to hit. On
+    # (best-effort) failure the dataset still records with ``None`` video stats,
+    # which LeRobot accepts and which can be recomputed offline.
+    def __init__(self, fps: int, want_stats: bool = True) -> None:
         self.fps = fps
         self._want_stats = want_stats
         self._cams: dict[str, _CameraH264Muxer] = {}
