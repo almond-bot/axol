@@ -128,16 +128,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     runner = OperationRunner(robot)
 
     def _is_idle() -> bool:
-        """Safe to restart: nothing running and no live robot link."""
+        """Safe to restart: no operation running.
+
+        A connected robot is fine -- restarting drops the CAN link, which simply
+        reconnects after the relaunch; only an in-flight operation must not be
+        interrupted.
+        """
         if runner.is_running():
             return False
-        if any(s["status"] in ("starting", "running") for s in manager.list()):
-            return False
-        return not robot.status()["connected"]
+        return not any(s["status"] in ("starting", "running") for s in manager.list())
 
-    # Keeps a hosted (uv tool) install in sync with main: poked by the UI's
-    # connect/poll endpoints, upgrades in the background, and restarts the
-    # process (systemd relaunches it) once idle. No-ops for dev checkouts.
+    # Surfaces "update available" (read-only `git ls-remote`) to the control
+    # panel via /api/update/status and applies an on-demand `uv tool upgrade`
+    # via /api/update/start, restarting the process (systemd relaunches it) once
+    # idle. Nothing upgrades automatically. No-ops for dev checkouts.
     updater = SelfUpdater(_is_idle)
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
@@ -166,7 +170,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:
         """Identify the serve host so the UI can build reachable links/hints."""
-        updater.poke()
+        # Self-heal a host that upgraded into this build from an older main (the
+        # old code never ran `axol provision`); idempotent, once per process.
+        updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
@@ -174,6 +180,24 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "vrPort": _VR_PORT,
             "commit": updater.commit,
         }
+
+    @app.get("/api/update/status")
+    async def update_status(refresh: bool = False) -> dict[str, Any]:
+        """Installed vs. tracked-ref commit so the UI can offer an update.
+
+        ``refresh=1`` forces a synchronous remote check (used on connect / page
+        load) so the result is current; the steady-state poll omits it and gets
+        the cheap debounced/cached value.
+        """
+        return await updater.status(force=refresh)
+
+    @app.post("/api/update/start")
+    async def update_start() -> JSONResponse:
+        """Apply a user-initiated upgrade; the server restarts onto new code."""
+        started, reason = updater.start()
+        if not started:
+            return JSONResponse({"error": reason}, status_code=409)
+        return JSONResponse({"started": True})
 
     # -- robot connection (detached CAN + 1 Hz motor ping) ------------------
 
@@ -239,9 +263,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/op/status")
     async def op_status() -> dict[str, Any]:
-        # The UI polls this while the panel is open, so a long-lived tab still
-        # picks up updates (the poke itself is debounced).
-        updater.poke()
         session = runner.current()
         return {
             "running": runner.is_running(),

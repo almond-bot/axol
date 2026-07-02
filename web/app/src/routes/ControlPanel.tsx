@@ -3,13 +3,16 @@ import { cn } from "@/lib/utils"
 import {
   OPERATIONS,
   cameraCount,
+  detectCameras,
   exportOpSettings,
   fetchCommands,
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchUpdateStatus,
   fetchUsbStatus,
   loadOpSettings,
+  missingCameraSerials,
   operationMeta,
   parseImportedSettings,
   robotConnect,
@@ -18,9 +21,11 @@ import {
   sendEpisodeCommand,
   setServerBase,
   startOperation,
+  startUpdate,
   stopOperation,
   usbConnect,
   useSessionLogs,
+  type CameraDevice,
   type CameraSpec,
   type CommandSpec,
   type FormValue,
@@ -28,14 +33,18 @@ import {
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type UpdatePhase,
+  type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
+import { UpdateBanner } from "@/components/update-banner"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
 import { CamerasDialog } from "@/components/cameras-dialog"
 import { SiteNav } from "@/components/site-nav"
+import { useToast } from "@/components/ui/toast"
 
 type OpSettings = Record<OperationId, Record<string, FormValue>>
 
@@ -79,6 +88,7 @@ function loadAllOpSettings(): OpSettings {
 }
 
 export default function ControlPanel() {
+  const toast = useToast()
   const [commands, setCommands] = useState<CommandSpec[]>([])
   const [conn, setConn] = useState<{ state: ConnState; message?: string }>({ state: "loading" })
   const [serverHost, setServerHost] = useState<string>(
@@ -86,12 +96,24 @@ export default function ControlPanel() {
   )
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
+  const [update, setUpdate] = useState<UpdateStatus | null>(null)
+  // Drives the banner's "Updating…" state while the server upgrades + restarts.
+  const [updating, setUpdating] = useState(false)
+  // Current step shown in the banner while updating (so it isn't an opaque
+  // spinner). Sourced from the server's reported phase, except "restarting"
+  // which we infer locally once the server stops responding (it exited).
+  const [updatePhase, setUpdatePhase] = useState<UpdatePhase | null>(null)
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  // Last ZED detection from the serve host (null until first detected), used to
+  // verify the assigned serials are actually connected before a task starts.
+  const [cameraDevices, setCameraDevices] = useState<CameraDevice[] | null>(null)
+  const [cameraDetectError, setCameraDetectError] = useState<string | null>(null)
+  const [cameraDetecting, setCameraDetecting] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
     () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
@@ -100,44 +122,72 @@ export default function ControlPanel() {
 
   const [session, setSession] = useState<SessionInfo | null>(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // Short label shown on the Start button while a start is being prepared (e.g.
+  // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
+  // update banner's phase display.
+  const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
   const [camerasDialogOpen, setCamerasDialogOpen] = useState(false)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
-  const loadServer = useCallback(async (host: string) => {
-    setServerBase(host)
-    setConn({ state: "loading" })
-    setError(null)
+  // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
+  // the assigned serials are actually connected (best-effort: failures leave the
+  // last known state and surface as a "can't detect" warning).
+  const refreshCameras = useCallback(async () => {
+    setCameraDetecting(true)
     try {
-      const cmds = await fetchCommands()
-      setCommands(cmds)
-      setConn({ state: "ok" })
-      setSetupOpen(false)
+      const result = await detectCameras()
+      setCameraDevices(result.devices)
+      setCameraDetectError(result.error)
     } catch (e) {
-      setCommands([])
-      setConn({ state: "err", message: String(e) })
-      return
+      setCameraDevices(null)
+      setCameraDetectError(String(e).replace(/^Error:\s*/, ""))
+    } finally {
+      setCameraDetecting(false)
     }
-    fetchInfo()
-      .then((info) => {
-        setViewerPort(info.viewerPort)
-        setHostInfo(info)
-      })
-      .catch(() => {})
-    fetchRobotStatus()
-      .then(setRobot)
-      .catch(() => {})
-    fetchOpStatus()
-      .then((op) => {
-        if (op.running && op.session) {
-          setSession(op.session)
-          setSelectedOp(op.session.command as OperationId)
-        }
-      })
-      .catch(() => {})
   }, [])
+
+  const loadServer = useCallback(
+    async (host: string) => {
+      setServerBase(host)
+      setConn({ state: "loading" })
+      try {
+        const cmds = await fetchCommands()
+        setCommands(cmds)
+        setConn({ state: "ok" })
+        setSetupOpen(false)
+      } catch (e) {
+        setCommands([])
+        setConn({ state: "err", message: String(e) })
+        return
+      }
+      refreshCameras()
+      fetchInfo()
+        .then((info) => {
+          setViewerPort(info.viewerPort)
+          setHostInfo(info)
+        })
+        .catch(() => {})
+      // Force a synchronous remote check on connect/page load so the banner
+      // reflects reality immediately; the steady-state poll below stays cheap.
+      fetchUpdateStatus(true)
+        .then(setUpdate)
+        .catch(() => {})
+      fetchRobotStatus()
+        .then(setRobot)
+        .catch(() => {})
+      fetchOpStatus()
+        .then((op) => {
+          if (op.running && op.session) {
+            setSession(op.session)
+            setSelectedOp(op.session.command as OperationId)
+          }
+        })
+        .catch(() => {})
+    },
+    [refreshCameras]
+  )
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -172,6 +222,27 @@ export default function ControlPanel() {
       clearInterval(t)
     }
   }, [conn.state])
+
+  // Poll the update indicator slowly while online (its server-side `ls-remote`
+  // is debounced, so a tight interval would buy nothing). Paused while an
+  // update is in flight — handleUpdate drives its own faster restart-watch poll.
+  useEffect(() => {
+    if (conn.state !== "ok" || updating) return
+    let active = true
+    const poll = () => {
+      fetchUpdateStatus()
+        .then((u) => {
+          if (active) setUpdate(u)
+        })
+        .catch(() => {})
+    }
+    poll()
+    const t = setInterval(poll, 60_000)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, updating])
 
   // Auto-connect Axol once after the host comes online, if it's sitting idle.
   // The ref makes it fire at most once per host session, so a manual robot
@@ -221,11 +292,10 @@ export default function ControlPanel() {
     // so disconnecting never leaves an orphaned op running server-side. Only
     // then tear down the (client-side) host connection.
     setBusy(true)
-    setError(null)
     try {
       await stopRunningOp()
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
       setBusy(false)
       return
     }
@@ -234,6 +304,11 @@ export default function ControlPanel() {
     setCommands([])
     setRobot(null)
     setSession(null)
+    setCameraDevices(null)
+    setCameraDetectError(null)
+    setUpdate(null)
+    setUpdating(false)
+    setUpdatePhase(null)
     autoRobotRef.current = false
   }
 
@@ -255,7 +330,6 @@ export default function ControlPanel() {
   function selectOp(op: OperationId) {
     setSelectedOp(op)
     localStorage.setItem("axolOp", op)
-    setError(null)
   }
 
   // -- per-operation settings --
@@ -283,9 +357,8 @@ export default function ControlPanel() {
   function importSettings(text: string) {
     try {
       updateSettings(selectedOp, parseImportedSettings(text))
-      setError(null)
     } catch (e) {
-      setError(`Import failed: ${e}`)
+      toast.error(`Import failed: ${e}`)
     }
   }
 
@@ -295,7 +368,7 @@ export default function ControlPanel() {
     try {
       setRobot(await robotConnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
@@ -303,14 +376,13 @@ export default function ControlPanel() {
 
   async function robotDisconnectClick() {
     setRobotBusy(true)
-    setError(null)
     try {
       // Kill any running task and wait for it to exit before releasing the
       // robot connection out from under it, then disconnect.
       await stopRunningOp()
       setRobot(await robotDisconnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
@@ -319,13 +391,12 @@ export default function ControlPanel() {
   // -- quest over usb (adb reverse pose tunnel) --
   async function usbConnectClick() {
     setUsbBusy(true)
-    setError(null)
     try {
       // Runs `adb reverse`; the first touch also pops the USB-debugging
       // authorization prompt on the headset.
       setUsb(await usbConnect())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setUsbBusy(false)
     }
@@ -369,6 +440,16 @@ export default function ControlPanel() {
   const selectedLive = isLive && runningOp === selectedOp
   const selectedStopping = isStopping && runningOp === selectedOp
 
+  // Whether an update is currently unsafe to apply. `isLive` is the immediate,
+  // local signal (reacts the instant an op starts/stops) so the banner blocks
+  // without waiting for the slow status poll; the server's `update.idle` is the
+  // backstop for any other non-idle reason (and the server guards the request
+  // regardless). Mirrors the server's _is_idle: only a running operation blocks
+  // a restart (a connected robot is fine).
+  const updateBlocked = isLive || !(update?.idle ?? true)
+  // Reason shown in the banner; capitalized clause, no trailing period.
+  const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
+
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to
   // exited even if the logs WebSocket drops its final status frame. The stop
@@ -389,6 +470,17 @@ export default function ControlPanel() {
       clearInterval(t)
     }
   }, [conn.state, isLive])
+
+  // Refresh the update status the moment an operation starts or stops, so the
+  // server's idle state (and thus the banner's blocked state) becomes current
+  // without waiting for the slow 60s poll. Skipped while an update is applying
+  // (handleUpdate drives its own watch poll then).
+  useEffect(() => {
+    if (conn.state !== "ok" || updating) return
+    fetchUpdateStatus()
+      .then(setUpdate)
+      .catch(() => {})
+  }, [conn.state, updating, isLive])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -421,8 +513,42 @@ export default function ControlPanel() {
 
   async function handleStart() {
     setBusy(true)
-    setError(null)
     try {
+      // Only ops that actually require cameras (collect-data / run-policy) are
+      // gated on them. Teleop streams whatever cameras are configured but must
+      // never be blocked by camera detection, and sim never touches hardware.
+      const isSimSelected = selectedOp === "teleop" && Boolean(settings.sim)
+      if (meta.requiresCameras && !isSimSelected) {
+        // Reuse the detection we already ran (on connect / when the Cameras
+        // dialog closed) instead of spawning a fresh enumeration on every start
+        // — re-detecting isn't more accurate anyway (the ZED daemon caches its
+        // device list until it's restarted), and the subprocess spawn is what
+        // made "Starting" hang. Only detect on demand if we have no result yet.
+        let devices = cameraDevices
+        let detErr = cameraDetectError
+        if (devices === null) {
+          setStartPhase("Checking cameras…")
+          const detect = await detectCameras()
+          setCameraDevices(detect.devices)
+          setCameraDetectError(detect.error)
+          devices = detect.devices
+          detErr = detect.error
+        }
+        if (detErr) {
+          toast.error(`Can't verify cameras: ${detErr}`)
+          return
+        }
+        const missing = missingCameraSerials(cameras, devices ?? [])
+        if (missing.length > 0) {
+          toast.error(
+            `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
+              ", "
+            )}. Reconnect, then Refresh (or Restart daemon) in the Cameras dialog.`
+          )
+          return
+        }
+      }
+
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim).
@@ -430,8 +556,9 @@ export default function ControlPanel() {
       const result = await startOperation(selectedOp, settings, spec)
       setSession(result)
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
+      setStartPhase(null)
       setBusy(false)
     }
   }
@@ -445,14 +572,68 @@ export default function ControlPanel() {
     try {
       setSession(await stopOperation())
     } catch (e) {
-      setError(String(e))
+      toast.error(String(e))
     } finally {
       setBusy(false)
     }
   }
 
   function handleEpisode(command: string) {
-    sendEpisodeCommand(command).catch((e) => setError(String(e)))
+    sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
+  }
+
+  // Apply the available update, then hard-reload once the server is back on the
+  // new commit. The server upgrades and exits (systemd relaunches it), so the
+  // start request and the watch polls below tolerate it briefly going away.
+  async function handleUpdate() {
+    const target = update?.remoteCommit
+    if (!target) return
+    setUpdating(true)
+    setUpdatePhase("upgrading")
+    try {
+      await startUpdate()
+    } catch (e) {
+      toast.error(`Update failed to start: ${e}`)
+      setUpdating(false)
+      setUpdatePhase(null)
+      return
+    }
+    // The hosted UI is served by Vercel, so a hard reload also pulls the latest
+    // front-end; reconnecting to the restarted backend re-runs loadServer.
+    const reload = () => window.location.reload()
+    const deadline = Date.now() + 5 * 60_000
+    const watch = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(watch)
+        setUpdating(false)
+        setUpdatePhase(null)
+        toast.error("Update is taking longer than expected. Reload to retry.")
+        return
+      }
+      try {
+        const u = await fetchUpdateStatus()
+        setUpdate(u)
+        if (u.state === "error") {
+          clearInterval(watch)
+          setUpdating(false)
+          setUpdatePhase(null)
+          toast.error(u.error ?? "Update failed.")
+          return
+        }
+        // Reflect the server's current step (upgrading/provisioning) so the
+        // banner shows progress rather than an opaque spinner.
+        if (u.phase) setUpdatePhase(u.phase)
+        // Server is back and now running the target commit — done.
+        if (u.commit === target) {
+          clearInterval(watch)
+          reload()
+        }
+      } catch {
+        // Server stopped responding: it exited to restart (or is briefly
+        // unreachable). Show "restarting" and keep watching for it to return.
+        setUpdatePhase("restarting")
+      }
+    }, 2000)
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
@@ -461,10 +642,22 @@ export default function ControlPanel() {
     <div className="min-h-screen">
       <SiteNav current="control" />
       <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-8">
+        {update?.updateAvailable && (
+          <UpdateBanner
+            update={update}
+            updating={updating}
+            phase={updatePhase}
+            blocked={updateBlocked}
+            busyReason={updateBusyReason}
+            onUpdate={handleUpdate}
+          />
+        )}
+
         <ConnectionsBar
           conn={conn.state}
           host={serverHost}
           hostName={hostInfo?.hostname}
+          commit={update?.commit ?? hostInfo?.commit ?? null}
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
           robot={robot}
@@ -472,6 +665,9 @@ export default function ControlPanel() {
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
           cameras={cameras}
+          cameraDevices={cameraDevices}
+          cameraDetectError={cameraDetectError}
+          cameraDetecting={cameraDetecting}
           onConfigureCameras={() => setCamerasDialogOpen(true)}
           usb={usb}
           usbBusy={usbBusy}
@@ -486,7 +682,6 @@ export default function ControlPanel() {
             it before starting another operation.
           </p>
         )}
-        {error && <p className="text-sm text-red-400">{error}</p>}
 
         <OperationPanel
           meta={meta}
@@ -505,6 +700,7 @@ export default function ControlPanel() {
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}
           viewerPort={viewerPort}
+          startPhase={startPhase}
           onStart={handleStart}
           onStop={handleStop}
           onEpisode={handleEpisode}
@@ -526,6 +722,9 @@ export default function ControlPanel() {
         onClose={() => setCamerasDialogOpen(false)}
         initial={cameras}
         onSave={saveCameras}
+        devices={cameraDevices}
+        detecting={cameraDetecting}
+        onRefresh={refreshCameras}
       />
     </div>
   )

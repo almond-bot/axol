@@ -46,6 +46,7 @@ export function OperationPanel({
   session,
   host,
   viewerPort,
+  startPhase,
   onStart,
   onStop,
   onEpisode,
@@ -66,6 +67,8 @@ export function OperationPanel({
   session: SessionInfo | null
   host: string
   viewerPort: number
+  /** Progress label shown on the Start button while preparing (e.g. camera check). */
+  startPhase: string | null
   onStart: () => void
   onStop: () => void
   onEpisode: (command: string) => void
@@ -144,7 +147,7 @@ export function OperationPanel({
             ) : (
               <Button onClick={onStart} disabled={busy || !available || blockers.length > 0}>
                 {busy ? <Loader2 className="animate-spin" /> : <Play />}
-                Start
+                {busy && startPhase ? startPhase : "Start"}
               </Button>
             )}
           </div>
