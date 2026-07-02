@@ -177,6 +177,15 @@ def _concat_constant_fps(
     every frame lands on ``k / fps`` with zero rounding error. Bitstream packets
     are copied verbatim (no re-encode); only container timing is rewritten.
 
+    Each input's demuxed packet count is checked against its container's sample
+    count (moov ``stsz``): a gst-muxed segment can demux short of the samples it
+    advertises (the trailing sample of an mp4mux file is sometimes not
+    surfaced), which would leave the chunk one frame short of its dataset rows
+    and silently shift every later episode's timestamp lookup. A short input is
+    padded back to its advertised count by re-muxing its last packet (a
+    duplicated frame decodes to the same image, so alignment and decodability
+    hold) with a loud log.
+
     The temp file lives next to the output (rename, never a cross-fs copy) and
     is muxed without ``faststart``: this runs once per camera on *every*
     ``save_episode``, rewriting the whole accumulating chunk file, and the
@@ -207,15 +216,38 @@ def _concat_constant_fps(
                             template=in_stream, opaque=True
                         )
                         out_stream.time_base = time_base
+                    expected = in_stream.frames or 0
+                    demuxed = 0
+                    last_payload: bytes | None = None
                     for packet in src.demux(in_stream):
                         if packet.dts is None:  # demux flushing packet
                             continue
+                        last_payload = bytes(packet)
                         packet.pts = frame_idx * step
                         packet.dts = frame_idx * step
                         packet.duration = step
                         packet.stream = out_stream
                         dst.mux(packet)
                         frame_idx += 1
+                        demuxed += 1
+                    if expected > demuxed and last_payload is not None:
+                        _logger.error(
+                            "concat: %s demuxed %d of %d advertised samples; "
+                            "padding %d duplicate trailing frame(s) to keep "
+                            "frame-count == row-count",
+                            Path(str(input_path)).name,
+                            demuxed,
+                            expected,
+                            expected - demuxed,
+                        )
+                        for _ in range(expected - demuxed):
+                            pad = av.Packet(last_payload)
+                            pad.pts = frame_idx * step
+                            pad.dts = frame_idx * step
+                            pad.duration = step
+                            pad.stream = out_stream
+                            dst.mux(pad)
+                            frame_idx += 1
         shutil.move(tmp_output_video_path, str(output_video_path))
     except Exception:
         Path(tmp_output_video_path).unlink(missing_ok=True)
@@ -367,6 +399,46 @@ def _concatenate_video_files_rebased(
         )
 
 
+def _video_duration_exact(video_path: "Path | str") -> float:
+    """Frame-count-exact video duration (drop-in for LeRobot's
+    ``get_video_duration_in_s``).
+
+    LeRobot stamps each episode's ``videos/<key>/from_timestamp`` /
+    ``to_timestamp`` from the *segment's* container duration, and the reader
+    later locates row *i*'s frame at ``from_timestamp + i / fps``. The stock
+    implementation trusts ``stream.duration`` — which on a gst ``mp4mux``
+    segment reads ``(N-1)/fps`` for N samples (the trailing sample's duration
+    is not reflected in the track header). That one-frame shortfall accumulates
+    through the chunk file: episode *k* appended to a file inherits a
+    ``from_timestamp`` short by ``k/fps``, so its rows silently resolve to
+    frames up to *k* ticks stale (no error — the exact-fps grid always has *a*
+    frame within tolerance). Deriving the duration from the packets themselves
+    (count x per-frame duration, using the advertised sample count when demux
+    comes up short — see the concat pad guard) makes ``to - from`` exactly
+    ``rows / fps`` for every episode.
+    """
+    import av
+
+    with av.open(str(video_path)) as container:
+        stream = container.streams.video[0]
+        tb = stream.time_base
+        demuxed = 0
+        last = None
+        for packet in container.demux(stream):
+            if packet.dts is None:
+                continue
+            demuxed += 1
+            last = packet
+        if last is None or tb is None:
+            return 0.0
+        n = max(demuxed, stream.frames or 0)
+        if last.duration:
+            return float(n * last.duration * tb)
+        if stream.average_rate:
+            return float(n / stream.average_rate)
+        return float((stream.duration or 0) * tb)
+
+
 class _RemuxOnMoveShutil:
     """``shutil`` stand-in for ``dataset_writer`` that re-muxes moved mp4 segments.
 
@@ -405,7 +477,11 @@ def _patch_video_concat() -> None:
     re-bases + re-stamps. Also swaps ``dataset_writer``'s ``shutil`` for a shim
     that re-muxes the "move segment to a fresh file" path (episode 0 / size
     rollover) through the same mux — otherwise those files keep the gst muxer's
-    undecodable final frame and their episode's last row won't load.
+    undecodable final frame and their episode's last row won't load. Also
+    replaces the writer's ``get_video_duration_in_s`` with the frame-count-exact
+    :func:`_video_duration_exact` so per-episode from/to timestamps span exactly
+    ``rows / fps`` (the stock stream-duration read is one frame short on gst
+    segments, silently shifting every later episode's frame lookups).
     """
     import lerobot.datasets.dataset_writer as _dw
     import lerobot.datasets.video_utils as _vu
@@ -415,9 +491,11 @@ def _patch_video_concat() -> None:
     _vu.concatenate_video_files = _concatenate_video_files_rebased
     _dw.concatenate_video_files = _concatenate_video_files_rebased
     _dw.shutil = _RemuxOnMoveShutil(_dw.shutil)
+    _dw.get_video_duration_in_s = _video_duration_exact
     _vu._axol_concat_rebased = True
     _logger.info(
-        "patched LeRobot video writes: re-stamp concat + re-mux moved segments"
+        "patched LeRobot video writes: re-stamp concat + re-mux moved segments "
+        "+ frame-exact durations"
     )
 
 
