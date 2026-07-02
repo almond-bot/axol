@@ -1162,10 +1162,26 @@ export default function App() {
   // retries are exhausted. (Y itself is no help here — its exit path still
   // works, but the user doesn't know they need to press it.)
   useEffect(() => {
-    if (status === AxolConnectionStatus.Failed) {
+    if (status !== AxolConnectionStatus.Failed) return
+    const endSessionOnDeadLink = () => {
+      // Re-check the live transport at call time, not React state: the store
+      // subscription below fires synchronously and can land after a reconnect
+      // began but before React has re-rendered `status` and cleaned up this
+      // effect (any mirror of React state is equally stale in that window).
+      // `useAxolVRClient` assigns `wsRef.current` synchronously the moment a
+      // connect starts and guarantees it is null in the Failed state, so a
+      // non-null socket means the link is recovering — don't end the session.
+      if (wsRef.current !== null) return
       void store.getState().session?.end()
     }
-  }, [status])
+    // End an already-presenting session now, and subscribe for one appearing
+    // later: XR entry is async (permission prompt, enterAR still resolving),
+    // so the session may materialise after the status already went Failed —
+    // without the subscription the operator could still enter VR on a dead
+    // link and be stuck exactly the way this exit is meant to prevent.
+    endSessionOnDeadLink()
+    return store.subscribe(endSessionOnDeadLink)
+  }, [status, wsRef])
 
   const handleConnect = () => {
     localStorage.setItem("wsHostname", hostname)
