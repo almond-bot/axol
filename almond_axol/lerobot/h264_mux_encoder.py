@@ -47,13 +47,14 @@ Image stats
 -----------
 LeRobot folds a sampled subset of frames into running image-normalization stats.
 Here the recorder no longer has raw frames, so — once the episode's mp4 is
-finalized — :meth:`_CameraH264Muxer.finish` decodes a sampled subset of that
-*already-written* file and feeds the same ``RunningQuantileStats`` the raw path
-uses. Decoding a finished file (rather than a live tee branch during muxing)
-sidesteps the Jetson ``nvv4l2decoder`` EOS-drain that used to stall the mp4
-finalize, and it runs between episodes (recording paused) so it never competes
-with the live capture loop. If decoding or lerobot is unavailable the encoder
-still records correctly and returns ``None`` stats (recomputable offline).
+finalized — :meth:`_CameraH264Muxer.finish` decodes the *already-written* file's
+keyframes (~4/s given the relay's IDR cadence; the decoder skips every P-frame)
+and feeds the same ``RunningQuantileStats`` the raw path uses. Decoding a
+finished file (rather than a live tee branch during muxing) sidesteps the Jetson
+``nvv4l2decoder`` EOS-drain that used to stall the mp4 finalize, and it runs
+between episodes (recording paused) so it never competes with the live capture
+loop. If decoding or lerobot is unavailable the encoder still records correctly
+and returns ``None`` stats (recomputable offline).
 """
 
 from __future__ import annotations
@@ -67,11 +68,6 @@ from typing import Any
 from ..video.hw_video import hw_h264_available
 
 _logger = logging.getLogger(__name__)
-
-# Target rate (Hz) at which each camera folds a decoded frame into running image
-# stats — same rationale as the raw encoder's ``_STATS_SAMPLE_HZ`` (keep the
-# GIL-bound quantile update off the per-frame hot path).
-_STATS_SAMPLE_HZ = 10
 
 # How long finish() waits for a muxer pipeline to flush EOS (write the moov atom)
 # before giving up on that camera's mp4.
@@ -115,10 +111,9 @@ class _CameraH264Muxer:
         self._error: str | None = None
         self._last_au: bytes | None = None
 
-        # Image stats are computed post-finalize (see finish()); sample every
-        # ``_stats_stride``-th decoded frame to hit ~_STATS_SAMPLE_HZ.
+        # Image stats are computed post-finalize from the file's keyframes
+        # (see _compute_stats_from_file).
         self._want_stats = want_stats
-        self._stats_stride = max(1, round(fps / _STATS_SAMPLE_HZ))
 
         video_path.parent.mkdir(parents=True, exist_ok=True)
         self._pipeline, self._src = self._build()
@@ -190,12 +185,16 @@ class _CameraH264Muxer:
             self.feed(self._last_au)
 
     def _compute_stats_from_file(self) -> dict | None:
-        """Decode a sampled subset of the finalized mp4 for image-norm stats.
+        """Decode the finalized mp4's keyframes for image-normalization stats.
 
         Runs once per episode after the file is written (recording paused between
-        episodes), so it never competes with the live capture loop. Folds every
-        ``_stats_stride``-th decoded frame into the same ``RunningQuantileStats``
-        the raw encoder uses, matching that path's downsample + (H*W, C) layout so
+        episodes), so it never competes with the live capture loop. Keyframes
+        only (``skip_frame=NONKEY``): the relay forces an IDR every ~0.25 s, so
+        this still samples ~4 frames/s while the decoder skips every P-frame —
+        the bulk of a full decode's cost. All sampled frames are folded in one
+        batched ``RunningQuantileStats.update`` (as stock LeRobot's
+        ``sample_images`` path does; the per-call histogram build dominates when
+        updating frame by frame), using the same downsample + (H*W, C) layout so
         LeRobot consumes the result identically. Best-effort: any failure (no
         lerobot, no PyAV, an unreadable file) logs and returns ``None`` rather
         than aborting the episode save.
@@ -217,8 +216,7 @@ class _CameraH264Muxer:
             )
             return None
 
-        stats = RunningQuantileStats()
-        samples = 0
+        batches: list = []
         # The yuv420p -> rgb24 conversion has no SIMD path in this ffmpeg build,
         # so libswscale logs a WARNING per scaler context; silence ffmpeg below
         # ERROR for the decode so it doesn't flood the recorder console.
@@ -228,15 +226,13 @@ class _CameraH264Muxer:
             with av.open(str(self.video_path)) as container:
                 stream = container.streams.video[0]
                 stream.thread_type = "AUTO"
-                for i, frame in enumerate(container.decode(stream)):
-                    if i % self._stats_stride:
-                        continue
+                stream.codec_context.skip_frame = "NONKEY"
+                for frame in container.decode(stream):
                     rgb = frame.to_ndarray(format="rgb24")  # H, W, C
                     ds = auto_downsample_height_width(
                         np.ascontiguousarray(rgb).transpose(2, 0, 1)  # -> C, H, W
                     )
-                    stats.update(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
-                    samples += 1
+                    batches.append(ds.transpose(1, 2, 0).reshape(-1, ds.shape[0]))
         except Exception as exc:  # noqa: BLE001 - never fail the save over stats
             _logger.warning(
                 "post-finalize stats decode failed for %s: %s",
@@ -246,8 +242,10 @@ class _CameraH264Muxer:
             return None
         finally:
             av.logging.set_level(prev_level)
-        if samples < 2:
+        if not batches:
             return None
+        stats = RunningQuantileStats()
+        stats.update(np.concatenate(batches, axis=0))
         return stats.get_statistics()
 
     def finish(self) -> tuple[Path, dict | None]:
