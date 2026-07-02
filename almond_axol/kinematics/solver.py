@@ -25,6 +25,7 @@ from ..constants import (
     urdf_body_name,
 )
 from .config import KinematicsConfig
+from .jax_cache import enable_persistent_compilation_cache
 
 _logger = logging.getLogger(__name__)
 
@@ -347,6 +348,8 @@ class KinematicsSolver:
             config: Cost weights and solver parameters.
         """
         self.config = config
+
+        enable_persistent_compilation_cache()
 
         _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
