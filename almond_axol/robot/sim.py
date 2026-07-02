@@ -224,16 +224,19 @@ class Sim(RobotBase):
                     if ri >= 0:
                         q_out[vi] = q_robot[ri]
                 # Trailing entries n_arm_total, n_arm_total+1 are the left/right
-                # gripper values in [0, 1]; scale to the prismatic travel limit
-                # (0 = closed, GRIPPER_URDF_OPEN = open).
+                # gripper values in [0, 1]; clamp (parity with hardware
+                # motion_control, which clips to joint limits) then scale to the
+                # prismatic travel limit (0 = closed, GRIPPER_URDF_OPEN = open).
                 if q_robot.size > n_arm_total + 1:
                     if left_grip_vi >= 0:
                         q_out[left_grip_vi] = (
-                            float(q_robot[n_arm_total]) * GRIPPER_URDF_OPEN
+                            float(np.clip(q_robot[n_arm_total], 0.0, 1.0))
+                            * GRIPPER_URDF_OPEN
                         )
                     if right_grip_vi >= 0:
                         q_out[right_grip_vi] = (
-                            float(q_robot[n_arm_total + 1]) * GRIPPER_URDF_OPEN
+                            float(np.clip(q_robot[n_arm_total + 1], 0.0, 1.0))
+                            * GRIPPER_URDF_OPEN
                         )
                 return q_out
 
