@@ -12,6 +12,8 @@ from .can import enable as can_enable
 from .can import setup as can_setup
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
+from .jax import build as jax_build
+from .jax import install as jax_install
 from .jetson import setup as jetson_setup
 from .motor import health as motor_health
 from .motor import info as motor_info
@@ -71,6 +73,8 @@ def main() -> None:
     zed_install.add_parser(subparsers)
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
+    jax_install.add_parser(subparsers)
+    jax_build.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)

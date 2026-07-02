@@ -20,7 +20,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from GitHub, with every extra except `cuda`), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from GitHub, with the `lerobot` + `sim` extras), and a root systemd service that keeps `axol serve` running at boot. It also runs `axol provision`, which installs the JAX CUDA plugin matching the machine's CUDA version when an NVIDIA GPU is present:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
@@ -48,12 +48,21 @@ Install optional dependency groups as needed:
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 
 ```bash
 uv sync --extra lerobot --extra sim          # teleoperation + data collection
-uv sync --extra lerobot --extra cuda         # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra cuda   # everything
+uv sync --extra lerobot --extra sim          # everything
+```
+
+GPU-accelerated JAX is **not** a static extra: the pip `jax[cudaNN]` wheels each bundle a fixed CUDA runtime, so a single pin would install the wrong CUDA major on hosts with a different driver. Instead, `axol jax.install` detects this device's CUDA version and installs the matching `jax[cudaNN]` plugin (it runs automatically as part of [`axol provision`](docs/cli/provision.mdx)). On a **Jetson/Tegra** board the PyPI CUDA wheels have no kernel image for the integrated GPU, so `jax.install` delegates to `axol jax.build`, which builds `jaxlib` + the CUDA plugin from source for the device's compute capability (`sm_87` on Orin). Note that CPU is usually faster for the JAX IK solver used by `teleop`.
+
+To avoid rebuilding on every robot, `jax.build` **downloads prebuilt wheels first** from a GitHub release on this repo (tagged per device class, e.g. `jax-wheels-v0.9.2-cuda12-sm87`) and only builds from source when none exist. A maintainer builds once and uploads with `--publish`; every other Jetson of the same class just downloads.
+
+```bash
+axol jax.install            # detect CUDA + install the matching GPU plugin (Jetson: download-or-build)
+axol jax.build              # (Jetson) download prebuilt wheels, or build from source if none published
+axol jax.build --publish    # (maintainer) build + upload wheels to the release for this device class (needs `gh`)
+axol jax.build --no-download # force a from-source build, ignoring published wheels
 ```
 
 The ZED Python bindings (`pyzed`) are not on PyPI and must be installed separately after the ZED SDK is installed:

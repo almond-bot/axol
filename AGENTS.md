@@ -25,7 +25,8 @@ Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no p
 |-------|---------|
 | `sim` | viser (browser 3D visualizer) — needed for sim mode |
 | `lerobot` | LeRobot data collection/policy — requires hardware + ZED cameras |
-| `cuda` | JAX with CUDA — requires GPU |
+
+GPU-accelerated JAX is not an extra: `axol jax.install` (run by `axol provision`) detects the device's CUDA version and installs the matching `jax[cudaNN]` plugin.
 
 For cloud development: `uv sync --extra sim` is sufficient.
 

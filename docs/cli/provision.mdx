@@ -1,11 +1,12 @@
 ---
 title: "provision"
-description: "Install or refresh the non-PyPI and system pieces — adb, pyzed, GStreamer/PyGObject, and the patched zed-gstreamer plugins."
+description: "Install or refresh the non-PyPI and system pieces — adb, the JAX CUDA plugin, pyzed, GStreamer/PyGObject, and the patched zed-gstreamer plugins."
 ---
 
 Installs and refreshes the pieces `uv tool install` / `uv tool upgrade` can't manage on their own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
+- **`jax.install`** — the **JAX CUDA plugin** matching *this device's* CUDA version. The pip `jax[cudaNN]` wheels each bundle a fixed CUDA runtime, so a single pinned extra would install the wrong CUDA major elsewhere; this detects the host's CUDA version (`nvidia-smi` / CUDA toolkit) and installs the matching `jax[cudaNN]`. It's not a core PyPI dependency, so `uv tool upgrade` drops it. Self-gates to a no-op with no NVIDIA GPU (JAX then runs on CPU). On a **Jetson/Tegra** board it delegates to `jax.build` — the PyPI CUDA wheels have no kernel image for the integrated GPU, so `jaxlib` + the CUDA plugin come from a source build for the device's compute capability (`sm_87` on Orin). `jax.build` downloads prebuilt wheels from the repo's GitHub releases when a maintainer has published them (`axol jax.build --publish`), falling back to a from-source build otherwise. Either way it's idempotent, so it runs at most once.
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped on every `uv tool upgrade`).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).

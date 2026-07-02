@@ -7,6 +7,12 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``adb``           — Android Debug Bridge + the Oculus udev rule, for
                       streaming Quest controller poses over a USB
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
+* ``jax.install``   — the JAX CUDA plugin matching *this device's* CUDA version
+                      (the pinned pip extra would install one fixed CUDA major
+                      everywhere; not a core PyPI dep, so dropped on upgrade).
+                      On a Jetson/Tegra board it delegates to ``jax.build`` (the
+                      PyPI CUDA wheels have no kernel image for the integrated
+                      GPU); that build is idempotent, so it runs at most once.
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
@@ -34,6 +40,7 @@ from pathlib import Path
 from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
+from .jax import install as jax_install
 from .zed import install as zed_install
 
 _logger = logging.getLogger(__name__)
@@ -73,6 +80,11 @@ def run(_args: object = None) -> None:
     # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
     # on apt-get.
     _step("adb (Quest-over-USB)", adb.install)
+    # GPU-accelerated JAX: detect the host's CUDA major and install the matching
+    # jax[cudaNN] plugin. Self-gates to a no-op on hosts with no NVIDIA GPU
+    # (JAX then runs on CPU). Not a core PyPI dep, so a `uv tool upgrade` drops
+    # it — provision re-installs it here.
+    _step("JAX CUDA plugin (jax.install)", jax_install.run)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)

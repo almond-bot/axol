@@ -31,13 +31,14 @@ Install optional dependency groups as needed (the install script includes `lerob
 |---|---|---|
 | `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
-| `cuda` | JAX with CUDA 13 support | GPU-accelerated JAX (IK solver used by `teleop`); note that CPU is usually faster for the JAX IK solver |
 
 ```bash
 uv sync --extra lerobot --extra sim                # teleoperation + data collection
-uv sync --extra lerobot --extra cuda               # policy execution on GPU
-uv sync --extra lerobot --extra sim --extra cuda   # everything
 ```
+
+<Note>
+  GPU-accelerated JAX isn't a dependency extra: the pip `jax[cudaNN]` wheels each bundle a fixed CUDA runtime, so a single pin would install the wrong CUDA major on a host with a different driver. Run [`axol jax.install`](/cli/provision) (also run by `axol provision`) to detect this device's CUDA version and install the matching `jax[cudaNN]` plugin. CPU is usually faster for the JAX IK solver used by `teleop`.
+</Note>
 
 <Note>
   Streaming the ZED camera feeds to the headset (`teleop --cameras`, `collect-data`) isn't a dependency extra — it needs the system GStreamer + camera stack, installed via [`axol provision`](/cli/provision) (see [Headset-video stack](#headset-video-stack) below).

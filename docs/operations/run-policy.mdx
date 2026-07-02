@@ -26,7 +26,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
 - **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them.
 - **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Assign the **same** cameras, and use the **same** camera resolution, stereo setting, and fps the policy was trained on.
-- **For local GPU inference**, the `cuda` extra — not included by the install script. Add it on a [development install](/advanced/development-install) with `uv sync --extra lerobot --extra cuda`, or offload to a remote server (below).
+- **For local GPU inference**, the JAX CUDA plugin — installed by `axol jax.install` (run automatically by `axol provision`), which detects this device's CUDA version and installs the matching `jax[cudaNN]`. Or offload to a remote server (below).
 
 ## Run it
 
@@ -86,7 +86,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 
 <Steps>
   <Step title="Start the inference server on the GPU machine">
-    The inference server runs on the GPU machine from the CLI — it isn't one of the control panel's operations. With the `lerobot` + `cuda` extras installed there:
+    The inference server runs on the GPU machine from the CLI — it isn't one of the control panel's operations. With the `lerobot` extra installed and the JAX CUDA plugin provisioned (`axol jax.install`) there:
 
     ```bash
     axol inference-server

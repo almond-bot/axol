@@ -3,10 +3,12 @@
 #
 #   curl https://axol.almond.bot/install -fsS | bash
 #
-# Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras
-# except cuda), installs the pyzed bindings when the ZED SDK is present,
-# installs adb for Quest-over-USB teleop, and registers a root systemd service
-# that keeps `axol serve` running at boot and restarts it if it ever goes down.
+# Installs uv, installs the axol CLI as a uv tool (from GitHub, the lerobot +
+# sim extras), installs the JAX CUDA plugin matching the device's CUDA version
+# (via `axol provision`), installs the pyzed bindings when the ZED SDK is
+# present, installs adb for Quest-over-USB teleop, and registers a root systemd
+# service that keeps `axol serve` running at boot and restarts it if it ever
+# goes down.
 # Safe to re-run: re-running upgrades to the latest main.
 
 set -euo pipefail

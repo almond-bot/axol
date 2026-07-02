@@ -26,7 +26,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.9.2"] # CPU is usually faster for the JAX IK solver
+# GPU-accelerated JAX is NOT a static extra: the pip jax[cudaNN] wheels each
+# bundle a fixed CUDA runtime, so pinning one here (e.g. cuda13) installs the
+# wrong CUDA major on any host with a different driver. `axol jax.install`
+# (run by `axol provision`) detects the device's CUDA version and installs the
+# matching jax[cudaNN] plugin instead. CPU is usually faster for the IK solver.
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
 
