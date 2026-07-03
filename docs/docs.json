@@ -19,6 +19,7 @@
         "group": "Get Started",
         "pages": [
           "index",
+          "hardware",
           "installation"
         ]
       },
@@ -29,6 +30,7 @@
           "operations/gravity-comp",
           "operations/data-collection",
           "operations/replay-dataset",
+          "operations/train-policy",
           "operations/run-policy"
         ]
       },
