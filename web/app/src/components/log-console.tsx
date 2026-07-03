@@ -19,7 +19,7 @@ export function LogConsole({ lines }: { lines: string[] }) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-")
     const a = document.createElement("a")
     a.href = url
-    a.download = `axol-logs-${stamp}.txt`
+    a.download = `axol-logs-${stamp}.log`
     document.body.appendChild(a)
     a.click()
     a.remove()
