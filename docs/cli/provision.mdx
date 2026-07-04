@@ -3,11 +3,11 @@ title: "provision"
 description: "Install or refresh the non-PyPI and system pieces — adb, pyzed, GStreamer/PyGObject, and the patched zed-gstreamer plugins."
 ---
 
-Installs and refreshes the pieces `uv tool install` / `uv tool upgrade` can't manage on their own:
+Installs and refreshes the pieces `uv tool install` can't manage on its own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
-- [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped on every `uv tool upgrade`).
+- [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
 
 ```bash

@@ -583,10 +583,10 @@ export default function ControlPanel() {
   }
 
   // Apply the available update, then hard-reload once the server is back on the
-  // new commit. The server upgrades and exits (systemd relaunches it), so the
+  // new release. The server upgrades and exits (systemd relaunches it), so the
   // start request and the watch polls below tolerate it briefly going away.
   async function handleUpdate() {
-    const target = update?.remoteCommit
+    const target = update?.remoteVersion
     if (!target) return
     setUpdating(true)
     setUpdatePhase("upgrading")
@@ -623,8 +623,8 @@ export default function ControlPanel() {
         // Reflect the server's current step (upgrading/provisioning) so the
         // banner shows progress rather than an opaque spinner.
         if (u.phase) setUpdatePhase(u.phase)
-        // Server is back and now running the target commit — done.
-        if (u.commit === target) {
+        // Server is back and now running the target release — done.
+        if (u.version === target) {
           clearInterval(watch)
           reload()
         }
@@ -657,7 +657,7 @@ export default function ControlPanel() {
           conn={conn.state}
           host={serverHost}
           hostName={hostInfo?.hostname}
-          commit={update?.commit ?? hostInfo?.commit ?? null}
+          version={update?.version ?? hostInfo?.version ?? null}
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
           robot={robot}

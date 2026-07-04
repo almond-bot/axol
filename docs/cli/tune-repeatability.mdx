@@ -1,24 +1,26 @@
 ---
 title: "tune.repeatability"
-description: "Measure how reliably the grippers return to the same physical contact point."
+description: "Measure how reliably the left arm returns to the same pose after many motions."
 ---
 
-Drives both arms between the rest pose and a hard-coded crossed-arms tips-touching pose, planning each leg with pyroki + the URDF so the arms can't clip the torso during the long arc. The gripper is held closed throughout and the arms run at maximum stiffness (the pre-tuning industrial gains) — repeatability is meaningless under the compliant teleop gains. Useful for measuring how reliably the grippers return to the same physical contact point after many motions.
+Repeatability test for the **left arm**: moves rest → pose **A** once, then bounces between two hard-coded poses (**A → B → A → B …**) for the requested number of cycles, returning to rest at the end (or on Ctrl-C). Each leg is planned in joint space with pyroki + the URDF so the arm can't clip the torso, and the playback is a pure joint-space interpolation — no per-waypoint IK — so it's smooth and perfectly repeatable. The gripper is held closed throughout, the right arm is left untouched (its CAN channel is disabled entirely).
 
 | Flag | Description |
 |---|---|
-| `--cycles INT` | Number of touch-and-return cycles; `0` (default) = run until Ctrl-C |
-| `--gripper-torque-limit FLOAT` | Gripper closing torque limit in Nm (default: 0.3); kept low so the tips collide gently |
-| `--dwell FLOAT` | Seconds to hold each end of the cycle (default: 0.5) |
-| `--rate FLOAT` | Control loop rate in Hz (default: 100) |
-| `--no-left` / `--no-right` | Disable an arm (the disabled side stays at rest while the other still moves) |
+| `--cycles INT` | Number of A→B→A round trips; `0` (default) = run until Ctrl-C |
+| `--gripper-torque-limit FLOAT` | Gripper closing torque limit in Nm (default: 0.3) |
+| `--dwell FLOAT` | Seconds to hold at each waypoint except B (default: 0.5) |
+| `--dwell-b FLOAT` | Seconds to hold at pose B before returning to A (default: 3.0) |
+| `--rate FLOAT` | Control loop / waypoint rate in Hz — higher = finer steps and smoother playback at the same speed (default: 250) |
+| `--speed FLOAT` | Average joint speed in rad/s of the worst-case joint; peak is 1.5× this (default: ~0.31) |
+| `--stiffness FLOAT` | Arm stiffness scale 0–1 — lower softens the motors and reduces tracking jitter (default: 0.5) |
 | `--log-level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 
 ```bash
-axol tune.repeatability               # forever
-axol tune.repeatability --cycles 5    # five touch-and-return cycles
+axol tune.repeatability               # bounce A↔B forever
+axol tune.repeatability --cycles 5    # five A→B→A round trips, then rest
 ```
 
 <Note>
-  The touching pose is hand-posed and lives at the top of `almond_axol/cli/tune/repeatability.py` — edit `_TOUCH_LEFT` / `_TOUCH_RIGHT` in place to re-calibrate the contact point.
+  Poses A and B are hand-posed and live at the top of `almond_axol/cli/tune/repeatability.py` — `_POSE_A_LEFT` / `_POSE_B_LEFT`, in raw motor-frame angles. To re-calibrate: pose the arm by hand, run `axol motor.info --l`, and paste the printed numbers in.
 </Note>
