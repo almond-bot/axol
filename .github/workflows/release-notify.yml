@@ -1,0 +1,101 @@
+# Announce every published GitHub release to Discord and Slack.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   DISCORD_WEBHOOK_URL  One Discord channel webhook URL
+#                        (channel -> Edit Channel -> Integrations -> Webhooks).
+#   SLACK_WEBHOOK_URLS   One Slack incoming-webhook URL per line, one per
+#                        customer channel (api.slack.com/apps -> Incoming
+#                        Webhooks). Every listed channel gets the announcement.
+name: Release notifications
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    env:
+      # Passed through the environment (not interpolated into the scripts) so
+      # release names/notes can't inject shell or JSON; jq does the quoting.
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_NAME: ${{ github.event.release.name }}
+      RELEASE_BODY: ${{ github.event.release.body }}
+      RELEASE_URL: ${{ github.event.release.html_url }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "${DISCORD_WEBHOOK_URL}" ]; then
+            echo "::error::DISCORD_WEBHOOK_URL secret is not set"
+            exit 1
+          fi
+          payload="$(jq -n \
+            --arg title "${RELEASE_NAME:-${RELEASE_TAG}}" \
+            --arg url "${RELEASE_URL}" \
+            --arg body "${RELEASE_BODY}" \
+            --arg repo "${REPO}" \
+            '{
+              embeds: [{
+                title: ("\($repo) \($title) released"),
+                url: $url,
+                # Discord caps embed descriptions at 4096 chars.
+                description: (if ($body | length) > 0 then $body[:4000] else $url end),
+                color: 5763719
+              }]
+            }')"
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "${payload}" "${DISCORD_WEBHOOK_URL}"
+
+      - name: Notify Slack channels
+        # Runs even if the Discord step failed, so one bad webhook doesn't
+        # silently skip the customer announcements.
+        if: always()
+        env:
+          SLACK_WEBHOOK_URLS: ${{ secrets.SLACK_WEBHOOK_URLS }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URLS}" ]; then
+            echo "::error::SLACK_WEBHOOK_URLS secret is not set"
+            exit 1
+          fi
+          payload="$(jq -n \
+            --arg title "${RELEASE_NAME:-${RELEASE_TAG}}" \
+            --arg url "${RELEASE_URL}" \
+            --arg body "${RELEASE_BODY}" \
+            --arg repo "${REPO}" \
+            '{
+              blocks: [
+                {
+                  type: "section",
+                  text: {
+                    type: "mrkdwn",
+                    text: ("*<\($url)|\($repo) \($title) released>*")
+                  }
+                },
+                {
+                  type: "section",
+                  # Slack caps a section text block at 3000 chars.
+                  text: {
+                    type: "mrkdwn",
+                    text: (if ($body | length) > 0 then $body[:2900] else "See the release page for details." end)
+                  }
+                }
+              ]
+            }')"
+          failed=0
+          while IFS= read -r webhook; do
+            webhook="$(echo "${webhook}" | tr -d "[:space:]")"
+            [ -n "${webhook}" ] || continue
+            if ! curl -fsS -X POST -H "Content-Type: application/json" \
+                -d "${payload}" "${webhook}"; then
+              echo "::error::Slack notification failed for one webhook"
+              failed=1
+            fi
+            echo
+          done <<< "${SLACK_WEBHOOK_URLS}"
+          exit "${failed}"

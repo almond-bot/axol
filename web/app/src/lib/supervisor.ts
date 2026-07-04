@@ -106,8 +106,8 @@ export interface ServerInfo {
   lanIp: string
   viewerPort: number
   vrPort: number
-  /** Installed git commit of the serve host (null for dev checkouts). */
-  commit?: string | null
+  /** Installed release version of the serve host, e.g. "0.1.2". */
+  version?: string | null
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
@@ -115,7 +115,7 @@ export async function fetchInfo(): Promise<ServerInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// Self-update (read-only commit check + user-initiated upgrade)
+// Self-update (read-only release-tag check + user-initiated upgrade)
 // ---------------------------------------------------------------------------
 
 export type UpdateState = "idle" | "updating" | "error"
@@ -126,11 +126,11 @@ export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
   enabled: boolean
-  /** Installed git commit (null for dev checkouts). */
-  commit: string | null
-  /** Latest commit on the tracked ref, or null until first resolved/offline. */
-  remoteCommit: string | null
-  /** remoteCommit is known and differs from the installed commit. */
+  /** Installed release version, e.g. "0.1.2". */
+  version: string | null
+  /** Latest release version (highest vX.Y.Z tag), or null until first resolved/offline. */
+  remoteVersion: string | null
+  /** A release with a higher version than the installed one exists. */
   updateAvailable: boolean
   /** Safe to restart now (no op running). */
   idle: boolean
@@ -143,8 +143,8 @@ export interface UpdateStatus {
 
 /**
  * Fetch the update indicator. Pass `force` on connect / page load to make the
- * server resolve the remote head synchronously (bypassing its debounce), so the
- * result is immediately current rather than a stale cached value.
+ * server resolve the latest release tag synchronously (bypassing its debounce),
+ * so the result is immediately current rather than a stale cached value.
  */
 export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
   return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))

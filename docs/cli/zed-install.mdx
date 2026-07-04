@@ -7,7 +7,12 @@ Downloads and installs the `pyzed` Python wheel matching the installed ZED SDK v
 
 ```bash
 axol zed.install
+axol zed.install --force   # reinstall even when the matching version is present
 ```
+
+| Flag | Description |
+|---|---|
+| `--force` | Reinstall pyzed even when the matching version is already present. Without it, the command is a no-op when the installed pyzed already matches the SDK. |
 
 <Note>
   Requires the **ZED SDK** to be installed at `/usr/local/zed` first — the command reads the SDK version from its headers to pick the right wheel, and exits with an error pointing to the [Stereolabs download page](https://www.stereolabs.com/developers/release) when it's missing. The [one-command install](/installation) runs this automatically whenever the SDK is present.

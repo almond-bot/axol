@@ -41,11 +41,15 @@ The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**,
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+
+#### Updates
+
+When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press.
 
 ### Axol
 
-Press **Connect** to bring up the robot. Under the hood this:
+The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
 
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).

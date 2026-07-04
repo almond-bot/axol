@@ -40,6 +40,7 @@ with AxolRobot(config) as robot:
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
 | `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
 | `observe_torques` | `False` | Include joint torques in `observation.state` |
+| `observe_cartesian` | `False` | Work in Cartesian end-effector space instead of 16 joint positions: observations report per-arm 6-axis EE poses (+ gripper) via FK, and `send_action()` accepts the same and resolves it to joint targets via IK |
 | `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |
 | `right_channel` | `"can_alm_axol_r"` | SocketCAN interface for the right arm |
 | `video_backend` | `"auto"` | Camera capture backend: `"gst"` (GPU-resident zed-gstreamer pipeline, low latency), `"sdk"` (ZED Python SDK), or `"auto"` (prefer `gst` when its stack is installed, else fall back to the SDK). [`run-policy`](/cli/run-policy) overrides this to `"sdk"` since it streams no headset video. |
@@ -50,7 +51,7 @@ with AxolRobot(config) as robot:
 |---|---|
 | `get_observation()` | Returns joint positions (+ torques if enabled) and latest camera frames |
 | `get_joint_observation()` | Returns joint positions only — no camera reads; use in the high-frequency teleop path |
-| `send_action(action)` | Sends joint position targets via impedance control (arm) and position-force control (gripper) |
+| `send_action(action)` | Sends joint position targets — or, with `observe_cartesian`, per-arm Cartesian EE poses resolved to joint targets via IK — via impedance control (arm) and position-force control (gripper) |
 | `positions` | `(left, right)` cached arm positions from telemetry, each shape `(8,)` |
 
 ## `AxolVRTeleop`
