@@ -14,9 +14,8 @@ on the repository and lets the operator apply the update on demand:
   than the installed one exists -- commits landing on ``main`` between releases
   are invisible to installs.
 - :meth:`SelfUpdater.start` is the Update button. It reinstalls the tool pinned
-  to the newest release tag; if the installed version then advanced, the
-  process exits so systemd restarts it on the new code. The UI then
-  hard-reloads.
+  to the newest release tag; once the reinstall succeeds, the process exits so
+  systemd restarts it on the new code. The UI then hard-reloads.
 
 Because the reinstall rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
@@ -342,11 +341,14 @@ class SelfUpdater:
                 self._fail("no release to install")
                 return
             url, _commit = self._origin
+            # Snapshot the release being installed: a background status poll
+            # could refresh the cached remote mid-update.
+            tag, target_version = self._remote_tag, self._remote_version
             # Reinstall pinned to the newest release tag. `uv tool upgrade`
             # cannot be used here: it re-resolves the originally requested
             # revision (the previous tag), so it would never move to a new
             # release. The requirement mirrors the hosted installer's.
-            requirement = f"{_PACKAGE}[{_EXTRAS}] @ git+{url}@{self._remote_tag}"
+            requirement = f"{_PACKAGE}[{_EXTRAS}] @ git+{url}@{tag}"
             self._phase = "upgrading"
             async with self._env_lock:
                 try:
@@ -372,29 +374,23 @@ class SelfUpdater:
                     )
                     return
 
-                # The reinstall rewrites the tool environment; re-read the
-                # metadata from disk to see whether the installed version moved
-                # past the running one (still under the lock, so it reflects
-                # this install).
-                new_version = installed_version()
-
-            # Always reprovision after an upgrade: it ran (so the env was rebuilt
-            # and pyzed/PyGObject pruned) whether or not the version advanced.
+            # The reinstall rebuilt the env, so reprovision before restarting
+            # onto the new code (pyzed/PyGObject were pruned).
             self._phase = "provisioning"
             await self._provision()
 
-            if new_version is None or new_version == self._version:
-                # The release didn't actually advance the install; nothing to
-                # restart onto. Clear the spinner and report up to date.
-                self._state = "idle"
-                self._phase = None
-                _logger.info("self-update: already up to date (v%s)", self._version)
-                return
-
+            # The install succeeded, so the target tag is what's on disk now.
+            # Deliberately don't re-read the installed version through
+            # importlib.metadata here: its path caches can still serve this
+            # process the pre-install metadata, which would make a real upgrade
+            # look like a no-op and skip the restart. `start()` only runs when
+            # the release is strictly newer, so a successful install always
+            # warrants the restart.
             _logger.info(
-                "self-update: upgraded v%s -> v%s; restarting when idle",
+                "self-update: installed %s (v%s -> v%s); restarting when idle",
+                tag,
                 self._version,
-                new_version,
+                target_version,
             )
             self._phase = "restarting"
             self._restart_pending = True
