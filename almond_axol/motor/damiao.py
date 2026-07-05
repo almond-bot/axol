@@ -128,12 +128,17 @@ class DamiaoMotor(MotorDriver):
                 self._handle_register_reply(data)
             return
 
-        # Feedback must arrive on this motor's MST_ID. The bus is shared with
-        # MyActuator traffic (and other Damiao motors), and matching on payload
-        # bytes alone let foreign frames whose byte 0 low nibble happened to
-        # equal this motor's ID be decoded as feedback — poisoning the cached
-        # position/torque with garbage (seen as single-frame spikes in recorded
-        # datasets). The nibble check stays as a guard against a misconfigured
+        # Feedback must arrive on this motor's MST_ID. Matching on payload
+        # bytes alone let any bus frame whose byte 0 low nibble equals this
+        # motor's ID be decoded as feedback, poisoning the cached
+        # position/torque. The known culprit is our own 0xCC feedback-request
+        # ([id_lo, id_hi, 0xCC, ...] on 0x7FF, see _request_feedback): when a
+        # second process shares the interface (e.g. `axol serve`'s 1 Hz motor
+        # ping running alongside teleop/collect-data), SocketCAN loops its
+        # frames into this socket, byte 0 = the motor's own ID passes the
+        # nibble check, and bytes 1-2 (0x00CC) decode to -12.42 rad — seen as
+        # single-frame spikes on the wrist/gripper channels in recorded
+        # datasets. The nibble check stays as a guard against a misconfigured
         # motor sharing our MST_ID.
         if msg.arbitration_id != self._feedback_id:
             return
