@@ -101,6 +101,10 @@ asyncio.run(main())
 
 Open `http://localhost:8002` in a browser to view the robot.
 
+<Note>
+  `Sim` renders whatever *you* command with `motion_control`. Running [`axol teleop --sim`](/cli/teleop) instead wraps a `Sim` in the full teleop stack — with no headset connected the arms just hold the rest pose. To drive them without a headset (e.g. in a test), stream [`VRFrame`](/api/vr) messages to the teleop VR WebSocket at `wss://localhost:8000/ws` (self-signed cert — disable TLS verification) with both `l_lock` and `r_lock` set `true` to engage tracking.
+</Note>
+
 ## Configuration — `AxolConfig`, `ArmConfig`, `JointConfig`
 
 Each arm joint is configured with a single `JointConfig` carrying its impedance gains, friction-comp model, and the inertial of the body it drives:
