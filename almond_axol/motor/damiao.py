@@ -128,6 +128,15 @@ class DamiaoMotor(MotorDriver):
                 self._handle_register_reply(data)
             return
 
+        # Feedback must arrive on this motor's MST_ID. The bus is shared with
+        # MyActuator traffic (and other Damiao motors), and matching on payload
+        # bytes alone let foreign frames whose byte 0 low nibble happened to
+        # equal this motor's ID be decoded as feedback — poisoning the cached
+        # position/torque with garbage (seen as single-frame spikes in recorded
+        # datasets). The nibble check stays as a guard against a misconfigured
+        # motor sharing our MST_ID.
+        if msg.arbitration_id != self._feedback_id:
+            return
         if (data[0] & 0x0F) == (self._motor_id & 0x0F):
             self._handle_feedback(data)
 
