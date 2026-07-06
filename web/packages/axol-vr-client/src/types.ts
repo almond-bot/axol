@@ -16,6 +16,13 @@ export enum AxolState {
  */
 export type AxolMode = "teleop" | "data_collection"
 
+/**
+ * Which episode action a HUD confirmation popup is gating while recording:
+ * stopping to save the episode ("save", armed by A) or discarding it to
+ * re-record ("discard", armed by X). Null when no confirmation is pending.
+ */
+export type ConfirmAction = "save" | "discard"
+
 export enum AxolConnectionStatus {
   Idle = "idle",
   Connecting = "connecting",
