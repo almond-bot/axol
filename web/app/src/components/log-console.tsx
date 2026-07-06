@@ -7,10 +7,24 @@ import { cn } from "@/lib/utils"
 /** Auto-scrolling log viewer shared by the operation panels and setup page. */
 export function LogConsole({ lines }: { lines: string[] }) {
   const scrollRef = useRef<HTMLDivElement>(null)
+  // Whether new lines should pull the view to the bottom. True while the user
+  // is at (or near) the bottom; cleared once they scroll up so they can read
+  // back through history without being yanked down by incoming logs.
+  const stickToBottom = useRef(true)
+
+  // Distance from the bottom (px) still treated as "following"; absorbs
+  // sub-pixel rounding and wrapped-line reflow.
+  const STICK_THRESHOLD_PX = 24
+
+  function handleScroll() {
+    const el = scrollRef.current
+    if (!el) return
+    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX
+  }
 
   useEffect(() => {
     const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight
   }, [lines])
 
   function downloadLogs() {
@@ -45,6 +59,7 @@ export function LogConsole({ lines }: { lines: string[] }) {
       </div>
       <div
         ref={scrollRef}
+        onScroll={handleScroll}
         className="max-h-[60vh] min-h-[280px] overflow-auto px-4 pb-4 font-mono text-xs leading-relaxed"
       >
         {lines.length === 0 ? (
