@@ -194,7 +194,7 @@ class AxolVRTeleop(Teleoperator):
         self._loop_thread.start()
         asyncio.run_coroutine_threadsafe(
             self._connect_async(q_start_left, q_start_right), loop
-        ).result(timeout=60)
+        ).result(timeout=120)
         _logger.info("AxolVRTeleop connected.")
 
     async def _connect_async(
