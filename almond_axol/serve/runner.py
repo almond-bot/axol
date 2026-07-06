@@ -77,11 +77,18 @@ _IGNORED_LOGGER_PREFIXES = (
     "asyncio",
 )
 
+# ANSI escape sequences (colours, cursor moves). uvicorn colourises its logs,
+# and various native tools emit them too; strip them before matching/emitting so
+# the filter below works and the UI console isn't littered with raw ``\x1b[..``.
+# The real terminal still gets the coloured originals via the tee's echo.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
 # uvicorn's DefaultFormatter / AccessFormatter writes lines like
 # "INFO:     Started server process [...]"  or
 # "INFO:     127.0.0.1:36514 - \"GET /api/robot/status HTTP/1.1\" 200 OK".
 # Detect that distinctive ``LEVEL:<4+ spaces>`` prefix so the same lines that
-# go to the actual terminal don't also pollute the op's session log.
+# go to the actual terminal don't also pollute the op's session log. Matched
+# against the ANSI-stripped line, since uvicorn colourises the ``LEVEL`` prefix.
 _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 # The camera slots the control panel can configure serials for.
@@ -91,9 +98,11 @@ _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
 def _forward_line(sink: Any, line: str) -> None:
     """Emit a completed output line to a session sink.
 
-    Drops uvicorn's own access / lifecycle lines — they still reach the real
-    terminal via the tee, but shouldn't pollute the op's session log.
+    Strips ANSI escapes (the UI console renders them as literal ``\\x1b[..``),
+    then drops uvicorn's own access / lifecycle lines — those still reach the
+    real terminal via the tee, but shouldn't pollute the op's session log.
     """
+    line = _ANSI_ESCAPE.sub("", line)
     if _UVICORN_LINE.match(line):
         return
     try:
