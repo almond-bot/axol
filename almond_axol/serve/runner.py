@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import os
 import re
 import sys
 import threading
@@ -76,15 +77,38 @@ _IGNORED_LOGGER_PREFIXES = (
     "asyncio",
 )
 
+# ANSI escape sequences (colours, cursor moves). uvicorn colourises its logs,
+# and various native tools emit them too; strip them before matching/emitting so
+# the filter below works and the UI console isn't littered with raw ``\x1b[..``.
+# The real terminal still gets the coloured originals via the tee's echo.
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
 # uvicorn's DefaultFormatter / AccessFormatter writes lines like
 # "INFO:     Started server process [...]"  or
 # "INFO:     127.0.0.1:36514 - \"GET /api/robot/status HTTP/1.1\" 200 OK".
 # Detect that distinctive ``LEVEL:<4+ spaces>`` prefix so the same lines that
-# go to the actual terminal don't also pollute the op's session log.
+# go to the actual terminal don't also pollute the op's session log. Matched
+# against the ANSI-stripped line, since uvicorn colourises the ``LEVEL`` prefix.
 _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 # The camera slots the control panel can configure serials for.
 _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
+
+
+def _forward_line(sink: Any, line: str) -> None:
+    """Emit a completed output line to a session sink.
+
+    Strips ANSI escapes (the UI console renders them as literal ``\\x1b[..``),
+    then drops uvicorn's own access / lifecycle lines — those still reach the
+    real terminal via the tee, but shouldn't pollute the op's session log.
+    """
+    line = _ANSI_ESCAPE.sub("", line)
+    if _UVICORN_LINE.match(line):
+        return
+    try:
+        sink(line)
+    except Exception:  # noqa: BLE001 - a broken sink must never break output
+        pass
 
 
 class _StreamTee:
@@ -103,11 +127,7 @@ class _StreamTee:
         self._buf += s
         while "\n" in self._buf:
             line, self._buf = self._buf.split("\n", 1)
-            # Don't echo uvicorn's own access / lifecycle lines into the UI;
-            # they still go to the real terminal via ``self._original`` above.
-            if _UVICORN_LINE.match(line):
-                continue
-            self._sink(line)
+            _forward_line(self._sink, line)
         return len(s)
 
     def flush(self) -> None:
@@ -144,7 +164,27 @@ class _SessionLogHandler(logging.Handler):
 
 
 class _Capture:
-    """Route ``logging`` + stdout/stderr into a session for one op's lifetime."""
+    """Route ``logging`` + stdout/stderr into a session for one op's lifetime.
+
+    Two capture layers run together:
+
+    * Python-level ``logging``/``print`` go through a :class:`_StreamTee` that
+      writes to a *saved dup* of the original fd (so the real terminal/journald
+      still see them) and forwards each line to the session.
+    * OS file descriptors 1 and 2 are redirected to a pipe drained by a reader
+      thread. This is the only way to capture output that bypasses Python's
+      ``sys.stdout``/``sys.stderr`` objects: native libraries (the ZED SDK,
+      GStreamer, CUDA) writing straight to fd 2, and the spawned video-relay /
+      recorder / encoder subprocesses that inherit these fds. Without it a
+      camera/ZED failure only reaches the service log and the UI shows a bare
+      "exited" with no reason.
+
+    Because the tee writes Python output to the saved fd (never fd 1/2) and the
+    reader drains only fd 1/2, a line is captured by exactly one path — no
+    double emission. The redirect is installed before the op spawns its children
+    so they inherit the pipe; if it can't be set up we fall back to Python-only
+    capture (the prior behaviour).
+    """
 
     def __init__(self, session: Session, level: int) -> None:
         self._session = session
@@ -153,6 +193,12 @@ class _Capture:
         self._old_stdout: Any = None
         self._old_stderr: Any = None
         self._old_root_level: int | None = None
+        # fd-level tee state (None when unavailable / not installed).
+        self._saved_out_fd: int | None = None
+        self._saved_err_fd: int | None = None
+        self._saved_out: Any = None
+        self._saved_err: Any = None
+        self._reader: threading.Thread | None = None
 
     def __enter__(self) -> _Capture:
         sink = self._session.emit
@@ -165,9 +211,75 @@ class _Capture:
         root.setLevel(self._level)
         root.addHandler(self._handler)
         self._old_stdout, self._old_stderr = sys.stdout, sys.stderr
-        sys.stdout = _StreamTee(self._old_stdout, sink)
-        sys.stderr = _StreamTee(self._old_stderr, sink)
+        try:
+            self._install_fd_tee(sink)
+        except Exception:  # noqa: BLE001 - degrade to Python-only capture
+            _logger.exception(
+                "fd-level log capture unavailable; native/child-process output "
+                "won't reach the UI log"
+            )
+            sys.stdout = _StreamTee(self._old_stdout, sink)
+            sys.stderr = _StreamTee(self._old_stderr, sink)
         return self
+
+    def _install_fd_tee(self, sink: Any) -> None:
+        # Save the real fds so we can keep echoing to the terminal/journald and
+        # restore them on exit.
+        self._saved_out_fd = os.dup(1)
+        self._saved_err_fd = os.dup(2)
+        pipe_r, pipe_w = os.pipe()
+        # Start the drainer *before* redirecting fd 1/2, so the pipe always has a
+        # reader — otherwise a failure between the redirect and the thread start
+        # could let the pipe fill and wedge the whole serve process.
+        self._reader = threading.Thread(
+            target=self._drain_pipe,
+            args=(pipe_r, self._saved_err_fd, sink),
+            name=f"log-tee-{self._session.id}",
+            daemon=True,
+        )
+        self._reader.start()
+        # Point the process's fd 1/2 at the pipe: everything writing to them from
+        # now on — native code and inherited child processes — lands there.
+        os.dup2(pipe_w, 1)
+        os.dup2(pipe_w, 2)
+        os.close(pipe_w)
+        # Line-buffered text wrappers over the *saved* fds. Python-level writes
+        # go here (real terminal + session) and never touch the pipe, so a
+        # print/log line isn't captured twice. closefd=False: we own the fds.
+        self._saved_out = os.fdopen(self._saved_out_fd, "w", buffering=1, closefd=False)
+        self._saved_err = os.fdopen(self._saved_err_fd, "w", buffering=1, closefd=False)
+        sys.stdout = _StreamTee(self._saved_out, sink)
+        sys.stderr = _StreamTee(self._saved_err, sink)
+
+    @staticmethod
+    def _drain_pipe(pipe_r: int, echo_fd: int, sink: Any) -> None:
+        """Read fd-level output, echo it to the terminal, forward lines."""
+        buf = ""
+        try:
+            while True:
+                chunk = os.read(pipe_r, 65536)
+                if not chunk:
+                    break
+                # Echo the raw bytes to the saved fd so the service log is
+                # unchanged; os.write (not the buffered stream) avoids racing
+                # the tee's writes to the same fd from the op thread.
+                try:
+                    os.write(echo_fd, chunk)
+                except OSError:
+                    pass
+                buf += chunk.decode("utf-8", "replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    _forward_line(sink, line)
+        except OSError:
+            pass
+        finally:
+            if buf:
+                _forward_line(sink, buf)
+            try:
+                os.close(pipe_r)
+            except OSError:
+                pass
 
     def __exit__(self, *_: object) -> None:
         sys.stdout, sys.stderr = self._old_stdout, self._old_stderr
@@ -176,6 +288,41 @@ class _Capture:
             root.removeHandler(self._handler)
         if self._old_root_level is not None:
             root.setLevel(self._old_root_level)
+        self._teardown_fd_tee()
+
+    def _teardown_fd_tee(self) -> None:
+        for stream in (self._saved_out, self._saved_err):
+            if stream is not None:
+                try:
+                    stream.flush()
+                except Exception:  # noqa: BLE001
+                    pass
+        # Restore the real fds. This drops the serve process's own write ends of
+        # the pipe; once the op's children (which inherited them) are gone the
+        # reader hits EOF and exits. Their teardown already ran in the op body.
+        if self._saved_out_fd is not None:
+            try:
+                os.dup2(self._saved_out_fd, 1)
+            except OSError:
+                pass
+        if self._saved_err_fd is not None:
+            try:
+                os.dup2(self._saved_err_fd, 2)
+            except OSError:
+                pass
+        # Wait briefly for the reader to drain; it's a daemon, so a lingering
+        # child can't wedge shutdown.
+        if self._reader is not None:
+            self._reader.join(timeout=2.0)
+        for fd in (self._saved_out_fd, self._saved_err_fd):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self._saved_out = self._saved_err = None
+        self._saved_out_fd = self._saved_err_fd = None
+        self._reader = None
 
 
 class OperationRunner:
