@@ -120,8 +120,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # host installer and its boot service (`axol jetson.setup` runs as an
     # ExecStartPre on axol.service; `axol provision` runs at install time). The
     # one exception is the self-updater (below), which re-runs `axol provision`
-    # after a `uv tool upgrade` and self-heals a host that upgraded into this
-    # build from an older main.
+    # after a release upgrade and self-heals a host that upgraded into this
+    # build from an older release.
 
     manager = SessionManager()
     robot = RobotLink()
@@ -138,10 +138,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return False
         return not any(s["status"] in ("starting", "running") for s in manager.list())
 
-    # Surfaces "update available" (read-only `git ls-remote`) to the control
-    # panel via /api/update/status and applies an on-demand `uv tool upgrade`
-    # via /api/update/start, restarting the process (systemd relaunches it) once
-    # idle. Nothing upgrades automatically. No-ops for dev checkouts.
+    # Surfaces "update available" (a newer release tag, found via read-only
+    # `git ls-remote --tags`) to the control panel via /api/update/status and
+    # applies an on-demand tag-pinned reinstall via /api/update/start,
+    # restarting the process (systemd relaunches it) once idle. Nothing
+    # upgrades automatically. No-ops for dev checkouts.
     updater = SelfUpdater(_is_idle)
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
@@ -170,20 +171,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:
         """Identify the serve host so the UI can build reachable links/hints."""
-        # Self-heal a host that upgraded into this build from an older main (the
-        # old code never ran `axol provision`); idempotent, once per process.
+        # Self-heal a host that upgraded into this build from an older release
+        # (the old code never ran `axol provision`); idempotent, once per process.
         updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
             "viewerPort": _VIEWER_PORT,
             "vrPort": _VR_PORT,
-            "commit": updater.commit,
+            "version": updater.version,
         }
 
     @app.get("/api/update/status")
     async def update_status(refresh: bool = False) -> dict[str, Any]:
-        """Installed vs. tracked-ref commit so the UI can offer an update.
+        """Installed vs. latest release version so the UI can offer an update.
 
         ``refresh=1`` forces a synchronous remote check (used on connect / page
         load) so the result is current; the steady-state poll omits it and gets

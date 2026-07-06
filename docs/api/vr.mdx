@@ -96,6 +96,9 @@ Requires the GPU-resident camera stack the host installer sets up once: the GStr
 | `port` | `8000` | WSS listen port |
 | `certfile` | auto | Path to TLS certificate; `None` uses the auto-generated cert |
 | `keyfile` | auto | Path to TLS private key |
+| `interp_enabled` | `True` | Enable the adaptive playout buffer that interpolates pose frames using the headset timestamp `t`, smoothing jittery / batched frame arrivals |
+| `interp_min_delay_s` | `0.0` | Minimum playout delay in seconds |
+| `interp_max_delay_s` | `0.1` | Maximum playout delay in seconds — caps how much latency the buffer may add |
 
 <Warning>
   Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.

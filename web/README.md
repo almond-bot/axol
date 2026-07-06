@@ -87,7 +87,7 @@ Each frame sends a JSON message over the WebSocket:
   r_lock:  boolean   // right grip button state (True = pressed); see l_lock
   l_grip:  number    // left grip (0 = fully gripped, 1 = open)
   r_grip:  number    // right grip
-  reset:   boolean   // true on the frame X was pressed
+  reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
   seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
 }
@@ -97,37 +97,34 @@ Each frame sends a JSON message over the WebSocket:
 
 ![Quest controller diagram](assets/quest.png)
 
+The operating mode (teleop vs. data collection) is **announced by the server on connect and locked** for the session — there's no in-headset toggle. In plain teleop the recording controls are inert; in data collection they drive episodes.
+
 | # | Button | Action |
 |---|---|---|
 | 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
 | 2 | Right grip | See above |
-| 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to move it |
-| 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to move it |
-| 5 | Left **X** | Reset pose; cancels recording countdown; exits Recording → DataCollection |
-| 7 | Left **Y** | Exit XR session |
-| 6 | Right **A** | Start recording (3-second countdown); stop immediately if already recording; cancels countdown if pressed during it |
-| 8 | Right **B** | Toggle between Teleop and DataCollection (disabled while recording or countdown) |
-| — | Right thumbstick | Flick = latched camera-view picker (up = overhead, left/right = wrist fullscreen, down = split; re-flick = back to default passthrough + PiPs). Click = re-anchor the screens to the current gaze |
+| 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
+| 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
+| 5 | Left **X** | Reset pose; cancels a recording countdown; stops and **discards** an in-progress take |
+| 7 | Left **Y** | Exit the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose |
+| 6 | Right **A** | **Record**: start a take (3-second countdown), or stop and **save** the current take — **data collection only** (no effect during plain teleop) |
+| — | Right thumbstick (click) | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
 
 ## State machine
 
+In **teleop** mode the headset stays in `Teleop` with the recording controls inert. In **data collection** mode it starts in `DataCollection` and drives episodes with **A** / **X**:
+
 ```
-Teleop ──[B]──► DataCollection ──[A]──► (countdown 3s) ──► Recording
-   ▲                 ▲                                          │
-   └────────[B]──────┘                                   [A or X]
-                                                               │
-                                                          (server push)
-                                                               │
-                                                             Saving
-                                                               │
-                                                          (save done)
-                                                               │
-                                                         DataCollection
+DataCollection ──[A]──► (countdown 3s) ──► Recording
+      ▲                                          │
+      │                                     [A or X]
+      │                                          │
+      └──────────── Saving ◄────────────── (server push)
 ```
 
 During the 3-second countdown the state sent to the server remains `DataCollection`. Once the countdown completes it transitions to `Recording`.
 
-The `Saving` state is **server-driven**: the Python SDK broadcasts `{"type": "state", "value": "saving"}` over the WebSocket immediately when recording stops, then `{"type": "state", "value": "data_collection"}` once `save_episode()` completes. While in `Saving`, all A/B/X button actions except Y (exit) are blocked.
+The `Saving` state is **server-driven**: the Python SDK broadcasts `{"type": "state", "value": "saving"}` over the WebSocket immediately when recording stops, then `{"type": "state", "value": "data_collection"}` once `save_episode()` completes. While in `Saving`, all A/X button actions except Y (exit) are blocked.
 
 The `Error` state is also **server-driven**: broadcasting `{"type": "state", "value": "error"}` displays an error indicator in the headset UI and blocks all recording controls.
 

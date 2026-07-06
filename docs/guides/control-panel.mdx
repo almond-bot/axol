@@ -41,11 +41,15 @@ The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**,
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+
+#### Updates
+
+When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press.
 
 ### Axol
 
-Press **Connect** to bring up the robot. Under the hood this:
+The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
 
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
@@ -56,7 +60,9 @@ The server runs as root under the one-command install's systemd service, so CAN 
 
 Data collection and policy inference also need the ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
 
-The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). If a camera was plugged in after boot and doesn't show up, press **Restart daemon** to restart the ZED X daemon and re-detect. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
+The tile's dot reflects whether the assigned cameras are **actually connected**, not merely configured: it stays green (`N/3 configured`) only while every assigned serial is detected on the host, turns **red** (`x/N connected`) the moment an assigned camera is unplugged or missing, and shows **Can't detect cameras** (amber) if the ZED SDK or daemon can't be queried at all.
+
+The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). Press **Refresh** to re-query the daemon's current device list, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
 
 The dialog is the single source of truth for all camera settings — these fields no longer appear in an operation's **Optional** form. It controls two independent branches:
 
@@ -67,7 +73,7 @@ Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, o
 
 A stereo **overhead** captures both eyes from one grab; with both eyes selected it's exposed as `overhead_left` / `overhead_right` (rendered per-lens in the headset, two observation keys in the dataset). A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist in your browser and are sent along when you start an operation. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on).
+The assignments and stream/record selection persist in your browser and are sent along when you start an operation. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras dialog. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 
@@ -99,7 +105,7 @@ Each operation's settings are saved to your browser automatically, so they reapp
 
 ### Running, logs, and stopping
 
-Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Host** / **Robot Disconnect** likewise wait for the running op to finish tearing down before proceeding.
+Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. The **download** button in the Logs header saves everything currently in the console to a timestamped `.log` file (disabled when there's no output) — handy for attaching to a bug report. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Host** / **Robot Disconnect** likewise wait for the running op to finish tearing down before proceeding.
 
 ## Run Policy episode controls
 

@@ -3,16 +3,17 @@
 #
 #   curl https://axol.almond.bot/install -fsS | bash
 #
-# Installs uv, installs the axol CLI as a uv tool (from GitHub, all extras),
-# installs the pyzed bindings when the ZED SDK is present,
-# installs adb for Quest-over-USB teleop, and registers a root systemd service
-# that keeps `axol serve` running at boot and restarts it if it ever goes down.
-# Safe to re-run: re-running upgrades to the latest main.
+# Installs uv, installs the axol CLI as a uv tool (from GitHub, pinned to the
+# latest release tag, all extras), installs the pyzed bindings when the ZED SDK
+# is present, installs adb for Quest-over-USB teleop, and registers a root
+# systemd service that keeps `axol serve` running at boot and restarts it if it
+# ever goes down. Safe to re-run: re-running upgrades to the latest release.
 
 set -euo pipefail
 
 INSTALL_URL="https://axol.almond.bot/install"
-REPO="git+https://github.com/almond-bot/axol"
+REPO_URL="https://github.com/almond-bot/axol"
+REPO="git+${REPO_URL}"
 # `video` is intentionally omitted: headset-video support is system-level
 # (GStreamer NVENC + PyGObject + the patched zed-gstreamer source plugins),
 # provisioned below by `axol provision`, not via a PyPI extra (see
@@ -27,7 +28,7 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 # managed-Python locations live under /root (mode 0700), which only root can
 # traverse, so the `axol` wrapper on PATH would fail for everyone else. Pin
 # both to shared, world-readable locations instead. The same vars are baked
-# into the systemd unit below so the self-updater's `uv tool upgrade` keeps
+# into the systemd unit below so the self-updater's tag-pinned reinstall keeps
 # operating on this one shared install rather than spawning a /root copy.
 UV_TOOL_DIR="/opt/axol/uv/tools"
 UV_PYTHON_INSTALL_DIR="/opt/axol/uv/python"
@@ -47,6 +48,9 @@ fi
 
 command -v systemctl >/dev/null 2>&1 || die "systemd is required."
 command -v curl >/dev/null 2>&1 || die "curl is required."
+# git is needed both to resolve the latest release tag and by uv itself to
+# install from the GitHub URL.
+command -v git >/dev/null 2>&1 || die "git is required."
 
 # -- uv -----------------------------------------------------------------------
 
@@ -60,12 +64,23 @@ UV="$(command -v uv || echo "${BIN_DIR}/uv")"
 
 # -- axol ---------------------------------------------------------------------
 
-say "Installing axol from GitHub (extras: ${EXTRAS}) — this can take a few minutes..."
+# Installs track releases, not main: resolve the newest release tag (vX.Y.Z)
+# and pin the install to it. The `axol serve` self-updater performs the same
+# tag-pinned reinstall when a newer release appears (serve/update.py) — keep
+# the requirement here and there in sync.
+say "Resolving the latest release..."
+LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
+    | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
+    | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
+[ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
+say "Latest release: ${LATEST_TAG}."
+
+say "Installing axol ${LATEST_TAG} from GitHub (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
-    "almond-axol[${EXTRAS}] @ ${REPO}"
+    "almond-axol[${EXTRAS}] @ ${REPO}@${LATEST_TAG}"
 
 # uv creates the tool venv + managed Python with the root umask; make sure every
 # user can read/traverse them (dirs + already-executable files only, via 'X') so
@@ -171,10 +186,10 @@ Environment=PYTHONUNBUFFERED=1
 # Store collected datasets under the installing user's home (see above) rather
 # than root's cache. Empty when no non-root user home was resolved.
 ${LEROBOT_HOME_ENV}
-# Keep the self-updater's \`uv tool upgrade\` on the same shared install the
+# Keep the self-updater's tag-pinned reinstall on the same shared install the
 # installer wrote, rather than letting uv fall back to its /root defaults.
 # UV_TOOL_BIN_DIR must match the install-time bin dir: without it, the first
-# \`uv tool upgrade\` relocates the \`axol\` wrapper to uv's default (/root/.local/bin),
+# self-update relocates the \`axol\` wrapper to uv's default (/root/.local/bin),
 # deleting ${BIN_DIR}/axol and breaking this unit's ExecStart with 203/EXEC.
 Environment=UV_TOOL_DIR=${UV_TOOL_DIR}
 Environment=UV_PYTHON_INSTALL_DIR=${UV_PYTHON_INSTALL_DIR}

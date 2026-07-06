@@ -5,6 +5,10 @@ description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
 
 Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first call takes a few seconds; subsequent calls are fast.
 
+<Note>
+  The XLA compile is cached to disk (`~/.almond/jax-cache`), so that cost is paid **once per machine**, not on every process start — a fresh `axol teleop` / `serve` boots straight into the fast path instead of recompiling. The cache key covers the solver graph plus the `jax`/`jaxlib` versions and backend, so upgrading JAX or changing the solver simply recompiles and refreshes the cache (stale entries are never reused). Only the XLA backend compile is skipped; Python-side tracing/lowering still runs each session. Set `JAX_COMPILATION_CACHE_DIR` to override the location.
+</Note>
+
 ```python
 from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
 ```

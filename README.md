@@ -26,7 +26,7 @@ One command installs `uv`, the `axol` CLI (from GitHub, with every extra), and a
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
-Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install keeps itself in sync with `main`: when the control panel connects, the server upgrades in the background and restarts onto the new version once idle.
+Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install tracks [releases](https://github.com/almond-bot/axol/releases): when a newer release exists, the control panel shows an update banner, and pressing **Update** reinstalls at the new release and restarts the server once idle.
 
 ### Development install
 
