@@ -38,6 +38,7 @@ export function AxolVRClient({
   onPendingRecording,
   onPendingConfirm,
   onMode,
+  onEpisode,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -57,6 +58,9 @@ export function AxolVRClient({
   onPendingConfirm?: (action: ConfirmAction | null) => void
   // Called when the server announces its operating mode (once per connection).
   onMode?: (mode: AxolMode) => void
+  // Called with the current 1-based episode number while collecting data (and
+  // null if the server ever clears it). Drives the in-headset episode readout.
+  onEpisode?: (episode: number | null) => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -79,6 +83,10 @@ export function AxolVRClient({
   const modeRef = useRef<AxolMode | null>(null)
   // Server-pushed mode announcement, applied at the start of the next frame.
   const serverModeRef = useRef<AxolMode | null>(null)
+  // Server-pushed episode number, applied at the start of the next frame. -1 is
+  // the "unset" sentinel (distinct from a real episode value or an explicit
+  // null the server could send); replaced with the parsed value on each push.
+  const serverEpisodeRef = useRef<number | null | -1>(-1)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
 
@@ -91,11 +99,16 @@ export function AxolVRClient({
       if (currentWs) {
         currentWs.onmessage = (event: MessageEvent) => {
           try {
-            const msg = JSON.parse(event.data as string) as { type: string; value: string }
+            const msg = JSON.parse(event.data as string) as {
+              type: string
+              value: string | number | null
+            }
             if (msg.type === "state") {
               serverStateRef.current = msg.value as AxolState
             } else if (msg.type === "mode") {
               serverModeRef.current = msg.value as AxolMode
+            } else if (msg.type === "episode") {
+              serverEpisodeRef.current = typeof msg.value === "number" ? msg.value : null
             }
           } catch {
             // ignore malformed messages
@@ -155,6 +168,13 @@ export function AxolVRClient({
         setState(AxolState.DataCollection)
       }
       onMode?.(mode)
+    }
+
+    // Surface any server-pushed episode number (purely informational — it
+    // doesn't feed the state machine below).
+    if (serverEpisodeRef.current !== -1) {
+      onEpisode?.(serverEpisodeRef.current)
+      serverEpisodeRef.current = -1
     }
 
     // Apply server-pushed state override before processing button presses.

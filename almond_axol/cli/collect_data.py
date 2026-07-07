@@ -697,6 +697,9 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     try:
         while not _stopped():
             episode_idx = recorder.episode_count()
+            # Surface the (1-based) episode number in the headset HUD so the
+            # operator can see which episode they're about to record.
+            teleop.send_feedback_episode(episode_idx + 1)
             log_say(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
