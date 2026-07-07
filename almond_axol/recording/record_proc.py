@@ -814,13 +814,27 @@ def run_capture_loop(
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
 
-        # Wait for the first snapshot (the control loop publishes every tick).
-        first_deadline = time.perf_counter() + 5.0
-        while read_snapshot() is None:
+        # Wait for the first snapshot *published after this episode started*.
+        # The snapshot slot is a single latest-wins register that persists
+        # across episodes, so at episode start it can still hold the previous
+        # episode's final snapshot (the control loop may not have published
+        # yet); pairing fresh camera frames with it would write a stale pose
+        # into the episode's opening rows. Snapshot timestamps are
+        # perf_counter values from the publishing process — comparable here
+        # because CLOCK_MONOTONIC is system-wide (the camera-frame pairing
+        # below already relies on this).
+        episode_start = time.perf_counter()
+        first_deadline = episode_start + 5.0
+        while True:
+            snap = read_snapshot()
+            if snap is not None and snap[2] >= episode_start:
+                break
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
-                _logger.warning("capture loop saw no snapshot within 5s; exiting.")
+                _logger.warning(
+                    "capture loop saw no fresh snapshot within 5s; exiting."
+                )
                 return
         if stop_event.is_set():
             return
@@ -982,16 +996,19 @@ def run_encoded_capture_loop(
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
 
-        # Wait for the first snapshot (the control loop publishes every tick).
+        # Wait for the first snapshot *published after this episode started* —
+        # the slot persists across episodes, so a stale previous-episode
+        # snapshot must not seed the opening rows (see run_capture_loop).
         # Keep it: rows whose seqlock read later misses reuse the last good one.
-        first_deadline = time.perf_counter() + 5.0
+        episode_start = time.perf_counter()
+        first_deadline = episode_start + 5.0
         last_snap = read_snapshot()
-        while last_snap is None:
+        while last_snap is None or last_snap[2] < episode_start:
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
                 _logger.warning(
-                    "encoded capture loop saw no snapshot within 5s; exiting."
+                    "encoded capture loop saw no fresh snapshot within 5s; exiting."
                 )
                 return
             last_snap = read_snapshot()
