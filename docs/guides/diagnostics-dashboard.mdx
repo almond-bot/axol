@@ -1,0 +1,24 @@
+---
+title: "Diagnostics Dashboard"
+description: "Live motor telemetry, health status, and diagnostics scripts in the browser."
+---
+
+The diagnostics dashboard lives alongside the [web control panel](https://docs.almond.bot/guides/control-panel) at `/diagnostics` — open [axol.almond.bot/diagnostics](https://axol.almond.bot/diagnostics) (or `https://<axol-host>:8001/diagnostics` on the LAN) while `axol serve` is running.
+
+## Motor status
+
+A tile per motor (8 per arm) shows its status code, temperature, bus voltage, and latest position, refreshed by the server's 1 Hz health ping. Clicking a tile opens the full `motor.info` readout — model, firmware, control mode, gains, and live readings — without launching a CLI session.
+
+## Live telemetry
+
+Position, velocity, and torque charts for all eight joints of the selected arm stream continuously at 10 Hz while the robot link is connected. The server keeps a 10-minute rolling buffer, so the charts backfill on page load; use the window (30s / 2m / 10m), arm, and pause controls above the charts.
+
+Telemetry is sampled by the idle robot link, which is the single owner of the CAN bus. While an operation or script owns the bus the stream pauses and the charts label the gap — history is kept, and streaming resumes as soon as the bus is released.
+
+## Diagnostics scripts
+
+The scripts section launches the diagnostics catalog — [`motor.info`](https://docs.almond.bot/cli/motor-info), [`motor.health`](https://docs.almond.bot/cli/motor-health), [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), and [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — plus the CAN bring-up commands [`can.setup`](https://docs.almond.bot/cli/can-setup) and [`can.enable`](https://docs.almond.bot/cli/can-enable), with the same configuration form and live log console as the control panel. Interactive prompts are replaced by countdowns when launched from the dashboard (`--no-prompt`).
+
+## Run history
+
+Every script launched from the dashboard is recorded as a *run*: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host). The ROM soak test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening the run charts that capture per arm.

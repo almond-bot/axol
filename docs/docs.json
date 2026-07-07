@@ -44,6 +44,7 @@
         "group": "Web Interfaces",
         "pages": [
           "guides/control-panel",
+          "guides/diagnostics-dashboard",
           "guides/vr-interface",
           "guides/quest-over-usb"
         ]
@@ -62,6 +63,10 @@
               "cli/can-driver",
               "cli/motor-info",
               "cli/motor-health",
+              "cli/diag-home",
+              "cli/diag-gripper",
+              "cli/diag-rom-enable",
+              "cli/diag-rom-disable",
               "cli/motor-set-can-id",
               "cli/motor-set-zero-pos",
               "cli/teleop",

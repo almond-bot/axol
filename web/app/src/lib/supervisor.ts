@@ -42,7 +42,7 @@ export interface CommandSpec {
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
-export const CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
+export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Cameras", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
@@ -89,8 +89,16 @@ export function serverHttpBase(host: string): string {
   }
 }
 
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   return `${apiBase}${path}`
+}
+
+/** WebSocket origin for the current server base (ws(s)://host[:port]). */
+export function wsBaseUrl(): string {
+  const base = apiBase || window.location.origin
+  const u = new URL(base)
+  const proto = u.protocol === "https:" ? "wss" : "ws"
+  return `${proto}://${u.host}`
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -584,10 +592,7 @@ export function parseImportedSettings(text: string): Record<string, FormValue> {
 // ---------------------------------------------------------------------------
 
 function wsUrl(id: string): string {
-  const base = apiBase || window.location.origin
-  const u = new URL(base)
-  const proto = u.protocol === "https:" ? "wss" : "ws"
-  return `${proto}://${u.host}/api/sessions/${id}/logs`
+  return `${wsBaseUrl()}/api/sessions/${id}/logs`
 }
 
 interface LogMessage {

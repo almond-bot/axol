@@ -1,0 +1,18 @@
+---
+title: "diag.rom-enable"
+description: "Range-of-motion soak test: sweep every joint for two hours."
+---
+
+Enables the motors, eases to home, then loops a full range-of-motion sweep of every joint for two hours. On a full-robot run it first prompts to clamp each gripper onto an item and holds it for the duration; when the soak finishes (or on Ctrl-C) the robot returns home with the item still gripped and the motors left enabled — run [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) afterwards to release it and power down.
+
+Joint positions and torques are captured to a CSV under `~/.almond/diagnostics/captures` at 5 Hz so the run can be charted in the [diagnostics dashboard](https://docs.almond.bot/guides/diagnostics-dashboard)'s run history.
+
+```bash
+axol diag.rom-enable
+axol diag.rom-enable --no-right                          # left arm only
+axol diag.rom-enable --joints wrist_1,wrist_2,wrist_3    # subset of joints
+axol diag.rom-enable --no-prompt                         # headless: countdown instead of Enter
+axol diag.rom-enable --no-capture                        # skip the telemetry CSV
+```
+
+`--no-prompt` replaces each interactive "Press Enter" gripper prompt with a 15 s countdown, which is how the web dashboard launches the test (sessions have no stdin).

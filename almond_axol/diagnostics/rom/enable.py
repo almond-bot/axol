@@ -24,7 +24,14 @@ range-of-motion sweeps for the selected joints; if the gripper is one of them it
 is cycled through its full open↔close range like any other joint (holding
 nothing, at the default gentle torque).
 
-Run:
+``--no-prompt`` replaces each interactive "Press Enter" gripper prompt with a
+fixed countdown, so the test can be launched unattended from the web control
+panel (which has no stdin). Joint positions and torques are captured to a CSV
+under ``~/.almond/diagnostics/captures`` for the diagnostics dashboard;
+``--no-capture`` disables that.
+
+Run via the CLI or directly:
+    axol diag.rom-enable
     uv run -m almond_axol.diagnostics.rom.enable
     uv run -m almond_axol.diagnostics.rom.enable --no-right
     uv run -m almond_axol.diagnostics.rom.enable --joints wrist_1,wrist_2,wrist_3
@@ -50,8 +57,13 @@ from ...robot.axol import (
     AxolArm,
 )
 from ...robot.config import AxolConfig
+from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
+
+# --no-prompt: seconds given to the operator to clamp the gripper by hand
+# before the run continues (no stdin available under the web control panel).
+NO_PROMPT_WAIT_S = 15.0
 
 AXOL_SPEED = 1.0  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
@@ -582,10 +594,21 @@ async def close_buses(robot: Axol) -> None:
     await asyncio.gather(*(bus.close() for bus in buses))
 
 
+async def _confirm(message: str, no_prompt: bool) -> None:
+    """Wait for Enter, or count down when running without a stdin."""
+    if no_prompt:
+        print(f"{message} — continuing in {NO_PROMPT_WAIT_S:.0f}s (--no-prompt)")
+        await asyncio.sleep(NO_PROMPT_WAIT_S)
+        return
+    await asyncio.to_thread(input, message)
+
+
 async def run_axol(
     present: set[Joint] = FULL_JOINT_SET,
     no_left: bool = False,
     no_right: bool = False,
+    no_prompt: bool = False,
+    capture: bool = True,
 ) -> None:
     run_left = not no_left
     run_right = not no_right
@@ -625,6 +648,10 @@ async def run_axol(
     await robot.enable()
     print("Motors enabled.")
     await asyncio.sleep(2.0)
+
+    logger = TelemetryCsvLogger(axol, "rom") if capture else None
+    if logger is not None:
+        logger.start()
 
     closed_left_q: np.ndarray | None = None
     closed_right_q: np.ndarray | None = None
@@ -667,16 +694,12 @@ async def run_axol(
         # joints instead (see module docstring).
         if grasp:
             if run_right:
-                await asyncio.to_thread(
-                    input, "Press Enter to close the RIGHT gripper ..."
-                )
+                await _confirm("Press Enter to close the RIGHT gripper ...", no_prompt)
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
                 )
             if run_left:
-                await asyncio.to_thread(
-                    input, "Press Enter to close the LEFT gripper ..."
-                )
+                await _confirm("Press Enter to close the LEFT gripper ...", no_prompt)
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
                 )
@@ -745,6 +768,8 @@ async def run_axol(
         keep_enabled = grasp
 
     finally:
+        if logger is not None:
+            await logger.stop()
         if keep_enabled:
             await close_buses(axol)
             print(
@@ -757,11 +782,8 @@ async def run_axol(
             print("Motors disabled.")
 
 
-def main() -> None:
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     valid_joints = [j.value for j in Joint]
-    parser = argparse.ArgumentParser(
-        description="Range of motion test for the Axol robot."
-    )
     parser.add_argument(
         "--joints",
         default=None,
@@ -770,14 +792,53 @@ def main() -> None:
     )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Replace the 'Press Enter' gripper prompts with a "
+        f"{NO_PROMPT_WAIT_S:.0f}s countdown (for headless / web-panel runs).",
+    )
+    parser.add_argument(
+        "--no-capture",
+        action="store_true",
+        help="Skip writing the telemetry CSV capture for the dashboard.",
+    )
 
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``diag.rom-enable`` subcommand."""
+    p = subparsers.add_parser(
+        "diag.rom-enable",
+        help="Range-of-motion soak test: sweep every joint for two hours.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=run_cli)
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    """Run the ROM soak from parsed arguments."""
     if args.no_left and args.no_right:
-        parser.error("Cannot skip both arms.")
-
+        raise SystemExit("Cannot skip both arms.")
     present = parse_joints(args.joints)
+    asyncio.run(
+        run_axol(
+            present=present,
+            no_left=args.no_left,
+            no_right=args.no_right,
+            no_prompt=args.no_prompt,
+            capture=not args.no_capture,
+        )
+    )
 
-    asyncio.run(run_axol(present=present, no_left=args.no_left, no_right=args.no_right))
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Range of motion test for the Axol robot."
+    )
+    _add_arguments(parser)
+    run_cli(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

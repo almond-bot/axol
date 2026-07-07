@@ -121,7 +121,9 @@ async def _disable(axol: Axol, present: set[Joint]) -> None:
         await asyncio.gather(*close_tasks)
 
 
-async def run(no_left: bool, no_right: bool, present: set[Joint]) -> None:
+async def run(
+    no_left: bool, no_right: bool, present: set[Joint], no_prompt: bool = False
+) -> None:
     """Open each present gripper sequentially, then disable the present motors."""
     kwargs = {}
     if no_left:
@@ -150,9 +152,14 @@ async def run(no_left: bool, no_right: bool, present: set[Joint]) -> None:
                 targets.append(("LEFT", axol.left))
 
             for side, arm in targets:
-                await asyncio.to_thread(
-                    input, f"Press Enter to open the {side} gripper ..."
-                )
+                message = f"Press Enter to open the {side} gripper ..."
+                if no_prompt:
+                    # No stdin under the web control panel: give the operator a
+                    # moment to get ready to catch the item, then open.
+                    print(f"{message} — opening in 10s (--no-prompt)")
+                    await asyncio.sleep(10.0)
+                else:
+                    await asyncio.to_thread(input, message)
                 await open_gripper(arm, side)
 
             print("\nGrippers open — item released.")
@@ -164,12 +171,8 @@ async def run(no_left: bool, no_right: bool, present: set[Joint]) -> None:
         print("Motors disabled.")
 
 
-def main() -> None:
-    """Parse CLI arguments and run the gripper release routine."""
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     valid_joints = [j.value for j in Joint]
-    parser = argparse.ArgumentParser(
-        description="Open the grippers from rom.enable and disable the robot."
-    )
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
@@ -178,14 +181,48 @@ def main() -> None:
         help="Comma-separated joints present on the bus (must match the rom.enable run). "
         f"Only these are talked to and disabled. Default: all. One of: {', '.join(valid_joints)}.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-prompt",
+        action="store_true",
+        help="Replace the 'Press Enter' prompts with a 10s countdown "
+        "(for headless / web-panel runs).",
+    )
 
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``diag.rom-disable`` subcommand."""
+    p = subparsers.add_parser(
+        "diag.rom-disable",
+        help="Open the grippers left clamped by the ROM test and power down.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=run_cli)
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    """Run the gripper release routine from parsed arguments."""
     if args.no_left and args.no_right:
-        parser.error("Cannot disable both arms.")
-
+        raise SystemExit("Cannot disable both arms.")
     present = parse_joints(args.joints)
+    asyncio.run(
+        run(
+            no_left=args.no_left,
+            no_right=args.no_right,
+            present=present,
+            no_prompt=args.no_prompt,
+        )
+    )
 
-    asyncio.run(run(no_left=args.no_left, no_right=args.no_right, present=present))
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and run the gripper release routine."""
+    parser = argparse.ArgumentParser(
+        description="Open the grippers from rom.enable and disable the robot."
+    )
+    _add_arguments(parser)
+    run_cli(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

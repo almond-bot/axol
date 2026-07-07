@@ -20,7 +20,7 @@ from typing import Any, Callable
 from .introspect import Schema, build_argparse_schema, build_schema
 
 # Display order for the catalog's category groups.
-CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
+CATEGORY_ORDER = ["Operate", "Diagnostics", "Cameras", "Calibrate", "Setup"]
 
 
 class CommandDef:
@@ -156,6 +156,68 @@ COMMANDS: dict[str, CommandDef] = {
         _run_policy,
         requires_hardware=True,
     ),
+    # -- Diagnostics ----------------------------------------------------------
+    "motor.info": CommandDef(
+        "motor.info",
+        "motor.info",
+        "Motor info",
+        "Read a motor's status to verify it is reachable at a CAN ID.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.motor.info"),
+        requires_hardware=True,
+    ),
+    "motor.health": CommandDef(
+        "motor.health",
+        "motor.health",
+        "Motor health",
+        "Probe all 16 motors and report which responded.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.motor.health"),
+        requires_hardware=True,
+    ),
+    "diag.home": CommandDef(
+        "diag.home",
+        "diag.home",
+        "Home arms",
+        "Enable the motors and smoothly bring every joint to zero.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.home"),
+        requires_hardware=True,
+    ),
+    "diag.gripper": CommandDef(
+        "diag.gripper",
+        "diag.gripper",
+        "Gripper check",
+        "Open then close the gripper on each arm.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.gripper"),
+        requires_hardware=True,
+    ),
+    "diag.rom-enable": CommandDef(
+        "diag.rom-enable",
+        "diag.rom-enable",
+        "ROM soak test",
+        "Sweep every joint through its full range of motion for two hours; "
+        "telemetry is captured for the dashboard.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.rom.enable"),
+        requires_hardware=True,
+    ),
+    "diag.rom-disable": CommandDef(
+        "diag.rom-disable",
+        "diag.rom-disable",
+        "ROM release",
+        "Open the grippers left clamped by the ROM test and power down.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.rom.disable"),
+        requires_hardware=True,
+    ),
     # -- Cameras ------------------------------------------------------------
     "zed.install": CommandDef(
         "zed.install",
@@ -216,26 +278,6 @@ COMMANDS: dict[str, CommandDef] = {
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.set_can_id"),
-        requires_hardware=True,
-    ),
-    "motor.info": CommandDef(
-        "motor.info",
-        "motor.info",
-        "Motor info",
-        "Read a motor's status to verify it is reachable at a CAN ID.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.motor.info"),
-        requires_hardware=True,
-    ),
-    "motor.health": CommandDef(
-        "motor.health",
-        "motor.health",
-        "Motor health",
-        "Probe all 16 motors and report which responded.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.motor.health"),
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------

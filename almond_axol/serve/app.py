@@ -23,6 +23,7 @@ from .commands import command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
+from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
 # The core operations run in-process via the OperationRunner.
@@ -30,6 +31,14 @@ _OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-d
 
 
 class RunRequest(BaseModel):
+    command: str
+    args: dict[str, Any] = {}
+
+
+class DiagnosticsRunRequest(BaseModel):
+    """Launch a catalog command as a *diagnostics run*: the session is wrapped
+    in a persisted run record with the telemetry observed while it ran."""
+
     command: str
     args: dict[str, Any] = {}
 
@@ -124,8 +133,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # build from an older release.
 
     manager = SessionManager()
-    robot = RobotLink()
+    hub = TelemetryHub()
+    robot = RobotLink(hub=hub)
     runner = OperationRunner(robot)
+    runs = DiagnosticsRunStore(hub)
 
     def _is_idle() -> bool:
         """Safe to restart: no operation running.
@@ -213,6 +224,96 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.post("/api/robot/disconnect")
     async def robot_disconnect() -> dict[str, Any]:
         return await asyncio.to_thread(robot.disconnect)
+
+    @app.get("/api/robot/motors/{arm}/{joint}")
+    async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
+        """One-motor full readout (the ``motor.info`` set) over the idle link."""
+        try:
+            details = await asyncio.to_thread(robot.motor_details, arm, joint)
+        except KeyError:
+            return JSONResponse({"error": "unknown motor"}, status_code=404)
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(details)
+
+    # -- motor telemetry (diagnostics dashboard) -----------------------------
+
+    @app.get("/api/telemetry")
+    async def telemetry_snapshot() -> dict[str, Any]:
+        """Link state + latest fast frame + latest slow sweep for every motor."""
+        return hub.snapshot()
+
+    @app.get("/api/telemetry/history")
+    async def telemetry_history(
+        seconds: float = 120.0, max_frames: int = 2000
+    ) -> dict[str, Any]:
+        """Buffered telemetry frames for chart backfill on page load."""
+        return {"frames": hub.history(seconds, max_frames)}
+
+    @app.websocket("/api/telemetry/ws")
+    async def telemetry_ws(ws: WebSocket) -> None:
+        """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        await ws.accept()
+        queue = hub.subscribe()
+        try:
+            await ws.send_json({"type": "hello", **hub.snapshot()})
+            while True:
+                await ws.send_json(await queue.get())
+        except WebSocketDisconnect:
+            pass
+        finally:
+            hub.unsubscribe(queue)
+
+    # -- diagnostics runs (script launches with telemetry capture) -----------
+
+    async def _watch_diagnostics_run(meta: dict[str, Any], session: Session) -> None:
+        """Wait for the session to end, then persist the run record."""
+        queue = manager.subscribe(session)
+        try:
+            while session.status in ("starting", "running", "stopping"):
+                try:
+                    line = await asyncio.wait_for(queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue  # re-check status: end-of-stream may have raced us
+                if line is None:
+                    break
+        finally:
+            manager.unsubscribe(session, queue)
+        await asyncio.to_thread(
+            runs.finalize, meta, session.status, session.exit_code, list(session.log)
+        )
+
+    @app.post("/api/diagnostics/run")
+    async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
+        try:
+            session = await manager.start(req.command, req.args)
+        except KeyError:
+            return JSONResponse(
+                {"error": f"unknown command: {req.command}"}, status_code=400
+            )
+        meta = runs.begin(session.id, req.command, req.args)
+        if session.status == "error":
+            await asyncio.to_thread(
+                runs.finalize,
+                meta,
+                session.status,
+                session.exit_code,
+                list(session.log),
+            )
+        else:
+            asyncio.create_task(_watch_diagnostics_run(meta, session))
+        return JSONResponse({"run": meta, "session": session.to_dict()})
+
+    @app.get("/api/diagnostics/runs")
+    async def diagnostics_runs() -> dict[str, Any]:
+        return {"runs": await asyncio.to_thread(runs.list)}
+
+    @app.get("/api/diagnostics/runs/{run_id}")
+    async def diagnostics_run_data(run_id: str) -> JSONResponse:
+        data = await asyncio.to_thread(runs.load, run_id)
+        if data is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        return JSONResponse(data)
 
     # -- local ZED cameras ---------------------------------------------------
 

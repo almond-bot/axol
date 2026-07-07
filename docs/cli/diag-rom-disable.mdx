@@ -1,0 +1,14 @@
+---
+title: "diag.rom-disable"
+description: "Open the grippers left clamped by the ROM test and power down."
+---
+
+Releases the item gripped by [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable) and disables the robot. Attaches to the already-enabled motors without recalibrating (a normal enable would force the grippers open and drop the item), opens each gripper one at a time so an operator can catch the item, then disables all motors.
+
+If the ROM test ran on a subset of joints (`--joints`), pass the same subset here so only those motors are addressed.
+
+```bash
+axol diag.rom-disable
+axol diag.rom-disable --joints wrist_1,wrist_2,wrist_3
+axol diag.rom-disable --no-prompt   # headless: 10 s countdown before each gripper opens
+```

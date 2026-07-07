@@ -74,19 +74,37 @@ async def _run(no_left: bool, no_right: bool) -> None:
     print("Done.")
 
 
-def main() -> None:
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--no-left", action="store_true", help="Skip left arm.")
+    parser.add_argument("--no-right", action="store_true", help="Skip right arm.")
+
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``diag.gripper`` subcommand."""
+    p = subparsers.add_parser(
+        "diag.gripper",
+        help="Open then close the gripper on each arm.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=run)
+
+
+def run(args: argparse.Namespace) -> None:
+    """Run the gripper open/close routine from parsed arguments."""
+    if args.no_left and args.no_right:
+        raise SystemExit("Cannot disable both arms.")
+    asyncio.run(_run(no_left=args.no_left, no_right=args.no_right))
+
+
+def main(argv: list[str] | None = None) -> None:
     """Parse CLI arguments and run the gripper open/close routine."""
     parser = argparse.ArgumentParser(
         description="Open then close the gripper on each arm."
     )
-    parser.add_argument("--no-left", action="store_true", help="Skip left arm.")
-    parser.add_argument("--no-right", action="store_true", help="Skip right arm.")
-    args = parser.parse_args()
-
-    if args.no_left and args.no_right:
-        parser.error("Cannot disable both arms.")
-
-    asyncio.run(_run(no_left=args.no_left, no_right=args.no_right))
+    _add_arguments(parser)
+    run(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

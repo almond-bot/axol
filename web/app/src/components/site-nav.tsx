@@ -14,9 +14,16 @@ import { cn } from "@/lib/utils"
 const PAGE_LABEL: Record<string, string> = {
   control: "Control Panel",
   vr: "VR",
+  diagnostics: "Diagnostics",
 }
 
-export function SiteNav({ current, right }: { current: "control" | "vr"; right?: ReactNode }) {
+export function SiteNav({
+  current,
+  right,
+}: {
+  current: "control" | "vr" | "diagnostics"
+  right?: ReactNode
+}) {
   return (
     <header className="sticky top-0 z-40 border-b border-white/10 bg-[#121212]/85 backdrop-blur-md">
       <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
@@ -40,6 +47,14 @@ export function SiteNav({ current, right }: { current: "control" | "vr"; right?:
           {current !== "control" && (
             <a href="/control" className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}>
               Control Panel
+            </a>
+          )}
+          {current !== "diagnostics" && (
+            <a
+              href="/diagnostics"
+              className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}
+            >
+              Diagnostics
             </a>
           )}
           {current !== "vr" && (
