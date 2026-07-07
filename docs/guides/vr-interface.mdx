@@ -88,8 +88,8 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
-| 5 | X | **Reset** pose; cancels a recording countdown; stops and discards an in-progress take |
-| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take — **data collection only** (no effect during plain teleop) |
+| 5 | X | **Reset** pose; cancels a recording countdown. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
+| 6 | A | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording. **Data collection only** (no effect during plain teleop) |
 | 7 | Y | **Exit** the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose and jerking on the next entry |
 | — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes |
 
@@ -104,12 +104,22 @@ In **teleop** mode the headset stays in `Teleop` with the recording controls ine
 ```
 DataCollection ──[A]──► (3s countdown) ──► Recording
       ▲                                          │
-      │                                     [A or X]
+      │                             [A]=save · [X]=discard
+      │                            (arms a confirm popup — press
+      │                             the same button again to commit)
       │                                          │
-      └──────────── Saving ◄────────────── (server push)
+      ├──────── Saving ◄──(server push)◄─── [A→A] save
+      │                                          │
+      └────────────────────────────────── [X→X] discard
 ```
 
 During the countdown the state sent to the server stays `DataCollection`; it becomes `Recording` once the countdown completes.
+
+Stopping a recording is **confirmation-gated**: the first **A** (save) or **X** (discard) press while recording arms an in-headset **Save episode?** / **Discard episode?** popup instead of stopping immediately — pressing the **same** button confirms, the **other** cancels and keeps recording. Nothing is committed server-side until you confirm a save; confirming a discard drops the take (via the reset flag) so you can re-record.
+
+<Note>
+  During data collection the HUD also shows an **Episode N** readout (top-right, under the recording status) so you can see which episode you're about to record. The server announces it on connect — a headset joining mid-session shows the right number immediately — and it's hidden in plain teleop. See the [VR server API](/api/vr) for the `episode` feedback message.
+</Note>
 
 **Saving** and **Error** are *server-driven*. When recording stops, the SDK pushes `{"type": "state", "value": "saving"}` and blocks every control except **Y** (exit) until the episode is written, then pushes `data_collection` to re-enable controls. Broadcasting `error` shows an error indicator in the headset. See [`almond_axol.vr`](/api/vr) for the frame protocol and `send_feedback_state()`.
 
