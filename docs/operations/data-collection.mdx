@@ -78,8 +78,8 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
-| 5 | X | **Reset** to rest pose. During a recording, stops and **discards** the take; during the start countdown, cancels it |
-| 6 | A | **Record**: start a take (3-second countdown), or stop and **save** the current take |
+| 5 | X | **Reset** to rest pose; during the start countdown, cancels it. During a recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
+| 6 | A | **Record**: start a take (3-second countdown). During a recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording |
 | 7 | Y | **Exit** the VR session |
 | — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes; see [Camera views](/guides/vr-interface#camera-views) |
 
@@ -99,12 +99,16 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
   </Step>
 
   <Step title="Finish the take">
-    - Press **A** to stop and **save** the episode.
-    - Press **X** to stop and **discard** it (re-record).
+    Stopping is **confirmation-gated** — the first press arms an in-headset popup instead of stopping immediately, so a fumbled button never loses a take:
 
-    While the episode is written to disk the headset enters the **Saving** state and every control except **Y** (exit) is blocked. When the write completes the headset returns to Data Collection and the arms move back to the rest pose, ready for the next take.
+    - Press **A** to arm **Save episode?** — press **A** again to save, or **X** to cancel and keep recording.
+    - Press **X** to arm **Discard episode?** — press **X** again to discard and re-record, or **A** to cancel and keep recording.
+
+    Nothing is committed until you confirm. After you confirm a **save**, the headset enters the **Saving** state and every control except **Y** (exit) is blocked while the episode is written to disk; when the write completes the headset returns to Data Collection and the arms move back to the rest pose, ready for the next take. Confirming a **discard** drops the take and rewinds to re-record it.
   </Step>
 </Steps>
+
+The HUD shows an **Episode N** readout (top-right) with the 1-based number of the episode you're about to record, so you always know where you are in the dataset.
 
 | Headset state | Meaning |
 |---|---|
