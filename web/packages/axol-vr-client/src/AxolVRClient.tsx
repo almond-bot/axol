@@ -96,6 +96,17 @@ export function AxolVRClient({
     const currentWs = wsRef.current
     if (currentWs !== wsWithHandlerRef.current) {
       wsWithHandlerRef.current = currentWs
+      // A new (or dropped) connection invalidates the previous session's
+      // episode number: the HUD readout only advances on a server `episode`
+      // message, and plain teleop never sends one, so without this a prior
+      // collect-data session's number would linger (even into a later teleop
+      // session). Clear it here; a reconnecting collect-data session re-announces
+      // the current episode on connect and repopulates it moments later.
+      // Reset to the -1 "handled" sentinel (dropping any pending value) since we
+      // notify here directly — the frame's apply block is gated behind an active
+      // XR session, but a reconnect commonly happens outside one.
+      serverEpisodeRef.current = -1
+      onEpisode?.(null)
       if (currentWs) {
         currentWs.onmessage = (event: MessageEvent) => {
           try {
