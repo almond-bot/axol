@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { Loader2, Play, Square, Timer, X } from "lucide-react"
+import { ArrowRight, Hand, Loader2, Play, Square, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { CuratedForm } from "@/components/config-form"
@@ -14,36 +14,42 @@ import {
 import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetry"
 
 // Flags handled by the dashboard itself, never shown in the dialog:
-// - no_prompt: sessions have no stdin, so the countdown mode is forced on.
+// - web_prompts: forced on so hands-on steps drive a Continue button.
 // - no_capture: dashboard runs always keep the telemetry capture for history.
-const HIDDEN_FLAGS = new Set(["no_prompt", "no_capture"])
+const HIDDEN_FLAGS = new Set(["web_prompts", "no_capture"])
 
 /**
  * Diagnostics as app actions: a card per test — click it, set parameters in a
- * dialog, hit Run. Progress feedback is the card's running state + the latest
- * output line (hands-on countdowns show there); results land in run history.
+ * dialog, hit Run. Progress feedback is the card's running state + latest
+ * output line; hands-on steps surface a Continue button; results land in run
+ * history.
  */
 export function DiagnosticActions({
   commands,
   activeCommand,
   activeSince,
   activeLine,
+  pendingPrompt,
   busy,
   disabled,
   onLaunch,
   onStop,
+  onContinue,
 }: {
   commands: CommandSpec[]
   /** Command id of the run in flight (any diagnostics launch), if one is. */
   activeCommand: string | null
   /** Epoch seconds the active run started, for the elapsed readout. */
   activeSince: number | null
-  /** Latest output line of the active run (countdowns, progress). */
+  /** Latest output line of the active run (progress context). */
   activeLine: string | null
+  /** Instruction for a hands-on step waiting on the operator, if any. */
+  pendingPrompt: string | null
   busy: boolean
   disabled: boolean
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
+  onContinue: () => void
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
   const open = useMemo(() => commands.find((c) => c.id === openId) ?? null, [commands, openId])
@@ -52,36 +58,58 @@ export function DiagnosticActions({
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
       {commands.map((cmd) => {
         const running = activeCommand === cmd.id
+        const prompt = running ? pendingPrompt : null
         return (
-          <button
+          <div
             key={cmd.id}
-            type="button"
-            onClick={() => setOpenId(cmd.id)}
             className={cn(
-              "flex flex-col gap-2 rounded-xl border p-4 text-left transition-all",
-              running
-                ? "border-emerald-400/40 bg-emerald-400/[0.06]"
-                : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
+              "flex flex-col gap-2 rounded-xl border p-4 transition-all",
+              prompt
+                ? "border-amber-400/50 bg-amber-400/[0.06]"
+                : running
+                  ? "border-emerald-400/40 bg-emerald-400/[0.06]"
+                  : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
             )}
           >
-            <div className="flex items-center gap-2">
-              <span className="text-sm font-semibold text-white/90">{cmd.label}</span>
-              {running && (
-                <span className="ml-auto flex items-center gap-1.5 text-xs text-emerald-300">
-                  <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
-                  <Elapsed since={activeSince} />
+            <button
+              type="button"
+              onClick={() => setOpenId(cmd.id)}
+              className="flex flex-col gap-2 text-left"
+            >
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-white/90">{cmd.label}</span>
+                {running && (
+                  <span className="ml-auto flex items-center gap-1.5 text-xs text-emerald-300">
+                    <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+                    <Elapsed since={activeSince} />
+                  </span>
+                )}
+              </div>
+              <span className="line-clamp-2 text-xs leading-relaxed text-white/40">
+                {cmd.description}
+              </span>
+              {running && activeLine && !prompt && (
+                <span className="truncate font-mono text-[0.7rem] text-emerald-200/70">
+                  {activeLine}
                 </span>
               )}
-            </div>
-            <span className="line-clamp-2 text-xs leading-relaxed text-white/40">
-              {cmd.description}
-            </span>
-            {running && activeLine && (
-              <span className="truncate font-mono text-[0.7rem] text-emerald-200/70">
-                {activeLine}
-              </span>
+            </button>
+            {prompt && (
+              <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-2.5">
+                <span className="flex items-start gap-1.5 text-xs leading-relaxed text-amber-100/90">
+                  <Hand className="mt-0.5 size-3.5 shrink-0 text-amber-300" />
+                  {prompt}
+                </span>
+                <Button
+                  size="sm"
+                  className="self-start bg-amber-400 text-black hover:bg-amber-300"
+                  onClick={onContinue}
+                >
+                  Continue <ArrowRight />
+                </Button>
+              </div>
             )}
-          </button>
+          </div>
         )
       })}
       {open && (
@@ -227,7 +255,7 @@ function ActionDialog({
     () => allFields.filter((f) => !HIDDEN_FLAGS.has(f.key) && f.key !== "joints"),
     [allFields]
   )
-  const hasNoPrompt = allFields.some((f) => f.key === "no_prompt")
+  const hasWebPrompts = allFields.some((f) => f.key === "web_prompts")
 
   function setOverride(key: string, value: FormValue | null) {
     setOverrides((prev) => {
@@ -244,7 +272,7 @@ function ActionDialog({
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
-    if (hasNoPrompt) args.no_prompt = true
+    if (hasWebPrompts) args.web_prompts = true
     onLaunch(args)
   }
 
@@ -304,12 +332,12 @@ function ActionDialog({
           />
         )}
 
-        {hasNoPrompt && (
+        {hasWebPrompts && (
           <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
-            <Timer className="mt-0.5 size-3.5 shrink-0 text-white/35" />
-            Hands-on steps don't wait for a key press from the dashboard: each one counts
-            down on the running card instead (e.g. ~15s to clamp or catch the item) and
-            then continues on its own.
+            <Hand className="mt-0.5 size-3.5 shrink-0 text-white/35" />
+            Hands-on steps (like clamping an item in the gripper) pause the run and show a
+            Continue button on the card — the test waits for you, then proceeds when you
+            click it.
           </p>
         )}
 

@@ -78,6 +78,15 @@ class EpisodeRequest(BaseModel):
     command: str
 
 
+class SessionInputRequest(BaseModel):
+    """A line written to a session's stdin (answers an interactive prompt).
+
+    Empty ``line`` (the default) sends a bare newline — i.e. "press Enter".
+    """
+
+    line: str = ""
+
+
 # Ports the launched commands expose on the serve host.
 _VIEWER_PORT = 8002  # viser sim 3D viewer
 _VR_PORT = ports.VR_PORT  # VR teleop WebSocket server (shared with the adb tunnel)
@@ -306,7 +315,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         await asyncio.to_thread(robot.release)
         try:
-            session = await manager.start(req.command, req.args)
+            # A writable stdin lets the UI answer the diagnostic's hands-on
+            # prompts (the ROM tests' "Continue" button) via /input below.
+            session = await manager.start(req.command, req.args, stdin_pipe=True)
         except Exception:
             await asyncio.to_thread(robot.reacquire)
             raise
@@ -454,6 +465,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": "unknown session"}, status_code=404)
         session = manager.get(session_id)
         return JSONResponse(session.to_dict() if session else {"ok": True})
+
+    @app.post("/api/sessions/{session_id}/input")
+    async def session_input(session_id: str, req: SessionInputRequest) -> JSONResponse:
+        """Answer a session's interactive prompt (the diagnostics Continue button)."""
+        session, _owner = _find_session(session_id)
+        if session is None:
+            return JSONResponse({"error": "unknown session"}, status_code=404)
+        ok = await session.send_input(req.line)
+        if not ok:
+            return JSONResponse(
+                {"error": "session is not accepting input"}, status_code=409
+            )
+        return JSONResponse({"ok": True})
 
     @app.get("/api/sessions/{session_id}/log")
     async def get_log(session_id: str, offset: int = 0) -> JSONResponse:

@@ -19,7 +19,7 @@ Telemetry is sampled by the idle robot link, which is the single owner of the CA
 
 Each diagnostic — [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — is a card: click it, set parameters in the dialog, and hit Run. The ROM tests expose a joint checkbox picker so you can soak a subset (e.g. just the wrist joints). The card shows the running state, elapsed time, and the latest output line; completion lands as a notification, and the full log is kept with the run in the history below. Launching hands the CAN bus over to the diagnostic for the duration of the run.
 
-Hands-on steps — like clamping an item in the ROM grasp test — can't wait for a key press from the browser (a launched diagnostic has no stdin), so each one counts down on the running card instead (e.g. ~15 s to clamp or catch the item) and then continues on its own; the card's status line shows which step is counting down. (The `motor.info` / `motor.health` read set needs no action here — the motor cards above show it live.)
+Hands-on steps — like clamping an item in the ROM grasp test — pause the run and surface a **Continue** button on the card with the instruction (e.g. "Position the item in the RIGHT gripper, then close it."). The test waits for you and proceeds when you click, so nothing moves until you're ready. Under the hood the diagnostic prints a `[prompt]` marker and blocks on stdin; the button writes a line back to it. (The `motor.info` / `motor.health` read set needs no action here — the motor cards above show it live.)
 
 ## Run history
 

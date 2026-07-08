@@ -18,6 +18,7 @@ import {
   fetchCommands,
   fetchRobotStatus,
   robotConnect,
+  sendSessionInput,
   setServerBase,
   stopSession,
   useSessionLogs,
@@ -97,11 +98,24 @@ export default function Diagnostics() {
   const { lines: activeLines, status: activeStatus } = useSessionLogs(
     activeRun?.session.id ?? null
   )
-  // Latest meaningful output line, surfaced on the running action card so
-  // hands-on countdowns ("close the RIGHT gripper … continuing in 15s") are
-  // visible without a log console.
+  // Hands-on steps (the ROM tests' gripper prompts) print a "[prompt] …"
+  // marker and then block on stdin; the run's Continue button answers them.
+  // Prompts are strictly ordered, so the pending one is the (answered+1)th.
+  const prompts = useMemo(
+    () =>
+      activeLines
+        .filter((l) => l.startsWith("[prompt] "))
+        .map((l) => l.slice("[prompt] ".length).trim()),
+    [activeLines]
+  )
+  const [answered, setAnswered] = useState(0)
+  const pendingPrompt = answered < prompts.length ? prompts[answered] : null
+  // Latest meaningful output line, surfaced on the running action card as
+  // secondary progress context.
   const activeLine =
-    [...activeLines].reverse().find((l) => l.trim() && !l.startsWith("[serve]")) ?? null
+    [...activeLines]
+      .reverse()
+      .find((l) => l.trim() && !l.startsWith("[serve]") && !l.startsWith("[prompt] ")) ?? null
 
   const stream = useTelemetryStream(serverOk)
 
@@ -184,6 +198,7 @@ export default function Diagnostics() {
       setLaunchBusy(true)
       try {
         const { run, session } = await startDiagnosticsRun(command, args)
+        setAnswered(0)
         setActiveRun({ command, session })
         setRuns((prev) => [run, ...prev])
       } catch (e) {
@@ -194,6 +209,20 @@ export default function Diagnostics() {
     },
     [toast]
   )
+
+  const continuePrompt = useCallback(async () => {
+    if (!activeRun) return
+    // Optimistically advance so the button hides until the next prompt marker
+    // arrives — this also guards against a double-click sending two newlines
+    // (which would skip the following prompt).
+    setAnswered((n) => n + 1)
+    try {
+      await sendSessionInput(activeRun.session.id)
+    } catch (e) {
+      setAnswered((n) => Math.max(0, n - 1))
+      toast.error(String(e))
+    }
+  }, [activeRun, toast])
 
   const stopActive = useCallback(async () => {
     if (!activeRun) return
@@ -460,10 +489,12 @@ export default function Diagnostics() {
             activeCommand={activeRun?.command ?? null}
             activeSince={activeRun?.session.startedAt ?? null}
             activeLine={activeLine}
+            pendingPrompt={pendingPrompt}
             busy={launchBusy}
             disabled={!serverOk}
             onLaunch={launch}
             onStop={stopActive}
+            onContinue={continuePrompt}
           />
         </section>
 

@@ -10,5 +10,7 @@ If the ROM test ran on a subset of joints (`--joints`), pass the same subset her
 ```bash
 axol diag.rom-disable
 axol diag.rom-disable --joints wrist_1,wrist_2,wrist_3
-axol diag.rom-disable --no-prompt   # headless: 10 s countdown before each gripper opens
+axol diag.rom-disable --web-prompts   # dashboard-driven "Continue" before each gripper opens
 ```
+
+By default each gripper-open step is an interactive `input()` prompt; `--web-prompts` makes it a `[prompt] …` marker the dashboard turns into a **Continue** button (set automatically from the dashboard).

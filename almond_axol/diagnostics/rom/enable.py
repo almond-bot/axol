@@ -24,10 +24,12 @@ range-of-motion sweeps for the selected joints; if the gripper is one of them it
 is cycled through its full open↔close range like any other joint (holding
 nothing, at the default gentle torque).
 
-``--no-prompt`` replaces each interactive "Press Enter" gripper prompt with a
-fixed countdown, so the test can be launched unattended from the web control
-panel (which has no stdin). Joint positions and torques are captured to a CSV
-under ``~/.almond/diagnostics/captures`` for the diagnostics dashboard;
+``--web-prompts`` makes each hands-on gripper step emit a ``[prompt] ...``
+marker on stdout and then block on stdin, so the web dashboard can turn the
+step into a Continue button (it writes a line to the process when the operator
+clicks). Without it the steps use ordinary ``input()`` tty prompts. Joint
+positions and torques are captured to a CSV under
+``~/.almond/diagnostics/captures`` for the diagnostics dashboard;
 ``--no-capture`` disables that.
 
 Run via the CLI or directly:
@@ -40,6 +42,7 @@ Run via the CLI or directly:
 import argparse
 import asyncio
 import math
+import sys
 import time
 
 import numpy as np
@@ -61,9 +64,9 @@ from ..telemetry_log import TelemetryCsvLogger
 
 CONTROL_RATE_HZ = 100.0  # Hz
 
-# --no-prompt: seconds given to the operator to clamp the gripper by hand
-# before the run continues (no stdin available under the web control panel).
-NO_PROMPT_WAIT_S = 15.0
+# Marker prefix a --web-prompts step prints before blocking on stdin. The web
+# dashboard watches the log for this and turns it into a Continue button.
+PROMPT_MARKER = "[prompt]"
 
 AXOL_SPEED = 1.0  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
@@ -594,20 +597,26 @@ async def close_buses(robot: Axol) -> None:
     await asyncio.gather(*(bus.close() for bus in buses))
 
 
-async def _confirm(message: str, no_prompt: bool) -> None:
-    """Wait for Enter, or count down when running without a stdin."""
-    if no_prompt:
-        print(f"{message} — continuing in {NO_PROMPT_WAIT_S:.0f}s (--no-prompt)")
-        await asyncio.sleep(NO_PROMPT_WAIT_S)
+async def _confirm(instruction: str, web_prompts: bool) -> None:
+    """Block until the operator confirms a hands-on step.
+
+    ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
+    Continue button, then block until it writes a line to our stdin. Otherwise
+    fall back to an ordinary tty ``input()`` prompt. A closed stdin (EOF, e.g.
+    the run is being stopped) unblocks and returns so teardown can proceed.
+    """
+    if web_prompts:
+        print(f"{PROMPT_MARKER} {instruction}", flush=True)
+        await asyncio.to_thread(sys.stdin.readline)
         return
-    await asyncio.to_thread(input, message)
+    await asyncio.to_thread(input, f"{instruction} Press Enter to continue ...")
 
 
 async def run_axol(
     present: set[Joint] = FULL_JOINT_SET,
     no_left: bool = False,
     no_right: bool = False,
-    no_prompt: bool = False,
+    web_prompts: bool = False,
     capture: bool = True,
 ) -> None:
     run_left = not no_left
@@ -694,12 +703,18 @@ async def run_axol(
         # joints instead (see module docstring).
         if grasp:
             if run_right:
-                await _confirm("Press Enter to close the RIGHT gripper ...", no_prompt)
+                await _confirm(
+                    "Position the item in the RIGHT gripper, then close it.",
+                    web_prompts,
+                )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
                 )
             if run_left:
-                await _confirm("Press Enter to close the LEFT gripper ...", no_prompt)
+                await _confirm(
+                    "Position the item in the LEFT gripper, then close it.",
+                    web_prompts,
+                )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
                 )
@@ -793,10 +808,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
-        "--no-prompt",
+        "--web-prompts",
         action="store_true",
-        help="Replace the 'Press Enter' gripper prompts with a "
-        f"{NO_PROMPT_WAIT_S:.0f}s countdown (for headless / web-panel runs).",
+        help="Emit '[prompt] ...' markers and block on stdin for hands-on "
+        "gripper steps, so the web dashboard can drive them with a Continue "
+        "button (set automatically by the dashboard).",
     )
     parser.add_argument(
         "--no-capture",
@@ -827,7 +843,7 @@ def run_cli(args: argparse.Namespace) -> None:
             present=present,
             no_left=args.no_left,
             no_right=args.no_right,
-            no_prompt=args.no_prompt,
+            web_prompts=args.web_prompts,
             capture=not args.no_capture,
         )
     )

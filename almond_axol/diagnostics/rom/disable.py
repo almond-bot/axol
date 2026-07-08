@@ -27,11 +27,16 @@ Run (right after rom.enable, while the motors are still enabled):
 import argparse
 import asyncio
 import math
+import sys
 import time
 
 from ...constants import Joint
 from ...motor import ControlMode
 from ...robot.axol import GRIPPER_TRAVEL, Axol, AxolArm
+
+# Marker prefix a --web-prompts step prints before blocking on stdin, matching
+# rom.enable; the dashboard turns it into a Continue button.
+PROMPT_MARKER = "[prompt]"
 
 RATE_HZ = 100.0  # Hz
 OPEN_SPEED = 0.2 * 2 * math.pi  # rad/s — gradual, so the operator can catch the item
@@ -122,7 +127,7 @@ async def _disable(axol: Axol, present: set[Joint]) -> None:
 
 
 async def run(
-    no_left: bool, no_right: bool, present: set[Joint], no_prompt: bool = False
+    no_left: bool, no_right: bool, present: set[Joint], web_prompts: bool = False
 ) -> None:
     """Open each present gripper sequentially, then disable the present motors."""
     kwargs = {}
@@ -152,14 +157,18 @@ async def run(
                 targets.append(("LEFT", axol.left))
 
             for side, arm in targets:
-                message = f"Press Enter to open the {side} gripper ..."
-                if no_prompt:
-                    # No stdin under the web control panel: give the operator a
-                    # moment to get ready to catch the item, then open.
-                    print(f"{message} — opening in 10s (--no-prompt)")
-                    await asyncio.sleep(10.0)
+                instruction = (
+                    f"Get ready to catch the item, then open the {side} gripper."
+                )
+                if web_prompts:
+                    # The dashboard turns this marker into a Continue button and
+                    # writes a line to our stdin when the operator clicks.
+                    print(f"{PROMPT_MARKER} {instruction}", flush=True)
+                    await asyncio.to_thread(sys.stdin.readline)
                 else:
-                    await asyncio.to_thread(input, message)
+                    await asyncio.to_thread(
+                        input, f"{instruction} Press Enter to continue ..."
+                    )
                 await open_gripper(arm, side)
 
             print("\nGrippers open — item released.")
@@ -182,10 +191,11 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
         f"Only these are talked to and disabled. Default: all. One of: {', '.join(valid_joints)}.",
     )
     parser.add_argument(
-        "--no-prompt",
+        "--web-prompts",
         action="store_true",
-        help="Replace the 'Press Enter' prompts with a 10s countdown "
-        "(for headless / web-panel runs).",
+        help="Emit '[prompt] ...' markers and block on stdin for the "
+        "gripper-open steps, so the web dashboard can drive them with a "
+        "Continue button (set automatically by the dashboard).",
     )
 
 
@@ -211,7 +221,7 @@ def run_cli(args: argparse.Namespace) -> None:
             no_left=args.no_left,
             no_right=args.no_right,
             present=present,
-            no_prompt=args.no_prompt,
+            web_prompts=args.web_prompts,
         )
     )
 

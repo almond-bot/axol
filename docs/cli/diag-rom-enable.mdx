@@ -11,8 +11,8 @@ Joint positions and torques are captured to a CSV under `~/.almond/diagnostics/c
 axol diag.rom-enable
 axol diag.rom-enable --no-right                          # left arm only
 axol diag.rom-enable --joints wrist_1,wrist_2,wrist_3    # subset of joints
-axol diag.rom-enable --no-prompt                         # headless: countdown instead of Enter
+axol diag.rom-enable --web-prompts                       # dashboard-driven prompts
 axol diag.rom-enable --no-capture                        # skip the telemetry CSV
 ```
 
-`--no-prompt` replaces each interactive "Press Enter" gripper prompt with a 15 s countdown, which is how the web dashboard launches the test (sessions have no stdin).
+By default each hands-on gripper step is an interactive `input()` prompt on the terminal. `--web-prompts` instead emits a `[prompt] …` marker and blocks on stdin, so the web dashboard can turn the step into a **Continue** button (it's set automatically when launched from the dashboard).

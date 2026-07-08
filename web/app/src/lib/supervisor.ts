@@ -359,6 +359,17 @@ export async function stopSession(id: string): Promise<SessionInfo> {
   return json(await fetch(apiUrl(`/api/sessions/${id}/stop`), { method: "POST" }))
 }
 
+/** Answer a session's interactive prompt (empty line = a bare "Enter"). */
+export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl(`/api/sessions/${id}/input`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ line }),
+    })
+  )
+}
+
 export function cameraCount(spec: CameraSpec): number {
   return Object.values(spec.serials).filter((s) => s.trim()).length
 }
