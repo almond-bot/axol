@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react"
-import { Download, Loader2, Plug, RotateCcw, Upload } from "lucide-react"
+import { Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
 import {
   OPERATIONS,
   filterSchema,
@@ -25,7 +25,7 @@ import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/components/ui/toast"
 import { Card } from "@/components/ui/card"
-import { ConfigForm } from "@/components/config-form"
+import { FieldRow, FlatSchemaForm } from "@/components/config-form"
 import { materializeCameraSpec } from "@/lib/camera-spec"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
@@ -571,25 +571,75 @@ function AdvancedPanel({
     return filterSchema(spec.schema, exclude)
   }, [spec, schema, op, meta])
 
+  // Top-level sections of the selected op's config, as flat sub-tabs: root
+  // fields group under "General", each nested config gets its own tab. No
+  // collapsed trees to dig through — a tab's fields are all visible at once.
+  const sections = useMemo(() => {
+    const rootFields = visibleSchema.filter((n) => n.kind === "field")
+    const out: { key: string; label: string; nodes: typeof visibleSchema }[] = []
+    if (rootFields.length > 0) out.push({ key: "__general", label: "General", nodes: rootFields })
+    for (const n of visibleSchema) {
+      if (n.kind === "group") out.push({ key: n.key, label: n.label, nodes: n.children })
+    }
+    return out
+  }, [visibleSchema])
+  const [sectionKey, setSectionKey] = useState<string | null>(null)
+  const section = sections.find((s) => s.key === sectionKey) ?? sections[0]
+
+  const [query, setQuery] = useState("")
+  const q = query.trim().toLowerCase()
+  const matches = useMemo(
+    () =>
+      q
+        ? flattenFields(visibleSchema).filter(
+            (f) => f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q)
+          )
+        : null,
+    [q, visibleSchema]
+  )
+
   const overrides = overridesByOp[op] ?? {}
   const editedCount = Object.keys(overrides).length
+  const common = {
+    overrides,
+    disabled: false,
+    onChange: (key: string, value: FormValue) => onChange(op, { ...overrides, [key]: value }),
+    onReset: (key: string) => {
+      const next = { ...overrides }
+      delete next[key]
+      onChange(op, next)
+    },
+  }
 
   return (
-    <div className="flex max-w-xl flex-col gap-4">
+    <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
         Rarely-needed per-operation overrides for anything not covered by the other tabs. Values set
         here apply on top of the shared settings every time the operation runs.
       </p>
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
         <Select
           value={op}
-          onChange={(e) => setOp(e.target.value as OperationId)}
+          onChange={(e) => {
+            setOp(e.target.value as OperationId)
+            setSectionKey(null)
+            setQuery("")
+          }}
           className="max-w-56"
         >
           {OPERATIONS.map((o) => (
             <SelectOption key={o.id} value={o.id} label={o.label} />
           ))}
         </Select>
+        <div className="relative min-w-48 flex-1">
+          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-white/30" />
+          <Input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search all config…"
+            className="pl-9"
+          />
+        </div>
         {editedCount > 0 && (
           <span className="rounded-full bg-[#eff483]/15 px-2 py-0.5 font-mono text-[0.65rem] text-[#eff483]">
             {editedCount} edited
@@ -598,18 +648,37 @@ function AdvancedPanel({
       </div>
       {!spec ? (
         <p className="text-sm text-white/40">This operation isn&apos;t available on the host.</p>
+      ) : matches ? (
+        <div className="flex max-w-xl flex-col gap-4">
+          {matches.length === 0 ? (
+            <p className="text-sm text-white/35">No matching config.</p>
+          ) : (
+            matches.map((f) => <FieldRow key={f.key} field={f} showPath {...common} />)
+          )}
+        </div>
       ) : (
-        <ConfigForm
-          schema={visibleSchema}
-          overrides={overrides}
-          disabled={false}
-          onChange={(key, value) => onChange(op, { ...overrides, [key]: value })}
-          onReset={(key) => {
-            const next = { ...overrides }
-            delete next[key]
-            onChange(op, next)
-          }}
-        />
+        <>
+          {sections.length > 1 && (
+            <div className="flex flex-wrap gap-1">
+              {sections.map((s) => (
+                <button
+                  key={s.key}
+                  type="button"
+                  onClick={() => setSectionKey(s.key)}
+                  className={cn(
+                    "rounded-md px-2.5 py-1 text-xs capitalize whitespace-nowrap transition-colors",
+                    s.key === section?.key
+                      ? "bg-white/[0.08] text-white"
+                      : "text-white/55 hover:bg-white/[0.04] hover:text-white/80"
+                  )}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          )}
+          {section && <FlatSchemaForm nodes={section.nodes} {...common} />}
+        </>
       )}
     </div>
   )

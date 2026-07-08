@@ -1,6 +1,7 @@
 import { useState } from "react"
-import { Loader2, RotateCw } from "lucide-react"
+import { CameraOff, Loader2, RotateCw } from "lucide-react"
 import {
+  apiUrl,
   restartCameraDaemon,
   RESOLUTION_OFF,
   type BranchSel,
@@ -14,6 +15,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectOption } from "@/components/ui/select"
 import { useToast } from "@/components/ui/toast"
 import { eyesLeft, eyesRight, selEnabled, selEyes } from "@/lib/camera-spec"
+import { cn } from "@/lib/utils"
 
 type BranchMap = Partial<Record<CameraSlot, BranchSel>>
 
@@ -58,7 +60,15 @@ export function CamerasPanel({
   onRefresh: () => void
 }) {
   const [restarting, setRestarting] = useState(false)
+  // Cache-buster for the per-camera preview frames; bumped by Refresh so the
+  // operator can grab fresh frames after moving a camera.
+  const [previewNonce, setPreviewNonce] = useState(0)
   const toast = useToast()
+
+  function refresh() {
+    onRefresh()
+    setPreviewNonce((n) => n + 1)
+  }
 
   const serials = spec.serials
   const streamResolution = spec.stream_resolution || spec.resolution || "SVGA"
@@ -71,7 +81,7 @@ export function CamerasPanel({
     try {
       const result = await restartCameraDaemon()
       if (result.error) toast.error(result.error)
-      else onRefresh()
+      else refresh()
     } catch (e) {
       toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
@@ -112,12 +122,6 @@ export function CamerasPanel({
     onChange({ ...spec, [key]: { ...map, [slot]: next } })
   }
 
-  const assigned = new Set(
-    Object.values(serials)
-      .map((s) => s.trim())
-      .filter(Boolean)
-  )
-
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
@@ -133,9 +137,9 @@ export function CamerasPanel({
             <Button
               variant="ghost"
               size="sm"
-              onClick={onRefresh}
+              onClick={refresh}
               disabled={detecting || restarting}
-              title="Re-query the ZED daemon's current device list. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
+              title="Re-query the ZED daemon's current device list and grab fresh preview frames. The daemon only scans the GMSL links at startup, so plugging/unplugging a camera won't show here until you restart the daemon."
             >
               {detecting ? <Loader2 className="animate-spin" /> : <RotateCw />}
               Refresh
@@ -160,21 +164,31 @@ export function CamerasPanel({
             plugged in after boot.
           </p>
         ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {devices.map((d) => (
-              <span
-                key={d.serial}
-                className={
-                  "rounded-md border px-2 py-1 font-mono text-xs " +
-                  (assigned.has(String(d.serial))
-                    ? "border-[#eff483]/40 bg-[#eff483]/10 text-[#eff483]"
-                    : "border-white/15 bg-white/[0.03] text-white/65")
-                }
-                title={`${d.model} (${d.kind})`}
-              >
-                {d.serial}
-              </span>
-            ))}
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {devices.map((d) => {
+              const slot = CAMERA_SLOTS.find(({ key }) => serials[key].trim() === String(d.serial))
+              return (
+                <div
+                  key={d.serial}
+                  className={cn(
+                    "flex flex-col gap-2 rounded-lg border p-2",
+                    slot
+                      ? "border-[#eff483]/35 bg-[#eff483]/[0.05]"
+                      : "border-white/10 bg-white/[0.02]"
+                  )}
+                >
+                  <CameraPreview serial={d.serial} nonce={previewNonce} className="aspect-video" />
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 px-0.5">
+                    <span className="font-mono text-xs text-white/85">{d.serial}</span>
+                    <KindBadge kind={d.kind} />
+                    <span className="text-[11px] text-white/45">{humanModel(d.model)}</span>
+                    {slot && (
+                      <span className="ml-auto text-[11px] text-[#eff483]">→ {slot.label}</span>
+                    )}
+                  </div>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
@@ -205,20 +219,16 @@ export function CamerasPanel({
           return (
             <div key={slot.key} className="flex flex-col gap-2">
               <div className="flex items-center justify-between gap-4">
-                <div className="flex items-center gap-2">
-                  <Label className="text-white/70">{slot.label}</Label>
-                  {kind && (
-                    <span
-                      className="rounded border border-white/15 bg-white/[0.03] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-white/45"
-                      title={
-                        stereo
-                          ? "Stereo ZED X (both eyes from one grab) — detected automatically"
-                          : "Mono ZED-X One — detected automatically"
-                      }
-                    >
-                      {kind}
-                    </span>
+                <div className="flex min-w-0 items-center gap-2.5">
+                  {assignedSlot && kind && (
+                    <CameraPreview
+                      serial={Number(serials[slot.key].trim())}
+                      nonce={previewNonce}
+                      className="h-10 w-16 shrink-0"
+                    />
                   )}
+                  <Label className="text-white/70">{slot.label}</Label>
+                  {kind && <KindBadge kind={kind} />}
                 </div>
                 <Input
                   value={serials[slot.key]}
@@ -257,6 +267,81 @@ export function CamerasPanel({
           )
         })}
       </div>
+    </div>
+  )
+}
+
+/** SDK model strings arrive like "MODEL.ZED_XONE_GS" — humanize for display. */
+function humanModel(model: string): string {
+  return (
+    model
+      .replace(/^MODEL\.?/i, "")
+      .replace(/_/g, " ")
+      .trim() || model
+  )
+}
+
+function KindBadge({ kind }: { kind: string }) {
+  return (
+    <span
+      className="rounded border border-white/15 bg-white/[0.03] px-1.5 py-0.5 text-[10px] tracking-wide text-white/55 uppercase"
+      title={
+        kind === "stereo"
+          ? "Stereo ZED X (both eyes from one grab) — detected automatically"
+          : "Mono ZED-X One — detected automatically"
+      }
+    >
+      {kind}
+    </span>
+  )
+}
+
+/**
+ * A live frame from one camera (GET /api/cameras/preview/<serial>), so the
+ * operator can see which physical camera a serial belongs to. Best-effort: a
+ * busy host (operation running) or capture failure shows a quiet placeholder.
+ */
+function CameraPreview({
+  serial,
+  nonce,
+  className,
+}: {
+  serial: number
+  nonce: number
+  className?: string
+}) {
+  const [state, setState] = useState<"loading" | "ok" | "error">("loading")
+  const [loadedKey, setLoadedKey] = useState("")
+  const key = `${serial}:${nonce}`
+  if (key !== loadedKey) {
+    setLoadedKey(key)
+    setState("loading")
+  }
+  return (
+    <div
+      className={cn(
+        "relative overflow-hidden rounded-md border border-white/10 bg-black/40",
+        className
+      )}
+    >
+      {state !== "error" && (
+        <img
+          src={apiUrl(`/api/cameras/preview/${serial}?v=${nonce}`)}
+          alt={`Camera ${serial} preview`}
+          className="size-full object-cover"
+          onLoad={() => setState("ok")}
+          onError={() => setState("error")}
+        />
+      )}
+      {state !== "ok" && (
+        <div className="absolute inset-0 flex items-center justify-center">
+          {state === "loading" ? (
+            <Loader2 className="size-4 animate-spin text-white/25" />
+          ) : (
+            <CameraOff className="size-4 text-white/20" />
+          )}
+        </div>
+      )}
     </div>
   )
 }

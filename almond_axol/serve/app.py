@@ -14,7 +14,7 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from ..constants import URDF_PATH
@@ -395,6 +395,41 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def cameras_detect() -> dict[str, Any]:
         """List locally connected ZED cameras (serial, model, mono/stereo)."""
         return await asyncio.to_thread(_detect_cameras)
+
+    @app.get("/api/cameras/preview/{serial}", response_model=None)
+    async def camera_preview(serial: int) -> Response | JSONResponse:
+        """One live JPEG frame from a connected ZED, so operators can tell
+        which physical camera a serial belongs to. Cameras are exclusive:
+        refused while an operation may be using them."""
+        if runner.is_running():
+            return JSONResponse(
+                {"error": "cannot preview cameras while an operation is running"},
+                status_code=409,
+            )
+
+        def _capture() -> bytes:
+            from ..zed.snapshot import snapshot_jpeg
+
+            return snapshot_jpeg(serial)
+
+        try:
+            data = await asyncio.to_thread(_capture)
+        except ImportError:
+            return JSONResponse(
+                {"error": "pyzed is not installed — run `axol zed.install` first"},
+                status_code=503,
+            )
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except Exception as exc:  # noqa: BLE001 - surface capture errors to the UI
+            return JSONResponse(
+                {"error": f"{type(exc).__name__}: {exc}"}, status_code=502
+            )
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/api/cameras/restart-daemon")
     async def cameras_restart_daemon() -> JSONResponse:

@@ -76,7 +76,7 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. |
-| **Advanced** | The full per-operation config tree (searchable) for anything not covered above — per-joint gains, IK weights, VR server ports, … |
+| **Advanced** | Every remaining per-operation field — per-joint gains, IK weights, VR server ports, … — flattened into plain sections (pick the operation, then a section like *axol* or *kinematics*), with a search box across all of it. Nothing is hidden behind collapsed groups. |
 
 Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
 
@@ -84,7 +84,7 @@ Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in yo
 
 Data collection and policy inference also need the ZED cameras attached to the host — they're assigned in the **Cameras** settings tab.
 
-The Cameras tab **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). Press **Refresh** to re-query the daemon's current device list, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
+The Cameras tab **detects the cameras** plugged into the host and shows one card per camera: its serial, its type (**stereo** ZED X / **mono** ZED-X One — detected automatically, never flagged manually), the model, and a **live preview frame**, so you can tell at a glance which physical camera each serial belongs to. Assign each one to its slot (overhead / left arm / right arm) — an assigned slot repeats the camera's preview thumbnail next to its name. Press **Refresh** to re-query the daemon's device list and grab fresh preview frames, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. (Previews are unavailable while an operation is running, since it owns the cameras.)
 
 The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
 

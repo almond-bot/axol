@@ -1,9 +1,8 @@
-import { useMemo, useRef, useState } from "react"
+import { useRef, useState } from "react"
 import { createPortal } from "react-dom"
-import { ChevronRight, Info, RotateCcw, Search } from "lucide-react"
+import { Info, RotateCcw } from "lucide-react"
 import {
   defaultString,
-  flattenFields,
   isModified,
   type FormValue,
   type SchemaField,
@@ -12,7 +11,6 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { cn } from "@/lib/utils"
 
 interface CommonProps {
   overrides: Record<string, FormValue>
@@ -21,72 +19,9 @@ interface CommonProps {
   onReset: (key: string) => void
 }
 
-export function ConfigForm({ schema, ...common }: CommonProps & { schema: SchemaNode[] }) {
-  const [query, setQuery] = useState("")
-  const allFields = useMemo(() => flattenFields(schema), [schema])
-
-  const required = allFields.filter((f) => f.required)
-  const rootFields = schema.filter((n): n is SchemaField => n.kind === "field" && !n.required)
-  const groups = schema.filter((n) => n.kind === "group")
-
-  const q = query.trim().toLowerCase()
-  const matches = q
-    ? allFields.filter((f) => f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q))
-    : null
-
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="relative">
-        <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-white/30" />
-        <Input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search all config…"
-          className="pl-9"
-        />
-      </div>
-
-      {matches ? (
-        <div className="flex flex-col gap-4">
-          {matches.length === 0 ? (
-            <p className="text-sm text-white/35">No matching config.</p>
-          ) : (
-            matches.map((f) => <FieldRow key={f.key} field={f} showPath {...common} />)
-          )}
-        </div>
-      ) : (
-        <>
-          {required.length > 0 && (
-            <div className="flex flex-col gap-4 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
-              <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
-                Required
-              </span>
-              {required.map((f) => (
-                <FieldRow key={f.key} field={f} {...common} />
-              ))}
-            </div>
-          )}
-
-          {rootFields.length > 0 && (
-            <div className="flex flex-col gap-4">
-              {rootFields.map((f) => (
-                <FieldRow key={f.key} field={f} {...common} />
-              ))}
-            </div>
-          )}
-
-          {groups.map((g) => (
-            <GroupSection key={g.key} group={g} depth={0} {...common} />
-          ))}
-        </>
-      )}
-    </div>
-  )
-}
-
 /**
  * Renders a curated, flat list of fields (a hand-picked subset of an op's
- * full schema) — used by the purpose-built operation panels.
+ * full schema) — used by the operation panels and the diagnostics actions.
  */
 export function CuratedForm({ fields, ...common }: CommonProps & { fields: SchemaField[] }) {
   if (fields.length === 0) {
@@ -101,62 +36,42 @@ export function CuratedForm({ fields, ...common }: CommonProps & { fields: Schem
   )
 }
 
-function GroupSection({
-  group,
-  depth,
+/**
+ * A config subtree rendered flat: every field visible (no collapsed groups to
+ * dig through), nested groups become plain section headings ("left › elbow")
+ * with their fields in a compact grid. Used by the settings Advanced tab.
+ */
+export function FlatSchemaForm({
+  nodes,
+  path = [],
   ...common
-}: CommonProps & { group: Extract<SchemaNode, { kind: "group" }>; depth: number }) {
-  const [open, setOpen] = useState(false)
-
-  const leaves = useMemo(() => flattenFields(group.children), [group])
-  const modifiedCount = leaves.filter((f) => isModified(f, common.overrides[f.key])).length
-
-  const fields = group.children.filter((n): n is SchemaField => n.kind === "field")
-  const subgroups = group.children.filter((n) => n.kind === "group")
-
+}: CommonProps & { nodes: SchemaNode[]; path?: string[] }) {
+  const fields = nodes.filter((n): n is SchemaField => n.kind === "field")
+  const groups = nodes.filter((n) => n.kind === "group")
   return (
-    <div
-      className={cn(
-        "rounded-lg border border-white/10",
-        depth === 0 ? "bg-white/[0.02]" : "bg-transparent"
-      )}
-    >
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
-      >
-        <ChevronRight
-          className={cn("size-4 shrink-0 text-white/40 transition-transform", open && "rotate-90")}
-        />
-        <span className="text-sm font-medium capitalize">{group.label}</span>
-        <span className="text-xs text-white/30">{leaves.length}</span>
-        {modifiedCount > 0 && (
-          <span className="ml-auto rounded-full bg-[#eff483]/15 px-2 py-0.5 font-mono text-[0.65rem] text-[#eff483]">
-            {modifiedCount} edited
-          </span>
-        )}
-      </button>
-      {open && (
-        <div className="flex flex-col gap-4 border-t border-white/10 p-3">
-          {fields.map((f) => (
-            <FieldRow key={f.key} field={f} {...common} />
-          ))}
-          {subgroups.map((sg) => (
-            <GroupSection
-              key={sg.key}
-              group={sg as Extract<SchemaNode, { kind: "group" }>}
-              depth={depth + 1}
-              {...common}
-            />
-          ))}
+    <div className="flex flex-col gap-4">
+      {fields.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {path.length > 0 && (
+            <span className="border-b border-white/10 pb-1 font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
+              {path.join(" › ")}
+            </span>
+          )}
+          <div className="grid gap-x-6 gap-y-3 sm:grid-cols-2">
+            {fields.map((f) => (
+              <FieldRow key={f.key} field={f} {...common} />
+            ))}
+          </div>
         </div>
       )}
+      {groups.map((g) => (
+        <FlatSchemaForm key={g.key} nodes={g.children} path={[...path, g.label]} {...common} />
+      ))}
     </div>
   )
 }
 
-function FieldRow({
+export function FieldRow({
   field,
   showPath,
   overrides,
