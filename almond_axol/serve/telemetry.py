@@ -204,14 +204,35 @@ class DiagnosticsRunStore:
             _logger.warning("failed to persist diagnostics run: %s", exc)
 
     def clear(self) -> int:
-        """Delete every persisted run record; returns how many were removed."""
+        """Delete every persisted run record and its telemetry capture.
+
+        Returns the number of run records (``*.meta.json``) removed. A run's
+        ROM-style CSV capture lives outside the runs dir (see
+        :class:`~almond_axol.diagnostics.telemetry_log.TelemetryCsvLogger`), so
+        it's deleted here too — otherwise Clear would leave orphaned capture
+        files with no dashboard path to remove them.
+        """
         if not self._dir.is_dir():
             return 0
+        # Delete referenced CSV captures first, before the metas that name them.
+        for meta_path in self._dir.glob("*.meta.json"):
+            try:
+                csv_path = json.loads(meta_path.read_text()).get("telemetryCsv")
+            except (OSError, ValueError):
+                continue
+            if csv_path:
+                try:
+                    Path(csv_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    _logger.warning("failed to delete capture %s: %s", csv_path, exc)
+
         removed = 0
         for path in self._dir.glob("*.json"):
+            is_meta = path.name.endswith(".meta.json")
             try:
                 path.unlink()
-                removed += 1
+                if is_meta:
+                    removed += 1
             except OSError as exc:
                 _logger.warning("failed to delete run record %s: %s", path, exc)
         return removed

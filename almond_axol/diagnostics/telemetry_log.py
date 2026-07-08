@@ -9,8 +9,11 @@ with a ``[telemetry] csv=<path>`` log line that the serve-side run store picks
 up when the session ends (see :mod:`almond_axol.serve.telemetry`).
 
 CSV columns: ``t`` (epoch seconds) then ``<arm>:<JOINT>:pos`` and
-``<arm>:<JOINT>:tq`` for every joint of every present arm. Velocity is not
-cached by the motor layer, so it is not captured here.
+``<arm>:<JOINT>:tq`` for every joint of every present arm. Positions are raw
+shaft radians (matching the live dashboard sampler); a cell is left empty for
+any motor with no cached reading yet, so a ``--joints`` subset run still
+captures the joints it actually drives. Velocity is not cached by the motor
+layer, so it is not captured here.
 """
 
 from __future__ import annotations
@@ -96,18 +99,23 @@ class TelemetryCsvLogger:
         while True:
             row: list[str | float] = [round(time.time(), 3)]
             wrote_any = False
+            # Sample per motor from its own cache rather than the arm-wide
+            # AxolArm.positions/torques, which raise if *any* joint on the arm
+            # is uncached — that would drop every row of a --joints subset run.
             for _side, arm in self._arms():
-                try:
-                    positions = arm.positions
-                    torques = arm.torques
-                except MotorError:
-                    # No cached data yet (or a subset run) — leave cells empty.
-                    row.extend([""] * (2 * len(Joint)))
-                    continue
-                for i in range(len(Joint)):
-                    row.append(round(float(positions[i]), 5))
-                    row.append(round(float(torques[i]), 4))
-                wrote_any = True
+                for joint in Joint:
+                    motor = arm.motors[joint]
+                    if motor.has_position:
+                        row.append(round(float(motor.position), 5))
+                        wrote_any = True
+                    else:
+                        row.append("")
+                    try:
+                        row.append(round(float(motor.torque), 4))
+                    except MotorError:
+                        # Torque cache can lag position (or never populate for
+                        # an idle joint); position alone still makes a row.
+                        row.append("")
             if wrote_any:
                 writer.writerow(row)
                 rows += 1
