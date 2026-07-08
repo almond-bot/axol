@@ -4,7 +4,12 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { LogConsole } from "@/components/log-console"
-import { TelemetryChart, type ChartSeries } from "@/components/diagnostics/telemetry-chart"
+import { JointFilter } from "@/components/diagnostics/joint-filter"
+import {
+  TelemetryChart,
+  type ChartSeries,
+  type ChartView,
+} from "@/components/diagnostics/telemetry-chart"
 import { cn } from "@/lib/utils"
 import {
   JOINTS,
@@ -15,6 +20,7 @@ import {
   type ArmSide,
   type DiagnosticsRunData,
   type DiagnosticsRunMeta,
+  type JointName,
 } from "@/lib/telemetry"
 
 function fmtWhen(t: number): string {
@@ -29,7 +35,10 @@ function fmtDuration(meta: DiagnosticsRunMeta): string {
   return m < 90 ? `${m}m ${s % 60}s` : `${Math.floor(m / 60)}h ${m % 60}m`
 }
 
-function runBadge(meta: DiagnosticsRunMeta): { variant: "success" | "destructive" | "neutral"; text: string } {
+function runBadge(meta: DiagnosticsRunMeta): {
+  variant: "success" | "destructive" | "neutral"
+  text: string
+} {
   if (meta.status === "running") return { variant: "neutral", text: "running" }
   if (meta.status === "error" || (meta.exitCode ?? 0) !== 0)
     return { variant: "destructive", text: `failed (${meta.exitCode ?? "?"})` }
@@ -37,9 +46,10 @@ function runBadge(meta: DiagnosticsRunMeta): { variant: "success" | "destructive
 }
 
 /**
- * Past diagnostics runs (ROM test, motor health, …) with their captured
- * telemetry re-charted. Captures record position + torque (velocity is not
- * cached by the motor layer during a script's own control loop).
+ * Past diagnostics runs (ROM test, homing, …) with their captured telemetry
+ * re-charted — same joint filter and zoom/pan as the live charts. Captures
+ * record position + torque (velocity is not cached by the motor layer during
+ * a script's own control loop).
  */
 export function RunHistory({
   runs,
@@ -115,6 +125,8 @@ function RunDetail({ id }: { id: string }) {
     error?: string
   } | null>(null)
   const [arm, setArm] = useState<ArmSide>("left")
+  const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
+  const [view, setView] = useState<ChartView | null>(null)
   const [showLog, setShowLog] = useState(false)
 
   useEffect(() => {
@@ -149,13 +161,21 @@ function RunDetail({ id }: { id: string }) {
   const effectiveArm = arms.includes(arm) ? arm : (arms[0] ?? "left")
   const series: ChartSeries[] = useMemo(
     () =>
-      JOINTS.map((joint) => ({
+      JOINTS.filter((j) => !hiddenJoints.has(j)).map((joint) => ({
         key: motorKey(effectiveArm, joint),
         label: jointLabel(joint),
         color: JOINT_COLORS[joint],
       })),
-    [effectiveArm]
+    [effectiveArm, hiddenJoints]
   )
+
+  // Default view fits the whole capture; zoom/pan pins a sub-range.
+  const fitView = useMemo<ChartView | null>(() => {
+    const frames = data?.frames ?? []
+    if (frames.length === 0) return null
+    return { t0: frames[0].t, t1: frames[frames.length - 1].t }
+  }, [data])
+  const effectiveView = view ?? fitView
 
   if (error) return <p className="px-8 pb-3 text-sm text-red-300">{error}</p>
   if (!data)
@@ -165,23 +185,42 @@ function RunDetail({ id }: { id: string }) {
       </div>
     )
 
-  const hasFrames = data.frames.length > 0
+  const hasFrames = data.frames.length > 0 && effectiveView != null
 
   return (
     <div className="flex flex-col gap-3 px-1 pt-1 pb-3 sm:px-8">
-      {hasFrames && arms.length > 1 && (
-        <div className="flex gap-1">
-          {arms.map((a) => (
+      {hasFrames && (
+        <div className="flex flex-wrap items-center gap-2">
+          {arms.length > 1 && (
+            <div className="flex overflow-hidden rounded-md border border-white/10">
+              {arms.map((a) => (
+                <button
+                  key={a}
+                  type="button"
+                  onClick={() => setArm(a)}
+                  className={cn(
+                    "px-2.5 py-1 text-xs capitalize transition-colors",
+                    effectiveArm === a
+                      ? "bg-[#eff483]/15 text-[#eff483]"
+                      : "text-white/50 hover:bg-white/[0.05]"
+                  )}
+                >
+                  {a} arm
+                </button>
+              ))}
+            </div>
+          )}
+          <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} />
+          {view != null && (
             <Button
-              key={a}
-              variant={a === effectiveArm ? "secondary" : "ghost"}
+              variant="ghost"
               size="sm"
-              onClick={() => setArm(a)}
-              className="capitalize"
+              className="text-white/50"
+              onClick={() => setView(null)}
             >
-              {a} arm
+              Reset zoom
             </Button>
-          ))}
+          )}
         </div>
       )}
       {hasFrames ? (
@@ -193,8 +232,8 @@ function RunDetail({ id }: { id: string }) {
             frames={data.frames}
             version={0}
             metric={0}
-            windowSec={null}
-            live={false}
+            view={effectiveView}
+            onViewChange={setView}
           />
           <TelemetryChart
             title="Torque"
@@ -203,8 +242,8 @@ function RunDetail({ id }: { id: string }) {
             frames={data.frames}
             version={0}
             metric={2}
-            windowSec={null}
-            live={false}
+            view={effectiveView}
+            onViewChange={setView}
           />
         </div>
       ) : (

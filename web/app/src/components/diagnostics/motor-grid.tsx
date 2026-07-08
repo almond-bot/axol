@@ -50,10 +50,22 @@ function fmt(v: number | null | undefined, digits: number, suffix: string): stri
   return v == null ? "–" : `${v.toFixed(digits)}${suffix}`
 }
 
+function Stat({ label, value, className }: { label: string; value: string; className?: string }) {
+  return (
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <span className="text-[0.65rem] tracking-wide text-white/35 uppercase">{label}</span>
+      <span className={cn("truncate font-mono text-sm text-white/85 tabular-nums", className)}>
+        {value}
+      </span>
+    </div>
+  )
+}
+
 /**
- * Per-motor status tiles for one arm: status (icon + label), temperature and
- * bus voltage from the 1 Hz health ping. A tile opens the full `motor.info`
- * readout (model, firmware, mode, gains) fetched over the idle link.
+ * Per-motor status tiles for one arm: status (icon + label) plus labeled
+ * temperature / bus voltage / position stats. A tile opens the full
+ * `motor.info` readout (model, firmware, mode, gains) fetched over the idle
+ * link.
  */
 export function MotorGrid({
   arm,
@@ -74,7 +86,7 @@ export function MotorGrid({
   const latestFrame = frames.length > 0 ? frames[frames.length - 1] : null
 
   return (
-    <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
       {JOINTS.map((joint) => {
         const key = motorKey(arm, joint)
         const reading = slow[key]
@@ -90,36 +102,36 @@ export function MotorGrid({
             onClick={() => setInspecting(joint)}
             title={canInspect ? "Motor details" : undefined}
             className={cn(
-              "flex flex-col gap-1 rounded-lg border border-white/10 bg-white/[0.02] p-2.5 text-left transition-colors",
+              "flex flex-col gap-3 rounded-xl border border-white/10 bg-white/[0.02] p-4 text-left transition-colors",
               canInspect && "hover:border-white/25 hover:bg-white/[0.05]"
             )}
           >
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-2">
               <span
-                className="inline-block size-2 shrink-0 rounded-full"
+                className="inline-block size-2.5 shrink-0 rounded-full"
                 style={{ background: JOINT_COLORS[joint] }}
               />
-              <span className="truncate text-xs font-medium text-white/85 capitalize">
+              <span className="truncate text-sm font-semibold text-white/90 capitalize">
                 {jointLabel(joint)}
               </span>
-            </div>
-            <div className={cn("flex items-center gap-1 text-xs", Meta.className)}>
-              <Meta.icon className="size-3.5 shrink-0" />
-              <span className="truncate font-mono text-[0.65rem] tracking-wide">
-                {reading?.status ?? (kind === "error" ? "UNREACHABLE" : "—")}
+              <span className={cn("ml-auto flex items-center gap-1 text-xs", Meta.className)}>
+                <Meta.icon className="size-4 shrink-0" />
+                <span className="font-mono text-[0.7rem] tracking-wide">
+                  {reading?.status ?? (kind === "error" ? "UNREACHABLE" : "—")}
+                </span>
               </span>
             </div>
-            <div className="flex items-baseline gap-2 font-mono text-[0.65rem] text-white/45 tabular-nums">
-              <span
+            <div className="grid grid-cols-3 gap-2">
+              <Stat
+                label="Temp"
+                value={fmt(temp, 0, "°C")}
                 className={cn(
                   temp != null && temp >= TEMP_HOT_C && "text-red-300",
                   temp != null && temp >= TEMP_WARN_C && temp < TEMP_HOT_C && "text-amber-300"
                 )}
-              >
-                {fmt(temp, 0, "°C")}
-              </span>
-              <span>{fmt(reading?.voltage, 1, "V")}</span>
-              <span className="ml-auto">{fmt(pos, 2, "")}</span>
+              />
+              <Stat label="Bus" value={fmt(reading?.voltage, 1, "V")} />
+              <Stat label="Pos (rad)" value={fmt(pos, 2, "")} />
             </div>
           </button>
         )

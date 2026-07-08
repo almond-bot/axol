@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
-from .commands import command_specs
+from .commands import COMMANDS, command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
@@ -267,7 +267,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
     async def _watch_diagnostics_run(meta: dict[str, Any], session: Session) -> None:
-        """Wait for the session to end, then persist the run record."""
+        """Wait for the session to end, persist the run, and return the bus."""
         queue = manager.subscribe(session)
         try:
             while session.status in ("starting", "running", "stopping"):
@@ -279,20 +279,40 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     break
         finally:
             manager.unsubscribe(session, queue)
+            await asyncio.to_thread(robot.reacquire)
         await asyncio.to_thread(
             runs.finalize, meta, session.status, session.exit_code, list(session.log)
         )
 
     @app.post("/api/diagnostics/run")
     async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
-        try:
-            session = await manager.start(req.command, req.args)
-        except KeyError:
+        # Diagnostics commands open the CAN bus (or reconfigure its interfaces)
+        # themselves, so the launch does the same single-owner dance as the
+        # in-process operations: refuse while something else owns the bus, and
+        # hand the idle link's buses over for the duration of the run.
+        if runner.is_running():
+            return JSONResponse(
+                {"error": "an operation is running — stop it first"}, status_code=409
+            )
+        if any(s["status"] in ("starting", "running") for s in manager.list()):
+            return JSONResponse(
+                {"error": "another session is running — stop it first"},
+                status_code=409,
+            )
+        if req.command not in COMMANDS:
             return JSONResponse(
                 {"error": f"unknown command: {req.command}"}, status_code=400
             )
+
+        await asyncio.to_thread(robot.release)
+        try:
+            session = await manager.start(req.command, req.args)
+        except Exception:
+            await asyncio.to_thread(robot.reacquire)
+            raise
         meta = runs.begin(session.id, req.command, req.args)
         if session.status == "error":
+            await asyncio.to_thread(robot.reacquire)
             await asyncio.to_thread(
                 runs.finalize,
                 meta,

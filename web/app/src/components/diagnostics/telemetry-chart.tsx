@@ -10,6 +10,12 @@ export interface ChartSeries {
   color: string
 }
 
+/** Visible time range (epoch seconds). Charts sharing a view stay in sync. */
+export interface ChartView {
+  t0: number
+  t1: number
+}
+
 interface TelemetryChartProps {
   title: string
   unit: string
@@ -20,10 +26,9 @@ interface TelemetryChartProps {
   version: number
   /** Index into the fast sample: 0 = position, 1 = velocity, 2 = torque. */
   metric: number
-  /** Visible window in seconds; null fits the whole buffer (run viewer). */
-  windowSec: number | null
-  /** Live charts anchor the window to now; static ones to the last frame. */
-  live: boolean
+  view: ChartView
+  /** Called on wheel-zoom / drag-pan; the parent owns the view. */
+  onViewChange?: (view: ChartView) => void
   /** Why the stream is quiet (shown as an in-plot notice), if it is. */
   quietReason?: string | null
   className?: string
@@ -39,12 +44,13 @@ const PAD = { top: 12, right: 12, bottom: 26, left: 48 }
 // task, server restart) instead of drawing a false bridge across it.
 const GAP_BREAK_S = 1.5
 const MAX_POINTS_PER_SERIES = 1500
+// Zoom limits (visible span, seconds).
+const MIN_SPAN_S = 3
+const MAX_SPAN_S = 3600
 
 interface Extracted {
   /** Per series, [t, value] pairs within the window (strided). */
   points: [number, number][][]
-  t0: number
-  t1: number
   min: number
   max: number
 }
@@ -53,16 +59,14 @@ function extract(
   frames: TelemetryFrame[],
   series: ChartSeries[],
   metric: number,
-  windowSec: number | null,
-  live: boolean
+  view: ChartView
 ): Extracted | null {
-  if (frames.length === 0) return null
-  const tEnd = live ? Date.now() / 1000 : frames[frames.length - 1].t
-  const t1 = tEnd
-  const t0 = windowSec == null ? frames[0].t : t1 - windowSec
+  if (frames.length === 0 || series.length === 0) return null
   let lo = 0
-  while (lo < frames.length && frames[lo].t < t0) lo++
-  const visible = frames.slice(lo)
+  while (lo < frames.length && frames[lo].t < view.t0) lo++
+  let hi = frames.length
+  while (hi > lo && frames[hi - 1].t > view.t1) hi--
+  const visible = frames.slice(lo, hi)
   if (visible.length === 0) return null
   const stride = Math.max(1, Math.ceil(visible.length / MAX_POINTS_PER_SERIES))
 
@@ -86,7 +90,7 @@ function extract(
     max += 0.5
   }
   const pad = (max - min) * 0.08
-  return { points, t0, t1, min: min - pad, max: max + pad }
+  return { points, min: min - pad, max: max + pad }
 }
 
 /** ~n clean tick values across [min, max]. */
@@ -116,9 +120,10 @@ function fmtClock(t: number): string {
 }
 
 /**
- * Streaming multi-series line chart on canvas: 2px round-joined lines, hairline
- * solid grid, crosshair + all-series tooltip (pointer or ←/→ on keyboard
- * focus), and a persistent legend with live per-series values under the plot.
+ * Interactive multi-series line chart on canvas: 2px round-joined lines,
+ * hairline solid grid, crosshair + all-series tooltip (pointer or ←/→ on
+ * keyboard focus), wheel-zoom and drag-pan on the time axis, and a persistent
+ * legend with live per-series values under the plot.
  */
 export function TelemetryChart({
   title,
@@ -127,8 +132,8 @@ export function TelemetryChart({
   frames,
   version,
   metric,
-  windowSec,
-  live,
+  view,
+  onViewChange,
   quietReason,
   className,
 }: TelemetryChartProps) {
@@ -137,6 +142,7 @@ export function TelemetryChart({
   const [size, setSize] = useState({ w: 0, h: 220 })
   // Hovered/focused time (seconds); null hides the crosshair.
   const [hoverT, setHoverT] = useState<number | null>(null)
+  const drag = useRef<{ x: number; view: ChartView; moved: boolean } | null>(null)
 
   useEffect(() => {
     const el = wrapRef.current
@@ -149,36 +155,74 @@ export function TelemetryChart({
   }, [])
 
   const data = useMemo(
-    () => extract(frames, series, metric, windowSec, live),
+    () => extract(frames, series, metric, view),
     // The live buffer is mutated in place (stable identity) — `version` is its
     // change signal; static charts pass a fresh `frames` array instead.
     // eslint-disable-next-line react-hooks/exhaustive-deps -- version is the buffer's change signal
-    [frames, version, series, metric, windowSec, live]
+    [frames, version, series, metric, view]
   )
+
+  const plotW = size.w - PAD.left - PAD.right
+
+  /** Clamp a candidate view to the data extent (with a little slack). */
+  const clampView = useCallback(
+    (t0: number, t1: number): ChartView => {
+      const span = Math.min(Math.max(t1 - t0, MIN_SPAN_S), MAX_SPAN_S)
+      const dataMin = frames.length > 0 ? frames[0].t : t0
+      const dataMax = Math.max(
+        frames.length > 0 ? frames[frames.length - 1].t : t1,
+        Date.now() / 1000
+      )
+      let start = t0
+      if (start + span > dataMax) start = dataMax - span
+      if (start < dataMin - span * 0.5) start = dataMin - span * 0.5
+      return { t0: start, t1: start + span }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- version is the buffer's change signal
+    [frames, version]
+  )
+
+  // Wheel-zoom needs preventDefault, so the listener must be non-passive.
+  useEffect(() => {
+    const el = wrapRef.current
+    if (!el || !onViewChange) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const frac = Math.min(
+        1,
+        Math.max(0, (e.clientX - rect.left - PAD.left) / (rect.width - PAD.left - PAD.right))
+      )
+      const span = view.t1 - view.t0
+      const newSpan = Math.min(Math.max(span * Math.exp(e.deltaY * 0.0015), MIN_SPAN_S), MAX_SPAN_S)
+      const anchor = view.t0 + frac * span
+      onViewChange(clampView(anchor - frac * newSpan, anchor + (1 - frac) * newSpan))
+    }
+    el.addEventListener("wheel", onWheel, { passive: false })
+    return () => el.removeEventListener("wheel", onWheel)
+  }, [onViewChange, view, clampView])
 
   // Values shown in the tooltip + the frame the crosshair snaps to.
   const hover = useMemo(() => {
     if (hoverT == null || !data) return null
-    let best: { t: number; values: (number | null)[] } | null = null
+    let snapT: number | null = null
     let bestDist = Infinity
-    // Snap to the nearest sampled time across all series (they share frames).
-    for (let s = 0; s < data.points.length; s++) {
-      for (const [t] of data.points[s]) {
+    for (const pts of data.points) {
+      for (const [t] of pts) {
         const d = Math.abs(t - hoverT)
         if (d < bestDist) {
           bestDist = d
-          best = { t, values: [] }
+          snapT = t
         }
       }
-      break // frames are shared — the first non-empty series is enough
+      if (pts.length > 0) break // frames are shared — one series is enough
     }
-    if (!best) return null
-    const snapT = best.t
-    best.values = data.points.map((pts) => {
+    if (snapT == null) return null
+    const values = data.points.map((pts) => {
       let v: number | null = null
       let dBest = 0.6 // within ~half a second counts as "at" the crosshair
       for (const [t, value] of pts) {
-        const d = Math.abs(t - snapT)
+        const d = Math.abs(t - snapT!)
         if (d < dBest) {
           dBest = d
           v = value
@@ -186,7 +230,7 @@ export function TelemetryChart({
       }
       return v
     })
-    return best
+    return { t: snapT, values }
   }, [hoverT, data])
 
   // Latest value per series, for the legend's live value labels.
@@ -212,7 +256,6 @@ export function TelemetryChart({
     ctx.scale(dpr, dpr)
     ctx.clearRect(0, 0, size.w, size.h)
 
-    const plotW = size.w - PAD.left - PAD.right
     const plotH = size.h - PAD.top - PAD.bottom
     if (plotW <= 0 || plotH <= 0) return
 
@@ -221,12 +264,16 @@ export function TelemetryChart({
     if (!data) {
       ctx.fillStyle = AXIS_INK
       ctx.textAlign = "center"
-      ctx.fillText(quietReason ?? "No telemetry", size.w / 2, size.h / 2)
+      ctx.fillText(
+        quietReason ?? (series.length === 0 ? "No joints selected" : "No telemetry in view"),
+        size.w / 2,
+        size.h / 2
+      )
       return
     }
 
-    const { t0, t1, min, max } = data
-    const x = (t: number) => PAD.left + ((t - t0) / (t1 - t0 || 1)) * plotW
+    const { min, max } = data
+    const x = (t: number) => PAD.left + ((t - view.t0) / (view.t1 - view.t0 || 1)) * plotW
     const y = (v: number) => PAD.top + (1 - (v - min) / (max - min)) * plotH
 
     // Grid + y labels (hairline, solid, recessive).
@@ -248,7 +295,7 @@ export function TelemetryChart({
     ctx.textAlign = "center"
     ctx.textBaseline = "top"
     const nTicksX = Math.max(2, Math.floor(plotW / 90))
-    for (const tick of ticks(t0, t1, nTicksX)) {
+    for (const tick of ticks(view.t0, view.t1, nTicksX)) {
       ctx.fillStyle = AXIS_INK
       ctx.fillText(fmtClock(tick), x(tick), size.h - PAD.bottom + 8)
     }
@@ -298,26 +345,52 @@ export function TelemetryChart({
         ctx.stroke()
       }
     }
-  }, [data, size, series, hover, quietReason])
+  }, [data, size, series, hover, quietReason, view, plotW])
 
   const toTime = useCallback(
     (clientX: number) => {
-      if (!data || !wrapRef.current) return null
+      if (!wrapRef.current) return null
       const rect = wrapRef.current.getBoundingClientRect()
       const frac = (clientX - rect.left - PAD.left) / (rect.width - PAD.left - PAD.right)
-      return data.t0 + Math.min(1, Math.max(0, frac)) * (data.t1 - data.t0)
+      return view.t0 + Math.min(1, Math.max(0, frac)) * (view.t1 - view.t0)
     },
-    [data]
+    [view]
   )
+
+  function onPointerDown(e: React.PointerEvent) {
+    if (!onViewChange || e.button !== 0) return
+    drag.current = { x: e.clientX, view, moved: false }
+    ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+  }
+
+  function onPointerMove(e: React.PointerEvent) {
+    const d = drag.current
+    if (d && onViewChange) {
+      const dx = e.clientX - d.x
+      if (d.moved || Math.abs(dx) > 3) {
+        d.moved = true
+        setHoverT(null)
+        const span = d.view.t1 - d.view.t0
+        const dt = (-dx / Math.max(1, plotW)) * span
+        onViewChange(clampView(d.view.t0 + dt, d.view.t1 + dt))
+        return
+      }
+    }
+    setHoverT(toTime(e.clientX))
+  }
+
+  function onPointerUp() {
+    drag.current = null
+  }
 
   function onKeyDown(e: React.KeyboardEvent) {
     if (!data) return
-    const span = data.t1 - data.t0
+    const span = view.t1 - view.t0
     const step = span / 60
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       e.preventDefault()
       const dir = e.key === "ArrowLeft" ? -1 : 1
-      setHoverT((t) => Math.min(data.t1, Math.max(data.t0, (t ?? data.t1) + dir * step)))
+      setHoverT((t) => Math.min(view.t1, Math.max(view.t0, (t ?? view.t1) + dir * step)))
     } else if (e.key === "Escape") {
       setHoverT(null)
     }
@@ -325,8 +398,8 @@ export function TelemetryChart({
 
   // Tooltip placement: clamp inside the plot, flip sides near the right edge.
   const tooltipLeft =
-    hover && data && size.w > 0
-      ? PAD.left + ((hover.t - data.t0) / (data.t1 - data.t0 || 1)) * (size.w - PAD.left - PAD.right)
+    hover && size.w > 0
+      ? PAD.left + ((hover.t - view.t0) / (view.t1 - view.t0 || 1)) * plotW
       : 0
   const flip = tooltipLeft > size.w - 190
 
@@ -345,10 +418,18 @@ export function TelemetryChart({
         aria-label={`${title} chart`}
         tabIndex={0}
         onKeyDown={onKeyDown}
-        onPointerMove={(e) => setHoverT(toTime(e.clientX))}
-        onPointerLeave={() => setHoverT(null)}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={() => {
+          setHoverT(null)
+          drag.current = null
+        }}
         onBlur={() => setHoverT(null)}
-        className="relative outline-none focus-visible:ring-1 focus-visible:ring-[#eff483]/50"
+        className={cn(
+          "relative touch-none outline-none focus-visible:ring-1 focus-visible:ring-[#eff483]/50",
+          onViewChange && "cursor-crosshair"
+        )}
         style={{ height: 220 }}
       >
         <canvas ref={canvasRef} style={{ width: "100%", height: "100%" }} />

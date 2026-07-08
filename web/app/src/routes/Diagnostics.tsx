@@ -1,22 +1,31 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
-import { Activity, Loader2, Pause, Play } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Activity, Cable, Loader2, Radio, Wrench } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
-import { ScriptRunner } from "@/components/diagnostics/script-runner"
-import { TelemetryChart, type ChartSeries } from "@/components/diagnostics/telemetry-chart"
+import { JointFilter } from "@/components/diagnostics/joint-filter"
+import { DiagnosticActions } from "@/components/diagnostics/diagnostic-actions"
+import {
+  TelemetryChart,
+  type ChartSeries,
+  type ChartView,
+} from "@/components/diagnostics/telemetry-chart"
 import { cn } from "@/lib/utils"
 import {
   fetchCommands,
   fetchRobotStatus,
   robotConnect,
   setServerBase,
+  stopSession,
+  useSessionLogs,
   type CommandSpec,
+  type FormValue,
   type RobotState,
   type RobotStatus,
+  type SessionInfo,
 } from "@/lib/supervisor"
 import {
   JOINTS,
@@ -24,20 +33,27 @@ import {
   fetchDiagnosticsRuns,
   jointLabel,
   motorKey,
+  startDiagnosticsRun,
   useTelemetryStream,
   type ArmSide,
   type DiagnosticsRunMeta,
+  type JointName,
 } from "@/lib/telemetry"
 
 const WINDOWS: { label: string; seconds: number }[] = [
   { label: "30s", seconds: 30 },
+  { label: "1m", seconds: 60 },
   { label: "2m", seconds: 120 },
+  { label: "5m", seconds: 300 },
   { label: "10m", seconds: 600 },
 ]
 
-const STATE_BADGE: Record<RobotState, { variant: "success" | "warning" | "destructive" | "neutral"; text: string }> = {
+const STATE_BADGE: Record<
+  RobotState,
+  { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
+> = {
   connected: { variant: "success", text: "streaming" },
-  busy: { variant: "warning", text: "operation owns the bus" },
+  busy: { variant: "warning", text: "test owns the bus" },
   connecting: { variant: "neutral", text: "connecting" },
   disconnected: { variant: "neutral", text: "robot disconnected" },
   error: { variant: "destructive", text: "error" },
@@ -45,12 +61,13 @@ const STATE_BADGE: Record<RobotState, { variant: "success" | "warning" | "destru
 
 /**
  * Motor diagnostics dashboard: live per-motor status (health, temperature,
- * voltage), always-running position / velocity / torque charts, a launcher for
- * the diagnostics scripts, and the recorded history of past runs.
+ * voltage), always-running position / velocity / torque charts with joint
+ * filtering and zoom/pan, one-click diagnostics with parameter dialogs, and
+ * the recorded history of past runs.
  *
- * Telemetry streams whenever the idle robot link owns the CAN bus. While an
- * operation or script owns it the stream pauses (single owner) — charts keep
- * their history and show why.
+ * Telemetry streams whenever the idle robot link owns the CAN bus. While a
+ * diagnostic or operation owns it the stream pauses (single owner) — charts
+ * keep their history and show why.
  */
 export default function Diagnostics() {
   const toast = useToast()
@@ -63,10 +80,21 @@ export default function Diagnostics() {
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
   )
   const [windowSec, setWindowSec] = useState(120)
-  const [paused, setPaused] = useState(false)
+  const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
+  // Zoom/pan pins the charts to a fixed range; null follows the live edge.
+  const [pinnedView, setPinnedView] = useState<ChartView | null>(null)
 
   const [runs, setRuns] = useState<DiagnosticsRunMeta[]>([])
   const [runsLoading, setRunsLoading] = useState(false)
+
+  // One diagnostics launch at a time (the CAN bus has a single owner). Both
+  // the action cards and the ad-hoc CAN buttons go through this.
+  const [activeRun, setActiveRun] = useState<{
+    command: string
+    session: SessionInfo
+  } | null>(null)
+  const [launchBusy, setLaunchBusy] = useState(false)
+  const { status: activeStatus } = useSessionLogs(activeRun?.session.id ?? null)
 
   const stream = useTelemetryStream(serverOk)
 
@@ -122,6 +150,56 @@ export default function Diagnostics() {
     if (serverOk) refreshRuns()
   }, [serverOk, refreshRuns])
 
+  // Completion feedback for the active run: toast + refresh the history once
+  // its session reaches a terminal state.
+  const notifiedRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!activeRun || !activeStatus) return
+    if (activeStatus.status !== "exited" && activeStatus.status !== "error") return
+    if (notifiedRef.current === activeRun.session.id) return
+    notifiedRef.current = activeRun.session.id
+    const label =
+      commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command
+    if (activeStatus.status === "exited" && (activeStatus.exitCode ?? 0) === 0) {
+      toast.success(`${label} finished.`)
+    } else {
+      toast.error(`${label} failed — see its run in the history for the log.`)
+    }
+    const t = setTimeout(() => {
+      refreshRuns()
+      setActiveRun(null)
+    }, 800)
+    return () => clearTimeout(t)
+  }, [activeRun, activeStatus, commands, refreshRuns, toast])
+
+  const launch = useCallback(
+    async (command: string, args: Record<string, FormValue>) => {
+      setLaunchBusy(true)
+      try {
+        const { run, session } = await startDiagnosticsRun(command, args)
+        setActiveRun({ command, session })
+        setRuns((prev) => [run, ...prev])
+      } catch (e) {
+        toast.error(String(e))
+      } finally {
+        setLaunchBusy(false)
+      }
+    },
+    [toast]
+  )
+
+  const stopActive = useCallback(async () => {
+    if (!activeRun) return
+    setLaunchBusy(true)
+    try {
+      await stopSession(activeRun.session.id)
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setLaunchBusy(false)
+    }
+  }, [activeRun, toast])
+
   async function connectRobot() {
     setRobotBusy(true)
     try {
@@ -140,37 +218,35 @@ export default function Diagnostics() {
 
   const series: ChartSeries[] = useMemo(
     () =>
-      JOINTS.map((joint) => ({
+      JOINTS.filter((j) => !hiddenJoints.has(j)).map((joint) => ({
         key: motorKey(arm, joint),
         label: jointLabel(joint),
         color: JOINT_COLORS[joint],
       })),
-    [arm]
+    [arm, hiddenJoints]
   )
 
   const linkState = robot?.state ?? stream.state
   const stateBadge = STATE_BADGE[linkState] ?? STATE_BADGE.disconnected
   const quietReason =
     linkState === "busy"
-      ? "paused — an operation owns the CAN bus"
+      ? "paused — a test or operation owns the bus"
       : linkState !== "connected"
         ? "robot link down"
         : null
 
-  // The Diagnostics catalog category, plus the CAN bring-up commands (Setup
-  // category in the control panel, but part of the motor troubleshooting
-  // toolkit: "motors unreachable" usually starts with the CAN interfaces).
   const diagCommands = useMemo(
-    () =>
-      commands.filter(
-        (c) => c.category === "Diagnostics" || c.id === "can.setup" || c.id === "can.enable"
-      ),
+    () => commands.filter((c) => c.category === "Diagnostics"),
     [commands]
   )
+  const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
-  // Freeze the live charts by pinning version + anchoring the window to the
-  // last frame; the buffer keeps filling so resume snaps back to now.
-  const chartVersion = paused ? -1 : stream.version
+  // Follow mode anchors the window to the newest sample; the page re-renders
+  // on every stream tick, so the live edge advances with the data (and holds
+  // still while the stream is paused). Zoom/pan pins a fixed range.
+  const lastT =
+    stream.frames.length > 0 ? stream.frames[stream.frames.length - 1].t : windowSec
+  const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
   return (
     <div className="min-h-screen">
@@ -183,7 +259,7 @@ export default function Diagnostics() {
           </span>
         }
       />
-      <main className="mx-auto flex max-w-6xl flex-col gap-6 px-6 py-8">
+      <main className="mx-auto flex max-w-6xl flex-col gap-8 px-6 py-8">
         {/* Robot link gate */}
         {robot && robot.state === "disconnected" && (
           <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
@@ -202,31 +278,55 @@ export default function Diagnostics() {
         )}
 
         {/* Motor status */}
-        <section className="flex flex-col gap-3">
-          <div className="flex items-baseline gap-3">
+        <section className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center gap-3">
             <h2 className="font-heading text-base font-semibold">Motors</h2>
             {robot && (
               <span className="text-xs text-white/40">
                 {robot.reachableCount}/{robot.motorCount} reachable
               </span>
             )}
+            <div className="ml-auto flex items-center gap-2">
+              {(["can.setup", "can.enable"] as const).map((id) => {
+                const cmd = canCommand(id)
+                if (!cmd) return null
+                const running = activeRun?.command === id
+                return (
+                  <Button
+                    key={id}
+                    variant="outline"
+                    size="sm"
+                    title={cmd.description}
+                    disabled={!serverOk || launchBusy || (activeRun != null && !running)}
+                    onClick={() => (running ? stopActive() : launch(id, {}))}
+                  >
+                    {running ? (
+                      <Loader2 className="animate-spin" />
+                    ) : id === "can.setup" ? (
+                      <Wrench />
+                    ) : (
+                      <Cable />
+                    )}
+                    {running ? `Stop ${cmd.label}` : cmd.label}
+                  </Button>
+                )
+              })}
+            </div>
           </div>
-          <div className="grid gap-4 lg:grid-cols-2">
-            {(["left", "right"] as ArmSide[]).map((side) => (
-              <div key={side} className="flex flex-col gap-2">
-                <span className="text-xs font-medium tracking-wide text-white/45 uppercase">
-                  {side} arm
-                </span>
-                <MotorGrid
-                  arm={side}
-                  slow={stream.slow}
-                  frames={stream.frames}
-                  version={stream.version}
-                  canInspect={linkState === "connected"}
-                />
-              </div>
-            ))}
-          </div>
+          {(["left", "right"] as ArmSide[]).map((side) => (
+            <div key={side} className="flex flex-col gap-2">
+              <span className="text-xs font-medium tracking-wide text-white/45 uppercase">
+                {side} arm
+              </span>
+              <MotorGrid
+                arm={side}
+                slow={stream.slow}
+                frames={stream.frames}
+                version={stream.version}
+                canInspect={linkState === "connected"}
+              />
+            </div>
+          ))}
         </section>
 
         {/* Live charts */}
@@ -239,10 +339,13 @@ export default function Diagnostics() {
                 <button
                   key={w.seconds}
                   type="button"
-                  onClick={() => setWindowSec(w.seconds)}
+                  onClick={() => {
+                    setWindowSec(w.seconds)
+                    setPinnedView(null)
+                  }}
                   className={cn(
                     "px-2.5 py-1 text-xs transition-colors",
-                    windowSec === w.seconds
+                    pinnedView == null && windowSec === w.seconds
                       ? "bg-[#eff483]/15 text-[#eff483]"
                       : "text-white/50 hover:bg-white/[0.05]"
                   )}
@@ -268,26 +371,31 @@ export default function Diagnostics() {
                 </button>
               ))}
             </div>
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-white/50"
-              onClick={() => setPaused((v) => !v)}
-            >
-              {paused ? <Play /> : <Pause />}
-              {paused ? "Resume" : "Pause"}
-            </Button>
+            {pinnedView != null && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-[#eff483]/90"
+                onClick={() => setPinnedView(null)}
+              >
+                <Radio /> Go live
+              </Button>
+            )}
           </div>
+          <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} />
+          <p className="text-xs text-white/30">
+            Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
+          </p>
           <div className="grid gap-4 xl:grid-cols-3">
             <TelemetryChart
               title="Position"
               unit="rad"
               series={series}
               frames={stream.frames}
-              version={chartVersion}
+              version={stream.version}
               metric={0}
-              windowSec={windowSec}
-              live={!paused}
+              view={view}
+              onViewChange={setPinnedView}
               quietReason={quietReason}
             />
             <TelemetryChart
@@ -295,10 +403,10 @@ export default function Diagnostics() {
               unit="rad/s"
               series={series}
               frames={stream.frames}
-              version={chartVersion}
+              version={stream.version}
               metric={1}
-              windowSec={windowSec}
-              live={!paused}
+              view={view}
+              onViewChange={setPinnedView}
               quietReason={quietReason}
             />
             <TelemetryChart
@@ -306,23 +414,26 @@ export default function Diagnostics() {
               unit="Nm"
               series={series}
               frames={stream.frames}
-              version={chartVersion}
+              version={stream.version}
               metric={2}
-              windowSec={windowSec}
-              live={!paused}
+              view={view}
+              onViewChange={setPinnedView}
               quietReason={quietReason}
             />
           </div>
         </section>
 
-        {/* Script runner */}
+        {/* Diagnostics actions */}
         <section className="flex flex-col gap-3">
-          <h2 className="font-heading text-base font-semibold">Diagnostics scripts</h2>
-          <ScriptRunner
+          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
+          <DiagnosticActions
             commands={diagCommands}
-            disabled={linkState === "disconnected" || linkState === "error"}
-            onRunStarted={(run) => setRuns((prev) => [run, ...prev])}
-            onRunFinished={refreshRuns}
+            activeCommand={activeRun?.command ?? null}
+            activeSince={activeRun?.session.startedAt ?? null}
+            busy={launchBusy}
+            disabled={!serverOk}
+            onLaunch={launch}
+            onStop={stopActive}
           />
         </section>
 
