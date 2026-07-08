@@ -200,7 +200,7 @@ export default function Diagnostics() {
     }
   }, [activeRun, toast])
 
-  async function connectRobot() {
+  const connectRobot = useCallback(async () => {
     setRobotBusy(true)
     try {
       setRobot(await robotConnect())
@@ -209,7 +209,24 @@ export default function Diagnostics() {
     } finally {
       setRobotBusy(false)
     }
-  }
+  }, [toast])
+
+  // Auto-connect the robot link once after the host comes online if it's
+  // sitting idle — same one-shot latch as the control panel, so a manual
+  // disconnect elsewhere isn't immediately undone.
+  const autoRobotRef = useRef(false)
+  useEffect(() => {
+    if (!serverOk) {
+      autoRobotRef.current = false
+      return
+    }
+    if (autoRobotRef.current || !robot) return
+    autoRobotRef.current = true
+    if (robot.state === "disconnected" && !robotBusy) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot auto-connect on host online
+      connectRobot()
+    }
+  }, [serverOk, robot, robotBusy, connectRobot])
 
   function selectArm(a: ArmSide) {
     setArm(a)

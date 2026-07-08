@@ -191,11 +191,20 @@ def _write_cron_script() -> None:
     _CRON_SCRIPT.write_text(
         f"#!/bin/bash\n"
         f"# Bring up Almond Axol CAN interfaces\n"
+        f"#\n"
+        f"# Both interfaces are channels of one dual-channel gs_usb adapter.\n"
+        f"# Bring them down together, configure, then up together — flapping\n"
+        f"# the channels one at a time (down/up L, then down/up R) toggles the\n"
+        f"# adapter into a state where TX works but no RX frame is delivered.\n"
         f"set -euo pipefail\n\n"
         f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
         f'    ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f"done\n"
+        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
         f'    ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
         f'    ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f"done\n"
+        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
         f'    ip link set "${{IFACE}}" up\n'
         f"done\n"
     )
@@ -223,10 +232,58 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
+def _rx_alive() -> bool:
+    """True when at least one motor answers on either arm.
+
+    Verifies the adapter's receive path, not just the interface state: the
+    dual-channel gs_usb adapter can come out of a down/up cycle in a state
+    where TX still works but no received frame is ever delivered (kernel-side
+    everything looks healthy — UP, ERROR-ACTIVE, correct bitrate).
+    """
+    import asyncio
+
+    from ...constants import Joint
+    from ...motor import CanBus, Motor
+
+    async def probe(channel: str) -> bool:
+        try:
+            async with CanBus(channel) as bus:
+                await asyncio.wait_for(
+                    Motor(bus, Joint.SHOULDER_1).get_error_code(), timeout=0.7
+                )
+                return True
+        except Exception:  # noqa: BLE001 - silence means "no RX", whatever the cause
+            return False
+
+    async def probe_all() -> bool:
+        await asyncio.sleep(0.5)  # let the freshly-upped interfaces settle
+        results = await asyncio.gather(probe(_CAN_L), probe(_CAN_R))
+        return any(results)
+
+    return asyncio.run(probe_all())
+
+
 def _bring_up_can() -> None:
+    """Run the bring-up script, then verify RX and re-flap once if it's dead.
+
+    Every down/up cycle of the adapter's channels toggles it between a healthy
+    state and the TX-only wedge described in :func:`_rx_alive`, so a bring-up
+    that lands in the wedge is recovered by exactly one more cycle. A robot
+    with its motors powered off is indistinguishable from the wedge, hence the
+    bounded retries and the warning instead of an error.
+    """
     print("Bringing up CAN interfaces (requires sudo)...")
-    run_root(["bash", str(_CRON_SCRIPT)], check=True)
-    print("  Done.")
+    for attempt in range(3):
+        run_root(["bash", str(_CRON_SCRIPT)], check=True)
+        if _rx_alive():
+            print("  Done — motors responding.")
+            return
+        if attempt < 2:
+            print("  No motor responses (adapter RX may be wedged) — cycling again...")
+    print(
+        "  WARNING: no motor responded after bring-up. If the robot is powered "
+        "on, re-run this command; otherwise this is expected."
+    )
 
 
 def is_configured() -> bool:
