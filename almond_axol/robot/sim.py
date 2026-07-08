@@ -7,7 +7,13 @@ import threading
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, URDF_PATH, urdf_arm_joint_names
+from ..constants import (
+    ARM_JOINTS,
+    GRIPPER_URDF_OPEN,
+    URDF_PATH,
+    urdf_arm_joint_names,
+    urdf_gripper_joint_name,
+)
 from ..utils.ports import reclaim_port
 from .base import RobotBase
 
@@ -149,12 +155,20 @@ class Sim(RobotBase):
             self._condition.notify()
 
     def _build_q(self) -> np.ndarray:
-        """Build the arm joint angle array (radians), left then right, no gripper."""
+        """Build the command vector consumed by the viser worker.
+
+        Layout (length 16): 7 left arm joints (rad), 7 right arm joints (rad),
+        then the left and right gripper values normalized to ``[0, 1]`` (0 =
+        closed, 1 = open). The arm joints map to the URDF revolute joints; the
+        two gripper values are mapped to the actuated prismatic finger joints in
+        :meth:`_run`.
+        """
         n_arm = len(ARM_JOINTS)  # 7, no gripper
         return np.concatenate(
             [
                 self._last_left[:n_arm].astype(float),
                 self._last_right[:n_arm].astype(float),
+                [float(self._last_left[n_arm]), float(self._last_right[n_arm])],
             ]
         )
 
@@ -177,13 +191,16 @@ class Sim(RobotBase):
             )
 
             # Build the robot-side joint ordering to match _build_q's output:
-            # left arm joint1-N, then right arm joint1-N.
+            # left arm joint1-N, then right arm joint1-N (the two trailing
+            # gripper entries are handled separately below).
             robot_order = (
                 self._joint_names or urdf_arm_joint_names(is_left=True)
             ) + urdf_arm_joint_names(is_left=False)
+            n_arm_total = len(robot_order)
 
             # Map each viser joint to its index in robot_order (-1 for joints not
-            # in robot_order, e.g. finger joints, which stay at 0).
+            # in robot_order). The gripper finger joints are not in robot_order;
+            # they are driven from the two trailing gripper values instead.
             viser_order = viser_urdf.get_actuated_joint_names()
             viser_to_robot: list[int] = []
             for name in viser_order:
@@ -192,18 +209,43 @@ class Sim(RobotBase):
                 except ValueError:
                     viser_to_robot.append(-1)
 
+            # Viser indices of the actuated (non-mimic) prismatic gripper joints.
+            # The opposing finger mimics these, so viser/yourdfpy moves it for us.
+            def _grip_vi(is_left: bool) -> int:
+                name = urdf_gripper_joint_name(is_left=is_left)
+                return viser_order.index(name) if name in viser_order else -1
+
+            left_grip_vi = _grip_vi(is_left=True)
+            right_grip_vi = _grip_vi(is_left=False)
+
             def _to_viser(q_robot: np.ndarray) -> np.ndarray:
                 q_out = np.zeros(len(viser_order), dtype=float)
                 for vi, ri in enumerate(viser_to_robot):
                     if ri >= 0:
                         q_out[vi] = q_robot[ri]
+                # Trailing entries n_arm_total, n_arm_total+1 are the left/right
+                # gripper values in [0, 1]; clamp (parity with hardware
+                # motion_control, which clips to joint limits) then scale to the
+                # prismatic travel limit (0 = closed, GRIPPER_URDF_OPEN = open).
+                if q_robot.size > n_arm_total + 1:
+                    if left_grip_vi >= 0:
+                        q_out[left_grip_vi] = (
+                            float(np.clip(q_robot[n_arm_total], 0.0, 1.0))
+                            * GRIPPER_URDF_OPEN
+                        )
+                    if right_grip_vi >= 0:
+                        q_out[right_grip_vi] = (
+                            float(np.clip(q_robot[n_arm_total + 1], 0.0, 1.0))
+                            * GRIPPER_URDF_OPEN
+                        )
                 return q_out
 
-            q0 = (
-                np.asarray(self._default_q, dtype=float)
-                if self._default_q is not None
-                else np.zeros(len(robot_order))
-            )
+            if self._default_q is not None:
+                default_arm = np.asarray(self._default_q, dtype=float)
+            else:
+                default_arm = np.zeros(n_arm_total)
+            # Start with grippers closed.
+            q0 = np.concatenate([default_arm[:n_arm_total], [0.0, 0.0]])
             viser_urdf.update_cfg(_to_viser(q0))
 
             server.scene.add_grid(
