@@ -17,7 +17,7 @@ Telemetry is sampled by the idle robot link, which is the single owner of the CA
 
 ## Diagnostics scripts
 
-The scripts section launches the diagnostics catalog — [`motor.info`](https://docs.almond.bot/cli/motor-info), [`motor.health`](https://docs.almond.bot/cli/motor-health), [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), and [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — plus the CAN bring-up commands [`can.setup`](https://docs.almond.bot/cli/can-setup) and [`can.enable`](https://docs.almond.bot/cli/can-enable), with the same configuration form and live log console as the control panel. Interactive prompts are replaced by countdowns when launched from the dashboard (`--no-prompt`).
+The scripts section launches the diagnostics catalog — [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), and [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — plus the CAN bring-up commands [`can.setup`](https://docs.almond.bot/cli/can-setup) and [`can.enable`](https://docs.almond.bot/cli/can-enable), with the same configuration form and live log console as the control panel. Interactive prompts are replaced by countdowns when launched from the dashboard (`--no-prompt`). (The `motor.info` / `motor.health` read set needs no script here — the motor tiles above show it live.)
 
 ## Run history
 
