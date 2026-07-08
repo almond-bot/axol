@@ -31,14 +31,6 @@ from .zed import install as zed_install
 # would slow every ``axol`` invocation if imported here for registration.
 # Each module's ``main(argv)`` owns its own argparse parser.
 _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
-    "diag.home": (
-        "almond_axol.diagnostics.home",
-        "Enable Axol and bring all joints to zero.",
-    ),
-    "diag.gripper": (
-        "almond_axol.diagnostics.gripper",
-        "Open then close the gripper on each arm.",
-    ),
     "diag.rom-enable": (
         "almond_axol.diagnostics.rom.enable",
         "Range-of-motion soak test: sweep every joint for two hours.",
@@ -46,6 +38,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
     "diag.rom-disable": (
         "almond_axol.diagnostics.rom.disable",
         "Open the grippers left clamped by the ROM test and power down.",
+    ),
+    "diag.zed-cable": (
+        "almond_axol.diagnostics.zed.cable",
+        "Verify a ZED camera cable by validating captured frames.",
     ),
 }
 

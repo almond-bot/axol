@@ -276,7 +276,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
     async def _watch_diagnostics_run(
-        meta: dict[str, Any] | None, session: Session
+        meta: dict[str, Any] | None, session: Session, uses_can_bus: bool
     ) -> None:
         """Wait for the session to end, return the bus, persist the run (if any)."""
         queue = manager.subscribe(session)
@@ -290,7 +290,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     break
         finally:
             manager.unsubscribe(session, queue)
-            await asyncio.to_thread(robot.reacquire)
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
         if meta is not None:
             await asyncio.to_thread(
                 runs.finalize,
@@ -320,13 +321,18 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": f"unknown command: {req.command}"}, status_code=400
             )
 
-        await asyncio.to_thread(robot.release)
+        # A camera-only diagnostic (ZED cable check) doesn't touch the CAN bus,
+        # so leave the idle motor telemetry streaming while it runs.
+        uses_can_bus = COMMANDS[req.command].uses_can_bus
+        if uses_can_bus:
+            await asyncio.to_thread(robot.release)
         try:
             # A writable stdin lets the UI answer the diagnostic's hands-on
             # prompts (the "Continue" button) via /input below.
             session = await manager.start(req.command, req.args, stdin_pipe=True)
         except Exception:
-            await asyncio.to_thread(robot.reacquire)
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
             raise
         # Only the Diagnostics tests are recorded in the run history; the
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
@@ -334,7 +340,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         record = COMMANDS[req.command].category == "Diagnostics"
         meta = runs.begin(session.id, req.command, req.args) if record else None
         if session.status == "error":
-            await asyncio.to_thread(robot.reacquire)
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
             if meta is not None:
                 await asyncio.to_thread(
                     runs.finalize,
@@ -344,7 +351,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     list(session.log),
                 )
         else:
-            asyncio.create_task(_watch_diagnostics_run(meta, session))
+            asyncio.create_task(_watch_diagnostics_run(meta, session, uses_can_bus))
         return JSONResponse({"run": meta, "session": session.to_dict()})
 
     @app.get("/api/diagnostics/runs")

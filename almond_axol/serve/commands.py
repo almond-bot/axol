@@ -42,6 +42,7 @@ class CommandDef:
         *,
         sim_capable: bool = False,
         requires_hardware: bool = False,
+        uses_can_bus: bool = True,
     ) -> None:
         self.id = id
         self.cli = cli
@@ -51,6 +52,10 @@ class CommandDef:
         self.kind = kind  # "draccus" | "argparse"
         self.sim_capable = sim_capable
         self.requires_hardware = requires_hardware
+        # Whether launching this command needs sole ownership of the CAN bus.
+        # A camera-only diagnostic (the ZED cable test) doesn't, so the serve
+        # layer keeps the idle motor telemetry streaming while it runs.
+        self.uses_can_bus = uses_can_bus
         self._loader = loader
 
     def load(self) -> Any:
@@ -161,26 +166,6 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
     ),
     # -- Diagnostics ----------------------------------------------------------
-    "diag.home": CommandDef(
-        "diag.home",
-        "diag.home",
-        "Home arms",
-        "Enable the motors and smoothly bring every joint to zero.",
-        "Diagnostics",
-        "argparse",
-        _argparse_loader("..diagnostics.home"),
-        requires_hardware=True,
-    ),
-    "diag.gripper": CommandDef(
-        "diag.gripper",
-        "diag.gripper",
-        "Gripper check",
-        "Open then close the gripper on each arm.",
-        "Diagnostics",
-        "argparse",
-        _argparse_loader("..diagnostics.gripper"),
-        requires_hardware=True,
-    ),
     "diag.rom-enable": CommandDef(
         "diag.rom-enable",
         "diag.rom-enable",
@@ -201,6 +186,18 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
+    ),
+    "diag.zed-cable": CommandDef(
+        "diag.zed-cable",
+        "diag.zed-cable",
+        "ZED cable check",
+        "Capture and validate frames from a connected ZED-X One camera to "
+        "verify its GMSL cable. Camera-only — does not touch the arms.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.zed.cable"),
+        requires_hardware=True,
+        uses_can_bus=False,
     ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
@@ -278,6 +275,7 @@ def command_specs() -> list[dict[str, Any]]:
             "category": cmd.category,
             "simCapable": cmd.sim_capable,
             "requiresHardware": cmd.requires_hardware,
+            "usesCanBus": cmd.uses_can_bus,
         }
         try:
             schema = get_schema(cmd.id)
