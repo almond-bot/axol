@@ -1314,10 +1314,13 @@ class InProcessRecorder:
         return self._dataset.num_episodes
 
     def start_episode(self, task: str) -> None:
+        from ..lerobot.nvenc_encoder import reset_dropped_frames
+
         self._stop_capture()  # defensive: never overlap two capture threads
         self._dataset.clear_episode_buffer()
         self._record.set()
         self._frames["n"] = 0
+        reset_dropped_frames()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=run_capture_loop,
@@ -1359,7 +1362,19 @@ class InProcessRecorder:
             self._thread = None
 
     def save_episode(self) -> None:
+        from ..lerobot.nvenc_encoder import dropped_frames
+
         self._stop_capture()
+        n_dropped = dropped_frames()
+        if n_dropped:
+            # Mirrors the recorder subprocess: a dropped frame's row still
+            # exists, so the video is misaligned — never save it silently.
+            self._dataset.clear_episode_buffer()
+            raise RuntimeError(
+                f"{n_dropped} video frame(s) were dropped by the encoder "
+                "(feed queue overflow) — the episode's video is misaligned "
+                "with its rows; episode discarded."
+            )
         self._dataset.save_episode()
         self._episodes_recorded += 1
 
@@ -1513,6 +1528,9 @@ def _recorder_main(
                 capture_error["v"] = None
                 record_event.set()
                 frame_counter["n"] = 0
+                from ..lerobot.nvenc_encoder import reset_dropped_frames
+
+                reset_dropped_frames()
                 stop = threading.Event()
                 loop_kwargs = dict(
                     cameras=cameras,
@@ -1567,8 +1585,26 @@ def _recorder_main(
                 conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
                 stop_capture()
+                from ..lerobot.nvenc_encoder import dropped_frames
+
+                n_dropped = dropped_frames()
                 if capture_error["v"] is not None:
                     conn.send(("error", capture_error["v"]))
+                elif n_dropped:
+                    # A dropped frame was never encoded but its row exists, so
+                    # the episode's video is misaligned with its rows (and
+                    # with the other cameras) — refuse to save silently
+                    # corrupted data. The caller should discard and re-record.
+                    dataset.clear_episode_buffer()
+                    conn.send(
+                        (
+                            "error",
+                            f"{n_dropped} video frame(s) were dropped by the "
+                            "encoder (feed queue overflow) — the episode's "
+                            "video is misaligned with its rows; episode "
+                            "discarded. Check recorder-core load.",
+                        )
+                    )
                 else:
                     try:
                         t_save = time.perf_counter()
