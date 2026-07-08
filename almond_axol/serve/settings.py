@@ -12,14 +12,18 @@ gives them one home on the serve host:
   each operation (the same ops have the same knob at different paths, e.g.
   stiffness is ``axol.left_stiffness`` on teleop but
   ``robot_config.axol_config.left_stiffness`` on collect-data).
+- :data:`ADVANCED_SECTIONS` — the unified Advanced tree: every remaining
+  config field under a *canonical* subsystem key (``axol.*``,
+  ``vr_teleop.*``, ``kinematics.*``, …). One stored value is translated to
+  each op's own dotted path at start, so there is a single source of truth
+  applying to all tasks — never per-task copies of the same knob.
 - :class:`SettingsStore` — JSON persistence at ``~/.almond/settings.json``
-  (the camera spec, the shared setting values, and per-op advanced
-  overrides), plus the merge that folds them into an op start's args. The
-  request's own args always win, so a per-run value can still override a
-  shared one.
+  (the camera spec, the curated values, and the canonical advanced values),
+  plus the merge that folds them into an op start's args. The request's own
+  args always win, so a per-run value can still override a shared one.
 
-Precedence at op start (later wins): dataclass defaults → shared settings →
-per-op advanced overrides → the request's args → the camera spec fold-in.
+Precedence at op start (later wins): dataclass defaults → curated settings →
+advanced values → the request's args → the camera spec fold-in.
 """
 
 from __future__ import annotations
@@ -536,6 +540,176 @@ _SETTINGS_BY_KEY: dict[str, SettingDef] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Advanced settings: ONE tree shared by every operation.
+#
+# The same subsystem config lives at a different dotted path on each op
+# (``axol.left.elbow.kp`` on teleop, ``robot_config.axol_config.left.elbow.kp``
+# on collect-data). Advanced values are therefore stored under a *canonical*
+# key — ``<section>.<subpath>`` — and translated to each op's own path at
+# start, so one stored value applies to every task that has that subsystem.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AdvancedSection:
+    """One canonical subsystem in the unified Advanced tree.
+
+    ``ref_op``/``ref_prefix`` name the op schema subtree the UI form is built
+    from; ``targets`` maps each op to the dotted prefix the canonical subpath
+    is grafted onto at start. ``drop_children`` removes subtrees owned
+    elsewhere (cameras by the Cameras tab; axol_config by the axol section).
+    """
+
+    key: str
+    label: str
+    ref_op: str
+    ref_prefix: str
+    targets: dict[str, str]
+    drop_children: tuple[str, ...] = ()
+
+
+ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
+    AdvancedSection(
+        key="axol",
+        label="Axol",
+        ref_op="teleop",
+        ref_prefix="axol",
+        targets={
+            "teleop": "axol",
+            "gravity-comp": "axol",
+            "collect-data": _AXOL,
+            "run-policy": _AXOL,
+            "replay-dataset": _AXOL,
+        },
+    ),
+    AdvancedSection(
+        key="vr_teleop",
+        label="Teleop",
+        ref_op="teleop",
+        ref_prefix="teleop",
+        targets={"teleop": "teleop", "collect-data": _VRT},
+    ),
+    AdvancedSection(
+        key="kinematics",
+        label="Kinematics",
+        ref_op="teleop",
+        ref_prefix="kinematics",
+        targets={"teleop": "kinematics", "collect-data": _KIN},
+    ),
+    AdvancedSection(
+        key="vr_server",
+        label="VR server",
+        ref_op="teleop",
+        ref_prefix="vr_server",
+        targets={
+            "teleop": "vr_server",
+            "collect-data": "teleop_config.vr_server_config",
+        },
+    ),
+    AdvancedSection(
+        key="lerobot",
+        label="LeRobot robot",
+        ref_op="collect-data",
+        ref_prefix=_ROBOT,
+        targets={
+            "collect-data": _ROBOT,
+            "run-policy": _ROBOT,
+            "replay-dataset": _ROBOT,
+        },
+        drop_children=("cameras", "axol config"),
+    ),
+)
+
+_ADVANCED_BY_KEY = {s.key: s for s in ADVANCED_SECTIONS}
+
+
+def _managed_canonical_keys() -> set[str]:
+    """Canonical advanced keys already owned by a curated setting.
+
+    Every curated target that falls inside a section's subtree (on any op) is
+    hidden from the Advanced tree, so each knob has exactly one home.
+    """
+    managed: set[str] = set()
+    for setting in _SETTINGS_BY_KEY.values():
+        for op, keys in setting.targets.items():
+            for key in keys:
+                for section in ADVANCED_SECTIONS:
+                    prefix = section.targets.get(op)
+                    if prefix and key.startswith(prefix + "."):
+                        managed.add(section.key + key[len(prefix) :])
+    return managed
+
+
+def _rekey_nodes(
+    nodes: list[dict[str, Any]],
+    old_prefix: str,
+    new_prefix: str,
+    managed: set[str],
+    drop: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Re-root a schema subtree under a canonical prefix, pruning owned keys."""
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        if node["label"] in drop:
+            continue
+        leaf = node["key"].rsplit(".", 1)[-1]
+        # ChoiceRegistry discriminators ("type") are implementation detail.
+        if node["kind"] == "field" and leaf == "type":
+            continue
+        new_key = new_prefix + node["key"][len(old_prefix) :]
+        if node["kind"] == "field":
+            if new_key in managed:
+                continue
+            out.append({**node, "key": new_key})
+        else:
+            children = _rekey_nodes(
+                node["children"], old_prefix, new_prefix, managed, ()
+            )
+            if children:
+                out.append({**node, "key": new_key, "children": children})
+    return out
+
+
+def advanced_schema() -> list[dict[str, Any]]:
+    """The unified Advanced tree: one canonical section per shared subsystem.
+
+    Best-effort per section: a subsystem whose reference op can't build its
+    schema (missing extras) is simply omitted.
+    """
+    from .commands import get_schema
+
+    managed = _managed_canonical_keys()
+    sections: list[dict[str, Any]] = []
+    for section in ADVANCED_SECTIONS:
+        try:
+            schema = get_schema(section.ref_op)
+        except Exception:  # noqa: BLE001 - optional extras may be missing
+            continue
+        subtree = next(
+            (
+                n
+                for n in schema.nodes
+                if n["kind"] == "group" and n["key"] == section.ref_prefix
+            ),
+            None,
+        )
+        if subtree is None:
+            continue
+        nodes = _rekey_nodes(
+            subtree["children"],
+            section.ref_prefix,
+            section.key,
+            managed,
+            section.drop_children,
+        )
+        if nodes:
+            sections.append(
+                {"key": section.key, "label": section.label, "nodes": nodes}
+            )
+    return sections
+
+
 def _schema_defaults() -> dict[str, dict[str, Any]]:
     """``op_id -> {leaf key -> default}`` from the introspected op schemas.
 
@@ -627,7 +801,7 @@ class SettingsStore:
           "version": 1,
           "values": {"robot.left_stiffness": 0.8, ...},
           "cameras": {...camera spec, see app.OpStartRequest...},
-          "op_overrides": {"collect-data": {"teleop_hz": 90, ...}, ...}
+          "advanced": {"axol.left.elbow.kp": 60, ...}   # canonical keys
         }
     """
 
@@ -643,17 +817,13 @@ class SettingsStore:
                 return {
                     "values": dict(raw.get("values") or {}),
                     "cameras": raw.get("cameras"),
-                    "op_overrides": {
-                        op: dict(v)
-                        for op, v in (raw.get("op_overrides") or {}).items()
-                        if isinstance(v, dict)
-                    },
+                    "advanced": dict(raw.get("advanced") or {}),
                 }
         except FileNotFoundError:
             pass
         except Exception:  # noqa: BLE001 - a corrupt file must not kill serve
             _logger.exception("failed to load %s; starting empty", self._path)
-        return {"values": {}, "cameras": None, "op_overrides": {}}
+        return {"values": {}, "cameras": None, "advanced": {}}
 
     def _save_locked(self) -> None:
         payload = {"version": 1, **self._data}
@@ -669,32 +839,29 @@ class SettingsStore:
             return {
                 "values": dict(self._data["values"]),
                 "cameras": self._data["cameras"],
-                "opOverrides": {
-                    op: dict(v) for op, v in self._data["op_overrides"].items()
-                },
+                "advanced": dict(self._data["advanced"]),
             }
 
     def update(
         self,
         values: dict[str, Any] | None = None,
         cameras: Any = ...,  # sentinel: ``...`` means "not provided"
-        op_overrides: dict[str, Any] | None = None,
+        advanced: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Apply a partial update and persist. Returns the new snapshot.
 
-        ``values`` merges per key; a ``None`` value removes the key (reset to
-        default). ``cameras`` replaces the whole camera spec (``None`` clears
-        it). ``op_overrides`` replaces per op: each op's map is swapped
-        wholesale (an empty/None map removes the op's overrides).
+        ``values`` and ``advanced`` merge per key; a ``None`` value removes the
+        key (reset to default). ``cameras`` replaces the whole camera spec
+        (``None`` clears it).
         """
         if values is not None:
             unknown = [k for k in values if k not in _SETTINGS_BY_KEY]
             if unknown:
                 raise KeyError(f"unknown settings: {', '.join(sorted(unknown))}")
-        if op_overrides is not None:
-            bad = [op for op in op_overrides if op not in _OPS]
+        if advanced is not None:
+            bad = [k for k in advanced if k.partition(".")[0] not in _ADVANCED_BY_KEY]
             if bad:
-                raise KeyError(f"unknown operations: {', '.join(sorted(bad))}")
+                raise KeyError(f"unknown advanced settings: {', '.join(sorted(bad))}")
         with self._lock:
             if values is not None:
                 for k, v in values.items():
@@ -704,12 +871,12 @@ class SettingsStore:
                         self._data["values"][k] = v
             if cameras is not ...:
                 self._data["cameras"] = cameras
-            if op_overrides is not None:
-                for op, overrides in op_overrides.items():
-                    if not overrides:
-                        self._data["op_overrides"].pop(op, None)
+            if advanced is not None:
+                for k, v in advanced.items():
+                    if v is None:
+                        self._data["advanced"].pop(k, None)
                     else:
-                        self._data["op_overrides"][op] = dict(overrides)
+                        self._data["advanced"][k] = v
             self._save_locked()
         return self.snapshot()
 
@@ -721,20 +888,28 @@ class SettingsStore:
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.
 
-        Later wins: shared setting values → the op's advanced overrides → the
-        request's own args. Keys the op's schema doesn't know are dropped later
-        by ``build_argv``, so a stale entry can never inject anything.
+        Later wins: curated setting values → advanced values (canonical keys
+        translated to this op's dotted paths) → the request's own args. Keys
+        the op's schema doesn't know are dropped later by ``build_argv``, so a
+        stale entry can never inject anything.
         """
         merged: dict[str, Any] = {}
         with self._lock:
             values = dict(self._data["values"])
-            overrides = dict(self._data["op_overrides"].get(op_id) or {})
+            advanced = dict(self._data["advanced"])
         for key, value in values.items():
             setting = _SETTINGS_BY_KEY.get(key)
             if setting is None or value is None:
                 continue
             for target in setting.targets.get(op_id, ()):
                 merged[target] = value
-        merged.update(overrides)
+        for key, value in advanced.items():
+            section_key, _, subpath = key.partition(".")
+            section = _ADVANCED_BY_KEY.get(section_key)
+            if section is None or not subpath or value is None:
+                continue
+            prefix = section.targets.get(op_id)
+            if prefix:
+                merged[f"{prefix}.{subpath}"] = value
         merged.update(args)
         return merged

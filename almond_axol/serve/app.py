@@ -24,7 +24,7 @@ from .commands import COMMANDS, command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
-from .settings import SettingsStore, settings_schema
+from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
@@ -77,9 +77,8 @@ class OpStartRequest(BaseModel):
 class SettingsUpdateRequest(BaseModel):
     """Partial update of the shared operator settings (serve/settings.py).
 
-    ``values`` merges per key (``null`` resets a key to its default);
-    ``cameras`` replaces the stored camera spec wholesale; ``opOverrides``
-    replaces each given op's advanced-override map wholesale. Omitted
+    ``values`` and ``advanced`` merge per key (``null`` resets a key to its
+    default); ``cameras`` replaces the stored camera spec wholesale. Omitted
     sections are left untouched.
     """
 
@@ -87,7 +86,7 @@ class SettingsUpdateRequest(BaseModel):
     cameras: dict[str, Any] | None = None
     # Distinguish "clear the cameras" (null) from "don't touch them" (omitted).
     camerasSet: bool = False
-    opOverrides: dict[str, dict[str, Any]] | None = None
+    advanced: dict[str, Any] | None = None
 
 
 class EpisodeRequest(BaseModel):
@@ -458,8 +457,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.get("/api/settings")
     async def get_settings() -> dict[str, Any]:
-        """Stored shared settings + the schema describing every category."""
-        return {**settings.snapshot(), "schema": settings_schema()}
+        """Stored shared settings + the schemas describing every category."""
+        return {
+            **settings.snapshot(),
+            "schema": settings_schema(),
+            "advancedSchema": advanced_schema(),
+        }
 
     @app.put("/api/settings")
     async def put_settings(req: SettingsUpdateRequest) -> JSONResponse:
@@ -469,7 +472,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 cameras=req.cameras
                 if (req.camerasSet or req.cameras is not None)
                 else ...,
-                op_overrides=req.opOverrides,
+                advanced=req.advanced,
             )
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)

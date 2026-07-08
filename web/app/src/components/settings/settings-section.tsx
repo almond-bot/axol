@@ -1,15 +1,11 @@
 import { useMemo, useRef, useState } from "react"
 import { Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
 import {
-  OPERATIONS,
-  filterSchema,
   flattenFields,
-  managedKeysForOp,
+  type AdvancedSection,
   type CameraDevice,
   type CameraSpec,
-  type CommandSpec,
   type FormValue,
-  type OperationId,
   type SettingsCategory,
   type SettingsField,
   type SettingsPatch,
@@ -36,7 +32,7 @@ export type SettingsTab = string // "cameras" | "usb" | "pose" | "advanced" | a 
 interface Draft {
   values: Record<string, SettingValue>
   cameras: CameraSpec
-  opOverrides: Record<string, Record<string, FormValue>>
+  advanced: Record<string, FormValue>
 }
 
 /**
@@ -54,7 +50,6 @@ export function SettingsSection({
   supportError,
   cameras,
   onSave,
-  specs,
   devices,
   detecting,
   onRefresh,
@@ -71,8 +66,6 @@ export function SettingsSection({
   /** Current camera spec (server-stored, with localStorage fallback). */
   cameras: CameraSpec
   onSave: (patch: SettingsPatch) => Promise<void>
-  /** Command specs, for the Advanced per-op override forms. */
-  specs: CommandSpec[]
   devices: CameraDevice[] | null
   detecting: boolean
   onRefresh: () => void
@@ -99,11 +92,9 @@ export function SettingsSection({
   const seedDraft = (): Draft => ({
     values: { ...(snapshot?.values ?? {}) },
     cameras,
-    opOverrides: Object.fromEntries(
-      Object.entries(snapshot?.opOverrides ?? {}).map(([op, v]) => [op, { ...v }])
-    ),
+    advanced: { ...(snapshot?.advanced ?? {}) },
   })
-  const nextSeedKey = JSON.stringify([snapshot?.values, snapshot?.opOverrides, cameras])
+  const nextSeedKey = JSON.stringify([snapshot?.values, snapshot?.advanced, cameras])
   if (nextSeedKey !== seedKey && (draft == null || !dirty)) {
     setSeedKey(nextSeedKey)
     setDraft(seedDraft())
@@ -143,7 +134,7 @@ export function SettingsSection({
     const blob = new Blob(
       [
         JSON.stringify(
-          { values: draft.values, cameras: draft.cameras, opOverrides: draft.opOverrides },
+          { values: draft.values, cameras: draft.cameras, advanced: draft.advanced },
           null,
           2
         ),
@@ -167,7 +158,7 @@ export function SettingsSection({
           ? {
               values: { ...(data.values ?? {}) },
               cameras: (data.cameras as CameraSpec) ?? d.cameras,
-              opOverrides: { ...(data.opOverrides ?? {}) },
+              advanced: { ...(data.advanced ?? {}) },
             }
           : d
       )
@@ -242,11 +233,18 @@ export function SettingsSection({
           <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
         ) : tab === "advanced" ? (
           <AdvancedPanel
-            specs={specs}
-            schema={schema}
-            overridesByOp={draft.opOverrides}
-            onChange={(op, next) =>
-              setDraft((d) => (d ? { ...d, opOverrides: { ...d.opOverrides, [op]: next } } : d))
+            sections={snapshot?.advancedSchema ?? []}
+            overrides={draft.advanced}
+            onChange={(key, value) =>
+              setDraft((d) => (d ? { ...d, advanced: { ...d.advanced, [key]: value } } : d))
+            }
+            onReset={(key) =>
+              setDraft((d) => {
+                if (!d) return d
+                const advanced = { ...d.advanced }
+                delete advanced[key]
+                return { ...d, advanced }
+              })
             }
           />
         ) : activeCategory ? (
@@ -322,13 +320,15 @@ function computePatch(
     patch.camerasSet = true
   }
 
-  const beforeOps = snapshot?.opOverrides ?? {}
-  const opsPatch: Record<string, Record<string, FormValue>> = {}
-  for (const op of new Set([...Object.keys(beforeOps), ...Object.keys(draft.opOverrides)])) {
-    const next = draft.opOverrides[op] ?? {}
-    if (JSON.stringify(beforeOps[op] ?? {}) !== JSON.stringify(next)) opsPatch[op] = next
+  const beforeAdv = snapshot?.advanced ?? {}
+  const advPatch: Record<string, FormValue | null> = {}
+  for (const [k, v] of Object.entries(draft.advanced)) {
+    if (JSON.stringify(beforeAdv[k]) !== JSON.stringify(v)) advPatch[k] = v
   }
-  if (Object.keys(opsPatch).length > 0) patch.opOverrides = opsPatch
+  for (const k of Object.keys(beforeAdv)) {
+    if (!(k in draft.advanced)) advPatch[k] = null
+  }
+  if (Object.keys(advPatch).length > 0) patch.advanced = advPatch
 
   return patch
 }
@@ -539,50 +539,24 @@ function SettingRow({
 }
 
 /**
- * Per-op escape hatch: the full introspected config tree, minus everything a
- * shared setting or the Cameras tab already owns (single source of truth) and
- * minus the per-run fields the op panel asks for. Values persist server-side
- * and are folded in beneath the per-run args.
+ * The unified Advanced tree: every remaining config field, organized by
+ * subsystem (Axol, Teleop, Kinematics, VR server, LeRobot robot). One value
+ * here is the source of truth for **all** operations — the server translates
+ * each canonical key to the right config path per op at start. Curated
+ * settings, cameras and per-run fields are pruned server-side so every knob
+ * has exactly one home.
  */
 function AdvancedPanel({
-  specs,
-  schema,
-  overridesByOp,
+  sections,
+  overrides,
   onChange,
+  onReset,
 }: {
-  specs: CommandSpec[]
-  schema: SettingsCategory[]
-  overridesByOp: Record<string, Record<string, FormValue>>
-  onChange: (op: string, next: Record<string, FormValue>) => void
+  sections: AdvancedSection[]
+  overrides: Record<string, FormValue>
+  onChange: (key: string, value: FormValue) => void
+  onReset: (key: string) => void
 }) {
-  const [op, setOp] = useState<OperationId>("teleop")
-  const spec = specs.find((s) => s.id === op)
-  const meta = OPERATIONS.find((o) => o.id === op)
-
-  const visibleSchema = useMemo(() => {
-    if (!spec) return []
-    const exclude = managedKeysForOp(schema, op)
-    for (const f of meta?.fields ?? []) exclude.add(f)
-    for (const f of flattenFields(spec.schema)) {
-      if (f.required) exclude.add(f.key)
-      // Camera fields are owned end-to-end by the Cameras tab.
-      if (f.key.startsWith("robot_config.cameras.")) exclude.add(f.key)
-    }
-    return filterSchema(spec.schema, exclude)
-  }, [spec, schema, op, meta])
-
-  // Top-level sections of the selected op's config, as flat sub-tabs: root
-  // fields group under "General", each nested config gets its own tab. No
-  // collapsed trees to dig through — a tab's fields are all visible at once.
-  const sections = useMemo(() => {
-    const rootFields = visibleSchema.filter((n) => n.kind === "field")
-    const out: { key: string; label: string; nodes: typeof visibleSchema }[] = []
-    if (rootFields.length > 0) out.push({ key: "__general", label: "General", nodes: rootFields })
-    for (const n of visibleSchema) {
-      if (n.kind === "group") out.push({ key: n.key, label: n.label, nodes: n.children })
-    }
-    return out
-  }, [visibleSchema])
   const [sectionKey, setSectionKey] = useState<string | null>(null)
   const section = sections.find((s) => s.key === sectionKey) ?? sections[0]
 
@@ -591,46 +565,26 @@ function AdvancedPanel({
   const matches = useMemo(
     () =>
       q
-        ? flattenFields(visibleSchema).filter(
-            (f) => f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q)
-          )
+        ? sections
+            .flatMap((s) => flattenFields(s.nodes))
+            .filter((f) => f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q))
         : null,
-    [q, visibleSchema]
+    [q, sections]
   )
 
-  const overrides = overridesByOp[op] ?? {}
+  const common = { overrides, disabled: false, onChange, onReset }
   const editedCount = Object.keys(overrides).length
-  const common = {
-    overrides,
-    disabled: false,
-    onChange: (key: string, value: FormValue) => onChange(op, { ...overrides, [key]: value }),
-    onReset: (key: string) => {
-      const next = { ...overrides }
-      delete next[key]
-      onChange(op, next)
-    },
-  }
 
+  if (sections.length === 0) {
+    return <p className="text-sm text-white/40">No advanced settings available on this host.</p>
+  }
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Rarely-needed per-operation overrides for anything not covered by the other tabs. Values set
-        here apply on top of the shared settings every time the operation runs.
+        Everything not covered by the other tabs. One value set here applies to{" "}
+        <span className="text-white/65">every operation</span> that uses the subsystem.
       </p>
       <div className="flex flex-wrap items-center gap-3">
-        <Select
-          value={op}
-          onChange={(e) => {
-            setOp(e.target.value as OperationId)
-            setSectionKey(null)
-            setQuery("")
-          }}
-          className="max-w-56"
-        >
-          {OPERATIONS.map((o) => (
-            <SelectOption key={o.id} value={o.id} label={o.label} />
-          ))}
-        </Select>
         <div className="relative min-w-48 flex-1">
           <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-white/30" />
           <Input
@@ -646,9 +600,7 @@ function AdvancedPanel({
           </span>
         )}
       </div>
-      {!spec ? (
-        <p className="text-sm text-white/40">This operation isn&apos;t available on the host.</p>
-      ) : matches ? (
+      {matches ? (
         <div className="flex max-w-xl flex-col gap-4">
           {matches.length === 0 ? (
             <p className="text-sm text-white/35">No matching config.</p>
@@ -658,25 +610,23 @@ function AdvancedPanel({
         </div>
       ) : (
         <>
-          {sections.length > 1 && (
-            <div className="flex flex-wrap gap-1">
-              {sections.map((s) => (
-                <button
-                  key={s.key}
-                  type="button"
-                  onClick={() => setSectionKey(s.key)}
-                  className={cn(
-                    "rounded-md px-2.5 py-1 text-xs capitalize whitespace-nowrap transition-colors",
-                    s.key === section?.key
-                      ? "bg-white/[0.08] text-white"
-                      : "text-white/55 hover:bg-white/[0.04] hover:text-white/80"
-                  )}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </div>
-          )}
+          <div className="flex flex-wrap gap-1">
+            {sections.map((s) => (
+              <button
+                key={s.key}
+                type="button"
+                onClick={() => setSectionKey(s.key)}
+                className={cn(
+                  "rounded-md px-2.5 py-1 text-xs whitespace-nowrap transition-colors",
+                  s.key === section?.key
+                    ? "bg-white/[0.08] text-white"
+                    : "text-white/55 hover:bg-white/[0.04] hover:text-white/80"
+                )}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
           {section && <FlatSchemaForm nodes={section.nodes} {...common} />}
         </>
       )}

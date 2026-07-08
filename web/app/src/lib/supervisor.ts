@@ -432,14 +432,24 @@ export interface SettingsCategory {
   settings: SettingsField[]
 }
 
+/** One canonical subsystem in the unified Advanced tree (serve/settings.py).
+ * Its values apply to every operation that has the subsystem. */
+export interface AdvancedSection {
+  key: string
+  label: string
+  nodes: SchemaNode[]
+}
+
 export interface SettingsSnapshot {
   /** Stored shared values keyed by canonical setting key (sparse: only set ones). */
   values: Record<string, SettingValue>
   /** Stored camera spec, or null when never configured on this host. */
   cameras: CameraSpec | null
-  /** Per-op advanced overrides (dotted config key -> value). */
-  opOverrides: Record<string, Record<string, FormValue>>
+  /** Advanced values keyed canonically (e.g. "axol.left.elbow.kp") — one
+   * source of truth, translated to each op's config path server-side. */
+  advanced: Record<string, FormValue>
   schema: SettingsCategory[]
+  advancedSchema: AdvancedSection[]
 }
 
 export interface SettingsPatch {
@@ -448,8 +458,8 @@ export interface SettingsPatch {
   cameras?: CameraSpec | null
   /** Must accompany `cameras: null` so clearing is distinguishable from omitting. */
   camerasSet?: boolean
-  /** Per-op wholesale replacement of the advanced overrides. */
-  opOverrides?: Record<string, Record<string, FormValue>>
+  /** Per-key merge of canonical advanced values; null resets a key. */
+  advanced?: Record<string, FormValue | null>
 }
 
 export async function fetchSettings(): Promise<SettingsSnapshot> {
@@ -457,26 +467,14 @@ export async function fetchSettings(): Promise<SettingsSnapshot> {
 }
 
 export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapshot> {
-  const res: Omit<SettingsSnapshot, "schema"> = await json(
+  const res: Omit<SettingsSnapshot, "schema" | "advancedSchema"> = await json(
     await fetch(apiUrl("/api/settings"), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(patch),
     })
   )
-  return { schema: [], ...res }
-}
-
-/** Every dotted config key on `op` that a shared setting manages — hidden from
- * the per-op advanced form so the shared settings stay the single source. */
-export function managedKeysForOp(schema: SettingsCategory[], op: string): Set<string> {
-  const keys = new Set<string>()
-  for (const cat of schema) {
-    for (const s of cat.settings) {
-      for (const k of s.targets[op] ?? []) keys.add(k)
-    }
-  }
-  return keys
+  return { schema: [], advancedSchema: [], ...res }
 }
 
 /** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */

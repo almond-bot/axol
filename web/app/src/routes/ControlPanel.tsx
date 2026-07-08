@@ -389,7 +389,11 @@ export default function ControlPanel() {
       return
     }
     const snap = await saveSettings(patch)
-    setSettingsSnap((prev) => ({ ...snap, schema: prev?.schema ?? snap.schema }))
+    setSettingsSnap((prev) => ({
+      ...snap,
+      schema: prev?.schema ?? snap.schema,
+      advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
+    }))
     if (snap.cameras) setCameras(snap.cameras)
   }
 
@@ -739,7 +743,6 @@ export default function ControlPanel() {
               supportError={settingsError}
               cameras={cameras}
               onSave={handleSettingsSave}
-              specs={commands}
               devices={cameraDevices}
               detecting={cameraDetecting}
               onRefresh={refreshCameras}
