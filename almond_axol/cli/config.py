@@ -480,6 +480,11 @@ class TeleopCmdConfig:
     """
 
     sim: bool = False
+    # Handheld UMI rig bench mode: drive the two handheld grippers (on
+    # can_alm_umi_l/r) from the Quest triggers while the arms exist only as
+    # the headset's URDF overlay — absolute pose mapping is forced on. No
+    # robot, no cameras, no recording. Mutually exclusive with --sim.
+    umi: bool = False
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)

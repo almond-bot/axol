@@ -49,6 +49,22 @@ def is_driver_available() -> bool:
     return subprocess.run([modinfo, "gs_usb"], capture_output=True).returncode == 0
 
 
+# USB IDs the installed driver must claim (modinfo alias fragments). A driver
+# missing any of them predates the vendored source and is rebuilt: 1d50:606f is
+# the Axol Hub / candleLight adapters, 16d0:117e is the off-the-shelf CANable
+# 2.0 used by the handheld UMI rig.
+_REQUIRED_ALIASES = ("v1D50p606F", "v16D0p117E")
+
+
+def _driver_supports_required_ids() -> bool:
+    """True when the available ``gs_usb`` claims every USB ID we rely on."""
+    modinfo = _find_modinfo()
+    if modinfo is None:
+        return False
+    out = subprocess.run([modinfo, "gs_usb"], capture_output=True, text=True).stdout
+    return all(alias in out for alias in _REQUIRED_ALIASES)
+
+
 def _build() -> Path:
     """Compile gs_usb.ko against the running kernel. Returns the .ko path."""
     kver = os.uname().release
@@ -88,19 +104,30 @@ def _install(ko: Path) -> None:
     run_root(["install", "-D", "-m", "644", str(ko), str(dest)], check=True)
     run_root(["depmod", "-a"], check=True)
     run_root(["tee", str(_MODULES_LOAD_FILE)], input_text="gs_usb\n", check=True)
+    # Reload so the freshly-installed module (and its device table) takes
+    # effect now — a bare modprobe is a no-op when an older gs_usb is already
+    # loaded. Best-effort: -r fails if an interface is up/in use, in which
+    # case the new module applies on the next replug or reboot.
+    run_root(["modprobe", "-r", "gs_usb"])
     run_root(["modprobe", "gs_usb"], check=True)
     print("  Done.")
 
 
 def ensure_driver() -> bool:
-    """Build and install gs_usb when the running kernel lacks it.
+    """Build and install gs_usb when the kernel's is missing or outdated.
 
-    Returns True when the driver was installed, False when it was already
-    available. Idempotent; safe to call from ``can.setup`` on every machine.
+    Rebuilds when no ``gs_usb`` is loadable *or* when the available one
+    doesn't claim every USB ID we support (e.g. an older vendored build that
+    predates CANable 2.0 support). Returns True when the driver was
+    (re)installed, False when it was already good. Idempotent; safe to call
+    from ``can.setup`` on every machine.
     """
-    if is_driver_available():
+    if is_driver_available() and _driver_supports_required_ids():
         return False
-    print("Kernel does not ship the gs_usb driver — building it from source.")
+    if is_driver_available():
+        print("Installed gs_usb driver lacks required USB IDs — rebuilding it.")
+    else:
+        print("Kernel does not ship the gs_usb driver — building it from source.")
     ko = _build()
     _install(ko)
     return True

@@ -27,6 +27,11 @@
 #define USB_CANDLELIGHT_VENDOR_ID  0x1209
 #define USB_CANDLELIGHT_PRODUCT_ID 0x2323
 
+/* CANable 2.0 running the stock canable2 firmware (github.com/normaldotcom/
+ * canable2) — the off-the-shelf adapters used by the handheld UMI rig. */
+#define USB_CANABLE2_VENDOR_ID     0x16d0
+#define USB_CANABLE2_PRODUCT_ID    0x117e
+
 /* Endpoint addresses are read from the interface descriptor at probe time
  * (backport of upstream "can: gs_usb: gs_usb_probe(): read endpoints from
  * interface descriptor"). Older firmware uses EP1 IN / EP2 OUT, newer
@@ -1078,6 +1083,8 @@ static const struct usb_device_id gs_usb_table[] = {
 				      USB_GSUSB_1_PRODUCT_ID, 0) },
 	{ USB_DEVICE_INTERFACE_NUMBER(USB_CANDLELIGHT_VENDOR_ID,
 				      USB_CANDLELIGHT_PRODUCT_ID, 0) },
+	{ USB_DEVICE_INTERFACE_NUMBER(USB_CANABLE2_VENDOR_ID,
+				      USB_CANABLE2_PRODUCT_ID, 0) },
 	{} /* Terminating entry */
 };
 

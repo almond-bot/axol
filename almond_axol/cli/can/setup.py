@@ -9,12 +9,15 @@ on a single USB device:
   channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
 
-``axol can.setup --umi`` configures a second adapter of the same model for the
-handheld UMI data-collection rig instead:
-  channel 0 (dev_id 0x0) -> can_alm_umi_l   (left gripper)
-  channel 1 (dev_id 0x1) -> can_alm_umi_r   (right gripper)
-The two profiles use separate udev rule files and startup scripts, so a machine
-can have both the robot and the UMI rig configured at once.
+``axol can.setup --umi`` configures the handheld UMI data-collection rig
+instead: **two off-the-shelf single-channel CANable adapters** (candleLight
+1d50:606f or CANable 2.0 16d0:117e), one per gripper, each keyed by its USB
+serial:
+  adapter A -> can_alm_umi_l   (left gripper)
+  adapter B -> can_alm_umi_r   (right gripper)
+Which adapter is left is chosen interactively at setup. The two profiles use
+separate udev rule files and startup scripts, so a machine can have both the
+robot and the UMI rig configured at once.
 """
 
 import subprocess
@@ -113,16 +116,57 @@ def _detect_serials() -> list[str]:
     return list(dict.fromkeys(serials))
 
 
-def _serial_in_rules(rules_file: Path) -> str | None:
-    """The adapter serial a previously-written rules file is keyed on, if any."""
+# USB IDs the UMI rig accepts: any gs_usb-compatible single-channel CANable —
+# candleLight-flashed (1d50:606f), CANable 2.0 stock firmware (16d0:117e), or
+# original candleLight (1209:2323). The vendored driver claims all of these.
+_UMI_USB_IDS = {("1d50", "606f"), ("16d0", "117e"), ("1209", "2323")}
+
+
+def _usb_attr(info: str, attr: str) -> str:
+    """First value of ``ATTRS{attr}`` (or ``ATTR{attr}``) in udevadm output."""
+    for line in info.splitlines():
+        if f"{{{attr}}}" in line and '=="' in line:
+            return line.split('=="')[1].split('"')[0]
+    return ""
+
+
+def _detect_umi_adapters() -> list[tuple[str, str, str]]:
+    """``(serial, vid, pid)`` of every attached UMI-compatible CAN adapter.
+
+    Scans the bound CAN network interfaces, so an adapter the running
+    ``gs_usb`` driver doesn't claim (e.g. a CANable 2.0 against an old driver
+    build) is invisible here — ``driver.ensure_driver()`` runs first to
+    prevent that. The Jetson's built-in mttcan controller has no USB vendor
+    attributes and is skipped naturally.
+    """
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for iface_path in sorted(Path("/sys/class/net").glob("can*")):
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        vid = _usb_attr(info, "idVendor").lower()
+        pid = _usb_attr(info, "idProduct").lower()
+        serial = _usb_attr(info, "serial")
+        if (vid, pid) in _UMI_USB_IDS and serial and serial not in seen:
+            seen.add(serial)
+            out.append((serial, vid, pid))
+    return out
+
+
+def _serials_in_rules(rules_file: Path) -> set[str]:
+    """Every adapter serial a previously-written rules file is keyed on."""
     try:
         content = rules_file.read_text()
     except OSError:
-        return None
+        return set()
+    serials: set[str] = set()
     for line in content.splitlines():
         if 'ATTRS{serial}=="' in line:
-            return line.split('ATTRS{serial}=="')[1].split('"')[0]
-    return None
+            serials.add(line.split('ATTRS{serial}=="')[1].split('"')[0])
+    return serials
 
 
 def _resolve_serial() -> str:
@@ -144,12 +188,12 @@ def _find_serial(profile: _Profile) -> str:
 
     unique = _detect_serials()
 
-    # When setting up a second profile, hide the serial the *other* profile's
-    # rules already claim so the obvious single-adapter case stays promptless.
-    other = _AXOL_PROFILE if profile is _UMI_PROFILE else _UMI_PROFILE
-    claimed = _serial_in_rules(other.rules_file)
+    # Hide serials the UMI profile's rules already claim (a candleLight
+    # CANable shares the hub's USB ID) so the obvious single-adapter case
+    # stays promptless.
+    claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
     if claimed and len(unique) > 1:
-        unique = [s for s in unique if s != claimed]
+        unique = [s for s in unique if s not in claimed]
 
     if not unique:
         print(
@@ -169,6 +213,83 @@ def _find_serial(profile: _Profile) -> str:
         print(f"    [{i}] {s}")
     idx = input("  Select adapter index [0]: ").strip() or "0"
     return unique[int(idx)]
+
+
+def _find_umi_assignment() -> dict[str, tuple[str, str, str]]:
+    """Interactively map the two UMI channel names to attached adapters.
+
+    Returns ``{interface_name: (serial, vid, pid)}`` for the left and right
+    grippers. Requires two UMI-compatible adapters to be attached (the serial
+    the robot-arm rules claim is excluded).
+    """
+    adapters = _detect_umi_adapters()
+    claimed = _serials_in_rules(_AXOL_PROFILE.rules_file)
+    adapters = [a for a in adapters if a[0] not in claimed]
+
+    if len(adapters) < 2:
+        _die(
+            f"Found {len(adapters)} UMI-compatible CAN adapter(s); need 2 "
+            "(one per gripper). Check both CANables are plugged in and the "
+            "gs_usb driver claims them (`axol can.driver`, then replug)."
+        )
+
+    print("  Found adapters:")
+    for i, (serial, vid, pid) in enumerate(adapters):
+        print(f"    [{i}] {serial}  ({vid}:{pid})")
+    idx_l = int(input("  Index of the LEFT gripper's adapter [0]: ").strip() or "0")
+    left = adapters[idx_l]
+    remaining = [a for i, a in enumerate(adapters) if i != idx_l]
+    if len(remaining) == 1:
+        right = remaining[0]
+        print(f"  Right gripper: {right[0]} ({right[1]}:{right[2]})")
+    else:
+        for i, (serial, vid, pid) in enumerate(remaining):
+            print(f"    [{i}] {serial}  ({vid}:{pid})")
+        idx_r = int(
+            input("  Index of the RIGHT gripper's adapter [0]: ").strip() or "0"
+        )
+        right = remaining[idx_r]
+    return {_UMI_PROFILE.left: left, _UMI_PROFILE.right: right}
+
+
+def _write_umi_udev_rules(assign: dict[str, tuple[str, str, str]]) -> None:
+    """Write per-serial rules naming each single-channel adapter's interface."""
+    print(f"Writing udev rules to {_UMI_PROFILE.rules_file} (requires sudo)...")
+    lines = [f"# {_UMI_PROFILE.label}: one single-channel CANable per gripper"]
+    for name, (serial, vid, pid) in assign.items():
+        side = "left" if name == _UMI_PROFILE.left else "right"
+        lines.append(f"# {side} gripper — adapter serial {serial}")
+        lines.append(
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{vid}", '
+            f'ATTRS{{idProduct}}=="{pid}", ATTRS{{serial}}=="{serial}", '
+            f'NAME="{name}"'
+        )
+    run_root(
+        ["tee", str(_UMI_PROFILE.rules_file)],
+        input_text="\n".join(lines) + "\n",
+        check=True,
+    )
+    print("  Done.")
+
+
+def _rename_umi_interfaces(assign: dict[str, tuple[str, str, str]]) -> None:
+    """Rename the assigned adapters' interfaces to their target names now."""
+    print("Renaming CAN interfaces (requires sudo)...")
+    by_serial = {serial: name for name, (serial, _vid, _pid) in assign.items()}
+    for iface_path in Path("/sys/class/net").glob("can*"):
+        iface = iface_path.name
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        new_name = by_serial.get(_usb_attr(info, "serial"))
+        if new_name is None or iface == new_name:
+            continue
+        print(f"  {iface} -> {new_name}")
+        run_root(["ip", "link", "set", iface, "down"], check=True)
+        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
+    print("  Done.")
 
 
 def _write_udev_rules(serial: str, profile: _Profile) -> None:
@@ -383,9 +504,25 @@ def _configure(serial: str, profile: _Profile) -> None:
 def run(args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     profile = _UMI_PROFILE if getattr(args, "umi", False) else _AXOL_PROFILE
-    driver.ensure_driver()
-    serial = _find_serial(profile)
-    _configure(serial, profile)
+    installed = driver.ensure_driver()
+    if installed:
+        # The freshly-loaded driver may claim adapters the old one ignored
+        # (CANable 2.0); give their interfaces a moment to appear.
+        import time
+
+        time.sleep(2.0)
+
+    if profile is _UMI_PROFILE:
+        assign = _find_umi_assignment()
+        _write_umi_udev_rules(assign)
+        _reload_udev()
+        _rename_umi_interfaces(assign)
+        _write_cron_script(profile)
+        _register_cron(profile)
+        _bring_up_can(profile)
+    else:
+        serial = _find_serial(profile)
+        _configure(serial, profile)
 
     print()
     print("Setup complete.")

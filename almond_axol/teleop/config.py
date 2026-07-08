@@ -156,3 +156,20 @@ class VRTeleopConfig:
     rotation_multiplier: float = 1.0
     absolute_mode: bool = False
     base_height: float | None = None
+
+
+def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
+    """Force the UMI handheld-rig mapping/faithfulness profile in place.
+
+    Shared by ``collect-data --umi`` and ``teleop --umi`` so the two flows
+    behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
+    alignment act), and transparent smoothing — the EMA and trapezoid filters
+    exist to protect a physical arm and only add lag between the solution and
+    where the hand actually was, so with no arm to protect the joints should
+    follow the raw IK output.
+    """
+    config.absolute_mode = True
+    config.ik_alpha = 1.0
+    config.teleop_max_vel = 1e6
+    config.teleop_max_accel = 1e6
+    config.engage_max_vel = 1e6

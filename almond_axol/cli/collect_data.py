@@ -102,17 +102,15 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
         cfg.robot_config = UmiRobotConfig(**kwargs)
 
     if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+        from ..teleop.config import apply_umi_teleop_profile
+
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.ik_alpha != 1.0:
             _logger.info(
                 "--umi: forcing absolute_mode, ik_alpha=1.0, and transparent "
                 "trapezoid limits on the teleop config."
             )
-        tc.absolute_mode = True
-        tc.ik_alpha = 1.0
-        tc.teleop_max_vel = 1e6
-        tc.teleop_max_accel = 1e6
-        tc.engage_max_vel = 1e6
+        apply_umi_teleop_profile(tc)
 
 
 def _default_robot_config() -> AxolRobotConfig:

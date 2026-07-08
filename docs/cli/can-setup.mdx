@@ -12,14 +12,18 @@ One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Installs 
 axol can.setup
 ```
 
-For the handheld UMI data-collection rig (a second adapter of the same model, each channel wired to one Damiao gripper), pass `--umi`. It uses its own udev rule file and startup script, so the robot and the rig can be configured on the same machine:
+For the handheld UMI data-collection rig — **two off-the-shelf single-channel CANable adapters** (candleLight `1d50:606f` or CANable 2.0 `16d0:117e`), one wired to each Damiao gripper — pass `--umi`. Setup lists the attached adapters by USB serial and asks which one is the left gripper. It uses its own udev rule file and startup script, so the robot and the rig can be configured on the same machine:
 
-- Left gripper → `can_alm_umi_l`
-- Right gripper → `can_alm_umi_r`
+- Left gripper's adapter → `can_alm_umi_l`
+- Right gripper's adapter → `can_alm_umi_r`
 
 ```bash
 axol can.setup --umi
 ```
+
+<Note>
+  CANable 2.0 support requires the vendored `gs_usb` driver build that claims `16d0:117e`; `can.setup` rebuilds and reloads the driver automatically when the installed one is older.
+</Note>
 
 <Note>
   `sudo` will be invoked automatically where required.

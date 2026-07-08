@@ -27,6 +27,7 @@ Runs on the **real robot by default**; pass `--sim` for the browser visualizer. 
 | Flag | Description |
 |---|---|
 | `--sim` | Use the software visualizer instead of the real robot. Bare `--sim` works (or `--sim true`). Omit to run on real hardware (the default). |
+| `--umi` | Handheld UMI rig bench mode: the Quest triggers drive the two real grippers on `can_alm_umi_l/r` (see [`can.setup --umi`](/cli/can-setup)) while the arms exist only as the headset's translucent URDF overlay — no robot, no cameras, no recording. Forces the same absolute-mapping profile as `collect-data --umi`, so this validates controller↔URDF alignment, trigger→gripper actuation, and IK tracking before collecting data. Mutually exclusive with `--sim`. |
 | `--left_channel <ch\|null>` | CAN channel for the left arm; `null` disables it. Default: `CAN_LEFT`. |
 | `--right_channel <ch\|null>` | CAN channel for the right arm; `null` disables it. Default: `CAN_RIGHT`. |
 | `--axol.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar (`0.8`) or a 7-element list (`[0.8,0.8,0.5,0.5,0.2,0.2,0.0]`, one per arm joint in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. See [`AxolConfig.left_stiffness`](/api/robot). |

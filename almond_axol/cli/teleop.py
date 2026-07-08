@@ -34,21 +34,21 @@ def _get_local_ip() -> str:
 
 
 def _normalize_sim_flag(argv: list[str]) -> list[str]:
-    """Let ``--sim`` be passed as a bare flag.
+    """Let ``--sim`` / ``--umi`` be passed as bare flags.
 
     draccus parses bool fields as value-taking arguments (``--sim true``),
-    so rewrite a standalone ``--sim`` (one that's followed by another flag
-    or nothing) into ``--sim true``. An explicit ``--sim true`` / ``--sim
-    false`` / ``--sim=...`` is left untouched.
+    so rewrite a standalone ``--sim`` or ``--umi`` (one that's followed by
+    another flag or nothing) into ``--sim true`` / ``--umi true``. An explicit
+    ``--sim true`` / ``--sim false`` / ``--sim=...`` is left untouched.
     """
     out: list[str] = []
     i = 0
     while i < len(argv):
         tok = argv[i]
-        if tok == "--sim":
+        if tok in ("--sim", "--umi"):
             nxt = argv[i + 1] if i + 1 < len(argv) else None
             if nxt is None or nxt.startswith("-"):
-                out.extend(("--sim", "true"))
+                out.extend((tok, "true"))
                 i += 1
                 continue
         out.append(tok)
@@ -281,10 +281,29 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
-    from ..robot import Axol, Sim
+    from ..robot import Axol, Sim, Umi
     from ..teleop import VRTeleop
 
-    if cfg.sim:
+    if cfg.umi and cfg.sim:
+        raise SystemExit("--umi and --sim are mutually exclusive")
+
+    if cfg.umi:
+        # Handheld UMI rig bench mode: the Quest triggers drive the two real
+        # grippers; the arms exist only as the headset's URDF overlay. Force
+        # the same absolute-mapping profile collect-data --umi uses so the
+        # bench test exercises exactly what collection will.
+        from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
+        from ..teleop.config import apply_umi_teleop_profile
+
+        left = cfg.left_channel
+        right = cfg.right_channel
+        if left == CAN_LEFT:
+            left = CAN_UMI_LEFT
+        if right == CAN_RIGHT:
+            right = CAN_UMI_RIGHT
+        apply_umi_teleop_profile(cfg.teleop)
+        robot = Umi(config=cfg.axol, left_channel=left, right_channel=right)
+    elif cfg.sim:
         robot = Sim()
     else:
         robot = Axol(
