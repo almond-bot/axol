@@ -514,7 +514,7 @@ function SettingRow({
   }
 
   const text = set ? String(value) : ""
-  const placeholder = field.default == null ? "unset" : String(field.default)
+  const placeholder = field.default != null ? String(field.default) : (field.defaultText ?? "unset")
   return (
     <div className="flex flex-col gap-1.5">
       {labelNode}

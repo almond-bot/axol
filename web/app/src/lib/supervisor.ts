@@ -418,6 +418,8 @@ export interface SettingsField {
   options: string[] | null
   /** Resolved from the op config dataclass defaults (null if unresolvable). */
   default: SettingValue | null
+  /** What a null default actually does (e.g. the LeRobot cache dir), for the placeholder. */
+  defaultText?: string | null
   ui: SettingsFieldUI
   /** op id -> dotted config keys this setting drives on that op. */
   targets: Record<string, string[]>

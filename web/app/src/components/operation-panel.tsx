@@ -20,6 +20,7 @@ import {
   type SessionInfo,
 } from "@/lib/supervisor"
 import { CuratedForm } from "@/components/config-form"
+import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -76,6 +77,9 @@ export function OperationPanel({
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
   const runFields = useMemo(() => (spec ? perRunFields(spec, meta) : []), [spec, meta])
+  // Gravity-comp's joint subset gets a proper picker instead of a text field.
+  const jointField = runFields.find((f) => f.key === "free_joints")
+  const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
   const isSim = meta.id === "teleop" && Boolean(settings.sim)
   const robotOk = robot?.state === "connected"
@@ -159,13 +163,23 @@ export function OperationPanel({
                       </button>
                     )}
                   </div>
-                  <CuratedForm
-                    fields={runFields}
-                    overrides={settings}
-                    disabled={live}
-                    onChange={onChange}
-                    onReset={onReset}
-                  />
+                  {textFields.length > 0 && (
+                    <CuratedForm
+                      fields={textFields}
+                      overrides={settings}
+                      disabled={live}
+                      onChange={onChange}
+                      onReset={onReset}
+                    />
+                  )}
+                  {jointField && (
+                    <ArmJointPicker
+                      value={settings[jointField.key]}
+                      disabled={live}
+                      onChange={(v) => onChange(jointField.key, v)}
+                      onReset={() => onReset(jointField.key)}
+                    />
+                  )}
                 </>
               )}
 

@@ -30,7 +30,7 @@ import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _logger = logging.getLogger(__name__)
 
@@ -53,7 +53,10 @@ class SettingDef:
     ``targets`` maps an operation id to the dotted config key(s) this setting
     sets on that op (build_argv turns them into CLI-style overrides). ``ui``
     carries optional widget hints for the front-end (slider ranges, the pose
-    editor). ``options`` makes it a dropdown.
+    editor). ``options`` makes it a dropdown. ``effective_default`` describes
+    what actually happens when the config default is ``None`` (e.g. "the
+    LeRobot cache dir", "inference runs locally") — shown as the placeholder
+    instead of an unhelpful "unset"; a callable is resolved on the serve host.
     """
 
     key: str
@@ -63,6 +66,7 @@ class SettingDef:
     targets: dict[str, tuple[str, ...]]
     options: tuple[str, ...] | None = None
     ui: dict[str, Any] = field(default_factory=dict)
+    effective_default: "str | Callable[[], str] | None" = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +79,16 @@ class SettingCategory:
 
 def _all_ops(*keys: str) -> dict[str, tuple[str, ...]]:
     return {op: keys for op in _OPS}
+
+
+def _lerobot_dataset_root() -> str:
+    """The directory datasets actually land in when ``root`` is unset."""
+    try:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        return str(HF_LEROBOT_HOME)
+    except Exception:  # noqa: BLE001 - lerobot extra may be absent (dev host)
+        return "~/.cache/huggingface/lerobot"
 
 
 SETTINGS: tuple[SettingCategory, ...] = (
@@ -395,6 +409,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Dataset root",
                 type="text",
                 help="Local directory datasets are written to / read from.",
+                effective_default=_lerobot_dataset_root,
                 targets={
                     "collect-data": ("root",),
                     "run-policy": ("root",),
@@ -416,6 +431,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Rerun viewer IP",
                 type="text",
                 help="Stream live visualization to a Rerun viewer at this address.",
+                effective_default="off — not streaming to a Rerun viewer",
                 targets={
                     "collect-data": ("rerun_ip",),
                     "run-policy": ("rerun_ip",),
@@ -454,6 +470,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "Address of a remote `axol inference-server`. Leave unset "
                     "to run inference locally."
                 ),
+                effective_default="local — inference runs on this machine",
                 targets={"run-policy": ("server_host",)},
             ),
             SettingDef(
@@ -575,6 +592,18 @@ def settings_schema() -> list[dict[str, Any]]:
                 if leaf is not None:
                     default = leaf
                     break
+            # A None default usually still *does* something (the LeRobot cache
+            # dir, local inference, …) — spell that out instead of "unset".
+            default_text: str | None = None
+            if default is None and s.effective_default is not None:
+                try:
+                    default_text = (
+                        s.effective_default()
+                        if callable(s.effective_default)
+                        else s.effective_default
+                    )
+                except Exception:  # noqa: BLE001 - placeholder is cosmetic
+                    default_text = None
             fields.append(
                 {
                     "key": s.key,
@@ -583,6 +612,7 @@ def settings_schema() -> list[dict[str, Any]]:
                     "help": s.help,
                     "options": list(s.options) if s.options else None,
                     "default": default,
+                    "defaultText": default_text,
                     "ui": s.ui,
                     "targets": {op: list(keys) for op, keys in s.targets.items()},
                 }

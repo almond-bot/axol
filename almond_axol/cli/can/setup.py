@@ -10,6 +10,7 @@ on a single USB device:
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -77,18 +78,63 @@ def _detect_serials() -> list[str]:
     return list(dict.fromkeys(serials))
 
 
+def _serial_of_interface(iface: str) -> str | None:
+    """The USB serial behind a named CAN interface, or None if it's absent."""
+    iface_path = Path("/sys/class/net") / iface
+    if not iface_path.exists():
+        return None
+    info = subprocess.run(
+        ["udevadm", "info", "-a", "-p", str(iface_path)],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return next(
+        (line.split('"')[1] for line in info.splitlines() if "ATTRS{serial}" in line),
+        None,
+    )
+
+
+def _configured_serial() -> str | None:
+    """The Axol adapter's serial as pinned by a *previous* setup, if any.
+
+    Preferred over live adapter detection: other candlelight devices (e.g. a
+    UMI rig's CAN adapter) share the same generic VID/PID, so a host with
+    several attached is ambiguous to a fresh scan — but not to a machine
+    that has already named its Axol interfaces or written its udev rules.
+    """
+    for iface in (_CAN_L, _CAN_R):
+        serial = _serial_of_interface(iface)
+        if serial:
+            return serial
+    try:
+        rules = _UDEV_RULES_FILE.read_text()
+    except OSError:
+        return None
+    match = re.search(r'ATTRS\{serial\}=="([^"]+)"', rules)
+    return match.group(1) if match else None
+
+
 def _resolve_serial() -> str:
     """Pick the adapter serial without prompting (for headless ``ensure_setup``).
 
-    Raises ``RuntimeError`` when zero or several adapters are present, since
+    A previously configured serial (named ``can_alm_axol_*`` interfaces, or
+    the pinned serial in the udev rules) wins outright, so re-running setup on
+    an already-configured host works no matter how many other candlelight
+    adapters are attached. Only a genuinely fresh machine falls back to live
+    detection — and raises when zero or several adapters are present, since
     that needs the interactive ``axol can.setup`` flow to disambiguate.
     """
+    configured = _configured_serial()
+    if configured:
+        return configured
     unique = _detect_serials()
     if len(unique) == 1:
         return unique[0]
     if not unique:
         raise RuntimeError("Robot not detected")
-    raise RuntimeError("Multiple CAN adapters")
+    raise RuntimeError(
+        "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
+    )
 
 
 def _find_serial() -> str:
