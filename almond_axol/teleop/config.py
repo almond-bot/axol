@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
@@ -156,6 +158,22 @@ class VRTeleopConfig:
     rotation_multiplier: float = 1.0
     absolute_mode: bool = False
     base_height: float | None = None
+    # Gripper TCP position in each controller's local (targetRaySpace) frame,
+    # metres — the physical controller→jaw lever arm of the UMI mount. When
+    # set, absolute mode anchors tracking (and the URDF overlay) to the
+    # physical gripper TCP instead of the controller body, so the virtual
+    # gripper sits on the real one and wrist rotations don't smear the offset
+    # into position error. Measure with ``axol umi.calibrate`` (saved offsets
+    # are auto-loaded by the --umi profile); ``None`` falls back to absorbing
+    # the offset into the engage snapshot (controller-anchored).
+    tcp_offset_left: list[float] | None = None
+    tcp_offset_right: list[float] | None = None
+
+
+# Pivot-calibrated controller→TCP offsets saved by ``axol umi.calibrate`` and
+# auto-loaded by :func:`apply_umi_teleop_profile` when the config leaves them
+# unset.
+UMI_TCP_OFFSET_FILE = Path.home() / ".almond" / "umi" / "tcp_offset.json"
 
 
 def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
@@ -178,3 +196,15 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     config.teleop_max_accel = 1e6
     config.engage_max_vel = 1e6
     config.pose_min_cutoff = 5.0
+
+    # Adopt the pivot-calibrated controller→TCP offsets unless the config
+    # already sets them explicitly.
+    if config.tcp_offset_left is None or config.tcp_offset_right is None:
+        try:
+            data = json.loads(UMI_TCP_OFFSET_FILE.read_text())
+        except (OSError, ValueError):
+            data = {}
+        if config.tcp_offset_left is None and "left" in data:
+            config.tcp_offset_left = [float(v) for v in data["left"]]
+        if config.tcp_offset_right is None and "right" in data:
+            config.tcp_offset_right = [float(v) for v in data["right"]]

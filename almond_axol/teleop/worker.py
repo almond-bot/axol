@@ -219,6 +219,18 @@ class IKWorker:
         # coords), so the web client can render the URDF at the calibrated
         # base. ``None`` until the first engage.
         self.abs_base_msg: dict[str, list[float]] | None = None
+        # Pivot-calibrated gripper-TCP position in each controller's local
+        # frame (``axol umi.calibrate``). When present, tracking anchors to
+        # the physical TCP; otherwise the lever arm is absorbed into the
+        # engage snapshot (controller-anchored).
+        self._tcp_offsets: dict[str, np.ndarray | None] = {
+            "left": np.asarray(config.tcp_offset_left, dtype=np.float64)
+            if config.tcp_offset_left is not None
+            else None,
+            "right": np.asarray(config.tcp_offset_right, dtype=np.float64)
+            if config.tcp_offset_right is not None
+            else None,
+        }
 
         freq = config.frequency
         mc = config.pose_min_cutoff
@@ -538,6 +550,16 @@ class IKWorker:
         """
         fk_l, fk_r = self._rest_fk_poses()
 
+        # Anchor the fit at the physical gripper TCPs when the controller→TCP
+        # lever arm is calibrated; otherwise the controller origins stand in
+        # for them (and the residual is absorbed into the offsets below).
+        off_l, off_r = self._tcp_offsets["left"], self._tcp_offsets["right"]
+        l_pos_raw, r_pos_raw = l_pos, r_pos
+        if off_l is not None:
+            l_pos = l_pos + l_rot @ off_l
+        if off_r is not None:
+            r_pos = r_pos + r_rot @ off_r
+
         # URDF base frame: +x = left, +y = forward, +z = up (the rest-pose
         # grippers sit at x = ±0.20 in it). Base up aligns with world up; base
         # +x aligns with the horizontal right→left gripper direction.
@@ -567,18 +589,26 @@ class IKWorker:
         }
 
         def _offset(
+            side: str,
             ctrl_pos: np.ndarray,
             ctrl_rot: np.ndarray,
             fk_pose: tuple[np.ndarray, np.ndarray],
         ) -> tuple[np.ndarray, np.ndarray]:
             fk_pos, fk_rot = fk_pose
-            p_w_tcp = R_wb @ fk_pos + t_wb
             r_w_tcp = R_wb @ fk_rot
-            return ctrl_rot.T @ (p_w_tcp - ctrl_pos), ctrl_rot.T @ r_w_tcp
+            r_off = ctrl_rot.T @ r_w_tcp
+            calibrated = self._tcp_offsets[side]
+            if calibrated is not None:
+                # ``ctrl_pos`` is already the physical TCP (adjusted above),
+                # so the position lever arm is the calibrated one, exactly —
+                # engage sloppiness moves the base, never the lever arm.
+                return calibrated, r_off
+            p_w_tcp = R_wb @ fk_pos + t_wb
+            return ctrl_rot.T @ (p_w_tcp - ctrl_pos), r_off
 
         self._abs_offset = {
-            "left": _offset(l_pos, l_rot, fk_l),
-            "right": _offset(r_pos, r_rot, fk_r),
+            "left": _offset("left", l_pos_raw, l_rot, fk_l),
+            "right": _offset("right", r_pos_raw, r_rot, fk_r),
         }
 
     def _absolute_target(
