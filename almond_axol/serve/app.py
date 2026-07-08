@@ -484,6 +484,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse(
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
+        # A faulted motor (over-temp, stall, encoder error, unreachable, …)
+        # must block every hardware operation — driving through a fault risks
+        # the arm. Sim teleop never touches the motors, so it stays allowed.
+        is_sim = req.op == "teleop" and bool(req.args.get("sim"))
+        if not is_sim:
+            faults = await asyncio.to_thread(robot.motor_faults)
+            if faults:
+                detail = ", ".join(
+                    f"{f['arm']} {f['joint'].lower()} ({f['problem']})" for f in faults
+                )
+                return JSONResponse(
+                    {"error": f"motor fault — fix before starting: {detail}"},
+                    status_code=409,
+                )
         try:
             session = runner.start(
                 req.op, req.args, cameras=req.cameras, loop=asyncio.get_running_loop()

@@ -52,6 +52,41 @@ STATE_ERROR = "error"
 _IFF_UP = 0x1
 
 
+# Motor status names that are healthy at idle: OK, or DISABLED (motors sit
+# disabled between tasks). Anything else — over-temp/voltage/current, stall,
+# encoder faults, lost comm — is a fault an operation must not start over.
+_HEALTHY_MOTOR_STATUSES = {"OK", "DISABLED", None}
+
+
+def motor_faults(
+    motors: list[dict[str, Any]], *, connected: bool
+) -> list[dict[str, Any]]:
+    """Faulted motors from a serialized health list: unreachable or errored.
+
+    Only meaningful while the link is connected (the idle ping keeps the health
+    fresh); an unconnected link reports no faults rather than stale ones.
+    """
+    if not connected:
+        return []
+    faults: list[dict[str, Any]] = []
+    for m in motors:
+        if not m["reachable"]:
+            problem = "unreachable"
+        elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
+            problem = str(m["status"]).replace("_", " ").lower()
+        else:
+            continue
+        faults.append(
+            {
+                "arm": m["arm"],
+                "joint": m["joint"],
+                "problem": problem,
+                "temperature": m.get("temperature"),
+            }
+        )
+    return faults
+
+
 def _format_error(exc: BaseException) -> str:
     """Short, human-readable error for the UI status pill.
 
@@ -274,6 +309,10 @@ class RobotLink:
             return
         self._set_state(STATE_CONNECTED)
 
+    def motor_faults(self) -> list[dict[str, Any]]:
+        """Current motor faults (see :func:`motor_faults`); [] when not connected."""
+        return self.status()["faults"]
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             state = self._state
@@ -289,6 +328,8 @@ class RobotLink:
                         "joint": joint.name,
                         "reachable": bool(h.get("reachable", False)),
                         "status": h.get("status"),
+                        "temperature": h.get("temperature"),
+                        "voltage": h.get("voltage"),
                     }
                 )
         reachable = sum(1 for m in motors if m["reachable"])
@@ -300,6 +341,9 @@ class RobotLink:
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
+            "faults": motor_faults(
+                motors, connected=state in (STATE_CONNECTED, STATE_BUSY)
+            ),
         }
 
     def motor_details(self, arm: str, joint_name: str) -> dict[str, Any]:

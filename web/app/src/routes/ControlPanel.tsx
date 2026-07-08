@@ -45,7 +45,7 @@ import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
-import { SettingsDialog, type SettingsTab } from "@/components/settings/settings-dialog"
+import { SettingsSection, type SettingsTab } from "@/components/settings/settings-section"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 
@@ -143,8 +143,10 @@ export default function ControlPanel() {
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("cameras")
+  // Anchor for the on-page settings card, so "…live in Settings" links can
+  // scroll to it.
+  const settingsRef = useRef<HTMLDivElement>(null)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
 
@@ -372,7 +374,7 @@ export default function ControlPanel() {
 
   function openSettings(tab: SettingsTab = "cameras") {
     setSettingsTab(tab)
-    setSettingsOpen(true)
+    settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
   }
 
   // Persist a settings-dialog save: cameras also mirror to localStorage (the
@@ -726,16 +728,27 @@ export default function ControlPanel() {
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
-          cameras={cameras}
-          cameraDevices={cameraDevices}
-          cameraDetectError={cameraDetectError}
-          cameraDetecting={cameraDetecting}
-          onConfigureCameras={() => openSettings("cameras")}
-          onOpenSettings={() => openSettings(settingsTab === "cameras" ? "robot" : settingsTab)}
-          usb={usb}
-          usbBusy={usbBusy}
-          onUsbConnect={() => usbConnectClick()}
         />
+
+        {conn.state === "ok" && (
+          <div ref={settingsRef} className="scroll-mt-4">
+            <SettingsSection
+              tab={settingsTab}
+              onTabChange={setSettingsTab}
+              snapshot={settingsSnap}
+              supportError={settingsError}
+              cameras={cameras}
+              onSave={handleSettingsSave}
+              specs={commands}
+              devices={cameraDevices}
+              detecting={cameraDetecting}
+              onRefresh={refreshCameras}
+              usb={usb}
+              usbBusy={usbBusy}
+              onUsbConnect={() => usbConnectClick()}
+            />
+          </div>
+        )}
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
 
@@ -778,20 +791,6 @@ export default function ControlPanel() {
         onChangeHost={updateServerHost}
         conn={conn}
         onConnect={() => loadServer(serverHost)}
-      />
-      <SettingsDialog
-        open={settingsOpen}
-        tab={settingsTab}
-        onTabChange={setSettingsTab}
-        onClose={() => setSettingsOpen(false)}
-        snapshot={settingsSnap}
-        supportError={settingsError}
-        cameras={cameras}
-        onSave={handleSettingsSave}
-        specs={commands}
-        devices={cameraDevices}
-        detecting={cameraDetecting}
-        onRefresh={refreshCameras}
       />
     </div>
   )

@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react"
-import { Download, Loader2, RotateCcw, Settings2, Upload, X } from "lucide-react"
+import { useMemo, useRef, useState } from "react"
+import { Download, Loader2, Plug, RotateCcw, Upload } from "lucide-react"
 import {
   OPERATIONS,
   filterSchema,
@@ -15,6 +15,7 @@ import {
   type SettingsPatch,
   type SettingsSnapshot,
   type SettingValue,
+  type UsbStatus,
 } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -23,13 +24,14 @@ import { Select, SelectOption } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
 import { Switch } from "@/components/ui/switch"
 import { useToast } from "@/components/ui/toast"
+import { Card } from "@/components/ui/card"
 import { ConfigForm } from "@/components/config-form"
 import { materializeCameraSpec } from "@/lib/camera-spec"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
 import { cn } from "@/lib/utils"
 
-export type SettingsTab = string // "cameras" | "pose" | "advanced" | a schema category key
+export type SettingsTab = string // "cameras" | "usb" | "pose" | "advanced" | a category key
 
 interface Draft {
   values: Record<string, SettingValue>
@@ -38,17 +40,16 @@ interface Draft {
 }
 
 /**
- * The shared settings dialog: everything that isn't a per-run input, split
- * into categories (Cameras, Robot, Teleop & VR, Rest pose, Recording,
- * Inference, System, plus per-op Advanced overrides). Values are persisted on
- * the serve host (~/.almond/settings.json) and folded into every operation
- * start, so they're shared across operations and operator devices.
+ * The shared settings, tabbed directly on the control panel page: everything
+ * that isn't a per-run input — Cameras, Quest USB, Robot, Teleop & VR, Rest
+ * pose, Recording, Inference, System, plus per-op Advanced overrides. Values
+ * persist on the serve host (~/.almond/settings.json) and are folded into
+ * every operation start, so they're shared across operations and operator
+ * devices. Edits stage locally until **Save**.
  */
-export function SettingsDialog({
-  open,
+export function SettingsSection({
   tab,
   onTabChange,
-  onClose,
   snapshot,
   supportError,
   cameras,
@@ -57,11 +58,12 @@ export function SettingsDialog({
   devices,
   detecting,
   onRefresh,
+  usb,
+  usbBusy,
+  onUsbConnect,
 }: {
-  open: boolean
   tab: SettingsTab
   onTabChange: (tab: SettingsTab) => void
-  onClose: () => void
   /** Server-stored settings + schema; null while loading or on an old host. */
   snapshot: SettingsSnapshot | null
   /** Why the settings API is unavailable (old serve host), else null. */
@@ -74,30 +76,15 @@ export function SettingsDialog({
   devices: CameraDevice[] | null
   detecting: boolean
   onRefresh: () => void
+  usb: UsbStatus | null
+  usbBusy: boolean
+  onUsbConnect: () => void
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
   const [saving, setSaving] = useState(false)
-  const [wasOpen, setWasOpen] = useState(false)
+  const [seedKey, setSeedKey] = useState("")
   const fileRef = useRef<HTMLInputElement>(null)
-
-  // (Re)seed the draft on each open ("adjust state when props change" — set
-  // during render, not in an effect). The dialog owns its draft while open;
-  // reseeding on snapshot changes would clobber in-progress edits.
-  if (open !== wasOpen) {
-    setWasOpen(open)
-    if (open) {
-      setDraft({
-        values: { ...(snapshot?.values ?? {}) },
-        cameras,
-        opOverrides: Object.fromEntries(
-          Object.entries(snapshot?.opOverrides ?? {}).map(([op, v]) => [op, { ...v }])
-        ),
-      })
-    }
-  }
-
-  const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
 
   const patch = useMemo(
     () => (draft ? computePatch(snapshot, cameras, draft, devices) : null),
@@ -105,31 +92,40 @@ export function SettingsDialog({
   )
   const dirty = patch != null && Object.keys(patch).length > 0
 
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && requestClose()
-    window.addEventListener("keydown", onKey)
-    return () => window.removeEventListener("keydown", onKey)
+  // Seed / reseed the draft from the stored state ("adjust state when props
+  // change" — set during render, not in an effect). While the operator has
+  // unsaved edits, incoming server state must not clobber them; once clean
+  // (including right after a save), the draft follows the store again.
+  const seedDraft = (): Draft => ({
+    values: { ...(snapshot?.values ?? {}) },
+    cameras,
+    opOverrides: Object.fromEntries(
+      Object.entries(snapshot?.opOverrides ?? {}).map(([op, v]) => [op, { ...v }])
+    ),
   })
-
-  if (!open || !draft) return null
-
-  function requestClose() {
-    if (dirty && !window.confirm("Discard unsaved settings changes?")) return
-    onClose()
+  const nextSeedKey = JSON.stringify([snapshot?.values, snapshot?.opOverrides, cameras])
+  if (nextSeedKey !== seedKey && (draft == null || !dirty)) {
+    setSeedKey(nextSeedKey)
+    setDraft(seedDraft())
   }
+
+  const schema = useMemo(() => snapshot?.schema ?? [], [snapshot])
 
   async function save() {
     if (!patch) return
     setSaving(true)
     try {
       await onSave(patch)
-      onClose()
     } catch (e) {
       toast.error(String(e).replace(/^Error:\s*/, ""))
     } finally {
       setSaving(false)
     }
+  }
+
+  function discard() {
+    setSeedKey(nextSeedKey)
+    setDraft(seedDraft())
   }
 
   function setValue(key: string, value: SettingValue | null) {
@@ -180,9 +176,13 @@ export function SettingsDialog({
     }
   }
 
-  // Sidebar: Cameras first (the most-touched), then the schema categories with
-  // the pose editor slotted after Teleop & VR, then per-op Advanced overrides.
-  const tabs: { key: SettingsTab; label: string }[] = [{ key: "cameras", label: "Cameras" }]
+  // Tab order: the hardware attached to the host first (Cameras, Quest USB),
+  // then the behaviour categories with the pose editor after Teleop & VR,
+  // then the per-op Advanced overrides.
+  const tabs: { key: SettingsTab; label: string }[] = [
+    { key: "cameras", label: "Cameras" },
+    { key: "usb", label: "Quest USB" },
+  ]
   for (const cat of schema) {
     tabs.push({ key: cat.key, label: cat.label })
     if (cat.key === "teleop") tabs.push({ key: "pose", label: "Rest pose" })
@@ -194,110 +194,106 @@ export function SettingsDialog({
     schema.find((c) => c.key === "teleop")?.settings.filter((s) => s.ui.widget === "pose") ?? []
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm sm:p-8">
-      <div className="absolute inset-0" onClick={requestClose} aria-hidden />
-      <div className="relative z-10 my-auto flex max-h-[88vh] w-full max-w-3xl flex-col rounded-2xl border border-white/10 bg-[#161616] shadow-2xl">
-        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-          <div className="flex items-center gap-2">
-            <Settings2 className="size-4 text-[#eff483]" />
-            <span className="font-heading text-base font-semibold">Settings</span>
-            <span className="text-xs text-white/35">shared by all operations on this robot</span>
-          </div>
+    <Card className="gap-0 p-0">
+      <div className="flex items-center justify-between gap-3 border-b border-white/10 px-5 pt-4 pb-0">
+        <span className="pb-3 font-mono text-xs tracking-widest text-white/40 uppercase">
+          Settings
+        </span>
+        <span className="hidden pb-3 text-xs text-white/35 sm:block">
+          shared by all operations on this robot
+        </span>
+      </div>
+
+      {/* Horizontal tab bar */}
+      <nav className="flex gap-1 overflow-x-auto border-b border-white/10 px-3 py-2">
+        {tabs.map((t) => (
           <button
+            key={t.key}
             type="button"
-            onClick={requestClose}
-            className="text-white/40 transition-colors hover:text-white/80"
-            aria-label="Close"
-          >
-            <X className="size-5" />
-          </button>
-        </div>
-
-        <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
-          {/* Category nav: horizontal chips on phones, sidebar on wider screens. */}
-          <nav className="flex shrink-0 gap-1 overflow-x-auto border-b border-white/10 p-2 sm:w-44 sm:flex-col sm:overflow-visible sm:border-r sm:border-b-0 sm:p-3">
-            {tabs.map((t) => (
-              <button
-                key={t.key}
-                type="button"
-                onClick={() => onTabChange(t.key)}
-                className={cn(
-                  "rounded-lg px-3 py-2 text-left text-sm whitespace-nowrap transition-colors",
-                  t.key === tab
-                    ? "bg-[#eff483]/10 text-[#eff483]"
-                    : "text-white/60 hover:bg-white/[0.05] hover:text-white/85"
-                )}
-              >
-                {t.label}
-              </button>
-            ))}
-          </nav>
-
-          <div className="min-h-0 flex-1 overflow-y-auto p-5">
-            {supportError && tab !== "cameras" ? (
-              <UpdateRequired error={supportError} />
-            ) : tab === "cameras" ? (
-              <CamerasPanel
-                spec={draft.cameras}
-                onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
-                devices={devices}
-                detecting={detecting}
-                onRefresh={onRefresh}
-              />
-            ) : tab === "pose" ? (
-              <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
-            ) : tab === "advanced" ? (
-              <AdvancedPanel
-                specs={specs}
-                schema={schema}
-                overridesByOp={draft.opOverrides}
-                onChange={(op, next) =>
-                  setDraft((d) => (d ? { ...d, opOverrides: { ...d.opOverrides, [op]: next } } : d))
-                }
-              />
-            ) : activeCategory ? (
-              <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
-            ) : (
-              <p className="text-sm text-white/40">Loading settings…</p>
+            onClick={() => onTabChange(t.key)}
+            className={cn(
+              "rounded-lg px-3 py-1.5 text-sm whitespace-nowrap transition-colors",
+              t.key === tab
+                ? "bg-[#eff483]/10 text-[#eff483]"
+                : "text-white/60 hover:bg-white/[0.05] hover:text-white/85"
             )}
-          </div>
-        </div>
+          >
+            {t.label}
+          </button>
+        ))}
+      </nav>
 
-        <div className="flex items-center justify-between gap-2 border-t border-white/10 px-5 py-3">
-          <div className="flex items-center gap-1">
-            <Button variant="ghost" size="sm" onClick={exportFile}>
-              <Download />
-              Export
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => fileRef.current?.click()}>
-              <Upload />
-              Import
-            </Button>
-            <input
-              ref={fileRef}
-              type="file"
-              accept="application/json"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0]
-                if (file) file.text().then(importFile)
-                e.target.value = ""
-              }}
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            {dirty && <span className="text-xs text-white/40">Unsaved changes</span>}
-            <Button variant="outline" size="sm" onClick={requestClose}>
-              Cancel
-            </Button>
-            <Button size="sm" onClick={save} disabled={!dirty || saving}>
-              {saving && <Loader2 className="animate-spin" />}
-              Save
-            </Button>
-          </div>
+      <div className="p-5">
+        {!draft ? (
+          <p className="text-sm text-white/40">Loading settings…</p>
+        ) : supportError && tab !== "cameras" && tab !== "usb" ? (
+          <UpdateRequired error={supportError} />
+        ) : tab === "cameras" ? (
+          <CamerasPanel
+            spec={draft.cameras}
+            onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+            devices={devices}
+            detecting={detecting}
+            onRefresh={onRefresh}
+          />
+        ) : tab === "usb" ? (
+          <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
+        ) : tab === "pose" ? (
+          <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
+        ) : tab === "advanced" ? (
+          <AdvancedPanel
+            specs={specs}
+            schema={schema}
+            overridesByOp={draft.opOverrides}
+            onChange={(op, next) =>
+              setDraft((d) => (d ? { ...d, opOverrides: { ...d.opOverrides, [op]: next } } : d))
+            }
+          />
+        ) : activeCategory ? (
+          <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
+        ) : (
+          <p className="text-sm text-white/40">Loading settings…</p>
+        )}
+      </div>
+
+      <div className="flex items-center justify-between gap-2 border-t border-white/10 px-5 py-3">
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="sm" onClick={exportFile}>
+            <Download />
+            Export
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => fileRef.current?.click()}>
+            <Upload />
+            Import
+          </Button>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file) file.text().then(importFile)
+              e.target.value = ""
+            }}
+          />
+        </div>
+        <div className="flex items-center gap-2">
+          {dirty && (
+            <>
+              <span className="text-xs text-white/40">Unsaved changes</span>
+              <Button variant="outline" size="sm" onClick={discard}>
+                Discard
+              </Button>
+            </>
+          )}
+          <Button size="sm" onClick={save} disabled={!dirty || saving}>
+            {saving && <Loader2 className="animate-spin" />}
+            Save
+          </Button>
         </div>
       </div>
-    </div>
+    </Card>
   )
 }
 
@@ -351,6 +347,66 @@ function UpdateRequired({ error }: { error: string }) {
   )
 }
 
+/** The Quest-over-USB pose link: live status + connect, from the old tile. */
+function UsbPanel({
+  usb,
+  usbBusy,
+  onUsbConnect,
+}: {
+  usb: UsbStatus | null
+  usbBusy: boolean
+  onUsbConnect: () => void
+}) {
+  const dotClass = !usb
+    ? "bg-white/30"
+    : !usb.installed
+      ? "bg-amber-400"
+      : usb.ready
+        ? "bg-emerald-400"
+        : usb.state === "none"
+          ? "bg-white/30"
+          : "bg-amber-400"
+  const label = !usb
+    ? "—"
+    : !usb.installed
+      ? "adb not installed"
+      : usb.ready
+        ? "Controller over USB"
+        : usb.state === "device"
+          ? "Headset ready"
+          : usb.state === "none"
+            ? "No headset"
+            : usb.state === "unauthorized"
+              ? "Authorize on headset"
+              : usb.state
+  return (
+    <div className="flex max-w-prose flex-col gap-4">
+      <p className="text-xs text-white/45">
+        Plug the Quest into the Axol host over USB to stream controller poses over the cable instead
+        of Wi-Fi (lower latency). The link is set up automatically when an authorized headset is
+        detected — accept the <span className="text-white/70">Allow USB debugging?</span> prompt on
+        the headset the first time. Camera video keeps using the LAN; a dropped cable fails over to
+        Wi-Fi instantly.
+      </p>
+      <div className="flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
+        <div className="flex items-center gap-2 text-sm">
+          <span className={cn("size-2 shrink-0 rounded-full", dotClass)} />
+          <span className="text-white/75">{label}</span>
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onUsbConnect}
+          disabled={usbBusy || usb?.installed === false}
+        >
+          {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+          {usb?.ready ? "Reconnect" : "Connect"}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 /** One settings category rendered as proper controls (not bare text boxes). */
 function CategoryPanel({
   category,
@@ -363,7 +419,7 @@ function CategoryPanel({
 }) {
   const fields = category.settings.filter((s) => s.ui.widget !== "pose")
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex max-w-xl flex-col gap-5">
       <p className="text-xs text-white/45">{category.description}</p>
       {fields.map((f) => (
         <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />
@@ -519,9 +575,9 @@ function AdvancedPanel({
   const editedCount = Object.keys(overrides).length
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex max-w-xl flex-col gap-4">
       <p className="text-xs text-white/45">
-        Rarely-needed per-operation overrides for anything not covered by the categories. Values set
+        Rarely-needed per-operation overrides for anything not covered by the other tabs. Values set
         here apply on top of the shared settings every time the operation runs.
       </p>
       <div className="flex items-center gap-3">

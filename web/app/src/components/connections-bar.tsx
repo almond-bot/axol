@@ -1,14 +1,7 @@
-import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power, Usb } from "lucide-react"
+import { AlertTriangle, Cpu, Loader2, Plug, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import {
-  cameraCount,
-  missingCameraSerials,
-  type CameraDevice,
-  type CameraSpec,
-  type RobotStatus,
-  type UsbStatus,
-} from "@/lib/supervisor"
+import { motorFaultLabel, type RobotStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -55,7 +48,7 @@ function Tile({
           {label}
         </span>
       </div>
-      {/* optional extra detail (e.g. the Axol motor grid) */}
+      {/* optional extra detail (e.g. the Axol motor grid + fault list) */}
       {extra}
       {/* action — pinned to the bottom so the buttons align across the row */}
       {children && <div className="mt-auto flex justify-end pt-1">{children}</div>}
@@ -63,6 +56,12 @@ function Tile({
   )
 }
 
+/**
+ * The two connection tiles: the Axol Host (the machine running `axol serve`)
+ * and the Axol robot itself, with live per-motor health and any active motor
+ * faults called out (a fault blocks every hardware operation from starting).
+ * Cameras and Quest USB live in the Settings tabs below.
+ */
 export function ConnectionsBar({
   conn,
   host,
@@ -74,15 +73,6 @@ export function ConnectionsBar({
   robotBusy,
   onRobotConnect,
   onRobotDisconnect,
-  cameras,
-  cameraDevices,
-  cameraDetectError,
-  cameraDetecting,
-  onConfigureCameras,
-  onOpenSettings,
-  usb,
-  usbBusy,
-  onUsbConnect,
 }: {
   conn: ConnState
   host: string
@@ -95,19 +85,6 @@ export function ConnectionsBar({
   robotBusy: boolean
   onRobotConnect: () => void
   onRobotDisconnect: () => void
-  cameras: CameraSpec
-  /** Detected ZED devices on the serve host (null until first detection). */
-  cameraDevices: CameraDevice[] | null
-  /** Why detection couldn't run (SDK/daemon issue), else null. */
-  cameraDetectError: string | null
-  /** A ZED enumeration is currently in flight. */
-  cameraDetecting: boolean
-  onConfigureCameras: () => void
-  /** Open the shared Settings dialog (robot/teleop/recording/…). */
-  onOpenSettings: () => void
-  usb: UsbStatus | null
-  usbBusy: boolean
-  onUsbConnect: () => void
 }) {
   const online = conn === "ok"
 
@@ -125,10 +102,11 @@ export function ConnectionsBar({
 
   // -- robot --
   const rs = robot?.state ?? "disconnected"
+  const faults = robot?.faults ?? []
   const robotDot: Dot =
     rs === "connected"
-      ? robot && robot.reachableCount < robot.motorCount
-        ? "warn"
+      ? faults.length > 0
+        ? "err"
         : "ok"
       : rs === "busy"
         ? "busy"
@@ -139,7 +117,9 @@ export function ConnectionsBar({
             : "idle"
   const robotLabel =
     rs === "connected"
-      ? `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 16} motors`
+      ? faults.length > 0
+        ? `${faults.length} motor ${faults.length > 1 ? "faults" : "fault"}`
+        : `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 16} motors healthy`
       : rs === "busy"
         ? "In use by task"
         : rs === "connecting"
@@ -148,62 +128,8 @@ export function ConnectionsBar({
             ? robot?.error || "Error"
             : "Disconnected"
 
-  // -- cameras --
-  // "Configured" only counts assigned serials; the green badge must also mean
-  // those cameras are actually *connected*. Once we have a detection result we
-  // cross-check the assigned serials against it: any that aren't physically
-  // present flip the badge red (x/N connected) instead of a misleading N/3.
-  const camCount = cameraCount(cameras)
-  const camMissing =
-    camCount > 0 && cameraDevices ? missingCameraSerials(cameras, cameraDevices) : []
-  let camDot: Dot
-  let camLabel: string
-  if (camCount === 0) {
-    camDot = "idle"
-    camLabel = "Not configured"
-  } else if (cameraDetecting && cameraDevices == null) {
-    // First detection still in flight (nothing to verify against yet).
-    camDot = "busy"
-    camLabel = "Detecting…"
-  } else if (cameraDetectError) {
-    // Detection itself couldn't run (SDK not installed, daemon hung): we can't
-    // confirm the cameras, so warn rather than claim they're connected.
-    camDot = "warn"
-    camLabel = "Can't detect cameras"
-  } else if (camMissing.length > 0) {
-    camDot = "err"
-    camLabel = `${camCount - camMissing.length}/${camCount} connected`
-  } else {
-    camDot = "ok"
-    camLabel = `${camCount}/3 configured`
-  }
-
-  // -- quest usb (adb reverse pose tunnel) --
-  const usbDot: Dot = !usb
-    ? "idle"
-    : !usb.installed
-      ? "warn"
-      : usb.ready
-        ? "ok"
-        : usb.state === "none"
-          ? "idle"
-          : "warn"
-  const usbLabel = !usb
-    ? "—"
-    : !usb.installed
-      ? "adb not installed"
-      : usb.ready
-        ? "Controller over USB"
-        : usb.state === "device"
-          ? "Headset ready"
-          : usb.state === "none"
-            ? "No headset"
-            : usb.state === "unauthorized"
-              ? "Authorize on headset"
-              : usb.state
-
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -219,27 +145,15 @@ export function ConnectionsBar({
         }
       >
         {online ? (
-          <div className="flex items-center gap-1.5">
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={onOpenSettings}
-              aria-label="Open settings"
-              title="Shared settings (robot, teleop, recording, inference)"
-              className="size-8"
-            >
-              <Settings2 />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={onHostDisconnect}
-              aria-label="Disconnect Axol Host"
-              className="size-8"
-            >
-              <Power />
-            </Button>
-          </div>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={onHostDisconnect}
+            aria-label="Disconnect Axol Host"
+            className="size-8"
+          >
+            <Power />
+          </Button>
         ) : (
           <Button variant="outline" size="sm" onClick={onOpenSetup}>
             <Plug />
@@ -255,7 +169,12 @@ export function ConnectionsBar({
         label={robotLabel}
         pulse={rs === "connecting"}
         extra={
-          robot && (rs === "connected" || rs === "busy") ? <MotorGrid robot={robot} /> : undefined
+          robot && (rs === "connected" || rs === "busy") ? (
+            <div className="flex flex-col gap-2">
+              <MotorGrid robot={robot} />
+              {faults.length > 0 && <MotorFaults robot={robot} />}
+            </div>
+          ) : undefined
         }
       >
         {rs === "connected" || rs === "busy" ? (
@@ -281,39 +200,14 @@ export function ConnectionsBar({
           </Button>
         )}
       </Tile>
-
-      <Tile
-        icon={<Camera className="size-3.5" />}
-        title="Cameras"
-        dot={camDot}
-        label={camLabel}
-        pulse={camDot === "busy"}
-      >
-        <Button variant="outline" size="sm" onClick={onConfigureCameras} disabled={!online}>
-          <Settings2 />
-          Configure
-        </Button>
-      </Tile>
-
-      <Tile icon={<Usb className="size-3.5" />} title="Quest USB" dot={usbDot} label={usbLabel}>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onUsbConnect}
-          disabled={!online || usbBusy || usb?.installed === false}
-        >
-          {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-          {usb?.ready ? "Reconnect" : "Connect"}
-        </Button>
-      </Tile>
     </div>
   )
 }
 
 /**
- * Compact 16-dot motor health, sized to sit inline in the Axol tile header
- * (two clusters of 8 dots, prefixed with a faint L / R) so the tile stays the
- * same height as the others.
+ * Compact 16-dot motor health (two clusters of 8 dots, prefixed with a faint
+ * L / R). A dot is red for any fault — unreachable *or* an error status —
+ * and its tooltip carries the details (status, temperature, voltage).
  */
 export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
@@ -326,18 +220,49 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
           <div className="flex gap-[3px]">
             {robot.motors
               .filter((m) => m.arm === arm)
-              .map((m) => (
-                <span
-                  key={m.joint}
-                  className={cn(
-                    "size-2 rounded-[2px]",
-                    m.reachable ? "bg-emerald-400/80" : "bg-red-400/60"
-                  )}
-                />
-              ))}
+              .map((m) => {
+                const healthy = m.reachable && (m.status === "OK" || m.status === "DISABLED")
+                const details = [
+                  m.reachable ? (m.status ?? "unknown") : "unreachable",
+                  m.temperature != null ? `${Math.round(m.temperature)}°C` : null,
+                  m.voltage != null ? `${m.voltage.toFixed(1)}V` : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
+                return (
+                  <span
+                    key={m.joint}
+                    title={`${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}: ${details}`}
+                    className={cn(
+                      "size-2 rounded-[2px]",
+                      healthy ? "bg-emerald-400/80" : "bg-red-400/60"
+                    )}
+                  />
+                )
+              })}
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+/** The active motor faults, spelled out — these block every hardware task. */
+function MotorFaults({ robot }: { robot: RobotStatus }) {
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-red-400/25 bg-red-400/[0.06] px-2.5 py-2">
+      {(robot.faults ?? []).map((f) => (
+        <div
+          key={`${f.arm}:${f.joint}`}
+          className="flex items-center gap-1.5 text-xs text-red-300/90"
+        >
+          <AlertTriangle className="size-3 shrink-0" />
+          <span className="truncate">{motorFaultLabel(f)}</span>
+        </div>
+      ))}
+      <span className="text-[0.65rem] text-white/40">
+        Operations are blocked until every motor fault is cleared.
+      </span>
     </div>
   )
 }

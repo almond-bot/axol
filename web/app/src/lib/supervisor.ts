@@ -173,7 +173,19 @@ export interface MotorHealth {
   arm: string
   joint: string
   reachable: boolean
+  /** MotorStatus name from the idle ping (e.g. "OK", "OVER_TEMPERATURE"). */
   status: string | null
+  temperature: number | null
+  voltage: number | null
+}
+
+/** A motor an operation must not drive through: unreachable or errored. */
+export interface MotorFault {
+  arm: string
+  joint: string
+  /** Human-readable problem, e.g. "unreachable", "over temperature". */
+  problem: string
+  temperature: number | null
 }
 
 export interface RobotStatus {
@@ -184,6 +196,16 @@ export interface RobotStatus {
   motors: MotorHealth[]
   motorCount: number
   reachableCount: number
+  /** Faulted motors while connected (server-computed); [] otherwise. */
+  faults?: MotorFault[]
+}
+
+/** Short display label for a fault, e.g. "L elbow — over temperature (78°C)". */
+export function motorFaultLabel(f: MotorFault): string {
+  const joint = f.joint.replace(/_/g, " ").toLowerCase()
+  const temp =
+    f.problem.includes("temp") && f.temperature != null ? ` (${Math.round(f.temperature)}°C)` : ""
+  return `${f.arm[0].toUpperCase()} ${joint} — ${f.problem}${temp}`
 }
 
 export async function fetchRobotStatus(): Promise<RobotStatus> {

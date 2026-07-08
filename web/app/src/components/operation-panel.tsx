@@ -10,6 +10,7 @@ import {
 } from "lucide-react"
 import {
   cameraCount,
+  motorFaultLabel,
   perRunFields,
   type CameraSpec,
   type CommandSpec,
@@ -82,10 +83,18 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
+  // A faulted motor blocks every hardware operation (the server refuses the
+  // start too) — driving through an over-temp / stalled / unreachable motor
+  // risks the arm. Sim never touches the motors.
+  if (!isSim) {
+    for (const f of robot?.faults ?? []) {
+      blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
+    }
+  }
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {
-    blockers.push("Assign at least one camera serial in Settings → Cameras")
+    blockers.push("Assign at least one camera serial in the Cameras settings tab")
   }
   for (const f of runFields) {
     if (f.required) {
