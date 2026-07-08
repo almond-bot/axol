@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Activity, Cable, Compass, Crosshair, Loader2, Radio, Tag, Wrench } from "lucide-react"
+import { Activity, Cable, Crosshair, Loader2, Radio, Tag, Wrench } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { SiteNav } from "@/components/site-nav"
@@ -11,6 +11,7 @@ import {
   ActionDialog,
   ActiveRunPanel,
   DiagnosticActions,
+  type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
 import {
   TelemetryChart,
@@ -307,40 +308,47 @@ export default function Diagnostics() {
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
-  // Motor calibration tools surfaced as buttons in the Motors header. Two of
-  // them share motor.set-zero-pos: presets split it into "one motor" and
-  // "guided walk of every joint" entry points.
-  const MOTOR_TOOLS = [
+  // Motor calibration tools surfaced as buttons in the Motors header. Zeroing
+  // is one button whose dialog tabs between "specific motor" and the guided
+  // walk of every joint (both back motor.set-zero-pos via presets).
+  const MOTOR_TOOLS: {
+    key: string
+    command: string
+    label: string
+    icon: typeof Tag
+    description?: string
+    modes?: ActionMode[]
+  }[] = [
     {
       key: "set-can-id",
       command: "motor.set-can-id",
       label: "Set CAN ID",
       icon: Tag,
-      description: undefined as string | undefined,
-      presetArgs: undefined as Record<string, FormValue> | undefined,
-      hideKeys: undefined as string[] | undefined,
     },
     {
-      key: "zero-motor",
+      key: "zero",
       command: "motor.set-zero-pos",
-      label: "Zero motor",
+      label: "Set zero position",
       icon: Crosshair,
-      description:
-        "Set one motor's zero to its current mechanical position (persisted to flash). " +
-        "Damiao motors need a power cycle afterwards.",
-      presetArgs: undefined,
-      hideKeys: ["guided"],
-    },
-    {
-      key: "guided-zero",
-      command: "motor.set-zero-pos",
-      label: "Guided zeroing",
-      icon: Compass,
-      description:
-        "Walk every joint of one arm and zero each against its closer end stop — " +
-        "each step pauses with instructions and a Continue button.",
-      presetArgs: { guided: true } as Record<string, FormValue>,
-      hideKeys: ["id", "type"],
+      modes: [
+        {
+          key: "single",
+          label: "Specific motor",
+          description:
+            "Set one motor's zero to its current mechanical position (persisted to " +
+            "flash). Damiao motors need a power cycle afterwards.",
+          hideKeys: ["guided"],
+        },
+        {
+          key: "guided",
+          label: "Guided",
+          description:
+            "Walk every joint of one arm and zero each against its closer end stop — " +
+            "each step pauses with instructions and a Continue button.",
+          presetArgs: { guided: true },
+          hideKeys: ["id", "type"],
+        },
+      ],
     },
   ]
   const [motorTool, setMotorTool] = useState<string | null>(null)
@@ -577,14 +585,13 @@ export default function Diagnostics() {
         />
       </main>
 
-      {/* Motor calibration tool dialog (Set CAN ID / Zero motor / Guided zeroing) */}
+      {/* Motor calibration tool dialog (Set CAN ID / Set zero position) */}
       {openTool && openToolSpec && (
         <ActionDialog
           spec={openToolSpec}
           title={openTool.label}
           description={openTool.description}
-          presetArgs={openTool.presetArgs}
-          hideKeys={openTool.hideKeys}
+          modes={openTool.modes}
           running={activeRun?.command === openTool.command}
           blocked={activeRun != null && activeRun.command !== openTool.command}
           busy={launchBusy}

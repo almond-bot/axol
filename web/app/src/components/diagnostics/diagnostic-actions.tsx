@@ -257,11 +257,21 @@ function JointPicker({
   )
 }
 
+/** One way of running a command inside its dialog (a tab). */
+export interface ActionMode {
+  key: string
+  label: string
+  description?: string
+  presetArgs?: Record<string, FormValue>
+  hideKeys?: string[]
+}
+
 /**
  * Parameter dialog for a catalog command. `presetArgs` are merged into the
  * launch args without appearing in the form, and `hideKeys` removes fields
- * the preset already decides — this is how one command backs two entry
- * points (e.g. single-motor vs guided zeroing).
+ * the preset already decides. `modes` renders those as selectable tabs, so
+ * one command backs several entry points (e.g. single-motor vs guided
+ * zeroing).
  */
 export function ActionDialog({
   spec,
@@ -269,6 +279,7 @@ export function ActionDialog({
   description,
   presetArgs,
   hideKeys,
+  modes,
   running,
   blocked,
   busy,
@@ -282,6 +293,7 @@ export function ActionDialog({
   description?: string
   presetArgs?: Record<string, FormValue>
   hideKeys?: string[]
+  modes?: ActionMode[]
   running: boolean
   blocked: boolean
   busy: boolean
@@ -292,10 +304,22 @@ export function ActionDialog({
 }) {
   const [overrides, setOverrides] = useState<Record<string, FormValue>>({})
   const [missing, setMissing] = useState<string[]>([])
+  const [modeKey, setModeKey] = useState(modes?.[0]?.key ?? null)
+  const mode = modes?.find((m) => m.key === modeKey) ?? null
 
+  const effectivePresets = useMemo(
+    () => ({ ...(presetArgs ?? {}), ...(mode?.presetArgs ?? {}) }),
+    [presetArgs, mode]
+  )
   const hidden = useMemo(
-    () => new Set([...HIDDEN_FLAGS, ...(hideKeys ?? []), ...Object.keys(presetArgs ?? {})]),
-    [hideKeys, presetArgs]
+    () =>
+      new Set([
+        ...HIDDEN_FLAGS,
+        ...(hideKeys ?? []),
+        ...(mode?.hideKeys ?? []),
+        ...Object.keys(effectivePresets),
+      ]),
+    [hideKeys, mode, effectivePresets]
   )
   const allFields = useMemo(() => flattenFields(spec.schema), [spec])
   const jointsField = useMemo(
@@ -324,7 +348,7 @@ export function ActionDialog({
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
     if (hasWebPrompts) args.web_prompts = true
-    Object.assign(args, presetArgs ?? {})
+    Object.assign(args, effectivePresets)
     onLaunch(args)
   }
 
@@ -341,7 +365,7 @@ export function ActionDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">{title ?? spec.label}</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              {description ?? spec.description}
+              {mode?.description ?? description ?? spec.description}
             </p>
           </div>
           <Button
@@ -354,6 +378,26 @@ export function ActionDialog({
             <X />
           </Button>
         </div>
+
+        {modes && modes.length > 1 && (
+          <div className="flex self-start overflow-hidden rounded-md border border-white/10">
+            {modes.map((m) => (
+              <button
+                key={m.key}
+                type="button"
+                onClick={() => setModeKey(m.key)}
+                className={cn(
+                  "px-3 py-1.5 text-xs transition-colors",
+                  modeKey === m.key
+                    ? "bg-[#eff483]/15 text-[#eff483]"
+                    : "text-white/50 hover:bg-white/[0.05]"
+                )}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        )}
 
         {!spec.available && <p className="text-xs text-red-300">Unavailable: {spec.error}</p>}
         {disabled && !running && (
