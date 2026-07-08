@@ -614,7 +614,7 @@ export const OPERATIONS: OperationMeta[] = [
   },
   {
     id: "gravity-comp",
-    label: "Gravity Compensation",
+    label: "Gravity compensation",
     description: "Hold the arms weightless so they can be moved by hand.",
     fields: ["free_joints"],
     requiresRobot: true,
@@ -623,7 +623,7 @@ export const OPERATIONS: OperationMeta[] = [
   },
   {
     id: "collect-data",
-    label: "Collect Data",
+    label: "Collect data",
     description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
     fields: ["repo_id", "task"],
     requiresRobot: true,
@@ -632,7 +632,7 @@ export const OPERATIONS: OperationMeta[] = [
   },
   {
     id: "replay-dataset",
-    label: "Replay Dataset",
+    label: "Replay dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
     fields: ["repo_id", "episode", "loop"],
     requiresRobot: true,
@@ -641,7 +641,7 @@ export const OPERATIONS: OperationMeta[] = [
   },
   {
     id: "run-policy",
-    label: "Run Policy",
+    label: "Run policy",
     description:
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
     fields: ["policy_path", "policy_type", "task", "repo_id"],

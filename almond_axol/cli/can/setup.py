@@ -278,7 +278,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def _rx_alive() -> bool:
+def rx_alive() -> bool:
     """True when at least one motor answers on either arm.
 
     Verifies the adapter's receive path, not just the interface state: the
@@ -309,11 +309,11 @@ def _rx_alive() -> bool:
     return asyncio.run(probe_all())
 
 
-def _bring_up_can() -> None:
+def bring_up_can() -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`_rx_alive`, so a bring-up
+    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
     that lands in the wedge is recovered by exactly one more cycle. A robot
     with its motors powered off is indistinguishable from the wedge, hence the
     bounded retries and the warning instead of an error.
@@ -321,7 +321,7 @@ def _bring_up_can() -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
     for attempt in range(3):
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
-        if _rx_alive():
+        if rx_alive():
             print("  Done — motors responding.")
             return
         if attempt < 2:
@@ -356,7 +356,7 @@ def ensure_setup(*, serial: str | None = None) -> None:
     _rename_interfaces(serial)
     _write_cron_script()
     _register_cron()
-    _bring_up_can()
+    bring_up_can()
 
 
 def run(_args: object = None) -> None:

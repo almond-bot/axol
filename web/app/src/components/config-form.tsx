@@ -12,7 +12,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { cn } from "@/lib/utils"
+import { cn, sentenceCase } from "@/lib/utils"
 
 interface CommonProps {
   overrides: Record<string, FormValue>
@@ -155,9 +155,9 @@ function GroupTable({
                 <th
                   key={`${c.sub}:${c.index ?? ""}`}
                   title={c.sub}
-                  className="px-1 pb-0.5 text-center text-[0.65rem] font-medium whitespace-nowrap text-white/45 capitalize"
+                  className="px-1 pb-0.5 text-center text-[0.65rem] font-medium whitespace-nowrap text-white/45"
                 >
-                  {c.label.replace(/_/g, " ")}
+                  {sentenceCase(c.label.replace(/_/g, " "))}
                 </th>
               ))}
             </tr>
@@ -165,8 +165,8 @@ function GroupTable({
           <tbody>
             {groups.map((g) => (
               <tr key={g.key}>
-                <td className="pr-2 text-xs whitespace-nowrap text-white/60 capitalize">
-                  {g.label}
+                <td className="pr-2 text-xs whitespace-nowrap text-white/60">
+                  {sentenceCase(g.label)}
                 </td>
                 {columns.map((c) => {
                   const field = fieldAt(g, c.sub)
@@ -317,7 +317,7 @@ export function FieldRow({
         {showPath ? (
           <span className="font-mono text-xs text-white/55">{field.key}</span>
         ) : (
-          <span className="capitalize">{field.label}</span>
+          <span>{sentenceCase(field.label)}</span>
         )}
       </Label>
       {field.required && <span className="text-xs text-[#eff483]">*</span>}

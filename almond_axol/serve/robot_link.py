@@ -449,26 +449,42 @@ class RobotLink:
     def _enable_can(self) -> None:
         """Bring up the CAN interfaces.
 
-        1. If the interfaces are already up, do nothing (common case: cron
-           brought them up at boot).
-        2. Otherwise run the full ``can.setup`` (driver, udev rules, persistent
-           names, @reboot bring-up, then bring-up) non-interactively.
+        1. If the interfaces are already up AND a motor answers, do nothing
+           (common case: cron brought them up at boot).
+        2. If they're up but silent, re-run the bring-up script: the
+           dual-channel gs_usb adapter can sit in a TX-only wedge where
+           everything looks healthy kernel-side but no received frame is ever
+           delivered — a down/up cycle recovers it (see ``can.setup``'s
+           ``rx_alive``). Motors that are simply powered off look the same;
+           the extra flap is harmless then.
+        3. Otherwise run the full ``can.setup`` (driver, udev rules,
+           persistent names, @reboot bring-up, then bring-up)
+           non-interactively.
 
-        We always run the full setup rather than just the persisted startup
-        script (``can.enable``): on a fresh axol the script doesn't exist yet,
-        and on a partially-configured one the driver may be unloaded or the
-        interfaces unnamed, so the bare bring-up script can't connect. The
-        whole setup is idempotent (see :func:`ensure_setup`), so re-running it
-        on an already-configured machine is safe and cheap.
+        We run the full setup rather than just the persisted startup script
+        (``can.enable``) when the interfaces are down: on a fresh axol the
+        script doesn't exist yet, and on a partially-configured one the driver
+        may be unloaded or the interfaces unnamed, so the bare bring-up script
+        can't connect. The whole setup is idempotent (see
+        :func:`ensure_setup`), so re-running it on an already-configured
+        machine is safe and cheap.
 
         ``axol serve`` runs as root under the hosted install, so the privileged
         steps inside :func:`ensure_setup` run without a sudo prompt.
         """
-        if self._can_already_up():
-            _logger.info("CAN interfaces already up; skipping bring-up.")
-            return
+        from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
 
-        from ..cli.can.setup import ensure_setup
+        if self._can_already_up():
+            if rx_alive():
+                _logger.info("CAN interfaces already up; motors responding.")
+                return
+            _logger.warning(
+                "CAN interfaces are up but no motor answers (adapter RX may "
+                "be wedged, or the motors are powered off) — re-cycling the "
+                "interfaces."
+            )
+            bring_up_can()
+            return
 
         _logger.info("CAN interfaces down; running can.setup.")
         ensure_setup()

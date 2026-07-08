@@ -52,9 +52,9 @@ When a newer [release](https://github.com/almond-bot/axol/releases) than the ins
 The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
 
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
-- Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R** — hover a dot for that motor's status, temperature, and voltage).
+- Pings all 16 motors once per second while idle, so the tile reflects live motor health as two rows of squares (grouped **L** / **R**): the top row is **CAN reachability**, the bottom row the motor's **error status**. Hover any square for the details (status, temperature).
 
-**Motor faults are surfaced and block everything.** A motor that is unreachable or reporting an error status (over-temperature, over-current, stall, encoder error, …) turns its dot red, flips the tile to a red *N motor faults* state, and lists each fault by joint (e.g. *R elbow — over temperature (81°C)*). While any fault is active, every hardware operation's **Start** is blocked — both in the panel and by the server itself — since driving through a faulted motor risks the arm. Sim teleop stays available.
+**Motor faults block everything.** The *N/16 motors* count only includes motors that are both reachable **and** error-free. While any motor is unreachable or reporting an error (over-temperature, over-current, stall, encoder error, …), every hardware operation's **Start** is blocked — both in the panel (a per-fault entry under *Before you can start*) and by the server itself — since driving through a faulted motor risks the arm. Sim teleop stays available.
 
 The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
@@ -71,7 +71,7 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | **Cameras** | The camera setup described [below](#cameras). |
 | **Quest USB** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
 | **Robot** | Left/right arm stiffness sliders, CAN channels, gripper torque limit and max speed (both grippers), gravity-comp damping and rate. |
-| **Teleop & VR** | Teleop control rate, position and rotation multipliers, return-to-rest speed. |
+| **Teleop & VR** | Teleop control rate, position and rotation multipliers. |
 | **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
 | **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
 | **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
@@ -109,10 +109,10 @@ Pick an operation from the selector. Each panel asks only for its **per-run inpu
 | Operation | Needs | Notes |
 |---|---|---|
 | **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
-| **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
-| **Collect Data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
-| **Replay Dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**. |
-| **Run Policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
+| **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
+| **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**. |
+| **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
 ### Before you can start
 
@@ -126,7 +126,7 @@ Starting an operation streams its logs into the console at the bottom of the pag
 
 ## Run Policy episode controls
 
-While **Run Policy** is live, an **Episode control** box appears in the operation card with three buttons:
+While **Run policy** is live, an **Episode control** box appears in the operation card with three buttons:
 
 | Button | Effect |
 |---|---|
@@ -137,7 +137,7 @@ While **Run Policy** is live, an **Episode control** box appears in the operatio
 These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
 
 <Note>
-  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
+  **Collect data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
 </Note>
 
 ## Next steps
