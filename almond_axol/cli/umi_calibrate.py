@@ -100,6 +100,22 @@ async def _capture_side(server, side: str) -> list[tuple[np.ndarray, np.ndarray]
     return poses
 
 
+async def _hold_grippers_closed(umi) -> None:
+    """Keep both grippers firmly closed for the duration of the session.
+
+    The pivot fit needs the jaw tip rigid relative to the controller; limp
+    (unpowered) jaws would wander. Transient CAN errors are swallowed — a
+    dead bus was already reported at enable time.
+    """
+    hold = np.zeros(8, dtype=np.float32)
+    while True:
+        try:
+            await umi.motion_control(left=hold, right=hold)
+        except Exception:  # noqa: BLE001 - keep holding through transients
+            pass
+        await asyncio.sleep(0.05)
+
+
 async def _run() -> None:
     from ..vr.server import VRServer
 
@@ -111,6 +127,28 @@ async def _run() -> None:
     print(f"  Hostname : {hostname}.local")
     print(f"  IP       : {local_ip}")
     print()
+
+    # Enable the grippers and hold them closed throughout — the jaws are the
+    # calibration reference, so they must be rigid. Falls back to a warning
+    # when the CAN buses aren't reachable (jaws must then be held closed some
+    # other way, e.g. a rubber band).
+    umi = None
+    hold_task: asyncio.Task | None = None
+    try:
+        from ..robot import Umi
+
+        umi = Umi()
+        print("Enabling grippers (they will sweep open to calibrate, then close)...")
+        await umi.enable()
+        hold_task = asyncio.create_task(_hold_grippers_closed(umi))
+        print("Grippers holding closed.\n")
+    except Exception as exc:  # noqa: BLE001 - CAN optional for calibration
+        print(
+            f"WARNING: could not enable the grippers over CAN ({exc}).\n"
+            "Proceeding anyway — keep the jaws fully closed by hand (rubber "
+            "band / tape) so the tip stays rigid.\n"
+        )
+        umi = None
 
     results: dict[str, list[float]] = {}
     async with VRServer() as server:
@@ -153,6 +191,14 @@ async def _run() -> None:
                     continue
                 results[side] = [float(v) for v in offset]
                 break
+
+    if hold_task is not None:
+        hold_task.cancel()
+    if umi is not None:
+        try:
+            await umi.disable()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
 
     UMI_TCP_OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
     UMI_TCP_OFFSET_FILE.write_text(json.dumps(results, indent=2) + "\n")
