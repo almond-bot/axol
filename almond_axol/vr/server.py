@@ -87,6 +87,13 @@ class VRServer:
         # in its legacy free-toggle behaviour (older backends that never set it).
         self._mode: str | None = None
 
+        # Current episode number to show in the headset HUD during data
+        # collection (the 1-based index of the episode being recorded next).
+        # Broadcast whenever it changes and re-sent to any client that connects
+        # mid-session (see the WebSocket accept handler). ``None`` hides the HUD
+        # readout — the default for plain teleop, which never sets it.
+        self._episode: int | None = None
+
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
         # each ``seq`` once, from whichever transport delivers it first — the
@@ -154,6 +161,17 @@ class VRServer:
         call before :meth:`enable`.
         """
         self._mode = mode
+
+    def set_episode(self, episode: int | None) -> None:
+        """Record the current episode number announced to headsets on connect.
+
+        ``episode`` is the 1-based index shown in the in-headset HUD during data
+        collection; ``None`` hides it. Stored so a client connecting mid-session
+        gets the current value in the WebSocket accept handler — live updates are
+        pushed separately via :meth:`broadcast_text`. Safe to call from any
+        thread (a plain attribute assignment).
+        """
+        self._episode = episode
 
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Register per-camera video sources to stream to the headset.
@@ -476,6 +494,16 @@ class VRServer:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort announce
                     _logger.warning("failed to send mode to client: %s", exc)
+            # Likewise seed the current episode number so a headset joining
+            # mid-session shows the right value immediately, not on the next
+            # episode. Best-effort for the same reason as the mode announce.
+            if server._episode is not None:
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "episode", "value": server._episode})
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send episode to client: %s", exc)
             try:
                 while True:
                     data = await websocket.receive_text()

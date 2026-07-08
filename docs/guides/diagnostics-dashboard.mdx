@@ -1,0 +1,28 @@
+---
+title: "Diagnostics Dashboard"
+description: "Live motor telemetry, health status, and diagnostics scripts in the browser."
+---
+
+The diagnostics dashboard lives alongside the [web control panel](https://docs.almond.bot/guides/control-panel) at `/diagnostics` — open [axol.almond.bot/diagnostics](https://axol.almond.bot/diagnostics) (or `https://<axol-host>:8001/diagnostics` on the LAN) while `axol serve` is running.
+
+## Motor status
+
+A card per motor (8 per arm) shows its status, temperature, bus voltage, and live position, refreshed by the server's 1 Hz health ping. A motor reads **OK** whether enabled or disabled — only genuine error codes (over-temperature, lost comm, …) or an unreachable motor light up red. Clicking a card opens the full `motor.info` readout — model, firmware, control mode, gains, and live readings — without launching a CLI session.
+
+The buttons in this section run the motor plumbing ad hoc: **CAN setup** / **CAN enable** for the bring-up commands ([`can.setup`](https://docs.almond.bot/cli/can-setup) / [`can.enable`](https://docs.almond.bot/cli/can-enable)) when motors are unreachable, **Set CAN ID** ([`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)), and zeroing via [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos) — **Zero motor** for a single motor, or **Guided zeroing** to walk every joint of one arm against its end stops with step-by-step Continue prompts.
+
+## Live telemetry
+
+Position, velocity, and torque charts for the selected arm stream continuously at 10 Hz while the robot link is connected. The server keeps a 10-minute rolling buffer, so the charts backfill on page load. The filter row scopes all three charts: time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**. Each chart's header button expands it to full screen (Esc to exit) for a closer look.
+
+Telemetry is sampled by the idle robot link, which is the single owner of the CAN bus. While a diagnostic or operation owns the bus the stream pauses and the charts label the gap — history is kept, and streaming resumes as soon as the bus is released.
+
+## Diagnostics
+
+Each diagnostic — [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable), and the [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable) camera-cable check — is a card: click it, set parameters in the dialog, and hit Run. The ROM tests expose a joint checkbox picker so you can soak a subset (e.g. just the wrist joints). The card shows the running state, elapsed time, and the latest output line; completion lands as a notification, and the full log is kept with the run in the history below. The ROM tests hand the CAN bus over for the duration of the run; the camera-only ZED cable check leaves motor telemetry streaming.
+
+Hands-on steps — like clamping an item in the ROM grasp test — pause the run and surface a **Continue** button on the card with the instruction (e.g. "Position the item in the RIGHT gripper, then close it."). The test waits for you and proceeds when you click, so nothing moves until you're ready. Under the hood the diagnostic prints a `[prompt]` marker and blocks on stdin; the button writes a line back to it. (The `motor.info` / `motor.health` read set needs no action here — the motor cards above show it live.)
+
+## Run history
+
+Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The ROM test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.

@@ -934,6 +934,29 @@ function StateDisplay({
   )
 }
 
+// Current episode number, shown top-right just under the recording status
+// during data collection. Null (plain teleop, or before the server announces
+// one) renders nothing.
+function EpisodeDisplay({ episode }: { episode: number | null }) {
+  if (episode === null) return null
+
+  return (
+    <HudText
+      position={[0.2, 0.06, -0.5]}
+      fontSize={0.016}
+      fontWeight="bold"
+      color="white"
+      anchorX="right"
+      anchorY="top"
+      renderOrder={999}
+      material-depthTest={false}
+      {...hudBg}
+    >
+      {`Episode ${episode}`}
+    </HudText>
+  )
+}
+
 function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
   const W = 0.44
   const H = 0.133
@@ -1199,6 +1222,9 @@ export default function App() {
   // Operating mode the server locked us to (null until it announces one on
   // connect). Drives which HUD/hint controls are shown.
   const [vrMode, setVrMode] = useState<AxolMode | null>(null)
+  // Current 1-based episode number during data collection (null until the
+  // server announces one; stays null in plain teleop).
+  const [episode, setEpisode] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
@@ -1417,6 +1443,7 @@ export default function App() {
               onPendingRecording={setRecordingPendingAt}
               onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
+              onEpisode={setEpisode}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
@@ -1424,6 +1451,7 @@ export default function App() {
               <ExitButton />
               <HelpIcon mode={vrMode} />
               <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
+              <EpisodeDisplay episode={episode} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>

@@ -91,6 +91,24 @@ _FEED_QUEUE_MAXSIZE = 90
 _STATS_SAMPLE_HZ = 10
 
 
+# Encoder-dropped frames since the last reset, across all cameras in this
+# process. A dropped frame is never encoded but its dataset row still exists,
+# so the episode's video is silently misaligned with its rows — the recorder
+# resets this at episode start and refuses to save an episode when it is
+# non-zero (see record_proc). Single process, GIL-atomic int updates.
+_EPISODE_DROPPED = {"n": 0}
+
+
+def reset_dropped_frames() -> None:
+    """Zero the per-episode dropped-frame counter (call at episode start)."""
+    _EPISODE_DROPPED["n"] = 0
+
+
+def dropped_frames() -> int:
+    """Encoder-dropped frames since the last reset (0 = episode video intact)."""
+    return _EPISODE_DROPPED["n"]
+
+
 def hw_dataset_encoder_available() -> bool:
     """True when the Jetson NVENC GStreamer encoder is usable."""
     return hw_h264_available()
@@ -247,6 +265,7 @@ class _CameraNvencEncoder:
             self._queue.put_nowait(image)
         except queue.Full:
             self._dropped += 1
+            _EPISODE_DROPPED["n"] += 1
             if self._dropped == 1 or self._dropped % 10 == 0:
                 _logger.warning(
                     "NVENC encoder queue full for %s, dropped %d frame(s).",
@@ -323,7 +342,16 @@ class _CameraNvencEncoder:
             if self._proc is None:
                 self._start(w, h, nv12=False)
             assert self._rgba is not None
-            self._rgba[:, :, :3] = frame
+            # RGB->RGBA pad into the preallocated buffer. Prefer cv2 (SIMD,
+            # releases the GIL) over the strided numpy assignment — the pad
+            # is on the per-frame hot path and its cost decides whether the
+            # feed keeps up with 60 fps.
+            try:
+                import cv2
+
+                cv2.cvtColor(frame, cv2.COLOR_RGB2RGBA, dst=self._rgba)
+            except Exception:  # noqa: BLE001 - fall back to the numpy copy
+                self._rgba[:, :, :3] = frame
             self._write(self._rgba)
             if sample:
                 self._update_stats(frame)

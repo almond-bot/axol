@@ -2,9 +2,10 @@
 
 Unlike the four operations (which open the robot themselves for the duration
 of a task), this module keeps a *detached* link to the robot alive while the
-panel is idle: it brings up the CAN interfaces and pings all 16 motors once a
-second so the UI can show a live connected / disconnected indicator and
-per-motor health.
+panel is idle: it brings up the CAN interfaces, pings all 16 motors once a
+second (reachability, status, temperature, voltage), and samples position /
+velocity / torque at :data:`~.telemetry.SAMPLE_HZ` into the telemetry hub for
+the diagnostics dashboard.
 
 The link runs on its own asyncio event loop in a dedicated thread so the CAN
 reader loops and the ping timer never touch uvicorn's loop. While a task runs
@@ -24,6 +25,7 @@ from typing import Any
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, Motor, MotorError
+from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
 _logger = logging.getLogger(__name__)
 
@@ -31,6 +33,10 @@ _logger = logging.getLogger(__name__)
 # timeout is generous so a momentarily-busy bus doesn't flap the indicator.
 _PING_INTERVAL_S = 1.0
 _PING_TIMEOUT_S = 0.5
+
+# Per-read timeout for the fast telemetry sweep. Tighter than the ping's: a
+# skipped sample is invisible on a chart, a flapping health dot is not.
+_SAMPLE_TIMEOUT_S = 0.2
 
 # State machine surfaced to the UI.
 #   disconnected -> connecting -> connected
@@ -69,13 +75,24 @@ class _ArmLink:
         self.side = side
         self._bus: CanBus | None = None
         self._motors: dict[Joint, Motor] = {}
-        # joint name -> {"reachable": bool, "status": str | None}
+        # Serializes reads to one motor between the ping and sample loops, so
+        # two in-flight requests to the same CAN ID can't mismatch replies.
+        self._locks: dict[Joint, asyncio.Lock] = {}
+        # joint name -> {"reachable": bool, "status": str | None, ...}
         self.health: dict[str, dict[str, Any]] = {}
+
+    @property
+    def motors(self) -> dict[Joint, Motor]:
+        return self._motors
+
+    def lock(self, joint: Joint) -> asyncio.Lock:
+        return self._locks[joint]
 
     async def open(self) -> None:
         self._bus = CanBus(self.channel)
         await self._bus.start()
         self._motors = {joint: Motor(self._bus, joint) for joint in Joint}
+        self._locks = {joint: asyncio.Lock() for joint in Joint}
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -85,35 +102,85 @@ class _ArmLink:
                 _logger.debug("closing %s bus failed: %s", self.channel, exc)
         self._bus = None
         self._motors = {}
+        self._locks = {}
 
-    async def ping(self) -> None:
-        """Read each motor's status; record reachability without raising."""
+    async def ping(self) -> dict[str, dict[str, Any]]:
+        """Read each motor's status/temperature/voltage; never raises.
+
+        Returns the slow-telemetry sweep keyed by ``arm:JOINT`` for the hub.
+        """
+        sweep: dict[str, dict[str, Any]] = {}
         for joint, motor in self._motors.items():
             reachable = True
             status: str | None = None
+            temperature: float | None = None
+            voltage: float | None = None
             try:
-                code = await asyncio.wait_for(
-                    motor.get_error_code(), timeout=_PING_TIMEOUT_S
-                )
-                status = getattr(code, "name", str(code))
+                async with self._locks[joint]:
+                    code = await asyncio.wait_for(
+                        motor.get_error_code(), timeout=_PING_TIMEOUT_S
+                    )
+                    status = getattr(code, "name", str(code))
+                    temperature = await asyncio.wait_for(
+                        motor.get_temperature(), timeout=_PING_TIMEOUT_S
+                    )
+                    voltage = await asyncio.wait_for(
+                        motor.get_voltage(), timeout=_PING_TIMEOUT_S
+                    )
             except (MotorError, asyncio.TimeoutError, Exception):  # noqa: BLE001
-                reachable = False
-            self.health[joint.name] = {"reachable": reachable, "status": status}
+                # A failed temperature/voltage read after a good status read
+                # still counts as reachable; a failed status read does not.
+                reachable = status is not None
+            self.health[joint.name] = {
+                "reachable": reachable,
+                "status": status,
+                "temperature": temperature,
+                "voltage": voltage,
+            }
+            sweep[motor_key(self.side, joint.name)] = self.health[joint.name]
+        return sweep
+
+    async def sample(self) -> dict[str, list[float]]:
+        """One fast sweep: position / velocity / torque for every motor."""
+
+        async def read(joint: Joint, motor: Motor) -> tuple[str, list[float] | None]:
+            try:
+                async with self._locks[joint]:
+                    pos = await asyncio.wait_for(
+                        motor.get_position(), timeout=_SAMPLE_TIMEOUT_S
+                    )
+                    vel = await asyncio.wait_for(
+                        motor.get_velocity(), timeout=_SAMPLE_TIMEOUT_S
+                    )
+                    torque = await asyncio.wait_for(
+                        motor.get_torque(), timeout=_SAMPLE_TIMEOUT_S
+                    )
+            except (MotorError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+                return motor_key(self.side, joint.name), None
+            return motor_key(self.side, joint.name), [pos, vel, torque]
+
+        results = await asyncio.gather(
+            *(read(joint, motor) for joint, motor in self._motors.items())
+        )
+        return {key: values for key, values in results if values is not None}
 
 
 class RobotLink:
-    """Owns the idle-time robot connection (CAN + 1 Hz motor ping)."""
+    """Owns the idle-time robot connection (CAN + ping + telemetry sampling)."""
 
     def __init__(
         self,
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
+        hub: TelemetryHub | None = None,
     ) -> None:
         self._arms: list[_ArmLink] = []
         if left_channel:
             self._arms.append(_ArmLink(left_channel, "left"))
         if right_channel:
             self._arms.append(_ArmLink(right_channel, "right"))
+
+        self.hub = hub if hub is not None else TelemetryHub()
 
         self._state = STATE_DISCONNECTED
         self._error: str | None = None
@@ -126,6 +193,7 @@ class RobotLink:
         )
         self._thread.start()
         self._ping_task: asyncio.Task[Any] | None = None
+        self._sample_task: asyncio.Task[Any] | None = None
         self._lock = threading.Lock()
 
     # -- thread plumbing ----------------------------------------------------
@@ -135,6 +203,12 @@ class RobotLink:
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
 
+    def _set_state(self, state: str, error: str | None = None) -> None:
+        with self._lock:
+            self._state = state
+            self._error = error
+        self.hub.push_state(state)
+
     # -- public API ---------------------------------------------------------
 
     def connect(self) -> dict[str, Any]:
@@ -142,26 +216,20 @@ class RobotLink:
         with self._lock:
             if self._state in (STATE_CONNECTED, STATE_BUSY):
                 return self.status()
-            self._state = STATE_CONNECTING
-            self._error = None
+        self._set_state(STATE_CONNECTING)
         try:
             self._enable_can()
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
-            with self._lock:
-                self._state = STATE_ERROR
-                self._error = _format_error(exc)
+            self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot connect failed: %s", exc)
             return self.status()
         try:
             self._submit(self._open_and_start())
         except Exception as exc:  # noqa: BLE001 - report any bring-up failure
-            with self._lock:
-                self._state = STATE_ERROR
-                self._error = _format_error(exc)
+            self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot connect failed: %s", exc)
             return self.status()
-        with self._lock:
-            self._state = STATE_CONNECTED
+        self._set_state(STATE_CONNECTED)
         return self.status()
 
     def disconnect(self) -> dict[str, Any]:
@@ -170,12 +238,12 @@ class RobotLink:
             self._submit(self._stop_and_close())
         except Exception as exc:  # noqa: BLE001
             _logger.debug("robot disconnect cleanup failed: %s", exc)
+        self._set_state(STATE_DISCONNECTED)
         with self._lock:
-            self._state = STATE_DISCONNECTED
-            self._error = None
             self._last_ping = None
         for arm in self._arms:
             arm.health = {}
+        self.hub.clear_slow()
         return self.status()
 
     def release(self) -> None:
@@ -187,7 +255,7 @@ class RobotLink:
         with self._lock:
             if self._state not in (STATE_CONNECTED,):
                 return
-            self._state = STATE_BUSY
+        self._set_state(STATE_BUSY)
         try:
             self._submit(self._stop_and_close())
         except Exception as exc:  # noqa: BLE001
@@ -201,13 +269,10 @@ class RobotLink:
         try:
             self._submit(self._open_and_start())
         except Exception as exc:  # noqa: BLE001
-            with self._lock:
-                self._state = STATE_ERROR
-                self._error = _format_error(exc)
+            self._set_state(STATE_ERROR, _format_error(exc))
             _logger.warning("robot reacquire failed: %s", exc)
             return
-        with self._lock:
-            self._state = STATE_CONNECTED
+        self._set_state(STATE_CONNECTED)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -237,6 +302,21 @@ class RobotLink:
             "reachableCount": reachable,
         }
 
+    def motor_details(self, arm: str, joint_name: str) -> dict[str, Any]:
+        """Full one-motor readout (the ``motor.info`` set) for the dashboard.
+
+        Raises ``RuntimeError`` unless the link currently owns the bus, and
+        ``KeyError`` for an unknown arm/joint.
+        """
+        with self._lock:
+            if self._state != STATE_CONNECTED:
+                raise RuntimeError(f"robot link is {self._state}")
+        arm_link = next((a for a in self._arms if a.side == arm), None)
+        if arm_link is None:
+            raise KeyError(arm)
+        joint = Joint[joint_name]
+        return self._submit(_read_motor_details(arm_link, joint))
+
     def shutdown(self) -> None:
         """Tear down the link and stop the loop thread (server shutdown)."""
         try:
@@ -251,15 +331,19 @@ class RobotLink:
             await arm.open()
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.ensure_future(self._ping_loop())
+        if self._sample_task is None or self._sample_task.done():
+            self._sample_task = asyncio.ensure_future(self._sample_loop())
 
     async def _stop_and_close(self) -> None:
-        if self._ping_task is not None:
-            self._ping_task.cancel()
-            try:
-                await self._ping_task
-            except asyncio.CancelledError:
-                pass
-            self._ping_task = None
+        for task in (self._ping_task, self._sample_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._ping_task = None
+        self._sample_task = None
         for arm in self._arms:
             await arm.close()
 
@@ -267,7 +351,12 @@ class RobotLink:
         while True:
             start = self._loop.time()
             try:
-                await asyncio.gather(*(arm.ping() for arm in self._arms))
+                sweeps = await asyncio.gather(*(arm.ping() for arm in self._arms))
+                slow: dict[str, dict[str, Any]] = {}
+                for sweep in sweeps:
+                    slow.update(sweep)
+                if slow:
+                    self.hub.push_slow(slow)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep the loop alive
@@ -276,6 +365,24 @@ class RobotLink:
                 self._last_ping = time.time()
             elapsed = self._loop.time() - start
             await asyncio.sleep(max(0.0, _PING_INTERVAL_S - elapsed))
+
+    async def _sample_loop(self) -> None:
+        interval = 1.0 / SAMPLE_HZ
+        while True:
+            start = self._loop.time()
+            try:
+                sweeps = await asyncio.gather(*(arm.sample() for arm in self._arms))
+                motors: dict[str, list[float]] = {}
+                for sweep in sweeps:
+                    motors.update(sweep)
+                if motors:
+                    self.hub.push_frame(motors)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive
+                _logger.debug("telemetry sweep error: %s", exc)
+            elapsed = self._loop.time() - start
+            await asyncio.sleep(max(0.0, interval - elapsed))
 
     # -- CAN bring-up -------------------------------------------------------
 
@@ -322,3 +429,33 @@ class RobotLink:
         _logger.info("CAN interfaces down; running can.setup.")
         ensure_setup()
         _logger.info("CAN setup complete; interfaces brought up.")
+
+
+async def _read_motor_details(arm_link: _ArmLink, joint: Joint) -> dict[str, Any]:
+    """The ``motor.info`` read set against a link-owned motor."""
+    motor = arm_link.motors[joint]
+
+    async def read(coro: Any) -> Any:
+        try:
+            return await asyncio.wait_for(coro, timeout=_PING_TIMEOUT_S)
+        except (MotorError, asyncio.TimeoutError, Exception):  # noqa: BLE001
+            return None
+
+    async with arm_link.lock(joint):
+        status = await read(motor.get_error_code())
+        mode = await read(motor.get_control_mode())
+        gains = await read(motor.get_gains())
+        return {
+            "arm": arm_link.side,
+            "joint": joint.name,
+            "model": await read(motor.get_model()),
+            "firmware": await read(motor.get_firmware_version()),
+            "status": getattr(status, "name", None),
+            "mode": getattr(mode, "name", None),
+            "position": await read(motor.get_position()),
+            "velocity": await read(motor.get_velocity()),
+            "torque": await read(motor.get_torque()),
+            "temperature": await read(motor.get_temperature()),
+            "voltage": await read(motor.get_voltage()),
+            "gains": vars(gains) if gains is not None else None,
+        }

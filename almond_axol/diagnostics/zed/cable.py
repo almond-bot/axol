@@ -7,6 +7,7 @@ restarts the ZED X daemon, opens the camera, and captures frames across a
 an exception; if it returns cleanly the cable is good.
 
 Usage:
+    axol diag.zed-cable
     uv run -m almond_axol.diagnostics.zed.cable
     uv run -m almond_axol.diagnostics.zed.cable --output logs/cable_frame.png
 """
@@ -219,18 +220,38 @@ def run(output: str | None = None) -> None:
     )
 
 
-def main() -> None:
-    """Parse CLI arguments and run the ZED cable test."""
-    parser = argparse.ArgumentParser(
-        description="Test a ZED camera cable by validating frames across 5 seconds."
-    )
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output",
         default=None,
         help="Optional path to save the last captured frame as PNG (e.g. logs/cable_frame.png).",
     )
-    args = parser.parse_args()
+
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``diag.zed-cable`` subcommand (for serve introspection)."""
+    p = subparsers.add_parser(
+        "diag.zed-cable",
+        help="Verify a ZED camera cable by validating captured frames.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=run_cli)
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    """Run the ZED cable test from parsed arguments."""
     run(output=args.output)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and run the ZED cable test."""
+    parser = argparse.ArgumentParser(
+        description="Test a ZED camera cable by validating frames across 5 seconds."
+    )
+    _add_arguments(parser)
+    run_cli(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

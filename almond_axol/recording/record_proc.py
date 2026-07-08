@@ -57,6 +57,9 @@ _READY_TIMEOUT_S = 60.0
 # How long a save_episode (encoder flush + parquet write + post-episode stats)
 # may take.
 _SAVE_TIMEOUT_S = 180.0
+# How long a lightweight episode command (pause/resume/frame_count) may take —
+# these only flip an event / read a counter in the recorder's command thread.
+_CMD_TIMEOUT_S = 10.0
 
 # --- Encoded (relay-side H.264) capture-loop tuning ---
 # How long the first row waits for each camera's first access unit (relay valve
@@ -782,6 +785,8 @@ def run_capture_loop(
     task: str,
     rerun_ip: str | None,
     stop_event: threading.Event,
+    record_event: "threading.Event | None" = None,
+    frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
 ) -> None:
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
@@ -791,26 +796,52 @@ def run_capture_loop(
     joint+action snapshot, and appends one dataset row. A camera read timeout
     reuses the previous frame for that camera (or skips the tick if none yet).
     Any fatal error is reported via ``on_error`` instead of dying silently.
+
+    ``record_event`` (optional) gates mid-episode capture: while cleared the
+    loop idles without appending rows, and on the next set it re-anchors its
+    tick clock to "now" so the dataset's index-based timestamps stay
+    contiguous across the gap — the saved episode plays straight through it.
+    Used by DAgger-style flows that must not record while the robot is frozen
+    between the policy and an operator takeover. ``None`` records
+    unconditionally (the pre-existing behaviour).
+
+    ``frame_counter`` (optional) is a mutable ``{"n": int}`` incremented after
+    every appended row, so the owner can convert instants into dataset time
+    (``n / fps``) — e.g. to annotate intervention spans.
     """
     try:
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
 
-        # Wait for the first snapshot (the control loop publishes every tick).
-        first_deadline = time.perf_counter() + 5.0
-        while read_snapshot() is None:
+        # Wait for the first snapshot *published after this episode started*.
+        # The snapshot slot is a single latest-wins register that persists
+        # across episodes, so at episode start it can still hold the previous
+        # episode's final snapshot (the control loop may not have published
+        # yet); pairing fresh camera frames with it would write a stale pose
+        # into the episode's opening rows. Snapshot timestamps are
+        # perf_counter values from the publishing process — comparable here
+        # because CLOCK_MONOTONIC is system-wide (the camera-frame pairing
+        # below already relies on this).
+        episode_start = time.perf_counter()
+        first_deadline = episode_start + 5.0
+        while True:
+            snap = read_snapshot()
+            if snap is not None and snap[2] >= episode_start:
+                break
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
-                _logger.warning("capture loop saw no snapshot within 5s; exiting.")
+                _logger.warning(
+                    "capture loop saw no fresh snapshot within 5s; exiting."
+                )
                 return
         if stop_event.is_set():
             return
 
         frame_interval = 1.0 / fps
         timeout_ms = int(2 * frame_interval * 1000 + 200)
-        recording_start = time.perf_counter()
+        recording_start: float | None = None
         last_frames: dict[str, tuple[Any, float, float]] = {}
         tick = 0
 
@@ -819,9 +850,21 @@ def run_capture_loop(
         skip_count = 0
         frames_added = 0
         ticks_window = 0
-        cap_last_log = recording_start
+        cap_last_log = time.perf_counter()
 
         while not stop_event.is_set():
+            if record_event is not None and not record_event.is_set():
+                # Paused: idle without capturing and drop the anchor so the
+                # tick clock re-anchors on resume (no timestamp gap).
+                recording_start = None
+                if stop_event.wait(timeout=0.02):
+                    return
+                continue
+            if recording_start is None:
+                # First tick, or first tick after a resume: anchor so the
+                # current tick's target is "now" and the cadence continues.
+                recording_start = time.perf_counter() - tick * frame_interval
+
             now = time.perf_counter()
             if now - cap_last_log >= 1.0:
                 dt = now - cap_last_log
@@ -893,6 +936,8 @@ def run_capture_loop(
             if stop_event.is_set():
                 return
             dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            if frame_counter is not None:
+                frame_counter["n"] += 1
             frames_added += 1
             tick_cost_sum += time.perf_counter() - body_t0
             ticks_window += 1
@@ -920,9 +965,15 @@ def run_encoded_capture_loop(
     task: str,
     rerun_ip: str | None,
     stop_event: threading.Event,
+    frame_counter: "dict[str, int] | None" = None,
     on_error: Callable[[str], None] | None = None,
 ) -> None:
     """Frame-driven capture for the relay-encoded (gstshm-h264) transport.
+
+    ``frame_counter`` mirrors :func:`run_capture_loop`'s (a mutable
+    ``{"n": int}`` incremented per appended row). There is no ``record_event``
+    on this path: an encoded stream cannot gate mid-episode — every dropped
+    access unit is referenced by later P-frames.
 
     Unlike :func:`run_capture_loop` (real-time paced, *selecting* the camera
     frame nearest each tick and dropping the rest), an encoded stream cannot drop
@@ -945,16 +996,19 @@ def run_encoded_capture_loop(
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
 
-        # Wait for the first snapshot (the control loop publishes every tick).
+        # Wait for the first snapshot *published after this episode started* —
+        # the slot persists across episodes, so a stale previous-episode
+        # snapshot must not seed the opening rows (see run_capture_loop).
         # Keep it: rows whose seqlock read later misses reuse the last good one.
-        first_deadline = time.perf_counter() + 5.0
+        episode_start = time.perf_counter()
+        first_deadline = episode_start + 5.0
         last_snap = read_snapshot()
-        while last_snap is None:
+        while last_snap is None or last_snap[2] < episode_start:
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
                 _logger.warning(
-                    "encoded capture loop saw no snapshot within 5s; exiting."
+                    "encoded capture loop saw no fresh snapshot within 5s; exiting."
                 )
                 return
             last_snap = read_snapshot()
@@ -1057,6 +1111,8 @@ def run_encoded_capture_loop(
             if stop_event.is_set():
                 return
             dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            if frame_counter is not None:
+                frame_counter["n"] += 1
             rows_added += 1
 
             if rerun_ip:
@@ -1244,6 +1300,10 @@ class InProcessRecorder:
         self._publisher = _SnapshotPublisher()
         self._thread: threading.Thread | None = None
         self._stop: threading.Event | None = None
+        # Mid-episode capture gate + row counter; same semantics as
+        # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
+        self._record = threading.Event()
+        self._frames: dict[str, int] = {"n": 0}
         self._episodes_recorded = 0
         self._session_start = time.time()
 
@@ -1254,8 +1314,13 @@ class InProcessRecorder:
         return self._dataset.num_episodes
 
     def start_episode(self, task: str) -> None:
+        from ..lerobot.nvenc_encoder import reset_dropped_frames
+
         self._stop_capture()  # defensive: never overlap two capture threads
         self._dataset.clear_episode_buffer()
+        self._record.set()
+        self._frames["n"] = 0
+        reset_dropped_frames()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=run_capture_loop,
@@ -1268,11 +1333,27 @@ class InProcessRecorder:
                 task=task,
                 rerun_ip=self._config["rerun_ip"],
                 stop_event=self._stop,
+                record_event=self._record,
+                frame_counter=self._frames,
             ),
             name="axol-capture",
             daemon=True,
         )
         self._thread.start()
+
+    def pause_episode(self) -> int:
+        """Stop capturing mid-episode; returns rows so far. Idempotent."""
+        self._record.clear()
+        return self._frames["n"]
+
+    def resume_episode(self) -> int:
+        """Resume a paused episode (the capture clock re-anchors). Idempotent."""
+        self._record.set()
+        return self._frames["n"]
+
+    def frame_count(self) -> int:
+        """Rows captured in the current episode (dataset time = n / fps)."""
+        return self._frames["n"]
 
     def _stop_capture(self) -> None:
         if self._thread is not None and self._stop is not None:
@@ -1281,7 +1362,19 @@ class InProcessRecorder:
             self._thread = None
 
     def save_episode(self) -> None:
+        from ..lerobot.nvenc_encoder import dropped_frames
+
         self._stop_capture()
+        n_dropped = dropped_frames()
+        if n_dropped:
+            # Mirrors the recorder subprocess: a dropped frame's row still
+            # exists, so the video is misaligned — never save it silently.
+            self._dataset.clear_episode_buffer()
+            raise RuntimeError(
+                f"{n_dropped} video frame(s) were dropped by the encoder "
+                "(feed queue overflow) — the episode's video is misaligned "
+                "with its rows; episode discarded."
+            )
         self._dataset.save_episode()
         self._episodes_recorded += 1
 
@@ -1405,6 +1498,12 @@ def _recorder_main(
     stop: threading.Event | None = None
     capture_error: dict[str, str | None] = {"v": None}
     episodes_recorded = 0
+    # Mid-episode capture gate + row counter (see run_capture_loop). The gate
+    # is only supported on the raw transports: pausing the encoded
+    # (gstshm-h264) stream mid-episode would drop access units that later
+    # P-frames reference, corrupting the mp4.
+    record_event = threading.Event()
+    frame_counter: dict[str, int] = {"n": 0}
 
     def stop_capture() -> None:
         nonlocal thread
@@ -1427,30 +1526,85 @@ def _recorder_main(
                 stop_capture()  # defensive: never overlap two capture threads
                 dataset.clear_episode_buffer()
                 capture_error["v"] = None
+                record_event.set()
+                frame_counter["n"] = 0
+                from ..lerobot.nvenc_encoder import reset_dropped_frames
+
+                reset_dropped_frames()
                 stop = threading.Event()
+                loop_kwargs = dict(
+                    cameras=cameras,
+                    read_snapshot=snap_reader.read_latest,
+                    dataset=dataset,
+                    robot_obs_proc=robot_obs_proc,
+                    fps=config["fps"],
+                    task=task,
+                    rerun_ip=config["rerun_ip"],
+                    stop_event=stop,
+                    on_error=lambda m: capture_error.__setitem__("v", m),
+                )
+                loop_kwargs["frame_counter"] = frame_counter
+                if not encoded_mode:
+                    loop_kwargs["record_event"] = record_event
                 thread = threading.Thread(
                     target=(
                         run_encoded_capture_loop if encoded_mode else run_capture_loop
                     ),
-                    kwargs=dict(
-                        cameras=cameras,
-                        read_snapshot=snap_reader.read_latest,
-                        dataset=dataset,
-                        robot_obs_proc=robot_obs_proc,
-                        fps=config["fps"],
-                        task=task,
-                        rerun_ip=config["rerun_ip"],
-                        stop_event=stop,
-                        on_error=lambda m: capture_error.__setitem__("v", m),
-                    ),
+                    kwargs=loop_kwargs,
                     name="axol-capture",
                     daemon=True,
                 )
                 thread.start()
+            elif kind == "pause_episode":
+                if encoded_mode:
+                    conn.send(
+                        (
+                            "error",
+                            "pause_episode requires a raw transport; the "
+                            "encoded (gstshm-h264) transport can't gate "
+                            "mid-episode.",
+                        )
+                    )
+                else:
+                    record_event.clear()
+                    conn.send(("paused", frame_counter["n"]))
+            elif kind == "resume_episode":
+                if encoded_mode:
+                    conn.send(
+                        (
+                            "error",
+                            "resume_episode requires a raw transport; the "
+                            "encoded (gstshm-h264) transport can't gate "
+                            "mid-episode.",
+                        )
+                    )
+                else:
+                    record_event.set()
+                    conn.send(("resumed", frame_counter["n"]))
+            elif kind == "frame_count":
+                conn.send(("frame_count", frame_counter["n"]))
             elif kind == "save_episode":
                 stop_capture()
+                from ..lerobot.nvenc_encoder import dropped_frames
+
+                n_dropped = dropped_frames()
                 if capture_error["v"] is not None:
                     conn.send(("error", capture_error["v"]))
+                elif n_dropped:
+                    # A dropped frame was never encoded but its row exists, so
+                    # the episode's video is misaligned with its rows (and
+                    # with the other cameras) — refuse to save silently
+                    # corrupted data. The caller should discard and re-record.
+                    dataset.clear_episode_buffer()
+                    conn.send(
+                        (
+                            "error",
+                            f"{n_dropped} video frame(s) were dropped by the "
+                            "encoder (feed queue overflow) — the episode's "
+                            "video is misaligned with its rows; episode "
+                            "discarded. Check recorder-core load.",
+                        )
+                    )
                 else:
                     try:
                         t_save = time.perf_counter()
@@ -1543,6 +1697,40 @@ class DatasetRecorderProcess:
     def start_episode(self, task: str) -> None:
         with self._lock:
             self._conn.send(("start_episode", task))
+
+    def _episode_gate(self, command: str, expect: str) -> int:
+        """Send a pause/resume/frame-count command; return the row count.
+
+        The reply's count may lag the capture thread by one in-flight row
+        (the gate is checked at tick boundaries) — a ±1-frame slop that is
+        negligible for annotation spans.
+        """
+        with self._lock:
+            self._conn.send((command,))
+            if not self._conn.poll(_CMD_TIMEOUT_S):
+                raise RuntimeError(f"recorder did not answer {command} in time")
+            msg = self._conn.recv()
+        if msg[0] == expect:
+            return int(msg[1])
+        raise RuntimeError(f"recorder {command} failed: {msg[1]}")
+
+    def pause_episode(self) -> int:
+        """Stop capturing mid-episode (rows + clock gate); returns rows so far.
+
+        Raw transports only — the encoded (gstshm-h264) transport can't gate
+        mid-episode (raises). On resume the capture clock re-anchors, so the
+        episode's index-based timestamps stay contiguous across the gap.
+        Idempotent.
+        """
+        return self._episode_gate("pause_episode", "paused")
+
+    def resume_episode(self) -> int:
+        """Resume a paused episode; returns rows captured so far. Idempotent."""
+        return self._episode_gate("resume_episode", "resumed")
+
+    def frame_count(self) -> int:
+        """Rows captured in the current episode (dataset time = n / fps)."""
+        return self._episode_gate("frame_count", "frame_count")
 
     def save_episode(self) -> None:
         with self._lock:

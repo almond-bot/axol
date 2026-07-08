@@ -413,6 +413,24 @@ class AxolVRTeleop(Teleoperator):
             self._vr_server.broadcast_text(text), self._loop
         )
 
+    def send_feedback_episode(self, episode: int) -> None:
+        """Broadcast the current episode number to all connected VR clients.
+
+        ``episode`` is the 1-based index of the episode being collected, shown
+        in the in-headset HUD during data collection. Also stored on the server
+        so a headset that connects mid-session picks up the current value on
+        connect. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        # Seed the connect-time announce for late-joining clients, then push the
+        # live update to everyone already connected.
+        self._vr_server.set_episode(episode)
+        text = json.dumps({"type": "episode", "value": episode})
+        asyncio.run_coroutine_threadsafe(
+            self._vr_server.broadcast_text(text), self._loop
+        )
+
     def send_feedback_error(self, timeout: float = 2.0) -> None:
         """Broadcast the error state to all connected VR clients.
 

@@ -22,7 +22,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from ...constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
+from ...constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT, Joint
 from ...utils.sudo import run_root
 from . import driver
 
@@ -43,6 +43,8 @@ class _Profile:
     right: str
     rules_file: Path
     cron_script: Path
+    # Joint whose motor the post-bring-up RX probe queries (see _rx_alive).
+    probe_joint: Joint
 
 
 _AXOL_PROFILE = _Profile(
@@ -51,6 +53,7 @@ _AXOL_PROFILE = _Profile(
     right=CAN_RIGHT,
     rules_file=Path("/etc/udev/rules.d/90-can.rules"),
     cron_script=_CAN_DIR / "startup.sh",
+    probe_joint=Joint.SHOULDER_1,
 )
 
 _UMI_PROFILE = _Profile(
@@ -59,6 +62,7 @@ _UMI_PROFILE = _Profile(
     right=CAN_UMI_RIGHT,
     rules_file=Path("/etc/udev/rules.d/91-can-umi.rules"),
     cron_script=_CAN_DIR / "startup_umi.sh",
+    probe_joint=Joint.GRIPPER,
 )
 
 
@@ -242,11 +246,20 @@ def _write_cron_script(profile: _Profile) -> None:
     profile.cron_script.write_text(
         f"#!/bin/bash\n"
         f"# Bring up {profile.label} CAN interfaces\n"
+        f"#\n"
+        f"# Both interfaces are channels of one dual-channel gs_usb adapter.\n"
+        f"# Bring them down together, configure, then up together — flapping\n"
+        f"# the channels one at a time (down/up L, then down/up R) toggles the\n"
+        f"# adapter into a state where TX works but no RX frame is delivered.\n"
         f"set -euo pipefail\n\n"
         f"for IFACE in {profile.left} {profile.right}; do\n"
         f'    ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f"done\n"
+        f"for IFACE in {profile.left} {profile.right}; do\n"
         f'    ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
         f'    ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f"done\n"
+        f"for IFACE in {profile.left} {profile.right}; do\n"
         f'    ip link set "${{IFACE}}" up\n'
         f"done\n"
     )
@@ -280,10 +293,59 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.set_defaults(func=run)
 
 
+def _rx_alive(profile: _Profile) -> bool:
+    """True when at least one motor answers on either channel.
+
+    Verifies the adapter's receive path, not just the interface state: the
+    dual-channel gs_usb adapter can come out of a down/up cycle in a state
+    where TX still works but no received frame is ever delivered (kernel-side
+    everything looks healthy — UP, ERROR-ACTIVE, correct bitrate). Probes the
+    profile's ``probe_joint`` — the shoulder on the robot arm, the gripper on
+    the UMI rig (its buses carry nothing else).
+    """
+    import asyncio
+
+    from ...motor import CanBus, Motor
+
+    async def probe(channel: str) -> bool:
+        try:
+            async with CanBus(channel) as bus:
+                await asyncio.wait_for(
+                    Motor(bus, profile.probe_joint).get_error_code(), timeout=0.7
+                )
+                return True
+        except Exception:  # noqa: BLE001 - silence means "no RX", whatever the cause
+            return False
+
+    async def probe_all() -> bool:
+        await asyncio.sleep(0.5)  # let the freshly-upped interfaces settle
+        results = await asyncio.gather(probe(profile.left), probe(profile.right))
+        return any(results)
+
+    return asyncio.run(probe_all())
+
+
 def _bring_up_can(profile: _Profile) -> None:
+    """Run the bring-up script, then verify RX and re-flap once if it's dead.
+
+    Every down/up cycle of the adapter's channels toggles it between a healthy
+    state and the TX-only wedge described in :func:`_rx_alive`, so a bring-up
+    that lands in the wedge is recovered by exactly one more cycle. A device
+    with its motors powered off is indistinguishable from the wedge, hence the
+    bounded retries and the warning instead of an error.
+    """
     print("Bringing up CAN interfaces (requires sudo)...")
-    run_root(["bash", str(profile.cron_script)], check=True)
-    print("  Done.")
+    for attempt in range(3):
+        run_root(["bash", str(profile.cron_script)], check=True)
+        if _rx_alive(profile):
+            print("  Done — motors responding.")
+            return
+        if attempt < 2:
+            print("  No motor responses (adapter RX may be wedged) — cycling again...")
+    print(
+        "  WARNING: no motor responded after bring-up. If the device is powered "
+        "on, re-run this command; otherwise this is expected."
+    )
 
 
 def is_configured() -> bool:

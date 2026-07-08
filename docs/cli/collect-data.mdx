@@ -54,8 +54,8 @@ Episodes are driven from the Quest controllers. The session is locked to **data 
 
 | Button | Action |
 |---|---|
-| **A** | Start a take (3-second countdown), or stop and **save** the current take. The headset enters `Saving` until the write completes |
-| **X** | During a recording, stop and **discard** the take (re-record); otherwise reset to the rest pose |
+| **A** | Start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save (the headset then enters `Saving` until the write completes), or **X** to cancel and keep recording |
+| **X** | During the start countdown, cancels it; otherwise resets to the rest pose. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
 
 After each episode the robot automatically returns to its rest pose before the next take begins. If an existing dataset is found at `--root`, collection resumes from where it left off; conversely, if no episodes were saved before exit the empty dataset directory is removed on shutdown so an aborted session does not leave a half-initialized dataset on disk.
 

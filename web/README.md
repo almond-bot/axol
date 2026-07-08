@@ -40,6 +40,8 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
+| `AxolMode` | Type — `"teleop" \| "data_collection"`, the server-announced operating mode that locks the HUD |
+| `ConfirmAction` | Type — `"save" \| "discard"`, which episode action a stop-recording confirmation popup is gating |
 | `CameraStreams` | Type — `Record<string, MediaStream>`, the camera-name → stream map returned by `useAxolVideo` |
 
 **`AxolVRClient` props**
@@ -50,6 +52,9 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `poseWsRef` | `RefObject<WebSocket \| null>` (optional) | Dedicated pose WebSocket from `useAxolPoseSocket` (Quest-over-USB). When supplied and open, each frame is sent over **both** this and `wsRef`; the server prefers the low-latency USB stream and uses the network frames only while USB is quiet, so a USB drop fails over to WiFi with no reconnect |
 | `onStateChange` | `(state: AxolState) => void` | Fires when the controller state machine transitions |
 | `onPendingRecording` | `(pendingAt: number \| null) => void` | Fires with a timestamp when a 3-second recording countdown begins; `null` when cancelled or resolved |
+| `onPendingConfirm` | `(action: ConfirmAction \| null) => void` | Fires with `"save"` / `"discard"` when the stop-recording confirmation popup is armed, and `null` when it's confirmed or cancelled |
+| `onMode` | `(mode: AxolMode) => void` | Fires once per connection with the server-announced operating mode (`"teleop"` / `"data_collection"`) that locks the HUD |
+| `onEpisode` | `(episode: number \| null) => void` | Fires with the current 1-based episode number during data collection (and `null` when the server clears it, e.g. on a connection change); drives the `Episode N` HUD readout |
 | `onExit` | `() => void` | Fires when the Y button exits the XR session |
 
 **`useAxolVRClient` params**
@@ -106,9 +111,9 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
 | 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
-| 5 | Left **X** | Reset pose; cancels a recording countdown; stops and **discards** an in-progress take |
+| 5 | Left **X** | Reset pose; cancels a recording countdown. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
 | 7 | Left **Y** | Exit the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose |
-| 6 | Right **A** | **Record**: start a take (3-second countdown), or stop and **save** the current take — **data collection only** (no effect during plain teleop) |
+| 6 | Right **A** | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording — **data collection only** (no effect during plain teleop) |
 | — | Right thumbstick (click) | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
 
 ## State machine
@@ -118,12 +123,18 @@ In **teleop** mode the headset stays in `Teleop` with the recording controls ine
 ```
 DataCollection ──[A]──► (countdown 3s) ──► Recording
       ▲                                          │
-      │                                     [A or X]
+      │                             [A]=save · [X]=discard
+      │                            (arms a confirm popup — press
+      │                             the same button again to commit)
       │                                          │
-      └──────────── Saving ◄────────────── (server push)
+      ├──────── Saving ◄──(server push)◄─── [A→A] save
+      │                                          │
+      └────────────────────────────────── [X→X] discard
 ```
 
 During the 3-second countdown the state sent to the server remains `DataCollection`. Once the countdown completes it transitions to `Recording`.
+
+Stopping a recording is **confirmation-gated**: while recording, the first **A** (save) or **X** (discard) press arms an in-headset **Save episode?** / **Discard episode?** popup instead of stopping immediately. Pressing the **same** button confirms; the **other** cancels and keeps recording. Nothing is committed server-side until a save is confirmed — a confirmed discard carries the reset flag so the server drops the take and rewinds to re-record.
 
 The `Saving` state is **server-driven**: the Python SDK broadcasts `{"type": "state", "value": "saving"}` over the WebSocket immediately when recording stops, then `{"type": "state", "value": "data_collection"}` once `save_episode()` completes. While in `Saving`, all A/X button actions except Y (exit) are blocked.
 
@@ -200,6 +211,8 @@ The server can push a state override to all connected headsets at any time:
 ```
 
 Use `AxolVRTeleop.send_feedback_state(VRState.SAVING)` / `send_feedback_state(VRState.DATA_COLLECTION)` to block and unblock recording controls on the headset while an episode is being written to disk.
+
+On connect the server announces its operating mode — `{ "type": "mode", "value": "teleop" | "data_collection" }` (via `VRServer.set_mode()`) — which locks the headset HUD to that mode. During data collection it also pushes the current episode number — `{ "type": "episode", "value": N }` (1-based) — via `AxolVRTeleop.send_feedback_episode(episode)`, rendered as an `Episode N` HUD readout; the latest value is stored (`VRServer.set_episode()`) and re-sent on connect so a headset joining mid-session shows the right number.
 
 The server also pushes `{ "type": "tracking", "value": true|false }` whenever the engage toggle changes; the headset uses it to only allow repositioning the camera screens while the robot isn't being controlled.
 

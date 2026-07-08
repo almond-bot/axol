@@ -26,12 +26,17 @@ _QUEUE_MAX = 1000
 _STOP_GRACE_S = 6.0
 
 
-async def spawn_proc(argv_tail: list[str]) -> asyncio.subprocess.Process:
+async def spawn_proc(
+    argv_tail: list[str], *, stdin_pipe: bool = False
+) -> asyncio.subprocess.Process:
     """Spawn ``python -m almond_axol <argv_tail>`` with merged, streamed stdout.
 
     Runs in its own session (process group) so the whole tree can be signalled
     on teardown, and uses the serving interpreter so ``axol`` need not be on
-    PATH.
+    PATH. ``stdin_pipe`` opens a writable stdin so the UI can answer a
+    command's interactive prompts (see :meth:`Session.send_input`); otherwise
+    stdin is ``/dev/null`` so any stray ``input()`` fails fast instead of
+    hanging.
     """
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -42,7 +47,7 @@ async def spawn_proc(argv_tail: list[str]) -> asyncio.subprocess.Process:
         *argv_tail,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        stdin=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.PIPE if stdin_pipe else asyncio.subprocess.DEVNULL,
         start_new_session=True,
         env=env,
     )
@@ -140,6 +145,23 @@ class Session:
         """Signal end-of-stream to subscribers so their WebSockets can close."""
         self._fanout(None)
 
+    async def send_input(self, line: str) -> bool:
+        """Write ``line`` (plus a newline) to the process stdin.
+
+        Used to answer a command's interactive ``input()`` prompt from the UI
+        — e.g. a diagnostic's "Continue" button. Returns False when the session
+        has no writable stdin or has already exited.
+        """
+        proc = self.proc
+        if proc is None or proc.stdin is None or proc.returncode is not None:
+            return False
+        try:
+            proc.stdin.write((line + "\n").encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            return False
+        return True
+
     def read_log(self, offset: int) -> tuple[list[str], int]:
         """Return log lines at/after ``offset`` plus the next offset to poll.
 
@@ -164,13 +186,17 @@ class SessionManager:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    async def start(self, command_id: str, args: dict[str, Any]) -> Session:
+    async def start(
+        self, command_id: str, args: dict[str, Any], *, stdin_pipe: bool = False
+    ) -> Session:
         if command_id not in COMMANDS:
             raise KeyError(command_id)
 
         cli = COMMANDS[command_id].cli
         argv = build_argv(command_id, args)
-        return await self.start_raw(command_id, [cli, *argv], args=args)
+        return await self.start_raw(
+            command_id, [cli, *argv], args=args, stdin_pipe=stdin_pipe
+        )
 
     async def start_raw(
         self,
@@ -178,15 +204,17 @@ class SessionManager:
         argv_tail: list[str],
         *,
         args: dict[str, Any] | None = None,
+        stdin_pipe: bool = False,
     ) -> Session:
         """Spawn an arbitrary ``axol`` invocation as a tracked session.
 
-        ``argv_tail`` is the full CLI tail (subcommand + flags).
+        ``argv_tail`` is the full CLI tail (subcommand + flags). ``stdin_pipe``
+        keeps a writable stdin so the UI can answer interactive prompts.
         """
         session = Session(command_id, args or {})
         self._sessions[session.id] = session
         try:
-            proc = await spawn_proc(argv_tail)
+            proc = await spawn_proc(argv_tail, stdin_pipe=stdin_pipe)
         except OSError as exc:
             session.status = "error"
             session.error = f"Failed to launch command: {exc}"
