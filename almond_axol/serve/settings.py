@@ -271,16 +271,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="teleop.reset_speed",
-                label="Return-to-rest speed (rad/s)",
-                type="number",
-                help="Peak joint speed while the arms return to the rest pose.",
-                targets={
-                    "teleop": ("teleop.reset_speed",),
-                    "collect-data": (f"{_VRT}.reset_speed",),
-                },
-            ),
-            SettingDef(
                 key="teleop.rest_pose_left",
                 label="Left arm rest pose",
                 type="text",

@@ -1,7 +1,7 @@
-import { AlertTriangle, Cpu, Loader2, Plug, Server, Power } from "lucide-react"
+import { Cpu, Loader2, Plug, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import { motorFaultLabel, type RobotStatus } from "@/lib/supervisor"
+import type { MotorHealth, RobotStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -103,6 +103,8 @@ export function ConnectionsBar({
   // -- robot --
   const rs = robot?.state ?? "disconnected"
   const faults = robot?.faults ?? []
+  // A motor only counts as healthy when it is reachable AND error-free.
+  const healthyCount = (robot?.motors ?? []).filter(motorHealthy).length
   const robotDot: Dot =
     rs === "connected"
       ? faults.length > 0
@@ -117,9 +119,7 @@ export function ConnectionsBar({
             : "idle"
   const robotLabel =
     rs === "connected"
-      ? faults.length > 0
-        ? `${faults.length} motor ${faults.length > 1 ? "faults" : "fault"}`
-        : `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 16} motors healthy`
+      ? `${healthyCount}/${robot?.motorCount ?? 16} motors`
       : rs === "busy"
         ? "In use by task"
         : rs === "connecting"
@@ -169,12 +169,7 @@ export function ConnectionsBar({
         label={robotLabel}
         pulse={rs === "connecting"}
         extra={
-          robot && (rs === "connected" || rs === "busy") ? (
-            <div className="flex flex-col gap-2">
-              <MotorGrid robot={robot} />
-              {faults.length > 0 && <MotorFaults robot={robot} />}
-            </div>
-          ) : undefined
+          robot && (rs === "connected" || rs === "busy") ? <MotorGrid robot={robot} /> : undefined
         }
       >
         {rs === "connected" || rs === "busy" ? (
@@ -204,65 +199,77 @@ export function ConnectionsBar({
   )
 }
 
+/** Healthy = reachable on CAN and reporting no error status. */
+function motorHealthy(m: MotorHealth): boolean {
+  return m.reachable && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+}
+
+const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}`
+
 /**
- * Compact 16-dot motor health (two clusters of 8 dots, prefixed with a faint
- * L / R). A dot is red for any fault — unreachable *or* an error status —
- * and its tooltip carries the details (status, temperature, voltage).
+ * Per-motor health as two rows of squares (two L/R clusters of 8 each):
+ * the top row is CAN reachability, the bottom row is the motor's error
+ * status — hover a red error square for what the error is.
  */
 export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
+  const rows: {
+    label: string
+    color: (m: MotorHealth) => "ok" | "err" | "unknown"
+    tip: (m: MotorHealth) => string
+  }[] = [
+    {
+      label: "CAN",
+      color: (m) => (m.reachable ? "ok" : "err"),
+      tip: (m) => `${jointName(m)}: ${m.reachable ? "reachable" : "unreachable"}`,
+    },
+    {
+      label: "ERR",
+      color: (m) =>
+        !m.reachable && m.status == null
+          ? "unknown"
+          : m.status === "OK" || m.status === "DISABLED" || m.status == null
+            ? "ok"
+            : "err",
+      tip: (m) => {
+        if (!m.reachable && m.status == null) return `${jointName(m)}: unknown (unreachable)`
+        const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
+        const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""
+        return `${jointName(m)}: ${status}${temp}`
+      },
+    },
+  ]
   const arms = ["left", "right"]
+  const SQUARE = {
+    ok: "bg-emerald-400/80",
+    err: "bg-red-400/70",
+    unknown: "bg-white/15",
+  }
   return (
-    <div className="flex flex-wrap items-center justify-start gap-x-2 gap-y-1">
-      {arms.map((arm) => (
-        <div key={arm} className="flex items-center gap-1">
-          <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-          <div className="flex gap-[3px]">
-            {robot.motors
-              .filter((m) => m.arm === arm)
-              .map((m) => {
-                const healthy = m.reachable && (m.status === "OK" || m.status === "DISABLED")
-                const details = [
-                  m.reachable ? (m.status ?? "unknown") : "unreachable",
-                  m.temperature != null ? `${Math.round(m.temperature)}°C` : null,
-                  m.voltage != null ? `${m.voltage.toFixed(1)}V` : null,
-                ]
-                  .filter(Boolean)
-                  .join(" · ")
-                return (
-                  <span
-                    key={m.joint}
-                    title={`${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}: ${details}`}
-                    className={cn(
-                      "size-2 rounded-[2px]",
-                      healthy ? "bg-emerald-400/80" : "bg-red-400/60"
-                    )}
-                  />
-                )
-              })}
-          </div>
+    <div className="flex flex-col gap-1.5">
+      {rows.map((row) => (
+        <div key={row.label} className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="w-7 shrink-0 font-mono text-[0.6rem] tracking-wide text-white/35">
+            {row.label}
+          </span>
+          {arms.map((arm) => (
+            <div key={arm} className="flex items-center gap-1.5">
+              <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
+              <div className="flex gap-1">
+                {robot.motors
+                  .filter((m) => m.arm === arm)
+                  .map((m) => (
+                    <span
+                      key={m.joint}
+                      title={row.tip(m)}
+                      className={cn("size-3 rounded-[3px]", SQUARE[row.color(m)])}
+                    />
+                  ))}
+              </div>
+            </div>
+          ))}
         </div>
       ))}
-    </div>
-  )
-}
-
-/** The active motor faults, spelled out — these block every hardware task. */
-function MotorFaults({ robot }: { robot: RobotStatus }) {
-  return (
-    <div className="flex flex-col gap-1 rounded-md border border-red-400/25 bg-red-400/[0.06] px-2.5 py-2">
-      {(robot.faults ?? []).map((f) => (
-        <div
-          key={`${f.arm}:${f.joint}`}
-          className="flex items-center gap-1.5 text-xs text-red-300/90"
-        >
-          <AlertTriangle className="size-3 shrink-0" />
-          <span className="truncate">{motorFaultLabel(f)}</span>
-        </div>
-      ))}
-      <span className="text-[0.65rem] text-white/40">
-        Operations are blocked until every motor fault is cleared.
-      </span>
     </div>
   )
 }
