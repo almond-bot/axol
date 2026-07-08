@@ -90,9 +90,10 @@ export function RobotModel({
       setRobot(loaded)
     })
     const loader = new URDFLoader(manager)
-    // The URDF references meshes as package://assembly/meshes/<name>.stl;
-    // the server exposes the whole urdf directory at /urdf.
-    loader.packages = { assembly: `${origin}/urdf` }
+    // The URDF references meshes as package://axol_kit/meshes/<name>.stl
+    // (package://assembly/... in older exports); the server exposes the whole
+    // urdf directory at /urdf either way.
+    loader.packages = { axol_kit: `${origin}/urdf`, assembly: `${origin}/urdf` }
     loader.load(
       `${origin}/urdf/axol.urdf`,
       (r) => {
