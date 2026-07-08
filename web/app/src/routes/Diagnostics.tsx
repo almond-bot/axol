@@ -94,7 +94,14 @@ export default function Diagnostics() {
     session: SessionInfo
   } | null>(null)
   const [launchBusy, setLaunchBusy] = useState(false)
-  const { status: activeStatus } = useSessionLogs(activeRun?.session.id ?? null)
+  const { lines: activeLines, status: activeStatus } = useSessionLogs(
+    activeRun?.session.id ?? null
+  )
+  // Latest meaningful output line, surfaced on the running action card so
+  // hands-on countdowns ("close the RIGHT gripper … continuing in 15s") are
+  // visible without a log console.
+  const activeLine =
+    [...activeLines].reverse().find((l) => l.trim() && !l.startsWith("[serve]")) ?? null
 
   const stream = useTelemetryStream(serverOk)
 
@@ -403,7 +410,9 @@ export default function Diagnostics() {
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
-          <div className="grid gap-4 xl:grid-cols-3">
+          {/* Stacked full-width so each chart gets real reading space; the
+              header button on each takes it truly full screen. */}
+          <div className="grid grid-cols-1 gap-4">
             <TelemetryChart
               title="Position"
               unit="rad"
@@ -414,6 +423,7 @@ export default function Diagnostics() {
               view={view}
               onViewChange={setPinnedView}
               quietReason={quietReason}
+              height={300}
             />
             <TelemetryChart
               title="Velocity"
@@ -425,6 +435,7 @@ export default function Diagnostics() {
               view={view}
               onViewChange={setPinnedView}
               quietReason={quietReason}
+              height={300}
             />
             <TelemetryChart
               title="Torque"
@@ -436,6 +447,7 @@ export default function Diagnostics() {
               view={view}
               onViewChange={setPinnedView}
               quietReason={quietReason}
+              height={300}
             />
           </div>
         </section>
@@ -447,6 +459,7 @@ export default function Diagnostics() {
             commands={diagCommands}
             activeCommand={activeRun?.command ?? null}
             activeSince={activeRun?.session.startedAt ?? null}
+            activeLine={activeLine}
             busy={launchBusy}
             disabled={!serverOk}
             onLaunch={launch}

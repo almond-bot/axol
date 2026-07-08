@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { Loader2, Play, Square, X } from "lucide-react"
+import { Loader2, Play, Square, Timer, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { CuratedForm } from "@/components/config-form"
@@ -11,16 +11,23 @@ import {
   type CommandSpec,
   type FormValue,
 } from "@/lib/supervisor"
+import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetry"
+
+// Flags handled by the dashboard itself, never shown in the dialog:
+// - no_prompt: sessions have no stdin, so the countdown mode is forced on.
+// - no_capture: dashboard runs always keep the telemetry capture for history.
+const HIDDEN_FLAGS = new Set(["no_prompt", "no_capture"])
 
 /**
  * Diagnostics as app actions: a card per test — click it, set parameters in a
- * dialog, hit Run. Progress feedback is the card's running state + toasts;
- * results (with telemetry and the full log) land in the run history below.
+ * dialog, hit Run. Progress feedback is the card's running state + the latest
+ * output line (hands-on countdowns show there); results land in run history.
  */
 export function DiagnosticActions({
   commands,
   activeCommand,
   activeSince,
+  activeLine,
   busy,
   disabled,
   onLaunch,
@@ -31,6 +38,8 @@ export function DiagnosticActions({
   activeCommand: string | null
   /** Epoch seconds the active run started, for the elapsed readout. */
   activeSince: number | null
+  /** Latest output line of the active run (countdowns, progress). */
+  activeLine: string | null
   busy: boolean
   disabled: boolean
   onLaunch: (command: string, args: Record<string, FormValue>) => void
@@ -67,6 +76,11 @@ export function DiagnosticActions({
             <span className="line-clamp-2 text-xs leading-relaxed text-white/40">
               {cmd.description}
             </span>
+            {running && activeLine && (
+              <span className="truncate font-mono text-[0.7rem] text-emerald-200/70">
+                {activeLine}
+              </span>
+            )}
           </button>
         )
       })}
@@ -101,6 +115,90 @@ function Elapsed({ since }: { since: number | null }) {
   return <span className="font-mono tabular-nums">{m > 0 ? `${m}m ${s % 60}s` : `${s}s`}</span>
 }
 
+/**
+ * Checkbox picker for a command's `--joints` subset (ROM tests). All checked
+ * (the default) omits the flag so the command runs its own "all joints"
+ * default; any subset is sent as the comma-separated joint list.
+ */
+function JointPicker({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: FormValue | undefined
+  disabled: boolean
+  onChange: (value: string | null) => void
+}) {
+  const selected = useMemo(() => {
+    const text = typeof value === "string" ? value.trim() : ""
+    if (!text) return new Set(JOINTS)
+    const names = new Set(text.split(",").map((s) => s.trim().toUpperCase()))
+    return new Set(JOINTS.filter((j) => names.has(j)))
+  }, [value])
+
+  function toggle(joint: JointName) {
+    const next = new Set(selected)
+    if (next.has(joint)) next.delete(joint)
+    else next.add(joint)
+    if (next.size === JOINTS.length) onChange(null) // all = command default
+    else onChange(JOINTS.filter((j) => next.has(j)).map((j) => j.toLowerCase()).join(","))
+  }
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex items-center gap-2">
+        <span className="text-sm capitalize">Joints</span>
+        <span className="text-xs text-white/35">
+          {selected.size === JOINTS.length ? "all" : `${selected.size} of ${JOINTS.length}`}
+        </span>
+        {selected.size < JOINTS.length && (
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            disabled={disabled}
+            className="text-xs text-[#eff483]/80 hover:text-[#eff483]"
+          >
+            Select all
+          </button>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+        {JOINTS.map((joint) => {
+          const on = selected.has(joint)
+          return (
+            <label
+              key={joint}
+              className={cn(
+                "flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 text-xs capitalize transition-colors",
+                on
+                  ? "border-white/20 bg-white/[0.05] text-white/85"
+                  : "border-white/10 text-white/35 hover:border-white/20",
+                disabled && "pointer-events-none opacity-50"
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={on}
+                disabled={disabled}
+                onChange={() => toggle(joint)}
+                className="sr-only"
+              />
+              <span
+                className={cn(
+                  "inline-block size-2 rounded-full",
+                  !on && "opacity-30"
+                )}
+                style={{ background: JOINT_COLORS[joint] }}
+              />
+              {jointLabel(joint)}
+            </label>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 function ActionDialog({
   spec,
   running,
@@ -124,16 +222,28 @@ function ActionDialog({
   const [missing, setMissing] = useState<string[]>([])
 
   const allFields = useMemo(() => flattenFields(spec.schema), [spec])
-  // Prompts can't be answered in the browser (sessions have no stdin), so the
-  // no-prompt countdown mode is forced on and hidden from the form.
-  const fields = useMemo(() => allFields.filter((f) => f.key !== "no_prompt"), [allFields])
-  const hasNoPrompt = allFields.length !== fields.length
+  const jointsField = useMemo(() => allFields.find((f) => f.key === "joints"), [allFields])
+  const fields = useMemo(
+    () => allFields.filter((f) => !HIDDEN_FLAGS.has(f.key) && f.key !== "joints"),
+    [allFields]
+  )
+  const hasNoPrompt = allFields.some((f) => f.key === "no_prompt")
+
+  function setOverride(key: string, value: FormValue | null) {
+    setOverrides((prev) => {
+      const next = { ...prev }
+      if (value == null) delete next[key]
+      else next[key] = value
+      return next
+    })
+  }
 
   function handleRun() {
-    const miss = missingRequired(fields, overrides)
+    const formFields = jointsField ? [...fields, jointsField] : fields
+    const miss = missingRequired(formFields, overrides)
     setMissing(miss)
     if (miss.length > 0) return
-    const args = computeArgs(fields, overrides)
+    const args = computeArgs(formFields, overrides)
     if (hasNoPrompt) args.no_prompt = true
     onLaunch(args)
   }
@@ -176,20 +286,31 @@ function ActionDialog({
           <p className="text-xs text-red-300">Missing required: {missing.join(", ")}</p>
         )}
 
+        {jointsField && (
+          <JointPicker
+            value={overrides.joints}
+            disabled={running || busy}
+            onChange={(v) => setOverride("joints", v)}
+          />
+        )}
+
         {fields.length > 0 && (
           <CuratedForm
             fields={fields}
             overrides={overrides}
             disabled={running || busy}
-            onChange={(key, value) => setOverrides((prev) => ({ ...prev, [key]: value }))}
-            onReset={(key) =>
-              setOverrides((prev) => {
-                const next = { ...prev }
-                delete next[key]
-                return next
-              })
-            }
+            onChange={(key, value) => setOverride(key, value)}
+            onReset={(key) => setOverride(key, null)}
           />
+        )}
+
+        {hasNoPrompt && (
+          <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
+            <Timer className="mt-0.5 size-3.5 shrink-0 text-white/35" />
+            Hands-on steps don't wait for a key press from the dashboard: each one counts
+            down on the running card instead (e.g. ~15s to clamp or catch the item) and
+            then continues on its own.
+          </p>
         )}
 
         <div className="flex items-center justify-end gap-2 pt-1">

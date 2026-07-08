@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Maximize2, Minimize2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 import type { TelemetryFrame } from "@/lib/telemetry"
@@ -31,6 +33,8 @@ interface TelemetryChartProps {
   onViewChange?: (view: ChartView) => void
   /** Why the stream is quiet (shown as an in-plot notice), if it is. */
   quietReason?: string | null
+  /** Plot height in px (fullscreen mode sizes itself). */
+  height?: number
   className?: string
 }
 
@@ -135,11 +139,13 @@ export function TelemetryChart({
   view,
   onViewChange,
   quietReason,
+  height = 260,
   className,
 }: TelemetryChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
-  const [size, setSize] = useState({ w: 0, h: 220 })
+  const [expanded, setExpanded] = useState(false)
+  const [size, setSize] = useState({ w: 0, h: height })
   // Hovered/focused time (seconds); null hides the crosshair.
   const [hoverT, setHoverT] = useState<number | null>(null)
   const drag = useRef<{ x: number; view: ChartView; moved: boolean } | null>(null)
@@ -148,11 +154,21 @@ export function TelemetryChart({
     const el = wrapRef.current
     if (!el) return
     const ro = new ResizeObserver(() => {
-      setSize({ w: el.clientWidth, h: 220 })
+      setSize({ w: el.clientWidth, h: el.clientHeight })
     })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [expanded])
+
+  // Fullscreen closes on Escape.
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setExpanded(false)
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [expanded])
 
   const data = useMemo(
     () => extract(frames, series, metric, view),
@@ -403,14 +419,24 @@ export function TelemetryChart({
       : 0
   const flip = tooltipLeft > size.w - 190
 
-  return (
-    <Card className={cn("gap-3 p-4", className)}>
+  const card = (
+    <Card className={cn("gap-3 p-4", expanded && "h-full w-full", className)}>
       <div className="flex items-baseline gap-2">
         <h3 className="font-heading text-sm font-semibold">{title}</h3>
         <span className="text-xs text-white/35">{unit}</span>
         {quietReason && data && (
           <span className="ml-auto text-xs text-amber-200/70">{quietReason}</span>
         )}
+        <Button
+          variant="ghost"
+          size="icon"
+          className={cn("size-7 self-center text-white/40", !quietReason && "ml-auto")}
+          onClick={() => setExpanded((v) => !v)}
+          aria-label={expanded ? "Exit full screen" : "Full screen"}
+          title={expanded ? "Exit full screen (Esc)" : "Full screen"}
+        >
+          {expanded ? <Minimize2 /> : <Maximize2 />}
+        </Button>
       </div>
       <div
         ref={wrapRef}
@@ -428,9 +454,10 @@ export function TelemetryChart({
         onBlur={() => setHoverT(null)}
         className={cn(
           "relative touch-none outline-none focus-visible:ring-1 focus-visible:ring-[#eff483]/50",
-          onViewChange && "cursor-crosshair"
+          onViewChange && "cursor-crosshair",
+          expanded && "min-h-0 flex-1"
         )}
-        style={{ height: 220 }}
+        style={expanded ? undefined : { height }}
       >
         <canvas ref={canvasRef} style={{ width: "100%", height: "100%" }} />
         {hover && (
@@ -470,4 +497,9 @@ export function TelemetryChart({
       </div>
     </Card>
   )
+
+  if (expanded) {
+    return <div className="fixed inset-0 z-50 flex bg-black/70 p-4 sm:p-8">{card}</div>
+  }
+  return card
 }

@@ -11,13 +11,15 @@ A card per motor (8 per arm) shows its status code, temperature, bus voltage, an
 
 ## Live telemetry
 
-Position, velocity, and torque charts for the selected arm stream continuously at 10 Hz while the robot link is connected. The server keeps a 10-minute rolling buffer, so the charts backfill on page load. The filter row scopes all three charts: time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**.
+Position, velocity, and torque charts for the selected arm stream continuously at 10 Hz while the robot link is connected. The server keeps a 10-minute rolling buffer, so the charts backfill on page load. The filter row scopes all three charts: time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**. Each chart's header button expands it to full screen (Esc to exit) for a closer look.
 
 Telemetry is sampled by the idle robot link, which is the single owner of the CAN bus. While a diagnostic or operation owns the bus the stream pauses and the charts label the gap — history is kept, and streaming resumes as soon as the bus is released.
 
 ## Diagnostics
 
-Each diagnostic — [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — is a card: click it, set parameters in the dialog, and hit Run. The card shows the running state and elapsed time; completion lands as a notification, and the full log is kept with the run in the history below. Interactive prompts are replaced by countdowns automatically (`--no-prompt`), and launching hands the CAN bus over to the diagnostic for the duration of the run. (The `motor.info` / `motor.health` read set needs no action here — the motor cards above show it live.)
+Each diagnostic — [`diag.home`](https://docs.almond.bot/cli/diag-home), [`diag.gripper`](https://docs.almond.bot/cli/diag-gripper), [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable) — is a card: click it, set parameters in the dialog, and hit Run. The ROM tests expose a joint checkbox picker so you can soak a subset (e.g. just the wrist joints). The card shows the running state, elapsed time, and the latest output line; completion lands as a notification, and the full log is kept with the run in the history below. Launching hands the CAN bus over to the diagnostic for the duration of the run.
+
+Hands-on steps — like clamping an item in the ROM grasp test — can't wait for a key press from the browser (a launched diagnostic has no stdin), so each one counts down on the running card instead (e.g. ~15 s to clamp or catch the item) and then continues on its own; the card's status line shows which step is counting down. (The `motor.info` / `motor.health` read set needs no action here — the motor cards above show it live.)
 
 ## Run history
 
