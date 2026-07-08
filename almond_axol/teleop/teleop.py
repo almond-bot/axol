@@ -96,7 +96,9 @@ class VRTeleop:
         # Engage toggle, EMA/trapezoidal smoothing, and reset handling all live
         # in the shared core so this flow and `axol collect-data` (AxolVRTeleop)
         # cannot drift apart.
-        self._core = VRTeleopCore(config, _logger, self._broadcast_tracking)
+        self._core = VRTeleopCore(
+            config, _logger, self._broadcast_tracking, self._broadcast_json
+        )
 
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
@@ -150,6 +152,21 @@ class VRTeleop:
         try:
             asyncio.run_coroutine_threadsafe(
                 self._vr_server.broadcast_text(text), self._vr_loop
+            )
+        except RuntimeError:
+            pass  # VR loop already shut down
+
+    def _broadcast_json(self, obj: dict) -> None:
+        """Push an arbitrary JSON message to the headset (fire-and-forget).
+
+        Used by the shared core for the URDF overlay state in absolute (UMI)
+        mode. Safe to call from any thread.
+        """
+        if self._vr_loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(json.dumps(obj)), self._vr_loop
             )
         except RuntimeError:
             pass  # VR loop already shut down

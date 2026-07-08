@@ -25,6 +25,11 @@ class Joint(Enum):
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
 
+# Handheld UMI data-collection rig: one dual-channel adapter, each channel
+# wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
+CAN_UMI_LEFT = "can_alm_umi_l"
+CAN_UMI_RIGHT = "can_alm_umi_r"
+
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
 

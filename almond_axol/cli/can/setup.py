@@ -8,26 +8,58 @@ The Almond Axol adapter (VID 0x1D50 / PID 0x606F) exposes two CAN channels
 on a single USB device:
   channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+
+``axol can.setup --umi`` configures a second adapter of the same model for the
+handheld UMI data-collection rig instead:
+  channel 0 (dev_id 0x0) -> can_alm_umi_l   (left gripper)
+  channel 1 (dev_id 0x1) -> can_alm_umi_r   (right gripper)
+The two profiles use separate udev rule files and startup scripts, so a machine
+can have both the robot and the UMI rig configured at once.
 """
 
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
-from ...constants import CAN_LEFT, CAN_RIGHT
+from ...constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
 from ...utils.sudo import run_root
 from . import driver
 
 _VID = "1d50"
 _PID = "606f"
-_CAN_L = CAN_LEFT
-_CAN_R = CAN_RIGHT
 _BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
-_UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
 _CAN_DIR = Path.home() / ".almond" / "can"
-_CRON_SCRIPT = _CAN_DIR / "startup.sh"
+
+
+@dataclass(frozen=True)
+class _Profile:
+    """One adapter's persistent-naming setup (rule file, names, bring-up script)."""
+
+    label: str
+    left: str
+    right: str
+    rules_file: Path
+    cron_script: Path
+
+
+_AXOL_PROFILE = _Profile(
+    label="Almond Axol arm",
+    left=CAN_LEFT,
+    right=CAN_RIGHT,
+    rules_file=Path("/etc/udev/rules.d/90-can.rules"),
+    cron_script=_CAN_DIR / "startup.sh",
+)
+
+_UMI_PROFILE = _Profile(
+    label="Almond UMI rig",
+    left=CAN_UMI_LEFT,
+    right=CAN_UMI_RIGHT,
+    rules_file=Path("/etc/udev/rules.d/91-can-umi.rules"),
+    cron_script=_CAN_DIR / "startup_umi.sh",
+)
 
 
 def _die(msg: str) -> None:
@@ -77,6 +109,18 @@ def _detect_serials() -> list[str]:
     return list(dict.fromkeys(serials))
 
 
+def _serial_in_rules(rules_file: Path) -> str | None:
+    """The adapter serial a previously-written rules file is keyed on, if any."""
+    try:
+        content = rules_file.read_text()
+    except OSError:
+        return None
+    for line in content.splitlines():
+        if 'ATTRS{serial}=="' in line:
+            return line.split('ATTRS{serial}=="')[1].split('"')[0]
+    return None
+
+
 def _resolve_serial() -> str:
     """Pick the adapter serial without prompting (for headless ``ensure_setup``).
 
@@ -91,10 +135,17 @@ def _resolve_serial() -> str:
     raise RuntimeError("Multiple CAN adapters")
 
 
-def _find_serial() -> str:
-    print(f"Scanning for Almond Axol CAN adapter ({_VID}:{_PID})...")
+def _find_serial(profile: _Profile) -> str:
+    print(f"Scanning for {profile.label} CAN adapter ({_VID}:{_PID})...")
 
     unique = _detect_serials()
+
+    # When setting up a second profile, hide the serial the *other* profile's
+    # rules already claim so the obvious single-adapter case stays promptless.
+    other = _AXOL_PROFILE if profile is _UMI_PROFILE else _UMI_PROFILE
+    claimed = _serial_in_rules(other.rules_file)
+    if claimed and len(unique) > 1:
+        unique = [s for s in unique if s != claimed]
 
     if not unique:
         print(
@@ -116,17 +167,17 @@ def _find_serial() -> str:
     return unique[int(idx)]
 
 
-def _write_udev_rules(serial: str) -> None:
-    print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
+def _write_udev_rules(serial: str, profile: _Profile) -> None:
+    print(f"Writing udev rules to {profile.rules_file} (requires sudo)...")
     content = (
-        f"# Almond Axol dual-channel CAN adapter\n"
+        f"# {profile.label} dual-channel CAN adapter\n"
         f"# Adapter serial: {serial}\n"
-        f"# Channel 0 -> left arm\n"
-        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x0", NAME="{_CAN_L}"\n'
-        f"# Channel 1 -> right arm\n"
-        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
+        f"# Channel 0 -> left\n"
+        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x0", NAME="{profile.left}"\n'
+        f"# Channel 1 -> right\n"
+        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{profile.right}"\n'
     )
-    run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
+    run_root(["tee", str(profile.rules_file)], input_text=content, check=True)
     print("  Done.")
 
 
@@ -137,10 +188,10 @@ def _reload_udev() -> None:
     print("  Done.")
 
 
-def _rename_interfaces(serial: str) -> None:
+def _rename_interfaces(serial: str, profile: _Profile) -> None:
     """Rename existing canX interfaces to their target names without replug."""
     print("Renaming CAN interfaces (requires sudo)...")
-    target = {0: _CAN_L, 1: _CAN_R}
+    target = {0: profile.left, 1: profile.right}
 
     for iface_path in Path("/sys/class/net").glob("can*"):
         iface = iface_path.name
@@ -185,29 +236,29 @@ def _rename_interfaces(serial: str) -> None:
     print("  Done.")
 
 
-def _write_cron_script() -> None:
-    print(f"Writing CAN startup script to {_CRON_SCRIPT}...")
+def _write_cron_script(profile: _Profile) -> None:
+    print(f"Writing CAN startup script to {profile.cron_script}...")
     _CAN_DIR.mkdir(parents=True, exist_ok=True)
-    _CRON_SCRIPT.write_text(
+    profile.cron_script.write_text(
         f"#!/bin/bash\n"
-        f"# Bring up Almond Axol CAN interfaces\n"
+        f"# Bring up {profile.label} CAN interfaces\n"
         f"set -euo pipefail\n\n"
-        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
+        f"for IFACE in {profile.left} {profile.right}; do\n"
         f'    ip link set "${{IFACE}}" down 2>/dev/null || true\n'
         f'    ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
         f'    ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
         f'    ip link set "${{IFACE}}" up\n'
         f"done\n"
     )
-    _CRON_SCRIPT.chmod(0o755)
+    profile.cron_script.chmod(0o755)
     print("  Done.")
 
 
-def _register_cron() -> None:
+def _register_cron(profile: _Profile) -> None:
     print("Registering @reboot cron entry in root crontab (requires sudo)...")
-    cron_entry = f"@reboot {_CRON_SCRIPT}"
+    cron_entry = f"@reboot {profile.cron_script}"
     existing = run_root(["crontab", "-l"]).stdout or ""
-    if str(_CRON_SCRIPT) in existing:
+    if str(profile.cron_script) in existing:
         print("  Entry already present — skipping.")
     else:
         new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
@@ -217,15 +268,21 @@ def _register_cron() -> None:
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.setup`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "can.setup",
-        help="Configure CAN interfaces for the Axol arm.",
-    ).set_defaults(func=run)
+        help="Configure CAN interfaces for the Axol arm (or the UMI rig with --umi).",
+    )
+    parser.add_argument(
+        "--umi",
+        action="store_true",
+        help=f"Configure the handheld UMI rig adapter ({CAN_UMI_LEFT} / {CAN_UMI_RIGHT}).",
+    )
+    parser.set_defaults(func=run)
 
 
-def _bring_up_can() -> None:
+def _bring_up_can(profile: _Profile) -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
-    run_root(["bash", str(_CRON_SCRIPT)], check=True)
+    run_root(["bash", str(profile.cron_script)], check=True)
     print("  Done.")
 
 
@@ -234,9 +291,10 @@ def is_configured() -> bool:
 
     Used by the control panel to decide whether connecting needs to run the
     full :func:`ensure_setup` (first time on a machine) or can just bring the
-    already-named interfaces up.
+    already-named interfaces up. Refers to the robot-arm profile; the UMI rig
+    is configured explicitly via ``axol can.setup --umi``.
     """
-    return _UDEV_RULES_FILE.exists() and _CRON_SCRIPT.exists()
+    return _AXOL_PROFILE.rules_file.exists() and _AXOL_PROFILE.cron_script.exists()
 
 
 def ensure_setup(*, serial: str | None = None) -> None:
@@ -244,26 +302,31 @@ def ensure_setup(*, serial: str | None = None) -> None:
 
     Mirrors :func:`run` but resolves the adapter serial without prompting.
     Each step is idempotent, so this is safe to call on a partially-configured
-    machine.
+    machine. Configures the robot-arm profile only.
     """
     driver.ensure_driver()
     serial = serial or _resolve_serial()
-    _write_udev_rules(serial)
+    _configure(serial, _AXOL_PROFILE)
+
+
+def _configure(serial: str, profile: _Profile) -> None:
+    _write_udev_rules(serial, profile)
     _reload_udev()
-    _rename_interfaces(serial)
-    _write_cron_script()
-    _register_cron()
-    _bring_up_can()
+    _rename_interfaces(serial, profile)
+    _write_cron_script(profile)
+    _register_cron(profile)
+    _bring_up_can(profile)
 
 
-def run(_args: object = None) -> None:
+def run(args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
+    profile = _UMI_PROFILE if getattr(args, "umi", False) else _AXOL_PROFILE
     driver.ensure_driver()
-    serial = _find_serial()
-    ensure_setup(serial=serial)
+    serial = _find_serial(profile)
+    _configure(serial, profile)
 
     print()
     print("Setup complete.")
-    print(f"  Left arm : {_CAN_L}")
-    print(f"  Right arm: {_CAN_R}")
-    print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
+    print(f"  Left  : {profile.left}")
+    print(f"  Right : {profile.right}")
+    print(f"  Startup  : {profile.cron_script} (runs at @reboot via root crontab)")

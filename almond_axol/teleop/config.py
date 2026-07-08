@@ -84,6 +84,29 @@ class VRTeleopConfig:
             controller since engage is converted to axis-angle and its angle
             is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
+        absolute_mode: UMI handheld-rig mapping. Instead of re-applying
+            controller *deltas* onto the robot's engage-time FK pose (normal
+            teleop), the engage rising edge solves a world-anchored robot
+            **base transform** — gravity-aligned, positioned/oriented so the
+            rest-pose FK gripper poses coincide with the two controllers'
+            current poses — and every subsequent frame maps the controller
+            pose 1:1 into that fixed base frame as an absolute IK target.
+            Engaging is therefore the alignment act: the operator holds both
+            grippers at the agreed start pose (matching the robot's rest
+            pose relative to the task scene) and squeezes both grips. The
+            offset between each controller and its gripper TCP (mount
+            geometry, URDF frame conventions) is absorbed by the same
+            engage snapshot. Elbow hints are ignored in this mode — human
+            elbow positions say nothing about the robot's preferred null-space
+            posture. ``position_multiplier`` / ``rotation_multiplier`` do not
+            apply (the mapping is 1:1 by construction). Defaults to ``False``.
+        base_height: Optional fixed height (metres) of the robot base origin
+            above the VR floor (the WebXR ``local-floor`` reference space) in
+            ``absolute_mode``. When set, the engage-time base fit pins the
+            base's vertical position to it — matching the robot's real
+            mounting height so datasets stay consistent across operators of
+            different heights. ``None`` (default) lets the fit take the
+            vertical position from the held grippers.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -131,3 +154,5 @@ class VRTeleopConfig:
     pose_beta: float = 5.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
+    absolute_mode: bool = False
+    base_height: float | None = None

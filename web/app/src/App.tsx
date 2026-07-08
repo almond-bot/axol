@@ -30,6 +30,7 @@ import interFontUrl from "@fontsource/inter/files/inter-latin-700-normal.woff"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
+import { RobotModel } from "@/components/robot-model"
 import { SiteNav } from "@/components/site-nav"
 import { authorizeCert } from "@/lib/cert-accept"
 import { cn } from "@/lib/utils"
@@ -1427,6 +1428,7 @@ export default function App() {
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
             <PoseVisualizer />
+            <RobotModel hostname={hostname} wsRef={wsRef} />
           </XR>
         </Suspense>
       </Canvas>

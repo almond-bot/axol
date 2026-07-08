@@ -102,7 +102,10 @@ class AxolVRTeleop(Teleoperator):
         # in the shared core so this flow and native `axol teleop` (VRTeleop)
         # cannot drift apart.
         self._core = VRTeleopCore(
-            config.vr_teleop_config, _logger, self._broadcast_tracking
+            config.vr_teleop_config,
+            _logger,
+            self._broadcast_tracking,
+            self._broadcast_json,
         )
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
@@ -381,6 +384,21 @@ class AxolVRTeleop(Teleoperator):
         except RuntimeError:
             pass  # event loop already shut down
 
+    def _broadcast_json(self, obj: dict[str, Any]) -> None:
+        """Push an arbitrary JSON message to the headset (fire-and-forget).
+
+        Used by the shared core for the URDF overlay state in absolute (UMI)
+        mode. Safe to call from any thread.
+        """
+        if self._vr_server is None or self._loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._vr_server.broadcast_text(json.dumps(obj)), self._loop
+            )
+        except RuntimeError:
+            pass  # event loop already shut down
+
     def send_feedback_state(self, state: VRState) -> None:
         """Broadcast a state override to all connected VR clients.
 
@@ -440,6 +458,17 @@ class AxolVRTeleop(Teleoperator):
         for i, key in enumerate(_RIGHT_POS_KEYS):
             action[key] = float(q[8 + i])
         return action
+
+    def pose_capture_ts(self) -> float | None:
+        """Host-clock capture time of the pose behind the latest action.
+
+        ``time.perf_counter`` seconds, estimated by the VR server's pose
+        interpolator (``VRFrame.t_host``). UMI data collection stamps dataset
+        rows with this so image exposure and pose share one capture timeline.
+        ``None`` before the first solve or when the client doesn't stamp
+        capture times.
+        """
+        return self._core.last_pose_host_ts
 
     def get_teleop_events(self) -> dict[TeleopEvents | str, Any]:
         """Return episode control events derived from VRState transitions.

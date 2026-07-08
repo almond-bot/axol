@@ -36,6 +36,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | `useAxolPoseSocket` | Hook — maintains a dedicated pose WebSocket to `wss://localhost:<port>` (the Quest-over-USB `adb reverse` tunnel) so controller poses avoid WiFi latency; returns `{ poseWsRef, status }` |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
 | `useAxolTracking` | Hook — returns a frame-readable `ref` reflecting whether the robot is currently engaged (mirroring the operator), driven by the server's `{"type":"tracking"}` pushes with a local grip-toggle fallback. Used to gate camera-screen repositioning to when the robot isn't being controlled |
+| `useAxolUrdfState` | Hook — returns a frame-readable `ref` with the latest `{"type":"urdf_state"}` push (robot base transform in the XR reference space + IK joint solution), used to render the virtual robot overlay in absolute (UMI) mode |
 | `AxolState` | Enum — `Teleop`, `DataCollection`, `Recording`, `Saving`, `Error` |
 | `AxolConnectionStatus` | Enum — `Idle`, `Connecting`, `Open`, `Error`, `Failed` |
 | `AxolPoseData` | Type — shape of each frame sent over the WebSocket |
@@ -201,6 +202,8 @@ The server can push a state override to all connected headsets at any time:
 Use `AxolVRTeleop.send_feedback_state(VRState.SAVING)` / `send_feedback_state(VRState.DATA_COLLECTION)` to block and unblock recording controls on the headset while an episode is being written to disk.
 
 The server also pushes `{ "type": "tracking", "value": true|false }` whenever the engage toggle changes; the headset uses it to only allow repositioning the camera screens while the robot isn't being controlled.
+
+In absolute (UMI) mode the server additionally streams `{ "type": "urdf_state", "base": { "pos": [x,y,z], "quat": [x,y,z,w] } | null, "joints": { "<urdf joint>": rad, ... }, "engaged": bool }` at ~30 Hz. `base` is the robot base transform solved at engage (null before the first engage) in the same reference space as the controller poses; the app renders the robot URDF there (`RobotModel` in the app), fetching the model from the server's `https://<host>:8000/urdf/` static mount.
 
 **Camera video (WebRTC)**
 

@@ -8,6 +8,7 @@ All intermediate computations stay in NumPy; the single JAX boundary is the
 
 from __future__ import annotations
 
+import logging
 import math
 import multiprocessing
 import multiprocessing.connection
@@ -24,9 +25,50 @@ from .config import VRTeleopConfig
 from .filter import OneEuroFilter
 from .trajectory import plan_collision_aware_trajectory
 
+_logger = logging.getLogger(__name__)
+
+# Up direction of the raw VR world frame (WebXR reference space: +y is up).
+_VR_UP = np.array([0.0, 1.0, 0.0])
+
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
 # ---------------------------------------------------------------------------
+
+
+def _matrix_to_quat_xyzw(R: np.ndarray) -> tuple[float, float, float, float]:
+    """Convert a 3x3 rotation matrix to an ``(x, y, z, w)`` quaternion."""
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        return (
+            float(R[2, 1] - R[1, 2]) / s,
+            float(R[0, 2] - R[2, 0]) / s,
+            float(R[1, 0] - R[0, 1]) / s,
+            0.25 * s,
+        )
+    if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        return (
+            0.25 * s,
+            float(R[0, 1] + R[1, 0]) / s,
+            float(R[0, 2] + R[2, 0]) / s,
+            float(R[2, 1] - R[1, 2]) / s,
+        )
+    if R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        return (
+            float(R[0, 1] + R[1, 0]) / s,
+            0.25 * s,
+            float(R[1, 2] + R[2, 1]) / s,
+            float(R[0, 2] - R[2, 0]) / s,
+        )
+    s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+    return (
+        float(R[0, 2] + R[2, 0]) / s,
+        float(R[1, 2] + R[2, 1]) / s,
+        0.25 * s,
+        float(R[1, 0] - R[0, 1]) / s,
+    )
 
 
 def _quat_xyzw_to_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -167,6 +209,17 @@ class IKWorker:
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
 
+        # Absolute (UMI) mode state: the world-anchored base transform solved
+        # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
+        # raw VR world frame — plus each controller's rigid controller→TCP
+        # offset ``(p_off, R_off)`` expressed in the controller's local frame.
+        self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
+        self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # JSON-safe copy of the base transform for the headset (VR world
+        # coords), so the web client can render the URDF at the calibrated
+        # base. ``None`` until the first engage.
+        self.abs_base_msg: dict[str, list[float]] | None = None
+
         freq = config.frequency
         mc = config.pose_min_cutoff
         beta = config.pose_beta
@@ -187,6 +240,13 @@ class IKWorker:
         self._rest_pose_left = q_settled[self._solver.left_indices].astype(np.float32)
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
+
+        if config.absolute_mode:
+            # Warm the no-elbow IK graph now: absolute mode never passes elbow
+            # hints, and that distinct JAX graph would otherwise JIT-compile on
+            # the first engage, stalling the session for the compile time.
+            fk_l, fk_r = self._rest_fk_poses()
+            self._solver.ik(self.get_rest_q(), left_pose=fk_l, right_pose=fk_r)
 
     # -- Properties the main process needs ----------------------------------
 
@@ -213,6 +273,9 @@ class IKWorker:
 
     def step(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
         """Process one VRFrame. Returns updated full (N,) q in radians."""
+        if self._config.absolute_mode:
+            return self._step_absolute(frame, q_current)
+
         enabled = frame.l_lock and frame.r_lock
         if not enabled:
             self._active = False
@@ -318,6 +381,83 @@ class IKWorker:
             right_elbow_pos=elbow_r,
         )
 
+    def _step_absolute(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
+        """UMI handheld-rig step: absolute world-anchored targets, no deltas.
+
+        The engage rising edge solves the base transform + per-controller TCP
+        offsets (:meth:`_engage_absolute`); every later frame maps each
+        controller pose rigidly into the base frame and solves IK against the
+        absolute target. Elbow hints are never passed — the operator's elbows
+        say nothing about the robot's preferred null-space posture, which is
+        instead anchored to the rest pose so joint solutions stay consistent
+        across operators and episodes.
+        """
+        enabled = frame.l_lock and frame.r_lock
+        if not enabled:
+            self._active = False
+            return q_current
+
+        if not self._active:
+            # Same rationale as the relative path: the One Euro state froze at
+            # the pose held when tracking was last disabled.
+            self._reset_pose_filters()
+
+        lp = self._f_l_pos.update(
+            np.array(
+                [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
+            )
+        )
+        lq = self._f_l_quat.update(
+            np.array(
+                [
+                    frame.l_ee.quaternion.x,
+                    frame.l_ee.quaternion.y,
+                    frame.l_ee.quaternion.z,
+                    frame.l_ee.quaternion.w,
+                ]
+            )
+        )
+        lq = lq / np.linalg.norm(lq)
+        rp = self._f_r_pos.update(
+            np.array(
+                [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
+            )
+        )
+        rq = self._f_r_quat.update(
+            np.array(
+                [
+                    frame.r_ee.quaternion.x,
+                    frame.r_ee.quaternion.y,
+                    frame.r_ee.quaternion.z,
+                    frame.r_ee.quaternion.w,
+                ]
+            )
+        )
+        rq = rq / np.linalg.norm(rq)
+
+        l_pos, l_rot = (
+            lp.astype(np.float64),
+            _quat_xyzw_to_matrix(*lq).astype(np.float64),
+        )
+        r_pos, r_rot = (
+            rp.astype(np.float64),
+            _quat_xyzw_to_matrix(*rq).astype(np.float64),
+        )
+
+        if not self._active:
+            self._active = True
+            self._engage_absolute(l_pos, l_rot, r_pos, r_rot)
+            # Anchor the null-space posture at rest (not q_current) so arm
+            # configurations stay consistent across operators and episodes.
+            self._solver.set_posture_pose(self.get_rest_q())
+            return q_current
+
+        return self._solver.ik(
+            q_current,
+            left_pose=self._absolute_target("left", l_pos, l_rot),
+            right_pose=self._absolute_target("right", r_pos, r_rot),
+        )
+
     def compute_reset_trajectory(
         self, q_current: np.ndarray, q_target: np.ndarray
     ) -> list[np.ndarray]:
@@ -349,12 +489,110 @@ class IKWorker:
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
         self._snap_elbow_fk = {}
+        self._abs_base = None
+        self._abs_offset = {}
+        self.abs_base_msg = None
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
         # restores the default rest-pose attractor.
         self._solver.set_posture_pose(self.get_rest_q())
 
     # -- Internal -----------------------------------------------------------
+
+    def _rest_fk_poses(
+        self,
+    ) -> tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]]:
+        """Rest-pose FK gripper poses ``(left, right)`` in the base frame."""
+        fk = self._solver.robot.forward_kinematics(jnp.asarray(self.get_rest_q()))
+
+        def _pose(idx: int) -> tuple[np.ndarray, np.ndarray]:
+            T = jaxlie.SE3(fk[idx])
+            return (
+                np.asarray(T.translation(), dtype=np.float64),
+                np.asarray(T.rotation().as_matrix(), dtype=np.float64),
+            )
+
+        return _pose(self._solver.l_ee_idx), _pose(self._solver.r_ee_idx)
+
+    def _engage_absolute(
+        self,
+        l_pos: np.ndarray,
+        l_rot: np.ndarray,
+        r_pos: np.ndarray,
+        r_rot: np.ndarray,
+    ) -> None:
+        """Solve the world-anchored base transform + controller→TCP offsets.
+
+        The operator is holding both grippers at the agreed start pose — the
+        pose the robot's grippers occupy at rest, relative to the task scene.
+        The base transform is gravity-aligned (base up = VR world up) with its
+        yaw set so the base's left axis points from the right gripper to the
+        left one, and its translation chosen so the rest-pose FK gripper
+        midpoint lands on the measured gripper midpoint (``base_height``, when
+        set, pins the vertical component to the robot's real mounting height
+        instead). Each controller's rigid offset to its gripper TCP is then
+        whatever makes the engage pose coincide exactly with rest FK — this
+        absorbs the physical mount transform, URDF frame conventions, and the
+        operator's residual alignment error in one snapshot. Alignment quality
+        at engage therefore bounds the episode's absolute accuracy.
+        """
+        fk_l, fk_r = self._rest_fk_poses()
+
+        # URDF base frame: +x = left, +y = forward, +z = up (the rest-pose
+        # grippers sit at x = ±0.20 in it). Base up aligns with world up; base
+        # +x aligns with the horizontal right→left gripper direction.
+        d = l_pos - r_pos
+        d_h = d - np.dot(d, _VR_UP) * _VR_UP
+        n = float(np.linalg.norm(d_h))
+        if n < 1e-6:
+            _logger.warning(
+                "absolute engage: grippers are horizontally coincident; "
+                "base yaw is arbitrary — re-engage with grippers apart."
+            )
+            d_h, n = np.array([1.0, 0.0, 0.0]), 1.0
+        x_axis = d_h / n
+        z_axis = _VR_UP
+        y_axis = np.cross(z_axis, x_axis)
+        R_wb = np.column_stack([x_axis, y_axis, z_axis])
+
+        mid_w = 0.5 * (l_pos + r_pos)
+        mid_b = 0.5 * (fk_l[0] + fk_r[0])
+        t_wb = mid_w - R_wb @ mid_b
+        if self._config.base_height is not None:
+            t_wb[1] = float(self._config.base_height)
+        self._abs_base = (R_wb, t_wb)
+        self.abs_base_msg = {
+            "pos": [float(v) for v in t_wb],
+            "quat": list(_matrix_to_quat_xyzw(R_wb)),
+        }
+
+        def _offset(
+            ctrl_pos: np.ndarray,
+            ctrl_rot: np.ndarray,
+            fk_pose: tuple[np.ndarray, np.ndarray],
+        ) -> tuple[np.ndarray, np.ndarray]:
+            fk_pos, fk_rot = fk_pose
+            p_w_tcp = R_wb @ fk_pos + t_wb
+            r_w_tcp = R_wb @ fk_rot
+            return ctrl_rot.T @ (p_w_tcp - ctrl_pos), ctrl_rot.T @ r_w_tcp
+
+        self._abs_offset = {
+            "left": _offset(l_pos, l_rot, fk_l),
+            "right": _offset(r_pos, r_rot, fk_r),
+        }
+
+    def _absolute_target(
+        self, side: str, pos: np.ndarray, rot: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map a controller pose rigidly into the base frame. Returns (pos_3, rot_3x3)."""
+        assert self._abs_base is not None
+        R_wb, t_wb = self._abs_base
+        p_off, R_off = self._abs_offset[side]
+        p_w = pos + rot @ p_off
+        R_w = rot @ R_off
+        p_b = R_wb.T @ (p_w - t_wb)
+        R_b = R_wb.T @ R_w
+        return p_b.astype(np.float32), R_b.astype(np.float32)
 
     def _reset_pose_filters(self) -> None:
         """Clear the OneEuroFilter state for every controller and elbow stream."""
@@ -538,6 +776,12 @@ def run_ik_worker(
                 conn.send(("reset_traj", q_rest.copy(), traj))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
-                conn.send(q.copy())
+                if config.absolute_mode:
+                    # Absolute (UMI) mode replies carry the engage-calibrated
+                    # base transform so the adapter can stream it (with the
+                    # joint solution) to the headset's URDF overlay.
+                    conn.send(("q", q.copy(), worker.abs_base_msg))
+                else:
+                    conn.send(q.copy())
         except (EOFError, KeyboardInterrupt):
             break

@@ -59,6 +59,29 @@ _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
 
 
+async def calibrate_gripper_open_stop(motor: Motor) -> float:
+    """Find a gripper's open hard-stop and return its raw motor position (rad).
+
+    Steps the motor incrementally toward open until the torque magnitude
+    reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop), or the full
+    travel has been swept. Shared by :class:`AxolArm` and the handheld UMI rig
+    (:mod:`almond_axol.robot.umi`), whose grippers are the same Damiao unit.
+
+    Must be called with the motor already enabled and in IMPEDANCE mode.
+    """
+    target = await motor.get_position()
+    for _ in range(_GRIPPER_CALIB_MAX_STEPS):
+        target -= _GRIPPER_CALIB_STEP
+        await motor.set_impedance(
+            target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
+        )
+        await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
+        torque = await motor.get_torque()
+        if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
+            break
+    return await motor.get_position()
+
+
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     """Return (min, max) position limits for a joint on the given arm.
 
@@ -272,32 +295,12 @@ class AxolArm:
     async def _calibrate_gripper(self) -> None:
         """Find the gripper open position by stepping in the negative direction.
 
-        Steps the gripper motor incrementally toward open until the torque
-        magnitude drops to ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop).
         Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
-        (close) which are used for normalization and clipping.
-
-        Must be called with the gripper motor already enabled and in IMPEDANCE mode.
+        (close) which are used for normalization and clipping. See
+        :func:`calibrate_gripper_open_stop`.
         """
-        motor = self.motors[Joint.GRIPPER]
         gripper_i = self._gripper_i
-
-        target = await motor.get_position()
-
-        for _ in range(_GRIPPER_CALIB_MAX_STEPS):
-            target -= _GRIPPER_CALIB_STEP
-            await motor.set_impedance(
-                target, 0.0, _GRIPPER_CALIB_KP, _GRIPPER_CALIB_KD, 0.0
-            )
-            await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
-            torque = await motor.get_torque()
-            if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
-                open_pos = await motor.get_position()
-                self._limits_lo[gripper_i] = open_pos
-                self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
-                return
-
-        open_pos = await motor.get_position()
+        open_pos = await calibrate_gripper_open_stop(self.motors[Joint.GRIPPER])
         self._limits_lo[gripper_i] = open_pos
         self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
 

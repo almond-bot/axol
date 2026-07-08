@@ -140,6 +140,10 @@ class PoseInterpolator:
                 self._transits.pop(0)
             ts = [t for _, t in self._transits]
             self._clock_offset = min(ts)
+            # Host-clock estimate of when this frame's poses were captured
+            # (biased late by the minimum one-way transit, which the min-filter
+            # can't separate from the clock offset — negligible on USB).
+            frame.t_host = cap_t + self._clock_offset
             jitter = max(ts) - self._clock_offset
             target_delay = min(max(jitter, self._min_delay), self._max_delay)
             # Grow the delay immediately (don't let the buffer run dry), shrink
@@ -206,8 +210,11 @@ class PoseInterpolator:
                 alpha = (play - caps[j - 1]) / span if span > 1e-9 else 0.0
             last_out = self._last_out
             last_pos = self._last_pos
+            # The rendered pose corresponds to headset-time ``play``; map it
+            # back onto the host clock for consumers that align to capture time.
+            play_host = play + self._clock_offset
 
-        rendered, pos = _interpolate(a, b, alpha, latest)
+        rendered, pos = _interpolate(a, b, alpha, latest, play_host)
 
         # Identity-stable: reuse the previous object when nothing moved and the
         # control state matches, so the consumer's `is` check skips the solve.
@@ -258,7 +265,7 @@ def _quat(q: VRQuaternion) -> np.ndarray:
 
 
 def _interpolate(
-    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame
+    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame, t_host: float | None = None
 ) -> tuple[VRFrame, np.ndarray]:
     """Interpolate motion between ``a`` and ``b``; take control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
@@ -292,6 +299,7 @@ def _interpolate(
         state=latest.state,
         t=latest.t,
         seq=latest.seq,
+        t_host=t_host,
     )
     pos = np.concatenate([l_ee_p, r_ee_p, l_el, r_el])
     return frame, pos

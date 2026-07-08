@@ -39,8 +39,11 @@ from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
+from ..constants import URDF_PATH
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
@@ -434,6 +437,21 @@ class VRServer:
     def _build_app(self) -> FastAPI:
         app = FastAPI()
         server = self
+
+        # The web app is served from a different origin (axol.almond.bot or a
+        # dev server), so its fetches of the URDF/meshes below need CORS. The
+        # WebSocket path is unaffected (WS is not subject to CORS).
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET"],
+            allow_headers=["*"],
+        )
+
+        # Robot model for the headset's URDF overlay (absolute/UMI mode): the
+        # web client fetches /urdf/axol.urdf and resolves its
+        # package://assembly/... mesh references against /urdf/.
+        app.mount("/urdf", StaticFiles(directory=str(URDF_PATH.parent)), name="urdf")
 
         @app.get("/__accept")
         async def _accept() -> HTMLResponse:

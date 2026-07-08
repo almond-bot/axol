@@ -54,6 +54,67 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
+def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
+    """Rewrite the parsed config for handheld UMI collection (``--umi``).
+
+    Robot side: swap a plain :class:`AxolRobotConfig` for
+    :class:`UmiRobotConfig` (handheld grippers on ``can_alm_umi_l/r``, virtual
+    arms), carrying over every field the operator may have set and only
+    replacing CAN channels still at the robot-arm defaults. Teleop side: force
+    the UMI mapping/faithfulness profile —
+
+    - ``absolute_mode``: controllers map to world-anchored absolute targets
+      (the engage squeeze is the start-pose alignment act);
+    - ``ik_alpha = 1.0`` and effectively-unbounded trapezoid limits: those
+      filters exist to protect a physical arm and only add lag between the
+      recorded action and where the hand actually was — with no arm to
+      protect, the recorded joints should follow the raw IK solution.
+
+    Applied after parsing, so it overrides these specific teleop fields even if
+    set on the CLI (a warning is logged); other teleop knobs (One Euro, rest
+    poses, frequency) pass through untouched.
+    """
+    from dataclasses import fields
+
+    from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
+    from ..lerobot.robot.config_umi import UmiRobotConfig
+
+    if isinstance(cfg.robot_config, AxolRobotConfig) and not isinstance(
+        cfg.robot_config, UmiRobotConfig
+    ):
+        kwargs = {
+            f.name: getattr(cfg.robot_config, f.name)
+            for f in fields(cfg.robot_config)
+            if f.init
+        }
+        if kwargs.get("left_channel") == CAN_LEFT:
+            kwargs["left_channel"] = CAN_UMI_LEFT
+        if kwargs.get("right_channel") == CAN_RIGHT:
+            kwargs["right_channel"] = CAN_UMI_RIGHT
+        # The rig has no overhead camera; drop the placeholder slot so the
+        # camera dialog / CLI surface matches the hardware (an explicitly
+        # assigned serial is kept — someone may rig a scene camera).
+        cameras = dict(kwargs.get("cameras") or {})
+        overhead = cameras.get("overhead")
+        if overhead is not None and int(getattr(overhead, "serial", 0) or 0) <= 0:
+            cameras.pop("overhead")
+        kwargs["cameras"] = cameras
+        cfg.robot_config = UmiRobotConfig(**kwargs)
+
+    if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+        tc = cfg.teleop_config.vr_teleop_config
+        if not tc.absolute_mode or tc.ik_alpha != 1.0:
+            _logger.info(
+                "--umi: forcing absolute_mode, ik_alpha=1.0, and transparent "
+                "trapezoid limits on the teleop config."
+            )
+        tc.absolute_mode = True
+        tc.ik_alpha = 1.0
+        tc.teleop_max_vel = 1e6
+        tc.teleop_max_accel = 1e6
+        tc.engage_max_vel = 1e6
+
+
 def _default_robot_config() -> AxolRobotConfig:
     """Default Axol robot config for data collection: local ZED cameras.
 
@@ -239,12 +300,18 @@ class CollectDataConfig:
     configs (cameras, per-joint gains, IK, VR server); nest into
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
+
+    ``--umi true`` records with the handheld UMI rig instead of the robot:
+    grippers on ``can_alm_umi_l/r``, wrist cameras only, absolute
+    (world-anchored) pose mapping, and dataset rows stamped with the VR pose
+    capture time. See :func:`_apply_umi_profile`.
     """
 
     repo_id: str
     task: str
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
+    umi: bool = False
     fps: int = 60
     teleop_hz: int = 120
     # Resolution the recorded dataset video is downscaled to (on the relay's VIC,
@@ -291,8 +358,12 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import AxolRobot
+    from ..lerobot.robot.robot_umi import UmiRobot
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
     from ..vr.models import VRState
+
+    if cfg.umi:
+        _apply_umi_profile(cfg)
 
     repo_id = cfg.repo_id
     task = cfg.task
@@ -333,7 +404,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 "dialog (or set its record_resolution / eyes)."
             )
 
-    robot = AxolRobot(cfg.robot_config)
+    from ..lerobot.robot.config_umi import UmiRobotConfig
+
+    umi_mode = isinstance(cfg.robot_config, UmiRobotConfig)
+    robot = UmiRobot(cfg.robot_config) if umi_mode else AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
@@ -558,6 +632,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     max_gap = {"v": 0.0}
     max_slip = {"v": 0.0}
     prev_t0 = {"v": 0.0}
+    # UMI only: worst pose-stream age (tick time minus pose capture time) in the
+    # window — transit + playout delay + filter lag, the residual misalignment
+    # between what the wrist cameras saw and the pose the row records.
+    max_pose_lag = {"v": 0.0}
 
     def _maybe_log_rate(t0: float) -> None:
         nonlocal last_rate_log, sect
@@ -572,12 +650,22 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
-        _logger.info(
-            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
-            loop_hz,
-            teleop.vr_hz(),
-            teleop.ik_hz(),
-        )
+        if umi_mode:
+            _logger.info(
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  pose_lag: %.0f ms",
+                loop_hz,
+                teleop.vr_hz(),
+                teleop.ik_hz(),
+                1e3 * max_pose_lag["v"],
+            )
+            max_pose_lag["v"] = 0.0
+        else:
+            _logger.info(
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+                loop_hz,
+                teleop.vr_hz(),
+                teleop.ik_hz(),
+            )
         # Jitter detail (maxgap/maxslip = "the thread lost the CPU") and the
         # per-section breakdown stay at DEBUG so INFO is just the rate line.
         if time_sections:
@@ -638,7 +726,22 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
             # arm is still commanded with the teleop joint targets above, so its
             # motion is unchanged — only the stored representation differs.
-            recorder.publish(joint_obs, robot.action_to_dataset(act_processed), t0)
+            #
+            # Row timestamp: on the robot the loop tick is correct (state and
+            # image both describe the physical robot at t0). On the UMI rig the
+            # pose stream *is* the plant's ground truth, so the row is stamped
+            # with the pose's capture time — the moment the hand was actually
+            # there — keeping it on the same capture timeline as the camera
+            # exposure timestamps.
+            row_ts = t0
+            if umi_mode:
+                pose_ts = teleop.pose_capture_ts()
+                if pose_ts is not None:
+                    row_ts = pose_ts
+                    lag = t0 - pose_ts
+                    if lag > max_pose_lag["v"]:
+                        max_pose_lag["v"] = lag
+            recorder.publish(joint_obs, robot.action_to_dataset(act_processed), row_ts)
 
             events = teleop.get_teleop_events()
 

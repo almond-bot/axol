@@ -309,12 +309,16 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    async def _connect_async(self) -> None:
-        self._axol = Axol(
+    def _build_hardware(self) -> Axol:
+        """Construct the hardware driver. Overridden by the UMI rig subclass."""
+        return Axol(
             self.config.axol_config,
             left_channel=self.config.left_channel,
             right_channel=self.config.right_channel,
         )
+
+    async def _connect_async(self) -> None:
+        self._axol = self._build_hardware()
         await self._axol.enable()
         if self.config.telemetry_hz > 0:
             await self._axol.start_telemetry(
