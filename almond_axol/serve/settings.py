@@ -43,6 +43,7 @@ _OPS = ("teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"
 _ROBOT = "robot_config"
 _AXOL = f"{_ROBOT}.axol_config"
 _VRT = "teleop_config.vr_teleop_config"
+_KIN = "teleop_config.kinematics_config"
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,62 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="robot.gripper_torque_limit",
+                label="Gripper torque limit (Nm)",
+                type="number",
+                help="Peak gripper output torque, applied to both grippers.",
+                targets={
+                    "teleop": (
+                        "axol.left.gripper.torque_limit",
+                        "axol.right.gripper.torque_limit",
+                    ),
+                    "gravity-comp": (
+                        "axol.left.gripper.torque_limit",
+                        "axol.right.gripper.torque_limit",
+                    ),
+                    "collect-data": (
+                        f"{_AXOL}.left.gripper.torque_limit",
+                        f"{_AXOL}.right.gripper.torque_limit",
+                    ),
+                    "run-policy": (
+                        f"{_AXOL}.left.gripper.torque_limit",
+                        f"{_AXOL}.right.gripper.torque_limit",
+                    ),
+                    "replay-dataset": (
+                        f"{_AXOL}.left.gripper.torque_limit",
+                        f"{_AXOL}.right.gripper.torque_limit",
+                    ),
+                },
+            ),
+            SettingDef(
+                key="robot.gripper_max_speed",
+                label="Gripper max speed (rad/s)",
+                type="number",
+                help="Maximum gripper joint speed, applied to both grippers.",
+                targets={
+                    "teleop": (
+                        "axol.left.gripper.max_speed",
+                        "axol.right.gripper.max_speed",
+                    ),
+                    "gravity-comp": (
+                        "axol.left.gripper.max_speed",
+                        "axol.right.gripper.max_speed",
+                    ),
+                    "collect-data": (
+                        f"{_AXOL}.left.gripper.max_speed",
+                        f"{_AXOL}.right.gripper.max_speed",
+                    ),
+                    "run-policy": (
+                        f"{_AXOL}.left.gripper.max_speed",
+                        f"{_AXOL}.right.gripper.max_speed",
+                    ),
+                    "replay-dataset": (
+                        f"{_AXOL}.left.gripper.max_speed",
+                        f"{_AXOL}.right.gripper.max_speed",
+                    ),
+                },
+            ),
+            SettingDef(
                 key="robot.gravity_kd",
                 label="Gravity comp damping (kd)",
                 type="number",
@@ -186,6 +243,30 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="teleop.rotation_multiplier",
+                label="Rotation multiplier",
+                type="number",
+                help=(
+                    "Scale factor from wrist rotation to end-effector rotation "
+                    "(1 = 1:1; larger rotates further with less wrist twist)."
+                ),
+                ui={"widget": "slider", "min": 0.5, "max": 3, "step": 0.1},
+                targets={
+                    "teleop": ("teleop.rotation_multiplier",),
+                    "collect-data": (f"{_VRT}.rotation_multiplier",),
+                },
+            ),
+            SettingDef(
+                key="teleop.reset_speed",
+                label="Return-to-rest speed (rad/s)",
+                type="number",
+                help="Peak joint speed while the arms return to the rest pose.",
+                targets={
+                    "teleop": ("teleop.reset_speed",),
+                    "collect-data": (f"{_VRT}.reset_speed",),
+                },
+            ),
+            SettingDef(
                 key="teleop.rest_pose_left",
                 label="Left arm rest pose",
                 type="text",
@@ -211,6 +292,72 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={
                     "teleop": ("teleop.rest_pose_right",),
                     "collect-data": (f"{_VRT}.rest_pose_right",),
+                },
+            ),
+        ),
+    ),
+    SettingCategory(
+        key="kinematics",
+        label="Kinematics",
+        description=(
+            "IK solver cost weights for teleop and data collection — how the "
+            "arms trade off tracking the hands against posture and limits."
+        ),
+        settings=(
+            SettingDef(
+                key="kinematics.pos_weight",
+                label="Position weight",
+                type="number",
+                help="Weight on end-effector position error.",
+                targets={
+                    "teleop": ("kinematics.pos_weight",),
+                    "collect-data": (f"{_KIN}.pos_weight",),
+                },
+            ),
+            SettingDef(
+                key="kinematics.ori_weight",
+                label="Orientation weight",
+                type="number",
+                help="Weight on end-effector orientation error.",
+                targets={
+                    "teleop": ("kinematics.ori_weight",),
+                    "collect-data": (f"{_KIN}.ori_weight",),
+                },
+            ),
+            SettingDef(
+                key="kinematics.elbow_weight",
+                label="Elbow weight",
+                type="number",
+                help=(
+                    "Weight on the elbow position hint — how strongly the arm "
+                    "follows the operator's elbow (position only)."
+                ),
+                targets={
+                    "teleop": ("kinematics.elbow_weight",),
+                    "collect-data": (f"{_KIN}.elbow_weight",),
+                },
+            ),
+            SettingDef(
+                key="kinematics.rest_weight",
+                label="Rest weight",
+                type="number",
+                help=(
+                    "Weight pulling joints toward the current configuration — "
+                    "higher damps drift, lower tracks more aggressively."
+                ),
+                targets={
+                    "teleop": ("kinematics.rest_weight",),
+                    "collect-data": (f"{_KIN}.rest_weight",),
+                },
+            ),
+            SettingDef(
+                key="kinematics.max_joint_delta",
+                label="Max joint delta (rad)",
+                type="number",
+                help="Maximum change of any joint between consecutive IK solutions.",
+                targets={
+                    "teleop": ("kinematics.max_joint_delta",),
+                    "collect-data": (f"{_KIN}.max_joint_delta",),
                 },
             ),
         ),

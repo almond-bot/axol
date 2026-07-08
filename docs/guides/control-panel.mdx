@@ -70,13 +70,14 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 |---|---|
 | **Cameras** | The camera setup described [below](#cameras). |
 | **Quest USB** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
-| **Robot** | Left/right arm stiffness sliders, CAN channels, gravity-comp damping and rate. |
-| **Teleop & VR** | Teleop control rate and the controller position multiplier. |
+| **Robot** | Left/right arm stiffness sliders, CAN channels, gripper torque limit and max speed (both grippers), gravity-comp damping and rate. |
+| **Teleop & VR** | Teleop control rate, position and rotation multipliers, return-to-rest speed. |
 | **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
+| **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
 | **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. |
-| **Advanced** | Every remaining per-operation field — per-joint gains, IK weights, VR server ports, … — flattened into plain sections (pick the operation, then a section like *axol* or *kinematics*), with a search box across all of it. Nothing is hidden behind collapsed groups. |
+| **Advanced** | Every remaining per-operation field, flattened into plain sections (pick the operation, then a section like *axol* or *vr server*) with a search box across all of it. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
 
 Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
 

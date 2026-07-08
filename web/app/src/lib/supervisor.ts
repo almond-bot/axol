@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 
-export type FieldType = "boolean" | "number" | "select" | "text"
+export type FieldType = "boolean" | "number" | "select" | "text" | "vector"
 
 /** A single configurable leaf in a command's config (serve/introspect.py). */
 export interface SchemaField {
@@ -8,7 +8,8 @@ export interface SchemaField {
   key: string
   label: string
   type: FieldType
-  default: string | number | boolean | null
+  /** For "vector" fields the default is the numeric array itself. */
+  default: string | number | boolean | number[] | null
   options?: string[] | null
   required: boolean
   /** Optional one-line help (argparse commands carry their flag help). */
@@ -57,7 +58,9 @@ export interface SessionInfo {
   pid: number | null
 }
 
-export type FormValue = string | boolean
+/** A submitted form value; vector fields carry one entry per component
+ * (numbers once parseable, the raw text while mid-edit). */
+export type FormValue = string | boolean | (number | string)[]
 
 const MAX_LINES = 5000
 
