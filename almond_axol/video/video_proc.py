@@ -165,6 +165,15 @@ def _open_gst_camera_raw(
       :class:`RawFrameWriter` shared-memory block (the older path; runs the copy
       in the relay's interpreter).
 
+    A spec can force the pyshm transport with ``raw_transport: "pyshm"`` even
+    when gst's shm plugin is available: pyshm blocks are readable by the
+    *control* process (``VideoRelayProcess.raw_cameras`` become real
+    :class:`RawFrameReader` proxies instead of dims-only stubs), which callers
+    need when something in the control process must consume the raw frames —
+    e.g. a policy building observations while the recorder subprocess records
+    the same frames. The cost is the relay-side per-frame Python copy this
+    path always had; the encoded headset branch is unaffected.
+
     Returns ``(owned_camera, {track: source}, [writers], {source: meta})`` — where
     ``meta`` is the per-source dict from :func:`_gstshm_meta` / :func:`_pyshm_meta`
     — or ``None`` when the gst stack/camera is unavailable (the caller then falls
@@ -201,7 +210,7 @@ def _open_gst_camera_raw(
         if dw < width or dh < height:
             raw_w, raw_h = dw, dh
     raw_dims = (raw_w, raw_h)
-    use_shm = socket_dir is not None
+    use_shm = socket_dir is not None and spec.get("raw_transport") != "pyshm"
     # A camera can opt out of either branch: stream-only (no raw / dataset) or
     # record-only (no encoded / headset). This path is only entered when the
     # camera records (see _relay_main), so the raw branch is always built; the
