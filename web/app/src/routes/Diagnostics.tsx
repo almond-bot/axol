@@ -301,6 +301,10 @@ export default function Diagnostics() {
       : linkState !== "connected"
         ? "robot link down"
         : null
+  // The CAN bus is owned by something we didn't launch (an in-process
+  // operation like teleop) — the server would reject a diagnostic launch, so
+  // gray out the launchers rather than let a click bounce off a 409.
+  const busyElsewhere = linkState === "busy" && activeRun == null
 
   const diagCommands = useMemo(
     () => commands.filter((c) => c.category === "Diagnostics"),
@@ -415,7 +419,12 @@ export default function Diagnostics() {
                     variant="outline"
                     size="sm"
                     title={cmd.description}
-                    disabled={!serverOk || launchBusy || (activeRun != null && !running)}
+                    disabled={
+                      !serverOk ||
+                      launchBusy ||
+                      busyElsewhere ||
+                      (activeRun != null && !running)
+                    }
                     onClick={() => (running ? stopActive() : launch(id, {}))}
                   >
                     {running ? (
@@ -438,7 +447,7 @@ export default function Diagnostics() {
                     variant="outline"
                     size="sm"
                     title={tool.description ?? cmd.description}
-                    disabled={!serverOk}
+                    disabled={!serverOk || busyElsewhere}
                     onClick={() => setMotorTool(tool.key)}
                   >
                     <tool.icon /> {tool.label}
@@ -570,7 +579,7 @@ export default function Diagnostics() {
             activeCommand={activeRun?.command ?? null}
             activeSince={activeRun?.session.startedAt ?? null}
             busy={launchBusy}
-            disabled={!serverOk}
+            disabled={!serverOk || busyElsewhere}
             onLaunch={launch}
             onStop={stopActive}
           />

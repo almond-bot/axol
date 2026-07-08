@@ -184,11 +184,11 @@ export function TelemetryChart({
   const clampView = useCallback(
     (t0: number, t1: number): ChartView => {
       const span = Math.min(Math.max(t1 - t0, MIN_SPAN_S), MAX_SPAN_S)
+      // Bound pan/zoom to the data's own timestamps (server clock) rather than
+      // the browser's Date.now(): a skewed client clock must not let the view
+      // scroll past the newest sample into empty space.
       const dataMin = frames.length > 0 ? frames[0].t : t0
-      const dataMax = Math.max(
-        frames.length > 0 ? frames[frames.length - 1].t : t1,
-        Date.now() / 1000
-      )
+      const dataMax = frames.length > 0 ? frames[frames.length - 1].t : t1
       let start = t0
       if (start + span > dataMax) start = dataMax - span
       if (start < dataMin - span * 0.5) start = dataMin - span * 0.5
