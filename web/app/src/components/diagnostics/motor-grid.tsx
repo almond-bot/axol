@@ -20,27 +20,23 @@ import {
 const TEMP_WARN_C = 60
 const TEMP_HOT_C = 75
 
-type StatusKind = "ok" | "disabled" | "warning" | "error" | "unknown"
+type StatusKind = "ok" | "warning" | "error" | "unknown"
 
 function statusKind(reading: SlowReading | undefined): StatusKind {
   if (!reading) return "unknown"
   if (!reading.reachable) return "error"
-  switch (reading.status) {
-    case "OK":
-      return "ok"
-    case "DISABLED":
-      return "disabled"
-    case null:
-      return "unknown"
-    default:
-      return "error"
-  }
+  // Disabled is a normal state, not a fault — only the Damiao motors even
+  // report it (MyActuator says OK either way), so surfacing it reads as an
+  // asymmetric error. Genuine error codes (over-temp, lost comm, …) and an
+  // unreachable motor are what light up red.
+  if (reading.status === "OK" || reading.status === "DISABLED") return "ok"
+  if (reading.status == null) return "unknown"
+  return "error"
 }
 
 /** Status is never color-alone: each kind pairs an icon with its label. */
 const STATUS_META: Record<StatusKind, { icon: typeof CircleCheck; className: string }> = {
   ok: { icon: CircleCheck, className: "text-emerald-300" },
-  disabled: { icon: CircleOff, className: "text-white/45" },
   warning: { icon: AlertTriangle, className: "text-amber-300" },
   error: { icon: CircleX, className: "text-red-300" },
   unknown: { icon: CircleOff, className: "text-white/30" },
@@ -117,7 +113,11 @@ export function MotorGrid({
               <span className={cn("ml-auto flex items-center gap-1 text-xs", Meta.className)}>
                 <Meta.icon className="size-4 shrink-0" />
                 <span className="font-mono text-[0.7rem] tracking-wide">
-                  {reading?.status ?? (kind === "error" ? "UNREACHABLE" : "—")}
+                  {kind === "ok"
+                    ? "OK"
+                    : reading && !reading.reachable
+                      ? "UNREACHABLE"
+                      : (reading?.status ?? "—")}
                 </span>
               </span>
             </div>

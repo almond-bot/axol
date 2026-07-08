@@ -1,15 +1,19 @@
-"""The curated catalog of ``axol`` CLI commands the web control panel exposes.
+"""The curated catalog of ``axol`` CLI commands the web UIs expose.
 
 Each command maps to a real ``axol <cli>`` invocation, grouped for the UI
-(Operate / Cameras / Calibrate / Setup). Its configuration surface is
+(Operate / Diagnostics / Calibrate / Setup). Its configuration surface is
 introspected on demand (see :mod:`.introspect`): draccus commands expose their
 nested config dataclass; argparse commands expose their flags/options. Commands
 whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
-Install-time commands (``gst.*``, ``jetson.setup``, ``can.driver``), the remote
-``inference-server``, and ``serve`` itself (the server hosting this UI) are
-intentionally absent — the host installer owns those.
+Only commands some UI surface actually launches belong here: the control
+panel's five operations, and the diagnostics dashboard's tests, CAN bring-up
+buttons, and motor calibration tools. Everything else — install-time commands
+(``gst.*``, ``jetson.setup``, ``can.driver``), the tuning suite (``tune.*``),
+one-off checks (``motor.info`` / ``motor.health``, whose read set the
+dashboard's motor tiles show live), the remote ``inference-server``, and
+``serve`` itself — stays CLI-only.
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ from typing import Any, Callable
 from .introspect import Schema, build_argparse_schema, build_schema
 
 # Display order for the catalog's category groups.
-CATEGORY_ORDER = ["Operate", "Diagnostics", "Cameras", "Calibrate", "Setup"]
+CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 
 class CommandDef:
@@ -180,7 +184,7 @@ COMMANDS: dict[str, CommandDef] = {
     "diag.rom-enable": CommandDef(
         "diag.rom-enable",
         "diag.rom-enable",
-        "ROM soak test",
+        "ROM enable",
         "Sweep every joint through its full range of motion for two hours; "
         "telemetry is captured for the dashboard.",
         "Diagnostics",
@@ -191,55 +195,14 @@ COMMANDS: dict[str, CommandDef] = {
     "diag.rom-disable": CommandDef(
         "diag.rom-disable",
         "diag.rom-disable",
-        "ROM release",
+        "ROM disable",
         "Open the grippers left clamped by the ROM test and power down.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
     ),
-    # -- Cameras ------------------------------------------------------------
-    "zed.install": CommandDef(
-        "zed.install",
-        "zed.install",
-        "Install pyzed",
-        "Download and install the pyzed wheel matching the installed ZED SDK.",
-        "Cameras",
-        "argparse",
-        _argparse_loader("..cli.zed.install"),
-        requires_hardware=True,
-    ),
     # -- Calibrate ----------------------------------------------------------
-    "tune.pid": CommandDef(
-        "tune.pid",
-        "tune.pid",
-        "Tune PID",
-        "Tune Kp/Kd for a single joint via sine or step tracking.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.tune.pid"),
-        requires_hardware=True,
-    ),
-    "tune.friction": CommandDef(
-        "tune.friction",
-        "tune.friction",
-        "Tune friction",
-        "Identify the friction-model parameters (Fc, k, Fv, Fo) for one joint.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.tune.friction"),
-        requires_hardware=True,
-    ),
-    "tune.repeatability": CommandDef(
-        "tune.repeatability",
-        "tune.repeatability",
-        "Repeatability",
-        "Drive between rest and a crossed-arms touching pose to measure repeatability.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.tune.repeatability"),
-        requires_hardware=True,
-    ),
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",
         "motor.set-zero-pos",
@@ -258,26 +221,6 @@ COMMANDS: dict[str, CommandDef] = {
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.set_can_id"),
-        requires_hardware=True,
-    ),
-    "motor.info": CommandDef(
-        "motor.info",
-        "motor.info",
-        "Motor info",
-        "Read a motor's status to verify it is reachable at a CAN ID.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.motor.info"),
-        requires_hardware=True,
-    ),
-    "motor.health": CommandDef(
-        "motor.health",
-        "motor.health",
-        "Motor health",
-        "Probe all 16 motors and report which responded.",
-        "Calibrate",
-        "argparse",
-        _argparse_loader("..cli.motor.health"),
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------

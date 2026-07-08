@@ -203,6 +203,19 @@ class DiagnosticsRunStore:
         except OSError as exc:
             _logger.warning("failed to persist diagnostics run: %s", exc)
 
+    def clear(self) -> int:
+        """Delete every persisted run record; returns how many were removed."""
+        if not self._dir.is_dir():
+            return 0
+        removed = 0
+        for path in self._dir.glob("*.json"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                _logger.warning("failed to delete run record %s: %s", path, exc)
+        return removed
+
     def list(self) -> list[dict[str, Any]]:
         if not self._dir.is_dir():
             return []

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Activity, Cable, Loader2, Radio, Wrench } from "lucide-react"
+import { Activity, Cable, Compass, Crosshair, Loader2, Radio, Tag, Wrench } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { SiteNav } from "@/components/site-nav"
@@ -7,7 +7,11 @@ import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
 import { RunHistory } from "@/components/diagnostics/run-history"
 import { JointFilter } from "@/components/diagnostics/joint-filter"
-import { DiagnosticActions } from "@/components/diagnostics/diagnostic-actions"
+import {
+  ActionDialog,
+  ActiveRunPanel,
+  DiagnosticActions,
+} from "@/components/diagnostics/diagnostic-actions"
 import {
   TelemetryChart,
   type ChartSeries,
@@ -31,6 +35,7 @@ import {
 import {
   JOINTS,
   JOINT_COLORS,
+  clearDiagnosticsRuns,
   fetchDiagnosticsRuns,
   jointLabel,
   motorKey,
@@ -166,6 +171,14 @@ export default function Diagnostics() {
       .finally(() => setRunsLoading(false))
   }, [])
 
+  const clearRuns = useCallback(() => {
+    setRunsLoading(true)
+    clearDiagnosticsRuns()
+      .then(() => setRuns([]))
+      .catch((e) => toast.error(String(e)))
+      .finally(() => setRunsLoading(false))
+  }, [toast])
+
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on connect
     if (serverOk) refreshRuns()
@@ -200,7 +213,7 @@ export default function Diagnostics() {
         const { run, session } = await startDiagnosticsRun(command, args)
         setAnswered(0)
         setActiveRun({ command, session })
-        setRuns((prev) => [run, ...prev])
+        if (run) setRuns((prev) => [run, ...prev])
       } catch (e) {
         toast.error(String(e))
       } finally {
@@ -294,6 +307,50 @@ export default function Diagnostics() {
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
+  // Motor calibration tools surfaced as buttons in the Motors header. Two of
+  // them share motor.set-zero-pos: presets split it into "one motor" and
+  // "guided walk of every joint" entry points.
+  const MOTOR_TOOLS = [
+    {
+      key: "set-can-id",
+      command: "motor.set-can-id",
+      label: "Set CAN ID",
+      icon: Tag,
+      description: undefined as string | undefined,
+      presetArgs: undefined as Record<string, FormValue> | undefined,
+      hideKeys: undefined as string[] | undefined,
+    },
+    {
+      key: "zero-motor",
+      command: "motor.set-zero-pos",
+      label: "Zero motor",
+      icon: Crosshair,
+      description:
+        "Set one motor's zero to its current mechanical position (persisted to flash). " +
+        "Damiao motors need a power cycle afterwards.",
+      presetArgs: undefined,
+      hideKeys: ["guided"],
+    },
+    {
+      key: "guided-zero",
+      command: "motor.set-zero-pos",
+      label: "Guided zeroing",
+      icon: Compass,
+      description:
+        "Walk every joint of one arm and zero each against its closer end stop — " +
+        "each step pauses with instructions and a Continue button.",
+      presetArgs: { guided: true } as Record<string, FormValue>,
+      hideKeys: ["id", "type"],
+    },
+  ]
+  const [motorTool, setMotorTool] = useState<string | null>(null)
+  const openTool = MOTOR_TOOLS.find((t) => t.key === motorTool) ?? null
+  const openToolSpec = openTool ? canCommand(openTool.command) : null
+
+  const activeLabel = activeRun
+    ? (commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command)
+    : null
+
   // Follow mode anchors the window to the newest sample; the page re-renders
   // on every stream tick, so the live edge advances with the data (and holds
   // still while the stream is paused). Zoom/pan pins a fixed range.
@@ -339,7 +396,7 @@ export default function Diagnostics() {
                 {robot.reachableCount}/{robot.motorCount} reachable
               </span>
             )}
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex flex-wrap items-center gap-2">
               {(["can.setup", "can.enable"] as const).map((id) => {
                 const cmd = canCommand(id)
                 if (!cmd) return null
@@ -361,6 +418,22 @@ export default function Diagnostics() {
                       <Cable />
                     )}
                     {running ? `Stop ${cmd.label}` : cmd.label}
+                  </Button>
+                )
+              })}
+              {MOTOR_TOOLS.map((tool) => {
+                const cmd = canCommand(tool.command)
+                if (!cmd) return null
+                return (
+                  <Button
+                    key={tool.key}
+                    variant="outline"
+                    size="sm"
+                    title={tool.description ?? cmd.description}
+                    disabled={!serverOk}
+                    onClick={() => setMotorTool(tool.key)}
+                  >
+                    <tool.icon /> {tool.label}
                   </Button>
                 )
               })}
@@ -488,19 +561,56 @@ export default function Diagnostics() {
             commands={diagCommands}
             activeCommand={activeRun?.command ?? null}
             activeSince={activeRun?.session.startedAt ?? null}
-            activeLine={activeLine}
-            pendingPrompt={pendingPrompt}
             busy={launchBusy}
             disabled={!serverOk}
             onLaunch={launch}
             onStop={stopActive}
-            onContinue={continuePrompt}
           />
         </section>
 
         {/* Run history */}
-        <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} />
+        <RunHistory
+          runs={runs}
+          loading={runsLoading}
+          onRefresh={refreshRuns}
+          onClear={clearRuns}
+        />
       </main>
+
+      {/* Motor calibration tool dialog (Set CAN ID / Zero motor / Guided zeroing) */}
+      {openTool && openToolSpec && (
+        <ActionDialog
+          spec={openToolSpec}
+          title={openTool.label}
+          description={openTool.description}
+          presetArgs={openTool.presetArgs}
+          hideKeys={openTool.hideKeys}
+          running={activeRun?.command === openTool.command}
+          blocked={activeRun != null && activeRun.command !== openTool.command}
+          busy={launchBusy}
+          disabled={!serverOk}
+          onLaunch={(args) => {
+            launch(openTool.command, args)
+            setMotorTool(null)
+          }}
+          onStop={stopActive}
+          onClose={() => setMotorTool(null)}
+        />
+      )}
+
+      {/* Floating status for the run in flight: live line, hands-on prompts
+          (Continue), and Stop — wherever the run was launched from. */}
+      {activeRun && activeLabel && (
+        <ActiveRunPanel
+          label={activeLabel}
+          since={activeRun.session.startedAt}
+          line={activeLine}
+          prompt={pendingPrompt}
+          busy={launchBusy}
+          onContinue={continuePrompt}
+          onStop={stopActive}
+        />
+      )}
     </div>
   )
 }

@@ -7,7 +7,9 @@ The diagnostics dashboard lives alongside the [web control panel](https://docs.a
 
 ## Motor status
 
-A card per motor (8 per arm) shows its status code, temperature, bus voltage, and live position, refreshed by the server's 1 Hz health ping. Clicking a card opens the full `motor.info` readout — model, firmware, control mode, gains, and live readings — without launching a CLI session. The **CAN setup** and **CAN enable** buttons in this section run the bring-up commands ([`can.setup`](https://docs.almond.bot/cli/can-setup) / [`can.enable`](https://docs.almond.bot/cli/can-enable)) ad hoc when motors are unreachable.
+A card per motor (8 per arm) shows its status, temperature, bus voltage, and live position, refreshed by the server's 1 Hz health ping. A motor reads **OK** whether enabled or disabled — only genuine error codes (over-temperature, lost comm, …) or an unreachable motor light up red. Clicking a card opens the full `motor.info` readout — model, firmware, control mode, gains, and live readings — without launching a CLI session.
+
+The buttons in this section run the motor plumbing ad hoc: **CAN setup** / **CAN enable** for the bring-up commands ([`can.setup`](https://docs.almond.bot/cli/can-setup) / [`can.enable`](https://docs.almond.bot/cli/can-enable)) when motors are unreachable, **Set CAN ID** ([`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)), and zeroing via [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos) — **Zero motor** for a single motor, or **Guided zeroing** to walk every joint of one arm against its end stops with step-by-step Continue prompts.
 
 ## Live telemetry
 
@@ -23,4 +25,4 @@ Hands-on steps — like clamping an item in the ROM grasp test — pause the run
 
 ## Run history
 
-Every diagnostic launched from the dashboard is recorded as a *run*: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host). The ROM soak test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.
+Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The ROM test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.

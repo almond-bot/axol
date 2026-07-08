@@ -55,10 +55,12 @@ export function RunHistory({
   runs,
   loading,
   onRefresh,
+  onClear,
 }: {
   runs: DiagnosticsRunMeta[]
   loading: boolean
   onRefresh: () => void
+  onClear: () => void
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
 
@@ -67,15 +69,30 @@ export function RunHistory({
       <div className="flex items-center gap-2">
         <History className="size-4 text-white/40" />
         <h3 className="font-heading text-sm font-semibold">Run history</h3>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="ml-auto text-white/50"
-          onClick={onRefresh}
-          disabled={loading}
-        >
-          {loading ? <Loader2 className="animate-spin" /> : "Refresh"}
-        </Button>
+        <div className="ml-auto flex items-center gap-1">
+          {runs.length > 0 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-white/50"
+              onClick={() => {
+                if (window.confirm("Delete all recorded runs and their telemetry?")) onClear()
+              }}
+              disabled={loading}
+            >
+              Clear
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-white/50"
+            onClick={onRefresh}
+            disabled={loading}
+          >
+            {loading ? <Loader2 className="animate-spin" /> : "Refresh"}
+          </Button>
+        </div>
       </div>
       {runs.length === 0 ? (
         <p className="text-sm text-white/35">

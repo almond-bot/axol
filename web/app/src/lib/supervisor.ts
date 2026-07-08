@@ -42,7 +42,7 @@ export interface CommandSpec {
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
-export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Cameras", "Calibrate", "Setup"]
+export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 

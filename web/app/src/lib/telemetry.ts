@@ -128,10 +128,11 @@ export interface DiagnosticsRunData {
   log: string[]
 }
 
+/** `run` is null for launches that aren't recorded (CAN bring-up, calibration). */
 export async function startDiagnosticsRun(
   command: string,
   args: Record<string, unknown>
-): Promise<{ run: DiagnosticsRunMeta; session: SessionInfo }> {
+): Promise<{ run: DiagnosticsRunMeta | null; session: SessionInfo }> {
   return json(
     await fetch(apiUrl("/api/diagnostics/run"), {
       method: "POST",
@@ -143,6 +144,10 @@ export async function startDiagnosticsRun(
 
 export async function fetchDiagnosticsRuns(): Promise<{ runs: DiagnosticsRunMeta[] }> {
   return json(await fetch(apiUrl("/api/diagnostics/runs")))
+}
+
+export async function clearDiagnosticsRuns(): Promise<{ removed: number }> {
+  return json(await fetch(apiUrl("/api/diagnostics/runs"), { method: "DELETE" }))
 }
 
 export async function fetchDiagnosticsRun(id: string): Promise<DiagnosticsRunData> {

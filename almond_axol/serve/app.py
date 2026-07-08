@@ -275,8 +275,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- diagnostics runs (script launches with telemetry capture) -----------
 
-    async def _watch_diagnostics_run(meta: dict[str, Any], session: Session) -> None:
-        """Wait for the session to end, persist the run, and return the bus."""
+    async def _watch_diagnostics_run(
+        meta: dict[str, Any] | None, session: Session
+    ) -> None:
+        """Wait for the session to end, return the bus, persist the run (if any)."""
         queue = manager.subscribe(session)
         try:
             while session.status in ("starting", "running", "stopping"):
@@ -289,9 +291,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         finally:
             manager.unsubscribe(session, queue)
             await asyncio.to_thread(robot.reacquire)
-        await asyncio.to_thread(
-            runs.finalize, meta, session.status, session.exit_code, list(session.log)
-        )
+        if meta is not None:
+            await asyncio.to_thread(
+                runs.finalize,
+                meta,
+                session.status,
+                session.exit_code,
+                list(session.log),
+            )
 
     @app.post("/api/diagnostics/run")
     async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
@@ -316,21 +323,26 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         await asyncio.to_thread(robot.release)
         try:
             # A writable stdin lets the UI answer the diagnostic's hands-on
-            # prompts (the ROM tests' "Continue" button) via /input below.
+            # prompts (the "Continue" button) via /input below.
             session = await manager.start(req.command, req.args, stdin_pipe=True)
         except Exception:
             await asyncio.to_thread(robot.reacquire)
             raise
-        meta = runs.begin(session.id, req.command, req.args)
+        # Only the Diagnostics tests are recorded in the run history; the
+        # ad-hoc launches (CAN bring-up, motor calibration tools) still get
+        # the bus handover + prompt plumbing but leave no record behind.
+        record = COMMANDS[req.command].category == "Diagnostics"
+        meta = runs.begin(session.id, req.command, req.args) if record else None
         if session.status == "error":
             await asyncio.to_thread(robot.reacquire)
-            await asyncio.to_thread(
-                runs.finalize,
-                meta,
-                session.status,
-                session.exit_code,
-                list(session.log),
-            )
+            if meta is not None:
+                await asyncio.to_thread(
+                    runs.finalize,
+                    meta,
+                    session.status,
+                    session.exit_code,
+                    list(session.log),
+                )
         else:
             asyncio.create_task(_watch_diagnostics_run(meta, session))
         return JSONResponse({"run": meta, "session": session.to_dict()})
@@ -338,6 +350,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/diagnostics/runs")
     async def diagnostics_runs() -> dict[str, Any]:
         return {"runs": await asyncio.to_thread(runs.list)}
+
+    @app.delete("/api/diagnostics/runs")
+    async def diagnostics_runs_clear() -> dict[str, Any]:
+        """Delete the whole run history (the dashboard's Clear button)."""
+        return {"removed": await asyncio.to_thread(runs.clear)}
 
     @app.get("/api/diagnostics/runs/{run_id}")
     async def diagnostics_run_data(run_id: str) -> JSONResponse:

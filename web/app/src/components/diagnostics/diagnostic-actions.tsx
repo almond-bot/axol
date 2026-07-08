@@ -13,43 +13,35 @@ import {
 } from "@/lib/supervisor"
 import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetry"
 
-// Flags handled by the dashboard itself, never shown in the dialog:
+// Flags handled by the dashboard itself, never shown in a dialog:
 // - web_prompts: forced on so hands-on steps drive a Continue button.
 // - no_capture: dashboard runs always keep the telemetry capture for history.
 const HIDDEN_FLAGS = new Set(["web_prompts", "no_capture"])
 
 /**
  * Diagnostics as app actions: a card per test — click it, set parameters in a
- * dialog, hit Run. Progress feedback is the card's running state + latest
- * output line; hands-on steps surface a Continue button; results land in run
+ * dialog, hit Run. The card shows the running state; hands-on prompts and the
+ * Stop control live in the page-level `ActiveRunPanel`; results land in run
  * history.
  */
 export function DiagnosticActions({
   commands,
   activeCommand,
   activeSince,
-  activeLine,
-  pendingPrompt,
   busy,
   disabled,
   onLaunch,
   onStop,
-  onContinue,
 }: {
   commands: CommandSpec[]
   /** Command id of the run in flight (any diagnostics launch), if one is. */
   activeCommand: string | null
   /** Epoch seconds the active run started, for the elapsed readout. */
   activeSince: number | null
-  /** Latest output line of the active run (progress context). */
-  activeLine: string | null
-  /** Instruction for a hands-on step waiting on the operator, if any. */
-  pendingPrompt: string | null
   busy: boolean
   disabled: boolean
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
-  onContinue: () => void
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
   const open = useMemo(() => commands.find((c) => c.id === openId) ?? null, [commands, openId])
@@ -58,58 +50,31 @@ export function DiagnosticActions({
     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
       {commands.map((cmd) => {
         const running = activeCommand === cmd.id
-        const prompt = running ? pendingPrompt : null
         return (
-          <div
+          <button
             key={cmd.id}
+            type="button"
+            onClick={() => setOpenId(cmd.id)}
             className={cn(
-              "flex flex-col gap-2 rounded-xl border p-4 transition-all",
-              prompt
-                ? "border-amber-400/50 bg-amber-400/[0.06]"
-                : running
-                  ? "border-emerald-400/40 bg-emerald-400/[0.06]"
-                  : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
+              "flex flex-col gap-2 rounded-xl border p-4 text-left transition-all",
+              running
+                ? "border-emerald-400/40 bg-emerald-400/[0.06]"
+                : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
             )}
           >
-            <button
-              type="button"
-              onClick={() => setOpenId(cmd.id)}
-              className="flex flex-col gap-2 text-left"
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold text-white/90">{cmd.label}</span>
-                {running && (
-                  <span className="ml-auto flex items-center gap-1.5 text-xs text-emerald-300">
-                    <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
-                    <Elapsed since={activeSince} />
-                  </span>
-                )}
-              </div>
-              <span className="line-clamp-2 text-xs leading-relaxed text-white/40">
-                {cmd.description}
-              </span>
-              {running && activeLine && !prompt && (
-                <span className="truncate font-mono text-[0.7rem] text-emerald-200/70">
-                  {activeLine}
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-white/90">{cmd.label}</span>
+              {running && (
+                <span className="ml-auto flex items-center gap-1.5 text-xs text-emerald-300">
+                  <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+                  <Elapsed since={activeSince} />
                 </span>
               )}
-            </button>
-            {prompt && (
-              <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-2.5">
-                <span className="flex items-start gap-1.5 text-xs leading-relaxed text-amber-100/90">
-                  <Hand className="mt-0.5 size-3.5 shrink-0 text-amber-300" />
-                  {prompt}
-                </span>
-                <Button
-                  size="sm"
-                  className="self-start bg-amber-400 text-black hover:bg-amber-300"
-                  onClick={onContinue}
-                >
-                  Continue <ArrowRight />
-                </Button>
-              </div>
-            )}
-          </div>
+            </div>
+            <span className="line-clamp-2 text-xs leading-relaxed text-white/40">
+              {cmd.description}
+            </span>
+          </button>
         )
       })}
       {open && (
@@ -141,6 +106,74 @@ function Elapsed({ since }: { since: number | null }) {
   const s = Math.max(0, Math.floor(now - since))
   const m = Math.floor(s / 60)
   return <span className="font-mono tabular-nums">{m > 0 ? `${m}m ${s % 60}s` : `${s}s`}</span>
+}
+
+/**
+ * Floating status panel for the run in flight — one canonical home for the
+ * live output line, hands-on prompts (Continue button), and Stop, wherever
+ * the run was launched from (action cards or the Motors-section buttons).
+ */
+export function ActiveRunPanel({
+  label,
+  since,
+  line,
+  prompt,
+  busy,
+  onContinue,
+  onStop,
+}: {
+  label: string
+  since: number | null
+  line: string | null
+  prompt: string | null
+  busy: boolean
+  onContinue: () => void
+  onStop: () => void
+}) {
+  return (
+    <Card
+      className={cn(
+        "fixed right-4 bottom-4 z-40 w-80 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl",
+        prompt ? "border-amber-400/50" : "border-emerald-400/30"
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <span className="size-2 animate-pulse rounded-full bg-emerald-400" />
+        <span className="text-sm font-semibold text-white/90">{label}</span>
+        <span className="ml-auto text-xs text-emerald-300">
+          <Elapsed since={since} />
+        </span>
+      </div>
+      {prompt ? (
+        <div className="flex flex-col gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-2.5">
+          <span className="flex items-start gap-1.5 text-xs leading-relaxed text-amber-100/90">
+            <Hand className="mt-0.5 size-3.5 shrink-0 text-amber-300" />
+            {prompt}
+          </span>
+          <Button
+            size="sm"
+            className="self-start bg-amber-400 text-black hover:bg-amber-300"
+            onClick={onContinue}
+          >
+            Continue <ArrowRight />
+          </Button>
+        </div>
+      ) : (
+        line && (
+          <span className="truncate font-mono text-[0.7rem] text-white/45">{line}</span>
+        )
+      )}
+      <Button
+        variant="ghost"
+        size="sm"
+        className="self-start text-white/50"
+        onClick={onStop}
+        disabled={busy}
+      >
+        <Square /> Stop
+      </Button>
+    </Card>
+  )
 }
 
 /**
@@ -212,10 +245,7 @@ function JointPicker({
                 className="sr-only"
               />
               <span
-                className={cn(
-                  "inline-block size-2 rounded-full",
-                  !on && "opacity-30"
-                )}
+                className={cn("inline-block size-2 rounded-full", !on && "opacity-30")}
                 style={{ background: JOINT_COLORS[joint] }}
               />
               {jointLabel(joint)}
@@ -227,8 +257,18 @@ function JointPicker({
   )
 }
 
-function ActionDialog({
+/**
+ * Parameter dialog for a catalog command. `presetArgs` are merged into the
+ * launch args without appearing in the form, and `hideKeys` removes fields
+ * the preset already decides — this is how one command backs two entry
+ * points (e.g. single-motor vs guided zeroing).
+ */
+export function ActionDialog({
   spec,
+  title,
+  description,
+  presetArgs,
+  hideKeys,
   running,
   blocked,
   busy,
@@ -238,6 +278,10 @@ function ActionDialog({
   onClose,
 }: {
   spec: CommandSpec
+  title?: string
+  description?: string
+  presetArgs?: Record<string, FormValue>
+  hideKeys?: string[]
   running: boolean
   blocked: boolean
   busy: boolean
@@ -249,11 +293,18 @@ function ActionDialog({
   const [overrides, setOverrides] = useState<Record<string, FormValue>>({})
   const [missing, setMissing] = useState<string[]>([])
 
+  const hidden = useMemo(
+    () => new Set([...HIDDEN_FLAGS, ...(hideKeys ?? []), ...Object.keys(presetArgs ?? {})]),
+    [hideKeys, presetArgs]
+  )
   const allFields = useMemo(() => flattenFields(spec.schema), [spec])
-  const jointsField = useMemo(() => allFields.find((f) => f.key === "joints"), [allFields])
+  const jointsField = useMemo(
+    () => allFields.find((f) => f.key === "joints" && !hidden.has("joints")),
+    [allFields, hidden]
+  )
   const fields = useMemo(
-    () => allFields.filter((f) => !HIDDEN_FLAGS.has(f.key) && f.key !== "joints"),
-    [allFields]
+    () => allFields.filter((f) => !hidden.has(f.key) && f.key !== "joints"),
+    [allFields, hidden]
   )
   const hasWebPrompts = allFields.some((f) => f.key === "web_prompts")
 
@@ -273,6 +324,7 @@ function ActionDialog({
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
     if (hasWebPrompts) args.web_prompts = true
+    Object.assign(args, presetArgs ?? {})
     onLaunch(args)
   }
 
@@ -287,8 +339,10 @@ function ActionDialog({
       >
         <div className="flex items-start gap-2">
           <div className="flex flex-col gap-1">
-            <h3 className="font-heading text-base font-semibold">{spec.label}</h3>
-            <p className="text-sm leading-relaxed text-white/45">{spec.description}</p>
+            <h3 className="font-heading text-base font-semibold">{title ?? spec.label}</h3>
+            <p className="text-sm leading-relaxed text-white/45">
+              {description ?? spec.description}
+            </p>
           </div>
           <Button
             variant="ghost"
@@ -335,9 +389,8 @@ function ActionDialog({
         {hasWebPrompts && (
           <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
             <Hand className="mt-0.5 size-3.5 shrink-0 text-white/35" />
-            Hands-on steps (like clamping an item in the gripper) pause the run and show a
-            Continue button on the card — the test waits for you, then proceeds when you
-            click it.
+            Hands-on steps pause the run and show a Continue button — the run waits for
+            you, then proceeds when you click it.
           </p>
         )}
 

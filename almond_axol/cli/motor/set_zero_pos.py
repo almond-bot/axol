@@ -18,12 +18,17 @@ Examples:
 import argparse
 import asyncio
 import math
+import sys
 
 from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
 from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
 from ...robot.axol import closer_end_stop
+
+# Marker prefix a --web-prompts step prints before blocking on stdin (same
+# convention as the ROM diagnostics); the dashboard shows a Continue button.
+PROMPT_MARKER = "[prompt]"
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -54,6 +59,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--guided",
         action="store_true",
         help="Walk every arm joint, zeroing each at its closer end stop.",
+    )
+    p.add_argument(
+        "--web-prompts",
+        action="store_true",
+        help="Emit '[prompt] ...' markers and block on stdin for the guided "
+        "steps, so the web dashboard can drive them with a Continue button "
+        "(set automatically by the dashboard).",
     )
     p.set_defaults(func=run)
 
@@ -104,10 +116,20 @@ _MIN_MOTION_RAD = math.radians(3.0)
 _MAGNITUDE_WARN_RAD = math.radians(20.0)
 
 
-def _prompt(msg: str) -> bool:
-    """Block on Enter; return ``False`` on Ctrl-C / EOF."""
+def _prompt(instruction: str, web_prompts: bool) -> bool:
+    """Block until the operator confirms a hands-on step.
+
+    ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
+    Continue button, then block until it writes a line to our stdin. Otherwise
+    an ordinary tty Enter prompt. Returns ``False`` on Ctrl-C / EOF.
+    """
     try:
-        input(msg)
+        if web_prompts:
+            print(f"{PROMPT_MARKER} {instruction}", flush=True)
+            if sys.stdin.readline() == "":
+                raise EOFError
+            return True
+        input(f"  {instruction} — press Enter: ")
         return True
     except (EOFError, KeyboardInterrupt):
         print("\n    skipped.")
@@ -120,21 +142,28 @@ def _fmt(rad: float) -> str:
 
 
 async def _calibrate_joint(
-    motor: Motor, joint: Joint, target_rad: float, expected_sign: int
+    motor: Motor,
+    joint: Joint,
+    target_rad: float,
+    expected_sign: int,
+    web_prompts: bool,
 ) -> bool:
     """Zero one joint at its closer end stop. Returns ``True`` on success."""
     target_deg = math.degrees(target_rad)
     direction = "−" if expected_sign < 0 else "+"
     print(f"\n— {joint.name}  →  end stop {target_deg:+.1f}° ({direction} motion) —")
 
+    # Prompts are self-contained (they name the joint) since the dashboard
+    # shows them on a Continue button without the surrounding log context.
     while True:
-        if not _prompt("  1) hold the joint inside its range, then Enter: "):
+        if not _prompt(f"{joint.name}: hold the joint inside its range", web_prompts):
             return False
         p_start = await motor.get_position()
         print(f"     start: {_fmt(p_start)}")
 
         if not _prompt(
-            f"  2) move to the END STOP at {target_deg:+.1f}°, then Enter: "
+            f"{joint.name}: move to the END STOP at {target_deg:+.1f}°",
+            web_prompts,
         ):
             return False
         p_end = await motor.get_position()
@@ -154,7 +183,11 @@ async def _calibrate_joint(
                 f"    ✗ wrong direction (expected {direction}) — move all the way"
                 f" to the OTHER end stop at {target_deg:+.1f}°."
             )
-            if not _prompt("    then Enter to set zero: "):
+            if not _prompt(
+                f"{joint.name}: wrong direction — move all the way to the OTHER "
+                f"end stop at {target_deg:+.1f}°, then zero",
+                web_prompts,
+            ):
                 return False
             p_end = await motor.get_position()
             print(f"     end:   {_fmt(p_end)}")
@@ -185,7 +218,9 @@ async def _run_guided(args: argparse.Namespace) -> None:
             target, sign = closer_end_stop(joint, is_left)
             motor = Motor(bus, joint)
             try:
-                ok = await _calibrate_joint(motor, joint, target, sign)
+                ok = await _calibrate_joint(
+                    motor, joint, target, sign, args.web_prompts
+                )
             except KeyboardInterrupt:
                 print("\naborted.")
                 break
