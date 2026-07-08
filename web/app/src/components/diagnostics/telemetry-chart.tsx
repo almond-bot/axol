@@ -420,7 +420,11 @@ export function TelemetryChart({
   const flip = tooltipLeft > size.w - 190
 
   const card = (
-    <Card className={cn("gap-3 p-4", expanded && "h-full w-full", className)}>
+    // The Card surface is normally a translucent wash; full screen needs a
+    // solid one so the page behind doesn't bleed through the plot.
+    <Card
+      className={cn("gap-3 p-4", expanded && "h-full w-full bg-[#161618]", className)}
+    >
       <div className="flex items-baseline gap-2">
         <h3 className="font-heading text-sm font-semibold">{title}</h3>
         <span className="text-xs text-white/35">{unit}</span>
@@ -499,7 +503,7 @@ export function TelemetryChart({
   )
 
   if (expanded) {
-    return <div className="fixed inset-0 z-50 flex bg-black/70 p-4 sm:p-8">{card}</div>
+    return <div className="fixed inset-0 z-50 flex bg-black/85 p-4 sm:p-8">{card}</div>
   }
   return card
 }
