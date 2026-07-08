@@ -11,6 +11,7 @@ import {
 } from "@/lib/supervisor"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
 import { cn } from "@/lib/utils"
 
 interface CommonProps {
@@ -276,36 +277,5 @@ function HelpTip({ text }: { text: string }) {
           document.body
         )}
     </span>
-  )
-}
-
-function Switch({
-  checked,
-  disabled,
-  onChange,
-}: {
-  checked: boolean
-  disabled: boolean
-  onChange: (v: boolean) => void
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative h-6 w-11 shrink-0 rounded-full border transition-colors disabled:opacity-50",
-        checked ? "border-[#eff483]/50 bg-[#eff483]/80" : "border-white/15 bg-white/[0.06]"
-      )}
-    >
-      <span
-        className={cn(
-          "absolute top-0.5 left-0.5 size-4.5 rounded-full transition-transform",
-          checked ? "translate-x-5 bg-[#121212]" : "translate-x-0 bg-white/80"
-        )}
-      />
-    </button>
   )
 }

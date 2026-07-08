@@ -17,12 +17,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
+from ..constants import URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import COMMANDS, command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
+from .settings import SettingsStore, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
@@ -70,6 +72,22 @@ class OpStartRequest(BaseModel):
     op: str
     args: dict[str, Any] = {}
     cameras: dict[str, Any] | None = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Partial update of the shared operator settings (serve/settings.py).
+
+    ``values`` merges per key (``null`` resets a key to its default);
+    ``cameras`` replaces the stored camera spec wholesale; ``opOverrides``
+    replaces each given op's advanced-override map wholesale. Omitted
+    sections are left untouched.
+    """
+
+    values: dict[str, Any] | None = None
+    cameras: dict[str, Any] | None = None
+    # Distinguish "clear the cameras" (null) from "don't touch them" (omitted).
+    camerasSet: bool = False
+    opOverrides: dict[str, dict[str, Any]] | None = None
 
 
 class EpisodeRequest(BaseModel):
@@ -144,7 +162,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     manager = SessionManager()
     hub = TelemetryHub()
     robot = RobotLink(hub=hub)
-    runner = OperationRunner(robot)
+    settings = SettingsStore()
+    runner = OperationRunner(robot, settings=settings)
     runs = DiagnosticsRunStore(hub)
 
     def _is_idle() -> bool:
@@ -399,6 +418,39 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         result = await asyncio.to_thread(_restart)
         return JSONResponse(result, status_code=200 if result["ok"] else 500)
+
+    # -- shared operator settings (see serve/settings.py) --------------------
+
+    @app.get("/api/settings")
+    async def get_settings() -> dict[str, Any]:
+        """Stored shared settings + the schema describing every category."""
+        return {**settings.snapshot(), "schema": settings_schema()}
+
+    @app.put("/api/settings")
+    async def put_settings(req: SettingsUpdateRequest) -> JSONResponse:
+        try:
+            snapshot = settings.update(
+                values=req.values,
+                cameras=req.cameras
+                if (req.camerasSet or req.cameras is not None)
+                else ...,
+                op_overrides=req.opOverrides,
+            )
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(snapshot)
+
+    # -- robot model (URDF + meshes for the pose editor) ---------------------
+
+    @app.get("/api/urdf/{asset_path:path}", response_model=None)
+    async def urdf_asset(asset_path: str) -> FileResponse | JSONResponse:
+        """Serve the robot URDF and its STL meshes to the web pose editor."""
+        base = URDF_PATH.parent.resolve()
+        target = (base / asset_path).resolve()
+        if not target.is_relative_to(base) or not target.is_file():
+            return JSONResponse({"error": "not found"}, status_code=404)
+        media = "model/stl" if target.suffix == ".stl" else "application/xml"
+        return FileResponse(target, media_type=media)
 
     # -- Quest-over-USB (adb reverse pose tunnel) ---------------------------
 

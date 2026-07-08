@@ -79,6 +79,7 @@ export function ConnectionsBar({
   cameraDetectError,
   cameraDetecting,
   onConfigureCameras,
+  onOpenSettings,
   usb,
   usbBusy,
   onUsbConnect,
@@ -102,6 +103,8 @@ export function ConnectionsBar({
   /** A ZED enumeration is currently in flight. */
   cameraDetecting: boolean
   onConfigureCameras: () => void
+  /** Open the shared Settings dialog (robot/teleop/recording/…). */
+  onOpenSettings: () => void
   usb: UsbStatus | null
   usbBusy: boolean
   onUsbConnect: () => void
@@ -216,15 +219,27 @@ export function ConnectionsBar({
         }
       >
         {online ? (
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={onHostDisconnect}
-            aria-label="Disconnect Axol Host"
-            className="size-8"
-          >
-            <Power />
-          </Button>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={onOpenSettings}
+              aria-label="Open settings"
+              title="Shared settings (robot, teleop, recording, inference)"
+              className="size-8"
+            >
+              <Settings2 />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={onHostDisconnect}
+              aria-label="Disconnect Axol Host"
+              className="size-8"
+            >
+              <Power />
+            </Button>
+          </div>
         ) : (
           <Button variant="outline" size="sm" onClick={onOpenSetup}>
             <Plug />

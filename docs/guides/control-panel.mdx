@@ -58,13 +58,13 @@ The server runs as root under the one-command install's systemd service, so CAN 
 
 ### Cameras
 
-Data collection and policy inference also need the ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
+Data collection and policy inference also need the ZED cameras attached to the host. Press **Configure** to open **Settings → Cameras**.
 
 The tile's dot reflects whether the assigned cameras are **actually connected**, not merely configured: it stays green (`N/3 configured`) only while every assigned serial is detected on the host, turns **red** (`x/N connected`) the moment an assigned camera is unplugged or missing, and shows **Can't detect cameras** (amber) if the ZED SDK or daemon can't be queried at all.
 
-The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). Press **Refresh** to re-query the daemon's current device list, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
+The Cameras tab **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). Press **Refresh** to re-query the daemon's current device list, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
 
-The dialog is the single source of truth for all camera settings — these fields no longer appear in an operation's **Optional** form. It controls two independent branches:
+The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
 
 - **Stream** — what is relayed to the VR headset over WebRTC (used by teleop, collect-data, and run-policy preview).
 - **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream).
@@ -73,7 +73,7 @@ Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, o
 
 A stereo **overhead** captures both eyes from one grab; with both eyes selected it's exposed as `overhead_left` / `overhead_right` (rendered per-lens in the headset, two observation keys in the dataset). A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist in your browser and are sent along when you start an operation. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras dialog. Teleop streams whatever is configured and is never blocked by this check.
+The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 
@@ -83,9 +83,26 @@ The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-
   Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
 </Warning>
 
+## Settings
+
+Almost nothing you configure is actually per-run — camera assignment, arm stiffness, teleop rate, recording fps and codec, the inference server address — so it all lives in one **Settings** dialog (the gear on the **Axol Host** tile, or the *…live in Settings* link under any operation), split into categories:
+
+| Category | What's in it |
+|---|---|
+| **Cameras** | The camera setup described [above](#cameras). |
+| **Robot** | Left/right arm stiffness sliders, CAN channels, gravity-comp damping and rate. |
+| **Teleop & VR** | Teleop control rate and the controller position multiplier. |
+| **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
+| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
+| **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
+| **System** | Log level. |
+| **Advanced** | The full per-operation config tree (searchable) for anything not covered above — per-joint gains, IK weights, VR server ports, … |
+
+Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the dialog footer move the whole settings file as JSON for backup or copying between robots.
+
 ## Operations
 
-Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown. Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
+Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy, the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
 
 | Operation | Needs | Notes |
 |---|---|---|
@@ -97,11 +114,9 @@ Pick an operation from the selector. Each has its own settings form; required fi
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Assign at least one camera serial in the Cameras dialog*, or *Set &lt;required field&gt;*.
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Assign at least one camera serial in Settings → Cameras*, or *Set &lt;required field&gt;*.
 
-### Settings persistence & import/export
-
-Each operation's settings are saved to your browser automatically, so they reappear on reload. Use **Export** to download a settings JSON and **Import** to load one — handy for sharing a known-good configuration across machines. (Camera assignments live with the Cameras dialog, not in an operation's export.)
+Per-run values (repo ids, task names, …) are remembered by your browser so they reappear on reload; everything else persists on the host with the shared settings.
 
 ### Running, logs, and stopping
 

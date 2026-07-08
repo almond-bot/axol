@@ -370,6 +370,93 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
   )
 }
 
+// ---------------------------------------------------------------------------
+// Shared operator settings (serve/settings.py) — persisted on the serve host
+// at ~/.almond/settings.json and folded into every op start server-side.
+// ---------------------------------------------------------------------------
+
+export type SettingValue = string | number | boolean | number[]
+
+/** Optional widget hints for a settings field (slider ranges, pose editor). */
+export interface SettingsFieldUI {
+  widget?: "slider" | "pose"
+  min?: number
+  max?: number
+  step?: number
+}
+
+export interface SettingsField {
+  key: string
+  label: string
+  type: FieldType
+  help: string
+  options: string[] | null
+  /** Resolved from the op config dataclass defaults (null if unresolvable). */
+  default: SettingValue | null
+  ui: SettingsFieldUI
+  /** op id -> dotted config keys this setting drives on that op. */
+  targets: Record<string, string[]>
+}
+
+export interface SettingsCategory {
+  key: string
+  label: string
+  description: string
+  settings: SettingsField[]
+}
+
+export interface SettingsSnapshot {
+  /** Stored shared values keyed by canonical setting key (sparse: only set ones). */
+  values: Record<string, SettingValue>
+  /** Stored camera spec, or null when never configured on this host. */
+  cameras: CameraSpec | null
+  /** Per-op advanced overrides (dotted config key -> value). */
+  opOverrides: Record<string, Record<string, FormValue>>
+  schema: SettingsCategory[]
+}
+
+export interface SettingsPatch {
+  /** Per-key merge; null resets a key to its default. */
+  values?: Record<string, SettingValue | null>
+  cameras?: CameraSpec | null
+  /** Must accompany `cameras: null` so clearing is distinguishable from omitting. */
+  camerasSet?: boolean
+  /** Per-op wholesale replacement of the advanced overrides. */
+  opOverrides?: Record<string, Record<string, FormValue>>
+}
+
+export async function fetchSettings(): Promise<SettingsSnapshot> {
+  return json(await fetch(apiUrl("/api/settings")))
+}
+
+export async function saveSettings(patch: SettingsPatch): Promise<SettingsSnapshot> {
+  const res: Omit<SettingsSnapshot, "schema"> = await json(
+    await fetch(apiUrl("/api/settings"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })
+  )
+  return { schema: [], ...res }
+}
+
+/** Every dotted config key on `op` that a shared setting manages — hidden from
+ * the per-op advanced form so the shared settings stay the single source. */
+export function managedKeysForOp(schema: SettingsCategory[], op: string): Set<string> {
+  const keys = new Set<string>()
+  for (const cat of schema) {
+    for (const s of cat.settings) {
+      for (const k of s.targets[op] ?? []) keys.add(k)
+    }
+  }
+  return keys
+}
+
+/** URL of the robot's URDF (meshes resolve relative to it via /api/urdf/…). */
+export function urdfUrl(): string {
+  return apiUrl("/api/urdf/axol.urdf")
+}
+
 export function cameraCount(spec: CameraSpec): number {
   return Object.values(spec.serials).filter((s) => s.trim()).length
 }
@@ -469,16 +556,18 @@ export function computeArgs(
 }
 
 // ---------------------------------------------------------------------------
-// Curated operations: the friendly subset of fields each op panel shows.
+// Per-run operation fields. Everything tunable-but-stable (stiffness, rates,
+// codecs, the inference server, …) lives in the shared Settings dialog and is
+// folded in server-side; the op panels only ask for what changes run to run.
 // Keys are the dotted draccus paths the backend understands (serve/commands.py
-// build_argv); unlisted fields fall back to their config defaults.
+// build_argv).
 // ---------------------------------------------------------------------------
 
 export interface OperationMeta {
   id: OperationId
   label: string
   description: string
-  /** Curated config keys surfaced in the panel (others use their defaults). */
+  /** Per-run config keys surfaced in the panel (required + run identity). */
   fields: string[]
   /** Needs the persistent robot connection (CAN) to run. */
   requiresRobot: boolean
@@ -493,7 +582,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "teleop",
     label: "Teleoperation",
     description: "Drive the Axol from a VR headset. Enable sim to preview in the browser.",
-    fields: ["sim", "teleop.frequency", "axol.left_stiffness", "axol.right_stiffness"],
+    fields: ["sim"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
@@ -502,7 +591,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "gravity-comp",
     label: "Gravity Compensation",
     description: "Hold the arms weightless so they can be moved by hand.",
-    fields: ["kd", "rate_hz", "free_joints"],
+    fields: ["free_joints"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -511,7 +600,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect Data",
     description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
-    fields: ["repo_id", "task", "fps", "push_to_hub"],
+    fields: ["repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -520,7 +609,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "replay-dataset",
     label: "Replay Dataset",
     description: "Replay a recorded episode of a LeRobot dataset on Axol, then return to rest.",
-    fields: ["repo_id", "episode", "fps", "loop"],
+    fields: ["repo_id", "episode", "loop"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
@@ -530,7 +619,7 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Run Policy",
     description:
       "Run a trained policy on Axol via LeRobot async inference, locally or on a remote inference server.",
-    fields: ["policy_path", "repo_id", "task", "episode_time_s", "server_host", "server_port"],
+    fields: ["policy_path", "policy_type", "task", "repo_id"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
@@ -545,6 +634,19 @@ export function operationMeta(op: OperationId): OperationMeta {
 export function curatedFields(spec: CommandSpec, meta: OperationMeta): SchemaField[] {
   const byKey = new Map(flattenFields(spec.schema).map((f) => [f.key, f]))
   return meta.fields.map((k) => byKey.get(k)).filter((f): f is SchemaField => f != null)
+}
+
+/**
+ * The fields an op panel shows (and the only args a start sends): the curated
+ * per-run fields plus every required field, required first. Everything else
+ * comes from the shared settings, folded in server-side.
+ */
+export function perRunFields(spec: CommandSpec, meta: OperationMeta): SchemaField[] {
+  const byKey = new Map(curatedFields(spec, meta).map((f) => [f.key, f]))
+  for (const f of flattenFields(spec.schema)) {
+    if (f.required && !byKey.has(f.key)) byKey.set(f.key, f)
+  }
+  return [...byKey.values()].sort((a, b) => Number(b.required) - Number(a.required))
 }
 
 // ---------------------------------------------------------------------------
@@ -569,33 +671,6 @@ export function saveOpSettings(op: OperationId, settings: Record<string, FormVal
   } catch {
     // ignore storage failures (private mode / quota)
   }
-}
-
-/** Trigger a browser download of an operation's settings as JSON. */
-export function exportOpSettings(op: OperationId, settings: Record<string, FormValue>): void {
-  const blob = new Blob([JSON.stringify({ op, settings }, null, 2)], {
-    type: "application/json",
-  })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement("a")
-  a.href = url
-  a.download = `${op}-settings.json`
-  a.click()
-  URL.revokeObjectURL(url)
-}
-
-/** Parse an imported settings file; accepts `{op, settings}` or a bare map. */
-export function parseImportedSettings(text: string): Record<string, FormValue> {
-  const data = JSON.parse(text)
-  const settings = data && typeof data === "object" && "settings" in data ? data.settings : data
-  if (!settings || typeof settings !== "object") throw new Error("invalid settings file")
-  const out: Record<string, FormValue> = {}
-  for (const [k, v] of Object.entries(settings as Record<string, unknown>)) {
-    if (typeof v === "string" || typeof v === "boolean" || typeof v === "number") {
-      out[k] = typeof v === "number" ? String(v) : v
-    }
-  }
-  return out
 }
 
 // ---------------------------------------------------------------------------
