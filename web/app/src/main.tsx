@@ -16,6 +16,7 @@ import { ToastProvider } from "./components/ui/toast"
 // which shows as a black screen until it finishes.
 const VrApp = lazy(() => import("./routes/VrApp"))
 const ControlPanel = lazy(() => import("./routes/ControlPanel"))
+const Diagnostics = lazy(() => import("./routes/Diagnostics"))
 
 /** Send headsets to the immersive app, everything else to the control panel. */
 function RootRedirect() {
@@ -39,6 +40,7 @@ createRoot(document.getElementById("root")!).render(
             <Route path="/" element={<RootRedirect />} />
             <Route path="/vr" element={<VrApp />} />
             <Route path="/control" element={<ControlPanel />} />
+            <Route path="/diagnostics" element={<Diagnostics />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </Suspense>

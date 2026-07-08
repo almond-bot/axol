@@ -42,7 +42,7 @@ export interface CommandSpec {
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
-export const CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
+export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
@@ -89,8 +89,16 @@ export function serverHttpBase(host: string): string {
   }
 }
 
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   return `${apiBase}${path}`
+}
+
+/** WebSocket origin for the current server base (ws(s)://host[:port]). */
+export function wsBaseUrl(): string {
+  const base = apiBase || window.location.origin
+  const u = new URL(base)
+  const proto = u.protocol === "https:" ? "wss" : "ws"
+  return `${proto}://${u.host}`
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -351,6 +359,17 @@ export async function stopSession(id: string): Promise<SessionInfo> {
   return json(await fetch(apiUrl(`/api/sessions/${id}/stop`), { method: "POST" }))
 }
 
+/** Answer a session's interactive prompt (empty line = a bare "Enter"). */
+export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl(`/api/sessions/${id}/input`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ line }),
+    })
+  )
+}
+
 export function cameraCount(spec: CameraSpec): number {
   return Object.values(spec.serials).filter((s) => s.trim()).length
 }
@@ -584,10 +603,7 @@ export function parseImportedSettings(text: string): Record<string, FormValue> {
 // ---------------------------------------------------------------------------
 
 function wsUrl(id: string): string {
-  const base = apiBase || window.location.origin
-  const u = new URL(base)
-  const proto = u.protocol === "https:" ? "wss" : "ws"
-  return `${proto}://${u.host}/api/sessions/${id}/logs`
+  return `${wsBaseUrl()}/api/sessions/${id}/logs`
 }
 
 interface LogMessage {
