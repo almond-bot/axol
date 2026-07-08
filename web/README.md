@@ -1,21 +1,23 @@
 # Almond Axol Web
 
-The browser front-ends for the Almond Axol robot. This directory lives inside the main `axol` repo (it was previously the standalone `axol-vr` repo) and builds two surfaces from one app:
+The browser front-ends for the Almond Axol robot. This directory lives inside the main `axol` repo (it was previously the standalone `axol-vr` repo) and builds three surfaces from one app:
 
 - **VR interface** (`/vr`) — WebXR teleoperation. Streams hand/elbow pose from a Meta Quest headset to the Almond Axol SDK over WebSocket. Deployed to Vercel at [axol.almond.bot](https://axol.almond.bot).
 - **Control panel** (`/control`) — browser UI for driving the robot (connect, teleop, gravity comp, collect data, run policy). Served by `axol serve`.
+- **Diagnostics dashboard** (`/diagnostics`) — live motor telemetry (position / velocity / torque charts), per-motor health tiles, and diagnostics / calibration script runners with run history. Also served by `axol serve`.
 
-The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control`.
+The base path `/` redirects by device: headset browsers go to `/vr`, everything else to `/control` (the diagnostics dashboard is reached from the control panel's nav bar).
 
-> Docs: [Web Control Panel](https://docs.almond.bot/guides/control-panel) · [VR Interface](https://docs.almond.bot/guides/vr-interface). The `serve` backend (FastAPI) that the control panel talks to lives in `almond_axol/serve/`.
+> Docs: [Web Control Panel](https://docs.almond.bot/guides/control-panel) · [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) · [VR Interface](https://docs.almond.bot/guides/vr-interface). The `serve` backend (FastAPI) that the control panel and diagnostics dashboard talk to lives in `almond_axol/serve/`.
 
 ## Structure
 
 ```
 web/
-├── app/                        # Vite + React app — both /vr and /control routes
+├── app/                        # Vite + React app — /vr, /control, and /diagnostics routes
 │   ├── src/routes/VrApp.tsx        # WebXR teleop interface
 │   ├── src/routes/ControlPanel.tsx # control panel UI
+│   ├── src/routes/Diagnostics.tsx  # motor diagnostics dashboard
 │   └── dist/                       # build output — served by `axol serve` and Vercel
 └── packages/
     └── axol-vr-client/         # Reusable R3F components and hooks
@@ -141,7 +143,7 @@ The `Error` state is also **server-driven**: broadcasting `{"type": "state", "va
 
 ## App
 
-The `app/` package is a Vite + React app that serves both the WebXR teleop interface (`/vr`, wrapping the `axol-vr-client` library) and the control panel (`/control`). The two routes are lazy-loaded so opening the control panel doesn't pull in the heavy three.js / XR bundle.
+The `app/` package is a Vite + React app that serves the WebXR teleop interface (`/vr`, wrapping the `axol-vr-client` library), the control panel (`/control`), and the motor diagnostics dashboard (`/diagnostics`). The routes are lazy-loaded so opening the control panel or diagnostics dashboard doesn't pull in the heavy three.js / XR bundle.
 
 **Dev**
 

@@ -119,6 +119,10 @@ The HUD shows an **Episode N** readout (top-right) with the 1-based number of th
 Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown.
 
 <Note>
+  **Saved takes are integrity-checked.** If the camera encoder drops frames during a take (a feed-queue overflow under heavy load), the video no longer lines up with its recorded rows — so that episode is **discarded instead of saved**, with an error explaining why (in the CLI output / control panel log console). Re-record it rather than adding a misaligned episode to the dataset.
+</Note>
+
+<Note>
   The full controller bindings and headset state machine are documented in the [VR Interface](/guides/vr-interface) guide.
 </Note>
 
