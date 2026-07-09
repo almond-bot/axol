@@ -95,11 +95,15 @@ export function OperationPanel({
   }, [spec, requiredFields, allFields, meta.requiresCameras])
 
   const isSim = meta.id === "teleop" && Boolean(settings.sim)
+  // UMI mode runs on the handheld rig's own CAN buses — the persistent Axol
+  // robot connection is not involved.
+  const isUmi =
+    (meta.id === "teleop" || meta.id === "collect-data") && Boolean(settings.umi)
   const robotOk = robot?.state === "connected"
   const camCount = cameraCount(cameras)
 
   const blockers: string[] = []
-  if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
+  if (meta.requiresRobot && !isSim && !isUmi && !robotOk) blockers.push("Connect Axol")
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {

@@ -172,10 +172,15 @@ def _serials_in_rules(rules_file: Path) -> set[str]:
 def _resolve_serial() -> str:
     """Pick the adapter serial without prompting (for headless ``ensure_setup``).
 
-    Raises ``RuntimeError`` when zero or several adapters are present, since
-    that needs the interactive ``axol can.setup`` flow to disambiguate.
+    Serials the UMI rig's rules already claim are excluded — the handheld
+    CANables share the hub's USB ID (1d50:606f), so with the rig plugged in
+    they would otherwise make the robot's adapter ambiguous. Raises
+    ``RuntimeError`` when zero or several candidates remain, since that needs
+    the interactive ``axol can.setup`` flow to disambiguate.
     """
     unique = _detect_serials()
+    claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
+    unique = [s for s in unique if s not in claimed]
     if len(unique) == 1:
         return unique[0]
     if not unique:
