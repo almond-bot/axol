@@ -215,12 +215,17 @@ def _find_serial(profile: _Profile) -> str:
     return unique[int(idx)]
 
 
-def _find_umi_assignment() -> dict[str, tuple[str, str, str]]:
-    """Interactively map the two UMI channel names to attached adapters.
+def _find_umi_assignment(
+    left_serial: str | None = None, right_serial: str | None = None
+) -> dict[str, tuple[str, str, str]]:
+    """Map the two UMI channel names to attached adapters.
 
     Returns ``{interface_name: (serial, vid, pid)}`` for the left and right
     grippers. Requires two UMI-compatible adapters to be attached (the serial
-    the robot-arm rules claim is excluded).
+    the robot-arm rules claim is excluded). Explicit ``left_serial`` /
+    ``right_serial`` win; otherwise the choice is prompted interactively, or —
+    with no TTY (the control panel's runner) — auto-assigned in detection
+    order with a loud note on how to swap.
     """
     adapters = _detect_umi_adapters()
     claimed = _serials_in_rules(_AXOL_PROFILE.rules_file)
@@ -236,6 +241,28 @@ def _find_umi_assignment() -> dict[str, tuple[str, str, str]]:
     print("  Found adapters:")
     for i, (serial, vid, pid) in enumerate(adapters):
         print(f"    [{i}] {serial}  ({vid}:{pid})")
+
+    by_serial = {a[0]: a for a in adapters}
+    if left_serial or right_serial:
+        if not (left_serial and right_serial):
+            _die("Pass both --left and --right serials (or neither).")
+        for s in (left_serial, right_serial):
+            if s not in by_serial:
+                _die(f"Serial {s} is not among the detected adapters above.")
+        return {
+            _UMI_PROFILE.left: by_serial[left_serial],
+            _UMI_PROFILE.right: by_serial[right_serial],
+        }
+
+    if not sys.stdin.isatty():
+        left, right = adapters[0], adapters[1]
+        print(
+            f"  No TTY — auto-assigning: LEFT={left[0]}  RIGHT={right[0]}.\n"
+            "  If the sides are swapped, swap the two USB plugs, or re-run "
+            "with --left/--right serials."
+        )
+        return {_UMI_PROFILE.left: left, _UMI_PROFILE.right: right}
+
     idx_l = int(input("  Index of the LEFT gripper's adapter [0]: ").strip() or "0")
     left = adapters[idx_l]
     remaining = [a for i, a in enumerate(adapters) if i != idx_l]
@@ -409,7 +436,17 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--umi",
         action="store_true",
-        help=f"Configure the handheld UMI rig adapter ({CAN_UMI_LEFT} / {CAN_UMI_RIGHT}).",
+        help=f"Configure the handheld UMI rig adapters ({CAN_UMI_LEFT} / {CAN_UMI_RIGHT}).",
+    )
+    parser.add_argument(
+        "--left",
+        metavar="SERIAL",
+        help="UMI only: USB serial of the LEFT gripper's adapter (skips the prompt).",
+    )
+    parser.add_argument(
+        "--right",
+        metavar="SERIAL",
+        help="UMI only: USB serial of the RIGHT gripper's adapter (skips the prompt).",
     )
     parser.set_defaults(func=run)
 
@@ -513,7 +550,9 @@ def run(args: object = None) -> None:
         time.sleep(2.0)
 
     if profile is _UMI_PROFILE:
-        assign = _find_umi_assignment()
+        assign = _find_umi_assignment(
+            getattr(args, "left", None), getattr(args, "right", None)
+        )
         _write_umi_udev_rules(assign)
         _reload_udev()
         _rename_umi_interfaces(assign)
