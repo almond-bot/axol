@@ -1223,7 +1223,16 @@ function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
 }
 
 export default function App() {
-  const [hostname, setHostname] = useState(() => localStorage.getItem("wsHostname") ?? "")
+  // Zero-touch bootstrap (axol umi.session): ?host= pre-fills the server and
+  // ?autoconnect=1 connects without a click — the headset browser is launched
+  // at this URL over adb, so the only remaining human steps are wearing the
+  // headset and the browser-mandated trigger pull to enter AR.
+  const bootParams = useRef(
+    typeof window === "undefined" ? null : new URLSearchParams(window.location.search)
+  )
+  const [hostname, setHostname] = useState(
+    () => bootParams.current?.get("host") ?? localStorage.getItem("wsHostname") ?? ""
+  )
   const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
@@ -1237,6 +1246,16 @@ export default function App() {
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
+
+  // Fire the autoconnect once the client is idle with a host set.
+  const autoConnectedRef = useRef(false)
+  useEffect(() => {
+    if (!bootParams.current?.get("autoconnect")) return
+    if (autoConnectedRef.current || !hostname) return
+    if (status !== AxolConnectionStatus.Idle) return
+    autoConnectedRef.current = true
+    connect()
+  }, [hostname, status, connect])
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
   // socket comes up once the main connection is open and the operator opts in.
