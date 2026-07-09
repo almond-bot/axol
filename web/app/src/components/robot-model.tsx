@@ -79,31 +79,53 @@ export function RobotModel({
   useEffect(() => {
     if (!hostname) return
     const origin = axolHttpsOrigin(hostname, VR_WS_PORT)
-    // Meshes load asynchronously after the URDF parse callback; the manager's
-    // onLoad fires once every referenced mesh has arrived, which is the first
-    // moment the overlay materials can actually be applied.
     let cancelled = false
-    let loaded: URDFRobot | null = null
-    const manager = new THREE.LoadingManager(() => {
-      if (cancelled || !loaded) return
-      applyOverlayMaterials(loaded)
-      setRobot(loaded)
-    })
-    const loader = new URDFLoader(manager)
-    // The URDF references meshes as package://axol_kit/meshes/<name>.stl
-    // (package://assembly/... in older exports); the server exposes the whole
-    // urdf directory at /urdf either way.
-    loader.packages = { axol_kit: `${origin}/urdf`, assembly: `${origin}/urdf` }
-    loader.load(
-      `${origin}/urdf/axol.urdf`,
-      (r) => {
-        loaded = r
-      },
-      undefined,
-      (err) => console.warn("failed to load robot URDF from", origin, err)
-    )
+    let retryTimer: ReturnType<typeof setTimeout> | null = null
+
+    // A one-shot load can race the teleop server's startup or the self-signed
+    // cert authorization and then never recover ("URDF doesn't appear until I
+    // restart the app") — retry until it loads or the component unmounts.
+    const attempt = () => {
+      if (cancelled) return
+      // Meshes load asynchronously after the URDF parse callback; the
+      // manager's onLoad fires once every referenced mesh has arrived, which
+      // is the first moment the overlay materials can actually be applied.
+      let loaded: URDFRobot | null = null
+      let failed = false
+      const manager = new THREE.LoadingManager(() => {
+        if (cancelled) return
+        if (!loaded || failed) {
+          retryTimer = setTimeout(attempt, 3000)
+          return
+        }
+        applyOverlayMaterials(loaded)
+        setRobot(loaded)
+      })
+      manager.onError = () => {
+        failed = true
+      }
+      const loader = new URDFLoader(manager)
+      // The URDF references meshes as package://axol_kit/meshes/<name>.stl
+      // (package://assembly/... in older exports); the server exposes the
+      // whole urdf directory at /urdf either way.
+      loader.packages = { axol_kit: `${origin}/urdf`, assembly: `${origin}/urdf` }
+      loader.load(
+        `${origin}/urdf/axol.urdf`,
+        (r) => {
+          loaded = r
+        },
+        undefined,
+        // Retry scheduling happens in the manager's onLoad (which also fires
+        // after errored items end), so this only logs — scheduling here too
+        // would fork parallel retry loops.
+        (err) => console.warn("failed to load robot URDF from", origin, "- retrying", err)
+      )
+    }
+    attempt()
+
     return () => {
       cancelled = true
+      if (retryTimer !== null) clearTimeout(retryTimer)
       setRobot(null)
     }
   }, [hostname])

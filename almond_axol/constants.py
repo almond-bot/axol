@@ -73,6 +73,13 @@ _BODY_URDF_SUFFIX: dict[Joint, str] = {
 _GRIPPER_JOINT_SUFFIX: str = "gripper_joint_a"
 GRIPPER_URDF_OPEN: float = 0.058804
 
+# Closed-jaw tip position in the ``*_gripper`` link frame (m), computed from
+# the URDF's Gripper_Tip meshes at the closed finger configuration (their
+# extremal extent along the protrusion axis). This is the physical TCP the UMI
+# pivot calibration measures; the ``*_gripper`` frame FK anchors sits this far
+# behind it.
+GRIPPER_TIP_IN_GRIPPER_FRAME: tuple[float, float, float] = (0.0, 0.0, -0.1466)
+
 
 def urdf_joint_name(joint: Joint, *, is_left: bool) -> str:
     """URDF revolute-joint name driving ``joint`` on the given arm.

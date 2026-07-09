@@ -552,7 +552,17 @@ class IKWorker:
 
         # Anchor the fit at the physical gripper TCPs when the controller→TCP
         # lever arm is calibrated; otherwise the controller origins stand in
-        # for them (and the residual is absorbed into the offsets below).
+        # for them (and the residual is absorbed into the offsets below). The
+        # pivot calibration measures the JAW TIP, which sits
+        # GRIPPER_TIP_IN_GRIPPER_FRAME ahead of the URDF's gripper frame (the
+        # FK anchor) — map each measured tip back to where the gripper frame
+        # must be, using the rest-pose FK orientation mapped into the world by
+        # the (not-yet-final) base yaw. Position-wise the tip protrusion is
+        # almost entirely along the gripper's own -z, so using rest FK
+        # orientation for the back-off is exact at engage by construction.
+        from ..constants import GRIPPER_TIP_IN_GRIPPER_FRAME
+
+        tip_g = np.asarray(GRIPPER_TIP_IN_GRIPPER_FRAME, dtype=np.float64)
         off_l, off_r = self._tcp_offsets["left"], self._tcp_offsets["right"]
         l_pos_raw, r_pos_raw = l_pos, r_pos
         if off_l is not None:
@@ -560,9 +570,14 @@ class IKWorker:
         if off_r is not None:
             r_pos = r_pos + r_rot @ off_r
 
-        # URDF base frame: +x = left, +y = forward, +z = up (the rest-pose
-        # grippers sit at x = ±0.20 in it). Base up aligns with world up; base
-        # +x aligns with the horizontal right→left gripper direction.
+        fk_l_anchor = fk_l[0] + fk_l[1] @ tip_g if off_l is not None else fk_l[0]
+        fk_r_anchor = fk_r[0] + fk_r[1] @ tip_g if off_r is not None else fk_r[0]
+
+        # URDF base frame: +x = left, +y = forward, +z = up. Base up aligns
+        # with world up; the yaw is set so the base-frame anchor-separation
+        # direction (projected horizontal — pure ±x for the gripper origins,
+        # slightly forward-tilted for the jaw tips) maps onto the measured
+        # right→left direction.
         d = l_pos - r_pos
         d_h = d - np.dot(d, _VR_UP) * _VR_UP
         n = float(np.linalg.norm(d_h))
@@ -572,13 +587,17 @@ class IKWorker:
                 "base yaw is arbitrary — re-engage with grippers apart."
             )
             d_h, n = np.array([1.0, 0.0, 0.0]), 1.0
-        x_axis = d_h / n
+        b = d_h / n
+        d_b = fk_l_anchor - fk_r_anchor
+        theta_a = math.atan2(float(d_b[1]), float(d_b[0]))
+        x_axis = b * math.cos(theta_a) - np.cross(_VR_UP, b) * math.sin(theta_a)
+        x_axis /= np.linalg.norm(x_axis)
         z_axis = _VR_UP
         y_axis = np.cross(z_axis, x_axis)
         R_wb = np.column_stack([x_axis, y_axis, z_axis])
 
         mid_w = 0.5 * (l_pos + r_pos)
-        mid_b = 0.5 * (fk_l[0] + fk_r[0])
+        mid_b = 0.5 * (fk_l_anchor + fk_r_anchor)
         t_wb = mid_w - R_wb @ mid_b
         if self._config.base_height is not None:
             t_wb[1] = float(self._config.base_height)
@@ -599,10 +618,11 @@ class IKWorker:
             r_off = ctrl_rot.T @ r_w_tcp
             calibrated = self._tcp_offsets[side]
             if calibrated is not None:
-                # ``ctrl_pos`` is already the physical TCP (adjusted above),
-                # so the position lever arm is the calibrated one, exactly —
-                # engage sloppiness moves the base, never the lever arm.
-                return calibrated, r_off
+                # The calibrated lever arm lands on the jaw TIP; back off to
+                # the URDF gripper frame (the FK anchor) through the absorbed
+                # controller→gripper rotation. Engage sloppiness then moves the
+                # base, never the lever arm.
+                return calibrated - r_off @ tip_g, r_off
             p_w_tcp = R_wb @ fk_pos + t_wb
             return ctrl_rot.T @ (p_w_tcp - ctrl_pos), r_off
 
