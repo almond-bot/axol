@@ -60,6 +60,8 @@ The server can push a state override to all connected headsets at any time using
 
 On connect the server also announces its **operating mode** — `{"type": "mode", "value": "teleop" | "data_collection"}` — set via `VRServer.set_mode()`. The web UI uses it to **lock the HUD** to a single mode: [`axol teleop`](/cli/teleop) sends `teleop` (recording controls hidden), while [`axol collect-data`](/cli/collect-data) sends `data_collection` (recording enabled, but no switching back to plain teleop). The message is pushed once per client in the WebSocket accept handler, so a headset that joins mid-session still gets it.
 
+During data collection the server likewise pushes the current **episode number** — `{"type": "episode", "value": N}` (1-based) — which the headset renders as an `Episode N` HUD readout. [`axol collect-data`](/cli/collect-data) announces it at the start of each episode via `AxolVRTeleop.send_feedback_episode(episode)`, which both stores the value on the server (`VRServer.set_episode()`, re-sent on connect so a mid-session headset shows the right number) and broadcasts a live update to connected clients. Plain teleop never sets it, so the readout stays hidden.
+
 Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
 
 ## Camera video to the headset
@@ -96,6 +98,9 @@ Requires the GPU-resident camera stack the host installer sets up once: the GStr
 | `port` | `8000` | WSS listen port |
 | `certfile` | auto | Path to TLS certificate; `None` uses the auto-generated cert |
 | `keyfile` | auto | Path to TLS private key |
+| `interp_enabled` | `True` | Enable the adaptive playout buffer that interpolates pose frames using the headset timestamp `t`, smoothing jittery / batched frame arrivals |
+| `interp_min_delay_s` | `0.0` | Minimum playout delay in seconds |
+| `interp_max_delay_s` | `0.1` | Maximum playout delay in seconds — caps how much latency the buffer may add |
 
 <Warning>
   Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.

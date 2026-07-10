@@ -1,0 +1,63 @@
+---
+title: "Train a Policy"
+description: "Train a model on your recorded Axol data using the standard LeRobot training pipeline."
+---
+
+Axol records every episode in the [LeRobot dataset format](/api/lerobot), so training a policy is just standard **LeRobot training** — there's nothing Axol-specific about it. Once you've recorded a dataset with [Data Collection](/operations/data-collection), you point LeRobot's training script at it, and the resulting checkpoint runs back on the robot with [Run Policy](/operations/run-policy).
+
+<Note>
+  Because the data is plain LeRobot format, any LeRobot training tutorial applies directly — just substitute your own dataset `repo_id`. The links below are the best places to start.
+</Note>
+
+## Which policy to train
+
+[**ACT** (Action Chunking with Transformers)](https://huggingface.co/docs/lerobot/en/act) is the recommended starting point: it's lightweight (~80M params), trains in a few hours on a single GPU, and often reaches high success rates with as few as ~50 demonstrations. Once you have a baseline working, you can explore larger vision-language-action models like [SmolVLA](https://huggingface.co/docs/lerobot/en/smolvla).
+
+## Train it
+
+With the [`lerobot` extra](/advanced/development-install#optional-extras) installed on a machine with a CUDA-capable GPU, train directly from your dataset's Hub `repo_id`:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=${HF_USER}/pick-place \
+  --policy.type=act \
+  --output_dir=outputs/train/act_pick_place \
+  --job_name=act_pick_place \
+  --policy.device=cuda \
+  --wandb.enable=true \
+  --policy.repo_id=${HF_USER}/act_pick_place
+```
+
+Training writes checkpoints under `outputs/train/.../checkpoints`, and (with `--policy.repo_id`) pushes the trained policy to the Hub so it's reachable from the robot machine and any [inference server](/cli/inference-server). Expect a few hours for ~100k steps on a single GPU.
+
+<Note>
+  No local GPU? The ACT tutorial links a [Google Colab notebook](https://huggingface.co/docs/lerobot/en/act#train-using-google-colab) you can use to train in the cloud.
+</Note>
+
+## LeRobotTutorials
+
+<CardGroup cols={2}>
+  <Card title="ACT" icon="robot" href="https://huggingface.co/docs/lerobot/en/act">
+    The recommended first policy — architecture, training, and tips.
+  </Card>
+  <Card title="Imitation learning walkthrough" icon="graduation-cap" href="https://huggingface.co/docs/lerobot/en/il_robots">
+    End-to-end record → train → evaluate with `lerobot-train`.
+  </Card>
+  <Card title="SmolVLA" icon="brain" href="https://huggingface.co/docs/lerobot/en/smolvla">
+    Fine-tune Hugging Face's lightweight vision-language-action model.
+  </Card>
+  <Card title="LeRobot docs" icon="book" href="https://huggingface.co/docs/lerobot/en/index">
+    Full documentation, models, and datasets.
+  </Card>
+</CardGroup>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Run Policy" icon="play" href="/operations/run-policy">
+    Deploy your trained checkpoint on the robot.
+  </Card>
+  <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
+    Record more episodes to improve the policy.
+  </Card>
+</CardGroup>

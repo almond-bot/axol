@@ -19,6 +19,7 @@
         "group": "Get Started",
         "pages": [
           "index",
+          "hardware",
           "installation"
         ]
       },
@@ -29,6 +30,7 @@
           "operations/gravity-comp",
           "operations/data-collection",
           "operations/replay-dataset",
+          "operations/train-policy",
           "operations/run-policy"
         ]
       },
@@ -42,6 +44,7 @@
         "group": "Web Interfaces",
         "pages": [
           "guides/control-panel",
+          "guides/diagnostics-dashboard",
           "guides/vr-interface",
           "guides/quest-over-usb"
         ]
@@ -60,6 +63,9 @@
               "cli/can-driver",
               "cli/motor-info",
               "cli/motor-health",
+              "cli/diag-rom-enable",
+              "cli/diag-rom-disable",
+              "cli/diag-zed-cable",
               "cli/motor-set-can-id",
               "cli/motor-set-zero-pos",
               "cli/teleop",

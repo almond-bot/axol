@@ -1,0 +1,13 @@
+{
+  "setup": [
+    "uv sync --extra lerobot --extra sim",
+    "source .venv/bin/activate",
+    "axol provision",
+    "axol jetson.setup"
+  ],
+  "teardown": [],
+  "run": [
+    "source .venv/bin/activate",
+    "axol serve"
+  ]
+}

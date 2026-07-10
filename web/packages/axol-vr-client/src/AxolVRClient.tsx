@@ -2,7 +2,7 @@ import type { RefObject } from "react"
 import { useRef } from "react"
 import { useFrame, useThree } from "@react-three/fiber"
 import { AxolState } from "./types"
-import type { AxolMode } from "./types"
+import type { AxolMode, ConfirmAction } from "./types"
 
 const L_ELBOW_JOINT = "left-arm-lower" as XRBodyJoint
 const R_ELBOW_JOINT = "right-arm-lower" as XRBodyJoint
@@ -36,7 +36,9 @@ export function AxolVRClient({
   poseChannelRef,
   onStateChange,
   onPendingRecording,
+  onPendingConfirm,
   onMode,
+  onEpisode,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -51,8 +53,14 @@ export function AxolVRClient({
   poseChannelRef?: RefObject<RTCDataChannel | null>
   onStateChange?: (state: AxolState) => void
   onPendingRecording?: (pendingAt: number | null) => void
+  // Called when the confirmation popup for stopping a recording is armed
+  // ("save"/"discard") or resolved (null). Drives the in-headset popup.
+  onPendingConfirm?: (action: ConfirmAction | null) => void
   // Called when the server announces its operating mode (once per connection).
   onMode?: (mode: AxolMode) => void
+  // Called with the current 1-based episode number while collecting data (and
+  // null if the server ever clears it). Drives the in-headset episode readout.
+  onEpisode?: (episode: number | null) => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -64,6 +72,9 @@ export function AxolVRClient({
   const prevARef = useRef(false)
   const prevBRef = useRef(false)
   const recordingPendingAtRef = useRef<number | null>(null)
+  // Which episode action (stop-to-save on A, discard on X) is awaiting a second
+  // confirming press. Null when no confirmation popup is armed.
+  const pendingConfirmRef = useRef<ConfirmAction | null>(null)
   // Server-pushed state override (e.g. "saving"). Applied at start of each frame.
   const serverStateRef = useRef<AxolState | null>(null)
   // Operating mode the server locked us to (null until announced). "teleop"
@@ -72,6 +83,10 @@ export function AxolVRClient({
   const modeRef = useRef<AxolMode | null>(null)
   // Server-pushed mode announcement, applied at the start of the next frame.
   const serverModeRef = useRef<AxolMode | null>(null)
+  // Server-pushed episode number, applied at the start of the next frame. -1 is
+  // the "unset" sentinel (distinct from a real episode value or an explicit
+  // null the server could send); replaced with the parsed value on each push.
+  const serverEpisodeRef = useRef<number | null | -1>(-1)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
 
@@ -81,14 +96,30 @@ export function AxolVRClient({
     const currentWs = wsRef.current
     if (currentWs !== wsWithHandlerRef.current) {
       wsWithHandlerRef.current = currentWs
+      // A new (or dropped) connection invalidates the previous session's
+      // episode number: the HUD readout only advances on a server `episode`
+      // message, and plain teleop never sends one, so without this a prior
+      // collect-data session's number would linger (even into a later teleop
+      // session). Clear it here; a reconnecting collect-data session re-announces
+      // the current episode on connect and repopulates it moments later.
+      // Reset to the -1 "handled" sentinel (dropping any pending value) since we
+      // notify here directly — the frame's apply block is gated behind an active
+      // XR session, but a reconnect commonly happens outside one.
+      serverEpisodeRef.current = -1
+      onEpisode?.(null)
       if (currentWs) {
         currentWs.onmessage = (event: MessageEvent) => {
           try {
-            const msg = JSON.parse(event.data as string) as { type: string; value: string }
+            const msg = JSON.parse(event.data as string) as {
+              type: string
+              value: string | number | null
+            }
             if (msg.type === "state") {
               serverStateRef.current = msg.value as AxolState
             } else if (msg.type === "mode") {
               serverModeRef.current = msg.value as AxolMode
+            } else if (msg.type === "episode") {
+              serverEpisodeRef.current = typeof msg.value === "number" ? msg.value : null
             }
           } catch {
             // ignore malformed messages
@@ -150,6 +181,13 @@ export function AxolVRClient({
       onMode?.(mode)
     }
 
+    // Surface any server-pushed episode number (purely informational — it
+    // doesn't feed the state machine below).
+    if (serverEpisodeRef.current !== -1) {
+      onEpisode?.(serverEpisodeRef.current)
+      serverEpisodeRef.current = -1
+    }
+
     // Apply server-pushed state override before processing button presses.
     if (serverStateRef.current !== null) {
       const next = serverStateRef.current
@@ -172,14 +210,65 @@ export function AxolVRClient({
 
     const isPending = recordingPendingAtRef.current !== null
 
-    // X — reset; also cancels pending/recording (not allowed while saving)
     let reset = false
-    if (xEdge && !isSaving) {
-      reset = true
-      if (state === AxolState.Recording || isPending) {
-        setState(AxolState.DataCollection)
-        recordingPendingAtRef.current = null
-        onPendingRecording?.(null)
+
+    if (state === AxolState.Recording && !isSaving) {
+      // Stopping a recording — to save (A) or discard (X) — is gated by a
+      // confirmation popup: the first press arms it, pressing the SAME button
+      // again commits, the OTHER button cancels and keeps recording. Handled
+      // before the generic A/X logic below so a stop can't slip through
+      // unconfirmed.
+      const pendingConfirm = pendingConfirmRef.current
+      if (pendingConfirm === null) {
+        if (aEdge) {
+          pendingConfirmRef.current = "save"
+          onPendingConfirm?.("save")
+        } else if (xEdge) {
+          pendingConfirmRef.current = "discard"
+          onPendingConfirm?.("discard")
+        }
+      } else if (aEdge || xEdge) {
+        const confirmed =
+          (pendingConfirm === "save" && aEdge) || (pendingConfirm === "discard" && xEdge)
+        if (confirmed) {
+          // A discard carries the reset flag so the server drops the episode
+          // and rewinds to re-record; a save stops with reset=false so it's
+          // kept. Both leave the recording state.
+          if (pendingConfirm === "discard") reset = true
+          setState(AxolState.DataCollection)
+        }
+        // Same button commits, the other cancels — either way clear the popup.
+        pendingConfirmRef.current = null
+        onPendingConfirm?.(null)
+      }
+    } else {
+      // Not recording: no episode to save/discard, so drop any stale armed
+      // confirmation and fall back to the plain reset / start-recording logic.
+      if (pendingConfirmRef.current !== null) {
+        pendingConfirmRef.current = null
+        onPendingConfirm?.(null)
+      }
+
+      // X — reset; also cancels a pending countdown (not allowed while saving).
+      if (xEdge && !isSaving) {
+        reset = true
+        if (isPending) {
+          setState(AxolState.DataCollection)
+          recordingPendingAtRef.current = null
+          onPendingRecording?.(null)
+        }
+      }
+
+      // A — start pending (3s countdown) or cancel it; blocked while saving and
+      // entirely unavailable in teleop mode (nothing records there).
+      if (aEdge && !isSaving && canRecord) {
+        if (state === AxolState.DataCollection && !isPending) {
+          recordingPendingAtRef.current = Date.now()
+          onPendingRecording?.(recordingPendingAtRef.current)
+        } else if (isPending) {
+          recordingPendingAtRef.current = null
+          onPendingRecording?.(null)
+        }
       }
     }
 
@@ -190,25 +279,16 @@ export function AxolVRClient({
     // frame carrying this reset is sent below (see the exit-on-send paths).
     if (yEdge) {
       reset = true
+      // Abandon any armed confirmation on the way out of the session.
+      if (pendingConfirmRef.current !== null) {
+        pendingConfirmRef.current = null
+        onPendingConfirm?.(null)
+      }
     }
 
     // B (right) — previously toggled teleop ↔ data_collection. The mode is now
     // fixed by the server (see modeRef), so B is intentionally inert.
     void bEdge
-
-    // A — start pending (3s countdown) or stop recording; blocked while saving
-    // and entirely unavailable in teleop mode (nothing records there).
-    if (aEdge && !isSaving && canRecord) {
-      if (state === AxolState.Recording) {
-        setState(AxolState.DataCollection)
-      } else if (state === AxolState.DataCollection && !isPending) {
-        recordingPendingAtRef.current = Date.now()
-        onPendingRecording?.(recordingPendingAtRef.current)
-      } else if (isPending) {
-        recordingPendingAtRef.current = null
-        onPendingRecording?.(null)
-      }
-    }
 
     // Promote pending → recording after 3s
     if (

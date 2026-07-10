@@ -42,7 +42,7 @@ curl https://axol.almond.bot/install -fsS | bash
 This one command:
 
 - Installs [`uv`](https://docs.astral.sh/uv/) if it isn't already present.
-- Installs the `axol` CLI from GitHub (Python 3.13 bundled), with the `lerobot` and `sim` extras.
+- Installs the `axol` CLI from GitHub, pinned to the **latest release** (Python 3.13 bundled), with the `lerobot` and `sim` extras.
 - Provisions the headset-video stack — the pyzed bindings, GStreamer/PyGObject, and the patched ZED source plugins — via [`axol provision`](/cli/provision). Each step self-gates and no-ops if the ZED SDK isn't present.
 - Installs `adb` and the Quest udev rule (also via [`axol provision`](/cli/provision)) for the optional [Quest-over-USB](/guides/quest-over-usb) controller link — no extra setup needed on the robot to use it.
 - On a Jetson, pins the real-time clocks ([`jetson.setup`](/cli/jetson-setup)) for low-latency camera encode and a steady IK loop.
@@ -56,7 +56,7 @@ When it finishes, open [axol.almond.bot](https://axol.almond.bot) and connect to
 
 ### Staying up to date
 
-The install keeps itself in sync with the latest release: whenever the control panel connects, the server checks for updates in the background and restarts onto the new version once idle. Re-running the install command also upgrades.
+Installs track [GitHub releases](https://github.com/almond-bot/axol/releases), not individual commits. The server checks for a newer release in the background; when one exists, the control panel shows an update banner with the installed and latest versions (e.g. `v0.1.2 → v0.1.3`). Press **Update** to apply it — the server reinstalls at the new release tag, re-provisions, and restarts once idle. Nothing updates without that button press. Re-running the install command also upgrades to the latest release.
 
 ```bash
 journalctl -u axol -f        # follow the service logs

@@ -4,7 +4,7 @@
 
 Command-line interface and Python SDK for the Almond Axol dual-arm robot. CLI invoked as `axol <command> [flags]`.
 
-The browser front-ends live under [`web/`](web/): a **VR teleoperation interface** (WebXR, hosted at [axol.almond.bot](https://axol.almond.bot)) and a **web control panel** that drives the robot from a browser via `axol serve`. See [`web/README.md`](web/README.md) for the front-end details.
+The browser front-ends live under [`web/`](web/): a **VR teleoperation interface** (WebXR, hosted at [axol.almond.bot](https://axol.almond.bot)), a **web control panel** that drives the robot from a browser via `axol serve`, and a **diagnostics dashboard** for live motor telemetry and health. See [`web/README.md`](web/README.md) for the front-end details.
 
 The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). The sources live under [`docs/`](docs/), and the pages below link to them.
 
@@ -26,7 +26,7 @@ One command installs `uv`, the `axol` CLI (from GitHub, with every extra), and a
 curl https://axol.almond.bot/install -fsS | bash
 ```
 
-Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install keeps itself in sync with `main`: when the control panel connects, the server upgrades in the background and restarts onto the new version once idle.
+Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine. The install tracks [releases](https://github.com/almond-bot/axol/releases): when a newer release exists, the control panel shows an update banner, and pressing **Update** reinstalls at the new release and restarts the server once idle.
 
 ### Development install
 
@@ -108,6 +108,7 @@ Each operation can be driven from the web control panel or the CLI:
 ### Web Interfaces
 
 - [Web Control Panel](https://docs.almond.bot/guides/control-panel) — drive the robot from a browser via `axol serve`
+- [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) — live motor telemetry, health tiles, and diagnostics scripts, served by `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
 - [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
 
@@ -124,6 +125,9 @@ Each operation can be driven from the web control panel or the CLI:
 - [`can.driver`](https://docs.almond.bot/cli/can-driver)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
+- [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)
+- [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable)
+- [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
 - [`teleop`](https://docs.almond.bot/cli/teleop)

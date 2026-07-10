@@ -19,10 +19,11 @@ from pydantic import BaseModel
 
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
-from .commands import command_specs
+from .commands import COMMANDS, command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
+from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
 # The core operations run in-process via the OperationRunner.
@@ -30,6 +31,14 @@ _OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-d
 
 
 class RunRequest(BaseModel):
+    command: str
+    args: dict[str, Any] = {}
+
+
+class DiagnosticsRunRequest(BaseModel):
+    """Launch a catalog command as a *diagnostics run*: the session is wrapped
+    in a persisted run record with the telemetry observed while it ran."""
+
     command: str
     args: dict[str, Any] = {}
 
@@ -67,6 +76,15 @@ class EpisodeRequest(BaseModel):
     """run-policy episode control command: ``start`` | ``s`` | ``r`` | ``q``."""
 
     command: str
+
+
+class SessionInputRequest(BaseModel):
+    """A line written to a session's stdin (answers an interactive prompt).
+
+    Empty ``line`` (the default) sends a bare newline — i.e. "press Enter".
+    """
+
+    line: str = ""
 
 
 # Ports the launched commands expose on the serve host.
@@ -120,12 +138,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # host installer and its boot service (`axol jetson.setup` runs as an
     # ExecStartPre on axol.service; `axol provision` runs at install time). The
     # one exception is the self-updater (below), which re-runs `axol provision`
-    # after a `uv tool upgrade` and self-heals a host that upgraded into this
-    # build from an older main.
+    # after a release upgrade and self-heals a host that upgraded into this
+    # build from an older release.
 
     manager = SessionManager()
-    robot = RobotLink()
+    hub = TelemetryHub()
+    robot = RobotLink(hub=hub)
     runner = OperationRunner(robot)
+    runs = DiagnosticsRunStore(hub)
 
     def _is_idle() -> bool:
         """Safe to restart: no operation running.
@@ -138,10 +158,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return False
         return not any(s["status"] in ("starting", "running") for s in manager.list())
 
-    # Surfaces "update available" (read-only `git ls-remote`) to the control
-    # panel via /api/update/status and applies an on-demand `uv tool upgrade`
-    # via /api/update/start, restarting the process (systemd relaunches it) once
-    # idle. Nothing upgrades automatically. No-ops for dev checkouts.
+    # Surfaces "update available" (a newer release tag, found via read-only
+    # `git ls-remote --tags`) to the control panel via /api/update/status and
+    # applies an on-demand tag-pinned reinstall via /api/update/start,
+    # restarting the process (systemd relaunches it) once idle. Nothing
+    # upgrades automatically. No-ops for dev checkouts.
     updater = SelfUpdater(_is_idle)
 
     def _find_session(session_id: str) -> tuple[Session | None, Any]:
@@ -170,20 +191,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.get("/api/info")
     async def get_info() -> dict[str, Any]:
         """Identify the serve host so the UI can build reachable links/hints."""
-        # Self-heal a host that upgraded into this build from an older main (the
-        # old code never ran `axol provision`); idempotent, once per process.
+        # Self-heal a host that upgraded into this build from an older release
+        # (the old code never ran `axol provision`); idempotent, once per process.
         updater.ensure_provisioned()
         return {
             "hostname": socket.gethostname(),
             "lanIp": _lan_ip(),
             "viewerPort": _VIEWER_PORT,
             "vrPort": _VR_PORT,
-            "commit": updater.commit,
+            "version": updater.version,
         }
 
     @app.get("/api/update/status")
     async def update_status(refresh: bool = False) -> dict[str, Any]:
-        """Installed vs. tracked-ref commit so the UI can offer an update.
+        """Installed vs. latest release version so the UI can offer an update.
 
         ``refresh=1`` forces a synchronous remote check (used on connect / page
         load) so the result is current; the steady-state poll omits it and gets
@@ -212,6 +233,142 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     @app.post("/api/robot/disconnect")
     async def robot_disconnect() -> dict[str, Any]:
         return await asyncio.to_thread(robot.disconnect)
+
+    @app.get("/api/robot/motors/{arm}/{joint}")
+    async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
+        """One-motor full readout (the ``motor.info`` set) over the idle link."""
+        try:
+            details = await asyncio.to_thread(robot.motor_details, arm, joint)
+        except KeyError:
+            return JSONResponse({"error": "unknown motor"}, status_code=404)
+        except RuntimeError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+        return JSONResponse(details)
+
+    # -- motor telemetry (diagnostics dashboard) -----------------------------
+
+    @app.get("/api/telemetry")
+    async def telemetry_snapshot() -> dict[str, Any]:
+        """Link state + latest fast frame + latest slow sweep for every motor."""
+        return hub.snapshot()
+
+    @app.get("/api/telemetry/history")
+    async def telemetry_history(
+        seconds: float = 120.0, max_frames: int = 2000
+    ) -> dict[str, Any]:
+        """Buffered telemetry frames for chart backfill on page load."""
+        return {"frames": hub.history(seconds, max_frames)}
+
+    @app.websocket("/api/telemetry/ws")
+    async def telemetry_ws(ws: WebSocket) -> None:
+        """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        await ws.accept()
+        queue = hub.subscribe()
+        try:
+            await ws.send_json({"type": "hello", **hub.snapshot()})
+            while True:
+                await ws.send_json(await queue.get())
+        except WebSocketDisconnect:
+            pass
+        finally:
+            hub.unsubscribe(queue)
+
+    # -- diagnostics runs (script launches with telemetry capture) -----------
+
+    async def _watch_diagnostics_run(
+        meta: dict[str, Any] | None, session: Session, uses_can_bus: bool
+    ) -> None:
+        """Wait for the session to end, return the bus, persist the run (if any)."""
+        queue = manager.subscribe(session)
+        try:
+            while session.status in ("starting", "running", "stopping"):
+                try:
+                    line = await asyncio.wait_for(queue.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue  # re-check status: end-of-stream may have raced us
+                if line is None:
+                    break
+        finally:
+            manager.unsubscribe(session, queue)
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
+        if meta is not None:
+            await asyncio.to_thread(
+                runs.finalize,
+                meta,
+                session.status,
+                session.exit_code,
+                list(session.log),
+            )
+
+    @app.post("/api/diagnostics/run")
+    async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
+        # Diagnostics commands open the CAN bus (or reconfigure its interfaces)
+        # themselves, so the launch does the same single-owner dance as the
+        # in-process operations: refuse while something else owns the bus, and
+        # hand the idle link's buses over for the duration of the run.
+        if runner.is_running():
+            return JSONResponse(
+                {"error": "an operation is running — stop it first"}, status_code=409
+            )
+        if any(s["status"] in ("starting", "running") for s in manager.list()):
+            return JSONResponse(
+                {"error": "another session is running — stop it first"},
+                status_code=409,
+            )
+        if req.command not in COMMANDS:
+            return JSONResponse(
+                {"error": f"unknown command: {req.command}"}, status_code=400
+            )
+
+        # A camera-only diagnostic (ZED cable check) doesn't touch the CAN bus,
+        # so leave the idle motor telemetry streaming while it runs.
+        uses_can_bus = COMMANDS[req.command].uses_can_bus
+        if uses_can_bus:
+            await asyncio.to_thread(robot.release)
+        try:
+            # A writable stdin lets the UI answer the diagnostic's hands-on
+            # prompts (the "Continue" button) via /input below.
+            session = await manager.start(req.command, req.args, stdin_pipe=True)
+        except Exception:
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
+            raise
+        # Only the Diagnostics tests are recorded in the run history; the
+        # ad-hoc launches (CAN bring-up, motor calibration tools) still get
+        # the bus handover + prompt plumbing but leave no record behind.
+        record = COMMANDS[req.command].category == "Diagnostics"
+        meta = runs.begin(session.id, req.command, req.args) if record else None
+        if session.status == "error":
+            if uses_can_bus:
+                await asyncio.to_thread(robot.reacquire)
+            if meta is not None:
+                await asyncio.to_thread(
+                    runs.finalize,
+                    meta,
+                    session.status,
+                    session.exit_code,
+                    list(session.log),
+                )
+        else:
+            asyncio.create_task(_watch_diagnostics_run(meta, session, uses_can_bus))
+        return JSONResponse({"run": meta, "session": session.to_dict()})
+
+    @app.get("/api/diagnostics/runs")
+    async def diagnostics_runs() -> dict[str, Any]:
+        return {"runs": await asyncio.to_thread(runs.list)}
+
+    @app.delete("/api/diagnostics/runs")
+    async def diagnostics_runs_clear() -> dict[str, Any]:
+        """Delete the whole run history (the dashboard's Clear button)."""
+        return {"removed": await asyncio.to_thread(runs.clear)}
+
+    @app.get("/api/diagnostics/runs/{run_id}")
+    async def diagnostics_run_data(run_id: str) -> JSONResponse:
+        data = await asyncio.to_thread(runs.load, run_id)
+        if data is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        return JSONResponse(data)
 
     # -- local ZED cameras ---------------------------------------------------
 
@@ -332,6 +489,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": "unknown session"}, status_code=404)
         session = manager.get(session_id)
         return JSONResponse(session.to_dict() if session else {"ok": True})
+
+    @app.post("/api/sessions/{session_id}/input")
+    async def session_input(session_id: str, req: SessionInputRequest) -> JSONResponse:
+        """Answer a session's interactive prompt (the diagnostics Continue button)."""
+        session, _owner = _find_session(session_id)
+        if session is None:
+            return JSONResponse({"error": "unknown session"}, status_code=404)
+        ok = await session.send_input(req.line)
+        if not ok:
+            return JSONResponse(
+                {"error": "session is not accepting input"}, status_code=409
+            )
+        return JSONResponse({"ok": True})
 
     @app.get("/api/sessions/{session_id}/log")
     async def get_log(session_id: str, offset: int = 0) -> JSONResponse:

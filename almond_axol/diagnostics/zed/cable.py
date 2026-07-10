@@ -1,12 +1,18 @@
 """
 Test script: verify a ZED camera cable by capturing and validating frames.
 
-Run this on a ZED box with exactly one ZED-X One camera connected. The test
-restarts the ZED X daemon, opens the camera, and captures frames across a
-5-second window, checking that each frame is a valid image. Any failure raises
-an exception; if it returns cleanly the cable is good.
+Run this on a ZED box with exactly one ZED camera connected — either a mono
+ZED-X One or a stereo ZED X. The test restarts the ZED X daemon, opens the
+camera, and captures frames across a 5-second window, checking that each frame
+is a valid image. Any failure raises an exception; if it returns cleanly the
+cable is good.
+
+The camera kind (mono vs stereo) is auto-detected by default; pass ``--kind``
+to force one if detection is ambiguous.
 
 Usage:
+    axol diag.zed-cable
+    axol diag.zed-cable --kind stereo
     uv run -m almond_axol.diagnostics.zed.cable
     uv run -m almond_axol.diagnostics.zed.cable --output logs/cable_frame.png
 """
@@ -52,6 +58,77 @@ class CableTestError(RuntimeError):
     """Raised when the ZED cable test fails at any step."""
 
 
+def _detect_kind() -> str:
+    """Auto-detect whether the single connected camera is mono or stereo.
+
+    Enumerates locally connected ZED cameras (in a fresh subprocess) and returns
+    the kind of the one that is present. The test expects exactly one camera, so
+    zero or multiple cameras is treated as a setup error the operator must
+    resolve (or disambiguate with ``--kind``).
+
+    Raises:
+        CableTestError: If no camera, or more than one, is detected.
+    """
+    from almond_axol.zed.devices import list_zed_devices
+
+    try:
+        devices = list_zed_devices()
+    except ImportError as exc:
+        raise CableTestError("pyzed is not installed; run `axol zed.install`.") from exc
+    except Exception as exc:  # noqa: BLE001 - detection failure is a test failure
+        raise CableTestError(f"Failed to enumerate ZED cameras: {exc}") from exc
+
+    if not devices:
+        raise CableTestError(
+            "No ZED camera detected (a camera plugged in after boot needs a "
+            "zed_x_daemon restart)."
+        )
+    if len(devices) > 1:
+        summary = ", ".join(f"{d['serial']} ({d['kind']})" for d in devices)
+        raise CableTestError(
+            f"Detected {len(devices)} ZED cameras [{summary}]; connect exactly "
+            "one, or pass --kind to choose which pipeline to test."
+        )
+    return devices[0]["kind"]
+
+
+def _open_camera(sl, kind: str):  # type: ignore[no-untyped-def]
+    """Open the connected camera with the API for ``kind`` and return the handle.
+
+    Mono ZED-X One cameras use ``sl.CameraOne`` and stereo ZED X cameras
+    ``sl.Camera``; the two have parallel but distinct open/retrieve APIs.
+
+    Raises:
+        CableTestError: If the camera cannot be opened.
+    """
+    if kind == "stereo":
+        zed = sl.Camera()
+        init_params = sl.InitParameters()
+        # We only need the rectified images; skip depth to save GPU.
+        init_params.depth_mode = sl.DEPTH_MODE.NONE
+    else:
+        zed = sl.CameraOne()
+        init_params = sl.InitParametersOne()
+
+    _logger.info("Opening connected ZED camera (%s)...", kind)
+    err = zed.open(init_params)
+    if err != sl.ERROR_CODE.SUCCESS:
+        raise CableTestError(f"Failed to open camera: {err}")
+    return zed
+
+
+def _retrieve_frame(sl, zed, image, kind: str):  # type: ignore[no-untyped-def]
+    """Retrieve one frame into ``image``; return the SDK error code.
+
+    For a stereo camera the left eye is retrieved — a marginal cable drops or
+    freezes frames on both eyes equally, so validating one eye is sufficient to
+    exercise the link.
+    """
+    if kind == "stereo":
+        return zed.retrieve_image(image, sl.VIEW.LEFT)
+    return zed.retrieve_image(image)
+
+
 def _validate_frame(bgr: np.ndarray, expected_width: int, expected_height: int) -> None:
     """Raise :class:`CableTestError` unless ``bgr`` looks like a real frame.
 
@@ -90,15 +167,18 @@ def _validate_frame(bgr: np.ndarray, expected_width: int, expected_height: int) 
         )
 
 
-def run(output: str | None = None) -> None:
+def run(output: str | None = None, kind: str = "auto") -> None:
     """Restart the daemon, open the camera, and validate frames over 5 seconds.
 
     Args:
         output: Optional path to save the last captured frame as PNG for inspection.
+        kind: Camera pipeline to test — ``"mono"`` (ZED-X One), ``"stereo"``
+            (ZED X), or ``"auto"`` to detect it from the single connected camera.
 
     Raises:
-        CableTestError: If the daemon cannot be restarted, the camera cannot be
-            opened, no frames can be grabbed, or any captured frame fails validation.
+        CableTestError: If the daemon cannot be restarted, the camera kind cannot
+            be resolved, the camera cannot be opened, no frames can be grabbed, or
+            any captured frame fails validation.
     """
     import pyzed.sl as sl
 
@@ -107,13 +187,11 @@ def run(output: str | None = None) -> None:
     except RuntimeError as exc:
         raise CableTestError(str(exc)) from exc
 
-    zed = sl.CameraOne()
-    init_params = sl.InitParametersOne()
+    if kind == "auto":
+        kind = _detect_kind()
+        _logger.info("Auto-detected %s camera.", kind)
 
-    _logger.info("Opening connected ZED camera...")
-    err = zed.open(init_params)
-    if err != sl.ERROR_CODE.SUCCESS:
-        raise CableTestError(f"Failed to open camera: {err}")
+    zed = _open_camera(sl, kind)
 
     last_bgr: np.ndarray | None = None
     try:
@@ -157,7 +235,7 @@ def run(output: str | None = None) -> None:
                 continue
             consecutive_failures = 0
 
-            if zed.retrieve_image(image) != sl.ERROR_CODE.SUCCESS:
+            if _retrieve_frame(sl, zed, image, kind) != sl.ERROR_CODE.SUCCESS:
                 raise CableTestError("Failed to retrieve image from camera.")
 
             raw = image.get_data()  # BGRA uint8
@@ -219,18 +297,46 @@ def run(output: str | None = None) -> None:
     )
 
 
-def main() -> None:
-    """Parse CLI arguments and run the ZED cable test."""
-    parser = argparse.ArgumentParser(
-        description="Test a ZED camera cable by validating frames across 5 seconds."
-    )
+def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--output",
         default=None,
         help="Optional path to save the last captured frame as PNG (e.g. logs/cable_frame.png).",
     )
-    args = parser.parse_args()
-    run(output=args.output)
+    parser.add_argument(
+        "--kind",
+        choices=("auto", "mono", "stereo"),
+        default="auto",
+        help="Camera pipeline to test: mono (ZED-X One), stereo (ZED X), or "
+        "auto to detect from the connected camera (default: auto).",
+    )
+
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register the ``diag.zed-cable`` subcommand (for serve introspection)."""
+    p = subparsers.add_parser(
+        "diag.zed-cable",
+        help="Verify a ZED camera cable by validating captured frames.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=run_cli)
+
+
+def run_cli(args: argparse.Namespace) -> None:
+    """Run the ZED cable test from parsed arguments."""
+    run(output=args.output, kind=args.kind)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Parse CLI arguments and run the ZED cable test."""
+    parser = argparse.ArgumentParser(
+        description="Test a ZED camera cable (mono or stereo) by validating "
+        "frames across 5 seconds."
+    )
+    _add_arguments(parser)
+    run_cli(parser.parse_args(argv))
 
 
 if __name__ == "__main__":

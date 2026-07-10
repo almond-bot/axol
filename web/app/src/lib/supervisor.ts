@@ -42,7 +42,7 @@ export interface CommandSpec {
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
-export const CATEGORY_ORDER = ["Operate", "Cameras", "Calibrate", "Setup"]
+export const CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 export type SessionStatus = "starting" | "running" | "stopping" | "exited" | "error"
 
@@ -89,8 +89,16 @@ export function serverHttpBase(host: string): string {
   }
 }
 
-function apiUrl(path: string): string {
+export function apiUrl(path: string): string {
   return `${apiBase}${path}`
+}
+
+/** WebSocket origin for the current server base (ws(s)://host[:port]). */
+export function wsBaseUrl(): string {
+  const base = apiBase || window.location.origin
+  const u = new URL(base)
+  const proto = u.protocol === "https:" ? "wss" : "ws"
+  return `${proto}://${u.host}`
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -106,8 +114,8 @@ export interface ServerInfo {
   lanIp: string
   viewerPort: number
   vrPort: number
-  /** Installed git commit of the serve host (null for dev checkouts). */
-  commit?: string | null
+  /** Installed release version of the serve host, e.g. "0.1.2". */
+  version?: string | null
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {
@@ -115,7 +123,7 @@ export async function fetchInfo(): Promise<ServerInfo> {
 }
 
 // ---------------------------------------------------------------------------
-// Self-update (read-only commit check + user-initiated upgrade)
+// Self-update (read-only release-tag check + user-initiated upgrade)
 // ---------------------------------------------------------------------------
 
 export type UpdateState = "idle" | "updating" | "error"
@@ -126,11 +134,11 @@ export type UpdatePhase = "upgrading" | "provisioning" | "restarting"
 export interface UpdateStatus {
   /** Updatable: installed from git as a uv tool with uv available. */
   enabled: boolean
-  /** Installed git commit (null for dev checkouts). */
-  commit: string | null
-  /** Latest commit on the tracked ref, or null until first resolved/offline. */
-  remoteCommit: string | null
-  /** remoteCommit is known and differs from the installed commit. */
+  /** Installed release version, e.g. "0.1.2". */
+  version: string | null
+  /** Latest release version (highest vX.Y.Z tag), or null until first resolved/offline. */
+  remoteVersion: string | null
+  /** A release with a higher version than the installed one exists. */
   updateAvailable: boolean
   /** Safe to restart now (no op running). */
   idle: boolean
@@ -143,8 +151,8 @@ export interface UpdateStatus {
 
 /**
  * Fetch the update indicator. Pass `force` on connect / page load to make the
- * server resolve the remote head synchronously (bypassing its debounce), so the
- * result is immediately current rather than a stale cached value.
+ * server resolve the latest release tag synchronously (bypassing its debounce),
+ * so the result is immediately current rather than a stale cached value.
  */
 export async function fetchUpdateStatus(force = false): Promise<UpdateStatus> {
   return json(await fetch(apiUrl(`/api/update/status${force ? "?refresh=1" : ""}`)))
@@ -349,6 +357,17 @@ export async function runCommand(
 
 export async function stopSession(id: string): Promise<SessionInfo> {
   return json(await fetch(apiUrl(`/api/sessions/${id}/stop`), { method: "POST" }))
+}
+
+/** Answer a session's interactive prompt (empty line = a bare "Enter"). */
+export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl(`/api/sessions/${id}/input`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ line }),
+    })
+  )
 }
 
 export function cameraCount(spec: CameraSpec): number {
@@ -584,10 +603,7 @@ export function parseImportedSettings(text: string): Record<string, FormValue> {
 // ---------------------------------------------------------------------------
 
 function wsUrl(id: string): string {
-  const base = apiBase || window.location.origin
-  const u = new URL(base)
-  const proto = u.protocol === "https:" ? "wss" : "ws"
-  return `${proto}://${u.host}/api/sessions/${id}/logs`
+  return `${wsBaseUrl()}/api/sessions/${id}/logs`
 }
 
 interface LogMessage {

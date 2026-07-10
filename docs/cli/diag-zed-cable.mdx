@@ -1,0 +1,16 @@
+---
+title: "diag.zed-cable"
+description: "Verify a ZED camera cable by capturing and validating frames."
+---
+
+Checks a ZED camera's GMSL cable end to end: restarts the ZED X daemon, opens the camera, and captures frames across a 5-second window, validating that each is a real image (correct resolution, non-trivial pixel variation, sane brightness) and that frames keep arriving without long stalls or duplicates. It exits non-zero on any failure — a dropped, garbled, or frozen stream points at a marginal cable.
+
+Run this on a ZED box with exactly one ZED camera connected — either a mono ZED-X One or a stereo ZED X. The camera kind is auto-detected; pass `--kind mono|stereo` to force one. It is camera-only and does not touch the arms, so it runs alongside the diagnostics dashboard's live motor telemetry.
+
+```bash
+axol diag.zed-cable
+axol diag.zed-cable --kind stereo                   # force the stereo (ZED X) pipeline
+axol diag.zed-cable --output logs/cable_frame.png   # also save the last frame as PNG
+```
+
+Also launchable from the [diagnostics dashboard](https://docs.almond.bot/guides/diagnostics-dashboard).

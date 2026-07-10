@@ -48,16 +48,16 @@ class VRTeleopConfig:
         teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
             trapezoidal filter during normal teleoperation.  Limits how fast
             any single joint can move toward a new IK target.  Defaults to
-            0.5 rev/s (~180 °/s).
+            1.0 rev/s (~360 °/s).
         teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
             trapezoidal filter.  Controls how quickly the commanded velocity
-            ramps up or down.  Defaults to 1.5 rev/s² (~540 °/s²), giving a
-            ~0.2 s ramp from rest to full speed.
+            ramps up or down.  Defaults to 3.5 rev/s² (~1260 °/s²), giving a
+            ~0.3 s ramp from rest to full speed.
         ik_alpha: Blend factor for the exponential moving average applied to
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
             high-frequency jitter at the cost of a small fixed lag
-            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.7`` (~3 ms lag
+            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.5`` (~8 ms lag
             at 120 Hz), which removes most IK noise without a perceptible
             feel difference.
         pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
@@ -69,9 +69,8 @@ class VRTeleopConfig:
             to ``1.5`` Hz.
         pose_beta: Speed coefficient for the One Euro Filter.  Raises the
             filter cutoff proportionally to the signal's instantaneous speed,
-            keeping the filter transparent during fast intentional moves.  For
-            meter-space positions at 120 Hz a value of ~20 works well; increase
-            if fast moves feel sticky.  Defaults to ``20.0``.
+            keeping the filter transparent during fast intentional moves.
+            Increase if fast moves feel sticky.  Defaults to ``5.0``.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;

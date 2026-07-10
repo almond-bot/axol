@@ -1,0 +1,176 @@
+---
+title: "Hardware Guide"
+description: "Overview and setup guide for Axol."
+---
+
+Axol is available in two configurations:
+
+- **Axol** — The dual-arm robot.
+- **Axol Kit** — Includes Axol, Axol Base, cameras and compute.
+
+## Axol Overview
+
+<Frame>
+  <img src="/assets/axol.png" alt="Almond Axol dual-arm robot" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+Axol ships fully assembled and ready to mount. It attaches with four **M8×12 bolts** that thread in from the bottom — see the [mounting holes diagram](#reference-diagrams) below.
+
+The back of the robot exposes the connectors used for power and camera control:
+
+- **2× GMSL2 ports** for the wrist cameras.
+- **1× XT90 connector** for power.
+- **1× Locking USB-C connector** for control.
+
+### Reference diagrams
+
+- [Mounting holes](https://www.almond.bot/resources/axol_mounting_holes.pdf) (PDF)
+- [Gripper drawing](https://www.almond.bot/resources/gripper.pdf) (PDF)
+- [Gripper CAD model](https://www.almond.bot/resources/gripper.step) (STEP)
+
+## Axol Kit Overview
+
+<Frame>
+  <img src="/assets/axol_kit.png" alt="Almond Axol Kit on its mobile base" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Axol Kit includes a **mobile base** with **locking caster wheels** and a **manual lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height. Axol Kit includes head and wrist cameras and the compute needed to run Axol.
+
+### Reference diagrams
+
+- [Wrist Mount](https://www.almond.bot/resources/wrist_mount.step) (STEP)
+- [Head Mount](https://www.almond.bot/resources/head_mount.step) (STEP)
+
+## Installation
+
+Setting up Axol Kit.
+
+#### Tools required
+
+You'll need hex (Allen) keys for the socket head cap screws used throughout the Kit:
+
+| Screw | Hex key |
+|---|---|
+| M8 | 6&nbsp;mm |
+| M4 | 3&nbsp;mm |
+| M3 | 2.5&nbsp;mm |
+| M2 | 1.5&nbsp;mm |
+
+### Mounting Axol
+
+Axol mounts to the base with four **M8×12 bolts** and their **locking washers**, threaded in from underneath the base. See the [mounting holes diagram](#reference-diagrams) for hole positions.
+
+<Warning>
+  We recommend using **two people** to lift and place it on the base.
+</Warning>
+
+<Steps>
+  <Step title="Gather the hardware">
+    Have the four **M8×12 bolts** and **locking washers** ready, along with a **6&nbsp;mm hex key**.
+  </Step>
+  <Step title="Place Axol on the base">
+    With two people, lift Axol and set it on the base, aligning its mounting holes with the holes in the base.
+  </Step>
+  <Step title="Insert the bolts from below">
+    From underneath the top plate of the base, pass each M8×12 bolt (with its locking washer) up through the base and into Axol's mounting holes.
+
+    <Note>
+      Getting the bolts to catch the threads can be tricky. Gently **wiggling Axol** as you start each bolt helps align the holes and lets the threads bite.
+    </Note>
+  </Step>
+  <Step title="Tighten">
+    Tighten all four bolts with the 6&nbsp;mm hex key to lock Axol in place.
+  </Step>
+</Steps>
+
+### Mounting the cameras
+
+<Note>
+  Before mounting each camera, scan the **QR code on the back** to grab its serial ID and note down which camera goes where (left wrist, right wrist, head). You'll need this mapping later to match each camera ID to its position.
+</Note>
+
+#### Wrist cameras
+
+<Steps>
+  <Step title="Mount the camera to the bracket">
+    Fasten each wrist camera to its mount with 4x **M2×8 screws**.
+
+    <Frame>
+      <img src="/assets/wirst_mount.png" alt="Wrist camera mounted to its bracket" width="400" style={{ margin: "0 auto" }} />
+    </Frame>
+  </Step>
+  <Step title="Mount the bracket to the wrist">
+    Attach the camera-and-bracket assembly to the wrist with **M3×8 screws**.
+
+    <Frame>
+      <img src="/assets/wrist_mount_gripper.png" alt="Wrist camera bracket mounted to the gripper" width="400" style={{ margin: "0 auto" }} />
+    </Frame>
+  </Step>
+  <Step title="Remove the lens cap">
+    Remove the lens cap from the wrist camera.
+  </Step>
+</Steps>
+
+#### Head camera
+
+<Steps>
+  <Step title="Mount the camera to the bracket">
+    The head camera screws depend on which model your Kit ships with:
+
+    - **ZED X Mini** - Use 4x **M4×8 screws**.
+    - **ZED X One S (ZX1S)** - Use 4x **M2×8 screws** (same as the wrist cameras).
+
+    <Frame>
+      <img src="/assets/head_mount.png" alt="Head camera mounted to its bracket" width="400" style={{ margin: "0 auto" }} />
+    </Frame>
+  </Step>
+  <Step title="Mount the bracket to the base">
+    Attach the camera-and-bracket assembly to the top of the base with **M4×10 screws**.
+  </Step>
+  <Step title="Remove the lens cap">
+    If your head camera is the **ZED X One S (ZX1S)**, remove its lens cap.
+  </Step>
+</Steps>
+
+### Leveling the casters
+
+Each caster has a ratchet with a small lever arm that raises or lowers the wheel. To level the base, flip the ratchet switch up or down on each caster and adjust it until the base sits level.
+
+### Raising and lowering the robot
+
+Adjust the robot's height with the manual lift: insert the crank into the hole at the top of the base and turn it to raise or lower the robot.
+
+<Frame>
+  <img src="/assets/height_adjust.png" alt="Inserting the crank into the top of the base to adjust height" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+<Warning>
+  Make sure the crank is inserted **all the way in** before turning it. It's easy to leave it partially seated, which can slip or damage the mechanism.
+</Warning>
+
+### Wiring
+
+Place the ZED Box and the power supply on the base, then connect the cables:
+
+<Steps>
+  <Step title="Set the ZED Box and power supply on the base">
+    Position the ZED Box and the power supply on the base so their cables comfortably reach the back of the robot.
+  </Step>
+  <Step title="Connect the head camera">
+    Run the head camera's **GMSL** cable from the camera to the ZED Box.
+  </Step>
+  <Step title="Connect the wrist cameras">
+    Run the shorter **GMSL** cable from the wrist cameras to the GMSL port on the wrist.
+  </Step>
+  <Step title="Connect the robot to the ZED Box and power">
+    From the back of the robot, run the **power** and **USB** cables to the ZED Box and power supply.
+  </Step>
+</Steps>
+
+## Next steps
+
+<CardGroup cols={1}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install Axol on the robot machine and open the web control panel.
+  </Card>
+</CardGroup>

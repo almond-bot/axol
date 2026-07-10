@@ -16,6 +16,7 @@ import {
   type AxolMode,
   AxolVRClient,
   AxolState,
+  type ConfirmAction,
   axolHttpsOrigin,
   useAxolControlChannel,
   useAxolPoseSocket,
@@ -360,9 +361,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   }>({ left: null, right: null })
   // Active two-hand resize: the slot being scaled plus the hand separation and
   // screen scale captured when the second hand grabbed on.
-  const resizeRef = useRef<{ slot: GrabSlot; startSep: number; startScale: number } | null>(
-    null
-  )
+  const resizeRef = useRef<{ slot: GrabSlot; startSep: number; startScale: number } | null>(null)
   // User-dragged position offsets, keyed by slot (group-local).
   const dragOffsetsRef = useRef<Record<string, THREE.Vector3>>({})
   // Per-slot size multipliers (default 1), driven by the two-hand resize.
@@ -557,8 +556,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // persist briefly. That way a momentary pipeline blip — which the frozen
     // last frame already covers — never flashes the arc near the top of the
     // frame, while a genuine sustained dropout still surfaces feedback.
-    const spinnerVisible =
-      presenting && connecting && (!anyLive || connectingHeldRef.current > 0.4)
+    const spinnerVisible = presenting && connecting && (!anyLive || connectingHeldRef.current > 0.4)
     spinner.visible = spinnerVisible
     if (spinnerVisible && spinnerMeshRef.current) {
       spinnerMeshRef.current.rotation.z -= 0.12
@@ -774,12 +772,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   return (
     <>
       <group ref={groupRef} visible={false}>
-        <mesh
-          ref={meshRef}
-          position={[0, FEED_Y, -FEED_DISTANCE]}
-          renderOrder={1}
-          visible={false}
-        >
+        <mesh ref={meshRef} position={[0, FEED_Y, -FEED_DISTANCE]} renderOrder={1} visible={false}>
           <planeGeometry args={[1, 1]} />
           <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={true} />
         </mesh>
@@ -940,6 +933,29 @@ function StateDisplay({
   )
 }
 
+// Current episode number, shown top-right just under the recording status
+// during data collection. Null (plain teleop, or before the server announces
+// one) renders nothing.
+function EpisodeDisplay({ episode }: { episode: number | null }) {
+  if (episode === null) return null
+
+  return (
+    <HudText
+      position={[0.2, 0.06, -0.5]}
+      fontSize={0.016}
+      fontWeight="bold"
+      color="white"
+      anchorX="right"
+      anchorY="top"
+      renderOrder={999}
+      material-depthTest={false}
+      {...hudBg}
+    >
+      {`Episode ${episode}`}
+    </HudText>
+  )
+}
+
 function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode | null }) {
   const W = 0.44
   const H = 0.133
@@ -1084,6 +1100,68 @@ function CountdownDisplay({ recordingPendingAt }: { recordingPendingAt: number |
   )
 }
 
+const CONFIRM_DISPLAY: Record<
+  ConfirmAction,
+  { title: string; confirm: string; cancel: string; color: string }
+> = {
+  save: { title: "Save episode?", confirm: "[A] Save", cancel: "[X] Cancel", color: "#4ade80" },
+  discard: {
+    title: "Discard episode?",
+    confirm: "[X] Discard",
+    cancel: "[A] Cancel",
+    color: "#f87171",
+  },
+}
+
+// Popup shown when a recording stop is awaiting confirmation. Pressing the same
+// physical button that armed it commits; the other cancels (see AxolVRClient).
+function ConfirmDisplay({ action }: { action: ConfirmAction | null }) {
+  if (action === null) return null
+  const { title, confirm, cancel, color } = CONFIRM_DISPLAY[action]
+  const W = 0.32
+  const H = 0.14
+
+  return (
+    <group position={[0, -0.02, -0.5]}>
+      {/* Panel background */}
+      <mesh position={[0, 0, -0.001]} renderOrder={998}>
+        <planeGeometry args={[W, H]} />
+        <meshBasicMaterial
+          color="black"
+          transparent
+          opacity={0.92}
+          depthTest={false}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
+      <HudText
+        position={[0, H / 2 - 0.028, 0]}
+        fontSize={0.024}
+        fontWeight="bold"
+        color={color}
+        anchorX="center"
+        anchorY="middle"
+        renderOrder={1000}
+        material-depthTest={false}
+      >
+        {title}
+      </HudText>
+      <HudText
+        position={[0, -H / 2 + 0.032, 0]}
+        fontSize={0.016}
+        color="white"
+        anchorX="center"
+        anchorY="middle"
+        renderOrder={1000}
+        material-depthTest={false}
+        lineHeight={1.6}
+      >
+        {`${confirm}\n${cancel}`}
+      </HudText>
+    </group>
+  )
+}
+
 function ControlHints({ title, rows }: { title: string; rows: [string, string][] }) {
   return (
     <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
@@ -1137,9 +1215,15 @@ export default function App() {
   const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
   const [recordingPendingAt, setRecordingPendingAt] = useState<number | null>(null)
+  // Which episode action (save/discard) the in-headset confirmation popup is
+  // gating; null when no confirmation is pending.
+  const [pendingConfirm, setPendingConfirm] = useState<ConfirmAction | null>(null)
   // Operating mode the server locked us to (null until it announces one on
   // connect). Drives which HUD/hint controls are shown.
   const [vrMode, setVrMode] = useState<AxolMode | null>(null)
+  // Current 1-based episode number during data collection (null until the
+  // server announces one; stays null in plain teleop).
+  const [episode, setEpisode] = useState<number | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
@@ -1356,7 +1440,9 @@ export default function App() {
               poseChannelRef={poseChannelRef}
               onStateChange={setVrState}
               onPendingRecording={setRecordingPendingAt}
+              onPendingConfirm={setPendingConfirm}
               onMode={setVrMode}
+              onEpisode={setEpisode}
               onExit={() => store.getState().session?.end()}
             />
             <ImmersiveCameraFeed wsRef={wsRef} />
@@ -1364,7 +1450,9 @@ export default function App() {
               <ExitButton />
               <HelpIcon mode={vrMode} />
               <StateDisplay state={vrState} isRecordingPending={recordingPendingAt !== null} />
+              <EpisodeDisplay episode={episode} />
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
+              <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
             <PoseVisualizer />
           </XR>

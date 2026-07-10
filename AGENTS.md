@@ -9,7 +9,13 @@ Almond Axol is a Python CLI + SDK for the Almond Axol dual-arm robot. Since no p
 ### Running the application
 
 - **Sim teleop** (the primary way to exercise the app without hardware): `uv run axol teleop --sim`
-  - Opens a viser 3D viewer at `http://localhost:8002` and a VR WebSocket server on port 8000.
+ - Opens a viser 3D viewer at `http://localhost:8002` and a VR WebSocket server on port 8000.
+ - With no VR headset connected the arms just hold the rest pose. To actually drive them, either use the `Sim` SDK directly (`sim.motion_control(left=..., right=...)`, see the `Sim` docstring in `almond_axol/robot/sim.py`) or connect a WebSocket client to `wss://localhost:8000/ws` (self-signed cert — disable TLS verification) and stream `VRFrame` JSON with both `l_lock`/`r_lock` true to engage tracking.
+ - The viser server persists engage/IK state across teleop restarts only within one process; if a WebSocket client leaves tracking engaged and reconnects, restart the `teleop` process for a clean engage.
+
+### Web front-end (second product)
+
+The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` teleop app and the `/control` panel served by `axol serve`). Node 22 is available; `web/` is **not** covered by `uv sync`. Standard install/build/dev commands are in `web/README.md` (build the `packages/axol-vr-client` workspace before `app`).
 
 ### Linting
 
