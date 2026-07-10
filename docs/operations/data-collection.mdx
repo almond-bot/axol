@@ -10,7 +10,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **At least one ZED camera connected** over GMSL (up to three: overhead / left arm / right arm), with their serial numbers on hand. (Camera serials are printed on the camera body, or read them from the Cameras dialog / Python — see the tip below.)
+- **At least one ZED camera connected** over GMSL (up to three: overhead / left arm / right arm), with their serial numbers on hand. (Camera serials are printed on the camera body, or read them from the Cameras settings tab / Python — see the tip below.)
 - **The VR TLS certificate authorized** once — see [Teleoperation](/operations/teleop#authorize-the-tls-certificate).
 
 <Tip>
@@ -20,7 +20,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
   python -c "from almond_axol.zed import list_zed_devices; print(list_zed_devices())"
   ```
 
-  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** in the control panel's Cameras dialog.
+  If a camera was plugged in after boot and doesn't show up, restart the ZED X daemon (`sudo systemctl restart zed_x_daemon`), or press **Restart daemon** in the control panel's Cameras settings tab.
 </Tip>
 
 ## Run it
@@ -29,11 +29,11 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then open the **Cameras** dialog and assign each detected camera to its slot (overhead / left arm / right arm) — at least one is required. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then open the **Cameras** settings tab and assign each detected camera to its slot (overhead / left arm / right arm) — at least one is required. Stereo ZED X cameras are detected automatically. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
-        Pick **Collect Data**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`) and the **task** description. Everything else lives under the **Optional** dropdown (fps, teleop rate, stiffness, push-to-hub).
+        Pick **Collect Data**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`) and the **task** description — the only per-run inputs. Everything reusable (fps, teleop rate, stiffness, push-to-hub) lives in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
 
       <Step title="Start and record from the headset">

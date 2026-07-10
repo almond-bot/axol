@@ -16,7 +16,7 @@ Sets the motor's zero-position reference to its current mechanical position (per
 | `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
 | `--guided` | Walk through every arm joint, zeroing each at its closer end stop |
 
-In `--guided` mode the CLI iterates through all 7 arm joints (the gripper is auto-calibrated at runtime). For each joint you place it somewhere inside its operating range, press Enter, then move it to the prompted end stop and press Enter again. If the motion is in the expected direction the zero is committed immediately. If you moved the wrong way, the CLI keeps your starting reference and asks you to travel to the *other* end stop instead; pressing Enter there sets the zero. Press Ctrl-C to skip a joint.
+In `--guided` mode the CLI first asks you to hold **every** joint somewhere inside its operating range (away from the end stops) and press Enter **once** — it captures each joint's in-range start reference concurrently. It then walks the 7 arm joints one at a time (the gripper is auto-calibrated at runtime): for each, move it to the prompted end stop and press Enter. If the motion is in the expected direction the zero is committed immediately. If you moved the wrong way, the CLI keeps your starting reference and asks you to travel to the *other* end stop instead; pressing Enter there sets the zero. Press Ctrl-C to skip a joint.
 
 ```bash
 axol motor.set-zero-pos --l --id 0x01      # single motor

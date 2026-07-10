@@ -34,11 +34,11 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
   <Tab title="Control Panel">
     <Steps>
       <Step title="Connect the robot and assign cameras">
-        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** dialog (at least one). See [Cameras](/guides/control-panel#cameras).
+        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** settings tab (at least one). See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Run Policy and fill the fields">
-        Pick **Run Policy**. Set the **policy path** and **policy type**, the **task** description, and (to offload) a **server host**. Optional fields hold aggregation, chunking, and dataset-saving settings.
+        Pick **Run Policy**. Set the **policy path**, **policy type**, and **task** description — the per-run inputs. Remote inference (**server host**/port), aggregation, and chunking now live in the [Settings](/guides/control-panel#settings) **Inference** tab.
       </Step>
 
       <Step title="Start and control rollouts">
@@ -100,7 +100,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 
     <Tabs>
       <Tab title="Control Panel">
-        In the **Run Policy** form, open the **Optional** dropdown and set the **server host** field to the GPU machine's address (e.g. `192.168.1.99`), then press **Start**.
+        In the [Settings](/guides/control-panel#settings) **Inference** tab, set the **server host** to the GPU machine's address (e.g. `192.168.1.99`) and **Save**, then press **Start** in the **Run Policy** panel.
       </Tab>
 
       <Tab title="CLI">
