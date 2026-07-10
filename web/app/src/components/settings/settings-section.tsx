@@ -379,29 +379,56 @@ function UsbPanel({
             : usb.state === "unauthorized"
               ? "Authorize on headset"
               : usb.state
+  // Per-state hint, mirroring the help line every other settings field has.
+  const hint = !usb
+    ? "Waiting for the host to report the USB link state."
+    : !usb.installed
+      ? "Install adb on the host, then reconnect the headset."
+      : usb.ready
+        ? "Controller poses stream over the cable; a dropped cable fails over to Wi-Fi instantly."
+        : usb.state === "device"
+          ? "Headset detected — the tunnel connects automatically; use Connect to retry."
+          : usb.state === "none"
+            ? "Plug the Quest into the Axol host with a USB-C cable."
+            : usb.state === "unauthorized"
+              ? "Put the headset on and accept the “Allow USB debugging?” prompt."
+              : "Reconnect the headset's USB cable."
   return (
-    <div className="flex max-w-prose flex-col gap-4">
+    <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">
-        Plug the Quest into the Axol host over USB to stream controller poses over the cable instead
-        of Wi-Fi (lower latency). The link is set up automatically when an authorized headset is
-        detected — accept the <span className="text-white/70">Allow USB debugging?</span> prompt on
-        the headset the first time. Camera video keeps using the LAN; a dropped cable fails over to
-        Wi-Fi instantly.
+        Stream controller poses over a USB cable instead of Wi-Fi for lower latency. The link is set
+        up automatically when an authorized headset is plugged into the host; camera video keeps
+        using the LAN.
       </p>
-      <div className="flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/[0.02] px-4 py-3">
-        <div className="flex items-center gap-2 text-sm">
-          <span className={cn("size-2 shrink-0 rounded-full", dotClass)} />
-          <span className="text-white/75">{label}</span>
+      <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-4">
+            <Label>Link status</Label>
+            <div className="flex items-center gap-2 text-sm">
+              <span className={cn("size-2 shrink-0 rounded-full", dotClass)} />
+              <span className="text-white/75">{label}</span>
+            </div>
+          </div>
+          <p className="max-w-prose text-xs text-white/35">{hint}</p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onUsbConnect}
-          disabled={usbBusy || usb?.installed === false}
-        >
-          {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-          {usb?.ready ? "Reconnect" : "Connect"}
-        </Button>
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center justify-between gap-4">
+            <Label>Pose tunnel</Label>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onUsbConnect}
+              disabled={usbBusy || usb?.installed === false}
+            >
+              {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+              {usb?.ready ? "Reconnect" : "Connect"}
+            </Button>
+          </div>
+          <p className="max-w-prose text-xs text-white/35">
+            Forwards the headset's pose stream to this host over the cable (adb reverse). The first
+            connection pops the authorization prompt on the headset.
+          </p>
+        </div>
       </div>
     </div>
   )
