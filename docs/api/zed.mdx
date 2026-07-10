@@ -44,7 +44,7 @@ Best-effort: any enumeration failure (`pyzed` missing, daemon down) returns an e
 
 ## `restart_zed_daemon()`
 
-Restarts the `zed_x_daemon` systemd service and blocks ~5 s while it re-enumerates the GMSL links. The daemon only scans for cameras when it starts, so a camera plugged in **after boot** stays invisible to the SDK until the daemon restarts — call this (or use the **Restart daemon** button in the [control panel's Cameras dialog](/guides/control-panel#cameras)) before opening cameras when in doubt.
+Restarts the `zed_x_daemon` systemd service and blocks ~5 s while it re-enumerates the GMSL links. The daemon only scans for cameras when it starts, so a camera plugged in **after boot** stays invisible to the SDK until the daemon restarts — call this (or use the **Restart daemon** button in the [control panel's Cameras settings tab](/guides/control-panel#cameras)) before opening cameras when in doubt.
 
 ```python
 from almond_axol.zed import restart_zed_daemon
