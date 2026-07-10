@@ -63,6 +63,9 @@ def snapshot_jpeg_inproc(serial: int) -> bytes:
     if stereo:
         cam: object = sl.Camera()
         params: object = sl.InitParameters()
+        # Preview only retrieves the left image. Disable depth so opening the
+        # camera does not load or optimize a depth model on the Jetson.
+        params.depth_mode = sl.DEPTH_MODE.NONE
     else:
         cam = sl.CameraOne()
         params = sl.InitParametersOne()
