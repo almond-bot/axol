@@ -90,16 +90,22 @@ export function SettingsSection({
   const dirty = patch != null && Object.keys(patch).length > 0
 
   // Seed / reseed the draft from the stored state ("adjust state when props
-  // change" — set during render, not in an effect). While the operator has
-  // unsaved edits, incoming server state must not clobber them; once clean
-  // (including right after a save), the draft follows the store again.
+  // change" — set during render, not in an effect). Do not seed while the
+  // settings request is still in flight: an empty early draft compared with a
+  // populated response looks like the operator deleted every stored value,
+  // which makes `dirty` true and prevents the response from ever reaching the
+  // form. On an old host, `supportError` resolves the request and enables the
+  // camera-only fallback draft.
   const seedDraft = (): Draft => ({
     values: { ...(snapshot?.values ?? {}) },
     cameras,
     advanced: { ...(snapshot?.advanced ?? {}) },
   })
-  const nextSeedKey = JSON.stringify([snapshot?.values, snapshot?.advanced, cameras])
-  if (nextSeedKey !== seedKey && (draft == null || !dirty)) {
+  const settingsResolved = snapshot !== null || supportError !== null
+  const nextSeedKey = settingsResolved
+    ? JSON.stringify([snapshot?.values, snapshot?.advanced, cameras])
+    : null
+  if (nextSeedKey !== null && nextSeedKey !== seedKey && (draft == null || !dirty)) {
     setSeedKey(nextSeedKey)
     setDraft(seedDraft())
   }
@@ -119,6 +125,7 @@ export function SettingsSection({
   }
 
   function discard() {
+    if (nextSeedKey === null) return
     setSeedKey(nextSeedKey)
     setDraft(seedDraft())
   }
