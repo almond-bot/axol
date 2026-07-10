@@ -557,6 +557,15 @@ class OperationRunner:
         control.push(command)
         return True
 
+    def policy_state(self) -> dict[str, Any] | None:
+        """run-policy episode phase/message/count, or None if no policy is running.
+
+        Read by /api/op/status so the control panel reflects whether an episode
+        is recording or sitting at the between-episode gate on any computer.
+        """
+        control = self._policy_control
+        return control.snapshot() if control is not None else None
+
     async def shutdown(self) -> None:
         # Server shutdown: stop and block until the op is actually gone (unlike
         # the API stop, which returns early and lets the watchdog finish).

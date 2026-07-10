@@ -424,6 +424,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         return {
             "running": runner.is_running(),
             "session": session.to_dict() if session else None,
+            "policy": runner.policy_state(),
         }
 
     @app.post("/api/op/start")
