@@ -400,35 +400,23 @@ function UsbPanel({
         up automatically when an authorized headset is plugged into the host; camera video keeps
         using the LAN.
       </p>
-      <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-4">
-            <Label>Link status</Label>
-            <div className="flex items-center gap-2 text-sm">
-              <span className={cn("size-2 shrink-0 rounded-full", dotClass)} />
-              <span className="text-white/75">{label}</span>
-            </div>
+      <div className="flex max-w-xl flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <span className={cn("size-2 shrink-0 rounded-full", dotClass)} />
+            <Label>{label}</Label>
           </div>
-          <p className="max-w-prose text-xs text-white/35">{hint}</p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={onUsbConnect}
+            disabled={usbBusy || usb?.installed === false}
+          >
+            {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
+            {usb?.ready ? "Reconnect" : "Connect"}
+          </Button>
         </div>
-        <div className="flex flex-col gap-1.5">
-          <div className="flex items-center justify-between gap-4">
-            <Label>Pose tunnel</Label>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={onUsbConnect}
-              disabled={usbBusy || usb?.installed === false}
-            >
-              {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-              {usb?.ready ? "Reconnect" : "Connect"}
-            </Button>
-          </div>
-          <p className="max-w-prose text-xs text-white/35">
-            Forwards the headset's pose stream to this host over the cable (adb reverse). The first
-            connection pops the authorization prompt on the headset.
-          </p>
-        </div>
+        <p className="max-w-prose text-xs text-white/35">{hint}</p>
       </div>
     </div>
   )
