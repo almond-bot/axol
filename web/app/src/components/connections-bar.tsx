@@ -22,7 +22,8 @@ function Tile({
   label,
   pulse,
   children,
-  extra,
+  statusEnd,
+  statusContent,
 }: {
   icon: ReactNode
   title: string
@@ -30,7 +31,8 @@ function Tile({
   label: string
   pulse?: boolean
   children?: ReactNode
-  extra?: ReactNode
+  statusEnd?: ReactNode
+  statusContent?: ReactNode
 }) {
   return (
     <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
@@ -41,17 +43,17 @@ function Tile({
         </div>
         {children && <div className="shrink-0">{children}</div>}
       </div>
-      {/* status — its own line, full width */}
-      <div className="flex items-center gap-2 text-sm">
-        <span
-          className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
-        />
-        <span className="min-w-0 truncate text-white/75" title={label}>
-          {label}
-        </span>
-      </div>
-      {/* optional extra detail (e.g. the Axol motor grid + fault list) */}
-      {extra}
+      {statusContent ?? (
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <span
+            className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
+          />
+          <span className="min-w-0 flex-1 truncate text-white/75" title={label}>
+            {label}
+          </span>
+          {statusEnd && <div className="shrink-0">{statusEnd}</div>}
+        </div>
+      )}
     </div>
   )
 }
@@ -103,8 +105,6 @@ export function ConnectionsBar({
   // -- robot --
   const rs = robot?.state ?? "disconnected"
   const faults = robot?.faults ?? []
-  // A motor only counts as healthy when it is reachable AND error-free.
-  const healthyCount = (robot?.motors ?? []).filter(motorHealthy).length
   const robotDot: Dot =
     rs === "connected"
       ? faults.length > 0
@@ -119,7 +119,7 @@ export function ConnectionsBar({
             : "idle"
   const robotLabel =
     rs === "connected"
-      ? `${healthyCount}/${robot?.motorCount ?? 16} motors`
+      ? "Connected"
       : rs === "busy"
         ? "In use by task"
         : rs === "connecting"
@@ -136,7 +136,7 @@ export function ConnectionsBar({
         dot={wsDot}
         label={wsLabel}
         pulse={conn === "loading"}
-        extra={
+        statusEnd={
           online && version ? (
             <span className="font-mono text-[0.7rem] text-white/35" title={`v${version}`}>
               axol v{version}
@@ -168,8 +168,10 @@ export function ConnectionsBar({
         dot={robotDot}
         label={robotLabel}
         pulse={rs === "connecting"}
-        extra={
-          robot && (rs === "connected" || rs === "busy") ? <MotorGrid robot={robot} /> : undefined
+        statusContent={
+          robot && robot.motors.length > 0 && (rs === "connected" || rs === "busy") ? (
+            <MotorGrid robot={robot} />
+          ) : undefined
         }
       >
         {rs === "connected" || rs === "busy" ? (
@@ -225,10 +227,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
     err: "bg-red-400/70",
   }
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-      <span className="w-10 shrink-0 font-mono text-[0.6rem] tracking-wide text-white/35">
-        STATUS
-      </span>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
       {arms.map((arm) => (
         <div key={arm} className="flex items-center gap-1.5">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
