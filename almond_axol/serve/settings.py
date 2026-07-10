@@ -386,6 +386,35 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="recording.observe_torques",
+                label="Observe torques",
+                type="boolean",
+                help=(
+                    "Include joint torques in the recorded observations. A "
+                    "policy must run with the same observation shape it was "
+                    "trained on."
+                ),
+                targets={
+                    "collect-data": (f"{_ROBOT}.observe_torques",),
+                    "run-policy": (f"{_ROBOT}.observe_torques",),
+                },
+            ),
+            SettingDef(
+                key="recording.observe_cartesian",
+                label="Observe Cartesian",
+                type="boolean",
+                help=(
+                    "Use Cartesian space for observations and actions: each "
+                    "arm's end-effector as a 6-axis pose plus gripper, instead "
+                    "of the 7 joint angles. Must match between data collection "
+                    "and running the policy."
+                ),
+                targets={
+                    "collect-data": (f"{_ROBOT}.observe_cartesian",),
+                    "run-policy": (f"{_ROBOT}.observe_cartesian",),
+                },
+            ),
+            SettingDef(
                 key="recording.vcodec",
                 label="Video codec",
                 type="text",

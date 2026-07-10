@@ -27,7 +27,12 @@ _SNAPSHOT_TIMEOUT_S = 20.0
 
 # Grab attempts before giving up (the first frames after open can fail while
 # the link settles).
-_GRAB_ATTEMPTS = 30
+_GRAB_ATTEMPTS = 120
+
+# Frames grabbed-and-discarded before the preview is taken: the first frames
+# after open come out with unsettled auto-exposure / auto-white-balance (a
+# strong yellow cast); AEC/AWB needs a couple dozen frames to converge.
+_WARMUP_FRAMES = 25
 
 # Preview width in pixels (height follows the aspect ratio).
 _PREVIEW_WIDTH = 480
@@ -68,8 +73,15 @@ def snapshot_jpeg_inproc(serial: int) -> bytes:
         raise ConnectionError(f"failed to open camera {serial}: {err}")
     try:
         image = sl.Mat()
+        frame = None
+        grabbed = 0
         for _ in range(_GRAB_ATTEMPTS):
             if cam.grab() != sl.ERROR_CODE.SUCCESS:
+                continue
+            grabbed += 1
+            # Discard the warmup frames so auto-exposure / white balance have
+            # settled by the time the preview frame is taken.
+            if grabbed < _WARMUP_FRAMES:
                 continue
             ok = (
                 cam.retrieve_image(image, sl.VIEW.LEFT)
@@ -77,10 +89,10 @@ def snapshot_jpeg_inproc(serial: int) -> bytes:
                 else cam.retrieve_image(image)
             )
             if ok == sl.ERROR_CODE.SUCCESS:
+                frame = image.get_data()  # BGRA
                 break
-        else:
+        if frame is None:
             raise ConnectionError(f"camera {serial} produced no frame")
-        frame = image.get_data()  # BGRA
     finally:
         cam.close()
 

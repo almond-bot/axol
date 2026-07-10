@@ -419,11 +419,13 @@ function CategoryPanel({
 }) {
   const fields = category.settings.filter((s) => s.ui.widget !== "pose")
   return (
-    <div className="flex max-w-xl flex-col gap-5">
+    <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>
-      {fields.map((f) => (
-        <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />
-      ))}
+      <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+        {fields.map((f) => (
+          <SettingRow key={f.key} field={f} value={values[f.key]} onChange={onChange} />
+        ))}
+      </div>
     </div>
   )
 }
