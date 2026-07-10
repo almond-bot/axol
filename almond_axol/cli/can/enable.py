@@ -5,7 +5,7 @@ Runs the CAN startup script to bring up the Almond Axol CAN interfaces.
 Requires can.setup to have been run at least once to generate the script.
 """
 
-from .setup import _CRON_SCRIPT, _bring_up_can
+from .setup import _CRON_SCRIPT, bring_up_can
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -23,4 +23,4 @@ def run(_args: object = None) -> None:
         print("Run 'axol can.setup' first.")
         raise SystemExit(1)
 
-    _bring_up_can()
+    bring_up_can()

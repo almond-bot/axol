@@ -328,8 +328,11 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None) -> None:
+    def __init__(self, robot_link: Any = None, settings: Any = None) -> None:
         self._robot_link = robot_link
+        # Shared operator settings (serve.settings.SettingsStore). Folded into
+        # every op start beneath the request's own args, so per-run values win.
+        self._settings = settings
         self._lock = threading.Lock()
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
@@ -395,13 +398,24 @@ class OperationRunner:
             # the subprocesses this op is about to spawn.
             self._baseline_children = {c.pid for c in multiprocessing.active_children()}
 
-        # Fold the camera spec into the argv-style args for collect-data /
-        # run-policy (their camera serials are required draccus inputs).
-        if cameras and op_id in ("collect-data", "run-policy"):
-            args = self._merge_camera_args(args, cameras)
-
-        # Build the config up front so config errors surface synchronously.
+        # Fold the shared settings and camera spec in and build the config up
+        # front, so every config error — a bad stored value as much as a bad
+        # request arg — surfaces synchronously as a failed session instead of
+        # an unhandled 500 that would leave this session wedged in "starting".
         try:
+            # Shared operator settings go beneath the request's args (per-run
+            # values win); the stored camera spec is the fallback when the
+            # request didn't carry one (older UIs still send it explicitly).
+            if self._settings is not None:
+                args = self._settings.merged_args(op_id, args)
+                if cameras is None:
+                    cameras = self._settings.cameras()
+
+            # Fold the camera spec into the argv-style args for collect-data /
+            # run-policy (their camera serials are required draccus inputs).
+            if cameras and op_id in ("collect-data", "run-policy"):
+                args = self._merge_camera_args(args, cameras)
+
             cfg = self._build_config(op_id, args)
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
             session.status = "error"
@@ -410,14 +424,24 @@ class OperationRunner:
             session.close_stream()
             return session
 
+        # Teleop relays the local ZED cameras to the headset when serials are
+        # configured (its ``cameras`` dict isn't reachable via flat argv).
+        # Best-effort: camera streaming is an optional add-on for teleop, and
+        # the spec is now always present via the settings store — a host that
+        # can't apply it (e.g. no ZED stack on a dev machine running sim) still
+        # gets a camera-less teleop instead of a failed start.
+        if op_id == "teleop":
+            try:
+                self._attach_cameras_to_teleop(cfg, cameras, session)
+            except Exception as exc:  # noqa: BLE001
+                session.emit(
+                    f"[serve] teleop: camera streaming unavailable ({exc}); "
+                    "continuing without cameras"
+                )
+
         is_sim = op_id == "teleop" and bool(args.get("sim"))
         needs_robot = op_id in _HARDWARE_OPS and not is_sim
         log_level = self._log_level(args)
-
-        # Teleop relays the local ZED cameras to the headset when serials are
-        # configured (its ``cameras`` dict isn't reachable via flat argv).
-        if op_id == "teleop":
-            self._attach_cameras_to_teleop(cfg, cameras, session)
 
         session.status = "running"
         session.emit(f"[serve] starting {op_id} (in-process)")

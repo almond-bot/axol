@@ -249,8 +249,14 @@ def _make_node(
         ftype = "select"
         default: Any = value
     elif isinstance(value, list):
-        ftype = "text"
-        default = json.dumps(value)
+        if value and all(isinstance(v, (int, float)) for v in value):
+            # Numeric vectors (CoM offsets, joint-angle arrays) render as one
+            # input per component instead of a raw JSON array.
+            ftype = "vector"
+            default = value
+        else:
+            ftype = "text"
+            default = json.dumps(value)
     else:
         ftype = _leaf_type(value)
         default = value

@@ -14,15 +14,17 @@ from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
+from ..constants import URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import COMMANDS, command_specs
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
+from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
 
@@ -70,6 +72,21 @@ class OpStartRequest(BaseModel):
     op: str
     args: dict[str, Any] = {}
     cameras: dict[str, Any] | None = None
+
+
+class SettingsUpdateRequest(BaseModel):
+    """Partial update of the shared operator settings (serve/settings.py).
+
+    ``values`` and ``advanced`` merge per key (``null`` resets a key to its
+    default); ``cameras`` replaces the stored camera spec wholesale. Omitted
+    sections are left untouched.
+    """
+
+    values: dict[str, Any] | None = None
+    cameras: dict[str, Any] | None = None
+    # Distinguish "clear the cameras" (null) from "don't touch them" (omitted).
+    camerasSet: bool = False
+    advanced: dict[str, Any] | None = None
 
 
 class EpisodeRequest(BaseModel):
@@ -144,8 +161,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     manager = SessionManager()
     hub = TelemetryHub()
     robot = RobotLink(hub=hub)
-    runner = OperationRunner(robot)
+    settings = SettingsStore()
+    runner = OperationRunner(robot, settings=settings)
     runs = DiagnosticsRunStore(hub)
+    # ZED devices are exclusive. Hold this across preview capture and operation
+    # startup so both paths make their idle check while owning one reservation.
+    camera_reservation = asyncio.Lock()
 
     def _is_idle() -> bool:
         """Safe to restart: no operation running.
@@ -171,6 +192,19 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if s is not None:
             return s, runner
         return manager.get(session_id), manager
+
+    async def _motor_fault_response() -> JSONResponse | None:
+        """Return the shared motor-fault rejection, or ``None`` when clear."""
+        faults = await asyncio.to_thread(robot.motor_faults)
+        if not faults:
+            return None
+        detail = ", ".join(
+            f"{f['arm']} {f['joint'].lower()} ({f['problem']})" for f in faults
+        )
+        return JSONResponse(
+            {"error": f"motor fault — fix before starting: {detail}"},
+            status_code=409,
+        )
 
     # Allow the Vite dev server (different origin) to call the API directly.
     app.add_middleware(
@@ -307,6 +341,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # themselves, so the launch does the same single-owner dance as the
         # in-process operations: refuse while something else owns the bus, and
         # hand the idle link's buses over for the duration of the run.
+        command = COMMANDS.get(req.command)
+        if command is None:
+            return JSONResponse(
+                {"error": f"unknown command: {req.command}"}, status_code=400
+            )
         if runner.is_running():
             return JSONResponse(
                 {"error": "an operation is running — stop it first"}, status_code=409
@@ -316,14 +355,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": "another session is running — stop it first"},
                 status_code=409,
             )
-        if req.command not in COMMANDS:
-            return JSONResponse(
-                {"error": f"unknown command: {req.command}"}, status_code=400
-            )
+        if command.drives_motors:
+            fault_response = await _motor_fault_response()
+            if fault_response is not None:
+                return fault_response
 
         # A camera-only diagnostic (ZED cable check) doesn't touch the CAN bus,
         # so leave the idle motor telemetry streaming while it runs.
-        uses_can_bus = COMMANDS[req.command].uses_can_bus
+        uses_can_bus = command.uses_can_bus
         if uses_can_bus:
             await asyncio.to_thread(robot.release)
         try:
@@ -337,7 +376,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # Only the Diagnostics tests are recorded in the run history; the
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
         # the bus handover + prompt plumbing but leave no record behind.
-        record = COMMANDS[req.command].category == "Diagnostics"
+        record = command.category == "Diagnostics"
         meta = runs.begin(session.id, req.command, req.args) if record else None
         if session.status == "error":
             if uses_can_bus:
@@ -377,28 +416,102 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """List locally connected ZED cameras (serial, model, mono/stereo)."""
         return await asyncio.to_thread(_detect_cameras)
 
+    @app.get("/api/cameras/preview/{serial}", response_model=None)
+    async def camera_preview(serial: int) -> Response | JSONResponse:
+        """One live JPEG frame from a connected ZED, so operators can tell
+        which physical camera a serial belongs to. Cameras are exclusive:
+        refused while an operation may be using them."""
+        async with camera_reservation:
+            if runner.is_running():
+                return JSONResponse(
+                    {"error": "cannot preview cameras while an operation is running"},
+                    status_code=409,
+                )
+
+            def _capture() -> bytes:
+                from ..zed.snapshot import snapshot_jpeg
+
+                return snapshot_jpeg(serial)
+
+            try:
+                data = await asyncio.to_thread(_capture)
+            except ImportError:
+                return JSONResponse(
+                    {"error": "pyzed is not installed — run `axol zed.install` first"},
+                    status_code=503,
+                )
+            except KeyError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=404)
+            except Exception as exc:  # noqa: BLE001 - surface capture errors to the UI
+                return JSONResponse(
+                    {"error": f"{type(exc).__name__}: {exc}"}, status_code=502
+                )
+            return Response(
+                content=data,
+                media_type="image/jpeg",
+                headers={"Cache-Control": "no-store"},
+            )
+
     @app.post("/api/cameras/restart-daemon")
     async def cameras_restart_daemon() -> JSONResponse:
         """Restart the ZED X daemon so cameras plugged in after boot enumerate."""
-        if runner.is_running():
-            return JSONResponse(
-                {
-                    "error": "cannot restart the ZED daemon while an operation is running"
-                },
-                status_code=409,
+        async with camera_reservation:
+            if runner.is_running():
+                return JSONResponse(
+                    {
+                        "error": "cannot restart the ZED daemon while an operation is running"
+                    },
+                    status_code=409,
+                )
+
+            def _restart() -> dict[str, Any]:
+                try:
+                    from ..zed import restart_zed_daemon
+
+                    restart_zed_daemon()
+                    return {"ok": True, "error": None}
+                except Exception as exc:  # noqa: BLE001 - surface to the UI
+                    return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+            result = await asyncio.to_thread(_restart)
+            return JSONResponse(result, status_code=200 if result["ok"] else 500)
+
+    # -- shared operator settings (see serve/settings.py) --------------------
+
+    @app.get("/api/settings")
+    async def get_settings() -> dict[str, Any]:
+        """Stored shared settings + the schemas describing every category."""
+        return {
+            **settings.snapshot(),
+            "schema": settings_schema(),
+            "advancedSchema": advanced_schema(),
+        }
+
+    @app.put("/api/settings")
+    async def put_settings(req: SettingsUpdateRequest) -> JSONResponse:
+        try:
+            snapshot = settings.update(
+                values=req.values,
+                cameras=req.cameras
+                if (req.camerasSet or req.cameras is not None)
+                else ...,
+                advanced=req.advanced,
             )
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse(snapshot)
 
-        def _restart() -> dict[str, Any]:
-            try:
-                from ..zed import restart_zed_daemon
+    # -- robot model (URDF + meshes for the pose editor) ---------------------
 
-                restart_zed_daemon()
-                return {"ok": True, "error": None}
-            except Exception as exc:  # noqa: BLE001 - surface to the UI
-                return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-        result = await asyncio.to_thread(_restart)
-        return JSONResponse(result, status_code=200 if result["ok"] else 500)
+    @app.get("/api/urdf/{asset_path:path}", response_model=None)
+    async def urdf_asset(asset_path: str) -> FileResponse | JSONResponse:
+        """Serve the robot URDF and its STL meshes to the web pose editor."""
+        base = URDF_PATH.parent.resolve()
+        target = (base / asset_path).resolve()
+        if not target.is_relative_to(base) or not target.is_file():
+            return JSONResponse({"error": "not found"}, status_code=404)
+        media = "model/stl" if target.suffix == ".stl" else "application/xml"
+        return FileResponse(target, media_type=media)
 
     # -- Quest-over-USB (adb reverse pose tunnel) ---------------------------
 
@@ -433,13 +546,25 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse(
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
-        try:
-            session = runner.start(
-                req.op, req.args, cameras=req.cameras, loop=asyncio.get_running_loop()
-            )
-        except RuntimeError as exc:
-            return JSONResponse({"error": str(exc)}, status_code=409)
-        return JSONResponse(session.to_dict())
+        async with camera_reservation:
+            # A faulted motor (over-temp, stall, encoder error, unreachable, …)
+            # must block every hardware operation — driving through a fault risks
+            # the arm. Sim teleop never touches the motors, so it stays allowed.
+            is_sim = req.op == "teleop" and bool(req.args.get("sim"))
+            if not is_sim:
+                fault_response = await _motor_fault_response()
+                if fault_response is not None:
+                    return fault_response
+            try:
+                session = runner.start(
+                    req.op,
+                    req.args,
+                    cameras=req.cameras,
+                    loop=asyncio.get_running_loop(),
+                )
+            except RuntimeError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=409)
+            return JSONResponse(session.to_dict())
 
     @app.post("/api/op/stop")
     async def op_stop() -> JSONResponse:

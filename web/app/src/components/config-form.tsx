@@ -1,17 +1,18 @@
-import { useMemo, useRef, useState } from "react"
+import { useRef, useState } from "react"
 import { createPortal } from "react-dom"
-import { ChevronRight, Info, RotateCcw, Search } from "lucide-react"
+import { Info, RotateCcw } from "lucide-react"
 import {
   defaultString,
-  flattenFields,
   isModified,
   type FormValue,
   type SchemaField,
+  type SchemaGroup,
   type SchemaNode,
 } from "@/lib/supervisor"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { cn } from "@/lib/utils"
+import { Switch } from "@/components/ui/switch"
+import { cn, sentenceCase } from "@/lib/utils"
 
 interface CommonProps {
   overrides: Record<string, FormValue>
@@ -20,72 +21,46 @@ interface CommonProps {
   onReset: (key: string) => void
 }
 
-export function ConfigForm({ schema, ...common }: CommonProps & { schema: SchemaNode[] }) {
-  const [query, setQuery] = useState("")
-  const allFields = useMemo(() => flattenFields(schema), [schema])
+// -- vector fields (numeric arrays rendered one input per component) ---------
 
-  const required = allFields.filter((f) => f.required)
-  const rootFields = schema.filter((n): n is SchemaField => n.kind === "field" && !n.required)
-  const groups = schema.filter((n) => n.kind === "group")
+const XYZ = ["x", "y", "z"]
 
-  const q = query.trim().toLowerCase()
-  const matches = q
-    ? allFields.filter((f) => f.key.toLowerCase().includes(q) || f.label.toLowerCase().includes(q))
-    : null
+const componentLabel = (length: number, i: number) => (length === 3 ? XYZ[i] : String(i + 1))
 
-  return (
-    <div className="flex flex-col gap-4">
-      <div className="relative">
-        <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-white/30" />
-        <Input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search all config…"
-          className="pl-9"
-        />
-      </div>
+const vectorDefault = (field: SchemaField): number[] =>
+  Array.isArray(field.default) ? field.default : []
 
-      {matches ? (
-        <div className="flex flex-col gap-4">
-          {matches.length === 0 ? (
-            <p className="text-sm text-white/35">No matching config.</p>
-          ) : (
-            matches.map((f) => <FieldRow key={f.key} field={f} showPath {...common} />)
-          )}
-        </div>
-      ) : (
-        <>
-          {required.length > 0 && (
-            <div className="flex flex-col gap-4 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
-              <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
-                Required
-              </span>
-              {required.map((f) => (
-                <FieldRow key={f.key} field={f} {...common} />
-              ))}
-            </div>
-          )}
+/** Parse one component's text: number when it is one, raw text while mid-edit. */
+const parseComponent = (text: string): number | string => {
+  const t = text.trim()
+  return t !== "" && Number.isFinite(Number(t)) ? Number(t) : text
+}
 
-          {rootFields.length > 0 && (
-            <div className="flex flex-col gap-4">
-              {rootFields.map((f) => (
-                <FieldRow key={f.key} field={f} {...common} />
-              ))}
-            </div>
-          )}
+/** Current component values: the override if set, else the defaults. */
+function vectorValue(field: SchemaField, value: FormValue | undefined): (number | string)[] {
+  return Array.isArray(value) ? value : vectorDefault(field)
+}
 
-          {groups.map((g) => (
-            <GroupSection key={g.key} group={g} depth={0} {...common} />
-          ))}
-        </>
-      )}
-    </div>
-  )
+/** Write one component, dropping the override when it lands back on defaults. */
+function setVectorComponent(
+  field: SchemaField,
+  value: FormValue | undefined,
+  index: number,
+  text: string,
+  onChange: (key: string, value: FormValue) => void,
+  onReset: (key: string) => void
+) {
+  const def = vectorDefault(field)
+  const next = [...vectorValue(field, value)]
+  next[index] = parseComponent(text)
+  const isDefault = next.length === def.length && next.every((v, i) => String(v) === String(def[i]))
+  if (isDefault) onReset(field.key)
+  else onChange(field.key, next)
 }
 
 /**
  * Renders a curated, flat list of fields (a hand-picked subset of an op's
- * full schema) — used by the purpose-built operation panels.
+ * full schema) — used by the operation panels and the diagnostics actions.
  */
 export function CuratedForm({ fields, ...common }: CommonProps & { fields: SchemaField[] }) {
   if (fields.length === 0) {
@@ -100,62 +75,227 @@ export function CuratedForm({ fields, ...common }: CommonProps & { fields: Schem
   )
 }
 
-function GroupSection({
-  group,
-  depth,
+// -- uniform-subgroup tables --------------------------------------------------
+//
+// The per-joint gain configs are 7+ sibling groups with identical numeric
+// fields (kp, kd, friction.*, mass, com, …). Rendering those as repeated field
+// lists is unreadable; a table — one row per joint, one column per parameter,
+// vectors split into per-component columns — is how you actually scan them.
+
+interface TableColumn {
+  /** Dotted subpath inside each subgroup (e.g. "friction.fc" or "com"). */
+  sub: string
+  label: string
+  /** Component index for vector fields; null for scalars. */
+  index: number | null
+}
+
+/**
+ * The column set of a subgroup if it is purely numeric (numbers + numeric
+ * vectors, possibly nested); null disqualifies it from table rendering.
+ */
+function numericColumns(group: SchemaGroup, prefix = ""): TableColumn[] | null {
+  const out: TableColumn[] = []
+  for (const node of group.children) {
+    if (node.kind === "group") {
+      const nested = numericColumns(node, prefix ? `${prefix}.${node.label}` : node.label)
+      if (nested == null) return null
+      out.push(...nested)
+      continue
+    }
+    const sub = prefix ? `${prefix}.${node.label}` : node.label
+    const leaf = sub.split(".").pop() ?? sub
+    if (node.type === "number") {
+      out.push({ sub, label: leaf, index: null })
+    } else if (node.type === "vector") {
+      const def = vectorDefault(node)
+      def.forEach((_, i) =>
+        out.push({ sub, label: `${leaf} ${componentLabel(def.length, i)}`, index: i })
+      )
+    } else {
+      return null
+    }
+  }
+  return out
+}
+
+const columnsSignature = (cols: TableColumn[]) =>
+  cols.map((c) => `${c.sub}:${c.index ?? ""}`).join("|")
+
+/** Look up the field at `sub` inside a subgroup (mirrors numericColumns). */
+function fieldAt(group: SchemaGroup, sub: string): SchemaField | null {
+  const [head, ...rest] = sub.split(".")
+  for (const node of group.children) {
+    if (node.label !== head) continue
+    if (node.kind === "field") return rest.length === 0 ? node : null
+    return fieldAt(node, rest.join("."))
+  }
+  return null
+}
+
+function GroupTable({
+  groups,
+  columns,
+  path,
   ...common
-}: CommonProps & { group: Extract<SchemaNode, { kind: "group" }>; depth: number }) {
-  const [open, setOpen] = useState(false)
-
-  const leaves = useMemo(() => flattenFields(group.children), [group])
-  const modifiedCount = leaves.filter((f) => isModified(f, common.overrides[f.key])).length
-
-  const fields = group.children.filter((n): n is SchemaField => n.kind === "field")
-  const subgroups = group.children.filter((n) => n.kind === "group")
-
+}: CommonProps & { groups: SchemaGroup[]; columns: TableColumn[]; path: string[] }) {
   return (
-    <div
-      className={cn(
-        "rounded-lg border border-white/10",
-        depth === 0 ? "bg-white/[0.02]" : "bg-transparent"
+    <div className="flex flex-col gap-2">
+      {path.length > 0 && (
+        <span className="border-b border-white/10 pb-1 font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
+          {path.join(" › ")}
+        </span>
       )}
-    >
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
-      >
-        <ChevronRight
-          className={cn("size-4 shrink-0 text-white/40 transition-transform", open && "rotate-90")}
-        />
-        <span className="text-sm font-medium capitalize">{group.label}</span>
-        <span className="text-xs text-white/30">{leaves.length}</span>
-        {modifiedCount > 0 && (
-          <span className="ml-auto rounded-full bg-[#eff483]/15 px-2 py-0.5 font-mono text-[0.65rem] text-[#eff483]">
-            {modifiedCount} edited
-          </span>
-        )}
-      </button>
-      {open && (
-        <div className="flex flex-col gap-4 border-t border-white/10 p-3">
-          {fields.map((f) => (
-            <FieldRow key={f.key} field={f} {...common} />
-          ))}
-          {subgroups.map((sg) => (
-            <GroupSection
-              key={sg.key}
-              group={sg as Extract<SchemaNode, { kind: "group" }>}
-              depth={depth + 1}
-              {...common}
-            />
-          ))}
-        </div>
-      )}
+      <div className="overflow-x-auto">
+        <table className="w-full border-separate border-spacing-x-1 border-spacing-y-1">
+          <thead>
+            <tr>
+              <th />
+              {columns.map((c) => (
+                <th
+                  key={`${c.sub}:${c.index ?? ""}`}
+                  title={c.sub}
+                  className="px-1 pb-0.5 text-center text-[0.65rem] font-medium whitespace-nowrap text-white/45"
+                >
+                  {sentenceCase(c.label.replace(/_/g, " "))}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((g) => (
+              <tr key={g.key}>
+                <td className="pr-2 text-xs whitespace-nowrap text-white/60">
+                  {sentenceCase(g.label)}
+                </td>
+                {columns.map((c) => {
+                  const field = fieldAt(g, c.sub)
+                  return field ? (
+                    <TableCell
+                      key={`${c.sub}:${c.index ?? ""}`}
+                      field={field}
+                      index={c.index}
+                      {...common}
+                    />
+                  ) : (
+                    <td key={`${c.sub}:${c.index ?? ""}`} />
+                  )
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }
 
-function FieldRow({
+function TableCell({
+  field,
+  index,
+  overrides,
+  disabled,
+  onChange,
+  onReset,
+}: CommonProps & { field: SchemaField; index: number | null }) {
+  const has = field.key in overrides
+  const value = has ? overrides[field.key] : undefined
+  let text: string
+  let modified: boolean
+  if (index == null) {
+    text = has ? String(value ?? "") : defaultString(field)
+    modified = isModified(field, value)
+  } else {
+    const arr = vectorValue(field, value)
+    text = String(arr[index] ?? "")
+    modified = has && String(arr[index]) !== String(vectorDefault(field)[index])
+  }
+  return (
+    <td>
+      <input
+        value={text}
+        inputMode="decimal"
+        disabled={disabled}
+        title={`${field.key}${index != null ? ` [${index}]` : ""}`}
+        onChange={(e) => {
+          const raw = e.target.value
+          if (index == null) {
+            if (raw === "") onReset(field.key)
+            else onChange(field.key, raw)
+          } else {
+            setVectorComponent(field, value, index, raw, onChange, onReset)
+          }
+        }}
+        className={cn(
+          "h-8 w-full min-w-14 rounded border bg-white/[0.02] px-1.5 text-center text-xs text-foreground outline-none focus-visible:border-ring/70 disabled:opacity-50",
+          modified ? "border-[#eff483]/50" : "border-white/10"
+        )}
+      />
+    </td>
+  )
+}
+
+/**
+ * A config subtree rendered flat: every field visible (no collapsed groups to
+ * dig through). Nested groups become plain section headings ("left › elbow")
+ * with their fields in a compact grid — except runs of sibling groups with
+ * identical numeric fields (the per-joint gains), which collapse into one
+ * table: a row per joint, a column per parameter. Used by the settings
+ * Advanced tab.
+ */
+export function FlatSchemaForm({
+  nodes,
+  path = [],
+  ...common
+}: CommonProps & { nodes: SchemaNode[]; path?: string[] }) {
+  const fields = nodes.filter((n): n is SchemaField => n.kind === "field")
+  const groups = nodes.filter((n): n is SchemaGroup => n.kind === "group")
+
+  // Cluster sibling groups by their numeric-column signature; a cluster of 3+
+  // renders as one table (keyed by its first member's position).
+  const signatures = new Map<string, { cols: TableColumn[] | null; sig: string | null }>()
+  const clusterSizes = new Map<string, number>()
+  for (const g of groups) {
+    const cols = numericColumns(g)
+    const sig = cols && cols.length >= 2 ? columnsSignature(cols) : null
+    signatures.set(g.key, { cols, sig })
+    if (sig) clusterSizes.set(sig, (clusterSizes.get(sig) ?? 0) + 1)
+  }
+  const renderedSigs = new Set<string>()
+
+  return (
+    <div className="flex flex-col gap-4">
+      {fields.length > 0 && (
+        <div className="flex flex-col gap-2">
+          {path.length > 0 && (
+            <span className="border-b border-white/10 pb-1 font-mono text-[0.65rem] tracking-widest text-white/40 uppercase">
+              {path.join(" › ")}
+            </span>
+          )}
+          <div className="grid gap-x-6 gap-y-3 sm:grid-cols-2">
+            {fields.map((f) => (
+              <FieldRow key={f.key} field={f} {...common} />
+            ))}
+          </div>
+        </div>
+      )}
+      {groups.map((g) => {
+        const { cols, sig } = signatures.get(g.key)!
+        if (sig && (clusterSizes.get(sig) ?? 0) >= 3) {
+          if (renderedSigs.has(sig)) return null
+          renderedSigs.add(sig)
+          const members = groups.filter((m) => signatures.get(m.key)!.sig === sig)
+          return <GroupTable key={g.key} groups={members} columns={cols!} path={path} {...common} />
+        }
+        return (
+          <FlatSchemaForm key={g.key} nodes={g.children} path={[...path, g.label]} {...common} />
+        )
+      })}
+    </div>
+  )
+}
+
+export function FieldRow({
   field,
   showPath,
   overrides,
@@ -177,7 +317,7 @@ function FieldRow({
         {showPath ? (
           <span className="font-mono text-xs text-white/55">{field.key}</span>
         ) : (
-          <span className="capitalize">{field.label}</span>
+          <span>{sentenceCase(field.label)}</span>
         )}
       </Label>
       {field.required && <span className="text-xs text-[#eff483]">*</span>}
@@ -204,6 +344,34 @@ function FieldRow({
         <div className="flex items-center justify-between gap-4">
           {labelNode}
           <Switch checked={checked} disabled={disabled} onChange={(v) => onChange(field.key, v)} />
+        </div>
+      </div>
+    )
+  }
+
+  if (field.type === "vector") {
+    const def = vectorDefault(field)
+    const arr = vectorValue(field, value)
+    return (
+      <div className="flex flex-col gap-1.5">
+        {labelNode}
+        <div className="flex flex-wrap gap-2">
+          {def.map((_, i) => (
+            <label key={i} className="flex items-center gap-1.5">
+              <span className="font-mono text-[0.65rem] text-white/40 uppercase">
+                {componentLabel(def.length, i)}
+              </span>
+              <Input
+                value={String(arr[i] ?? "")}
+                inputMode="decimal"
+                disabled={disabled}
+                onChange={(e) =>
+                  setVectorComponent(field, value, i, e.target.value, onChange, onReset)
+                }
+                className="h-8 w-24 px-2 text-xs"
+              />
+            </label>
+          ))}
         </div>
       </div>
     )
@@ -276,36 +444,5 @@ function HelpTip({ text }: { text: string }) {
           document.body
         )}
     </span>
-  )
-}
-
-function Switch({
-  checked,
-  disabled,
-  onChange,
-}: {
-  checked: boolean
-  disabled: boolean
-  onChange: (v: boolean) => void
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={cn(
-        "relative h-6 w-11 shrink-0 rounded-full border transition-colors disabled:opacity-50",
-        checked ? "border-[#eff483]/50 bg-[#eff483]/80" : "border-white/15 bg-white/[0.06]"
-      )}
-    >
-      <span
-        className={cn(
-          "absolute top-0.5 left-0.5 size-4.5 rounded-full transition-transform",
-          checked ? "translate-x-5 bg-[#121212]" : "translate-x-0 bg-white/80"
-        )}
-      />
-    </button>
   )
 }

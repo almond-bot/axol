@@ -10,6 +10,7 @@ on a single USB device:
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -77,18 +78,63 @@ def _detect_serials() -> list[str]:
     return list(dict.fromkeys(serials))
 
 
+def _serial_of_interface(iface: str) -> str | None:
+    """The USB serial behind a named CAN interface, or None if it's absent."""
+    iface_path = Path("/sys/class/net") / iface
+    if not iface_path.exists():
+        return None
+    info = subprocess.run(
+        ["udevadm", "info", "-a", "-p", str(iface_path)],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return next(
+        (line.split('"')[1] for line in info.splitlines() if "ATTRS{serial}" in line),
+        None,
+    )
+
+
+def _configured_serial() -> str | None:
+    """The Axol adapter's serial as pinned by a *previous* setup, if any.
+
+    Preferred over live adapter detection: other candlelight devices (e.g. a
+    UMI rig's CAN adapter) share the same generic VID/PID, so a host with
+    several attached is ambiguous to a fresh scan — but not to a machine
+    that has already named its Axol interfaces or written its udev rules.
+    """
+    for iface in (_CAN_L, _CAN_R):
+        serial = _serial_of_interface(iface)
+        if serial:
+            return serial
+    try:
+        rules = _UDEV_RULES_FILE.read_text()
+    except OSError:
+        return None
+    match = re.search(r'ATTRS\{serial\}=="([^"]+)"', rules)
+    return match.group(1) if match else None
+
+
 def _resolve_serial() -> str:
     """Pick the adapter serial without prompting (for headless ``ensure_setup``).
 
-    Raises ``RuntimeError`` when zero or several adapters are present, since
+    A previously configured serial (named ``can_alm_axol_*`` interfaces, or
+    the pinned serial in the udev rules) wins outright, so re-running setup on
+    an already-configured host works no matter how many other candlelight
+    adapters are attached. Only a genuinely fresh machine falls back to live
+    detection — and raises when zero or several adapters are present, since
     that needs the interactive ``axol can.setup`` flow to disambiguate.
     """
+    configured = _configured_serial()
+    if configured:
+        return configured
     unique = _detect_serials()
     if len(unique) == 1:
         return unique[0]
     if not unique:
         raise RuntimeError("Robot not detected")
-    raise RuntimeError("Multiple CAN adapters")
+    raise RuntimeError(
+        "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
+    )
 
 
 def _find_serial() -> str:
@@ -232,7 +278,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def _rx_alive() -> bool:
+def rx_alive() -> bool:
     """True when at least one motor answers on either arm.
 
     Verifies the adapter's receive path, not just the interface state: the
@@ -263,11 +309,11 @@ def _rx_alive() -> bool:
     return asyncio.run(probe_all())
 
 
-def _bring_up_can() -> None:
+def bring_up_can() -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`_rx_alive`, so a bring-up
+    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
     that lands in the wedge is recovered by exactly one more cycle. A robot
     with its motors powered off is indistinguishable from the wedge, hence the
     bounded retries and the warning instead of an error.
@@ -275,7 +321,7 @@ def _bring_up_can() -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
     for attempt in range(3):
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
-        if _rx_alive():
+        if rx_alive():
             print("  Done — motors responding.")
             return
         if attempt < 2:
@@ -310,7 +356,7 @@ def ensure_setup(*, serial: str | None = None) -> None:
     _rename_interfaces(serial)
     _write_cron_script()
     _register_cron()
-    _bring_up_can()
+    bring_up_can()
 
 
 def run(_args: object = None) -> None:
