@@ -35,7 +35,7 @@ function Tile({
   statusContent?: ReactNode
 }) {
   return (
-    <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
+    <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
       <div className="flex min-h-8 items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
           {icon}
@@ -234,13 +234,37 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
           <div className="flex gap-1">
             {robot.motors
               .filter((m) => m.arm === arm)
-              .map((m) => (
-                <span
-                  key={m.joint}
-                  title={tip(m)}
-                  className={cn("size-3 rounded-[3px]", SQUARE[color(m)])}
-                />
-              ))}
+              .map((m, index, motors) => {
+                const tooltip = `motor-${m.arm}-${m.joint}-tooltip`
+                const first = index === 0
+                const last = index === motors.length - 1
+                return (
+                  <span
+                    key={m.joint}
+                    tabIndex={0}
+                    aria-describedby={tooltip}
+                    className="group/motor relative inline-flex rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111]"
+                  >
+                    <span className={cn("size-3 rounded-[3px]", SQUARE[color(m)])} />
+                    <span
+                      id={tooltip}
+                      role="tooltip"
+                      className={cn(
+                        "pointer-events-none absolute top-full z-30 mt-2 w-max max-w-56 rounded-md border border-white/15 bg-[#181818] px-2.5 py-1.5 text-center text-xs leading-snug font-normal text-white/85 opacity-0 shadow-lg transition-opacity duration-75 group-hover/motor:opacity-100 group-focus-visible/motor:opacity-100",
+                        first ? "left-0" : last ? "right-0" : "left-1/2 -translate-x-1/2"
+                      )}
+                    >
+                      {tip(m)}
+                      <span
+                        className={cn(
+                          "absolute bottom-full size-1.5 translate-y-1/2 rotate-45 border-t border-l border-white/15 bg-[#181818]",
+                          first ? "left-1" : last ? "right-1" : "left-1/2 -translate-x-1/2"
+                        )}
+                      />
+                    </span>
+                  </span>
+                )
+              })}
           </div>
         </div>
       ))}
