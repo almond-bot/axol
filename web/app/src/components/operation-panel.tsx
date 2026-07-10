@@ -313,16 +313,19 @@ function EpisodeControls({
 }) {
   const phase = policy?.phase ?? "preparing"
   const ready = phase === "ready" // between-episode gate: start the next episode
-  const recording = phase === "recording" // episode in flight: save or discard
+  // Episode in flight, or the safety-cap decision after it — Save/Discard apply.
+  const canChoose = phase === "recording" || phase === "deciding"
   // Status line so both the initiator and any other computer see what's happening.
   const status =
     phase === "recording"
       ? "Recording — Save to keep, Discard to re-record."
-      : phase === "ready"
-        ? "Reset the scene, then start the episode."
-        : phase === "resetting"
-          ? "Returning to rest…"
-          : "Preparing…"
+      : phase === "deciding"
+        ? "Time cap reached — Save to keep, Discard to re-record."
+        : phase === "ready"
+          ? "Reset the scene, then start the episode."
+          : phase === "resetting"
+            ? "Returning to rest…"
+            : "Preparing…"
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
       <div className="flex items-center justify-between gap-2">
@@ -338,10 +341,10 @@ function EpisodeControls({
         <Button size="sm" disabled={!ready} onClick={() => onEpisode("start")}>
           Start episode
         </Button>
-        <Button variant="outline" size="sm" disabled={!recording} onClick={() => onEpisode("s")}>
+        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("s")}>
           Save
         </Button>
-        <Button variant="outline" size="sm" disabled={!recording} onClick={() => onEpisode("r")}>
+        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("r")}>
           Discard
         </Button>
       </div>

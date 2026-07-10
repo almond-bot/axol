@@ -100,12 +100,16 @@ export default function ControlPanel() {
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
   // Bridges the gap between clicking Update and the server's status first
   // reporting the in-flight update, so the banner switches to the spinner
-  // immediately. Steady state is derived from the server (see `updating`).
+  // immediately; the watcher clears it once the real server state is known.
   const [startingUpdate, setStartingUpdate] = useState(false)
+  // Set when the watcher gives up (deadline) so the banner drops the spinner and
+  // offers a retry even if the server is still/again reporting "updating".
+  // Cleared when a new update is kicked off (and on disconnect).
+  const [updateAbandoned, setUpdateAbandoned] = useState(false)
   // Whether the server is applying an update. Derived from its authoritative
   // status (not a local click) so EVERY connected computer shows the in-flight
   // update — spinner + phase — rather than a stale, clickable Update button.
-  const updating = startingUpdate || update?.state === "updating"
+  const updating = !updateAbandoned && (startingUpdate || update?.state === "updating")
   // Current step shown in the banner while updating (so it isn't an opaque
   // spinner). Sourced from the server's reported phase, except "restarting"
   // which we infer locally once the server stops responding (it exited).
@@ -320,6 +324,7 @@ export default function ControlPanel() {
     setCameraDetectError(null)
     setUpdate(null)
     setStartingUpdate(false)
+    setUpdateAbandoned(false)
     setUpdatePhase(null)
     autoRobotRef.current = false
   }
@@ -511,14 +516,25 @@ export default function ControlPanel() {
     const t = setInterval(async () => {
       if (Date.now() > deadline) {
         clearInterval(t)
-        toast.error("Update is taking longer than expected. Reload to retry.")
+        if (active) {
+          // Give up auto-watching so the banner leaves the spinner and offers a
+          // retry, even if the server is still/again reporting "updating".
+          setUpdateAbandoned(true)
+          setStartingUpdate(false)
+          setUpdatePhase(null)
+          toast.error("Update is taking longer than expected. Reload to retry.")
+        }
         return
       }
       try {
         const u = await fetchUpdateStatus()
         if (!active) return
         setUpdate(u)
+        // Real server state is known now — drop the optimistic bridge so a
+        // failed status fetch in handleUpdate can't wedge `updating` on.
+        setStartingUpdate(false)
         if (u.state === "error") {
+          setUpdatePhase(null)
           toast.error(u.error ?? "Update failed.")
           return
         }
@@ -646,6 +662,7 @@ export default function ControlPanel() {
   // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
     if (!update?.remoteVersion) return
+    setUpdateAbandoned(false)
     setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {

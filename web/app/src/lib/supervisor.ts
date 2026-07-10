@@ -256,7 +256,7 @@ export type OperationId =
 
 /** run-policy episode lifecycle phase, surfaced so the control panel on any
  *  computer shows the right episode controls (not just the tab that started it). */
-export type PolicyPhase = "preparing" | "ready" | "recording" | "resetting"
+export type PolicyPhase = "preparing" | "ready" | "recording" | "deciding" | "resetting"
 
 export interface PolicyState {
   phase: PolicyPhase

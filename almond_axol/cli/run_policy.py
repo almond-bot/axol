@@ -289,12 +289,17 @@ class _QueuePolicyControl:
         log_say(
             f"Episode time cap ({episode_time_s}s) reached — choose save/rerecord/quit."
         )
+        # The cap stopped recording, but the operator still owes a save/rerecord/
+        # quit decision — keep the choice controls live (begin/end_episode leave
+        # the phase at "recording"/"resetting", neither of which enables them).
+        self._set_phase("deciding")
         while not self._stop.is_set():
             try:
                 cmd = self._q.get(timeout=0.25)
             except queue.Empty:
                 continue
             if cmd in ("s", "r", "q"):
+                self._set_phase("resetting")
                 return cmd
         return "q"
 
