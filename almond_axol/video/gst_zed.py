@@ -1054,7 +1054,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
         src = (
             f"zedsrc camera-sn={self.serial} "
             f"camera-resolution={_STEREO_RESOLUTION_ENUM[self.resolution]} "
-            f"camera-fps={self.fps} stream-type=7 do-timestamp=false "
+            f"camera-fps={self.fps} stream-type=7 depth-mode=0 "
+            "do-timestamp=false "
             "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
         branches = "  ".join(
