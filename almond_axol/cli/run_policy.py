@@ -189,6 +189,10 @@ class _StdinPolicyControl:
         if self._stop is not None:
             self._stop.set()
 
+    def note_saved(self) -> None:
+        # Web-control-only bookkeeping; the terminal path shows saves via log_say.
+        pass
+
     def close(self) -> None:
         self.end_episode()
 
@@ -206,9 +210,30 @@ class _QueuePolicyControl:
         self._q: "queue.Queue[str]" = queue.Queue()
         self._stop = stop_event
         self._choice: str | None = None
+        # Episode phase/count, read by the serve runner so the web control panel
+        # on ANY connected computer can show the right controls (see snapshot()).
+        self._state_lock = threading.Lock()
+        self._phase = "preparing"
+        self._episodes_recorded = 0
 
     def push(self, command: str) -> None:
         self._q.put(command)
+
+    def _set_phase(self, phase: str) -> None:
+        with self._state_lock:
+            self._phase = phase
+
+    def note_saved(self) -> None:
+        with self._state_lock:
+            self._episodes_recorded += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        """Thread-safe episode phase/count for the /api/op/status API."""
+        with self._state_lock:
+            return {
+                "phase": self._phase,
+                "episodesRecorded": self._episodes_recorded,
+            }
 
     def _drain(self) -> None:
         import queue
@@ -225,6 +250,7 @@ class _QueuePolicyControl:
         from lerobot.utils.utils import log_say
 
         log_say(message)
+        self._set_phase("ready")
         while not self._stop.is_set():
             try:
                 cmd = self._q.get(timeout=0.25)
@@ -239,6 +265,7 @@ class _QueuePolicyControl:
     def begin_episode(self) -> None:
         self._choice = None
         self._drain()
+        self._set_phase("recording")
 
     def poll_choice(self) -> str | None:
         import queue
@@ -272,7 +299,8 @@ class _QueuePolicyControl:
         return "q"
 
     def end_episode(self) -> None:
-        pass
+        # The episode ended; the loop returns to rest before the next gate.
+        self._set_phase("resetting")
 
     def close(self) -> None:
         pass
@@ -1157,6 +1185,7 @@ def _run(
             if dataset is not None:
                 dataset.save_episode()
             episodes_recorded += 1
+            control.note_saved()
             log_say(f"Saved episode {episodes_recorded}.")
             log_say("Returning to rest pose.")
             reset_controller.return_to_rest(robot)

@@ -254,9 +254,20 @@ export type OperationId =
   | "run-policy"
   | "replay-dataset"
 
+/** run-policy episode lifecycle phase, surfaced so the control panel on any
+ *  computer shows the right episode controls (not just the tab that started it). */
+export type PolicyPhase = "preparing" | "ready" | "recording" | "resetting"
+
+export interface PolicyState {
+  phase: PolicyPhase
+  episodesRecorded: number
+}
+
 export interface OpStatus {
   running: boolean
   session: SessionInfo | null
+  /** Present only while run-policy is the running op; null otherwise. */
+  policy: PolicyState | null
 }
 
 export async function fetchOpStatus(): Promise<OpStatus> {

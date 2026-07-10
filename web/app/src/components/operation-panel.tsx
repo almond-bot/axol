@@ -19,6 +19,7 @@ import {
   type CommandSpec,
   type FormValue,
   type OperationMeta,
+  type PolicyState,
   type RobotStatus,
   type SchemaNode,
   type SessionInfo,
@@ -47,6 +48,7 @@ export function OperationPanel({
   host,
   viewerPort,
   startPhase,
+  policy,
   onStart,
   onStop,
   onEpisode,
@@ -69,6 +71,8 @@ export function OperationPanel({
   viewerPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** run-policy episode phase/count (null unless run-policy is the live op). */
+  policy: PolicyState | null
   onStart: () => void
   onStop: () => void
   onEpisode: (command: string) => void
@@ -231,7 +235,9 @@ export function OperationPanel({
                 </div>
               )}
 
-              {meta.id === "run-policy" && live && <EpisodeControls onEpisode={onEpisode} />}
+              {meta.id === "run-policy" && live && (
+                <EpisodeControls policy={policy} onEpisode={onEpisode} />
+              )}
 
               <RunningHints
                 op={meta.id}
@@ -298,20 +304,44 @@ function OptionalSettings({
   )
 }
 
-function EpisodeControls({ onEpisode }: { onEpisode: (command: string) => void }) {
+function EpisodeControls({
+  policy,
+  onEpisode,
+}: {
+  policy: PolicyState | null
+  onEpisode: (command: string) => void
+}) {
+  const phase = policy?.phase ?? "preparing"
+  const ready = phase === "ready" // between-episode gate: start the next episode
+  const recording = phase === "recording" // episode in flight: save or discard
+  // Status line so both the initiator and any other computer see what's happening.
+  const status =
+    phase === "recording"
+      ? "Recording — Save to keep, Discard to re-record."
+      : phase === "ready"
+        ? "Reset the scene, then start the episode."
+        : phase === "resetting"
+          ? "Returning to rest…"
+          : "Preparing…"
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
-      <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
-        Episode control
-      </span>
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
+          Episode control
+        </span>
+        <span className="font-mono text-[0.65rem] text-white/40">
+          {policy?.episodesRecorded ?? 0} saved
+        </span>
+      </div>
+      <span className="text-xs text-white/50">{status}</span>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => onEpisode("start")}>
-          Start Episode
+        <Button size="sm" disabled={!ready} onClick={() => onEpisode("start")}>
+          Start episode
         </Button>
-        <Button variant="outline" size="sm" onClick={() => onEpisode("s")}>
+        <Button variant="outline" size="sm" disabled={!recording} onClick={() => onEpisode("s")}>
           Save
         </Button>
-        <Button variant="outline" size="sm" onClick={() => onEpisode("r")}>
+        <Button variant="outline" size="sm" disabled={!recording} onClick={() => onEpisode("r")}>
           Discard
         </Button>
       </div>

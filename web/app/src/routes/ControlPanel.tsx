@@ -30,6 +30,7 @@ import {
   type CommandSpec,
   type FormValue,
   type OperationId,
+  type PolicyState,
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
@@ -97,8 +98,14 @@ export default function ControlPanel() {
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
-  // Drives the banner's "Updating…" state while the server upgrades + restarts.
-  const [updating, setUpdating] = useState(false)
+  // Bridges the gap between clicking Update and the server's status first
+  // reporting the in-flight update, so the banner switches to the spinner
+  // immediately. Steady state is derived from the server (see `updating`).
+  const [startingUpdate, setStartingUpdate] = useState(false)
+  // Whether the server is applying an update. Derived from its authoritative
+  // status (not a local click) so EVERY connected computer shows the in-flight
+  // update — spinner + phase — rather than a stale, clickable Update button.
+  const updating = startingUpdate || update?.state === "updating"
   // Current step shown in the banner while updating (so it isn't an opaque
   // spinner). Sourced from the server's reported phase, except "restarting"
   // which we infer locally once the server stops responding (it exited).
@@ -121,6 +128,9 @@ export default function ControlPanel() {
   const [settingsByOp, setSettingsByOp] = useState<OpSettings>(() => loadAllOpSettings())
 
   const [session, setSession] = useState<SessionInfo | null>(null)
+  // run-policy episode phase/count, from the server so the episode controls are
+  // correct on any computer (not just the tab that started the run).
+  const [policy, setPolicy] = useState<PolicyState | null>(null)
   const [busy, setBusy] = useState(false)
   // Short label shown on the Start button while a start is being prepared (e.g.
   // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
@@ -183,6 +193,7 @@ export default function ControlPanel() {
             setSession(op.session)
             setSelectedOp(op.session.command as OperationId)
           }
+          setPolicy(op.running ? op.policy : null)
         })
         .catch(() => {})
     },
@@ -304,10 +315,11 @@ export default function ControlPanel() {
     setCommands([])
     setRobot(null)
     setSession(null)
+    setPolicy(null)
     setCameraDevices(null)
     setCameraDetectError(null)
     setUpdate(null)
-    setUpdating(false)
+    setStartingUpdate(false)
     setUpdatePhase(null)
     autoRobotRef.current = false
   }
@@ -461,7 +473,9 @@ export default function ControlPanel() {
     const t = setInterval(() => {
       fetchOpStatus()
         .then((op) => {
-          if (active && op.session) setSession(op.session)
+          if (!active) return
+          if (op.session) setSession(op.session)
+          setPolicy(op.running ? op.policy : null)
         })
         .catch(() => {})
     }, 1500)
@@ -481,6 +495,48 @@ export default function ControlPanel() {
       .then(setUpdate)
       .catch(() => {})
   }, [conn.state, updating, isLive])
+
+  // Drive an in-flight update to completion on ANY connected computer: advance
+  // the phase, surface a failure, and hard-reload once the backend is back on
+  // the target release (the hosted front-end is on Vercel, so a reload also
+  // pulls the latest UI and reconnects to the restarted server). Keys off the
+  // server's "updating" state rather than a local click, so a second computer
+  // that opens the panel mid-update behaves like the initiator. Replaces the
+  // per-click watch loop handleUpdate used to run itself.
+  useEffect(() => {
+    if (conn.state !== "ok" || !updating) return
+    const target = update?.remoteVersion ?? null
+    const deadline = Date.now() + 5 * 60_000
+    let active = true
+    const t = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(t)
+        toast.error("Update is taking longer than expected. Reload to retry.")
+        return
+      }
+      try {
+        const u = await fetchUpdateStatus()
+        if (!active) return
+        setUpdate(u)
+        if (u.state === "error") {
+          toast.error(u.error ?? "Update failed.")
+          return
+        }
+        // Reflect the server's current step so the banner shows progress.
+        if (u.phase) setUpdatePhase(u.phase)
+        // Back on the new release — done.
+        if (target && u.version === target) window.location.reload()
+      } catch {
+        // Server stopped responding: it exited to relaunch (or is briefly
+        // unreachable). Show "restarting" and keep watching for it to return.
+        if (active) setUpdatePhase("restarting")
+      }
+    }, 2000)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, updating, update?.remoteVersion, toast])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -555,6 +611,8 @@ export default function ControlPanel() {
       const spec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
       const result = await startOperation(selectedOp, settings, spec)
       setSession(result)
+      // Fresh run — clear any stale phase; the live poll repopulates it.
+      setPolicy(null)
     } catch (e) {
       toast.error(String(e))
     } finally {
@@ -582,58 +640,30 @@ export default function ControlPanel() {
     sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
   }
 
-  // Apply the available update, then hard-reload once the server is back on the
-  // new release. The server upgrades and exits (systemd relaunches it), so the
-  // start request and the watch polls below tolerate it briefly going away.
+  // Kick off the available update. The server upgrades and exits (systemd
+  // relaunches it); the update-watcher effect — which runs on any computer while
+  // the server reports an update in flight — then advances the phase and
+  // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
-    const target = update?.remoteVersion
-    if (!target) return
-    setUpdating(true)
+    if (!update?.remoteVersion) return
+    setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {
       await startUpdate()
     } catch (e) {
       toast.error(`Update failed to start: ${e}`)
-      setUpdating(false)
+      setStartingUpdate(false)
       setUpdatePhase(null)
       return
     }
-    // The hosted UI is served by Vercel, so a hard reload also pulls the latest
-    // front-end; reconnecting to the restarted backend re-runs loadServer.
-    const reload = () => window.location.reload()
-    const deadline = Date.now() + 5 * 60_000
-    const watch = setInterval(async () => {
-      if (Date.now() > deadline) {
-        clearInterval(watch)
-        setUpdating(false)
-        setUpdatePhase(null)
-        toast.error("Update is taking longer than expected. Reload to retry.")
-        return
-      }
-      try {
-        const u = await fetchUpdateStatus()
+    // Pull the now-"updating" status so `updating` derives true and the watcher
+    // takes over; then drop the optimistic flag (server state carries it now).
+    fetchUpdateStatus()
+      .then((u) => {
         setUpdate(u)
-        if (u.state === "error") {
-          clearInterval(watch)
-          setUpdating(false)
-          setUpdatePhase(null)
-          toast.error(u.error ?? "Update failed.")
-          return
-        }
-        // Reflect the server's current step (upgrading/provisioning) so the
-        // banner shows progress rather than an opaque spinner.
-        if (u.phase) setUpdatePhase(u.phase)
-        // Server is back and now running the target release — done.
-        if (u.version === target) {
-          clearInterval(watch)
-          reload()
-        }
-      } catch {
-        // Server stopped responding: it exited to restart (or is briefly
-        // unreachable). Show "restarting" and keep watching for it to return.
-        setUpdatePhase("restarting")
-      }
-    }, 2000)
+        setStartingUpdate(false)
+      })
+      .catch(() => {})
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
@@ -701,6 +731,7 @@ export default function ControlPanel() {
           host={viewerHost}
           viewerPort={viewerPort}
           startPhase={startPhase}
+          policy={selectedLive ? policy : null}
           onStart={handleStart}
           onStop={handleStop}
           onEpisode={handleEpisode}
