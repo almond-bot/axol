@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react"
-import { Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
+import { ChevronDown, Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
 import {
   flattenFields,
   type AdvancedSection,
@@ -44,6 +44,8 @@ interface Draft {
  * devices. Edits stage locally until **Save**.
  */
 export function SettingsSection({
+  open,
+  onOpenChange,
   tab,
   onTabChange,
   snapshot,
@@ -57,6 +59,8 @@ export function SettingsSection({
   usbBusy,
   onUsbConnect,
 }: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
   tab: SettingsTab
   onTabChange: (tab: SettingsTab) => void
   /** Server-stored settings + schema; null while loading or on an old host. */
@@ -186,111 +190,124 @@ export function SettingsSection({
 
   return (
     <Card className="gap-0 p-0">
-      <div className="flex items-center justify-between gap-3 border-b border-white/10 px-5 pt-4 pb-0">
-        <span className="pb-3 font-mono text-xs tracking-widest text-white/40 uppercase">
-          Settings
-        </span>
-        <span className="hidden pb-3 text-xs text-white/35 sm:block">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => onOpenChange(!open)}
+        className={cn(
+          "flex w-full items-center justify-between gap-3 px-5 py-3.5 text-left",
+          open && "border-b border-white/10"
+        )}
+      >
+        <span className="font-mono text-xs tracking-widest text-white/40 uppercase">Settings</span>
+        <span className="ml-auto hidden text-xs text-white/35 sm:block">
           shared by all operations on this robot
         </span>
-      </div>
+        <ChevronDown
+          className={cn("size-4 shrink-0 text-white/45 transition-transform", open && "rotate-180")}
+        />
+      </button>
 
-      {/* Horizontal tab bar */}
-      <nav className="flex gap-1 overflow-x-auto border-b border-white/10 px-3 py-2">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            type="button"
-            onClick={() => onTabChange(t.key)}
-            className={cn(
-              "rounded-lg px-3 py-1.5 text-sm whitespace-nowrap transition-colors",
-              t.key === tab
-                ? "bg-[#eff483]/10 text-[#eff483]"
-                : "text-white/60 hover:bg-white/[0.05] hover:text-white/85"
+      {open && (
+        <>
+          {/* Horizontal tab bar */}
+          <nav className="flex gap-1 overflow-x-auto border-b border-white/10 px-3 py-2">
+            {tabs.map((t) => (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => onTabChange(t.key)}
+                className={cn(
+                  "rounded-lg px-3 py-1.5 text-sm whitespace-nowrap transition-colors",
+                  t.key === tab
+                    ? "bg-[#eff483]/10 text-[#eff483]"
+                    : "text-white/60 hover:bg-white/[0.05] hover:text-white/85"
+                )}
+              >
+                {t.label}
+              </button>
+            ))}
+          </nav>
+
+          <div className="p-5">
+            {!draft ? (
+              <p className="text-sm text-white/40">Loading settings…</p>
+            ) : supportError && tab !== "cameras" && tab !== "usb" ? (
+              <UpdateRequired error={supportError} />
+            ) : tab === "cameras" ? (
+              <CamerasPanel
+                spec={draft.cameras}
+                onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+                devices={devices}
+                detecting={detecting}
+                onRefresh={onRefresh}
+              />
+            ) : tab === "usb" ? (
+              <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
+            ) : tab === "pose" ? (
+              <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
+            ) : tab === "advanced" ? (
+              <AdvancedPanel
+                sections={snapshot?.advancedSchema ?? []}
+                overrides={draft.advanced}
+                onChange={(key, value) =>
+                  setDraft((d) => (d ? { ...d, advanced: { ...d.advanced, [key]: value } } : d))
+                }
+                onReset={(key) =>
+                  setDraft((d) => {
+                    if (!d) return d
+                    const advanced = { ...d.advanced }
+                    delete advanced[key]
+                    return { ...d, advanced }
+                  })
+                }
+              />
+            ) : activeCategory ? (
+              <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
+            ) : (
+              <p className="text-sm text-white/40">Loading settings…</p>
             )}
-          >
-            {t.label}
-          </button>
-        ))}
-      </nav>
+          </div>
 
-      <div className="p-5">
-        {!draft ? (
-          <p className="text-sm text-white/40">Loading settings…</p>
-        ) : supportError && tab !== "cameras" && tab !== "usb" ? (
-          <UpdateRequired error={supportError} />
-        ) : tab === "cameras" ? (
-          <CamerasPanel
-            spec={draft.cameras}
-            onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
-            devices={devices}
-            detecting={detecting}
-            onRefresh={onRefresh}
-          />
-        ) : tab === "usb" ? (
-          <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
-        ) : tab === "pose" ? (
-          <PosePanel fields={poseFields} values={draft.values} onChange={setValue} />
-        ) : tab === "advanced" ? (
-          <AdvancedPanel
-            sections={snapshot?.advancedSchema ?? []}
-            overrides={draft.advanced}
-            onChange={(key, value) =>
-              setDraft((d) => (d ? { ...d, advanced: { ...d.advanced, [key]: value } } : d))
-            }
-            onReset={(key) =>
-              setDraft((d) => {
-                if (!d) return d
-                const advanced = { ...d.advanced }
-                delete advanced[key]
-                return { ...d, advanced }
-              })
-            }
-          />
-        ) : activeCategory ? (
-          <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
-        ) : (
-          <p className="text-sm text-white/40">Loading settings…</p>
-        )}
-      </div>
-
-      <div className="flex items-center justify-between gap-2 border-t border-white/10 px-5 py-3">
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="sm" onClick={exportFile}>
-            <Download />
-            Export
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => fileRef.current?.click()}>
-            <Upload />
-            Import
-          </Button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/json"
-            className="hidden"
-            onChange={(e) => {
-              const file = e.target.files?.[0]
-              if (file) file.text().then(importFile)
-              e.target.value = ""
-            }}
-          />
-        </div>
-        <div className="flex items-center gap-2">
-          {dirty && (
-            <>
-              <span className="text-xs text-white/40">Unsaved changes</span>
-              <Button variant="outline" size="sm" onClick={discard}>
-                Discard
+          <div className="flex items-center justify-between gap-2 border-t border-white/10 px-5 py-3">
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" onClick={exportFile}>
+                <Download />
+                Export
               </Button>
-            </>
-          )}
-          <Button size="sm" onClick={save} disabled={!dirty || saving}>
-            {saving && <Loader2 className="animate-spin" />}
-            Save
-          </Button>
-        </div>
-      </div>
+              <Button variant="ghost" size="sm" onClick={() => fileRef.current?.click()}>
+                <Upload />
+                Import
+              </Button>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="application/json"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0]
+                  if (file) file.text().then(importFile)
+                  e.target.value = ""
+                }}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              {dirty && (
+                <>
+                  <span className="text-xs text-white/40">Unsaved changes</span>
+                  <Button variant="outline" size="sm" onClick={discard}>
+                    Discard
+                  </Button>
+                </>
+              )}
+              <Button size="sm" onClick={save} disabled={!dirty || saving}>
+                {saving && <Loader2 className="animate-spin" />}
+                Save
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
     </Card>
   )
 }

@@ -229,6 +229,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help="Gravity compensation control-loop rate.",
                 targets={"gravity-comp": ("rate_hz",)},
             ),
+            SettingDef(
+                key="robot.gravity_telemetry_hz",
+                label="Gravity telemetry rate (Hz)",
+                type="number",
+                help="Background motor telemetry rate during gravity compensation.",
+                targets={"gravity-comp": ("telemetry_hz",)},
+            ),
         ),
     ),
     SettingCategory(
@@ -301,6 +308,20 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "teleop": ("teleop.rest_pose_right",),
                     "collect-data": (f"{_VRT}.rest_pose_right",),
                 },
+            ),
+            SettingDef(
+                key="teleop.id",
+                label="Teleoperator ID",
+                type="text",
+                help="LeRobot identifier used for this teleoperator instance.",
+                targets={"collect-data": ("teleop_config.id",)},
+            ),
+            SettingDef(
+                key="teleop.calibration_dir",
+                label="Teleoperator calibration directory",
+                type="text",
+                help="Directory containing LeRobot teleoperator calibration files.",
+                targets={"collect-data": ("teleop_config.calibration_dir",)},
             ),
         ),
     ),
@@ -384,6 +405,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "collect-data": ("fps",),
                     "run-policy": ("fps",),
                 },
+            ),
+            SettingDef(
+                key="recording.replay_fps",
+                label="Replay fps",
+                type="number",
+                help="Replay rate override; 0 uses the dataset's recorded frame rate.",
+                targets={"replay-dataset": ("fps",)},
             ),
             SettingDef(
                 key="recording.observe_torques",
@@ -639,7 +667,9 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
     AdvancedSection(
         key="lerobot",
         label="LeRobot robot",
-        ref_op="collect-data",
+        # Replay exposes the same robot subtree without importing the optional
+        # ZED stack, so these controls remain available on camera-less hosts.
+        ref_op="replay-dataset",
         ref_prefix=_ROBOT,
         targets={
             "collect-data": _ROBOT,

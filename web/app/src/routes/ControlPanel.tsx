@@ -131,6 +131,7 @@ export default function ControlPanel() {
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  const [settingsOpen, setSettingsOpen] = useState(() => cameraCount(loadCameras()) === 0)
   // Shared settings stored on the serve host (~/.almond/settings.json); null
   // until fetched. settingsError marks a host too old for the settings API —
   // cameras then fall back to the legacy localStorage flow.
@@ -163,6 +164,14 @@ export default function ControlPanel() {
   const settingsRef = useRef<HTMLDivElement>(null)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
+
+  const hasConfiguredCamera = cameraCount(cameras) > 0
+  useEffect(() => {
+    // Keep setup in view until the first camera is assigned. Later camera
+    // presence changes drive the default state, but manual toggles stay put.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSettingsOpen(!hasConfiguredCamera)
+  }, [hasConfiguredCamera])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -391,6 +400,7 @@ export default function ControlPanel() {
 
   function openSettings(tab: SettingsTab = "cameras") {
     setSettingsTab(tab)
+    setSettingsOpen(true)
     settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
   }
 
@@ -784,6 +794,8 @@ export default function ControlPanel() {
         {conn.state === "ok" && (
           <div ref={settingsRef} className="scroll-mt-4">
             <SettingsSection
+              open={settingsOpen}
+              onOpenChange={setSettingsOpen}
               tab={settingsTab}
               onTabChange={setSettingsTab}
               snapshot={settingsSnap}

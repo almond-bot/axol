@@ -33,11 +33,13 @@ function Tile({
   extra?: ReactNode
 }) {
   return (
-    <div className="group relative flex min-w-0 flex-col gap-2.5 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-4">
-      {/* title — its own line */}
-      <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-        {icon}
-        <span className="font-mono">{title}</span>
+    <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
+      <div className="flex min-h-8 items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
+          {icon}
+          <span className="font-mono">{title}</span>
+        </div>
+        {children && <div className="shrink-0">{children}</div>}
       </div>
       {/* status — its own line, full width */}
       <div className="flex items-center gap-2 text-sm">
@@ -50,8 +52,6 @@ function Tile({
       </div>
       {/* optional extra detail (e.g. the Axol motor grid + fault list) */}
       {extra}
-      {/* action — pinned to the bottom so the buttons align across the row */}
-      {children && <div className="mt-auto flex justify-end pt-1">{children}</div>}
     </div>
   )
 }
@@ -129,7 +129,7 @@ export function ConnectionsBar({
             : "Disconnected"
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
@@ -207,67 +207,42 @@ function motorHealthy(m: MotorHealth): boolean {
 const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}`
 
 /**
- * Per-motor health as two rows of squares (two L/R clusters of 8 each):
- * the top row is CAN reachability, the bottom row is the motor's error
- * status — hover a red error square for what the error is.
+ * Per-motor health as one status row. CAN reachability and the reported motor
+ * error are one result: an unreachable motor is an error, not a separate state.
  */
 export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
-  const rows: {
-    label: string
-    color: (m: MotorHealth) => "ok" | "err" | "unknown"
-    tip: (m: MotorHealth) => string
-  }[] = [
-    {
-      label: "CAN",
-      color: (m) => (m.reachable ? "ok" : "err"),
-      tip: (m) => `${jointName(m)}: ${m.reachable ? "reachable" : "unreachable"}`,
-    },
-    {
-      label: "ERR",
-      color: (m) =>
-        !m.reachable && m.status == null
-          ? "unknown"
-          : m.status === "OK" || m.status === "DISABLED" || m.status == null
-            ? "ok"
-            : "err",
-      tip: (m) => {
-        if (!m.reachable && m.status == null) return `${jointName(m)}: unknown (unreachable)`
-        const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
-        const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""
-        return `${jointName(m)}: ${status}${temp}`
-      },
-    },
-  ]
+  const color = (m: MotorHealth) => (motorHealthy(m) ? "ok" : "err")
+  const tip = (m: MotorHealth) => {
+    if (!m.reachable) return `${jointName(m)}: unreachable`
+    const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
+    const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""
+    return `${jointName(m)}: ${status}${temp}`
+  }
   const arms = ["left", "right"]
   const SQUARE = {
     ok: "bg-emerald-400/80",
     err: "bg-red-400/70",
-    unknown: "bg-white/15",
   }
   return (
-    <div className="flex flex-col gap-1.5">
-      {rows.map((row) => (
-        <div key={row.label} className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="w-7 shrink-0 font-mono text-[0.6rem] tracking-wide text-white/35">
-            {row.label}
-          </span>
-          {arms.map((arm) => (
-            <div key={arm} className="flex items-center gap-1.5">
-              <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-              <div className="flex gap-1">
-                {robot.motors
-                  .filter((m) => m.arm === arm)
-                  .map((m) => (
-                    <span
-                      key={m.joint}
-                      title={row.tip(m)}
-                      className={cn("size-3 rounded-[3px]", SQUARE[row.color(m)])}
-                    />
-                  ))}
-              </div>
-            </div>
-          ))}
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      <span className="w-10 shrink-0 font-mono text-[0.6rem] tracking-wide text-white/35">
+        STATUS
+      </span>
+      {arms.map((arm) => (
+        <div key={arm} className="flex items-center gap-1.5">
+          <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
+          <div className="flex gap-1">
+            {robot.motors
+              .filter((m) => m.arm === arm)
+              .map((m) => (
+                <span
+                  key={m.joint}
+                  title={tip(m)}
+                  className={cn("size-3 rounded-[3px]", SQUARE[color(m)])}
+                />
+              ))}
+          </div>
         </div>
       ))}
     </div>
