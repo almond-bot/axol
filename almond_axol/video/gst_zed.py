@@ -63,9 +63,10 @@ _RESOLUTION_DIMS: dict[str, tuple[int, int]] = {
     "HD1080": (1920, 1080),
     "HD1200": (1920, 1200),
 }
-# zedsrc camera-resolution enum (GstZedSrcRes) for the stereo ZED X. Only the
-# GMSL2 60-fps modes are exposed (SVGA is ZED-X-One-only).
-_STEREO_RESOLUTION_ENUM: dict[str, int] = {"HD1080": 1, "HD1200": 2}
+# zedsrc camera-resolution enum (GstZedSrcRes) for the stereo ZED X. Note the
+# enum values differ from zedxonesrc's: SVGA is 4 here but 0 there (HD1080 and
+# HD1200 happen to share 1/2 in both).
+_STEREO_RESOLUTION_ENUM: dict[str, int] = {"SVGA": 4, "HD1080": 1, "HD1200": 2}
 
 # Per-subscriber AU queue depth. A healthy consumer pops every AU as it
 # arrives; the bound only matters for a stalled consumer, where the oldest
