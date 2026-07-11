@@ -14,11 +14,14 @@ The robot is moved to the rest pose before playback so the arm starts from the
 same place every episode does in ``collect-data`` (episodes are recorded from
 rest, so the first replayed action is ~rest and there's no jump). Each frame's
 action is sent at the dataset's recorded fps to reproduce the original timing,
-then a final return-to-rest leaves the arm parked.
+then the soft-shutdown park leaves the arms eased down at the zero pose.
 
 With ``--loop`` the episode replays continuously (returning to rest between
-takes) until stopped with Ctrl+C, or Stop in the control panel; either way the
-arm returns to the rest pose before the operation exits.
+takes) until stopped with Ctrl+C, or Stop in the control panel. On a clean
+stop the arms are parked — eased to the rest pose and then to the all-zeros
+pose — before the motors release (``--park_on_exit false`` opts out); after an
+error the possibly-faulted robot is never commanded, and the motors release
+where they are.
 """
 
 from __future__ import annotations
@@ -70,8 +73,20 @@ class ReplayDatasetConfig:
     fps: int = 0
     # Replay the episode on a loop until stopped (Ctrl+C, or Stop in the UI),
     # returning to rest between takes. Off by default (a single replay). Either
-    # way the arm returns to the rest pose before the operation exits.
+    # way a clean stop parks the arms before the operation exits (see
+    # park_on_exit).
     loop: bool = False
+    # Park the arms on a clean stop (Ctrl+C or Stop in the control panel):
+    # ease both arms to the rest pose and then to the all-zeros pose before
+    # the motors release. Skipped after a propagating error — a
+    # possibly-faulted robot is never commanded blind. A second Ctrl+C during
+    # the park releases the motors immediately.
+    park_on_exit: bool = True
+    # Rest pose targeted by the pre-replay/between-take resets and the park's
+    # first leg: 7 arm-joint angles (radians, in Joint enum order), one list
+    # per arm. None keeps the built-in VRTeleopConfig rest pose.
+    rest_pose_left: list[float] | None = None
+    rest_pose_right: list[float] | None = None
     log_level: LogLevel = "INFO"
 
 
@@ -99,7 +114,7 @@ def main(argv: list[str]) -> None:
 
 
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
-    """Load the episode, return to rest, replay its actions, then return to rest."""
+    """Load the episode, return to rest, replay its actions, then park the arms."""
     from pathlib import Path
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -169,21 +184,38 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     actions = dataset.select_columns(ACTION)
 
     # Spawn the IK worker now so its JAX JIT (~10-20 s) overlaps with the robot
-    # connect, exactly as run-policy does before its policy load.
-    reset_controller = IKResetController()
+    # connect, exactly as run-policy does before its policy load. A configured
+    # rest pose (rest_pose_left / rest_pose_right) rides in on a VRTeleopConfig;
+    # the defaults keep the stock config.
+    vr_config = None
+    if cfg.rest_pose_left is not None or cfg.rest_pose_right is not None:
+        import numpy as np
+
+        from ..teleop.config import VRTeleopConfig
+
+        rest_overrides = {}
+        for name, pose in (
+            ("rest_pose_left", cfg.rest_pose_left),
+            ("rest_pose_right", cfg.rest_pose_right),
+        ):
+            if pose is None:
+                continue
+            # Fail here with a clear message — a wrong-length pose otherwise
+            # surfaces ~20 s later as a shape error inside the IK worker.
+            if len(pose) != 7:
+                raise ValueError(
+                    f"--{name} must list exactly 7 arm-joint angles in "
+                    f"radians (Joint enum order); got {len(pose)}."
+                )
+            rest_overrides[name] = np.asarray(pose, dtype=np.float32)
+        vr_config = VRTeleopConfig(**rest_overrides)
+    reset_controller = IKResetController(vr_config=vr_config)
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
-    # Tracks whether the arm is currently parked at rest, so the teardown only
-    # adds a return-to-rest when one is actually needed (and not a redundant one
-    # right after a loop iteration already ended at rest).
-    rested = False
-
     def _go_to_rest(message: str = "Returning to rest pose.") -> None:
-        nonlocal rested
         log_say(message)
         reset_controller.return_to_rest(robot)
-        rested = True
 
     def _stopped() -> bool:
         return stop_event.is_set()
@@ -207,11 +239,10 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         period = 1.0 / fps
         iteration = 0
         # Replay once, or repeatedly when ``loop`` is set, until stopped (Ctrl+C
-        # or the UI's Stop). The arm is parked at rest before the op exits — on a
-        # clean finish and on a stop alike — by the teardown below.
+        # or the UI's Stop). On a clean finish and on a stop alike, the arms
+        # are parked (rest pose, then zero) by the teardown below.
         while not _stopped():
             iteration += 1
-            rested = False
             if loop:
                 log_say(
                     f"Replaying episode {episode} (loop {iteration}): "
@@ -240,25 +271,31 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     except KeyboardInterrupt:
         pass
     finally:
-        # Ignore SIGINT during cleanup so a second Ctrl+C can't abort partway
-        # through the return-to-rest or teardown (mirrors run-policy).
         import signal
+        import sys
 
+        # Park on a clean stop: ease the arms to the rest pose and then to the
+        # all-zeros pose BEFORE robot.disconnect() releases the motors. The
+        # rest leg is a zero-length move when a loop iteration already ended at
+        # rest (the planner handles it — no special case). Skipped after a
+        # propagating error: the robot may be faulted and must not be commanded
+        # blind. Runs before the SIG_IGN below so the park's own raising
+        # handler lets a second Ctrl+C abort it; park() itself is best-effort
+        # and never raises.
+        clean = sys.exc_info()[0] is None
+        try:
+            if clean and cfg.park_on_exit and robot.is_connected:
+                reset_controller.park(robot)
+        except KeyboardInterrupt:
+            # Ctrl+C before the park installed its raising handler: skip it.
+            pass
+
+        # Ignore SIGINT for the rest of cleanup so another Ctrl+C can't abort
+        # partway through teardown (mirrors run-policy).
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except (ValueError, OSError):
             pass
-
-        # Park the arm at rest before killing the operation, unless it's already
-        # there (a loop iteration just ended at rest) or never moved (connect
-        # failed). The reset is planned by the IK worker (a quick round-trip) and
-        # then played locally, so it still completes if a slow stop's watchdog
-        # force-kills the worker mid-move.
-        if robot.is_connected and not rested:
-            try:
-                _go_to_rest("Replay finished. Returning to rest pose.")
-            except Exception:  # noqa: BLE001 - best-effort; still tear down
-                _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
         log_say("Stopping.")
         try:

@@ -262,6 +262,14 @@ class CollectDataConfig:
     push_to_hub: bool = False
     rerun_ip: str | None = None
     rerun_port: int = 9876
+    # Park the arms on a clean stop (Ctrl+C, or Stop in the control panel):
+    # ease both arms to the all-zeros pose — a collision-aware move planned by
+    # the IK worker — before the motors release, instead of dropping from
+    # wherever the session ended. The grippers hold their current value for
+    # the whole move. Skipped after a propagating error: a possibly-faulted
+    # robot is never commanded blind. A second Ctrl+C during the park releases
+    # the motors immediately.
+    park_on_exit: bool = True
     log_level: LogLevel = "INFO"
 
 
@@ -747,12 +755,93 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         teleop.send_feedback_error()
         raise
     finally:
+        import signal
+        import sys
+
         log_say("Stopping.")
 
         if diag is not None:
             diag.stop()
         if tegra is not None:
             tegra.stop()
+
+        # Park the arms on a clean stop BEFORE robot.disconnect() releases the
+        # motors (and before teleop.disconnect() — the drive loop below pulls
+        # its actions from the teleop's IK machinery): latch a return-to-zero
+        # on the teleop and drive it exactly the way the between-episode
+        # _reset_loop drives a rest move. Skipped after a propagating error —
+        # a possibly-faulted robot is never commanded blind. No
+        # reset_command_state is needed here: the teleop control loop was
+        # commanding the arms continuously right up to the stop, so the
+        # per-step jump guard's cache is fresh.
+        if (
+            sys.exc_info()[0] is None
+            and cfg.park_on_exit
+            and robot.is_connected
+            and teleop.is_connected
+        ):
+            park_abort = threading.Event()
+            park_fut = None
+
+            async def _park_drive() -> int:
+                # Play the park to completion. Unlike _reset_loop this must
+                # NOT bail on _stopped() — the session stop flag is set during
+                # shutdown, which is exactly when this runs — so it watches
+                # only the abort event and a hard time cap. Returns the number
+                # of steps driven so the caller can tell a played move from a
+                # dispatch that failed underneath the is_resetting flag.
+                steps = 0
+                cap = time.perf_counter() + 30.0
+                deadline = time.perf_counter()
+                while (
+                    teleop.is_resetting
+                    and not park_abort.is_set()
+                    and time.perf_counter() < cap
+                ):
+                    deadline += teleop_interval
+                    joint_obs = robot.get_joint_observation()
+                    act = teleop.get_action()
+                    await robot.send_action_async(robot_action_proc((act, joint_obs)))
+                    steps += 1
+                    await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+                return steps
+
+            # One containment for the WHOLE park — a second Ctrl+C anywhere
+            # in it (not just while blocked on the future) aborts the move
+            # and drains the drive loop so nothing is commanding the robot
+            # when teardown continues.
+            try:
+                log_say("Parking arms: easing to the zero pose.")
+                teleop.request_zero()
+                park_fut = asyncio.run_coroutine_threadsafe(
+                    _park_drive(), robot.event_loop
+                )
+                if park_fut.result() < 10:
+                    # A dead IK worker clears is_resetting within a step or
+                    # two, indistinguishable from a completed move by the flag
+                    # alone — this few steps means nothing actually played.
+                    _logger.warning(
+                        "park never played (IK worker gone?); releasing motors "
+                        "from the current pose."
+                    )
+            except KeyboardInterrupt:
+                park_abort.set()
+                if park_fut is not None:
+                    try:
+                        park_fut.result(timeout=5.0)
+                    except BaseException:  # noqa: BLE001
+                        park_fut.cancel()
+                log_say("Park aborted — releasing motors now.")
+            except Exception:  # noqa: BLE001 - never block teardown
+                _logger.exception("Soft-shutdown park failed; releasing motors.")
+
+        # Ignore SIGINT for the remainder of teardown so another Ctrl+C can't
+        # abort partway through disconnect / the recorder's save (mirrors
+        # run-policy). Restored at end of block.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
 
         robot.disconnect()
         teleop.disconnect()
@@ -769,3 +858,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 os.sched_setaffinity(0, _orig_affinity)
             except OSError:
                 pass
+
+        # Restore the default handler so Ctrl+C can still kill any leaked
+        # non-daemon thread keeping the interpreter alive.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass

@@ -400,6 +400,15 @@ def _relay_main(
     omitted from ``raw_meta`` so the parent can fall back to the in-process
     camera path.
     """
+    # Ignore Ctrl+C — a terminal SIGINT hits the whole process group, but the
+    # parent drives this relay's shutdown over the pipe (``shutdown()`` sends
+    # ``None``). Without this it dies on Ctrl+C mid-``asyncio.run``, spewing a
+    # CancelledError/KeyboardInterrupt traceback during teardown and dropping
+    # the headset feed while the soft-shutdown park is still moving the arms.
+    from ..utils.signals import ignore_sigint
+
+    ignore_sigint()
+
     logging.basicConfig(level=log_level)
 
     # Disable the cyclic garbage collector in the relay. aiortc sends WebRTC media

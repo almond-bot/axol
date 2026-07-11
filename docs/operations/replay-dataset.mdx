@@ -3,7 +3,7 @@ title: "Replay Dataset"
 description: "Replay a recorded LeRobot dataset episode on the arms — from the web control panel or the CLI."
 ---
 
-Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight back onto the arms: the episode's recorded `action` column is streamed to the motors frame by frame, then the robot returns to its rest pose. It's the inverse of [data collection](/operations/data-collection) — instead of recording teleop actions it reproduces an already-recorded take on the hardware. You can launch it from the **web control panel** or the **CLI** (`axol replay-dataset`).
+Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight back onto the arms: the episode's recorded `action` column is streamed to the motors frame by frame; on a clean stop the arms are then parked — eased to the rest pose and down to the all-zeros pose — before the motors release (after an error, or with `--park_on_exit false`, there is no teardown motion). It's the inverse of [data collection](/operations/data-collection) — instead of recording teleop actions it reproduces an already-recorded take on the hardware. You can launch it from the **web control panel** or the **CLI** (`axol replay-dataset`).
 
 No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.
 
@@ -30,7 +30,7 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
       </Step>
 
       <Step title="Start">
-        Clear the workspace, then press **Start**. The arm moves to rest, replays the episode at the recorded timing, and returns to rest. With **loop** on it repeats (returning to rest between takes) until you press **Stop**.
+        Clear the workspace, then press **Start**. The arm moves to rest, replays the episode at the recorded timing, and is parked — eased to the rest pose, then down to the zero pose — before the motors release. With **loop** on it repeats (returning to rest between takes) until you press **Stop**, which parks the arms the same way.
       </Step>
     </Steps>
   </Tab>
@@ -43,7 +43,7 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
     axol replay-dataset --repo_id myorg/pick-place --episode 0 --loop true   # loop until Ctrl+C
     ```
 
-    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. Press `Ctrl+C` to stop — the arm returns to rest before exiting. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
+    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. Press `Ctrl+C` to stop — on a clean stop the arms are parked (rest pose, then zero) before the motors release; a second `Ctrl+C` aborts the park, and `--park_on_exit false` skips it entirely. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
   </Tab>
 </Tabs>
 

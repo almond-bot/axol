@@ -31,12 +31,26 @@ from typing import TYPE_CHECKING, Any, Callable
 from ..constants import ARM_JOINTS
 
 if TYPE_CHECKING:
+    import numpy as np
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.types import RobotAction
 
+    from ..kinematics.config import KinematicsConfig
+    from ..teleop.config import VRTeleopConfig
     from .robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
+
+
+def _announce(text: str) -> None:
+    """Announce a park step via lerobot's ``log_say`` (spoken prompts match
+    the CLIs' own status lines); fall back to plain logging without lerobot."""
+    try:
+        from lerobot.utils.utils import log_say
+
+        log_say(text)
+    except Exception:  # noqa: BLE001 - announcement must never break the park
+        _logger.info(text)
 
 
 class IKResetController:
@@ -50,12 +64,19 @@ class IKResetController:
     so the IK JIT overlaps with the policy load.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        vr_config: "VRTeleopConfig | None" = None,
+        kin_config: "KinematicsConfig | None" = None,
+    ) -> None:
         from ..kinematics.config import KinematicsConfig
         from ..teleop.config import VRTeleopConfig
 
-        self._vr_cfg = VRTeleopConfig()
-        self._kin_cfg = KinematicsConfig()
+        # Both configs default to the stock ones (unchanged behavior); pass a
+        # VRTeleopConfig to customize the rest pose the resets target
+        # (rest_pose_left / rest_pose_right) or the playback frequency.
+        self._vr_cfg = vr_config if vr_config is not None else VRTeleopConfig()
+        self._kin_cfg = kin_config if kin_config is not None else KinematicsConfig()
         self._proc: Any | None = None
         self._conn: Any | None = None
         self._q_init: Any | None = None
@@ -106,60 +127,236 @@ class IKResetController:
 
     def return_to_rest(self, robot: "AxolRobot") -> None:
         """Plan and play a collision-aware trajectory to the rest pose."""
+        self._request_and_play(robot)
+
+    def _request_and_play(
+        self,
+        robot: "AxolRobot",
+        q_target: "np.ndarray | None" = None,
+        *,
+        deadline_s: float | None = None,
+        hold_grippers: "tuple[float, float] | None" = None,
+        abort_on_sigint: bool = False,
+    ) -> bool:
+        """Plan a collision-aware trajectory and stream it to the robot.
+
+        ``q_target=None`` plans to the configured rest pose (the worker's
+        original 2-tuple reset message, unchanged); an explicit target is sent
+        as the 3-tuple form. ``deadline_s`` caps the move — the plan
+        round-trip gets the remaining budget and past the deadline the
+        playback loop breaks with a warning, so whatever pose was reached
+        stands. ``hold_grippers`` is a ``(left, right)`` pair of normalized
+        gripper targets to hold on every waypoint instead of ramping the
+        grippers open. ``abort_on_sigint`` makes Ctrl+C raise for the
+        duration of the move so an operator can abort a park; off the main
+        thread (e.g. under ``axol serve``, where handlers can't be installed)
+        the move simply runs non-abortable, still capped by ``deadline_s``.
+
+        Returns ``False`` when the move was aborted by Ctrl+C or the worker
+        didn't answer the plan request within the budget, ``True`` otherwise
+        (a mid-playback deadline break is best-effort playback, not an
+        error).
+        """
         import numpy as np
 
         from ..constants import Joint
         from ..teleop.filter import ResetInterpolator
 
-        self.wait_ready()
-        assert self._conn is not None
-        assert self._q_init is not None
-        assert self._left_indices is not None
-        assert self._right_indices is not None
+        prev_handler: Any | None = None
+        if abort_on_sigint:
+            import signal
 
-        pos_l, pos_r = robot.positions
-        pos_l = np.asarray(pos_l, dtype=np.float32)
-        pos_r = np.asarray(pos_r, dtype=np.float32)
+            def _raise(signum: int, frame: Any) -> None:
+                raise KeyboardInterrupt
 
-        q_current = self._q_init.copy()
-        for i, gi in enumerate(self._left_indices):
-            q_current[gi] = float(pos_l[i])
-        for i, gi in enumerate(self._right_indices):
-            q_current[gi] = float(pos_r[i])
+            try:
+                prev_handler = signal.signal(signal.SIGINT, _raise)
+            except (ValueError, OSError):
+                prev_handler = None
 
-        self._conn.send(("reset", q_current))
-        result = self._conn.recv()
-        if not (isinstance(result, tuple) and result[0] == "reset_traj"):
-            raise RuntimeError(f"Unexpected IK worker response: {result!r}")
-        _, _q_rest, traj = result
-        if not traj:
-            _logger.warning("IK worker returned an empty reset trajectory; skipping.")
-            return
+        try:
+            self.wait_ready()
+            assert self._conn is not None
+            assert self._q_init is not None
+            assert self._left_indices is not None
+            assert self._right_indices is not None
 
-        interp = ResetInterpolator()
-        interp.set_trajectory(traj, float(pos_l[7]), float(pos_r[7]))
+            pos_l, pos_r = robot.positions
+            pos_l = np.asarray(pos_l, dtype=np.float32)
+            pos_r = np.asarray(pos_r, dtype=np.float32)
 
-        joints = list(Joint)
-        play_hz = float(self._vr_cfg.frequency)
-        period = 1.0 / play_hz
-        while interp.is_active():
-            t0 = time.perf_counter()
-            new_q, l_grip, r_grip, _done = interp.step()
-            if new_q is None:
-                break
-            arm_left = np.asarray(new_q)[self._left_indices]
-            arm_right = np.asarray(new_q)[self._right_indices]
-            action: dict[str, float] = {}
-            for j in joints:
-                if j in ARM_JOINTS:
-                    ai = ARM_JOINTS.index(j)
-                    action[f"left_{j.value}.pos"] = float(arm_left[ai])
-                    action[f"right_{j.value}.pos"] = float(arm_right[ai])
-                else:
-                    action[f"left_{j.value}.pos"] = float(l_grip)
-                    action[f"right_{j.value}.pos"] = float(r_grip)
-            robot.send_action(action)
-            time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+            q_current = self._q_init.copy()
+            for i, gi in enumerate(self._left_indices):
+                q_current[gi] = float(pos_l[i])
+            for i, gi in enumerate(self._right_indices):
+                q_current[gi] = float(pos_r[i])
+
+            deadline = (
+                time.perf_counter() + deadline_s if deadline_s is not None else None
+            )
+            if q_target is None:
+                self._conn.send(("reset", q_current))
+            else:
+                self._conn.send(("reset", q_current, q_target))
+            # A capped move must also cap the plan round-trip: a wedged or
+            # dying worker would otherwise hang this recv past the park
+            # budget (a warm worker answers in milliseconds).
+            if deadline is not None and not self._conn.poll(
+                max(0.0, deadline - time.perf_counter())
+            ):
+                _logger.warning(
+                    "IK worker did not answer the reset plan within the %.1fs "
+                    "budget; skipping the move.",
+                    deadline_s,
+                )
+                return False
+            result = self._conn.recv()
+            if not (isinstance(result, tuple) and result[0] == "reset_traj"):
+                raise RuntimeError(f"Unexpected IK worker response: {result!r}")
+            _, _goal_q, traj = result
+            if not traj:
+                # A zero-length move (already at the target) plans to an empty
+                # trajectory; nothing to play.
+                _logger.warning(
+                    "IK worker returned an empty reset trajectory; skipping."
+                )
+                return True
+
+            interp = ResetInterpolator()
+            if hold_grippers is not None:
+                interp.set_trajectory(
+                    traj, hold_grippers[0], hold_grippers[1], hold_grippers=True
+                )
+            else:
+                interp.set_trajectory(traj, float(pos_l[7]), float(pos_r[7]))
+
+            joints = list(Joint)
+            play_hz = float(self._vr_cfg.frequency)
+            period = 1.0 / play_hz
+            while interp.is_active():
+                if deadline is not None and time.perf_counter() >= deadline:
+                    _logger.warning(
+                        "reset playback exceeded its %.1fs deadline; "
+                        "stopping the move early.",
+                        deadline_s,
+                    )
+                    break
+                t0 = time.perf_counter()
+                new_q, l_grip, r_grip, _done = interp.step()
+                if new_q is None:
+                    break
+                arm_left = np.asarray(new_q)[self._left_indices]
+                arm_right = np.asarray(new_q)[self._right_indices]
+                action: dict[str, float] = {}
+                for j in joints:
+                    if j in ARM_JOINTS:
+                        ai = ARM_JOINTS.index(j)
+                        action[f"left_{j.value}.pos"] = float(arm_left[ai])
+                        action[f"right_{j.value}.pos"] = float(arm_right[ai])
+                    else:
+                        action[f"left_{j.value}.pos"] = float(l_grip)
+                        action[f"right_{j.value}.pos"] = float(r_grip)
+                robot.send_action(action)
+                time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+            return True
+        except KeyboardInterrupt:
+            if not abort_on_sigint:
+                raise
+            _announce("Park aborted — releasing motors now.")
+            return False
+        finally:
+            if prev_handler is not None:
+                import signal
+
+                try:
+                    signal.signal(signal.SIGINT, prev_handler)
+                except (ValueError, OSError):
+                    pass
+
+    def park(self, robot: "AxolRobot", *, deadline_s: float = 30.0) -> bool:
+        """Ease both arms to the rest pose and then to all-zeros.
+
+        The soft-shutdown park: played on a *clean* stop right before
+        ``robot.disconnect()`` releases the motors, so the arms descend
+        gradually instead of dropping from wherever the run ended. The
+        grippers hold their last commanded value throughout (a park must not
+        drop or loosen a held object — see ``AxolArm.last_gripper_commanded``),
+        one ``deadline_s`` budget covers BOTH legs, and a second
+        Ctrl+C aborts the move and releases the motors immediately.
+        Best-effort: every failure is logged and swallowed — the caller's
+        ``finally`` must still disconnect no matter what happens here.
+
+        Returns ``True`` when both legs played to completion.
+        """
+        if self._conn is None:
+            return False
+        if self._proc is not None and not self._proc.is_alive():
+            _logger.warning("IK worker is gone; skipping the park.")
+            return False
+
+        deadline = time.perf_counter() + deadline_s
+        _announce("Parking arms: rest pose, then zero.")
+        try:
+            # Pick the gripper value to hold ONCE, for both legs. Prefer the
+            # last COMMANDED value: the grippers run position-force control,
+            # so on a held object the measured position sags below the
+            # command (the force comes from that gap) — re-commanding the
+            # measured value would collapse the grip force, and re-reading it
+            # per leg would ratchet the grip looser leg by leg. Snapshot
+            # before reset_command_state() clears the command cache; fall
+            # back to the measured position when nothing was commanded yet.
+            pos_l, pos_r = robot.positions
+            hold_l, hold_r = float(pos_l[7]), float(pos_r[7])
+            cmd_l, cmd_r = robot.last_gripper_commands()
+            if cmd_l is not None:
+                hold_l = cmd_l
+            if cmd_r is not None:
+                hold_r = cmd_r
+
+            # The arms may sit far from the last commanded pose (the run ended
+            # mid-motion): clear the per-step jump guard first, or
+            # motion_control silently drops every waypoint whose arm delta vs
+            # the stale cached command exceeds max_step_rad and the park never
+            # moves.
+            robot.reset_command_state()
+            if not self._request_and_play(
+                robot,
+                deadline_s=deadline - time.perf_counter(),
+                hold_grippers=(hold_l, hold_r),
+                abort_on_sigint=True,
+            ):
+                return False
+
+            assert self._q_init is not None
+            assert self._left_indices is not None
+            assert self._right_indices is not None
+            q_target = self._q_init.copy()
+            q_target[self._left_indices] = 0.0
+            q_target[self._right_indices] = 0.0
+
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0.0:
+                _logger.warning(
+                    "park deadline (%.1fs) exhausted before the zero leg; "
+                    "releasing from the rest pose.",
+                    deadline_s,
+                )
+                return False
+            return self._request_and_play(
+                robot,
+                q_target,
+                deadline_s=remaining,
+                hold_grippers=(hold_l, hold_r),
+                abort_on_sigint=True,
+            )
+        except KeyboardInterrupt:
+            # A Ctrl+C landing between the legs (outside _request_and_play's
+            # raising handler) still aborts the park.
+            _announce("Park aborted — releasing motors now.")
+            return False
+        except Exception:  # noqa: BLE001 - never block the disconnect
+            _logger.exception("Soft-shutdown park failed; releasing motors.")
+            return False
 
     def stop(self) -> None:
         """Signal shutdown, close the pipe, and reap the subprocess."""

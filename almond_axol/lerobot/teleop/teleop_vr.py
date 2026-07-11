@@ -325,6 +325,18 @@ class AxolVRTeleop(Teleoperator):
         """
         self._core.request_reset()
 
+    def request_zero(self) -> None:
+        """Programmatically trigger a return-to-zero park move.
+
+        Safe to call from any thread. Like :meth:`request_reset`, but the
+        collision-aware trajectory targets the all-zeros arm pose instead of
+        the configured rest pose, and the grippers hold their current value —
+        used by the soft-shutdown park so the arms descend gradually (without
+        dropping a held object) before the motors release. Poll
+        :attr:`is_resetting` to know when the move completes.
+        """
+        self._core.request_zero()
+
     @property
     def is_resetting(self) -> bool:
         """True while a reset is pending or a reset trajectory is playing back."""

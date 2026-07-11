@@ -131,6 +131,18 @@ class RunPolicyConfig:
     temporal_ensemble_coeff: float = 0.01
     rerun_ip: str | None = None
     rerun_port: int = 9876
+    # Park the arms on a clean stop (Ctrl+C, `q`, the episode cap, or Stop in
+    # the control panel): ease both arms to the rest pose and then to the
+    # all-zeros pose before the motors release, instead of dropping from
+    # wherever the run ended. Skipped after a hardware fault or any propagating
+    # error — a possibly-faulted robot is never commanded blind. A second
+    # Ctrl+C during the park releases the motors immediately.
+    park_on_exit: bool = True
+    # Rest pose targeted by the between-episode resets and the park's first
+    # leg: 7 arm-joint angles (radians, in Joint enum order), one list per arm.
+    # None keeps the built-in VRTeleopConfig rest pose.
+    rest_pose_left: list[float] | None = None
+    rest_pose_right: list[float] | None = None
     log_level: LogLevel = "INFO"
 
 
@@ -826,6 +838,37 @@ def _build_axol_robot_client(
 # ----------------------------------------------------------------------
 
 
+def _should_park(
+    cfg: RunPolicyConfig,
+    client: Any,
+    robot: "AxolRobot",
+    exc_info: tuple,
+    hard_interrupt: bool = False,
+) -> bool:
+    """Whether teardown may play the soft-shutdown park.
+
+    Park only on a CLEAN stop with the motors still engaged. A propagating
+    exception at teardown time means the robot may be faulted (control-loop
+    hardware faults are re-raised before the ``finally``, and anything
+    unexpected is just as suspect), and ``client.fatal_error`` is checked in
+    its own right for the paths where the re-raise never runs — a
+    possibly-faulted robot is never commanded blind. ``hard_interrupt`` marks
+    a Ctrl+C that escaped the episode loop's own handler: that path may have
+    skipped the per-episode thread joins, so a control thread could still be
+    commanding — parking would race it with the max-step guard freshly
+    cleared.
+    """
+    if not cfg.park_on_exit:
+        return False
+    if hard_interrupt:
+        return False
+    if exc_info[0] is not None:
+        return False
+    if client is not None and client.fatal_error is not None:
+        return False
+    return bool(robot.is_connected)
+
+
 def _run(
     cfg: RunPolicyConfig,
     stop_event: "threading.Event | None" = None,
@@ -999,12 +1042,39 @@ def _run(
         log_say(f"Using remote inference server at {server_host}:{server_port}.")
 
     # Spawn the IK worker in parallel so JAX JIT overlaps with policy load.
-    reset_controller = IKResetController()
+    # A configured rest pose (rest_pose_left / rest_pose_right) rides in on a
+    # VRTeleopConfig; the defaults keep the stock config.
+    vr_config = None
+    if cfg.rest_pose_left is not None or cfg.rest_pose_right is not None:
+        import numpy as np
+
+        from ..teleop.config import VRTeleopConfig
+
+        rest_overrides: dict[str, Any] = {}
+        for name, pose in (
+            ("rest_pose_left", cfg.rest_pose_left),
+            ("rest_pose_right", cfg.rest_pose_right),
+        ):
+            if pose is None:
+                continue
+            # Fail here with a clear message — a wrong-length pose otherwise
+            # surfaces ~20 s later as a shape error inside the IK worker.
+            if len(pose) != 7:
+                raise ValueError(
+                    f"--{name} must list exactly 7 arm-joint angles in "
+                    f"radians (Joint enum order); got {len(pose)}."
+                )
+            rest_overrides[name] = np.asarray(pose, dtype=np.float32)
+        vr_config = VRTeleopConfig(**rest_overrides)
+    reset_controller = IKResetController(vr_config=vr_config)
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
     client = None
     episodes_recorded = 0
+    # Set when a Ctrl+C escapes the episode loop's own handler (see the outer
+    # KeyboardInterrupt handler below); read by the teardown park gate.
+    hard_interrupt = False
     try:
         _wait_for_port(server_host, server_port, timeout=30.0)
 
@@ -1204,23 +1274,57 @@ def _run(
             raise client.fatal_error
 
     except KeyboardInterrupt:
-        pass
+        # A Ctrl+C inside an episode is handled by the loop itself (the
+        # per-episode threads are then joined normally, and the park may
+        # run). Landing HERE means it hit somewhere else — the thread joins,
+        # a between-episode reset, a prompt — and the joins may have been
+        # skipped, so a control thread could still be commanding. Remember
+        # that: the teardown park must not race a live commander with the
+        # max-step guard freshly cleared.
+        hard_interrupt = True
     finally:
-        # Ignore SIGINT during cleanup so a second Ctrl+C can't abort
-        # partway through disconnect/teardown. Restored at end of block.
         import signal
+        import sys
 
+        # Decide park eligibility FIRST: sys.exc_info() must be read before
+        # any exception handled below can mask the in-flight one.
+        parkable = _should_park(
+            cfg, client, robot, sys.exc_info(), hard_interrupt=hard_interrupt
+        )
+
+        try:
+            log_say("Stopping.")
+            if client is not None:
+                try:
+                    client.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+            # Park on a clean stop: ease the arms to the rest pose and then to
+            # zero BEFORE robot.disconnect() releases the motors. This runs
+            # after client.stop() — which only sets shutdown_event and closes
+            # the gRPC channel; the per-episode threads were already joined
+            # (with timeouts) at episode teardown — and BEFORE the blanket
+            # SIG_IGN below, so the park's own raising handler lets a second
+            # Ctrl+C abort it. Deliberately not gated on stop_event: the web
+            # panel's Stop sets it before this finally runs, and a panel Stop
+            # must park too. fatal_error is re-checked at the last moment —
+            # a control thread can still be failing (and setting it) between
+            # the eligibility read above and this point.
+            if parkable and (client is None or client.fatal_error is None):
+                reset_controller.park(robot)
+        except KeyboardInterrupt:
+            # A Ctrl+C in the window before the park installs its raising
+            # handler: skip the park (the operator wants out) and fall through
+            # to the teardown below.
+            pass
+
+        # Ignore SIGINT for the rest of cleanup so another Ctrl+C can't abort
+        # partway through disconnect/teardown. Restored at end of block.
         try:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
         except (ValueError, OSError):
             pass
 
-        log_say("Stopping.")
-        if client is not None:
-            try:
-                client.stop()
-            except Exception:  # noqa: BLE001
-                pass
         # ``disconnect()`` is null-safe and idempotent; always call it so a
         # ``connect()`` that bailed mid-enable doesn't leak the asyncio
         # event-loop thread or any already-opened CAN buses.
