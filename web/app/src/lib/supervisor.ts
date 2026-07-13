@@ -96,6 +96,17 @@ export function apiUrl(path: string): string {
   return `${apiBase}${path}`
 }
 
+/**
+ * Whether this bundle is the one `axol serve` hosts from web/app/dist — a
+ * commit mismatch with the backend then means that local bundle is stale.
+ * Only a production build on the backend's own origin qualifies: the Vite dev
+ * server also proxies /api same-origin, but it serves its own working-tree
+ * code, not the backend's dist, so dev is never "served by the backend".
+ */
+export function servedByBackend(): boolean {
+  return !import.meta.env.DEV && apiBase === ""
+}
+
 /** WebSocket origin for the current server base (ws(s)://host[:port]). */
 export function wsBaseUrl(): string {
   const base = apiBase || window.location.origin
@@ -119,6 +130,10 @@ export interface ServerInfo {
   vrPort: number
   /** Installed release version of the serve host, e.g. "0.1.2". */
   version?: string | null
+  /** Git commit the serve host is running (PEP 610 pin or checkout HEAD). */
+  commit?: string | null
+  /** Tag-pinned git tool install (true) vs dev checkout (false). */
+  releaseInstall?: boolean
 }
 
 export async function fetchInfo(): Promise<ServerInfo> {

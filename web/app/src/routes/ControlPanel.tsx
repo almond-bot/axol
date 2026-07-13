@@ -42,6 +42,8 @@ import {
   type UsbStatus,
 } from "@/lib/supervisor"
 import { UpdateBanner } from "@/components/update-banner"
+import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
+import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
@@ -302,6 +304,9 @@ export default function ControlPanel() {
   // Poll the update indicator slowly while online (its server-side `ls-remote`
   // is debounced, so a tight interval would buy nothing). Paused while an
   // update is in flight — handleUpdate drives its own faster restart-watch poll.
+  // Host identity (/api/info) rides along so a backend upgraded/restarted from
+  // outside this tab (installer, another terminal) refreshes the commit the
+  // version-mismatch check compares against.
   useEffect(() => {
     if (conn.state !== "ok" || updating) return
     let active = true
@@ -309,6 +314,13 @@ export default function ControlPanel() {
       fetchUpdateStatus()
         .then((u) => {
           if (active) setUpdate(u)
+        })
+        .catch(() => {})
+      fetchInfo()
+        .then((info) => {
+          if (!active) return
+          setViewerPort(info.viewerPort)
+          setHostInfo(info)
         })
         .catch(() => {})
     }
@@ -763,6 +775,15 @@ export default function ControlPanel() {
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
 
+  // UI/backend skew warning (stale local bundle, or hosted UI on a different
+  // release than the robot). Suppressed while the update banner covers the
+  // same ground — an available update *is* the mismatch's remediation — and
+  // while an update is applying (the page hard-reloads when it lands).
+  const mismatch = useMemo(
+    () => (conn.state === "ok" ? versionMismatch(hostInfo) : null),
+    [conn.state, hostInfo]
+  )
+
   return (
     <div className="min-h-screen">
       <SiteNav current="control" />
@@ -776,6 +797,10 @@ export default function ControlPanel() {
             busyReason={updateBusyReason}
             onUpdate={handleUpdate}
           />
+        )}
+
+        {mismatch && !updating && !update?.updateAvailable && (
+          <VersionMismatchBanner mismatch={mismatch} />
         )}
 
         <ConnectionsBar
