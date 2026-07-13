@@ -44,13 +44,16 @@ no-ops.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
 from typing import Callable
 
 _logger = logging.getLogger(__name__)
@@ -112,6 +115,49 @@ def installed_origin() -> tuple[str, str] | None:
     return url, commit
 
 
+def _git(repo_root: Path, *args: str) -> bytes | None:
+    """Raw stdout of a git command in ``repo_root``; ``None`` on any failure."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            capture_output=True,
+            timeout=10.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def installed_commit() -> str | None:
+    """The git commit this backend is running, or ``None`` when unknown.
+
+    For a git tool install it is the PEP 610 pinned commit; for a dev checkout
+    it is the checkout's HEAD, with a ``-dirty.<hash>`` suffix over any
+    uncommitted changes so two different working-tree states never share an
+    identity. The web bundle bakes its own build commit in at build time
+    (``buildCommit()`` in web/app/vite.config.ts — the dirty-hash scheme must
+    stay identical), so the control panel can compare the two and warn when
+    the UI and the backend are on different code. Works on forks too — it
+    never references the upstream repository.
+    """
+    origin = installed_origin()
+    if origin is not None:
+        return origin[1]
+    repo_root = Path(__file__).resolve().parents[2]
+    if not (repo_root / ".git").exists():
+        return None
+    head = _git(repo_root, "rev-parse", "HEAD")
+    commit = head.decode("utf-8", "replace").strip() if head else ""
+    if not commit:
+        return None
+    status = _git(repo_root, "status", "--porcelain")
+    if status is None or not status.strip():
+        return commit
+    diff = _git(repo_root, "diff", "HEAD") or b""
+    digest = hashlib.sha256(status + diff).hexdigest()[:8]
+    return f"{commit}-dirty.{digest}"
+
+
 def installed_version() -> str | None:
     """Installed release version (the pyproject ``version``), e.g. ``"0.1.2"``.
 
@@ -139,6 +185,7 @@ class SelfUpdater:
         self._is_idle = is_idle
         self._origin = installed_origin()
         self._version = installed_version()
+        self._commit = installed_commit()
         # Cached newest release (tag + parsed-out version) and when it was last
         # resolved, so the polled status endpoint answers immediately and only
         # re-runs `git ls-remote --tags` at most once per debounce window
@@ -170,6 +217,22 @@ class SelfUpdater:
     @property
     def version(self) -> str | None:
         return self._version
+
+    @property
+    def commit(self) -> str | None:
+        """Git commit of the running backend (see :func:`installed_commit`)."""
+        return self._commit
+
+    @property
+    def release_install(self) -> bool:
+        """Whether this backend is a tag-pinned git tool install.
+
+        Release installs only ever sit on release-tag commits, so the control
+        panel compares *versions* against them (a hosted UI built from main
+        legitimately differs in commit between releases). Dev checkouts can be
+        on any commit, so the panel compares commits directly.
+        """
+        return self._origin is not None
 
     @property
     def enabled(self) -> bool:

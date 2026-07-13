@@ -234,6 +234,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             "viewerPort": _VIEWER_PORT,
             "vrPort": _VR_PORT,
             "version": updater.version,
+            # Backend git commit, compared against the commit baked into the
+            # web bundle at build time to warn about a UI/backend mismatch.
+            # Against a release (tag-pinned) install a hosted UI compares
+            # versions instead — its commit tracks main and legitimately
+            # differs between releases.
+            "commit": updater.commit,
+            "releaseInstall": updater.release_install,
         }
 
     @app.get("/api/update/status")
