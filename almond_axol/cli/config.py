@@ -475,6 +475,11 @@ class TeleopCmdConfig:
     back to the default policy (overhead streams both eyes per-lens, wrists
     stream their left eye).
 
+    ``--stream_bitrate_mbps`` fixes the headset (WebRTC) encoder bitrate per
+    streamed feed (each stereo eye is its own feed), e.g. ``4`` for 4 Mbps.
+    ``null`` (the default) budgets from the resolution (~0.12 bits/pixel,
+    clamped 4-20 Mbps). The recorded dataset encode is budgeted separately.
+
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
     """
@@ -489,6 +494,7 @@ class TeleopCmdConfig:
     cameras: dict[str, int] = field(default_factory=dict)
     camera_eyes: dict[str, str] = field(default_factory=dict)
     resolution: str | None = None
+    stream_bitrate_mbps: float | None = None
     log_level: LogLevel = "INFO"
 
 

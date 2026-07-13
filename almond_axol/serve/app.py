@@ -54,6 +54,7 @@ class OpStartRequest(BaseModel):
         {
           "serials": {"overhead": 41234567, "left_arm": ..., "right_arm": ...},
           "stream_resolution": "HD1200",   # capture res → headset; "off" disables
+          "stream_bitrate_mbps": 8,        # fixed headset bitrate per feed (unset = auto)
           "record_resolution": "SVGA",     # dataset downscale; "off" disables
           "stream": {"overhead": "both", "left_arm": true},   # per-slot headset
           "record": {"overhead": "left", "left_arm": false}   # per-slot dataset

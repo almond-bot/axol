@@ -644,6 +644,17 @@ class OperationRunner:
         return val
 
     @staticmethod
+    def _stream_bitrate_mbps(cameras: dict[str, Any] | None) -> float | None:
+        """Fixed headset-stream bitrate (Mbps per feed), or ``None`` for auto."""
+        raw = (cameras or {}).get("stream_bitrate_mbps")
+        if raw in (None, ""):
+            return None
+        val = float(raw)
+        if val <= 0:
+            raise ValueError(f"stream_bitrate_mbps must be positive; got {raw!r}")
+        return val
+
+    @staticmethod
     def _branch(
         cameras: dict[str, Any] | None, key: str, slot: str, global_on: bool
     ) -> tuple[bool, str | None]:
@@ -683,6 +694,8 @@ class OperationRunner:
         - ``stream`` / ``record`` are per-slot maps deciding which cameras (and,
           for stereo, which eyes) take part — mapping to ``cameras.<slot>.stream``
           / ``.record`` plus ``.stream_eyes`` (headset) and ``.eyes`` (dataset).
+        - ``stream_bitrate_mbps`` fixes the headset encoder bitrate per streamed
+          feed (unset = auto from the resolution).
 
         A camera that takes part in neither branch is omitted entirely. Capture
         resolution per camera is the streaming resolution when it streams, else
@@ -729,6 +742,12 @@ class OperationRunner:
 
         if record_res is not None:
             merged["dataset_resolution"] = record_res
+        # Fixed headset-stream bitrate → collect-data's top-level
+        # ``stream_bitrate_mbps`` (run-policy streams no headset video;
+        # ``build_argv`` drops the unknown key there).
+        bitrate = self._stream_bitrate_mbps(cameras)
+        if bitrate is not None and stream_res is not None:
+            merged["stream_bitrate_mbps"] = bitrate
         return merged
 
     def _attach_cameras_to_teleop(
@@ -766,12 +785,16 @@ class OperationRunner:
             cfg.camera_eyes = camera_eyes
         if stream_res:
             cfg.resolution = stream_res
+        bitrate = self._stream_bitrate_mbps(cameras)
+        if bitrate is not None:
+            cfg.stream_bitrate_mbps = bitrate
         stereo_slots = sorted(s for s in cam_map if cam_map[s] in detected)
         stereo_note = f" (stereo: {', '.join(stereo_slots)})" if stereo_slots else ""
         resolution_note = f" @ {stream_res}" if stream_res else ""
+        bitrate_note = f" @ {bitrate:g} Mbps" if bitrate is not None else ""
         session.emit(
             "[serve] teleop: streaming cameras to the headset "
-            f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}"
+            f"({', '.join(sorted(cam_map))}){stereo_note}{resolution_note}{bitrate_note}"
         )
 
     def _build_config(self, op_id: str, args: dict[str, Any]) -> Any:
