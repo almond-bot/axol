@@ -102,9 +102,11 @@ export function apiUrl(path: string): string {
  * Only a production build on the backend's own origin qualifies: the Vite dev
  * server also proxies /api same-origin, but it serves its own working-tree
  * code, not the backend's dist, so dev is never "served by the backend".
+ * An explicit server base still counts when it points back at the origin
+ * that served the page (e.g. a host entered on this panel earlier).
  */
 export function servedByBackend(): boolean {
-  return !import.meta.env.DEV && apiBase === ""
+  return !import.meta.env.DEV && (apiBase === "" || apiBase === window.location.origin)
 }
 
 /** WebSocket origin for the current server base (ws(s)://host[:port]). */

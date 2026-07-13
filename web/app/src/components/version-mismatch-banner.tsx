@@ -3,7 +3,10 @@ import type { VersionMismatch } from "@/lib/version"
 import { Button } from "@/components/ui/button"
 
 function label(commit: string, version: string | null): string {
-  const short = commit.slice(0, 7)
+  // Shorten only the SHA, keeping any -dirty.<hash> suffix — two identities
+  // sharing HEAD but differing in working-tree state must render differently.
+  const [sha, ...suffix] = commit.split("-")
+  const short = [sha.slice(0, 7), ...suffix].join("-")
   return version ? `v${version} (${short})` : short
 }
 

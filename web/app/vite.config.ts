@@ -26,7 +26,13 @@ const SUPERVISOR = process.env.AXOL_SERVE_URL ?? "http://localhost:8001"
 function buildCommit(): string | null {
   const fromEnv = process.env.VERCEL_GIT_COMMIT_SHA
   if (fromEnv) return fromEnv
-  const git = { encoding: "buffer", maxBuffer: 256 * 1024 * 1024 } as const
+  // Run from the repo root — the backend computes its identity there, and
+  // status/diff output must be byte-identical for the hashes to agree.
+  const git = {
+    encoding: "buffer",
+    maxBuffer: 256 * 1024 * 1024,
+    cwd: fileURLToPath(new URL("../..", import.meta.url)),
+  } as const
   try {
     const head = execSync("git rev-parse HEAD", git).toString("utf8").trim()
     if (!head) return null
