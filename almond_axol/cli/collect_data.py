@@ -183,8 +183,6 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
             "record": wants_record,
             "stream": wants_stream,
         }
-        if cfg.stream_bitrate_mbps:
-            spec["stream_bitrate"] = int(cfg.stream_bitrate_mbps * 1_000_000)
         res = camcfg.resolution_name() if hasattr(camcfg, "resolution_name") else None
         if res:
             spec["resolution"] = res
@@ -261,11 +259,6 @@ class CollectDataConfig:
     # saturates the Jetson CPU moving raw bytes, collapsing the control loop.
     # Clamped to the capture resolution, so it only ever downscales.
     dataset_resolution: DatasetResolution = "SVGA"
-    # Fixed headset (WebRTC) encoder bitrate in Mbps per streamed feed (each
-    # stereo eye is its own feed). None budgets from the resolution (~0.12
-    # bits/pixel, clamped 4-20 Mbps). Only affects the live headset stream —
-    # the recorded dataset encode is budgeted separately (dataset_vbr_bitrate).
-    stream_bitrate_mbps: float | None = None
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).

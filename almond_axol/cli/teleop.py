@@ -153,8 +153,6 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
         spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
-        if cfg.stream_bitrate_mbps:
-            spec["stream_bitrate"] = int(cfg.stream_bitrate_mbps * 1_000_000)
         if int(serial) in stereo_set:
             spec["stereo"] = True
             spec["eyes"], spec["eye_suffix"] = _stream_eyes_for(cfg, name)

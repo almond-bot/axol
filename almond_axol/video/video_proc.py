@@ -227,9 +227,6 @@ def _open_gst_camera_raw(
     # camera records (see _relay_main), so the raw branch is always built; the
     # encoded branch is gated on ``stream``.
     wants_stream = bool(spec.get("stream", True))
-    # Fixed headset-stream encoder bitrate (bits/s, per encoded stream/eye);
-    # unset picks the resolution-based default.
-    stream_bitrate = int(spec["stream_bitrate"]) if spec.get("stream_bitrate") else None
 
     for fps in (int(spec.get("fps", 60)), 30):
         writers: list = []
@@ -262,7 +259,6 @@ def _open_gst_camera_raw(
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
-                    stream_bitrate=stream_bitrate,
                     **eye_kwargs,
                 )
                 cam.connect()
@@ -301,7 +297,6 @@ def _open_gst_camera_raw(
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
                     encoded_sbs=sbs,
-                    stream_bitrate=stream_bitrate,
                     **eye_kwargs,
                 )
                 cam.connect()
@@ -328,7 +323,6 @@ def _open_gst_camera_raw(
                     want_encoded=wants_stream,
                     raw_socket_path=sock,
                     raw_dims=raw_dims,
-                    stream_bitrate=stream_bitrate,
                 )
                 cam.connect()
                 meta = {name: _gsth264_meta(sock, raw_w, raw_h, fps)}
@@ -342,7 +336,6 @@ def _open_gst_camera_raw(
                 want_encoded=wants_stream,
                 raw_sink=writer.publish,
                 raw_dims=raw_dims,
-                stream_bitrate=stream_bitrate,
             )
             cam.connect()
             return (
@@ -381,7 +374,6 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
         return None
     if not stereo and not zed_gst_available():
         return None
-    stream_bitrate = int(spec["stream_bitrate"]) if spec.get("stream_bitrate") else None
 
     for fps in (int(spec.get("fps", 60)), 30):
         try:
@@ -395,7 +387,6 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
                     want_raw=False,
                     encoded_eyes=[],
                     encoded_sbs=True,
-                    stream_bitrate=stream_bitrate,
                 )
                 cam.connect()
                 return cam, {f"{name}_sbs": cam.sbs_view}
@@ -409,7 +400,6 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
                     want_encoded=True,
                     want_raw=False,
                     eyes=gst_eyes,
-                    stream_bitrate=stream_bitrate,
                 )
                 cam.connect()
                 sources = {
@@ -423,7 +413,6 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
                 fps,
                 want_encoded=True,
                 want_raw=False,
-                stream_bitrate=stream_bitrate,
             )
             cam.connect()
             return cam, {name: cam}

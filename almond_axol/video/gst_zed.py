@@ -657,7 +657,6 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         raw_sink: Any = None,
         raw_socket_path: str | None = None,
         raw_dims: tuple[int, int] | None = None,
-        stream_bitrate: int | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _RESOLUTION_ENUM:
@@ -683,9 +682,6 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
-        # Fixed headset-stream encoder bitrate (bits/s); None picks the
-        # resolution-based default (see hw_video._bitrate_for).
-        self._stream_bitrate = stream_bitrate
         self._raw_sink_override = raw_sink
         self._raw_socket_path = raw_socket_path
         # Pipeline latency for the shmsink path's recorder-side frame stamps,
@@ -703,9 +699,7 @@ class ZedGstCamera(_GstPipelineBase, _GstStreamConsumer):
         return f"ZedGstCamera(serial={self.serial})"
 
     def _pipeline_str(self) -> str:
-        bitrate = self._stream_bitrate or _bitrate_for(
-            self.width, self.height, self.fps
-        )
+        bitrate = _bitrate_for(self.width, self.height, self.fps)
         self._enc_bitrate = bitrate
         src = (
             f"zedxonesrc camera-sn={self.serial} "
@@ -883,7 +877,6 @@ class ZedGstStereoCamera(_GstPipelineBase):
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
         encoded_sbs: bool = False,
-        stream_bitrate: int | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
         if resolution not in _STEREO_RESOLUTION_ENUM:
@@ -954,9 +947,6 @@ class ZedGstStereoCamera(_GstPipelineBase):
         self.raw_width, self.raw_height = raw_dims or (self.width, self.height)
         self._want_encoded = want_encoded
         self._want_raw = want_raw
-        # Fixed per-eye headset-stream encoder bitrate (bits/s); None picks the
-        # resolution-based default (see hw_video._bitrate_for).
-        self._stream_bitrate = stream_bitrate
         self._left_raw_sink = left_raw_sink
         self._right_raw_sink = right_raw_sink
         self._left_raw_socket_path = left_raw_socket_path
@@ -1017,7 +1007,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         eye_w, eye_h = self.width, self.height
         left = 0 if side == "left" else eye_w
         right = eye_w if side == "left" else eye_w * 2
-        bitrate = self._stream_bitrate or _bitrate_for(eye_w, eye_h, self.fps)
+        bitrate = _bitrate_for(eye_w, eye_h, self.fps)
         self._enc_bitrate = bitrate
         caps = (
             f"video/x-raw(memory:NVMM),format=NV12,width={eye_w},height={eye_h},"
@@ -1069,13 +1059,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
 
         ``zedsrc`` delivers the pair side-by-side in a single NVMM buffer, so no
         crop or compose is needed — the frame goes straight into NVENC. The
-        default bitrate is twice the per-eye default (same total bits as two
-        per-eye streams, just in one track); an explicit ``stream_bitrate`` is
-        the whole packed stream's budget.
+        bitrate is twice the per-eye default (same total bits as two per-eye
+        streams, just in one track).
         """
-        bitrate = self._stream_bitrate or 2 * _bitrate_for(
-            self.width, self.height, self.fps
-        )
+        bitrate = 2 * _bitrate_for(self.width, self.height, self.fps)
         self._sbs_bitrate = bitrate
         return (
             f"{_QUEUE} ! {_enc_branch(bitrate, self.fps, 'venc_s')} ! "

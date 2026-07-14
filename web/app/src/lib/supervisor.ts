@@ -360,9 +360,6 @@ export interface CameraSpec {
   serials: Record<CameraSlot, string>
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
-  /** Fixed headset encoder bitrate in Mbps per streamed feed (each stereo eye
-   * is its own feed); unset = auto from the resolution (~0.12 bits/pixel). */
-  stream_bitrate_mbps?: number
   /** Dataset downscale target (collect-data recording), or `"off"`. */
   record_resolution?: string
   /** Per-slot streaming participation (headset feed). */

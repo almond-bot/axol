@@ -63,10 +63,6 @@ export function CamerasPanel({
   // Cache-buster for the per-camera preview frames; bumped by Refresh so the
   // operator can grab fresh frames after moving a camera.
   const [previewNonce, setPreviewNonce] = useState(0)
-  // Text draft for the bitrate field so partial input ("8.") isn't collapsed
-  // by the numeric round-trip through the spec; the spec only ever stores a
-  // parsed positive number (or drops the key = Auto).
-  const [bitrateText, setBitrateText] = useState(spec.stream_bitrate_mbps?.toString() ?? "")
   const toast = useToast()
 
   function refresh() {
@@ -212,31 +208,6 @@ export function CamerasPanel({
           value={recordResolution}
           onChange={(v) => onChange({ ...spec, record_resolution: v })}
         />
-        <div className="flex flex-col gap-1">
-          <Label htmlFor="camera-stream-bitrate">Streaming bitrate (Mbps)</Label>
-          <Input
-            id="camera-stream-bitrate"
-            value={bitrateText}
-            inputMode="decimal"
-            spellCheck={false}
-            disabled={!streamingOn}
-            placeholder="Auto"
-            onChange={(e) => {
-              const raw = e.target.value
-              setBitrateText(raw)
-              const v = Number(raw)
-              onChange({
-                ...spec,
-                stream_bitrate_mbps: raw.trim() && Number.isFinite(v) && v > 0 ? v : undefined,
-              })
-            }}
-          />
-          <span className="text-[10px] text-white/35">
-              Fixed headset bitrate per streamed feed (a stereo pair ships as one side-by-side
-              feed). Leave empty for Auto (~16 Mbps at HD1200 mono, ~33 Mbps for a stereo pair).
-              Recording quality is unaffected.
-          </span>
-        </div>
       </div>
 
       <div className="flex flex-col gap-3 border-t border-white/10 pt-4">

@@ -49,7 +49,6 @@ export function materializeCameraSpec(
       right_arm: spec.serials.right_arm.trim(),
     },
     stream_resolution: spec.stream_resolution || spec.resolution || "SVGA",
-    ...(spec.stream_bitrate_mbps ? { stream_bitrate_mbps: spec.stream_bitrate_mbps } : {}),
     record_resolution: spec.record_resolution || "SVGA",
     stream: outStream,
     record: outRecord,
