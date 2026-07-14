@@ -47,6 +47,8 @@ The **Axol Host** is the machine running `axol serve` — the computer wired to 
 
 When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press.
 
+The same banner area also warns when the **control panel UI and the host backend are running different code** — the web bundle bakes in the git commit and release version it was built from, the host reports its own via `/api/info`, and a mismatch raises the warning (a released host is compared by version, a dev checkout by commit). This catches a stale hosted tab, or an unbuilt local `web/app/dist`, silently driving a newer or older backend; clear it by updating the host to the matching release or rebuilding the local UI.
+
 ### Axol
 
 The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
@@ -94,7 +96,7 @@ The Cameras tab is the single source of truth for all camera settings — these 
 
 Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
 
-A stereo **overhead** captures both eyes from one grab; with both eyes selected it's exposed as `overhead_left` / `overhead_right` (rendered per-lens in the headset, two observation keys in the dataset). A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
+A stereo **overhead** captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
 The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
 
