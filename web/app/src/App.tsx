@@ -1,6 +1,7 @@
 import {
   Suspense,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ComponentProps,
@@ -9,7 +10,7 @@ import {
 } from "react"
 import { Canvas, useFrame, useThree } from "@react-three/fiber"
 import { Text } from "@react-three/drei"
-import { createXRStore, XR, XRLayer, useXR } from "@react-three/xr"
+import { createXRStore, XR, XRLayer, useXR, useXRSessionFeatureEnabled } from "@react-three/xr"
 import * as THREE from "three"
 import {
   AxolConnectionStatus,
@@ -349,6 +350,11 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // `videoWidth` can read 0, so we reuse the cached aspect instead of falling
   // back to 16:9 — otherwise the screen resizes for a frame.
   const aspectRef = useRef<Record<string, number>>({})
+  // Cameras that have decoded at least one frame this session. Re-pointing a
+  // <video> at a reconnected stream resets `videoWidth` to 0 until the new
+  // metadata lands, but the compositor keeps showing the last frame — so a
+  // once-live feed stays "live" for the spinner instead of flashing it.
+  const everLiveRef = useRef<Set<string>>(new Set())
   // Whether the screen group has been world-anchored for this XR session.
   const anchoredRef = useRef(false)
   // Per-hand active grab (trigger held while pointing at a plane), if any.
@@ -389,10 +395,25 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // `streams` upstream) shows the frozen last frame instead of cutting to
   // passthrough. When the stream returns we just re-point the existing <video>
   // at the new MediaStream, so the layer keeps sampling the same element with
-  // no flash. Videos are only released on unmount / session end (below).
+  // no flash. Videos are released on unmount / session end (below), or when a
+  // renegotiation drops their camera for good.
   useEffect(() => {
     const store = videosRef.current
-    let added = false
+    let changed = false
+    // A non-empty map is the current negotiation's full track set (an empty
+    // one is a transient blip that keeps the frozen frames), so cameras it no
+    // longer carries are gone for good — e.g. per-eye overhead tracks replaced
+    // by a packed _sbs track. Drop them, or their dead <video>s would keep a
+    // stale layer up and hold the "connecting" spinner on forever.
+    if (Object.keys(streams).length > 0) {
+      for (const name of Object.keys(store)) {
+        if (name in streams) continue
+        store[name].srcObject = null
+        delete store[name]
+        everLiveRef.current.delete(name)
+        changed = true
+      }
+    }
     for (const [name, stream] of Object.entries(streams)) {
       let video = store[name]
       if (!video) {
@@ -401,22 +422,24 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
         video.autoplay = true
         video.playsInline = true
         store[name] = video
-        added = true
+        changed = true
       }
       if (video.srcObject !== stream) {
         video.srcObject = stream
         void video.play().catch(() => {})
       }
     }
-    if (added) setVideos({ ...store })
+    if (changed) setVideos({ ...store })
   }, [streams])
 
   // Release the video elements when the feed unmounts.
   useEffect(() => {
     const videos = videosRef.current
+    const everLive = everLiveRef.current
     return () => {
       for (const video of Object.values(videos)) video.srcObject = null
       aspectRef.current = {}
+      everLive.clear()
     }
   }, [])
 
@@ -434,6 +457,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       delete store[name]
     }
     aspectRef.current = {}
+    everLiveRef.current.clear()
     // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the mirrored video set on session teardown
     setVideos({})
   }, [session])
@@ -453,12 +477,15 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const videos = videosRef.current
 
     // A camera is live once its <video> knows its size (metadata + first
-    // frames decoded). It stays live through a stall or stream reconnect —
-    // the media layer keeps compositing the last decoded frame, which is what
-    // stops the feed from flickering to passthrough and back.
+    // frames decoded), and *stays* live through a stall or stream reconnect
+    // (everLiveRef) even though re-pointing the <video> resets `videoWidth`
+    // to 0 — the media layer keeps compositing the last decoded frame, which
+    // is what stops the feed from flickering to passthrough and back.
     const liveVideo = (name: string) => {
       const v = videos[name]
-      return v && v.videoWidth ? v : undefined
+      if (!v) return undefined
+      if (v.videoWidth) everLiveRef.current.add(name)
+      return v.videoWidth || everLiveRef.current.has(name) ? v : undefined
     }
 
     // World-anchor the screen group once per session: place it at the head
@@ -699,13 +726,29 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // mono, since a media layer can't split across two videos).
   const overheadVideo = sbsVideo ?? videos["overhead"] ?? videos["overhead_left"]
 
+  // On a session without compositor layers <XRLayer> falls back to a plain
+  // video-textured mesh that ignores layout="stereo-left-right", which would
+  // squeeze the full side-by-side frame into the panel. Render our own
+  // fallback mesh instead, with the texture cropped to the left eye — mono,
+  // like the legacy per-eye case (WebGL can't split one quad across lenses).
+  const layersEnabled = useXRSessionFeatureEnabled("layers")
+  const sbsFallback = session != null && !layersEnabled && sbsVideo != null
+  const sbsFallbackTexture = useMemo(() => {
+    if (!sbsFallback) return null
+    const tex = new THREE.VideoTexture(sbsVideo)
+    tex.colorSpace = THREE.SRGBColorSpace
+    tex.repeat.set(0.5, 1)
+    return tex
+  }, [sbsFallback, sbsVideo])
+  useEffect(() => () => sbsFallbackTexture?.dispose(), [sbsFallbackTexture])
+
   return (
     <>
       <group ref={groupRef}>
         {/* Distinct renderOrders keep the compositing order deterministic
             where the PiPs overlap the overhead (higher composites on top; the
             WebGL projection layer with the HUD is always last, i.e. above). */}
-        {session && overheadVideo && (
+        {session && overheadVideo && !sbsFallback && (
           <XRLayer
             ref={overheadMeshRef}
             src={overheadVideo}
@@ -714,6 +757,12 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
             renderOrder={1}
             position={[0, FEED_Y, -FEED_DISTANCE]}
           />
+        )}
+        {sbsFallback && (
+          <mesh ref={overheadMeshRef} renderOrder={1} position={[0, FEED_Y, -FEED_DISTANCE]}>
+            <planeGeometry />
+            <meshBasicMaterial map={sbsFallbackTexture} toneMapped={false} />
+          </mesh>
         )}
         {session && videos["left_arm"] && (
           <XRLayer
