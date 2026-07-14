@@ -232,8 +232,9 @@ export function CamerasPanel({
             }}
           />
           <span className="text-[10px] text-white/35">
-            Fixed headset bitrate per streamed feed (each stereo eye is a feed). Leave empty for
-            Auto (~16 Mbps at HD1200). Recording quality is unaffected.
+              Fixed headset bitrate per streamed feed (a stereo pair ships as one side-by-side
+              feed). Leave empty for Auto (~16 Mbps at HD1200 mono, ~33 Mbps for a stereo pair).
+              Recording quality is unaffected.
           </span>
         </div>
       </div>

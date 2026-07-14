@@ -856,6 +856,14 @@ class ZedGstStereoCamera(_GstPipelineBase):
     and encodes the full pair, while ``"left"`` / ``"right"`` build a single eye
     only — the wrist policy, where a stereo camera streams/records just its left
     eye so it costs no more than a mono one. The unbuilt eye's view is ``None``.
+
+    ``encoded_sbs`` packs both eyes into a **single side-by-side stream**
+    instead of two per-eye ones: ``zedsrc`` already delivers the stereo pair as
+    one double-width NVMM frame, so the SBS branch simply encodes it uncropped —
+    one NVENC session here and, crucially, one decoder session on the headset
+    (two 1920x1200 decoder sessions measurably drop the Quest's render rate).
+    The packed stream is exposed as :attr:`sbs_view`; the raw (dataset) branch
+    still crops per eye, so recordings are unchanged.
     """
 
     def __init__(
@@ -874,6 +882,7 @@ class ZedGstStereoCamera(_GstPipelineBase):
         eyes: str = "both",
         encoded_eyes: "list[str] | tuple[str, ...] | None" = None,
         raw_eyes: "list[str] | tuple[str, ...] | None" = None,
+        encoded_sbs: bool = False,
         stream_bitrate: int | None = None,
     ) -> None:
         _GstPipelineBase.__init__(self)
@@ -912,15 +921,22 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     raise ValueError(f"eye must be 'left' or 'right'; got {s!r}.")
             return tuple(s for s in ("left", "right") if s in sides)
 
-        self._encoded_sides = _order(
-            encoded_eyes
-            if encoded_eyes is not None
-            else (base_sides if want_encoded else ())
+        # The SBS branch replaces the per-eye encodes (one packed stream instead
+        # of two): with ``encoded_sbs`` no per-eye encoded side is built.
+        self._encoded_sbs = encoded_sbs
+        self._encoded_sides = (
+            ()
+            if encoded_sbs
+            else _order(
+                encoded_eyes
+                if encoded_eyes is not None
+                else (base_sides if want_encoded else ())
+            )
         )
         self._raw_sides = _order(
             raw_eyes if raw_eyes is not None else (base_sides if want_raw else ())
         )
-        want_encoded = bool(self._encoded_sides)
+        want_encoded = bool(self._encoded_sides) or encoded_sbs
         want_raw = bool(self._raw_sides)
         # Build (crop) every eye either branch needs, ordered left-then-right.
         self._sides: tuple[str, ...] = _order(
@@ -975,6 +991,14 @@ class ZedGstStereoCamera(_GstPipelineBase):
         if "right" in self._sides:
             self._right_enc, self._right_raw, self.right_view = eye(
                 "right", right_raw_sink, right_raw_socket_path
+            )
+        # Packed side-by-side stream: both eyes in one double-width frame/track.
+        self._sbs_enc: _AUChannel | None = None
+        self.sbs_view: _GstEye | None = None
+        if encoded_sbs:
+            self._sbs_enc = _AUChannel(lambda: self.alive)
+            self.sbs_view = _GstEye(
+                self, self._sbs_enc, None, self.width * 2, self.height, self.fps
             )
 
     def __repr__(self) -> str:
@@ -1040,6 +1064,24 @@ class ZedGstStereoCamera(_GstPipelineBase):
             )
         return f"{crop} ! {raw}"
 
+    def _sbs_branch(self) -> str:
+        """Encode the uncropped double-width stereo frame as one packed stream.
+
+        ``zedsrc`` delivers the pair side-by-side in a single NVMM buffer, so no
+        crop or compose is needed — the frame goes straight into NVENC. The
+        default bitrate is twice the per-eye default (same total bits as two
+        per-eye streams, just in one track); an explicit ``stream_bitrate`` is
+        the whole packed stream's budget.
+        """
+        bitrate = self._stream_bitrate or 2 * _bitrate_for(
+            self.width, self.height, self.fps
+        )
+        self._sbs_bitrate = bitrate
+        return (
+            f"{_QUEUE} ! {_enc_branch(bitrate, self.fps, 'venc_s')} ! "
+            f"{_enc_appsink('enc_s')}"
+        )
+
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open or close both eyes' dataset branches at runtime.
 
@@ -1060,6 +1102,8 @@ class ZedGstStereoCamera(_GstPipelineBase):
             _set_enc_bitrate(
                 self._pipeline, f"venc_{side[0]}", self._enc_bitrate * scale
             )
+        if self._encoded_sbs:
+            _set_enc_bitrate(self._pipeline, "venc_s", self._sbs_bitrate * scale)
 
     def _pipeline_str(self) -> str:
         src = (
@@ -1069,9 +1113,10 @@ class ZedGstStereoCamera(_GstPipelineBase):
             "do-timestamp=false "
             "! video/x-raw(memory:NVMM),format=NV12 ! tee name=split"
         )
-        branches = "  ".join(
-            f"split. ! {self._eye_branch(side, side[0])}" for side in self._sides
-        )
+        parts = [f"split. ! {self._eye_branch(side, side[0])}" for side in self._sides]
+        if self._encoded_sbs:
+            parts.append(f"split. ! {self._sbs_branch()}")
+        branches = "  ".join(parts)
         return f"{src}  {branches}"
 
     def connect(self, warmup: bool = True) -> None:
@@ -1112,7 +1157,15 @@ class ZedGstStereoCamera(_GstPipelineBase):
                     f"raw_{suffix}",
                     self._make_raw_handler(sink, self.raw_width, self.raw_height),
                 )
-        channels = tuple(c for c in (self._left_enc, self._right_enc) if c is not None)
+        if self._sbs_enc is not None:
+            self._start_pull(
+                f"zedgst-{self.serial}-encs",
+                "enc_s",
+                self._make_au_handler(self._sbs_enc, f"sn{self.serial}-sbs"),
+            )
+        channels = tuple(
+            c for c in (self._left_enc, self._right_enc, self._sbs_enc) if c is not None
+        )
         if not self._play_and_wait(channels):
             self.disconnect()
             raise RuntimeError(

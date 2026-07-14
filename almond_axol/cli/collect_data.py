@@ -216,6 +216,11 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
                 ["left", "right"] if stream_eyes == "both" else [stream_eyes]
             )
             spec["stream_suffix"] = stream_eyes == "both"
+            # Both streamed eyes ship packed side-by-side in one track
+            # ({name}_sbs — one decoder session on the headset); the per-eye
+            # keys remain as the SDK fallback, which can't pack. Recording
+            # (record_eyes) is per-eye regardless.
+            spec["stream_sbs"] = stream_eyes == "both"
         else:
             spec["stereo"] = False
         specs[name] = spec

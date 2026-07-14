@@ -136,6 +136,17 @@ def _eye_plan(name: str, spec: dict) -> list[tuple[str, str]]:
     return _plan(name, eyes, suffix)
 
 
+def _stream_sbs(spec: dict) -> bool:
+    """Whether a stereo spec streams both eyes packed side-by-side (one track).
+
+    Packing both eyes into a single double-width stream halves the headset's
+    decoder sessions (its actual bottleneck: two full-res sessions drop the
+    Quest's render rate from 120 Hz). Only the gst pipeline can pack; the SDK
+    fallback ignores the flag and streams per-eye as before.
+    """
+    return bool(spec.get("stream_sbs"))
+
+
 def _raw_plan(name: str, spec: dict) -> list[tuple[str, str]]:
     """Raw (dataset recording) ``[(eye_side, source_name)]`` for a stereo spec.
 
@@ -226,8 +237,11 @@ def _open_gst_camera_raw(
             if stereo and use_shm:
                 # Encoded eyes feed the headset; raw eyes feed the dataset — they
                 # may differ (stream both, record one). Build the union; each eye
-                # is cropped once and tee'd into whichever branch wants it.
-                enc_plan = _eye_plan(name, spec) if wants_stream else []
+                # is cropped once and tee'd into whichever branch wants it. When
+                # both eyes stream they are packed into one side-by-side track
+                # ({name}_sbs) instead of two per-eye ones (see _stream_sbs).
+                sbs = wants_stream and _stream_sbs(spec)
+                enc_plan = _eye_plan(name, spec) if wants_stream and not sbs else []
                 raw_plan = _raw_plan(name, spec)
                 enc_sides = [side for side, _ in enc_plan]
                 raw_sides = [side for side, _ in raw_plan]
@@ -247,6 +261,7 @@ def _open_gst_camera_raw(
                     raw_dims=raw_dims,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
+                    encoded_sbs=sbs,
                     stream_bitrate=stream_bitrate,
                     **eye_kwargs,
                 )
@@ -255,13 +270,16 @@ def _open_gst_camera_raw(
                     src: (cam.left_view if side == "left" else cam.right_view)
                     for side, src in enc_plan
                 }
+                if sbs:
+                    sources[f"{name}_sbs"] = cam.sbs_view
                 raw_meta = {
                     src: _gsth264_meta(socks[side], raw_w, raw_h, fps)
                     for side, src in raw_plan
                 }
                 return cam, sources, [], raw_meta
             if stereo:
-                enc_plan = _eye_plan(name, spec) if wants_stream else []
+                sbs = wants_stream and _stream_sbs(spec)
+                enc_plan = _eye_plan(name, spec) if wants_stream and not sbs else []
                 raw_plan = _raw_plan(name, spec)
                 enc_sides = [side for side, _ in enc_plan]
                 raw_sides = [side for side, _ in raw_plan]
@@ -282,6 +300,7 @@ def _open_gst_camera_raw(
                     raw_dims=raw_dims,
                     encoded_eyes=enc_sides,
                     raw_eyes=raw_sides,
+                    encoded_sbs=sbs,
                     stream_bitrate=stream_bitrate,
                     **eye_kwargs,
                 )
@@ -290,6 +309,8 @@ def _open_gst_camera_raw(
                     src: (cam.left_view if side == "left" else cam.right_view)
                     for side, src in enc_plan
                 }
+                if sbs:
+                    sources[f"{name}_sbs"] = cam.sbs_view
                 raw_meta = {
                     src: _pyshm_meta(eye_writers[side].name, raw_w, raw_h, fps)
                     for side, src in raw_plan
@@ -364,10 +385,24 @@ def _open_gst_camera(name: str, spec: dict) -> tuple[object, dict[str, object]] 
 
     for fps in (int(spec.get("fps", 60)), 30):
         try:
+            if stereo and _stream_sbs(spec):
+                # Both eyes packed into one side-by-side track ({name}_sbs).
+                cam: object = ZedGstStereoCamera(
+                    serial,
+                    resolution,
+                    fps,
+                    want_encoded=True,
+                    want_raw=False,
+                    encoded_eyes=[],
+                    encoded_sbs=True,
+                    stream_bitrate=stream_bitrate,
+                )
+                cam.connect()
+                return cam, {f"{name}_sbs": cam.sbs_view}
             if stereo:
                 plan = _eye_plan(name, spec)
                 gst_eyes = "both" if len(plan) == 2 else plan[0][0]
-                cam: object = ZedGstStereoCamera(
+                cam = ZedGstStereoCamera(
                     serial,
                     resolution,
                     fps,

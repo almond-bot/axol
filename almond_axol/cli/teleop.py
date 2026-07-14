@@ -97,11 +97,13 @@ def _stereo_serials_for(cfg: TeleopCmdConfig) -> set[int]:
 def _stereo_eyes_for(name: str) -> tuple[list[str], bool]:
     """``(eyes, suffix)`` for a stereo camera slot under the wrist policy.
 
-    Only the head (``overhead``) camera streams both eyes — per-lens, exposed as
-    ``{name}_left`` / ``{name}_right`` (suffix). Every other slot (the wrists)
-    streams just its left eye under the plain ``{name}``, so a stereo wrist
-    encodes and ships exactly one feed, costing the same as a mono one. This is
-    what keeps the control loop's spare CPU regardless of wrist camera type.
+    Only the head (``overhead``) camera streams both eyes — packed side-by-side
+    into a single ``{name}_sbs`` track on the gst pipeline (see ``stream_sbs``
+    in ``_start_video_relay``), or per-lens ``{name}_left`` / ``{name}_right``
+    tracks on the SDK fallback. Every other slot (the wrists) streams just its
+    left eye under the plain ``{name}``, so a stereo wrist encodes and ships
+    exactly one feed, costing the same as a mono one. This is what keeps the
+    control loop's spare CPU regardless of wrist camera type.
     """
     if name == "overhead":
         return ["left", "right"], True
@@ -156,6 +158,11 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
         if int(serial) in stereo_set:
             spec["stereo"] = True
             spec["eyes"], spec["eye_suffix"] = _stream_eyes_for(cfg, name)
+            # Both eyes ship packed side-by-side in one track (one decoder
+            # session on the headset); the per-eye keys remain as the SDK
+            # fallback, which can't pack.
+            if len(spec["eyes"]) == 2:
+                spec["stream_sbs"] = True
         specs[name] = spec
 
     relay = VideoRelayProcess(specs)

@@ -9,7 +9,7 @@ import {
 } from "react"
 import { Canvas, useFrame, useThree } from "@react-three/fiber"
 import { Text } from "@react-three/drei"
-import { createXRStore, XR, useXR } from "@react-three/xr"
+import { createXRStore, XR, XRLayer, useXR } from "@react-three/xr"
 import * as THREE from "three"
 import {
   AxolConnectionStatus,
@@ -262,10 +262,22 @@ function PoseVisualizer() {
 
 // Cameras streamed from the robot, shown immersively over passthrough.
 //
-// All three feeds are shown at once: the overhead in the centre (per-eye stereo
-// when both eyes stream) with the two wrist cams as bottom-corner picture-in-
-// picture panes (left wrist → bottom-left, right wrist → bottom-right). There
-// is no view picker — the operator tailors the layout directly instead:
+// Each feed is drawn as a WebXR *media layer* (XRMediaBinding quad, via
+// @react-three/xr's <XRLayer>): the compositor samples the decoded video
+// directly, so no per-frame VideoTexture upload ever crosses the WebGL
+// pipeline — the main-thread render loop cost of a feed is ~zero, which is
+// what keeps the headset's render (and thus the VR pose stream driving IK) at
+// full rate with several cameras live. A stereo overhead arrives as a single
+// side-by-side track ("overhead_sbs", packed on the robot so the headset runs
+// one decoder session instead of two) and is displayed with the
+// "stereo-left-right" layer layout — each lens sees its own eye. On a session
+// without layer support <XRLayer> falls back to an ordinary textured plane.
+//
+// All three feeds are shown at once: the overhead in the centre (true stereo
+// when the packed track streams) with the two wrist cams as bottom-corner
+// picture-in-picture panes (left wrist → bottom-left, right wrist →
+// bottom-right). There is no view picker — the operator tailors the layout
+// directly instead:
 //   - Move a screen: point a controller at it and hold the rear trigger, then
 //     move the controller; release to drop. Each screen remembers its spot.
 //   - Resize a screen: grab the *same* screen with both controllers' triggers
@@ -280,8 +292,7 @@ function PoseVisualizer() {
 // broadcasts its engage toggle over the WebSocket (`{"type": "tracking"}`),
 // covering grips, X/reset, and saving.
 
-// Which draggable screen a plane belongs to: the overhead (its mono plane or
-// its two stereo eye planes, both "overhead") or a wrist-cam plane.
+// Which draggable screen a layer belongs to: the overhead or a wrist cam.
 type GrabSlot = "overhead" | "left" | "right"
 
 const FEED_DISTANCE = 1 // metres from the anchor point to the screens
@@ -301,7 +312,6 @@ const MAX_SCALE = 4
 
 // Scratch objects for the per-frame grab raycast (avoid allocations).
 const _raycaster = new THREE.Raycaster()
-_raycaster.layers.enableAll() // the stereo eye planes live on layers 1/2
 const _rayMatrix = new THREE.Matrix4()
 const _grabTarget = new THREE.Vector3()
 const _dragDelta = new THREE.Vector3()
@@ -323,30 +333,21 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   const { streams, available } = useAxolVideo(wsRef, session != null)
 
   const groupRef = useRef<THREE.Group>(null)
-  const meshRef = useRef<THREE.Mesh>(null)
-  const matRef = useRef<THREE.MeshBasicMaterial>(null)
-  // Per-eye planes for a stereo overhead: left on layer 1 (left lens only),
-  // right on layer 2 (right lens only). Unused for mono feeds.
-  const leftMeshRef = useRef<THREE.Mesh>(null)
-  const leftMatRef = useRef<THREE.MeshBasicMaterial>(null)
-  const rightMeshRef = useRef<THREE.Mesh>(null)
-  const rightMatRef = useRef<THREE.MeshBasicMaterial>(null)
-  // The two wrist-cam planes (layer 0): A = left wrist, B = right wrist.
+  // The three feed screens, one <XRLayer> mesh each: the overhead (stereo SBS
+  // or mono) plus the two wrist PiPs (A = left wrist, B = right wrist).
+  const overheadMeshRef = useRef<THREE.Mesh>(null)
   const dualAMeshRef = useRef<THREE.Mesh>(null)
-  const dualAMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const dualBMeshRef = useRef<THREE.Mesh>(null)
-  const dualBMatRef = useRef<THREE.MeshBasicMaterial>(null)
   const spinnerRef = useRef<THREE.Group>(null)
   const spinnerMeshRef = useRef<THREE.Mesh>(null)
   const videosRef = useRef<Record<string, HTMLVideoElement>>({})
-  const texturesRef = useRef<Record<string, THREE.VideoTexture>>({})
-  // Cameras that have decoded at least one real frame. Used to keep the last
-  // good frame on screen through brief dropouts instead of cutting to
-  // passthrough (see `liveTex`).
-  const shownRef = useRef<Record<string, boolean>>({})
-  // Last known good aspect ratio per texture. During a brief stall `videoWidth`
-  // reads 0, so we reuse the cached aspect instead of falling back to 16:9 —
-  // otherwise the plane resizes for a frame and its edges flash passthrough.
+  // Render-side mirror of videosRef: the set of camera <video>s drives which
+  // <XRLayer>s are mounted, so it must live in state; the per-frame loop reads
+  // the ref. The elements themselves are stable and shared between both.
+  const [videos, setVideos] = useState<Record<string, HTMLVideoElement>>({})
+  // Last known good aspect ratio per screen slot. During a brief stall
+  // `videoWidth` can read 0, so we reuse the cached aspect instead of falling
+  // back to 16:9 — otherwise the screen resizes for a frame.
   const aspectRef = useRef<Record<string, number>>({})
   // Whether the screen group has been world-anchored for this XR session.
   const anchoredRef = useRef(false)
@@ -379,49 +380,42 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // after we've already gone live) doesn't flash the arc over the feed.
   const connectingHeldRef = useRef(0)
 
-  // Wrap each incoming MediaStream in a <video> + VideoTexture.
+  // Wrap each incoming MediaStream in a <video> the media layers sample from.
   //
-  // We deliberately do NOT tear down a camera's <video>/texture when its stream
-  // momentarily disappears from `streams`. A `THREE.VideoTexture` keeps the last
-  // decoded frame uploaded on the GPU, so as long as we keep the texture alive
-  // and the plane visible, a brief WebRTC blip (a transient `failed`/`closed`,
-  // a socket swap, or a re-offer — all of which clear `streams` upstream) shows
-  // the frozen last frame instead of cutting to passthrough. When the stream
-  // returns we just re-point the existing <video> at the new MediaStream, so the
-  // texture keeps streaming into the same object with no flash. Textures are
-  // only released on unmount (below).
+  // We deliberately do NOT tear down a camera's <video> when its stream
+  // momentarily disappears from `streams`. The compositor keeps presenting the
+  // video's last decoded frame, so a brief WebRTC blip (a transient
+  // `failed`/`closed`, a socket swap, or a re-offer — all of which clear
+  // `streams` upstream) shows the frozen last frame instead of cutting to
+  // passthrough. When the stream returns we just re-point the existing <video>
+  // at the new MediaStream, so the layer keeps sampling the same element with
+  // no flash. Videos are only released on unmount / session end (below).
   useEffect(() => {
-    const videos = videosRef.current
-    const textures = texturesRef.current
+    const store = videosRef.current
+    let added = false
     for (const [name, stream] of Object.entries(streams)) {
-      let video = videos[name]
+      let video = store[name]
       if (!video) {
         video = document.createElement("video")
         video.muted = true
         video.autoplay = true
         video.playsInline = true
-        videos[name] = video
+        store[name] = video
+        added = true
       }
       if (video.srcObject !== stream) {
         video.srcObject = stream
         void video.play().catch(() => {})
       }
-      if (!textures[name]) {
-        const tex = new THREE.VideoTexture(video)
-        tex.colorSpace = THREE.SRGBColorSpace
-        textures[name] = tex
-      }
     }
+    if (added) setVideos({ ...store })
   }, [streams])
 
-  // Release GPU textures / video elements when the feed unmounts.
+  // Release the video elements when the feed unmounts.
   useEffect(() => {
     const videos = videosRef.current
-    const textures = texturesRef.current
     return () => {
-      for (const tex of Object.values(textures)) tex.dispose()
       for (const video of Object.values(videos)) video.srcObject = null
-      shownRef.current = {}
       aspectRef.current = {}
     }
   }, [])
@@ -429,68 +423,42 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // Fully release the cameras when the XR session ends. This component stays
   // mounted across sessions, and we intentionally keep the last frame through
   // *in-session* dropouts (see the `[streams]` effect), but a session end is a
-  // clean teardown: without this, the sticky textures/videos/shownRef would
-  // survive and a later re-entry would treat last session's frozen GPU frames
-  // as live (hiding the connecting spinner) until fresh tracks arrive.
+  // clean teardown: without this, the sticky videos would survive and a later
+  // re-entry would treat last session's frozen frames as live (hiding the
+  // connecting spinner) until fresh tracks arrive.
   useEffect(() => {
     if (session) return
-    const videos = videosRef.current
-    const textures = texturesRef.current
-    for (const name of Object.keys(textures)) {
-      textures[name].dispose()
-      delete textures[name]
+    const store = videosRef.current
+    for (const name of Object.keys(store)) {
+      store[name].srcObject = null
+      delete store[name]
     }
-    for (const name of Object.keys(videos)) {
-      videos[name].srcObject = null
-      delete videos[name]
-    }
-    shownRef.current = {}
     aspectRef.current = {}
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reset the mirrored video set on session teardown
+    setVideos({})
   }, [session])
-
-  // Confine the stereo eye planes to their lens via three.js layers: an object
-  // on layer 1 renders to the left eye only, layer 2 to the right eye only.
-  useEffect(() => {
-    leftMeshRef.current?.layers.set(1)
-    rightMeshRef.current?.layers.set(2)
-  }, [])
 
   useFrame((_state, delta, frame) => {
     const group = groupRef.current
-    const mesh = meshRef.current
-    const mat = matRef.current
     const spinner = spinnerRef.current
-    const leftMesh = leftMeshRef.current
-    const rightMesh = rightMeshRef.current
-    const leftMat = leftMatRef.current
-    const rightMat = rightMatRef.current
+    // The screen meshes mount/unmount with their streams (<XRLayer> below);
+    // any of them may be absent this frame.
+    const overheadMesh = overheadMeshRef.current
     const aMesh = dualAMeshRef.current
-    const aMat = dualAMatRef.current
     const bMesh = dualBMeshRef.current
-    const bMat = dualBMatRef.current
-    if (!group || !mesh || !mat || !spinner) return
-    if (!leftMesh || !rightMesh || !leftMat || !rightMat) return
-    if (!aMesh || !aMat || !bMesh || !bMat) return
+    if (!group || !spinner) return
 
     const presenting = gl.xr.isPresenting
     const cam = gl.xr.getCamera()
-    const textures = texturesRef.current
+    const videos = videosRef.current
 
-    // A texture is usable once its <video> has decoded at least one real frame.
-    // Once that's happened we keep returning it (the texture still holds that
-    // last frame on the GPU) even if `videoWidth` momentarily reads 0 during a
-    // stall or stream reconnect — that's what stops the feed from flickering to
-    // passthrough and back. It only becomes unusable again if the texture itself
-    // is gone (i.e. on unmount).
-    const liveTex = (name: string) => {
-      const t = textures[name]
-      if (!t) return undefined
-      const v = t.image as HTMLVideoElement | undefined
-      if (v && v.videoWidth) {
-        shownRef.current[name] = true
-        return t
-      }
-      return shownRef.current[name] ? t : undefined
+    // A camera is live once its <video> knows its size (metadata + first
+    // frames decoded). It stays live through a stall or stream reconnect —
+    // the media layer keeps compositing the last decoded frame, which is what
+    // stops the feed from flickering to passthrough and back.
+    const liveVideo = (name: string) => {
+      const v = videos[name]
+      return v && v.videoWidth ? v : undefined
     }
 
     // World-anchor the screen group once per session: place it at the head
@@ -530,25 +498,14 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     }
     stickClickPrevRef.current = stickClicked
 
-    // All available feeds are shown at once: the overhead centred (true per-eye
-    // stereo when both eyes stream, else a single mono plane) with the wrist
-    // cams as bottom-corner PiPs.
-    const oL = liveTex("overhead_left")
-    const oR = liveTex("overhead_right")
-    const overheadMono = oL && oR ? undefined : (oL ?? liveTex("overhead"))
-    const leftTex = liveTex("left_arm")
-    const rightTex = liveTex("right_arm")
-    const anyLive = !!(oL || overheadMono || leftTex || rightTex)
-
-    group.visible = presenting && anyLive
-
     // "Connecting cameras…" is a global indicator: show it while video is still
     // being negotiated (available === null), or while any camera that IS being
     // streamed hasn't produced its first frame yet. Hidden once every streamed
     // camera is live, and entirely when the server reports no video
     // (available === false — nothing is streaming).
-    const streamed = Object.keys(textures)
-    const allLive = streamed.length > 0 && streamed.every((n) => !!liveTex(n))
+    const streamed = Object.keys(videos)
+    const anyLive = streamed.some((n) => !!liveVideo(n))
+    const allLive = streamed.length > 0 && streamed.every((n) => !!liveVideo(n))
     const connecting = available === null || (available === true && !allLive)
     connectingHeldRef.current = connecting ? connectingHeldRef.current + delta : 0
     // Show the spinner immediately during the initial connect (nothing live
@@ -562,81 +519,46 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       spinnerMeshRef.current.rotation.z -= 0.12
     }
 
-    // Hide every plane up front; the layout below re-enables what it draws.
-    mesh.visible = false
-    leftMesh.visible = false
-    rightMesh.visible = false
-    aMesh.visible = false
-    bMesh.visible = false
-    if (!group.visible) return
-
-    // Aspect ratio of a feed's video, cached per texture. While a stream stalls
-    // `videoWidth`/`videoHeight` read 0; reuse the last good aspect so the plane
-    // keeps its size (and its edges don't flash passthrough) until the sticky
-    // texture resumes. Falls back to 16:9 only before the first decoded frame.
-    const aspectOf = (t: THREE.VideoTexture) => {
-      const v = t.image as HTMLVideoElement | undefined
+    // Aspect ratio of a feed's video, cached per screen slot. While a stream
+    // (re)connects `videoWidth`/`videoHeight` read 0; reuse the last good
+    // aspect so the screen keeps its size until the video resumes. Falls back
+    // to 16:9 only before the first frame. An SBS video carries both eyes in
+    // one double-width frame, so the *displayed* aspect halves its width.
+    const aspectOf = (slot: string, v: HTMLVideoElement | undefined, sbs: boolean) => {
       if (v && v.videoWidth && v.videoHeight) {
-        const a = v.videoWidth / v.videoHeight
-        aspectRef.current[t.uuid] = a
+        const a = v.videoWidth / (sbs ? 2 : 1) / v.videoHeight
+        aspectRef.current[slot] = a
         return a
       }
-      return aspectRef.current[t.uuid] ?? 16 / 9
+      return aspectRef.current[slot] ?? 16 / 9
     }
-    // Place a plane sized to a target height (width from the video aspect),
-    // times the slot's user resize factor.
-    const fitHeight = (
-      m: THREE.Mesh,
-      mt: THREE.MeshBasicMaterial,
-      t: THREE.VideoTexture,
-      height: number,
-      x: number,
-      y: number,
-      scale: number
-    ) => {
-      const aspect = aspectOf(t)
-      if (mt.map !== t) {
-        mt.map = t
-        mt.needsUpdate = true
-      }
-      const h = height * scale
-      m.scale.set(h * aspect, h, 1)
-      m.position.set(x, y, -FEED_DISTANCE)
-      m.visible = true
-    }
-    // Place a plane sized to a target width (height from the video aspect).
+    // Place a screen sized to a target width (height from the video aspect),
+    // times the slot's user resize factor. The mesh scale is what sizes the
+    // compositor quad (see XRLayer): scale.x/y = full width/height in metres.
     const fitWidth = (
-      m: THREE.Mesh,
-      mt: THREE.MeshBasicMaterial,
-      t: THREE.VideoTexture,
+      m: THREE.Mesh | null,
+      v: HTMLVideoElement | undefined,
+      sbs: boolean,
+      slot: GrabSlot,
       width: number,
       x: number,
-      y: number,
-      scale: number
+      y: number
     ) => {
-      const aspect = aspectOf(t)
-      fitHeight(m, mt, t, width / aspect, x, y, scale)
-      m.scale.x = width * scale
+      if (!m) return
+      const aspect = aspectOf(slot, v, sbs)
+      const w = width * (scalesRef.current[slot] ?? 1)
+      m.scale.set(w, w / aspect, 1)
+      m.position.set(x, y, -FEED_DISTANCE)
     }
 
-    const scaleOf = (slot: GrabSlot) => scalesRef.current[slot] ?? 1
-
-    // Overhead in the centre.
-    if (oL && oR) {
-      // True stereo: each eye sees its own image (layer 1 left, layer 2 right).
-      fitWidth(leftMesh, leftMat, oL, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
-      fitWidth(rightMesh, rightMat, oR, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
-      const eyes = (cam as THREE.ArrayCamera).cameras
-      if (eyes && eyes.length >= 2) {
-        eyes[0].layers.enable(1)
-        eyes[1].layers.enable(2)
-      }
-    } else if (overheadMono) {
-      fitWidth(mesh, mat, overheadMono, OVERHEAD_WIDTH, 0, FEED_Y, scaleOf("overhead"))
-    }
-    // Wrist cams as bottom-corner PiPs (left → bottom-left, right → bottom-right).
-    if (leftTex) fitWidth(aMesh, aMat, leftTex, PIP_WIDTH, -PIP_X, PIP_Y, scaleOf("left"))
-    if (rightTex) fitWidth(bMesh, bMat, rightTex, PIP_WIDTH, PIP_X, PIP_Y, scaleOf("right"))
+    // Overhead in the centre, wrist cams as bottom-corner PiPs (left →
+    // bottom-left, right → bottom-right). Screens mount/unmount with their
+    // streams; here we only (re)size and place whichever exist.
+    const sbs = !!videos["overhead_sbs"]
+    const overheadVideo = videos["overhead_sbs"] ?? videos["overhead"] ?? videos["overhead_left"]
+    fitWidth(overheadMesh, overheadVideo, sbs, "overhead", OVERHEAD_WIDTH, 0, FEED_Y)
+    fitWidth(aMesh, videos["left_arm"], false, "left", PIP_WIDTH, -PIP_X, PIP_Y)
+    fitWidth(bMesh, videos["right_arm"], false, "right", PIP_WIDTH, PIP_X, PIP_Y)
 
     // Refresh each hand's pointing ray (origin + forward) in world space, so
     // both the single-hand drag and the two-hand resize can read either hand.
@@ -663,6 +585,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     // while robot tracking is engaged — the trigger drives the gripper then, and
     // a grab would fight the teleop.
     const grabs = grabsRef.current
+    const scaleOf = (slot: GrabSlot) => scalesRef.current[slot] ?? 1
     if (robotEngagedRef.current) {
       grabs.left = null
       grabs.right = null
@@ -680,10 +603,9 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
       }
       if (!wasPressed && !grabs[hand] && _handRay[hand].valid) {
         const candidates: [THREE.Mesh, GrabSlot][] = []
-        if (mesh.visible) candidates.push([mesh, "overhead"])
-        if (leftMesh.visible) candidates.push([leftMesh, "overhead"])
-        if (aMesh.visible) candidates.push([aMesh, "left"])
-        if (bMesh.visible) candidates.push([bMesh, "right"])
+        if (overheadMesh) candidates.push([overheadMesh, "overhead"])
+        if (aMesh) candidates.push([aMesh, "left"])
+        if (bMesh) candidates.push([bMesh, "right"])
         _raycaster.set(_handRay[hand].origin, _handRay[hand].dir)
         const hits = _raycaster.intersectObjects(
           candidates.map((c) => c[0]),
@@ -756,76 +678,63 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     // Apply any remembered drag offset, then turn each screen to face the
     // operator's head (a world-anchored panel viewed edge-on is useless).
-    const orient = (m: THREE.Mesh, slot: GrabSlot) => {
-      if (!m.visible) return
+    const orient = (m: THREE.Mesh | null, slot: GrabSlot) => {
+      if (!m) return
       const off = dragOffsetsRef.current[slot]
       if (off) m.position.add(off)
       m.lookAt(cam.position)
     }
-    orient(mesh, "overhead")
-    orient(leftMesh, "overhead")
-    orient(rightMesh, "overhead")
+    orient(overheadMesh, "overhead")
     orient(aMesh, "left")
     orient(bMesh, "right")
   })
 
+  // The screens mount/unmount with their videos: hiding a compositor media
+  // layer requires destroying it (a placeholder mesh's `visible` flag has no
+  // effect on compositing), so each <XRLayer> exists exactly while its camera
+  // has a (sticky) <video>.
+  const sbsVideo = videos["overhead_sbs"]
+  // Preference order: packed SBS (true stereo) > mono > legacy per-eye left
+  // (an older robot streaming separate overhead_left/right tracks — shown
+  // mono, since a media layer can't split across two videos).
+  const overheadVideo = sbsVideo ?? videos["overhead"] ?? videos["overhead_left"]
+
   return (
     <>
-      <group ref={groupRef} visible={false}>
-        <mesh ref={meshRef} position={[0, FEED_Y, -FEED_DISTANCE]} renderOrder={1} visible={false}>
-          <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial ref={matRef} toneMapped={false} depthTest={false} depthWrite={true} />
-        </mesh>
-        <mesh
-          ref={leftMeshRef}
-          position={[0, FEED_Y, -FEED_DISTANCE]}
-          renderOrder={1}
-          visible={false}
-        >
-          <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial
-            ref={leftMatRef}
-            toneMapped={false}
-            depthTest={false}
-            depthWrite={true}
+      <group ref={groupRef}>
+        {/* Distinct renderOrders keep the compositing order deterministic
+            where the PiPs overlap the overhead (higher composites on top; the
+            WebGL projection layer with the HUD is always last, i.e. above). */}
+        {session && overheadVideo && (
+          <XRLayer
+            ref={overheadMeshRef}
+            src={overheadVideo}
+            shape="quad"
+            layout={sbsVideo ? "stereo-left-right" : "mono"}
+            renderOrder={1}
+            position={[0, FEED_Y, -FEED_DISTANCE]}
           />
-        </mesh>
-        <mesh
-          ref={rightMeshRef}
-          position={[0, FEED_Y, -FEED_DISTANCE]}
-          renderOrder={1}
-          visible={false}
-        >
-          <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial
-            ref={rightMatRef}
-            toneMapped={false}
-            depthTest={false}
-            depthWrite={true}
+        )}
+        {session && videos["left_arm"] && (
+          <XRLayer
+            ref={dualAMeshRef}
+            src={videos["left_arm"]}
+            shape="quad"
+            layout="mono"
+            renderOrder={2}
+            position={[-PIP_X, PIP_Y, -FEED_DISTANCE]}
           />
-        </mesh>
-        {/* Wrist-cam planes shown as bottom-corner PiPs (A = left, B = right).
-            Distinct renderOrders keep the paint order deterministic where the
-            PiPs overlap the overhead — without depth testing, equal orders let
-            three.js's distance sort flip coplanar planes and flicker. */}
-        <mesh ref={dualAMeshRef} renderOrder={2} visible={false}>
-          <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial
-            ref={dualAMatRef}
-            toneMapped={false}
-            depthTest={false}
-            depthWrite={true}
+        )}
+        {session && videos["right_arm"] && (
+          <XRLayer
+            ref={dualBMeshRef}
+            src={videos["right_arm"]}
+            shape="quad"
+            layout="mono"
+            renderOrder={3}
+            position={[PIP_X, PIP_Y, -FEED_DISTANCE]}
           />
-        </mesh>
-        <mesh ref={dualBMeshRef} renderOrder={3} visible={false}>
-          <planeGeometry args={[1, 1]} />
-          <meshBasicMaterial
-            ref={dualBMatRef}
-            toneMapped={false}
-            depthTest={false}
-            depthWrite={true}
-          />
-        </mesh>
+        )}
       </group>
       <group ref={spinnerRef} visible={false}>
         {/* Spinning arc (a torus with a gap) shown while the cameras connect. */}
