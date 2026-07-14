@@ -41,15 +41,19 @@ _logger = logging.getLogger(__name__)
 
 # How long a stop waits for the op to unwind cleanly before force-killing the
 # op's child subprocesses, and how long it then waits for the freed-up worker
-# thread to finish. Kept short so Stop feels immediate: the worker thread can be
-# stuck for *minutes* on a child subprocess with no stop check in between —
-# either tearing down (``recorder.close()`` waits up to 180s for an in-flight
-# save; the video relay / IK joins add more) or still starting up (it blocks in
-# ``teleop.connect()`` on the IK worker's "ready" message, which only arrives
-# after JAX finishes compiling the IK solver — a cold compile is minutes). The
-# only reliable way to stop fast in all those cases is to kill the children out
-# from under it, which makes the blocked join/recv return.
-_STOP_GRACE_S = 6.0
+# thread to finish. The stop grace must exceed the ~30s soft-shutdown park cap
+# plus planning margin: a stopping op may still be easing the arms down to
+# zero, and force-killing its children mid-park would take out the IK worker
+# planning the move (dropping the arms) and the dataset recorder mid-save
+# (losing the episode) on every panel Stop. Past the grace the worker thread
+# can still be stuck for *minutes* on a child subprocess with no stop check in
+# between — either tearing down (``recorder.close()`` waits up to 180s for an
+# in-flight save; the video relay / IK joins add more) or still starting up
+# (it blocks in ``teleop.connect()`` on the IK worker's "ready" message, which
+# only arrives after JAX finishes compiling the IK solver — a cold compile is
+# minutes) — and the only reliable way to unstick those remains killing the
+# children out from under it, which makes the blocked join/recv return.
+_STOP_GRACE_S = 40.0
 _FORCE_GRACE_S = 5.0
 
 # Operations that need exclusive ownership of the CAN bus (everything except

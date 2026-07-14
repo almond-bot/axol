@@ -3,7 +3,7 @@ title: "collect-data"
 description: "Record teleoperation episodes to a LeRobot-format dataset."
 ---
 
-Records teleoperation episodes using VR controller inputs and locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
+Records teleoperation episodes using VR controller inputs and locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`. On a clean stop the arms are parked — eased down to the all-zeros pose with the grippers holding their current value — before the motors release; see `--park_on_exit`.
 
 <Tip>
   For the end-to-end workflow, see the [Data Collection guide](/operations/data-collection).
@@ -32,6 +32,7 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--teleop_config.vr_teleop_config.rotation_multiplier FLOAT` | Scale factor on hand **orientation** (not position): the end-effector target rotates this many times as far as your wrist. `1.0` (default) is 1:1; `2.0` rotates the arm twice as far. |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
 | `--rerun_port INT` | Rerun viewer port (default: 9876); only used when `--rerun_ip` is set |
+| `--park_on_exit false` | Opt out of parking the arms on a clean stop. By default (`true`) the arms ease down to the all-zeros pose (a collision-aware move planned by the IK worker) before the motors release, with the grippers holding their current value. The park is skipped after an error (a possibly-faulted robot is never commanded), capped at ~30 s, and a second `Ctrl+C` aborts it and releases the motors immediately. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 

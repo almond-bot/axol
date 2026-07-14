@@ -113,6 +113,15 @@ class VRTeleopCore:
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
         self._reset_latched: bool = False
+        # Target of the next latched reset — "rest" (the configured rest pose,
+        # the default) or "zero" (all arm joints at 0, used by the
+        # soft-shutdown park; see request_zero). Consumed and restored to
+        # "rest" when the move is dispatched. _dispatching_reset holds
+        # is_resetting True across the blocking plan round-trip so a poller
+        # never sees a false "done" between the latch clearing and the
+        # trajectory becoming active.
+        self._reset_target: str = "rest"
+        self._dispatching_reset: bool = False
 
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)
@@ -172,6 +181,21 @@ class VRTeleopCore:
 
     def request_reset(self) -> None:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
+        self._reset_target = "rest"  # see request_zero
+        self._reset_latched = True
+
+    def request_zero(self) -> None:
+        """Programmatically trigger a return-to-zero move. Safe from any thread.
+
+        Like :meth:`request_reset`, but the collision-aware trajectory targets
+        the all-zeros arm pose instead of the configured rest pose — used to
+        park the arms at the end of a session so they descend gradually rather
+        than dropping when the motors release. The IK loop picks up the latch
+        on its next iteration; poll :attr:`is_resetting` to know when the move
+        completes. The grippers hold their current value for the whole move (a
+        park must not drop a held object).
+        """
+        self._reset_target = "zero"
         self._reset_latched = True
 
     def clear_reset_request(self) -> None:
@@ -184,8 +208,12 @@ class VRTeleopCore:
 
     @property
     def is_resetting(self) -> bool:
-        """True while a reset is pending or a reset trajectory is playing back."""
-        return self._reset_latched or self.reset_interp.is_active()
+        """True while a reset is pending, dispatching, or playing back."""
+        return (
+            self._reset_latched
+            or self._dispatching_reset  # see __init__
+            or self.reset_interp.is_active()
+        )
 
     # ------------------------------------------------------------------
     # Engage toggle + IK target (IK thread)
@@ -341,14 +369,34 @@ class VRTeleopCore:
                 and not self.reset_interp.is_active()
             ):
                 self._reset_latched = False
+                # Consume the reset target (default "rest"; "zero" parks the
+                # arms at all-joints-0, computed here on the thread that owns
+                # self.q — see request_zero). _dispatching_reset holds
+                # is_resetting True across the blocking plan round-trip.
+                target = self._reset_target
+                self._reset_target = "rest"
+                self._dispatching_reset = True
                 try:
-                    conn.send(("reset", self.q.copy()))
+                    if target == "zero":
+                        q_target = self.q.copy()
+                        q_target[self.left_indices] = 0.0
+                        q_target[self.right_indices] = 0.0
+                    else:
+                        q_target = None
+                    conn.send(("reset", self.q.copy(), q_target))
                     result = conn.recv()
                     if isinstance(result, tuple) and result[0] == "reset_traj":
                         _, q_default, trajectory = result
                         if trajectory:
+                            # A zero-target move is the soft-shutdown park:
+                            # hold the grippers at their current value instead
+                            # of ramping them open, so a held object isn't
+                            # dropped as the arms ease down.
                             self.reset_interp.set_trajectory(
-                                trajectory, self.l_grip, self.r_grip
+                                trajectory,
+                                self.l_grip,
+                                self.r_grip,
+                                hold_grippers=(target == "zero"),
                             )
                             self.teleop_enabled = False
                             self._broadcast(False)
@@ -359,6 +407,8 @@ class VRTeleopCore:
                         self.q = np.asarray(q_default, dtype=np.float32)
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
                     self._logger.error("Reset error: %s", e)
+                finally:
+                    self._dispatching_reset = False
                 self._pace(t0, ik_interval)
                 continue
 

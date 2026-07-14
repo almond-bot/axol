@@ -464,6 +464,16 @@ def run_ik_worker(
     q_current_right: np.ndarray | None = None,
 ) -> None:
     """IK subprocess entry point."""
+    # Ignore Ctrl+C here — a terminal SIGINT reaches the whole process group,
+    # but this worker's lifecycle is owned by the parent (it stops on the
+    # ``None`` sentinel / pipe EOF sent at disconnect). Without this it exits
+    # on Ctrl+C, and the soft-shutdown park — which needs this worker to plan
+    # the trajectory — fails with [Errno 104] Connection reset by peer and the
+    # arms drop instead of easing down.
+    from ..utils.signals import ignore_sigint
+
+    ignore_sigint()
+
     # Confine the JAX solve to a single core's worth of compute. The per-arm IK
     # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
     # core for each solve; combined with this process's nice(-10) boost, that
@@ -532,10 +542,20 @@ def run_ik_worker(
                 break
             if isinstance(msg, tuple) and msg[0] == "reset":
                 q_current = np.asarray(msg[1], dtype=np.float32)
-                traj = worker.compute_reset_trajectory(q_current, q_rest)
+                # Optional explicit target (msg[2]); None/absent → the
+                # configured rest pose, so every 2-tuple sender keeps the
+                # original behavior. The soft-shutdown park sends an all-zeros
+                # arm pose here so the arms ease down before the motors
+                # release.
+                q_target = (
+                    np.asarray(msg[2], dtype=np.float32)
+                    if len(msg) > 2 and msg[2] is not None
+                    else q_rest
+                )
+                traj = worker.compute_reset_trajectory(q_current, q_target)
                 worker.reset()
-                q = traj[-1].copy() if traj else q_rest.copy()
-                conn.send(("reset_traj", q_rest.copy(), traj))
+                q = traj[-1].copy() if traj else q_target.copy()
+                conn.send(("reset_traj", q_target.copy(), traj))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())

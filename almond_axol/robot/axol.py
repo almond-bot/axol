@@ -265,6 +265,32 @@ class AxolArm:
         """
         return np.array([m.torque for m in self.motors.values()], dtype=np.float32)
 
+    @property
+    def last_gripper_commanded(self) -> float | None:
+        """Last commanded gripper target, normalized to [0, 1].
+
+        ``None`` until the first ``motion_control`` command lands (or after
+        :meth:`reset_command_state` clears the cache). ``_last_q_commanded``
+        stores the gripper in raw motor radians (``motion_control`` converts
+        before caching), so invert the same limits mapping :attr:`positions`
+        uses to give callers the [0, 1] frame they command in.
+
+        The gripper runs position-force control: under load the *measured*
+        position sags below the command (the force comes from that gap), so a
+        caller that wants to keep holding an object must re-command this
+        value — re-commanding the measured position would collapse the grip
+        force. The soft-shutdown park reads this for exactly that reason.
+        """
+        if self._last_q_commanded is None:
+            return None
+        gripper_i = self._gripper_i
+        lo = float(self._limits_lo[gripper_i])
+        hi = float(self._limits_hi[gripper_i])
+        if lo == hi:
+            return None
+        value = (float(self._last_q_commanded[gripper_i]) - hi) / (lo - hi)
+        return float(min(1.0, max(0.0, value)))
+
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
     # ------------------------------------------------------------------ #

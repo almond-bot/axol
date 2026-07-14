@@ -696,6 +696,23 @@ class AxolRobot(Robot):
             self._axol.gravity_compensate(kd=kd, free_joints=free_joints), self._loop
         ).result(timeout=1.0)
 
+    def last_gripper_commands(self) -> tuple[float | None, float | None]:
+        """Last commanded gripper targets ``(left, right)``, normalized [0, 1].
+
+        ``None`` per side until the first ``motion_control`` command (or after
+        :meth:`reset_command_state`). See
+        :attr:`almond_axol.robot.axol.AxolArm.last_gripper_commanded` for why
+        holding an object requires re-commanding this value rather than the
+        measured position.
+        """
+        assert self._axol is not None
+        left = self._axol.left
+        right = self._axol.right
+        return (
+            left.last_gripper_commanded if left is not None else None,
+            right.last_gripper_commanded if right is not None else None,
+        )
+
     def reset_command_state(self) -> None:
         """Clear cached command history after an out-of-band move.
 

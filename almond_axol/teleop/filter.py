@@ -221,7 +221,9 @@ class ResetInterpolator:
     """Steps through a pre-computed collision-aware trajectory one waypoint per call.
 
     Optionally ramps gripper values (normalized [0, 1]) from a start value to
-    1.0 (open) over the same number of steps as the arm trajectory.
+    1.0 (open) over the same number of steps as the arm trajectory, or — with
+    ``hold_grippers`` — keeps them at their start values for the whole move
+    (the soft-shutdown park must not drop a held object).
     """
 
     def __init__(self) -> None:
@@ -233,33 +235,46 @@ class ResetInterpolator:
         self._traj_index: int = 0
         self._l_grip_start: float = 0.0
         self._r_grip_start: float = 0.0
+        self._hold_grippers: bool = False
 
     def set_trajectory(
         self,
         trajectory: list[np.ndarray],
         l_grip: float = 0.0,
         r_grip: float = 0.0,
+        hold_grippers: bool = False,
     ) -> None:
-        """Load a pre-computed trajectory and gripper start values."""
+        """Load a pre-computed trajectory and gripper start values.
+
+        With ``hold_grippers`` the gripper values stay at ``l_grip`` /
+        ``r_grip`` for every step instead of ramping open.
+        """
         self._trajectory = [np.array(q, dtype=np.float64) for q in trajectory]
         self._traj_index = 0
         self._l_grip_start = l_grip
         self._r_grip_start = r_grip
+        self._hold_grippers = hold_grippers
 
     def step(self) -> tuple[np.ndarray | None, float, float, bool]:
         """Advance one step.
 
         Returns ``(new_q_rad, l_grip, r_grip, done)`` where gripper values are
-        smoothstepped from their start values to 1.0 over the trajectory length.
+        smoothstepped from their start values to 1.0 over the trajectory length
+        (or held at their start values when the trajectory was loaded with
+        ``hold_grippers``).
         """
         if self._trajectory is None or self._traj_index >= len(self._trajectory):
             self.clear()
             return None, 1.0, 1.0, True
         n = len(self._trajectory)
-        alpha = (self._traj_index + 1) / n
-        smooth = alpha * alpha * (3.0 - 2.0 * alpha)
-        l_grip = self._l_grip_start + smooth * (1.0 - self._l_grip_start)
-        r_grip = self._r_grip_start + smooth * (1.0 - self._r_grip_start)
+        if self._hold_grippers:
+            l_grip = self._l_grip_start
+            r_grip = self._r_grip_start
+        else:
+            alpha = (self._traj_index + 1) / n
+            smooth = alpha * alpha * (3.0 - 2.0 * alpha)
+            l_grip = self._l_grip_start + smooth * (1.0 - self._l_grip_start)
+            r_grip = self._r_grip_start + smooth * (1.0 - self._r_grip_start)
         q = self._trajectory[self._traj_index]
         self._traj_index += 1
         done = self._traj_index >= n
