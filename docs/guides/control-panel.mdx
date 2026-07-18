@@ -76,7 +76,7 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | **Teleop & VR** | Teleop control rate, position and rotation multipliers. |
 | **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
 | **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
-| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
+| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. |
 | **Advanced** | Every remaining config field, organized by subsystem (*Axol*, *Teleop*, *Kinematics*, *VR server*, *LeRobot robot*) with a search box across all of it. There is **one value per knob, applied to every operation** — the host translates it to each operation's config path, so there are never different per-task copies of the same setting. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
