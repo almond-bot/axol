@@ -415,6 +415,36 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         relay.shutdown()
         relay = None
 
+    # On the relay's encoded (gstshm-h264) transport the dataset capture loop
+    # is paced by camera frame arrival — exactly one encoded frame per dataset
+    # row — so rows land at the camera rate no matter what fps was requested,
+    # while ``meta/info.json`` is stamped with the requested value. A mismatch
+    # therefore records a dataset whose metadata lies about its timing, and
+    # every consumer (replay-dataset, training) plays it back at the wrong
+    # speed. Fail fast with the rates the relay actually opened the cameras at
+    # (they can fall back, e.g. to 30 fps) instead of recording bad data.
+    if use_relay:
+        mismatched = {
+            src: int(m["fps"])
+            for src, m in relay.raw_meta.items()
+            if src in expected
+            and m["transport"] == "gstshm-h264"
+            and int(m["fps"]) != fps
+        }
+        if mismatched:
+            relay.shutdown()
+            rates = ", ".join(
+                f"{src} at {v} fps" for src, v in sorted(mismatched.items())
+            )
+            raise ValueError(
+                f"Recording fps is {fps}, but dataset frames are captured at "
+                f"the camera rate ({rates}) — the episode would actually "
+                f"record at the camera rate while claiming {fps} fps, so "
+                f"replay and training would run at the wrong speed. Set the "
+                f"recording fps to the camera rate, or raise the camera fps "
+                f"to {fps}."
+            )
+
     # Connect first — cameras auto-detect resolution and FPS on open, which
     # is then used to define the dataset observation features. With the relay
     # the robot's cameras are shared-memory proxies, so this only opens the arms.

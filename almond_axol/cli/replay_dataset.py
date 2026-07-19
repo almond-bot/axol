@@ -14,7 +14,10 @@ The robot is moved to the rest pose before playback so the arm starts from the
 same place every episode does in ``collect-data`` (episodes are recorded from
 rest, so the first replayed action is ~rest and there's no jump). Each frame's
 action is sent at the dataset's recorded fps to reproduce the original timing,
-then a final return-to-rest leaves the arm parked.
+then a final return-to-rest leaves the arm parked. Playback runs on the
+robot's event loop with absolute-deadline pacing (like collect-data's control
+loop) so command intervals stay regular; ``--interpolate`` additionally
+upsamples the recorded actions to ~120 Hz commands for smoother tracking.
 
 With ``--loop`` the episode replays continuously (returning to rest between
 takes) until stopped with Ctrl+C, or Stop in the control panel; either way the
@@ -23,6 +26,7 @@ arm returns to the rest pose before the operation exits.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
@@ -34,6 +38,11 @@ from ..lerobot.robot.config_axol import AxolRobotConfig
 from .config import LogLevel, parse
 
 _logger = logging.getLogger(__name__)
+
+# Command rate interpolated playback upsamples to — the teleop control rate,
+# so the arm receives setpoints at the same cadence it was driven with when
+# the episode was recorded.
+_INTERP_HZ = 120
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -68,6 +77,11 @@ class ReplayDatasetConfig:
     # Playback rate. ``0`` (the default) replays at the dataset's recorded fps,
     # reproducing the original timing; set a positive value to override it.
     fps: int = 0
+    # Smooth playback by linearly interpolating between recorded actions and
+    # commanding the arms at ~120 Hz (the teleop control rate) instead of the
+    # dataset fps. Episode timing is unchanged; only the command granularity
+    # increases. Off by default (each recorded action is sent once, as-is).
+    interpolate: bool = False
     # Replay the episode on a loop until stopped (Ctrl+C, or Stop in the UI),
     # returning to rest between takes. Off by default (a single replay). Either
     # way the arm returns to the rest pose before the operation exits.
@@ -102,6 +116,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     """Load the episode, return to rest, replay its actions, then return to rest."""
     from pathlib import Path
 
+    import numpy as np
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME
     from lerobot.utils.utils import log_say
@@ -166,7 +181,14 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             f"expects (recorded actions: {action_names}). It wasn't recorded for "
             "this robot."
         )
+    # Pull the whole episode's actions into one numpy array up front: indexing
+    # the Arrow-backed dataset per frame inside the timed playback loop has
+    # variable latency (chunk decode), which would land directly in the command
+    # interval and show up as jerk (see the pacing note in the playback loop).
     actions = dataset.select_columns(ACTION)
+    action_matrix = np.stack(
+        [np.asarray(actions[i][ACTION], dtype=np.float64) for i in range(num_frames)]
+    )
 
     # Spawn the IK worker now so its JAX JIT (~10-20 s) overlaps with the robot
     # connect, exactly as run-policy does before its policy load.
@@ -188,6 +210,60 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     def _stopped() -> bool:
         return stop_event.is_set()
 
+    # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
+    # by linearly blending between consecutive recorded actions. Episode timing
+    # is unchanged — substeps subdivide each recorded frame's period. Linear
+    # blending is exact for joint targets and a good small-step approximation
+    # for Cartesian poses (positions are linear; consecutive rotation vectors
+    # are close enough that lerp ~= slerp at these deltas).
+    substeps = max(1, round(_INTERP_HZ / fps)) if cfg.interpolate else 1
+
+    async def _play_episode() -> None:
+        """Stream the episode's actions from the robot's event loop.
+
+        Runs *on* the robot's event loop so each command is dispatched inline
+        via ``send_action_async`` — no per-frame cross-thread hop — and paces
+        with absolute deadlines so a late wakeup is corrected on the next
+        cycle instead of stretching the command interval (both mirror
+        collect-data's hot loop). Regular command timing matters because
+        ``motion_control`` derives its velocity/acceleration feedforward by
+        differentiating commanded positions against wall time, so interval
+        jitter comes out of the arm as torque jitter.
+        """
+        send_period = 1.0 / (fps * substeps)
+        deadline = time.perf_counter()
+        for idx in range(num_frames):
+            base = action_matrix[idx]
+            # Hold the last recorded action for its full frame; never
+            # extrapolate past the end of the episode.
+            nxt = action_matrix[idx + 1] if idx + 1 < num_frames else base
+            for sub in range(substeps):
+                if _stopped():
+                    return
+                deadline += send_period
+                values = base if sub == 0 else base + (nxt - base) * (sub / substeps)
+                action = {name: float(values[i]) for i, name in enumerate(action_names)}
+                await robot.send_action_async(action)
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+
+    def _play_episode_blocking() -> None:
+        """Run the playback coroutine on the robot's loop; block until done.
+
+        On Ctrl+C, signal the coroutine to unwind and wait for it to finish so
+        it stops commanding the robot before teardown, then re-raise (the
+        outer handler falls through to the return-to-rest teardown).
+        """
+        fut = asyncio.run_coroutine_threadsafe(_play_episode(), robot.event_loop)
+        try:
+            fut.result()
+        except KeyboardInterrupt:
+            stop_event.set()
+            try:
+                fut.result(timeout=5.0)
+            except BaseException:  # noqa: BLE001 - best-effort unwind
+                fut.cancel()
+            raise
+
     try:
         log_say("Connecting robot...")
         robot.connect()
@@ -204,7 +280,9 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         _go_to_rest()
 
         loop = bool(cfg.loop)
-        period = 1.0 / fps
+        interp_note = (
+            f", interpolated to {fps * substeps} Hz commands" if substeps > 1 else ""
+        )
         iteration = 0
         # Replay once, or repeatedly when ``loop`` is set, until stopped (Ctrl+C
         # or the UI's Stop). The arm is parked at rest before the op exits — on a
@@ -215,22 +293,14 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             if loop:
                 log_say(
                     f"Replaying episode {episode} (loop {iteration}): "
-                    f"{num_frames} frames at {fps} fps."
+                    f"{num_frames} frames at {fps} fps{interp_note}."
                 )
             else:
                 log_say(
-                    f"Replaying episode {episode}: {num_frames} frames at {fps} fps."
+                    f"Replaying episode {episode}: {num_frames} frames at "
+                    f"{fps} fps{interp_note}."
                 )
-            for idx in range(num_frames):
-                if _stopped():
-                    break
-                t0 = time.perf_counter()
-                action_array = actions[idx][ACTION]
-                action = {
-                    name: float(action_array[i]) for i, name in enumerate(action_names)
-                }
-                robot.send_action(action)
-                time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+            _play_episode_blocking()
 
             if not loop or _stopped():
                 break

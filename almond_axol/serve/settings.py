@@ -400,7 +400,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="recording.fps",
                 label="Recording fps",
                 type="number",
-                help="Frame rate of the recorded dataset (and policy control rate).",
+                help=(
+                    "Frame rate of the recorded dataset (and policy control "
+                    "rate). Recording cameras' capture fps is raised "
+                    "automatically to match when this is set above their "
+                    "default 60 — note the ZED X only supports rates above "
+                    "60 at SVGA resolution."
+                ),
                 targets={
                     "collect-data": ("fps",),
                     "run-policy": ("fps",),

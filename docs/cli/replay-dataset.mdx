@@ -16,6 +16,7 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--repo_id <user>/<dataset>` | HuggingFace dataset repo ID (required) |
 | `--episode INT` | Index of the episode to replay, 0-indexed — the first recorded episode is `0` (required) |
 | `--fps INT` | Playback frame rate. `0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. |
+| `--interpolate true` | Smooth playback: linearly interpolate between recorded actions and command the arms at ~120 Hz (the teleop control rate) instead of the dataset fps. Episode timing is unchanged — only the command granularity increases. Default: off (each recorded action is sent once, as-is). |
 | `--loop true` | Replay the episode continuously (returning to rest between takes) until stopped with `Ctrl+C` / **Stop**, then return to rest. Default: off (a single replay). |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--robot_config.axol_config.left_stiffness S` | Compliance↔stiffness blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `0` = fully compliant; `1` = pre-tuning industrial gains; `0.5` (default) is the geometric mean. Use `right_stiffness` for the right arm. Match the stiffness used at data-collection time so the arm tracks the recorded actions the same way. See [`AxolConfig.left_stiffness`](/api/robot). |

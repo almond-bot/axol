@@ -76,7 +76,7 @@ Almost nothing you configure is actually per-run — camera assignment, arm stif
 | **Teleop & VR** | Teleop control rate, position and rotation multipliers. |
 | **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
 | **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
-| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. |
+| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
 | **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
 | **System** | Log level. |
 | **Advanced** | Every remaining config field, organized by subsystem (*Axol*, *Teleop*, *Kinematics*, *VR server*, *LeRobot robot*) with a search box across all of it. There is **one value per knob, applied to every operation** — the host translates it to each operation's config path, so there are never different per-task copies of the same setting. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
@@ -113,7 +113,7 @@ Pick an operation from the selector. Each panel asks only for its **per-run inpu
 | **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
 | **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
-| **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**. |
+| **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
 | **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
 ### Before you can start

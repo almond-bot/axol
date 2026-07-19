@@ -687,14 +687,33 @@ class OperationRunner:
         A camera that takes part in neither branch is omitted entirely. Capture
         resolution per camera is the streaming resolution when it streams, else
         the recording resolution (no point grabbing larger than it records).
+
+        A recording fps above the cameras' default capture rate raises each
+        *recording* camera's capture fps to match: on the encoded relay
+        transport dataset rows are paced by camera frame arrival, so
+        collect-data requires the recording fps to equal the capture rate —
+        without this, setting a higher recording fps in Settings would just
+        fail that validation. (Higher rates may still be rejected by the
+        camera at large capture resolutions; that surfaces as the same clear
+        validation error.)
         """
-        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        from ..lerobot.camera.configuration_zed import (
+            ZED_RESOLUTION_DIMS,
+            ZedCameraConfig,
+        )
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
         stream_res = self._resolution(cameras, "stream_resolution", legacy="resolution")
         record_res = self._resolution(cameras, "record_resolution")
         detected = stereo_serials()
+
+        # The op's recording fps (settings already folded in; 0 = unset).
+        try:
+            recording_fps = int(float(str(args.get("fps") or 0)))
+        except (TypeError, ValueError):
+            recording_fps = 0
+        default_capture_fps = ZedCameraConfig.fps or 0
 
         for slot, serial in serials.items():
             streams, s_eyes = self._branch(
@@ -726,6 +745,12 @@ class OperationRunner:
                 dims = ZED_RESOLUTION_DIMS[cap]
                 merged[f"{prefix}.width"] = dims[0]
                 merged[f"{prefix}.height"] = dims[1]
+            # Recording cameras must capture at least at the recording fps
+            # (rows are paced by frame arrival on the relay's encoded
+            # transport); raise their capture fps when the setting asks for
+            # more than the default rate.
+            if records and recording_fps > default_capture_fps:
+                merged[f"{prefix}.fps"] = recording_fps
 
         if record_res is not None:
             merged["dataset_resolution"] = record_res
