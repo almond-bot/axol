@@ -17,6 +17,7 @@ from .motor import health as motor_health
 from .motor import info as motor_info
 from .motor import set_can_id, set_zero_pos
 from .tune import friction, pid, repeatability
+from .zed import driver as zed_driver
 from .zed import install as zed_install
 
 # Commands that parse their config with draccus instead of argparse. Their
@@ -93,6 +94,7 @@ def main() -> None:
     motor_info.add_parser(subparsers)
     motor_health.add_parser(subparsers)
     zed_install.add_parser(subparsers)
+    zed_driver.add_parser(subparsers)
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)

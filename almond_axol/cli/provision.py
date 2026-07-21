@@ -7,6 +7,9 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``adb``           — Android Debug Bridge + the Oculus udev rule, for
                       streaming Quest controller poses over a USB
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
+* ``zed.driver``    — replaces the ZED Box Duo's known-bad factory GMSL
+                      capture driver with the pinned release (takes effect on
+                      the next reboot; never reboots itself).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
@@ -34,6 +37,7 @@ from pathlib import Path
 from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
+from .zed import driver as zed_driver
 from .zed import install as zed_install
 
 _logger = logging.getLogger(__name__)
@@ -73,6 +77,11 @@ def run(_args: object = None) -> None:
     # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
     # on apt-get.
     _step("adb (Quest-over-USB)", adb.install)
+    # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
+    # replace it with the pinned release. Self-gates on the factory package
+    # being present (a no-op everywhere else) and never reboots — the new
+    # kernel driver loads on the next reboot, so it just prints a notice.
+    _step("ZED Box camera driver (zed.driver)", zed_driver.run)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)
