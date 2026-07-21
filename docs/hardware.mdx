@@ -3,10 +3,11 @@ title: "Hardware Guide"
 description: "Overview and setup guide for Axol."
 ---
 
-Axol is available in two configurations:
+Axol is configured at order time from three choices:
 
-- **Axol** — The dual-arm robot.
-- **Axol Kit** — Includes Axol, Axol Base, cameras and compute.
+- **Axol** — The dual-arm robot. Every configuration starts here.
+- **Mounting** — Standalone (bolt Axol to your own table or fixture), the **Axol Mount** (rigid table/fixture column), or the **Axol Cart** (height-adjustable mobile cart).
+- **Perception Kit** (optional) — Head and wrist cameras plus the compute needed to run Axol.
 
 ## Axol Overview
 
@@ -28,13 +29,38 @@ The back of the robot exposes the connectors used for power and camera control:
 - [Gripper drawing](https://www.almond.bot/resources/gripper.pdf) (PDF)
 - [Gripper CAD model](https://www.almond.bot/resources/gripper.step) (STEP)
 
-## Axol Kit Overview
+## Axol Mount Overview
 
 <Frame>
-  <img src="/assets/axol_kit.png" alt="Almond Axol Kit on its mobile base" width="400" style={{ margin: "0 auto" }} />
+  <img src="/assets/axol_mount.png" alt="Almond Axol on the Axol Mount" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
-The Axol Kit includes a **mobile base** with **locking caster wheels** and a **manual lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height. Axol Kit includes head and wrist cameras and the compute needed to run Axol.
+The Axol Mount is a rigid **400mm 8080 aluminum T-slot extrusion column** that bolts Axol to a table, workbench, or fixture. Its base brackets include clearance holes for **2020, 4040, and 4545** extrusion patterns, so it drops onto most T-slot tables without drilling, and the column's T-slots stay free for cable management and accessories. An Axol mounting plate and all table/fixture hardware are included.
+
+### Reference diagrams
+
+- [Mount drawing](https://www.almond.bot/resources/static_mount.pdf) (PDF)
+
+## Axol Cart Overview
+
+<Frame>
+  <img src="/assets/axol_cart.png" alt="Almond Axol on the height-adjustable Axol Cart" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Axol Cart is a height-adjustable mobile cart with **leveling casters** and a **manual lift**, so you can roll the robot between workstations, lock it in place, and set it to a comfortable working height. Its **60x60cm footprint** fits through standard doors, and T-slot mounting keeps it easy to customize.
+
+## Perception Kit Overview
+
+<Frame>
+  <img src="/assets/axol_perception_kit.png" alt="Almond Axol with the Perception Kit cameras and head mount" width="400" style={{ margin: "0 auto" }} />
+</Frame>
+
+The Perception Kit adds the cameras and compute for data collection and policy inference:
+
+- **2× ZED X One S** wrist cameras with wrist mounts.
+- **1× ZED X Mini** head camera with a head mount.
+- **1× ZED Box Orin NX 16GB** for onboard compute.
+- **FAKRA GMSL2 cabling** for all three cameras.
 
 ### Reference diagrams
 
@@ -43,11 +69,11 @@ The Axol Kit includes a **mobile base** with **locking caster wheels** and a **m
 
 ## Installation
 
-Setting up Axol Kit.
+Setting up your Axol configuration.
 
 #### Tools required
 
-You'll need hex (Allen) keys for the socket head cap screws used throughout the Kit:
+You'll need hex (Allen) keys for the socket head cap screws used throughout:
 
 | Screw | Hex key |
 |---|---|
@@ -58,21 +84,21 @@ You'll need hex (Allen) keys for the socket head cap screws used throughout the 
 
 ### Mounting Axol
 
-Axol mounts to the base with four **M8×12 bolts** and their **locking washers**, threaded in from underneath the base. See the [mounting holes diagram](#reference-diagrams) for hole positions.
+Axol mounts to the Axol Mount, the Axol Cart, or your own fixture with four **M8×12 bolts** and their **locking washers**, threaded in from underneath. See the [mounting holes diagram](#reference-diagrams) for hole positions.
 
 <Warning>
-  We recommend using **two people** to lift and place it on the base.
+  We recommend using **two people** to lift and place it on the mount.
 </Warning>
 
 <Steps>
   <Step title="Gather the hardware">
     Have the four **M8×12 bolts** and **locking washers** ready, along with a **6&nbsp;mm hex key**.
   </Step>
-  <Step title="Place Axol on the base">
-    With two people, lift Axol and set it on the base, aligning its mounting holes with the holes in the base.
+  <Step title="Place Axol on the mount">
+    With two people, lift Axol and set it on the mount, aligning its mounting holes with the holes in the mounting plate.
   </Step>
   <Step title="Insert the bolts from below">
-    From underneath the top plate of the base, pass each M8×12 bolt (with its locking washer) up through the base and into Axol's mounting holes.
+    From underneath the mounting plate, pass each M8×12 bolt (with its locking washer) up through the plate and into Axol's mounting holes.
 
     <Note>
       Getting the bolts to catch the threads can be tricky. Gently **wiggling Axol** as you start each bolt helps align the holes and lets the threads bite.
@@ -84,6 +110,8 @@ Axol mounts to the base with four **M8×12 bolts** and their **locking washers**
 </Steps>
 
 ### Mounting the cameras
+
+This section applies to configurations with the **Perception Kit**.
 
 <Note>
   Before mounting each camera, scan the **QR code on the back** to grab its serial ID and note down which camera goes where (left wrist, right wrist, head). You'll need this mapping later to match each camera ID to its position.
@@ -115,7 +143,7 @@ Axol mounts to the base with four **M8×12 bolts** and their **locking washers**
 
 <Steps>
   <Step title="Mount the camera to the bracket">
-    The head camera screws depend on which model your Kit ships with:
+    The head camera screws depend on which model your Perception Kit ships with:
 
     - **ZED X Mini** - Use 4x **M4×8 screws**.
     - **ZED X One S (ZX1S)** - Use 4x **M2×8 screws** (same as the wrist cameras).
@@ -124,8 +152,8 @@ Axol mounts to the base with four **M8×12 bolts** and their **locking washers**
       <img src="/assets/head_mount.png" alt="Head camera mounted to its bracket" width="400" style={{ margin: "0 auto" }} />
     </Frame>
   </Step>
-  <Step title="Mount the bracket to the base">
-    Attach the camera-and-bracket assembly to the top of the base with **M4×10 screws**.
+  <Step title="Mount the bracket to the robot">
+    Attach the camera-and-bracket assembly to the head-camera mounting holes on top of Axol with **M4×10 screws**.
   </Step>
   <Step title="Remove the lens cap">
     If your head camera is the **ZED X One S (ZX1S)**, remove its lens cap.
@@ -134,14 +162,18 @@ Axol mounts to the base with four **M8×12 bolts** and their **locking washers**
 
 ### Leveling the casters
 
-Each caster has a ratchet with a small lever arm that raises or lowers the wheel. To level the base, flip the ratchet switch up or down on each caster and adjust it until the base sits level.
+This section applies to configurations with the **Axol Cart**.
+
+Each caster has a ratchet with a small lever arm that raises or lowers the wheel. To level the cart, flip the ratchet switch up or down on each caster and adjust it until the cart sits level.
 
 ### Raising and lowering the robot
 
-Adjust the robot's height with the manual lift: insert the crank into the hole at the top of the base and turn it to raise or lower the robot.
+This section applies to configurations with the **Axol Cart**.
+
+Adjust the robot's height with the manual lift: insert the crank into the hole at the top of the cart and turn it to raise or lower the robot.
 
 <Frame>
-  <img src="/assets/height_adjust.png" alt="Inserting the crank into the top of the base to adjust height" width="400" style={{ margin: "0 auto" }} />
+  <img src="/assets/height_adjust.png" alt="Inserting the crank into the top of the cart to adjust height" width="400" style={{ margin: "0 auto" }} />
 </Frame>
 
 <Warning>
@@ -150,11 +182,13 @@ Adjust the robot's height with the manual lift: insert the crank into the hole a
 
 ### Wiring
 
-Place the ZED Box and the power supply on the base, then connect the cables:
+This section applies to configurations with the **Perception Kit**.
+
+Place the ZED Box and the power supply near the robot (on the cart, if you have one), then connect the cables:
 
 <Steps>
-  <Step title="Set the ZED Box and power supply on the base">
-    Position the ZED Box and the power supply on the base so their cables comfortably reach the back of the robot.
+  <Step title="Position the ZED Box and power supply">
+    Set the ZED Box and the power supply down so their cables comfortably reach the back of the robot.
   </Step>
   <Step title="Connect the head camera">
     Run the head camera's **GMSL** cable from the camera to the ZED Box.
