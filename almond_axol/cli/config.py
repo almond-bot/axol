@@ -464,16 +464,17 @@ class TeleopCmdConfig:
     gst.install``) installed locally.
 
     A stereo ZED X overhead is detected automatically from its serial: its
-    two eyes are relayed as ``overhead_left`` / ``overhead_right`` and
-    rendered per-lens in the headset for true stereo. ``--resolution`` picks
-    the capture resolution for all cameras (``SVGA`` / ``HD1080`` /
-    ``HD1200``); ``null`` (the default) keeps each camera's SDK default.
+    two eyes are relayed packed side-by-side in a single ``overhead_sbs``
+    track (one decoder session on the headset) and rendered per-lens for
+    true stereo. ``--resolution`` picks the capture resolution for all
+    cameras (``SVGA`` / ``HD1080`` / ``HD1200``); ``null`` (the default)
+    keeps each camera's SDK default.
 
     ``--camera_eyes`` overrides which eye(s) of a stereo slot are streamed to
     the headset, keyed by slot (``both`` / ``left`` / ``right``) — e.g.
     ``--camera_eyes "{overhead: both, left_arm: left}"``. Unset slots fall
-    back to the default policy (overhead streams both eyes per-lens, wrists
-    stream their left eye).
+    back to the default policy (overhead streams both eyes packed
+    side-by-side, wrists stream their left eye).
 
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.

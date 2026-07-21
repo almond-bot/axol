@@ -43,6 +43,7 @@ class CommandDef:
         sim_capable: bool = False,
         requires_hardware: bool = False,
         uses_can_bus: bool = True,
+        drives_motors: bool = False,
     ) -> None:
         self.id = id
         self.cli = cli
@@ -56,6 +57,10 @@ class CommandDef:
         # A camera-only diagnostic (the ZED cable test) doesn't, so the serve
         # layer keeps the idle motor telemetry streaming while it runs.
         self.uses_can_bus = uses_can_bus
+        # Motor-driving diagnostics must honor the same fault gate as core
+        # operations. Connectivity repair commands intentionally leave this
+        # false so they remain available when a motor cannot be reached.
+        self.drives_motors = drives_motors
         self._loader = loader
 
     def load(self) -> Any:
@@ -176,6 +181,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..diagnostics.rom.enable"),
         requires_hardware=True,
+        drives_motors=True,
     ),
     "diag.rom-disable": CommandDef(
         "diag.rom-disable",
@@ -186,6 +192,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
+        drives_motors=True,
     ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
@@ -209,6 +216,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.motor.set_zero_pos"),
         requires_hardware=True,
+        drives_motors=True,
     ),
     "motor.set-can-id": CommandDef(
         "motor.set-can-id",

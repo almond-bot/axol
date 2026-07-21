@@ -4,20 +4,21 @@ import {
   OPERATIONS,
   cameraCount,
   detectCameras,
-  exportOpSettings,
   fetchCommands,
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
   loadOpSettings,
   missingCameraSerials,
   operationMeta,
-  parseImportedSettings,
+  perRunFields,
   robotConnect,
   robotDisconnect,
   saveOpSettings,
+  saveSettings,
   sendEpisodeCommand,
   setServerBase,
   startOperation,
@@ -30,19 +31,24 @@ import {
   type CommandSpec,
   type FormValue,
   type OperationId,
+  type PolicyState,
   type RobotStatus,
   type ServerInfo,
   type SessionInfo,
+  type SettingsPatch,
+  type SettingsSnapshot,
   type UpdatePhase,
   type UpdateStatus,
   type UsbStatus,
 } from "@/lib/supervisor"
 import { UpdateBanner } from "@/components/update-banner"
+import { VersionMismatchBanner } from "@/components/version-mismatch-banner"
+import { versionMismatch } from "@/lib/version"
 import { ConnectionsBar } from "@/components/connections-bar"
 import { OperationPanel } from "@/components/operation-panel"
 import { LogConsole } from "@/components/log-console"
 import { SetupDialog, type ConnState } from "@/components/setup-dialog"
-import { CamerasDialog } from "@/components/cameras-dialog"
+import { SettingsSection, type SettingsTab } from "@/components/settings/settings-section"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 
@@ -80,6 +86,14 @@ function loadCameras(): CameraSpec {
   return DEFAULT_CAMERAS
 }
 
+function persistLocalCameras(spec: CameraSpec) {
+  try {
+    localStorage.setItem("axolCameraSpec", JSON.stringify(spec))
+  } catch {
+    // ignore storage failures
+  }
+}
+
 function loadAllOpSettings(): OpSettings {
   return OPERATIONS.reduce((acc, op) => {
     acc[op.id] = loadOpSettings(op.id)
@@ -97,8 +111,18 @@ export default function ControlPanel() {
   const [hostInfo, setHostInfo] = useState<ServerInfo | null>(null)
   const [viewerPort, setViewerPort] = useState(8002)
   const [update, setUpdate] = useState<UpdateStatus | null>(null)
-  // Drives the banner's "Updating…" state while the server upgrades + restarts.
-  const [updating, setUpdating] = useState(false)
+  // Bridges the gap between clicking Update and the server's status first
+  // reporting the in-flight update, so the banner switches to the spinner
+  // immediately; the watcher clears it once the real server state is known.
+  const [startingUpdate, setStartingUpdate] = useState(false)
+  // Set when the watcher gives up (deadline) so the banner drops the spinner and
+  // offers a retry even if the server is still/again reporting "updating".
+  // Cleared when a new update is kicked off (and on disconnect).
+  const [updateAbandoned, setUpdateAbandoned] = useState(false)
+  // Whether the server is applying an update. Derived from its authoritative
+  // status (not a local click) so EVERY connected computer shows the in-flight
+  // update — spinner + phase — rather than a stale, clickable Update button.
+  const updating = !updateAbandoned && (startingUpdate || update?.state === "updating")
   // Current step shown in the banner while updating (so it isn't an opaque
   // spinner). Sourced from the server's reported phase, except "restarting"
   // which we infer locally once the server stops responding (it exited).
@@ -109,6 +133,12 @@ export default function ControlPanel() {
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
+  const [settingsOpen, setSettingsOpen] = useState(() => cameraCount(loadCameras()) === 0)
+  // Shared settings stored on the serve host (~/.almond/settings.json); null
+  // until fetched. settingsError marks a host too old for the settings API —
+  // cameras then fall back to the legacy localStorage flow.
+  const [settingsSnap, setSettingsSnap] = useState<SettingsSnapshot | null>(null)
+  const [settingsError, setSettingsError] = useState<string | null>(null)
   // Last ZED detection from the serve host (null until first detected), used to
   // verify the assigned serials are actually connected before a task starts.
   const [cameraDevices, setCameraDevices] = useState<CameraDevice[] | null>(null)
@@ -121,15 +151,29 @@ export default function ControlPanel() {
   const [settingsByOp, setSettingsByOp] = useState<OpSettings>(() => loadAllOpSettings())
 
   const [session, setSession] = useState<SessionInfo | null>(null)
+  // run-policy episode phase/count, from the server so the episode controls are
+  // correct on any computer (not just the tab that started the run).
+  const [policy, setPolicy] = useState<PolicyState | null>(null)
   const [busy, setBusy] = useState(false)
   // Short label shown on the Start button while a start is being prepared (e.g.
   // "Checking cameras…"), so the wait isn't an opaque spinner — mirrors the
   // update banner's phase display.
   const [startPhase, setStartPhase] = useState<string | null>(null)
   const [setupOpen, setSetupOpen] = useState(false)
-  const [camerasDialogOpen, setCamerasDialogOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("cameras")
+  // Anchor for the on-page settings card, so "…live in Settings" links can
+  // scroll to it.
+  const settingsRef = useRef<HTMLDivElement>(null)
 
   const { lines, status } = useSessionLogs(session?.id ?? null)
+
+  const hasConfiguredCamera = cameraCount(cameras) > 0
+  useEffect(() => {
+    // Keep setup in view until the first camera is assigned. Later camera
+    // presence changes drive the default state, but manual toggles stay put.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setSettingsOpen(!hasConfiguredCamera)
+  }, [hasConfiguredCamera])
 
   // Enumerate the ZED cameras on the serve host so the Cameras badge can verify
   // the assigned serials are actually connected (best-effort: failures leave the
@@ -148,6 +192,38 @@ export default function ControlPanel() {
     }
   }, [])
 
+  // Pull the shared settings from the serve host. A host whose stored camera
+  // spec is empty gets this browser's legacy localStorage spec migrated up
+  // once, so nobody has to re-enter serials after updating.
+  const loadSettings = useCallback(async () => {
+    try {
+      const snap = await fetchSettings()
+      setSettingsError(null)
+      if (snap.cameras) {
+        setCameras(snap.cameras)
+        persistLocalCameras(snap.cameras)
+        setSettingsSnap(snap)
+      } else {
+        const local = loadCameras()
+        if (cameraCount(local) > 0) {
+          try {
+            await saveSettings({ cameras: local, camerasSet: true })
+            setSettingsSnap({ ...snap, cameras: local })
+          } catch {
+            setSettingsSnap(snap)
+          }
+        } else {
+          setSettingsSnap(snap)
+        }
+      }
+    } catch (e) {
+      // Old serve host without /api/settings: keep the localStorage camera
+      // flow; the settings dialog explains the needed update.
+      setSettingsSnap(null)
+      setSettingsError(String(e).replace(/^Error:\s*/, ""))
+    }
+  }, [])
+
   const loadServer = useCallback(
     async (host: string) => {
       setServerBase(host)
@@ -163,6 +239,7 @@ export default function ControlPanel() {
         return
       }
       refreshCameras()
+      loadSettings()
       fetchInfo()
         .then((info) => {
           setViewerPort(info.viewerPort)
@@ -183,10 +260,11 @@ export default function ControlPanel() {
             setSession(op.session)
             setSelectedOp(op.session.command as OperationId)
           }
+          setPolicy(op.running ? op.policy : null)
         })
         .catch(() => {})
     },
-    [refreshCameras]
+    [refreshCameras, loadSettings]
   )
 
   useEffect(() => {
@@ -226,6 +304,9 @@ export default function ControlPanel() {
   // Poll the update indicator slowly while online (its server-side `ls-remote`
   // is debounced, so a tight interval would buy nothing). Paused while an
   // update is in flight — handleUpdate drives its own faster restart-watch poll.
+  // Host identity (/api/info) rides along so a backend upgraded/restarted from
+  // outside this tab (installer, another terminal) refreshes the commit the
+  // version-mismatch check compares against.
   useEffect(() => {
     if (conn.state !== "ok" || updating) return
     let active = true
@@ -233,6 +314,13 @@ export default function ControlPanel() {
       fetchUpdateStatus()
         .then((u) => {
           if (active) setUpdate(u)
+        })
+        .catch(() => {})
+      fetchInfo()
+        .then((info) => {
+          if (!active) return
+          setViewerPort(info.viewerPort)
+          setHostInfo(info)
         })
         .catch(() => {})
     }
@@ -304,10 +392,14 @@ export default function ControlPanel() {
     setCommands([])
     setRobot(null)
     setSession(null)
+    setPolicy(null)
     setCameraDevices(null)
     setCameraDetectError(null)
+    setSettingsSnap(null)
+    setSettingsError(null)
     setUpdate(null)
-    setUpdating(false)
+    setStartingUpdate(false)
+    setUpdateAbandoned(false)
     setUpdatePhase(null)
     autoRobotRef.current = false
   }
@@ -318,13 +410,30 @@ export default function ControlPanel() {
     else localStorage.removeItem("axolServerHost")
   }
 
-  function saveCameras(spec: CameraSpec) {
-    setCameras(spec)
-    try {
-      localStorage.setItem("axolCameraSpec", JSON.stringify(spec))
-    } catch {
-      // ignore storage failures
+  function openSettings(tab: SettingsTab = "cameras") {
+    setSettingsTab(tab)
+    setSettingsOpen(true)
+    settingsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }
+
+  // Persist a settings-dialog save: cameras also mirror to localStorage (the
+  // fallback for old hosts / offline), everything else goes to the serve host.
+  async function handleSettingsSave(patch: SettingsPatch) {
+    if (patch.cameras) {
+      setCameras(patch.cameras)
+      persistLocalCameras(patch.cameras)
     }
+    if (settingsError) {
+      // Old host: only the cameras section is editable, and it saved locally.
+      return
+    }
+    const snap = await saveSettings(patch)
+    setSettingsSnap((prev) => ({
+      ...snap,
+      schema: prev?.schema ?? snap.schema,
+      advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
+    }))
+    if (snap.cameras) setCameras(snap.cameras)
   }
 
   function selectOp(op: OperationId) {
@@ -352,14 +461,6 @@ export default function ControlPanel() {
 
   function resetAll() {
     updateSettings(selectedOp, {})
-  }
-
-  function importSettings(text: string) {
-    try {
-      updateSettings(selectedOp, parseImportedSettings(text))
-    } catch (e) {
-      toast.error(`Import failed: ${e}`)
-    }
   }
 
   // -- robot connection --
@@ -461,7 +562,9 @@ export default function ControlPanel() {
     const t = setInterval(() => {
       fetchOpStatus()
         .then((op) => {
-          if (active && op.session) setSession(op.session)
+          if (!active) return
+          if (op.session) setSession(op.session)
+          setPolicy(op.running ? op.policy : null)
         })
         .catch(() => {})
     }, 1500)
@@ -481,6 +584,59 @@ export default function ControlPanel() {
       .then(setUpdate)
       .catch(() => {})
   }, [conn.state, updating, isLive])
+
+  // Drive an in-flight update to completion on ANY connected computer: advance
+  // the phase, surface a failure, and hard-reload once the backend is back on
+  // the target release (the hosted front-end is on Vercel, so a reload also
+  // pulls the latest UI and reconnects to the restarted server). Keys off the
+  // server's "updating" state rather than a local click, so a second computer
+  // that opens the panel mid-update behaves like the initiator. Replaces the
+  // per-click watch loop handleUpdate used to run itself.
+  useEffect(() => {
+    if (conn.state !== "ok" || !updating) return
+    const target = update?.remoteVersion ?? null
+    const deadline = Date.now() + 5 * 60_000
+    let active = true
+    const t = setInterval(async () => {
+      if (Date.now() > deadline) {
+        clearInterval(t)
+        if (active) {
+          // Give up auto-watching so the banner leaves the spinner and offers a
+          // retry, even if the server is still/again reporting "updating".
+          setUpdateAbandoned(true)
+          setStartingUpdate(false)
+          setUpdatePhase(null)
+          toast.error("Update is taking longer than expected. Reload to retry.")
+        }
+        return
+      }
+      try {
+        const u = await fetchUpdateStatus()
+        if (!active) return
+        setUpdate(u)
+        // Real server state is known now — drop the optimistic bridge so a
+        // failed status fetch in handleUpdate can't wedge `updating` on.
+        setStartingUpdate(false)
+        if (u.state === "error") {
+          setUpdatePhase(null)
+          toast.error(u.error ?? "Update failed.")
+          return
+        }
+        // Reflect the server's current step so the banner shows progress.
+        if (u.phase) setUpdatePhase(u.phase)
+        // Back on the new release — done.
+        if (target && u.version === target) window.location.reload()
+      } catch {
+        // Server stopped responding: it exited to relaunch (or is briefly
+        // unreachable). Show "restarting" and keep watching for it to return.
+        if (active) setUpdatePhase("restarting")
+      }
+    }, 2000)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [conn.state, updating, update?.remoteVersion, toast])
 
   const meta = operationMeta(selectedOp)
   const spec = useMemo(
@@ -549,12 +705,20 @@ export default function ControlPanel() {
         }
       }
 
+      // Send only the panel's per-run fields — the shared settings (and any
+      // advanced overrides) are folded in server-side, and stale keys from the
+      // old per-op localStorage must not shadow them.
+      const runKeys = new Set(spec ? perRunFields(spec, meta).map((f) => f.key) : [])
+      const args = Object.fromEntries(Object.entries(settings).filter(([k]) => runKeys.has(k)))
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
-      // the headset (and runs fine with none in sim).
-      const spec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
-      const result = await startOperation(selectedOp, settings, spec)
+      // the headset (and runs fine with none in sim). Newer hosts also hold the
+      // spec in their settings store; sending it stays compatible with old ones.
+      const camSpec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
+      const result = await startOperation(selectedOp, args, camSpec)
       setSession(result)
+      // Fresh run — clear any stale phase; the live poll repopulates it.
+      setPolicy(null)
     } catch (e) {
       toast.error(String(e))
     } finally {
@@ -582,61 +746,43 @@ export default function ControlPanel() {
     sendEpisodeCommand(command).catch((e) => toast.error(String(e)))
   }
 
-  // Apply the available update, then hard-reload once the server is back on the
-  // new release. The server upgrades and exits (systemd relaunches it), so the
-  // start request and the watch polls below tolerate it briefly going away.
+  // Kick off the available update. The server upgrades and exits (systemd
+  // relaunches it); the update-watcher effect — which runs on any computer while
+  // the server reports an update in flight — then advances the phase and
+  // hard-reloads once the backend is back on the new release.
   async function handleUpdate() {
-    const target = update?.remoteVersion
-    if (!target) return
-    setUpdating(true)
+    if (!update?.remoteVersion) return
+    setUpdateAbandoned(false)
+    setStartingUpdate(true)
     setUpdatePhase("upgrading")
     try {
       await startUpdate()
     } catch (e) {
       toast.error(`Update failed to start: ${e}`)
-      setUpdating(false)
+      setStartingUpdate(false)
       setUpdatePhase(null)
       return
     }
-    // The hosted UI is served by Vercel, so a hard reload also pulls the latest
-    // front-end; reconnecting to the restarted backend re-runs loadServer.
-    const reload = () => window.location.reload()
-    const deadline = Date.now() + 5 * 60_000
-    const watch = setInterval(async () => {
-      if (Date.now() > deadline) {
-        clearInterval(watch)
-        setUpdating(false)
-        setUpdatePhase(null)
-        toast.error("Update is taking longer than expected. Reload to retry.")
-        return
-      }
-      try {
-        const u = await fetchUpdateStatus()
+    // Pull the now-"updating" status so `updating` derives true and the watcher
+    // takes over; then drop the optimistic flag (server state carries it now).
+    fetchUpdateStatus()
+      .then((u) => {
         setUpdate(u)
-        if (u.state === "error") {
-          clearInterval(watch)
-          setUpdating(false)
-          setUpdatePhase(null)
-          toast.error(u.error ?? "Update failed.")
-          return
-        }
-        // Reflect the server's current step (upgrading/provisioning) so the
-        // banner shows progress rather than an opaque spinner.
-        if (u.phase) setUpdatePhase(u.phase)
-        // Server is back and now running the target release — done.
-        if (u.version === target) {
-          clearInterval(watch)
-          reload()
-        }
-      } catch {
-        // Server stopped responding: it exited to restart (or is briefly
-        // unreachable). Show "restarting" and keep watching for it to return.
-        setUpdatePhase("restarting")
-      }
-    }, 2000)
+        setStartingUpdate(false)
+      })
+      .catch(() => {})
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
+
+  // UI/backend skew warning (stale local bundle, or hosted UI on a different
+  // release than the robot). Suppressed while the update banner covers the
+  // same ground — an available update *is* the mismatch's remediation — and
+  // while an update is applying (the page hard-reloads when it lands).
+  const mismatch = useMemo(
+    () => (conn.state === "ok" ? versionMismatch(hostInfo) : null),
+    [conn.state, hostInfo]
+  )
 
   return (
     <div className="min-h-screen">
@@ -653,6 +799,10 @@ export default function ControlPanel() {
           />
         )}
 
+        {mismatch && !updating && !update?.updateAvailable && (
+          <VersionMismatchBanner mismatch={mismatch} />
+        )}
+
         <ConnectionsBar
           conn={conn.state}
           host={serverHost}
@@ -664,15 +814,28 @@ export default function ControlPanel() {
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}
           onRobotDisconnect={robotDisconnectClick}
-          cameras={cameras}
-          cameraDevices={cameraDevices}
-          cameraDetectError={cameraDetectError}
-          cameraDetecting={cameraDetecting}
-          onConfigureCameras={() => setCamerasDialogOpen(true)}
-          usb={usb}
-          usbBusy={usbBusy}
-          onUsbConnect={() => usbConnectClick()}
         />
+
+        {conn.state === "ok" && (
+          <div ref={settingsRef} className="scroll-mt-4">
+            <SettingsSection
+              open={settingsOpen}
+              onOpenChange={setSettingsOpen}
+              tab={settingsTab}
+              onTabChange={setSettingsTab}
+              snapshot={settingsSnap}
+              supportError={settingsError}
+              cameras={cameras}
+              onSave={handleSettingsSave}
+              devices={cameraDevices}
+              detecting={cameraDetecting}
+              onRefresh={refreshCameras}
+              usb={usb}
+              usbBusy={usbBusy}
+              onUsbConnect={() => usbConnectClick()}
+            />
+          </div>
+        )}
 
         <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
 
@@ -690,8 +853,7 @@ export default function ControlPanel() {
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}
-          onExport={() => exportOpSettings(selectedOp, settings)}
-          onImport={importSettings}
+          onOpenSettings={() => openSettings(settingsTab === "cameras" ? "robot" : settingsTab)}
           cameras={cameras}
           robot={robot}
           live={selectedLive}
@@ -701,6 +863,7 @@ export default function ControlPanel() {
           host={viewerHost}
           viewerPort={viewerPort}
           startPhase={startPhase}
+          policy={selectedLive ? policy : null}
           onStart={handleStart}
           onStop={handleStop}
           onEpisode={handleEpisode}
@@ -716,15 +879,6 @@ export default function ControlPanel() {
         onChangeHost={updateServerHost}
         conn={conn}
         onConnect={() => loadServer(serverHost)}
-      />
-      <CamerasDialog
-        open={camerasDialogOpen}
-        onClose={() => setCamerasDialogOpen(false)}
-        initial={cameras}
-        onSave={saveCameras}
-        devices={cameraDevices}
-        detecting={cameraDetecting}
-        onRefresh={refreshCameras}
       />
     </div>
   )

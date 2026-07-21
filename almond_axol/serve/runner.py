@@ -328,8 +328,11 @@ class _Capture:
 class OperationRunner:
     """Runs one core operation in-process at a time, with log capture."""
 
-    def __init__(self, robot_link: Any = None) -> None:
+    def __init__(self, robot_link: Any = None, settings: Any = None) -> None:
         self._robot_link = robot_link
+        # Shared operator settings (serve.settings.SettingsStore). Folded into
+        # every op start beneath the request's own args, so per-run values win.
+        self._settings = settings
         self._lock = threading.Lock()
         self._session: Session | None = None
         self._thread: threading.Thread | None = None
@@ -395,13 +398,24 @@ class OperationRunner:
             # the subprocesses this op is about to spawn.
             self._baseline_children = {c.pid for c in multiprocessing.active_children()}
 
-        # Fold the camera spec into the argv-style args for collect-data /
-        # run-policy (their camera serials are required draccus inputs).
-        if cameras and op_id in ("collect-data", "run-policy"):
-            args = self._merge_camera_args(args, cameras)
-
-        # Build the config up front so config errors surface synchronously.
+        # Fold the shared settings and camera spec in and build the config up
+        # front, so every config error — a bad stored value as much as a bad
+        # request arg — surfaces synchronously as a failed session instead of
+        # an unhandled 500 that would leave this session wedged in "starting".
         try:
+            # Shared operator settings go beneath the request's args (per-run
+            # values win); the stored camera spec is the fallback when the
+            # request didn't carry one (older UIs still send it explicitly).
+            if self._settings is not None:
+                args = self._settings.merged_args(op_id, args)
+                if cameras is None:
+                    cameras = self._settings.cameras()
+
+            # Fold the camera spec into the argv-style args for collect-data /
+            # run-policy (their camera serials are required draccus inputs).
+            if cameras and op_id in ("collect-data", "run-policy"):
+                args = self._merge_camera_args(args, cameras)
+
             cfg = self._build_config(op_id, args)
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
             session.status = "error"
@@ -410,14 +424,24 @@ class OperationRunner:
             session.close_stream()
             return session
 
+        # Teleop relays the local ZED cameras to the headset when serials are
+        # configured (its ``cameras`` dict isn't reachable via flat argv).
+        # Best-effort: camera streaming is an optional add-on for teleop, and
+        # the spec is now always present via the settings store — a host that
+        # can't apply it (e.g. no ZED stack on a dev machine running sim) still
+        # gets a camera-less teleop instead of a failed start.
+        if op_id == "teleop":
+            try:
+                self._attach_cameras_to_teleop(cfg, cameras, session)
+            except Exception as exc:  # noqa: BLE001
+                session.emit(
+                    f"[serve] teleop: camera streaming unavailable ({exc}); "
+                    "continuing without cameras"
+                )
+
         is_sim = op_id == "teleop" and bool(args.get("sim"))
         needs_robot = op_id in _HARDWARE_OPS and not is_sim
         log_level = self._log_level(args)
-
-        # Teleop relays the local ZED cameras to the headset when serials are
-        # configured (its ``cameras`` dict isn't reachable via flat argv).
-        if op_id == "teleop":
-            self._attach_cameras_to_teleop(cfg, cameras, session)
 
         session.status = "running"
         session.emit(f"[serve] starting {op_id} (in-process)")
@@ -557,6 +581,15 @@ class OperationRunner:
         control.push(command)
         return True
 
+    def policy_state(self) -> dict[str, Any] | None:
+        """run-policy episode phase/message/count, or None if no policy is running.
+
+        Read by /api/op/status so the control panel reflects whether an episode
+        is recording or sitting at the between-episode gate on any computer.
+        """
+        control = self._policy_control
+        return control.snapshot() if control is not None else None
+
     async def shutdown(self) -> None:
         # Server shutdown: stop and block until the op is actually gone (unlike
         # the API stop, which returns early and lets the watchdog finish).
@@ -654,14 +687,33 @@ class OperationRunner:
         A camera that takes part in neither branch is omitted entirely. Capture
         resolution per camera is the streaming resolution when it streams, else
         the recording resolution (no point grabbing larger than it records).
+
+        A recording fps above the cameras' default capture rate raises each
+        *recording* camera's capture fps to match: on the encoded relay
+        transport dataset rows are paced by camera frame arrival, so
+        collect-data requires the recording fps to equal the capture rate —
+        without this, setting a higher recording fps in Settings would just
+        fail that validation. (Higher rates may still be rejected by the
+        camera at large capture resolutions; that surfaces as the same clear
+        validation error.)
         """
-        from ..lerobot.camera.configuration_zed import ZED_RESOLUTION_DIMS
+        from ..lerobot.camera.configuration_zed import (
+            ZED_RESOLUTION_DIMS,
+            ZedCameraConfig,
+        )
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
         stream_res = self._resolution(cameras, "stream_resolution", legacy="resolution")
         record_res = self._resolution(cameras, "record_resolution")
         detected = stereo_serials()
+
+        # The op's recording fps (settings already folded in; 0 = unset).
+        try:
+            recording_fps = int(float(str(args.get("fps") or 0)))
+        except (TypeError, ValueError):
+            recording_fps = 0
+        default_capture_fps = ZedCameraConfig.fps or 0
 
         for slot, serial in serials.items():
             streams, s_eyes = self._branch(
@@ -693,6 +745,12 @@ class OperationRunner:
                 dims = ZED_RESOLUTION_DIMS[cap]
                 merged[f"{prefix}.width"] = dims[0]
                 merged[f"{prefix}.height"] = dims[1]
+            # Recording cameras must capture at least at the recording fps
+            # (rows are paced by frame arrival on the relay's encoded
+            # transport); raise their capture fps when the setting asks for
+            # more than the default rate.
+            if records and recording_fps > default_capture_fps:
+                merged[f"{prefix}.fps"] = recording_fps
 
         if record_res is not None:
             merged["dataset_resolution"] = record_res

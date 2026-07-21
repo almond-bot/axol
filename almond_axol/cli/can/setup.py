@@ -20,6 +20,7 @@ separate udev rule files and startup scripts, so a machine can have both the
 robot and the UMI rig configured at once.
 """
 
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -46,7 +47,7 @@ class _Profile:
     right: str
     rules_file: Path
     cron_script: Path
-    # Joint whose motor the post-bring-up RX probe queries (see _rx_alive).
+    # Joint whose motor the post-bring-up RX probe queries (see rx_alive).
     probe_joint: Joint
 
 
@@ -169,15 +170,58 @@ def _serials_in_rules(rules_file: Path) -> set[str]:
     return serials
 
 
+def _serial_of_interface(iface: str) -> str | None:
+    """The USB serial behind a named CAN interface, or None if it's absent."""
+    iface_path = Path("/sys/class/net") / iface
+    if not iface_path.exists():
+        return None
+    info = subprocess.run(
+        ["udevadm", "info", "-a", "-p", str(iface_path)],
+        capture_output=True,
+        text=True,
+    ).stdout
+    return next(
+        (line.split('"')[1] for line in info.splitlines() if "ATTRS{serial}" in line),
+        None,
+    )
+
+
+def _configured_serial() -> str | None:
+    """The Axol adapter's serial as pinned by a *previous* setup, if any.
+
+    Preferred over live adapter detection: other candlelight devices (e.g. a
+    UMI rig's CAN adapter) share the same generic VID/PID, so a host with
+    several attached is ambiguous to a fresh scan — but not to a machine
+    that has already named its Axol interfaces or written its udev rules.
+    """
+    for iface in (_AXOL_PROFILE.left, _AXOL_PROFILE.right):
+        serial = _serial_of_interface(iface)
+        if serial:
+            return serial
+    try:
+        rules = _AXOL_PROFILE.rules_file.read_text()
+    except OSError:
+        return None
+    match = re.search(r'ATTRS\{serial\}=="([^"]+)"', rules)
+    return match.group(1) if match else None
+
+
 def _resolve_serial() -> str:
     """Pick the adapter serial without prompting (for headless ``ensure_setup``).
 
-    Serials the UMI rig's rules already claim are excluded — the handheld
-    CANables share the hub's USB ID (1d50:606f), so with the rig plugged in
-    they would otherwise make the robot's adapter ambiguous. Raises
+    A previously configured serial (named ``can_alm_axol_*`` interfaces, or
+    the pinned serial in the udev rules) wins outright, so re-running setup on
+    an already-configured host works no matter how many other candlelight
+    adapters are attached. Only a genuinely fresh machine falls back to live
+    detection, where serials the UMI rig's rules already claim are excluded —
+    the handheld CANables share the hub's USB ID (1d50:606f), so with the rig
+    plugged in they would otherwise make the robot's adapter ambiguous. Raises
     ``RuntimeError`` when zero or several candidates remain, since that needs
     the interactive ``axol can.setup`` flow to disambiguate.
     """
+    configured = _configured_serial()
+    if configured:
+        return configured
     unique = _detect_serials()
     claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
     unique = [s for s in unique if s not in claimed]
@@ -185,7 +229,9 @@ def _resolve_serial() -> str:
         return unique[0]
     if not unique:
         raise RuntimeError("Robot not detected")
-    raise RuntimeError("Multiple CAN adapters")
+    raise RuntimeError(
+        "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
+    )
 
 
 def _find_serial(profile: _Profile) -> str:
@@ -456,7 +502,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.set_defaults(func=run)
 
 
-def _rx_alive(profile: _Profile) -> bool:
+def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
     """True when at least one motor answers on either channel.
 
     Verifies the adapter's receive path, not just the interface state: the
@@ -488,11 +534,11 @@ def _rx_alive(profile: _Profile) -> bool:
     return asyncio.run(probe_all())
 
 
-def _bring_up_can(profile: _Profile) -> None:
+def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`_rx_alive`, so a bring-up
+    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
     that lands in the wedge is recovered by exactly one more cycle. A device
     with its motors powered off is indistinguishable from the wedge, hence the
     bounded retries and the warning instead of an error.
@@ -500,7 +546,7 @@ def _bring_up_can(profile: _Profile) -> None:
     print("Bringing up CAN interfaces (requires sudo)...")
     for attempt in range(3):
         run_root(["bash", str(profile.cron_script)], check=True)
-        if _rx_alive(profile):
+        if rx_alive(profile):
             print("  Done — motors responding.")
             return
         if attempt < 2:
@@ -540,7 +586,7 @@ def _configure(serial: str, profile: _Profile) -> None:
     _rename_interfaces(serial, profile)
     _write_cron_script(profile)
     _register_cron(profile)
-    _bring_up_can(profile)
+    bring_up_can(profile)
 
 
 def run(args: object = None) -> None:
@@ -563,7 +609,7 @@ def run(args: object = None) -> None:
         _rename_umi_interfaces(assign)
         _write_cron_script(profile)
         _register_cron(profile)
-        _bring_up_can(profile)
+        bring_up_can(profile)
     else:
         serial = _find_serial(profile)
         _configure(serial, profile)

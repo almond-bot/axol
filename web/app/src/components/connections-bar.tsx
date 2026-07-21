@@ -1,14 +1,7 @@
-import { Cpu, Loader2, Plug, Camera, Settings2, Server, Power, Usb } from "lucide-react"
+import { Cpu, Loader2, Plug, Server, Power } from "lucide-react"
 import type { ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import {
-  cameraCount,
-  missingCameraSerials,
-  type CameraDevice,
-  type CameraSpec,
-  type RobotStatus,
-  type UsbStatus,
-} from "@/lib/supervisor"
+import type { MotorHealth, RobotStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 
@@ -29,7 +22,8 @@ function Tile({
   label,
   pulse,
   children,
-  extra,
+  statusEnd,
+  statusContent,
 }: {
   icon: ReactNode
   title: string
@@ -37,32 +31,39 @@ function Tile({
   label: string
   pulse?: boolean
   children?: ReactNode
-  extra?: ReactNode
+  statusEnd?: ReactNode
+  statusContent?: ReactNode
 }) {
   return (
-    <div className="group relative flex min-w-0 flex-col gap-2.5 overflow-hidden rounded-xl border border-white/10 bg-white/[0.02] p-4">
-      {/* title — its own line */}
-      <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
-        {icon}
-        <span className="font-mono">{title}</span>
+    <div className="group relative flex h-fit min-w-0 flex-col gap-2 overflow-visible rounded-xl border border-white/10 bg-white/[0.02] p-3.5">
+      <div className="flex min-h-8 items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-xs tracking-widest text-white/40 uppercase">
+          {icon}
+          <span className="font-mono">{title}</span>
+        </div>
+        {children && <div className="shrink-0">{children}</div>}
       </div>
-      {/* status — its own line, full width */}
-      <div className="flex items-center gap-2 text-sm">
-        <span
-          className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
-        />
-        <span className="min-w-0 truncate text-white/75" title={label}>
-          {label}
-        </span>
-      </div>
-      {/* optional extra detail (e.g. the Axol motor grid) */}
-      {extra}
-      {/* action — pinned to the bottom so the buttons align across the row */}
-      {children && <div className="mt-auto flex justify-end pt-1">{children}</div>}
+      {statusContent ?? (
+        <div className="flex min-w-0 items-center gap-2 text-sm">
+          <span
+            className={cn("size-2 shrink-0 rounded-full", DOT_CLASS[dot], pulse && "animate-pulse")}
+          />
+          <span className="min-w-0 flex-1 truncate text-white/75" title={label}>
+            {label}
+          </span>
+          {statusEnd && <div className="shrink-0">{statusEnd}</div>}
+        </div>
+      )}
     </div>
   )
 }
 
+/**
+ * The two connection tiles: the Axol Host (the machine running `axol serve`)
+ * and the Axol robot itself, with live per-motor health and any active motor
+ * faults called out (a fault blocks every hardware operation from starting).
+ * Cameras and Quest USB live in the Settings tabs below.
+ */
 export function ConnectionsBar({
   conn,
   host,
@@ -74,14 +75,6 @@ export function ConnectionsBar({
   robotBusy,
   onRobotConnect,
   onRobotDisconnect,
-  cameras,
-  cameraDevices,
-  cameraDetectError,
-  cameraDetecting,
-  onConfigureCameras,
-  usb,
-  usbBusy,
-  onUsbConnect,
 }: {
   conn: ConnState
   host: string
@@ -94,17 +87,6 @@ export function ConnectionsBar({
   robotBusy: boolean
   onRobotConnect: () => void
   onRobotDisconnect: () => void
-  cameras: CameraSpec
-  /** Detected ZED devices on the serve host (null until first detection). */
-  cameraDevices: CameraDevice[] | null
-  /** Why detection couldn't run (SDK/daemon issue), else null. */
-  cameraDetectError: string | null
-  /** A ZED enumeration is currently in flight. */
-  cameraDetecting: boolean
-  onConfigureCameras: () => void
-  usb: UsbStatus | null
-  usbBusy: boolean
-  onUsbConnect: () => void
 }) {
   const online = conn === "ok"
 
@@ -122,10 +104,11 @@ export function ConnectionsBar({
 
   // -- robot --
   const rs = robot?.state ?? "disconnected"
+  const faults = robot?.faults ?? []
   const robotDot: Dot =
     rs === "connected"
-      ? robot && robot.reachableCount < robot.motorCount
-        ? "warn"
+      ? faults.length > 0
+        ? "err"
         : "ok"
       : rs === "busy"
         ? "busy"
@@ -136,7 +119,7 @@ export function ConnectionsBar({
             : "idle"
   const robotLabel =
     rs === "connected"
-      ? `${robot?.reachableCount ?? 0}/${robot?.motorCount ?? 16} motors`
+      ? "Connected"
       : rs === "busy"
         ? "In use by task"
         : rs === "connecting"
@@ -145,69 +128,15 @@ export function ConnectionsBar({
             ? robot?.error || "Error"
             : "Disconnected"
 
-  // -- cameras --
-  // "Configured" only counts assigned serials; the green badge must also mean
-  // those cameras are actually *connected*. Once we have a detection result we
-  // cross-check the assigned serials against it: any that aren't physically
-  // present flip the badge red (x/N connected) instead of a misleading N/3.
-  const camCount = cameraCount(cameras)
-  const camMissing =
-    camCount > 0 && cameraDevices ? missingCameraSerials(cameras, cameraDevices) : []
-  let camDot: Dot
-  let camLabel: string
-  if (camCount === 0) {
-    camDot = "idle"
-    camLabel = "Not configured"
-  } else if (cameraDetecting && cameraDevices == null) {
-    // First detection still in flight (nothing to verify against yet).
-    camDot = "busy"
-    camLabel = "Detecting…"
-  } else if (cameraDetectError) {
-    // Detection itself couldn't run (SDK not installed, daemon hung): we can't
-    // confirm the cameras, so warn rather than claim they're connected.
-    camDot = "warn"
-    camLabel = "Can't detect cameras"
-  } else if (camMissing.length > 0) {
-    camDot = "err"
-    camLabel = `${camCount - camMissing.length}/${camCount} connected`
-  } else {
-    camDot = "ok"
-    camLabel = `${camCount}/3 configured`
-  }
-
-  // -- quest usb (adb reverse pose tunnel) --
-  const usbDot: Dot = !usb
-    ? "idle"
-    : !usb.installed
-      ? "warn"
-      : usb.ready
-        ? "ok"
-        : usb.state === "none"
-          ? "idle"
-          : "warn"
-  const usbLabel = !usb
-    ? "—"
-    : !usb.installed
-      ? "adb not installed"
-      : usb.ready
-        ? "Controller over USB"
-        : usb.state === "device"
-          ? "Headset ready"
-          : usb.state === "none"
-            ? "No headset"
-            : usb.state === "unauthorized"
-              ? "Authorize on headset"
-              : usb.state
-
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-2">
       <Tile
         icon={<Server className="size-3.5" />}
         title="Axol Host"
         dot={wsDot}
         label={wsLabel}
         pulse={conn === "loading"}
-        extra={
+        statusEnd={
           online && version ? (
             <span className="font-mono text-[0.7rem] text-white/35" title={`v${version}`}>
               axol v{version}
@@ -239,8 +168,10 @@ export function ConnectionsBar({
         dot={robotDot}
         label={robotLabel}
         pulse={rs === "connecting"}
-        extra={
-          robot && (rs === "connected" || rs === "busy") ? <MotorGrid robot={robot} /> : undefined
+        statusContent={
+          robot && robot.motors.length > 0 && (rs === "connected" || rs === "busy") ? (
+            <MotorGrid robot={robot} />
+          ) : undefined
         }
       >
         {rs === "connected" || rs === "busy" ? (
@@ -266,60 +197,74 @@ export function ConnectionsBar({
           </Button>
         )}
       </Tile>
-
-      <Tile
-        icon={<Camera className="size-3.5" />}
-        title="Cameras"
-        dot={camDot}
-        label={camLabel}
-        pulse={camDot === "busy"}
-      >
-        <Button variant="outline" size="sm" onClick={onConfigureCameras} disabled={!online}>
-          <Settings2 />
-          Configure
-        </Button>
-      </Tile>
-
-      <Tile icon={<Usb className="size-3.5" />} title="Quest USB" dot={usbDot} label={usbLabel}>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={onUsbConnect}
-          disabled={!online || usbBusy || usb?.installed === false}
-        >
-          {usbBusy ? <Loader2 className="animate-spin" /> : <Plug />}
-          {usb?.ready ? "Reconnect" : "Connect"}
-        </Button>
-      </Tile>
     </div>
   )
 }
 
+/** Healthy = reachable on CAN and reporting no error status. */
+function motorHealthy(m: MotorHealth): boolean {
+  return m.reachable && (m.status === "OK" || m.status === "DISABLED" || m.status == null)
+}
+
+const jointName = (m: MotorHealth) => `${m.arm} ${m.joint.replace(/_/g, " ").toLowerCase()}`
+
 /**
- * Compact 16-dot motor health, sized to sit inline in the Axol tile header
- * (two clusters of 8 dots, prefixed with a faint L / R) so the tile stays the
- * same height as the others.
+ * Per-motor health as one status row. CAN reachability and the reported motor
+ * error are one result: an unreachable motor is an error, not a separate state.
  */
 export function MotorGrid({ robot }: { robot: RobotStatus }) {
   if (!robot.motors.length) return null
+  const color = (m: MotorHealth) => (motorHealthy(m) ? "ok" : "err")
+  const tip = (m: MotorHealth) => {
+    if (!m.reachable) return `${jointName(m)}: unreachable`
+    const status = (m.status ?? "OK").replace(/_/g, " ").toLowerCase()
+    const temp = m.temperature != null ? ` · ${Math.round(m.temperature)}°C` : ""
+    return `${jointName(m)}: ${status}${temp}`
+  }
   const arms = ["left", "right"]
+  const SQUARE = {
+    ok: "bg-emerald-400/80",
+    err: "bg-red-400/70",
+  }
   return (
-    <div className="flex flex-wrap items-center justify-start gap-x-2 gap-y-1">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
       {arms.map((arm) => (
-        <div key={arm} className="flex items-center gap-1">
+        <div key={arm} className="flex items-center gap-1.5">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-          <div className="flex gap-[3px]">
+          <div className="flex gap-1">
             {robot.motors
               .filter((m) => m.arm === arm)
-              .map((m) => (
-                <span
-                  key={m.joint}
-                  className={cn(
-                    "size-2 rounded-[2px]",
-                    m.reachable ? "bg-emerald-400/80" : "bg-red-400/60"
-                  )}
-                />
-              ))}
+              .map((m, index, motors) => {
+                const tooltip = `motor-${m.arm}-${m.joint}-tooltip`
+                const first = index === 0
+                const last = index === motors.length - 1
+                return (
+                  <span
+                    key={m.joint}
+                    tabIndex={0}
+                    aria-describedby={tooltip}
+                    className="group/motor relative inline-flex rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111]"
+                  >
+                    <span className={cn("size-3 rounded-[3px]", SQUARE[color(m)])} />
+                    <span
+                      id={tooltip}
+                      role="tooltip"
+                      className={cn(
+                        "pointer-events-none absolute top-full z-30 mt-2 w-max max-w-56 rounded-md border border-white/15 bg-[#181818] px-2.5 py-1.5 text-center text-xs leading-snug font-normal text-white/85 opacity-0 shadow-lg transition-opacity duration-75 group-hover/motor:opacity-100 group-focus-visible/motor:opacity-100",
+                        first ? "left-0" : last ? "right-0" : "left-1/2 -translate-x-1/2"
+                      )}
+                    >
+                      {tip(m)}
+                      <span
+                        className={cn(
+                          "absolute bottom-full size-1.5 translate-y-1/2 rotate-45 border-t border-l border-white/15 bg-[#181818]",
+                          first ? "left-1" : last ? "right-1" : "left-1/2 -translate-x-1/2"
+                        )}
+                      />
+                    </span>
+                  </span>
+                )
+              })}
           </div>
         </div>
       ))}

@@ -22,6 +22,7 @@ import { cn } from "@/lib/utils"
 import {
   fetchCommands,
   fetchRobotStatus,
+  fetchSessions,
   robotConnect,
   sendSessionInput,
   setServerBase,
@@ -66,6 +67,13 @@ const STATE_BADGE: Record<
   error: { variant: "destructive", text: "error" },
 }
 
+// Commands this dashboard launches as manager sessions besides the fetched
+// Diagnostics-category catalog: the CAN quick buttons and the motor calibration
+// tools. Used to recognise an already-running session and adopt it (see the
+// adoption effect) so its Stop button shows on any browser, not just the tab
+// that started it.
+const PAGE_COMMAND_IDS = ["can.setup", "can.enable", "motor.set-can-id", "motor.set-zero-pos"]
+
 /**
  * Motor diagnostics dashboard: live per-motor status (health, temperature,
  * voltage), always-running position / velocity / torque charts with joint
@@ -101,21 +109,32 @@ export default function Diagnostics() {
     session: SessionInfo
   } | null>(null)
   const [launchBusy, setLaunchBusy] = useState(false)
-  const { lines: activeLines, status: activeStatus } = useSessionLogs(
-    activeRun?.session.id ?? null
-  )
-  // Hands-on steps (the ROM tests' gripper prompts) print a "[prompt] …"
-  // marker and then block on stdin; the run's Continue button answers them.
-  // Prompts are strictly ordered, so the pending one is the (answered+1)th.
-  const prompts = useMemo(
-    () =>
-      activeLines
-        .filter((l) => l.startsWith("[prompt] "))
-        .map((l) => l.slice("[prompt] ".length).trim()),
-    [activeLines]
-  )
-  const [answered, setAnswered] = useState(0)
-  const pendingPrompt = answered < prompts.length ? prompts[answered] : null
+  const { lines: activeLines, status: activeStatus } = useSessionLogs(activeRun?.session.id ?? null)
+  // Hands-on steps (the ROM tests' gripper prompts) print a "[prompt] …" marker
+  // and then block on stdin; the run's Continue button answers them. The run is
+  // waiting on one iff its most recent output is that marker — after the operator
+  // answers, the script always prints more output, so a non-prompt tail means
+  // nothing is pending. Deriving the pending prompt from the log tail (instead of
+  // counting how many were answered) keeps it correct on any browser, including
+  // one that adopted a run already in flight from another computer.
+  const promptTail = useMemo(() => {
+    for (let i = activeLines.length - 1; i >= 0; i--) {
+      const l = activeLines[i]
+      if (!l.trim() || l.startsWith("[serve]")) continue
+      return l.startsWith("[prompt] ") ? l.slice("[prompt] ".length).trim() : null
+    }
+    return null
+  }, [activeLines])
+  // Hide the Continue button the instant it's clicked (until the next line
+  // arrives) so a double-click can't send two newlines and skip the following
+  // prompt. Tagged with the session id so the suppression never bleeds from one
+  // run into the next.
+  const [dismissed, setDismissed] = useState<{ id: string; len: number } | null>(null)
+  const pendingPrompt =
+    promptTail &&
+    !(dismissed && dismissed.id === activeRun?.session.id && dismissed.len === activeLines.length)
+      ? promptTail
+      : null
   // Latest meaningful output line, surfaced on the running action card as
   // secondary progress context.
   const activeLine =
@@ -193,8 +212,7 @@ export default function Diagnostics() {
     if (activeStatus.status !== "exited" && activeStatus.status !== "error") return
     if (notifiedRef.current === activeRun.session.id) return
     notifiedRef.current = activeRun.session.id
-    const label =
-      commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command
+    const label = commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command
     if (activeStatus.status === "exited" && (activeStatus.exitCode ?? 0) === 0) {
       toast.success(`${label} finished.`)
     } else {
@@ -212,7 +230,6 @@ export default function Diagnostics() {
       setLaunchBusy(true)
       try {
         const { run, session } = await startDiagnosticsRun(command, args)
-        setAnswered(0)
         setActiveRun({ command, session })
         if (run) setRuns((prev) => [run, ...prev])
       } catch (e) {
@@ -226,17 +243,16 @@ export default function Diagnostics() {
 
   const continuePrompt = useCallback(async () => {
     if (!activeRun) return
-    // Optimistically advance so the button hides until the next prompt marker
-    // arrives — this also guards against a double-click sending two newlines
-    // (which would skip the following prompt).
-    setAnswered((n) => n + 1)
+    // Hide the button until the next line arrives (double-click guard); restore
+    // it if the input fails to send.
+    setDismissed({ id: activeRun.session.id, len: activeLines.length })
     try {
       await sendSessionInput(activeRun.session.id)
     } catch (e) {
-      setAnswered((n) => Math.max(0, n - 1))
+      setDismissed(null)
       toast.error(String(e))
     }
-  }, [activeRun, toast])
+  }, [activeRun, activeLines.length, toast])
 
   const stopActive = useCallback(async () => {
     if (!activeRun) return
@@ -312,6 +328,41 @@ export default function Diagnostics() {
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
+  // Adopt a diagnostics/CAN run that's already in flight so its Stop button,
+  // live output and Continue prompt appear on *any* browser — not just the tab
+  // that launched it. Without this, opening the dashboard on a second computer
+  // while a run is going gives no way to cancel it. Poll only while nothing is
+  // tracked locally; once a run is adopted (or launched) activeRun is set and
+  // this stops. The completion effect clears activeRun when the run ends, which
+  // re-arms the poll (the finished session is then no longer "live").
+  useEffect(() => {
+    if (!serverOk || activeRun != null) return
+    const ours = (command: string) =>
+      PAGE_COMMAND_IDS.includes(command) || diagCommands.some((c) => c.id === command)
+    let active = true
+    const poll = () => {
+      fetchSessions()
+        .then((sessions) => {
+          if (!active) return
+          const live = sessions
+            .filter(
+              (s) =>
+                (s.status === "starting" || s.status === "running" || s.status === "stopping") &&
+                ours(s.command)
+            )
+            .sort((a, b) => b.startedAt - a.startedAt)[0]
+          if (live) setActiveRun({ command: live.command, session: live })
+        })
+        .catch(() => {})
+    }
+    poll()
+    const t = setInterval(poll, 2000)
+    return () => {
+      active = false
+      clearInterval(t)
+    }
+  }, [serverOk, activeRun, diagCommands])
+
   // Motor calibration tools surfaced as buttons in the Motors header. Zeroing
   // is one button whose dialog tabs between "specific motor" and the guided
   // walk of every joint (both back motor.set-zero-pos via presets).
@@ -366,8 +417,7 @@ export default function Diagnostics() {
   // Follow mode anchors the window to the newest sample; the page re-renders
   // on every stream tick, so the live edge advances with the data (and holds
   // still while the stream is paused). Zoom/pan pins a fixed range.
-  const lastT =
-    stream.frames.length > 0 ? stream.frames[stream.frames.length - 1].t : windowSec
+  const lastT = stream.frames.length > 0 ? stream.frames[stream.frames.length - 1].t : windowSec
   const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
   return (
@@ -420,10 +470,7 @@ export default function Diagnostics() {
                     size="sm"
                     title={cmd.description}
                     disabled={
-                      !serverOk ||
-                      launchBusy ||
-                      busyElsewhere ||
-                      (activeRun != null && !running)
+                      !serverOk || launchBusy || busyElsewhere || (activeRun != null && !running)
                     }
                     onClick={() => (running ? stopActive() : launch(id, {}))}
                   >
@@ -586,12 +633,7 @@ export default function Diagnostics() {
         </section>
 
         {/* Run history */}
-        <RunHistory
-          runs={runs}
-          loading={runsLoading}
-          onRefresh={refreshRuns}
-          onClear={clearRuns}
-        />
+        <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />
       </main>
 
       {/* Motor calibration tool dialog (Set CAN ID / Set zero position) */}

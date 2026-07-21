@@ -37,7 +37,7 @@ Open the **Local** URL on the host, or the **LAN** URL from another machine on t
 
 ## Connections
 
-The top of the panel is a row of tiles — **Axol Host**, **Axol**, **Cameras**, and **Quest USB** — each with a colored status dot.
+The top of the panel is a pair of tiles — **Axol Host** and **Axol** — each with a colored status dot. (Cameras and the Quest USB link are configured in the [Settings](#settings) tabs right below.)
 
 ### Axol Host
 
@@ -47,61 +47,80 @@ The **Axol Host** is the machine running `axol serve` — the computer wired to 
 
 When a newer [release](https://github.com/almond-bot/axol/releases) than the installed one exists, a banner appears above the tiles showing the version jump (e.g. `v0.1.2 → v0.1.3`) with a link to the release notes. Press **Update** to apply it: the host reinstalls at the new release, re-provisions its system dependencies, and restarts once idle — the button is disabled while an operation is running, since applying an update restarts the server. Nothing updates without that button press.
 
+The same banner area also warns when the **control panel UI and the host backend are running different code** — the web bundle bakes in the git commit and release version it was built from, the host reports its own via `/api/info`, and a mismatch raises the warning (a released host is compared by version, a dev checkout by commit). This catches a stale hosted tab, or an unbuilt local `web/app/dist`, silently driving a newer or older backend; clear it by updating the host to the matching release or rebuilding the local UI.
+
 ### Axol
 
 The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
 
 - Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
-- Pings all 16 motors once per second while idle, so the tile reflects live motor health (a green/red dot per joint, grouped **L** / **R**).
+- Pings all 16 motors once per second while idle, so the tile reflects live motor health as two rows of squares (grouped **L** / **R**): the top row is **CAN reachability**, the bottom row the motor's **error status**. Hover any square for the details (status, temperature).
+
+**Motor faults block everything.** The *N/16 motors* count only includes motors that are both reachable **and** error-free. While any motor is unreachable or reporting an error (over-temperature, over-current, stall, encoder error, …), every hardware operation's **Start** is blocked — both in the panel (a per-fault entry under *Before you can start*) and by the server itself — since driving through a faulted motor risks the arm. Sim teleop stays available.
 
 The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
+<Warning>
+  Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
+</Warning>
+
+## Settings
+
+Almost nothing you configure is actually per-run — camera assignment, arm stiffness, teleop rate, recording fps and codec, the inference server address — so it all lives in one **Settings** card, tabbed directly on the page below the connection tiles:
+
+| Tab | What's in it |
+|---|---|
+| **Cameras** | The camera setup described [below](#cameras). |
+| **Quest USB** | The optional [Quest-over-USB](#quest-usb) controller-pose link. |
+| **Robot** | Left/right arm stiffness sliders, CAN channels, gripper torque limit and max speed (both grippers), gravity-comp damping and rate. |
+| **Teleop & VR** | Teleop control rate, position and rotation multipliers. |
+| **Rest pose** | An **interactive 3D pose editor**: the robot model (loaded from the host's URDF) rendered live, with a slider per joint for each arm. The pose you set here is where the arms start from — and return to — in teleop and data collection. |
+| **Kinematics** | The IK solver's main cost weights (position / orientation / elbow / rest) and the per-step joint delta cap. |
+| **Recording** | Dataset fps, video codec, dataset root, push-to-hub, Rerun viewer address. Setting the recording fps above the cameras' default 60 automatically raises the recording cameras' capture rate to match (the ZED X only supports rates above 60 at SVGA). |
+| **Inference** | Device, remote inference server host/port, episode length, chunking and aggregation. |
+| **System** | Log level. |
+| **Advanced** | Every remaining config field, organized by subsystem (*Axol*, *Teleop*, *Kinematics*, *VR server*, *LeRobot robot*) with a search box across all of it. There is **one value per knob, applied to every operation** — the host translates it to each operation's config path, so there are never different per-task copies of the same setting. Runs of identical sub-configs — the per-joint gains — render as **one table per arm** (a row per joint, a column per parameter), and vector values like a link's CoM are entered as separate **x / y / z** fields, never raw arrays. Nothing is hidden behind collapsed groups. |
+
+Values are stored **on the Axol host** (`~/.almond/settings.json`) — not in your browser — so they're shared by every operation and every operator device, and they're folded into each operation start automatically (a per-run field always wins over a shared one). Edits stage locally until you press **Save** (or **Discard**). Unset fields show the config's own default as a placeholder; edited ones get a reset button. **Export** / **Import** in the card footer move the whole settings file as JSON for backup or copying between robots.
+
 ### Cameras
 
-Data collection and policy inference also need the ZED cameras attached to the host. Press **Configure** to open the **Cameras** dialog.
+Data collection and policy inference also need the ZED cameras attached to the host — they're assigned in the **Cameras** settings tab.
 
-The tile's dot reflects whether the assigned cameras are **actually connected**, not merely configured: it stays green (`N/3 configured`) only while every assigned serial is detected on the host, turns **red** (`x/N connected`) the moment an assigned camera is unplugged or missing, and shows **Can't detect cameras** (amber) if the ZED SDK or daemon can't be queried at all.
+The Cameras tab **detects the cameras** plugged into the host and shows one card per camera: its serial, its type (**stereo** ZED X / **mono** ZED-X One — detected automatically, never flagged manually), the model, and a **live preview frame**, so you can tell at a glance which physical camera each serial belongs to. Assign each one to its slot (overhead / left arm / right arm) — an assigned slot repeats the camera's preview thumbnail next to its name. Press **Refresh** to re-query the daemon's device list and grab fresh preview frames, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. (Previews are unavailable while an operation is running, since it owns the cameras.)
 
-The dialog **detects the cameras** plugged into the host and lists their serial numbers — assign each one to its slot (overhead / left arm / right arm). Press **Refresh** to re-query the daemon's current device list, or **Restart daemon** to restart the ZED X daemon so it re-scans the GMSL links — needed to pick up a camera plugged in or unplugged since boot. Stereo ZED X cameras are **detected automatically** — a **stereo** / **mono** badge appears next to each assigned slot, so you never flag it manually.
-
-The dialog is the single source of truth for all camera settings — these fields no longer appear in an operation's **Optional** form. It controls two independent branches:
+The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
 
 - **Stream** — what is relayed to the VR headset over WebRTC (used by teleop, collect-data, and run-policy preview).
 - **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream).
 
 Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
 
-A stereo **overhead** captures both eyes from one grab; with both eyes selected it's exposed as `overhead_left` / `overhead_right` (rendered per-lens in the headset, two observation keys in the dataset). A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
+A stereo **overhead** captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist in your browser and are sent along when you start an operation. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras dialog. Teleop streams whatever is configured and is never blocked by this check.
+The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 
-The **Quest USB** tile manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the tile sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. The headset sends every pose over both the cable and Wi-Fi, so a dropped cable **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link when it returns.
-
-<Warning>
-  Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
-</Warning>
+The **Quest USB** tab manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. The headset sends every pose over both the cable and Wi-Fi, so a dropped cable **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link when it returns.
 
 ## Operations
 
-Pick an operation from the selector. Each has its own settings form; required fields are shown directly and everything else lives under an **Optional** dropdown. Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
+Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy, the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
 
 | Operation | Needs | Notes |
 |---|---|---|
 | **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
-| **Gravity Compensation** | Axol | Hold the arms weightless for hand-guiding. |
-| **Collect Data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
-| **Replay Dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**. |
-| **Run Policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
+| **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
+| **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
+| **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
 ### Before you can start
 
-The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Assign at least one camera serial in the Cameras dialog*, or *Set &lt;required field&gt;*.
+The **Start** button stays disabled until everything an operation needs is ready, and a "Before you can start" list spells out what's missing — e.g. *Connect Axol*, *Fix motor fault: R elbow — over temperature*, *Assign at least one camera serial in the Cameras settings tab*, or *Set &lt;required field&gt;*.
 
-### Settings persistence & import/export
-
-Each operation's settings are saved to your browser automatically, so they reappear on reload. Use **Export** to download a settings JSON and **Import** to load one — handy for sharing a known-good configuration across machines. (Camera assignments live with the Cameras dialog, not in an operation's export.)
+Per-run values (repo ids, task names, …) are remembered by your browser so they reappear on reload; everything else persists on the host with the shared settings.
 
 ### Running, logs, and stopping
 
@@ -109,7 +128,7 @@ Starting an operation streams its logs into the console at the bottom of the pag
 
 ## Run Policy episode controls
 
-While **Run Policy** is live, an **Episode control** box appears in the operation card with three buttons:
+While **Run policy** is live, an **Episode control** box appears in the operation card with three buttons:
 
 | Button | Effect |
 |---|---|
@@ -120,12 +139,15 @@ While **Run Policy** is live, an **Episode control** box appears in the operatio
 These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
 
 <Note>
-  **Collect Data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
+  **Collect data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
 </Note>
 
 ## Next steps
 
 <CardGroup cols={2}>
+  <Card title="Diagnostics dashboard" icon="chart-line" href="/guides/diagnostics-dashboard">
+    Live motor telemetry, health tiles, and diagnostics scripts — the sibling `/diagnostics` page.
+  </Card>
   <Card title="serve reference" icon="terminal" href="/cli/serve">
     Flags, TLS, and what the server exposes.
   </Card>

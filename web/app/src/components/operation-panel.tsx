@@ -1,34 +1,38 @@
-import { useMemo, useRef, useState } from "react"
+import { useMemo } from "react"
 import {
   AlertTriangle,
-  ChevronRight,
-  Download,
   ExternalLink,
   Loader2,
   Play,
   RotateCcw,
+  Settings2,
   Square,
-  Upload,
 } from "lucide-react"
 import {
   cameraCount,
-  filterSchema,
-  flattenFields,
-  isModified,
+  motorFaultLabel,
+  perRunFields,
   type CameraSpec,
   type CommandSpec,
   type FormValue,
   type OperationMeta,
+  type PolicyState,
   type RobotStatus,
-  type SchemaNode,
   type SessionInfo,
 } from "@/lib/supervisor"
-import { ConfigForm, CuratedForm } from "@/components/config-form"
+import { CuratedForm } from "@/components/config-form"
+import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { cn } from "@/lib/utils"
 
+/**
+ * One operation's panel: just its per-run inputs (dataset / task / policy
+ * identity) and Start/Stop. Everything reusable across runs — cameras, arm
+ * behaviour, recording, inference — lives in the shared Settings dialog and is
+ * folded in server-side at start.
+ */
 export function OperationPanel({
   meta,
   spec,
@@ -36,8 +40,7 @@ export function OperationPanel({
   onChange,
   onReset,
   onResetAll,
-  onExport,
-  onImport,
+  onOpenSettings,
   cameras,
   robot,
   live,
@@ -47,6 +50,7 @@ export function OperationPanel({
   host,
   viewerPort,
   startPhase,
+  policy,
   onStart,
   onStop,
   onEpisode,
@@ -57,8 +61,7 @@ export function OperationPanel({
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
   onResetAll: () => void
-  onExport: () => void
-  onImport: (text: string) => void
+  onOpenSettings: () => void
   cameras: CameraSpec
   robot: RobotStatus | null
   live: boolean
@@ -69,30 +72,18 @@ export function OperationPanel({
   viewerPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
+  /** run-policy episode phase/count (null unless run-policy is the live op). */
+  policy: PolicyState | null
   onStart: () => void
   onStop: () => void
   onEpisode: (command: string) => void
 }) {
-  const fileRef = useRef<HTMLInputElement>(null)
-  // Required fields stay visible; every optional field lives in the dropdown.
-  const allFields = useMemo(() => (spec ? flattenFields(spec.schema) : []), [spec])
-  const requiredFields = useMemo(() => allFields.filter((f) => f.required), [allFields])
-  const optionalSchema = useMemo(() => {
-    if (!spec) return []
-    const exclude = new Set(requiredFields.map((f) => f.key))
-    // Per-slot camera config (serial / stereo / eyes / resolution / …) is owned
-    // by the Cameras dialog and auto-detected by the backend (stereo promotion in
-    // AxolRobotConfig.apply_detected_stereo). The advanced form renders the static
-    // schema defaults (serial 0, stereo off, eyes both), which never reflect the
-    // detected/assigned cameras — so for ops that use the dialog, hide the
-    // disconnected robot_config.cameras.* duplicate to keep the UI consistent.
-    if (meta.requiresCameras) {
-      for (const f of allFields) {
-        if (f.key.startsWith("robot_config.cameras.")) exclude.add(f.key)
-      }
-    }
-    return filterSchema(spec.schema, exclude)
-  }, [spec, requiredFields, allFields, meta.requiresCameras])
+  // Per-run inputs: every required field plus the op's curated run-identity
+  // fields (repo id, task, policy path, episode, …) — required ones first.
+  const runFields = useMemo(() => (spec ? perRunFields(spec, meta) : []), [spec, meta])
+  // Gravity-comp's joint subset gets a proper picker instead of a text field.
+  const jointField = runFields.find((f) => f.key === "free_joints")
+  const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
   const isSim = meta.id === "teleop" && Boolean(settings.sim)
   // UMI mode runs on the handheld rig's own CAN buses — the persistent Axol
@@ -104,12 +95,21 @@ export function OperationPanel({
 
   const blockers: string[] = []
   if (meta.requiresRobot && !isSim && !isUmi && !robotOk) blockers.push("Connect Axol")
+  // A faulted motor blocks every hardware operation (the server refuses the
+  // start too) — driving through an over-temp / stalled / unreachable motor
+  // risks the arm. Sim never touches the motors, and UMI ops run on the
+  // handheld rig's own buses rather than the Axol's.
+  if (!isSim && !isUmi) {
+    for (const f of robot?.faults ?? []) {
+      blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
+    }
+  }
   // Collect-data / run-policy record whichever camera slots are assigned, so
   // at least one serial must be set before starting (the rest are optional).
   if (meta.requiresCameras && camCount < 1) {
-    blockers.push("Assign at least one camera serial in the Cameras dialog")
+    blockers.push("Assign at least one camera serial in the Cameras settings tab")
   }
-  for (const f of allFields) {
+  for (const f of runFields) {
     if (f.required) {
       const v = settings[f.key]
       if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
@@ -118,13 +118,6 @@ export function OperationPanel({
 
   const editedCount = Object.keys(settings).length
   const available = spec?.available ?? false
-
-  function handleFile(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
-    file.text().then(onImport)
-    e.target.value = ""
-  }
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -162,67 +155,53 @@ export function OperationPanel({
             <Unavailable spec={spec} />
           ) : (
             <>
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
-                  Settings
-                </span>
-                <div className="flex items-center gap-1">
-                  {editedCount > 0 && !live && (
-                    <button
-                      type="button"
-                      onClick={onResetAll}
-                      className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
-                    >
-                      <RotateCcw className="size-3" />
-                      Reset
-                    </button>
+              {runFields.length > 0 && (
+                <>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
+                      This run
+                    </span>
+                    {editedCount > 0 && !live && (
+                      <button
+                        type="button"
+                        onClick={onResetAll}
+                        className="flex items-center gap-1 px-2 text-xs text-white/40 hover:text-white/70"
+                      >
+                        <RotateCcw className="size-3" />
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                  {textFields.length > 0 && (
+                    <CuratedForm
+                      fields={textFields}
+                      overrides={settings}
+                      disabled={live}
+                      onChange={onChange}
+                      onReset={onReset}
+                    />
                   )}
-                  <Button variant="ghost" size="sm" onClick={onExport}>
-                    <Download />
-                    Export
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => fileRef.current?.click()}
-                    disabled={live}
-                  >
-                    <Upload />
-                    Import
-                  </Button>
-                  <input
-                    ref={fileRef}
-                    type="file"
-                    accept="application/json"
-                    className="hidden"
-                    onChange={handleFile}
-                  />
-                </div>
-              </div>
-
-              {requiredFields.length > 0 && (
-                <CuratedForm
-                  fields={requiredFields}
-                  overrides={settings}
-                  disabled={live}
-                  onChange={onChange}
-                  onReset={onReset}
-                />
+                  {jointField && (
+                    <ArmJointPicker
+                      value={settings[jointField.key]}
+                      disabled={live}
+                      onChange={(v) => onChange(jointField.key, v)}
+                      onReset={() => onReset(jointField.key)}
+                    />
+                  )}
+                </>
               )}
 
-              {optionalSchema.length > 0 && (
-                <OptionalSettings
-                  schema={optionalSchema}
-                  overrides={settings}
-                  disabled={live}
-                  onChange={onChange}
-                  onReset={onReset}
-                />
-              )}
-
-              {requiredFields.length === 0 && optionalSchema.length === 0 && (
-                <p className="text-sm text-white/40">No settings — just press Start.</p>
-              )}
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                className="flex w-fit items-center gap-1.5 text-xs text-white/40 transition-colors hover:text-white/70"
+              >
+                <Settings2 className="size-3.5" />
+                {runFields.length > 0
+                  ? "Cameras, arm behaviour, recording and everything else live in Settings"
+                  : "No per-run inputs — configure everything in Settings, then press Start"}
+              </button>
 
               {blockers.length > 0 && !live && (
                 <div className="flex flex-col gap-1 rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
@@ -235,7 +214,9 @@ export function OperationPanel({
                 </div>
               )}
 
-              {meta.id === "run-policy" && live && <EpisodeControls onEpisode={onEpisode} />}
+              {meta.id === "run-policy" && live && (
+                <EpisodeControls policy={policy} onEpisode={onEpisode} />
+              )}
 
               <RunningHints
                 op={meta.id}
@@ -252,70 +233,47 @@ export function OperationPanel({
   )
 }
 
-function OptionalSettings({
-  schema,
-  overrides,
-  disabled,
-  onChange,
-  onReset,
+function EpisodeControls({
+  policy,
+  onEpisode,
 }: {
-  schema: SchemaNode[]
-  overrides: Record<string, FormValue>
-  disabled: boolean
-  onChange: (key: string, value: FormValue) => void
-  onReset: (key: string) => void
+  policy: PolicyState | null
+  onEpisode: (command: string) => void
 }) {
-  const [open, setOpen] = useState(false)
-  const leaves = useMemo(() => flattenFields(schema), [schema])
-  const editedCount = leaves.filter((f) => isModified(f, overrides[f.key])).length
-
-  return (
-    <div className="rounded-lg border border-white/10 bg-white/[0.02]">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-2 px-3 py-2.5 text-left"
-      >
-        <ChevronRight
-          className={cn("size-4 shrink-0 text-white/40 transition-transform", open && "rotate-90")}
-        />
-        <span className="text-sm font-medium">Optional</span>
-        <span className="text-xs text-white/30">{leaves.length}</span>
-        {editedCount > 0 && (
-          <span className="ml-auto rounded-full bg-[#eff483]/15 px-2 py-0.5 font-mono text-[0.65rem] text-[#eff483]">
-            {editedCount} edited
-          </span>
-        )}
-      </button>
-      {open && (
-        <div className="border-t border-white/10 p-3">
-          <ConfigForm
-            schema={schema}
-            overrides={overrides}
-            disabled={disabled}
-            onChange={onChange}
-            onReset={onReset}
-          />
-        </div>
-      )}
-    </div>
-  )
-}
-
-function EpisodeControls({ onEpisode }: { onEpisode: (command: string) => void }) {
+  const phase = policy?.phase ?? "preparing"
+  const ready = phase === "ready" // between-episode gate: start the next episode
+  // Episode in flight, or the safety-cap decision after it — Save/Discard apply.
+  const canChoose = phase === "recording" || phase === "deciding"
+  // Status line so both the initiator and any other computer see what's happening.
+  const status =
+    phase === "recording"
+      ? "Recording — Save to keep, Discard to re-record."
+      : phase === "deciding"
+        ? "Time cap reached — Save to keep, Discard to re-record."
+        : phase === "ready"
+          ? "Reset the scene, then start the episode."
+          : phase === "resetting"
+            ? "Returning to rest…"
+            : "Preparing…"
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
-      <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
-        Episode control
-      </span>
+      <div className="flex items-center justify-between gap-2">
+        <span className="font-mono text-xs tracking-widest text-[#eff483]/80 uppercase">
+          Episode control
+        </span>
+        <span className="font-mono text-[0.65rem] text-white/40">
+          {policy?.episodesRecorded ?? 0} saved
+        </span>
+      </div>
+      <span className="text-xs text-white/50">{status}</span>
       <div className="flex flex-wrap gap-2">
-        <Button size="sm" onClick={() => onEpisode("start")}>
-          Start Episode
+        <Button size="sm" disabled={!ready} onClick={() => onEpisode("start")}>
+          Start episode
         </Button>
-        <Button variant="outline" size="sm" onClick={() => onEpisode("s")}>
+        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("s")}>
           Save
         </Button>
-        <Button variant="outline" size="sm" onClick={() => onEpisode("r")}>
+        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("r")}>
           Discard
         </Button>
       </div>

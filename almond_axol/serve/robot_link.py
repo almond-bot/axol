@@ -52,6 +52,41 @@ STATE_ERROR = "error"
 _IFF_UP = 0x1
 
 
+# Motor status names that are healthy at idle: OK, or DISABLED (motors sit
+# disabled between tasks). Anything else — over-temp/voltage/current, stall,
+# encoder faults, lost comm — is a fault an operation must not start over.
+_HEALTHY_MOTOR_STATUSES = {"OK", "DISABLED", None}
+
+
+def motor_faults(
+    motors: list[dict[str, Any]], *, connected: bool
+) -> list[dict[str, Any]]:
+    """Faulted motors from a serialized health list: unreachable or errored.
+
+    Only meaningful while the link is connected (the idle ping keeps the health
+    fresh); an unconnected link reports no faults rather than stale ones.
+    """
+    if not connected:
+        return []
+    faults: list[dict[str, Any]] = []
+    for m in motors:
+        if not m["reachable"]:
+            problem = "unreachable"
+        elif m["status"] not in _HEALTHY_MOTOR_STATUSES:
+            problem = str(m["status"]).replace("_", " ").lower()
+        else:
+            continue
+        faults.append(
+            {
+                "arm": m["arm"],
+                "joint": m["joint"],
+                "problem": problem,
+                "temperature": m.get("temperature"),
+            }
+        )
+    return faults
+
+
 def _format_error(exc: BaseException) -> str:
     """Short, human-readable error for the UI status pill.
 
@@ -274,6 +309,10 @@ class RobotLink:
             return
         self._set_state(STATE_CONNECTED)
 
+    def motor_faults(self) -> list[dict[str, Any]]:
+        """Current motor faults (see :func:`motor_faults`); [] when not connected."""
+        return self.status()["faults"]
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             state = self._state
@@ -289,6 +328,8 @@ class RobotLink:
                         "joint": joint.name,
                         "reachable": bool(h.get("reachable", False)),
                         "status": h.get("status"),
+                        "temperature": h.get("temperature"),
+                        "voltage": h.get("voltage"),
                     }
                 )
         reachable = sum(1 for m in motors if m["reachable"])
@@ -300,6 +341,9 @@ class RobotLink:
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
+            "faults": motor_faults(
+                motors, connected=state in (STATE_CONNECTED, STATE_BUSY)
+            ),
         }
 
     def motor_details(self, arm: str, joint_name: str) -> dict[str, Any]:
@@ -405,26 +449,42 @@ class RobotLink:
     def _enable_can(self) -> None:
         """Bring up the CAN interfaces.
 
-        1. If the interfaces are already up, do nothing (common case: cron
-           brought them up at boot).
-        2. Otherwise run the full ``can.setup`` (driver, udev rules, persistent
-           names, @reboot bring-up, then bring-up) non-interactively.
+        1. If the interfaces are already up AND a motor answers, do nothing
+           (common case: cron brought them up at boot).
+        2. If they're up but silent, re-run the bring-up script: the
+           dual-channel gs_usb adapter can sit in a TX-only wedge where
+           everything looks healthy kernel-side but no received frame is ever
+           delivered — a down/up cycle recovers it (see ``can.setup``'s
+           ``rx_alive``). Motors that are simply powered off look the same;
+           the extra flap is harmless then.
+        3. Otherwise run the full ``can.setup`` (driver, udev rules,
+           persistent names, @reboot bring-up, then bring-up)
+           non-interactively.
 
-        We always run the full setup rather than just the persisted startup
-        script (``can.enable``): on a fresh axol the script doesn't exist yet,
-        and on a partially-configured one the driver may be unloaded or the
-        interfaces unnamed, so the bare bring-up script can't connect. The
-        whole setup is idempotent (see :func:`ensure_setup`), so re-running it
-        on an already-configured machine is safe and cheap.
+        We run the full setup rather than just the persisted startup script
+        (``can.enable``) when the interfaces are down: on a fresh axol the
+        script doesn't exist yet, and on a partially-configured one the driver
+        may be unloaded or the interfaces unnamed, so the bare bring-up script
+        can't connect. The whole setup is idempotent (see
+        :func:`ensure_setup`), so re-running it on an already-configured
+        machine is safe and cheap.
 
         ``axol serve`` runs as root under the hosted install, so the privileged
         steps inside :func:`ensure_setup` run without a sudo prompt.
         """
-        if self._can_already_up():
-            _logger.info("CAN interfaces already up; skipping bring-up.")
-            return
+        from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
 
-        from ..cli.can.setup import ensure_setup
+        if self._can_already_up():
+            if rx_alive():
+                _logger.info("CAN interfaces already up; motors responding.")
+                return
+            _logger.warning(
+                "CAN interfaces are up but no motor answers (adapter RX may "
+                "be wedged, or the motors are powered off) — re-cycling the "
+                "interfaces."
+            )
+            bring_up_can()
+            return
 
         _logger.info("CAN interfaces down; running can.setup.")
         ensure_setup()
