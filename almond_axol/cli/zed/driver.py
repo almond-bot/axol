@@ -25,7 +25,6 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -44,6 +43,10 @@ _DEB_URL = (
 _L4T_RELEASE = "36"
 _L4T_REVISION_MAJOR = "4"
 _L4T_RELEASE_FILE = Path("/etc/nv_tegra_release")
+# Persistent cache (like zed.install's wheel cache) so a failed install can be
+# recovered by re-running — or by the manual `dpkg -i` the failure prints —
+# without re-downloading.
+_CACHE_DIR = Path.home() / ".almond" / "drivers"
 
 
 def _installed_version() -> str | None:
@@ -84,19 +87,59 @@ def _is_older(installed: str) -> bool:
     )
 
 
-def _upgrade() -> None:
-    """Download the pinned .deb and replace the installed package (needs root)."""
-    with tempfile.TemporaryDirectory(prefix="axol-zed-driver-") as tmp:
-        deb = Path(tmp) / _DEB_URL.rsplit("/", 1)[-1]
+def _download_deb() -> Path:
+    """Download the pinned .deb into the cache and verify it is a valid archive.
+
+    Everything that can fail without root — the download and the archive check
+    — happens here, *before* the factory package is removed, so a network error
+    or truncated download can never leave the box with no driver installed.
+    The cached copy also makes a re-run (or the printed manual recovery
+    command) work offline.
+    """
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    deb = _CACHE_DIR / _DEB_URL.rsplit("/", 1)[-1]
+    if not deb.exists():
         print(f"Downloading {_DEB_URL}")
-        urllib.request.urlretrieve(_DEB_URL, deb)
-        # Remove the factory package first (per Stereolabs' upgrade procedure)
-        # rather than upgrading in place; best-effort since a half-removed
-        # package still gets replaced by the install below.
-        print(f"Removing the factory {_PACKAGE} package (requires sudo)...")
-        run_root(["dpkg", "-r", _PACKAGE])
-        print(f"Installing {deb.name}...")
+        # Download to a temp name and rename so an interrupted download can
+        # never be mistaken for a complete cached .deb on the next run.
+        partial = deb.with_suffix(".part")
+        urllib.request.urlretrieve(_DEB_URL, partial)
+        partial.rename(deb)
+    else:
+        print(f"Already downloaded: {deb}")
+    proc = subprocess.run(
+        ["dpkg-deb", "--info", str(deb)], capture_output=True, text=True
+    )
+    if proc.returncode != 0:
+        deb.unlink()  # corrupt — drop it so the next run re-downloads
+        raise RuntimeError(
+            f"downloaded .deb failed verification: {(proc.stderr or '').strip()}"
+        )
+    return deb
+
+
+def _upgrade() -> None:
+    """Replace the installed factory package with the pinned .deb (needs root)."""
+    deb = _download_deb()
+    # Remove the factory package first (per Stereolabs' upgrade procedure)
+    # rather than upgrading in place; best-effort since a half-removed
+    # package still gets replaced by the install below.
+    print(f"Removing the factory {_PACKAGE} package (requires sudo)...")
+    run_root(["dpkg", "-r", _PACKAGE])
+    print(f"Installing {deb.name}...")
+    try:
         run_root(["dpkg", "-i", str(deb)], check=True)
+    except RuntimeError:
+        # The factory package is already removed at this point, so don't fail
+        # silently: tell the operator exactly how to finish the install by
+        # hand (the verified .deb stays in the cache).
+        print(
+            f"ERROR: installing {deb.name} failed after the factory package "
+            f"was removed — the box has NO camera driver until this is fixed. "
+            f"Recover with: sudo dpkg -i {deb}",
+            file=sys.stderr,
+        )
+        raise
 
 
 def ensure_driver() -> bool:

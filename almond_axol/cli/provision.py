@@ -58,7 +58,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def _step(label: str, fn: Callable[[], None]) -> None:
+def _step(label: str, fn: Callable[[], object]) -> None:
     """Run one provisioning step; log and continue on failure (best-effort)."""
     try:
         fn()
@@ -79,9 +79,10 @@ def run(_args: object = None) -> None:
     _step("adb (Quest-over-USB)", adb.install)
     # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
     # replace it with the pinned release. Self-gates on the factory package
-    # being present (a no-op everywhere else) and never reboots — the new
-    # kernel driver loads on the next reboot, so it just prints a notice.
-    _step("ZED Box camera driver (zed.driver)", zed_driver.run)
+    # being present (ensure_driver, not run: a *quiet* no-op everywhere else)
+    # and never reboots — the new kernel driver loads on the next reboot, so
+    # it just prints a notice.
+    _step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)
