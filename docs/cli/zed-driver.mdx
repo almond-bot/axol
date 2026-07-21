@@ -1,0 +1,20 @@
+---
+title: "zed.driver"
+description: "Upgrade the ZED Box Duo camera driver (stereolabs-zedbox-duo) to the pinned known-good release."
+---
+
+Replaces the ZED Box Duo's factory-flashed GMSL capture driver (`stereolabs-zedbox-duo`) with the pinned known-good release from Stereolabs. ZED Box Duo units ship with a buggy driver version, which this command upgrades in place (`dpkg -r` the factory package, then `dpkg -i` the pinned `.deb`).
+
+```bash
+axol zed.driver
+```
+
+On any machine that isn't a factory-flashed ZED Box Duo — the `stereolabs-zedbox-duo` package isn't installed — this is a no-op. It also refuses to act when the installed driver is already at (or newer than) the pinned version, or when the running L4T release differs from the one the pinned `.deb` was built for.
+
+<Note>
+  [`provision`](/cli/provision) runs this automatically (the hosted installer and the `axol serve` self-updater both run `provision`), so you normally never need to invoke it directly.
+</Note>
+
+<Warning>
+  The new driver is a kernel module and only loads at boot, so a **reboot is required** after the upgrade. The command never reboots the box itself — it prints a notice instead — because it runs mid-install over SSH and from the running `axol serve` process.
+</Warning>

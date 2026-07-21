@@ -74,6 +74,7 @@
               "cli/run-policy",
               "cli/inference-server",
               "cli/provision",
+              "cli/zed-driver",
               "cli/zed-install",
               "cli/gst-install",
               "cli/gst-build-zed",

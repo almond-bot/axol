@@ -6,6 +6,7 @@ description: "Install or refresh the non-PyPI and system pieces — adb, pyzed, 
 Installs and refreshes the pieces `uv tool install` can't manage on its own:
 
 - **adb** + the Quest udev rule — for the [Quest-over-USB](/guides/quest-over-usb) controller transport (the `adb reverse` tunnel that streams poses over the cable). Self-gates on `apt`.
+- [`zed.driver`](/cli/zed-driver) — replaces the ZED Box Duo's known-bad factory **GMSL camera driver** (`stereolabs-zedbox-duo`) with the pinned release. Takes effect on the next reboot (prints a notice; never reboots itself). A no-op off a factory-flashed ZED Box Duo.
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).

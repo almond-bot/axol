@@ -101,10 +101,18 @@ say "axol installed at $(command -v axol)."
 # idempotently -- the same command the `axol serve` self-updater runs after an
 # upgrade, so there is exactly one provisioning path. Each step self-gates
 # (a no-op without the ZED SDK / apt / NVENC).
-# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport);
-# self-gates on apt and is a no-op where unavailable.
+# Also installs adb + the Oculus udev rule (Quest-over-USB controller transport)
+# and, on a factory-flashed ZED Box Duo, replaces the known-bad factory GMSL
+# camera driver with the pinned release (`axol zed.driver`); the new driver
+# only loads at boot, so provision prints a REBOOT REQUIRED notice we surface
+# in the summary below rather than rebooting the box mid-install.
 say "Provisioning system dependencies (pyzed + GStreamer camera stack + adb)..."
-axol provision || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
+PROVISION_LOG="$(mktemp)"
+axol provision 2>&1 | tee "${PROVISION_LOG}" \
+    || say "WARNING: provisioning failed; cameras may be unavailable or fall back to the slower ZED SDK path. Re-run 'axol provision'."
+REBOOT_REQUIRED=0
+if grep -q "REBOOT REQUIRED" "${PROVISION_LOG}"; then REBOOT_REQUIRED=1; fi
+rm -f "${PROVISION_LOG}"
 
 # -- Quest-over-USB operator access -------------------------------------------
 
@@ -217,3 +225,8 @@ fi
 say ""
 say "  Service logs  : journalctl -u ${SERVICE_NAME} -f"
 say "  Re-run this installer anytime to upgrade."
+if [ "${REBOOT_REQUIRED}" = "1" ]; then
+    say ""
+    say "REBOOT REQUIRED: the ZED Box camera driver was upgraded and only loads"
+    say "at boot. Reboot when convenient:  sudo reboot"
+fi
