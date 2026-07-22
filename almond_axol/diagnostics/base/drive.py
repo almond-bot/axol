@@ -16,6 +16,22 @@ Controls (Logitech F310/F710 in XInput mode):
     LB or RB      deadman — hold to drive; release for a smooth stop
     B             quit (wheels stopped, motors disabled)
 
+When the deadman is released and the command has ramped to zero, the wheels
+are parked: switched to MIT/impedance mode and held at their current
+position by the motor's internal high-bandwidth position loop, so the wheel
+does not give under load. Tune with ``--hold-kp`` / ``--hold-kd``;
+``--hold-kp 0`` disables parking.
+
+Damiao position commands/feedback are mapped into ±PMAX (12.5 rad from
+factory — about two wheel turns), which drive wheels escape almost
+immediately; anchoring at the reported position then means a phantom error
+of several radians and instant overcurrent. Re-zeroing at park time doesn't
+help either: on this firmware the 0xFE zero command only applies after a
+power cycle. So at startup the PMAX register is raised (RAM only, reverts
+on power-off) to keep multi-turn positions valid for a whole session, and
+parking refuses (with a warning) if a wheel ever approaches the widened
+limit.
+
 Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
 if a wheel runs backwards on your base, flip its entry in
@@ -36,6 +52,7 @@ import time
 from dataclasses import dataclass
 
 from ...motor import CanBus, ControlMode, make_driver
+from ...motor.damiao import _DM_REG_PMAX
 from ...motor.driver import MotorDriver
 
 # The base rides its own CAN interface, separate from the two arm buses.
@@ -51,7 +68,13 @@ _BTN_RB = 5
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
-_WHEEL_SIGNS: dict[int, float] = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0}
+_WHEEL_SIGNS: dict[int, float] = {1: 1.0, 2: -1.0, 3: 1.0, 4: -1.0}
+
+# Position-mapping range (PMAX, register 21) written at startup, in rad.
+# Wide enough that a session's accumulated wheel rotation stays in range
+# (the factory 12.5 rad is ~2 wheel turns), narrow enough that the 16-bit
+# MIT position encoding keeps sub-centidegree resolution (~12 mrad here).
+_SESSION_PMAX = 400.0
 
 
 @dataclass(frozen=True)
@@ -131,9 +154,14 @@ def _init_gamepad(index: int):  # noqa: ANN202 — pygame typed lazily
 
 
 def _status_line(
-    engaged: bool, cmd: list[float], speeds: list[float], stale: bool
+    engaged: bool, cmd: list[float], speeds: list[float], stale: bool, holding: bool
 ) -> str:
-    state = "DRIVE" if engaged else "hold LB/RB to drive"
+    if engaged:
+        state = "DRIVE"
+    elif holding:
+        state = "PARKED (hold LB/RB)"
+    else:
+        state = "hold LB/RB to drive"
     wheels = "  ".join(
         f"{w.name.split('_')[0][0]}{w.name.split('_')[1][0]}:{s:+6.2f}"
         for w, s in zip(_WHEELS, speeds)
@@ -145,8 +173,40 @@ def _status_line(
     )
 
 
+async def _park(motors: list[MotorDriver]) -> list[float] | None:
+    """Switch the wheels to the MIT position hold at their current positions.
+
+    Returns the per-wheel anchor positions, or None if any wheel reports a
+    position too close to the widened ±PMAX mapping limit — holding there
+    would risk a wrapped/clamped anchor and a phantom position error at full
+    torque, so the caller falls back to velocity mode instead.
+    """
+    positions = await asyncio.gather(*[m.get_position() for m in motors])
+    if any(abs(p) > 0.9 * _SESSION_PMAX for p in positions):
+        return None
+    await asyncio.gather(
+        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
+    )
+    return list(positions)
+
+
+async def _unpark(motors: list[MotorDriver]) -> None:
+    """Return parked wheels to VELOCITY mode (clears the motors' command state)."""
+    await asyncio.gather(*[m.set_control_mode(ControlMode.VELOCITY) for m in motors])
+
+
 async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace):  # noqa: ANN001
-    """Poll the gamepad and stream velocity commands until B is pressed."""
+    """Poll the gamepad and stream wheel commands until B is pressed.
+
+    While the deadman is held the wheels track the stick in VELOCITY mode.
+    Once it is released and the slew-limited command has ramped to zero, the
+    wheels are parked (see :func:`_park`): held at their current positions by
+    the motor's internal MIT position loop with ``--hold-kp``/``--hold-kd``.
+    The hold command is re-sent every cycle to keep the lost-comm watchdog
+    fed. Holding in the motor's own loop (rather than an outer software loop
+    over CAN) is what makes the wheel rigid instead of giving first and
+    correcting after.
+    """
     import pygame
 
     interval = 1.0 / args.hz
@@ -155,6 +215,8 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
     max_delta = args.slew * interval
     cmd = [0.0, 0.0, 0.0]  # (vx, vy, wz), normalized [-1, 1]
     send_failed = False
+    hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
+    park_failed = False  # anchor out of range — don't retry every cycle
 
     while True:
         t_iter = time.perf_counter()
@@ -162,6 +224,8 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
 
         if pad.get_button(_BTN_B):
             print("\nB pressed — stopping.")
+            if hold_pos is not None:
+                await _unpark(motors)
             return
 
         engaged = bool(pad.get_button(_BTN_LB) or pad.get_button(_BTN_RB))
@@ -180,18 +244,49 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
 
         speeds = _mix(cmd[0], cmd[1], cmd[2], args.max_speed, args.turn_scale)
 
+        stopped = not engaged and all(abs(c) < 1e-3 for c in cmd)
         if motors:
             try:
-                await asyncio.gather(
-                    *[m.set_velocity(s) for m, s in zip(motors, speeds)]
-                )
+                if engaged:
+                    park_failed = False
+                    if hold_pos is not None:
+                        await _unpark(motors)
+                        hold_pos = None
+
+                if stopped and args.hold_kp > 0.0 and not park_failed:
+                    if hold_pos is None:
+                        hold_pos = await _park(motors)
+                        if hold_pos is None:
+                            park_failed = True
+                            print(
+                                "\n  WARNING: wheel position near the ±PMAX "
+                                "mapping limit — parking disabled. Power-cycle "
+                                "the base to reset wheel positions.\n"
+                            )
+                    if hold_pos is not None:
+                        await asyncio.gather(
+                            *[
+                                m.set_impedance(
+                                    p, 0.0, args.hold_kp, args.hold_kd, 0.0
+                                )
+                                for m, p in zip(motors, hold_pos)
+                            ]
+                        )
+                if hold_pos is None:
+                    await asyncio.gather(
+                        *[m.set_velocity(s) for m, s in zip(motors, speeds)]
+                    )
                 send_failed = False
             except Exception:
                 # Transient send failures (buffer full, bus-off recovery) are
                 # surfaced on the status line; the next cycle retries.
                 send_failed = True
 
-        print(_status_line(engaged, cmd, speeds, send_failed), end="", flush=True)
+        print(
+            _status_line(engaged, cmd, speeds, send_failed, hold_pos is not None),
+            end="",
+            flush=True,
+        )
 
         elapsed = time.perf_counter() - t_iter
         await asyncio.sleep(max(0.0, interval - elapsed))
@@ -210,7 +305,18 @@ async def _run(args: argparse.Namespace) -> None:
         # table, so the Damiao protocol is forced explicitly.
         motors = [make_driver(bus, w.motor_id, motor_type="damiao") for w in _WHEELS]
         print(f"Enabling wheel motors on {args.channel} ...")
+        # Widen the position-mapping range (RAM only) before enable() reads it
+        # back, so multi-turn wheel positions stay valid for the MIT park hold.
+        await asyncio.gather(
+            *[m._write_register(_DM_REG_PMAX, _SESSION_PMAX) for m in motors]
+        )
         await asyncio.gather(*[m.enable() for m in motors])
+        for w, m in zip(_WHEELS, motors):
+            if abs(m._p_max - _SESSION_PMAX) > 1.0:
+                print(
+                    f"  WARNING: {w.name} PMAX readback {m._p_max:.0f} != "
+                    f"{_SESSION_PMAX:.0f} — parking may misbehave."
+                )
         await asyncio.gather(
             *[m.set_control_mode(ControlMode.VELOCITY) for m in motors]
         )
@@ -263,6 +369,20 @@ def main(argv: list[str] | None = None) -> None:
         type=float,
         default=2.0,
         help="Max change of the normalized body command per second (default: 2)",
+    )
+    parser.add_argument(
+        "--hold-kp",
+        type=float,
+        default=60.0,
+        help="Position stiffness (Nm/rad) of the parked MIT hold; "
+        "0 disables parking (default: 60)",
+    )
+    parser.add_argument(
+        "--hold-kd",
+        type=float,
+        default=1.5,
+        help="Damping (Nm·s/rad) of the parked MIT hold; must be > 0 "
+        "when hold-kp > 0 (default: 1.5)",
     )
     parser.add_argument(
         "--joystick",
