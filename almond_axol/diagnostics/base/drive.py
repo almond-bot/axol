@@ -13,8 +13,19 @@ VELOCITY mode. CAN IDs are fixed by convention:
 Controls (Logitech F310/F710 in XInput mode):
     Left stick    translate (up = forward, left = strafe left)
     Right stick   rotate (left = counter-clockwise)
+    D-pad up/down raise / lower the telescoping lift (hold to move)
     LB or RB      deadman — hold to drive; release for a smooth stop
     B             quit (wheels stopped, motors disabled)
+
+The telescoping lift (a Jiecang JCB35N2 box driving two desk legs) is
+commanded by emulating its wired handset on two open-drain GPIOs — its
+RJ45 port is a button/UART interface, not Ethernet; see ``lift.py`` for
+the protocol and wiring. The lift only moves while the deadman is held
+and the D-pad is pressed; releasing either stops it (the box also has its
+own anti-collision stop). Configure with ``--lift-up-gpio`` /
+``--lift-down-gpio`` / ``--lift-chip``; pass ``--lift-height-port`` (a
+serial device wired to RJ45 pin 2) to display live height; ``--no-lift``
+disables the lift entirely.
 
 When the deadman is released and the command has ramped to zero, the wheels
 are parked: switched to MIT/impedance mode and held at their current
@@ -54,6 +65,7 @@ from dataclasses import dataclass
 from ...motor import CanBus, ControlMode, make_driver
 from ...motor.damiao import _DM_REG_PMAX
 from ...motor.driver import MotorDriver
+from .lift import DOWN, STOP, UP, HeightReader, JiecangLift
 
 # The base rides its own CAN interface, separate from the two arm buses.
 DEFAULT_CHANNEL = "can_alm_axol_base"
@@ -65,6 +77,7 @@ _AXIS_RX = 3  # right stick x: left = -1
 _BTN_B = 1
 _BTN_LB = 4
 _BTN_RB = 5
+_HAT_DPAD = 0  # D-pad hat index; hat y: up = +1, down = -1
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
@@ -154,7 +167,13 @@ def _init_gamepad(index: int):  # noqa: ANN202 — pygame typed lazily
 
 
 def _status_line(
-    engaged: bool, cmd: list[float], speeds: list[float], stale: bool, holding: bool
+    engaged: bool,
+    cmd: list[float],
+    speeds: list[float],
+    stale: bool,
+    holding: bool,
+    lift_dir: int,
+    lift_height_mm: int | None,
 ) -> str:
     if engaged:
         state = "DRIVE"
@@ -166,10 +185,12 @@ def _status_line(
         f"{w.name.split('_')[0][0]}{w.name.split('_')[1][0]}:{s:+6.2f}"
         for w, s in zip(_WHEELS, speeds)
     )
+    lift = {UP: "up", DOWN: "down", STOP: "--"}[lift_dir]
+    height = f" {lift_height_mm}mm" if lift_height_mm is not None else ""
     warn = "  [CMD ERR]" if stale else ""
     return (
         f"\r  {state:<22}  vx={cmd[0]:+.2f} vy={cmd[1]:+.2f} wz={cmd[2]:+.2f}"
-        f"  |  {wheels} rad/s{warn}  \033[K"
+        f"  |  {wheels} rad/s  |  lift:{lift}{height}{warn}  \033[K"
     )
 
 
@@ -184,9 +205,7 @@ async def _park(motors: list[MotorDriver]) -> list[float] | None:
     positions = await asyncio.gather(*[m.get_position() for m in motors])
     if any(abs(p) > 0.9 * _SESSION_PMAX for p in positions):
         return None
-    await asyncio.gather(
-        *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
-    )
+    await asyncio.gather(*[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors])
     return list(positions)
 
 
@@ -195,7 +214,13 @@ async def _unpark(motors: list[MotorDriver]) -> None:
     await asyncio.gather(*[m.set_control_mode(ControlMode.VELOCITY) for m in motors])
 
 
-async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace):  # noqa: ANN001
+async def _control_loop(
+    pad,  # noqa: ANN001 — pygame typed lazily
+    motors: list[MotorDriver],
+    lift: JiecangLift | None,
+    height: HeightReader | None,
+    args: argparse.Namespace,
+):
     """Poll the gamepad and stream wheel commands until B is pressed.
 
     While the deadman is held the wheels track the stick in VELOCITY mode.
@@ -229,6 +254,17 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
             return
 
         engaged = bool(pad.get_button(_BTN_LB) or pad.get_button(_BTN_RB))
+
+        # Lift: hold-to-move on the D-pad, gated behind the same deadman as
+        # the wheels. command() is edge-triggered internally, so calling it
+        # every cycle is free and guarantees release on any state change.
+        lift_dir = STOP
+        if engaged and pad.get_numhats() > _HAT_DPAD:
+            hat_y = pad.get_hat(_HAT_DPAD)[1]
+            lift_dir = UP if hat_y > 0 else DOWN if hat_y < 0 else STOP
+        if lift is not None:
+            lift.command(lift_dir)
+        lift_height = height.poll() if height is not None else None
         if engaged:
             target = (
                 -_deadzone(pad.get_axis(_AXIS_LY), args.deadzone),  # vx: up = fwd
@@ -266,9 +302,7 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
                     if hold_pos is not None:
                         await asyncio.gather(
                             *[
-                                m.set_impedance(
-                                    p, 0.0, args.hold_kp, args.hold_kd, 0.0
-                                )
+                                m.set_impedance(p, 0.0, args.hold_kp, args.hold_kd, 0.0)
                                 for m, p in zip(motors, hold_pos)
                             ]
                         )
@@ -283,7 +317,15 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
                 send_failed = True
 
         print(
-            _status_line(engaged, cmd, speeds, send_failed, hold_pos is not None),
+            _status_line(
+                engaged,
+                cmd,
+                speeds,
+                send_failed,
+                hold_pos is not None,
+                lift_dir if lift is not None else STOP,
+                lift_height,
+            ),
             end="",
             flush=True,
         )
@@ -295,9 +337,34 @@ async def _control_loop(pad, motors: list[MotorDriver], args: argparse.Namespace
 async def _run(args: argparse.Namespace) -> None:
     pad = _init_gamepad(args.joystick)
 
+    lift: JiecangLift | None = None
+    height: HeightReader | None = None
+    if not args.no_lift:
+        lift = JiecangLift(args.lift_chip, args.lift_up_gpio, args.lift_down_gpio)
+        print(
+            f"Lift: {args.lift_chip} up=GPIO{args.lift_up_gpio} "
+            f"down=GPIO{args.lift_down_gpio} — D-pad up/down (with deadman)."
+        )
+        if args.lift_height_port:
+            height = HeightReader(args.lift_height_port)
+    try:
+        await _run_wheels(pad, lift, height, args)
+    finally:
+        if height is not None:
+            height.close()
+        if lift is not None:
+            lift.close()
+
+
+async def _run_wheels(
+    pad,  # noqa: ANN001 — pygame typed lazily
+    lift: JiecangLift | None,
+    height: HeightReader | None,
+    args: argparse.Namespace,
+) -> None:
     if args.no_can:
-        print("--no-can: gamepad check only, no motors will move.")
-        await _control_loop(pad, [], args)
+        print("--no-can: gamepad check only, no wheel motors will move.")
+        await _control_loop(pad, [], lift, height, args)
         return
 
     async with CanBus(args.channel) as bus:
@@ -322,7 +389,7 @@ async def _run(args: argparse.Namespace) -> None:
         )
         print("Motors enabled. Hold LB/RB to drive, B to quit.")
         try:
-            await _control_loop(pad, motors, args)
+            await _control_loop(pad, motors, lift, height, args)
         finally:
             try:
                 await asyncio.gather(*[m.set_velocity(0.0) for m in motors])
@@ -394,6 +461,34 @@ def main(argv: list[str] | None = None) -> None:
         "--no-can",
         action="store_true",
         help="Skip the CAN bus and just display the gamepad mixing (no motion).",
+    )
+    parser.add_argument(
+        "--lift-chip",
+        default="/dev/gpiochip0",
+        help="gpiochip device for the lift button lines (default: /dev/gpiochip0)",
+    )
+    parser.add_argument(
+        "--lift-up-gpio",
+        type=int,
+        default=23,
+        help="GPIO line offset wired to lift RJ45 pin 7 (HS1, up) (default: 23)",
+    )
+    parser.add_argument(
+        "--lift-down-gpio",
+        type=int,
+        default=24,
+        help="GPIO line offset wired to lift RJ45 pin 8 (HS0, down) (default: 24)",
+    )
+    parser.add_argument(
+        "--lift-height-port",
+        default=None,
+        help="Serial device wired to lift RJ45 pin 2 (DTX) to display live "
+        "height, e.g. /dev/ttyAMA0. Default: off.",
+    )
+    parser.add_argument(
+        "--no-lift",
+        action="store_true",
+        help="Skip the lift entirely (no GPIOs are touched).",
     )
     args = parser.parse_args(argv)
 

@@ -26,7 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gamepad = ["pygame>=2.6"]
+gamepad = ["pygame>=2.6", "gpiod>=2.2", "pyserial>=3.5"]
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
 
