@@ -102,6 +102,7 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
         cfg.robot_config = UmiRobotConfig(**kwargs)
 
     if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+        from ..kinematics.config import apply_umi_kinematics_profile
         from ..teleop.config import apply_umi_teleop_profile
 
         tc = cfg.teleop_config.vr_teleop_config
@@ -111,6 +112,7 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
                 "trapezoid limits on the teleop config."
             )
         apply_umi_teleop_profile(tc)
+        apply_umi_kinematics_profile(cfg.teleop_config.kinematics_config)
 
 
 def _default_robot_config() -> AxolRobotConfig:

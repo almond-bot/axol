@@ -300,6 +300,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         # the same absolute-mapping profile collect-data --umi uses so the
         # bench test exercises exactly what collection will.
         from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
+        from ..kinematics.config import apply_umi_kinematics_profile
         from ..teleop.config import apply_umi_teleop_profile
 
         left = cfg.left_channel
@@ -309,6 +310,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         if right == CAN_RIGHT:
             right = CAN_UMI_RIGHT
         apply_umi_teleop_profile(cfg.teleop)
+        apply_umi_kinematics_profile(cfg.kinematics)
         robot = Umi(config=cfg.axol, left_channel=left, right_channel=right)
     elif cfg.sim:
         robot = Sim()
