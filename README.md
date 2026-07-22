@@ -136,6 +136,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`provision`](https://docs.almond.bot/cli/provision)
+- [`zed.driver`](https://docs.almond.bot/cli/zed-driver)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
