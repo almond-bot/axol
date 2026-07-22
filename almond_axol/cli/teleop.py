@@ -11,6 +11,7 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
+    axol teleop --cart.enabled true                   # powered cart (base+lift)
     axol teleop --config_path my_teleop.json          # whole-config file
 """
 
@@ -299,11 +300,20 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
         )
+    # Powered-cart robots (--cart.enabled true) get the base + lift driven by
+    # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
+    # sim — there's no cart hardware model in the visualizer.
+    cart = None
+    if cfg.cart.enabled and not cfg.sim:
+        from ..robot.cart import Cart
+
+        cart = Cart(cfg.cart)
     async with VRTeleop(
         robot,
         config=cfg.teleop,
         kinematics_config=cfg.kinematics,
         vr_server_config=cfg.vr_server,
+        cart=cart,
     ) as teleop:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to

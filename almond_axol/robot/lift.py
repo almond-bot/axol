@@ -70,11 +70,11 @@ class JiecangLift:
         try:
             import gpiod
             from gpiod.line import Direction, Drive, Value
-        except ImportError:
-            raise SystemExit(
-                "gpiod is not installed — run with the gamepad extra:\n"
-                "  uv run --extra gamepad -m almond_axol.diagnostics.base.drive"
-            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "gpiod is not installed — install the gamepad extra "
+                "(uv sync --extra gamepad) to control the lift"
+            ) from exc
         self._value = Value
         self._up = up_offset
         self._down = down_offset
@@ -125,11 +125,11 @@ class HeightReader:
     def __init__(self, port: str) -> None:
         try:
             import serial
-        except ImportError:
-            raise SystemExit(
-                "pyserial is not installed — run with the gamepad extra:\n"
-                "  uv run --extra gamepad -m almond_axol.diagnostics.base.drive"
-            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "pyserial is not installed — install the gamepad extra "
+                "(uv sync --extra gamepad) to read the lift height"
+            ) from exc
         self._serial = serial.Serial(port, 9600, timeout=0)
         self._buf = bytearray()
         self.height_mm: int | None = None

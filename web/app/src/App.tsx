@@ -283,8 +283,9 @@ function PoseVisualizer() {
 //     move the controller; release to drop. Each screen remembers its spot.
 //   - Resize a screen: grab the *same* screen with both controllers' triggers
 //     and move your hands apart (bigger) or together (smaller).
-//   - Reset: click the right thumbstick to re-anchor every screen to the
-//     current gaze and clear all moves + resizes.
+//   - Reset: press B (right controller) to re-anchor every screen to the
+//     current gaze and clear all moves + resizes. (The thumbstick clicks are
+//     reserved for the powered cart's lift.)
 //
 // The screens behave like TVs: they are world-anchored where the operator was
 // looking when the session started, so the head can move freely while the
@@ -379,8 +380,8 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
   // it over the WebSocket). Screen grabbing is blocked while engaged, since the
   // trigger drives the gripper then.
   const robotEngagedRef = useAxolTracking(wsRef)
-  // Right-thumbstick click last frame, for rising-edge re-anchor detection.
-  const stickClickPrevRef = useRef(false)
+  // Right-controller B button last frame, for rising-edge re-anchor detection.
+  const reanchorPrevRef = useRef(false)
   // Seconds the feed has been continuously "connecting". Used to debounce the
   // connecting spinner so a transient reconnect blip (a single-frame spike
   // after we've already gone live) doesn't flash the arc over the feed.
@@ -513,17 +514,18 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
     const sources = xrSession ? Array.from(xrSession.inputSources) : []
     const right = sources.find((s) => s.handedness === "right")
 
-    // Clicking the right thumbstick (buttons[3]) re-anchors the screens to the
-    // current gaze and clears every move + resize.
-    const stickClicked = right?.gamepad?.buttons?.[3]?.pressed ?? false
-    if (stickClicked && !stickClickPrevRef.current) {
+    // Pressing B on the right controller (buttons[5]) re-anchors the screens
+    // to the current gaze and clears every move + resize. The thumbstick
+    // clicks (buttons[3]) are reserved for the powered cart's lift.
+    const reanchorPressed = right?.gamepad?.buttons?.[5]?.pressed ?? false
+    if (reanchorPressed && !reanchorPrevRef.current) {
       anchoredRef.current = false
       grabsRef.current = { left: null, right: null }
       resizeRef.current = null
       dragOffsetsRef.current = {}
       scalesRef.current = {}
     }
-    stickClickPrevRef.current = stickClicked
+    reanchorPrevRef.current = reanchorPressed
 
     // "Connecting cameras…" is a global indicator: show it while video is still
     // being negotiated (available === null), or while any camera that IS being
@@ -921,8 +923,8 @@ function HelpPanel({ onDismiss, mode }: { onDismiss: () => void; mode: AxolMode 
   // Recording only exists in data collection; teleop drops the [A] hint.
   const rightRows =
     mode === "teleop"
-      ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[Stick Click]  Reset Screens"
-      : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[Stick Click]  Reset Screens"
+      ? "[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
+      : "[A]  Start / Stop Rec\n[Trigger]  Move Screen\n[2× Trigger]  Resize\n[B]  Reset Screens"
 
   return (
     <group position={[0, -0.038, 0]}>
@@ -1353,7 +1355,7 @@ export default function App() {
                       : ([["A", "Start / stop rec"]] as [string, string][])),
                     ["Trigger", "Move screen"],
                     ["2× Trigger", "Resize screen"],
-                    ["Stick click", "Reset screens"],
+                    ["B", "Reset screens"],
                   ]}
                 />
               </div>

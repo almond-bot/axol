@@ -52,6 +52,7 @@ import numpy as np
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
+from ..robot.cart import CartConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..vr.config import VRServerConfig
@@ -478,6 +479,13 @@ class TeleopCmdConfig:
 
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
+
+    Robots on the powered cart (x-drive base + telescoping lift) enable it
+    with ``--cart.enabled true``; the thumbsticks then drive the base (left
+    stick translates, right stick x rotates) and the stick clicks run the
+    lift (left click down, right click up), independent of the arm engage
+    toggle. Cart parameters live on the nested ``cart`` config — e.g.
+    ``--cart.max_speed 5`` or ``--cart.channel can0``.
     """
 
     sim: bool = False
@@ -485,6 +493,7 @@ class TeleopCmdConfig:
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server: VRServerConfig = field(default_factory=VRServerConfig)
+    cart: CartConfig = field(default_factory=CartConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)

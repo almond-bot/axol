@@ -286,8 +286,8 @@ export function AxolVRClient({
       }
     }
 
-    // B (right) — previously toggled teleop ↔ data_collection. The mode is now
-    // fixed by the server (see modeRef), so B is intentionally inert.
+    // B (right) — handled in the app layer: it re-anchors the camera screens
+    // to the current gaze (see App.tsx). Nothing is sent to the server for it.
     void bEdge
 
     // Promote pending → recording after 3s
@@ -357,6 +357,15 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
+    // Thumbstick state for the powered cart (xr-standard mapping: stick axes
+    // at axes[2]/[3], stick click at buttons[3]). Servers without a cart
+    // configured simply ignore these fields.
+    const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
+    const l_stick_y = leftSource?.gamepad?.axes[3] ?? 0
+    const r_stick_x = rightSource?.gamepad?.axes[2] ?? 0
+    const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
+    const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
+
     // Serialise once so both transports carry the identical frame (same seq),
     // letting the server treat them as one stream and de-dupe to whichever
     // arrives first.
@@ -371,6 +380,11 @@ export function AxolVRClient({
       r_grip,
       reset,
       state: stateRef.current,
+      l_stick_x,
+      l_stick_y,
+      r_stick_x,
+      l_stick_click,
+      r_stick_click,
       seq: ++seqRef.current,
       // Capture timestamp (ms). The server's pose interpolator uses this to
       // reconstruct the true motion cadence when frames arrive batched over a
