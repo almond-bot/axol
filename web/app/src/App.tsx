@@ -22,7 +22,6 @@ import {
   useAxolControlChannel,
   useAxolPoseSocket,
   useAxolTracking,
-  useAxolUrdfState,
   useAxolVideo,
   useAxolVRClient,
 } from "@almond/axol-vr-client"
@@ -181,24 +180,14 @@ function AxesMarker({ groupRef }: { groupRef: React.RefObject<THREE.Group | null
   )
 }
 
-function PoseVisualizer({ wsRef }: { wsRef: RefObject<WebSocket | null> }) {
+function PoseVisualizer() {
   const { gl } = useThree()
-  // In absolute (UMI) mode the URDF overlay is the pose feedback; the axis
-  // arrows and elbow dots are redundant clutter, so hide them whenever the
-  // server is streaming urdf_state.
-  const urdfStateRef = useAxolUrdfState(wsRef)
   const leftRef = useRef<THREE.Group>(null)
   const rightRef = useRef<THREE.Group>(null)
   const lElbowRef = useRef<THREE.Group>(null)
   const rElbowRef = useRef<THREE.Group>(null)
 
   useFrame(() => {
-    if (urdfStateRef.current !== null) {
-      for (const ref of [leftRef, rightRef, lElbowRef, rElbowRef]) {
-        if (ref.current) ref.current.visible = false
-      }
-      return
-    }
     const session = gl.xr.getSession()
     if (!session) return
     const frame = gl.xr.getFrame()
@@ -1443,7 +1432,7 @@ export default function App() {
               <CountdownDisplay recordingPendingAt={recordingPendingAt} />
               <ConfirmDisplay action={pendingConfirm} />
             </XRHud>
-            <PoseVisualizer wsRef={wsRef} />
+            <PoseVisualizer />
             <RobotModel hostname={hostname} wsRef={wsRef} />
           </XR>
         </Suspense>
