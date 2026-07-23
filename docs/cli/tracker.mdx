@@ -1,0 +1,101 @@
+---
+title: "tracker.bridge / tracker.identify"
+description: "Headset-free UMI teleop and data collection with Vive trackers."
+---
+
+Drives the UMI handheld rig from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --umi`](/cli/teleop) and [`collect-data --umi`](/cli/collect-data) run unchanged.
+
+Two tracker families are supported:
+
+| Backend | Hardware | Tracking | Extra requirements |
+|---|---|---|---|
+| `survive` | Vive Tracker 3.0 | Lighthouse (outside-in) | 1–2 SteamVR base stations; a libsurvive build on the Jetson |
+| `ultimate` | Vive Ultimate Tracker | Inside-out SLAM (no base stations) | The HTC wireless dongle; the `pyvut` package; a one-time map created with VIVE Hub on Windows |
+
+The absolute (UMI) IK mode solves the rigid tracker→gripper mount and the world yaw/translation at engage time, so the tracker's own frame conventions never need hand-calibrating — only **gravity alignment and metric scale** must be right, which both tracking systems provide.
+
+## Workflow
+
+```bash
+# One-time: bind each physical tracker to its rig side.
+axol tracker.identify
+
+# Every session: teleop or collection in one terminal...
+axol teleop --umi                # or: axol collect-data --umi ...
+# ...and the bridge in another.
+axol tracker.bridge
+```
+
+No tracker→gripper calibration is needed: the absolute (UMI) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy.
+
+Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands stream fully open until the analog pot hardware exists.
+
+## `axol tracker.bridge`
+
+| Flag | Description |
+|---|---|
+| `--backend {survive,ultimate,synthetic}` | Tracker backend. Default: the saved config (`~/.almond/tracker/config.json`), else `survive`. `synthetic` streams generated motion for end-to-end tests without hardware. |
+| `--left KEY` / `--right KEY` | Override the saved device binding (libsurvive codename like `T20`, or an Ultimate tracker MAC). |
+| `--host HOST` | VR server host — the machine running teleop/collect-data. Default: `localhost`. |
+| `--port INT` | VR server port. Default: 8000. |
+| `--hz FLOAT` | Frame streaming rate. Default: 120. |
+
+A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its last good pose and logs a warning rather than feeding IK a glitch; disengage, recover the tracker, and re-engage.
+
+## `axol tracker.identify`
+
+Discovers the powered-on trackers, then asks you to shake each rig in turn; the device with the most motion is bound to that side. Saves `~/.almond/tracker/config.json`:
+
+```json
+{
+  "backend": "survive",
+  "left": "T20",
+  "right": "T21",
+  "ultimate_quat_order": "xyzw",
+  "ultimate_up_axis": "z"
+}
+```
+
+| Flag | Description |
+|---|---|
+| `--backend {survive,ultimate,synthetic}` | Backend to use and save. Default: the saved config, else `survive`. |
+
+## Vive Tracker 3.0 setup (libsurvive)
+
+Mount 1–2 SteamVR base stations (1.0 or 2.0) with the workspace in view, then build [libsurvive](https://github.com/collabora/libsurvive) on the Jetson — the PyPI `pysurvive` wheel is outdated, so build from source:
+
+```bash
+sudo apt install build-essential cmake zlib1g-dev libx11-dev libusb-1.0-0-dev \
+                 freeglut3-dev liblapacke-dev libhidapi-dev libudev-dev
+git clone https://github.com/collabora/libsurvive.git && cd libsurvive
+# udev rules so the trackers are readable without root
+sudo cp ./useful_files/81-vive.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+cmake -B build -DUSE_HIDAPI=1 -DUSE_EIGEN=ON && cmake --build build -j
+sudo cmake --install build
+# optional, preferred: the Python bindings (the bridge falls back to
+# parsing a survive-cli subprocess when these aren't importable)
+uv pip install ./bindings/python
+```
+
+<Note>
+  On ARM, avoid linking libsurvive against OpenBLAS (known instability/CPU blowups); `-DUSE_EIGEN=ON` sidesteps it. Close SteamVR if one is somehow present — it competes for the devices.
+</Note>
+
+Connect each tracker over USB-C or its HTC dongle. libsurvive calibrates the base-station world on first run (leave the trackers still and visible for a few seconds); the resulting world frame is shared by all trackers and gravity-aligned.
+
+## Vive Ultimate Tracker setup (dongle + pyvut)
+
+There is no official Linux support; the bridge uses the community [pyvut](https://github.com/nijkah/pyvut) driver, which speaks to the **wireless dongle over USB HID** without a headset:
+
+1. **One-time, on Windows:** create the SLAM map with VIVE Hub (Streaming Hub) — pair the trackers to the dongle and walk the map-creation flow (the final "connect a headset" step can be ignored). The map is stored on the trackers and shared between them.
+2. On the Jetson: `sudo apt install libhidapi-hidraw0 libhidapi-libusb0`, then install `pyvut` into the project environment (`uv pip install git+https://github.com/nijkah/pyvut`). Add a udev rule (or `chmod` the `/dev/hidraw*` node) so the dongle is readable without root.
+3. Plug the dongle in and run `axol tracker.identify --backend ultimate`.
+
+<Warning>
+  The dongle protocol is reverse-engineered and firmware-dependent. At first bring-up, verify the pose conventions: hold a tracker still and level and check the streamed orientation is gravity-upright. If it isn't, flip `ultimate_quat_order` (`xyzw`/`wxyz`) and/or `ultimate_up_axis` (`z`/`y`) in `~/.almond/tracker/config.json`.
+</Warning>
+
+## Acceptance check
+
+After mounting and binding, run `axol teleop --sim` with the bridge streaming: engage, move each rig slowly, and confirm the sim arms follow smoothly with no jumps or drift. A tracker that stutters or relocalises here will not produce usable UMI data.

@@ -69,6 +69,7 @@
               "cli/motor-set-can-id",
               "cli/motor-set-zero-pos",
               "cli/teleop",
+              "cli/tracker",
               "cli/collect-data",
               "cli/replay-dataset",
               "cli/run-policy",
