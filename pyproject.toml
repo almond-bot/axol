@@ -28,6 +28,10 @@ dependencies = [
 [project.optional-dependencies]
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
+# Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS
+# client; hidapi backs the Ultimate Tracker dongle path. libsurvive (Tracker
+# 3.0) and pyvut (Ultimate) are operator-installed — see docs/cli/tracker.mdx.
+tracker = ["websockets>=12", "hidapi>=0.14"]
 
 [tool.uv.sources]
 pyroki = { git = "https://github.com/chungmin99/pyroki.git", rev = "388e43e1fc0d0ee382968d3dd72970fd62a0450c" }
