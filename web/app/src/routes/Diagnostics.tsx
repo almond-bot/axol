@@ -431,7 +431,7 @@ export default function Diagnostics() {
           </span>
         }
       />
-      <main className="mx-auto flex max-w-6xl flex-col gap-8 px-6 py-8">
+      <main className="safe-x mx-auto flex max-w-6xl flex-col gap-8 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
         {/* Robot link gate */}
         {robot && robot.state === "disconnected" && (
           <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">

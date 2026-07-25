@@ -133,7 +133,7 @@ export function ActiveRunPanel({
   return (
     <Card
       className={cn(
-        "fixed right-4 bottom-4 z-40 w-80 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl",
+        "fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] left-[max(1rem,env(safe-area-inset-left))] z-40 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl sm:left-auto sm:w-80",
         prompt ? "border-amber-400/50" : "border-emerald-400/30"
       )}
     >
@@ -159,9 +159,7 @@ export function ActiveRunPanel({
           </Button>
         </div>
       ) : (
-        line && (
-          <span className="truncate font-mono text-[0.7rem] text-white/45">{line}</span>
-        )
+        line && <span className="truncate font-mono text-[0.7rem] text-white/45">{line}</span>
       )}
       <Button
         variant="ghost"
@@ -201,8 +199,14 @@ function JointPicker({
     const next = new Set(selected)
     if (next.has(joint)) next.delete(joint)
     else next.add(joint)
-    if (next.size === JOINTS.length) onChange(null) // all = command default
-    else onChange(JOINTS.filter((j) => next.has(j)).map((j) => j.toLowerCase()).join(","))
+    if (next.size === JOINTS.length)
+      onChange(null) // all = command default
+    else
+      onChange(
+        JOINTS.filter((j) => next.has(j))
+          .map((j) => j.toLowerCase())
+          .join(",")
+      )
   }
 
   return (
@@ -433,8 +437,8 @@ export function ActionDialog({
         {hasWebPrompts && (
           <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
             <Hand className="mt-0.5 size-3.5 shrink-0 text-white/35" />
-            Hands-on steps pause the run and show a Continue button — the run waits for
-            you, then proceeds when you click it.
+            Hands-on steps pause the run and show a Continue button — the run waits for you, then
+            proceeds when you click it.
           </p>
         )}
 

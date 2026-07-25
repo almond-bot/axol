@@ -787,7 +787,7 @@ export default function ControlPanel() {
   return (
     <div className="min-h-screen">
       <SiteNav current="control" />
-      <main className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-8">
+      <main className="safe-x mx-auto flex max-w-5xl flex-col gap-6 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
         {update?.updateAvailable && (
           <UpdateBanner
             update={update}
@@ -817,7 +817,7 @@ export default function ControlPanel() {
         />
 
         {conn.state === "ok" && (
-          <div ref={settingsRef} className="scroll-mt-4">
+          <div ref={settingsRef} className="scroll-mt-18 sm:scroll-mt-20">
             <SettingsSection
               open={settingsOpen}
               onOpenChange={setSettingsOpen}
@@ -894,7 +894,7 @@ function OperationSelector({
   onSelect: (op: OperationId) => void
 }) {
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
       {OPERATIONS.map((op) => {
         const active = op.id === selected
         const running = op.id === runningOp
