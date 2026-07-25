@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react"
-import { ExternalLink, Menu, X } from "lucide-react"
+import { ExternalLink, Menu, Rocket, X } from "lucide-react"
 import { buttonVariants } from "@/components/ui/button"
-import { QuickstartButton } from "@/components/quickstart-dialog"
+import { QuickstartDialog } from "@/components/quickstart-dialog"
 import { cn } from "@/lib/utils"
 
 /**
@@ -18,7 +18,15 @@ const PAGE_LABEL: Record<string, string> = {
   diagnostics: "Diagnostics",
 }
 
-function NavLinks({ current, itemClass }: { current: string; itemClass?: string }) {
+function NavLinks({
+  current,
+  onQuickstart,
+  itemClass,
+}: {
+  current: string
+  onQuickstart: () => void
+  itemClass?: string
+}) {
   const item = cn(buttonVariants({ variant: "ghost", size: "sm" }), itemClass)
   return (
     <>
@@ -26,7 +34,12 @@ function NavLinks({ current, itemClass }: { current: string; itemClass?: string 
         Docs
         <ExternalLink />
       </a>
-      {current === "control" && <QuickstartButton className={itemClass} />}
+      {current === "control" && (
+        <button type="button" onClick={onQuickstart} className={item}>
+          <Rocket />
+          Quickstart
+        </button>
+      )}
       {current !== "control" && (
         <a href="/control" className={item}>
           Control Panel
@@ -54,9 +67,12 @@ export function SiteNav({
   right?: ReactNode
 }) {
   const [menuOpen, setMenuOpen] = useState(false)
+  // Owned here, not by the menu item: closing the menu unmounts its contents,
+  // which must not take an opening Quickstart dialog down with it.
+  const [quickstartOpen, setQuickstartOpen] = useState(false)
   return (
-    <header className="sticky top-0 z-40 border-b border-white/10 bg-[#121212]/85 backdrop-blur-md">
-      <div className="relative mx-auto flex h-14 max-w-6xl items-center justify-between gap-2 px-4 sm:h-16 sm:px-6">
+    <header className="sticky top-0 z-40 border-b border-white/10 bg-[#121212]/85 pt-[env(safe-area-inset-top)] backdrop-blur-md">
+      <div className="safe-x relative mx-auto flex h-14 max-w-6xl items-center justify-between gap-2 sm:h-16">
         <div className="flex min-w-0 items-center gap-2 sm:gap-3">
           <img src="/almond.svg" alt="Almond" className="h-6 w-6 shrink-0" />
           <span className="font-heading text-base font-semibold tracking-tight whitespace-nowrap">
@@ -69,7 +85,7 @@ export function SiteNav({
         <div className="flex shrink-0 items-center gap-2">
           {right}
           <nav className="hidden items-center gap-2 md:flex">
-            <NavLinks current={current} />
+            <NavLinks current={current} onQuickstart={() => setQuickstartOpen(true)} />
           </nav>
           <button
             type="button"
@@ -83,13 +99,18 @@ export function SiteNav({
         </div>
         {menuOpen && (
           <nav
-            className="absolute inset-x-0 top-full flex flex-col gap-1 border-b border-white/10 bg-[#121212]/95 p-3 shadow-xl backdrop-blur-md md:hidden"
+            className="safe-x absolute inset-x-0 top-full flex flex-col gap-1 border-b border-white/10 bg-[#121212]/95 py-3 shadow-xl backdrop-blur-md md:hidden"
             onClick={() => setMenuOpen(false)}
           >
-            <NavLinks current={current} itemClass="w-full justify-start" />
+            <NavLinks
+              current={current}
+              onQuickstart={() => setQuickstartOpen(true)}
+              itemClass="w-full justify-start"
+            />
           </nav>
         )}
       </div>
+      <QuickstartDialog open={quickstartOpen} onClose={() => setQuickstartOpen(false)} />
     </header>
   )
 }

@@ -133,7 +133,7 @@ export function ActiveRunPanel({
   return (
     <Card
       className={cn(
-        "fixed right-4 bottom-4 left-4 z-40 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl sm:left-auto sm:w-80",
+        "fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] left-[max(1rem,env(safe-area-inset-left))] z-40 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl sm:left-auto sm:w-80",
         prompt ? "border-amber-400/50" : "border-emerald-400/30"
       )}
     >

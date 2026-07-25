@@ -94,6 +94,19 @@ body {
   text-rendering: optimizeLegibility;
 }
 
+/* Horizontal page padding that also clears the notch in landscape
+   (viewport-fit=cover): the usual 1rem / 1.5rem gutters, grown to the
+   safe-area inset when the device reports a larger one. */
+@utility safe-x {
+  padding-left: max(1rem, env(safe-area-inset-left));
+  padding-right: max(1rem, env(safe-area-inset-right));
+
+  @media (min-width: 640px) {
+    padding-left: max(1.5rem, env(safe-area-inset-left));
+    padding-right: max(1.5rem, env(safe-area-inset-right));
+  }
+}
+
 /* The R3F canvas in the VR route fills its (fixed, full-screen) parent. */
 canvas {
   display: block;
