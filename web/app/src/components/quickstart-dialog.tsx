@@ -12,14 +12,14 @@ const QUICKSTART: { label: string; hint?: string; cmd: string }[] = [
 ]
 
 /** Nav-bar button that opens the Quickstart install/run cheatsheet. */
-export function QuickstartButton() {
+export function QuickstartButton({ className }: { className?: string }) {
   const [open, setOpen] = useState(false)
   return (
     <>
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className={cn(buttonVariants({ variant: "ghost", size: "sm" }))}
+        className={cn(buttonVariants({ variant: "ghost", size: "sm" }), className)}
       >
         <Rocket />
         Quickstart
@@ -69,8 +69,8 @@ function QuickstartDialog({ open, onClose }: { open: boolean; onClose: () => voi
             </div>
           ))}
           <p className="text-xs text-white/45">
-            Then press <span className="text-white/70">Connect</span> and enter the
-            machine&apos;s IP.
+            Then press <span className="text-white/70">Connect</span> and enter the machine&apos;s
+            IP.
           </p>
         </div>
       </div>
