@@ -55,7 +55,9 @@ from .lift import DOWN, STOP, UP, JiecangLift
 _logger = logging.getLogger(__name__)
 
 # The cart's wheels ride their own CAN interface, separate from the arm buses.
-DEFAULT_CHANNEL = "can_alm_axol_base"
+# NB: kernel interface names are capped at 15 chars (IFNAMSIZ), so this can't
+# be the more readable "can_alm_axol_base".
+DEFAULT_CHANNEL = "can_alm_axol_b"
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
