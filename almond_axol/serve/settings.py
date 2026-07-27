@@ -40,7 +40,9 @@ _logger = logging.getLogger(__name__)
 
 SETTINGS_PATH = Path.home() / ".almond" / "settings.json"
 
-# Operation ids (mirrors serve.commands / serve.runner).
+# The built-in operations, whose dotted config paths the tables below spell
+# out. A registered operation joins the same tables through its
+# ``settings_like`` alias rather than re-declaring them (see _settings_op).
 _OPS = ("teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset")
 
 # Dotted paths into the lerobot-based ops' shared robot config.
@@ -83,6 +85,22 @@ class SettingCategory:
 
 def _all_ops(*keys: str) -> dict[str, tuple[str, ...]]:
     return {op: keys for op in _OPS}
+
+
+def _settings_op(op_id: str) -> str:
+    """Resolve an operation to the id whose targets it uses.
+
+    An operation registered by a downstream package usually embeds the same
+    config dataclasses as a built-in one, so its dotted paths are identical;
+    declaring ``settings_like="collect-data"`` on its
+    :class:`~almond_axol.serve.commands.CommandDef` inherits the whole table
+    instead of restating ~50 mappings. Unknown or unaliased ids resolve to
+    themselves and simply match nothing.
+    """
+    from .commands import COMMANDS
+
+    cmd = COMMANDS.get(op_id)
+    return cmd.settings_like if cmd is not None and cmd.settings_like else op_id
 
 
 def _lerobot_dataset_root() -> str:
@@ -956,8 +974,11 @@ class SettingsStore:
         Later wins: curated setting values → advanced values (canonical keys
         translated to this op's dotted paths) → the request's own args. Keys
         the op's schema doesn't know are dropped later by ``build_argv``, so a
-        stale entry can never inject anything.
+        stale entry can never inject anything — which is also what makes an
+        inherited target table safe when an aliased op only shares part of the
+        original's config.
         """
+        target_op = _settings_op(op_id)
         merged: dict[str, Any] = {}
         with self._lock:
             values = dict(self._data["values"])
@@ -966,14 +987,14 @@ class SettingsStore:
             setting = _SETTINGS_BY_KEY.get(key)
             if setting is None or value is None:
                 continue
-            for target in setting.targets.get(op_id, ()):
+            for target in setting.targets.get(target_op, ()):
                 merged[target] = value
         for key, value in advanced.items():
             section_key, _, subpath = key.partition(".")
             section = _ADVANCED_BY_KEY.get(section_key)
             if section is None or not subpath or value is None:
                 continue
-            prefix = section.targets.get(op_id)
+            prefix = section.targets.get(target_op)
             if prefix:
                 merged[f"{prefix}.{subpath}"] = value
         merged.update(args)

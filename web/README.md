@@ -155,6 +155,8 @@ npm run dev --workspace=app
 - **VR**: open the printed localhost URL on your Quest browser, enter the hostname of the machine running the Almond Axol SDK, press **Connect**, then **Start** to enter the AR session.
 - **Control panel**: open `/control` in a normal browser. It talks to the `axol serve` API (default `https://localhost:8001`).
 
+The control panel's operations aren't hardcoded here: `/api/commands` tells it which ones the connected host offers and what each needs (per-run fields, cameras, a sim flag, episode controls), so a host with extra operations registered — see `register()` in `almond_axol/serve/commands.py` — gets panels for them with no change to this app. A host predating that API answers without those fields, and the panel falls back to the built-in list in `app/src/lib/supervisor.ts` so an up-to-date panel still drives an older robot.
+
 **Build**
 
 ```bash

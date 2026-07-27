@@ -10,6 +10,7 @@ import {
 } from "lucide-react"
 import {
   cameraCount,
+  isSimRun,
   motorFaultLabel,
   perRunFields,
   type CameraSpec,
@@ -85,7 +86,7 @@ export function OperationPanel({
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
-  const isSim = meta.id === "teleop" && Boolean(settings.sim)
+  const isSim = isSimRun(meta, settings)
   const robotOk = robot?.state === "connected"
   const camCount = cameraCount(cameras)
 
@@ -209,12 +210,12 @@ export function OperationPanel({
                 </div>
               )}
 
-              {meta.id === "run-policy" && live && (
+              {meta.episodeControl && live && (
                 <EpisodeControls policy={policy} onEpisode={onEpisode} />
               )}
 
               <RunningHints
-                op={meta.id}
+                usesHeadset={meta.usesHeadset}
                 session={live ? session : null}
                 isSim={isSim}
                 host={host}
@@ -277,13 +278,13 @@ function EpisodeControls({
 }
 
 function RunningHints({
-  op,
+  usesHeadset,
   session,
   isSim,
   host,
   viewerPort,
 }: {
-  op: string
+  usesHeadset: boolean
   session: SessionInfo | null
   isSim: boolean
   host: string
@@ -304,7 +305,7 @@ function RunningHints({
           Open 3D viewer
         </a>
       )}
-      {op === "teleop" && (
+      {usesHeadset && (
         <p className="rounded-lg border border-white/10 bg-white/[0.02] p-3 text-xs leading-relaxed text-white/45">
           Put on the headset, open <span className="text-white/70">axol.almond.bot</span>, and
           connect to <span className="font-mono text-[#eff483]">{host || "this machine"}</span>.

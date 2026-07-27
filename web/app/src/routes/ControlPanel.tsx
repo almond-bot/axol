@@ -11,9 +11,10 @@ import {
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
+  isSimRun,
   loadOpSettings,
   missingCameraSerials,
-  operationMeta,
+  operationsFromCommands,
   perRunFields,
   robotConnect,
   robotDisconnect,
@@ -31,6 +32,7 @@ import {
   type CommandSpec,
   type FormValue,
   type OperationId,
+  type OperationMeta,
   type PolicyState,
   type RobotStatus,
   type ServerInfo,
@@ -94,13 +96,6 @@ function persistLocalCameras(spec: CameraSpec) {
   }
 }
 
-function loadAllOpSettings(): OpSettings {
-  return OPERATIONS.reduce((acc, op) => {
-    acc[op.id] = loadOpSettings(op.id)
-    return acc
-  }, {} as OpSettings)
-}
-
 export default function ControlPanel() {
   const toast = useToast()
   const [commands, setCommands] = useState<CommandSpec[]>([])
@@ -146,9 +141,11 @@ export default function ControlPanel() {
   const [cameraDetecting, setCameraDetecting] = useState(false)
 
   const [selectedOp, setSelectedOp] = useState<OperationId>(
-    () => (localStorage.getItem("axolOp") as OperationId) || "teleop"
+    () => localStorage.getItem("axolOp") || OPERATIONS[0].id
   )
-  const [settingsByOp, setSettingsByOp] = useState<OpSettings>(() => loadAllOpSettings())
+  // Only the ops edited this session; the rest are read from localStorage on
+  // demand, since which ops exist isn't known until the host answers.
+  const [settingsByOp, setSettingsByOp] = useState<OpSettings>({})
 
   const [session, setSession] = useState<SessionInfo | null>(null)
   // run-policy episode phase/count, from the server so the episode controls are
@@ -436,13 +433,23 @@ export default function ControlPanel() {
     if (snap.cameras) setCameras(snap.cameras)
   }
 
+  // The operations this host offers, and the selected one resolved against
+  // them: a stored selection the host doesn't have lands on its first
+  // operation instead of an empty panel.
+  const operations = useMemo(() => operationsFromCommands(commands), [commands])
+  const meta = useMemo(
+    () => operations.find((o) => o.id === selectedOp) ?? operations[0],
+    [operations, selectedOp]
+  )
+  const opId = meta.id
+
   function selectOp(op: OperationId) {
     setSelectedOp(op)
     localStorage.setItem("axolOp", op)
   }
 
   // -- per-operation settings --
-  const settings = settingsByOp[selectedOp] ?? {}
+  const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -450,17 +457,17 @@ export default function ControlPanel() {
   }, [])
 
   function setSetting(key: string, value: FormValue) {
-    updateSettings(selectedOp, { ...settings, [key]: value })
+    updateSettings(opId, { ...settings, [key]: value })
   }
 
   function resetSetting(key: string) {
     const next = { ...settings }
     delete next[key]
-    updateSettings(selectedOp, next)
+    updateSettings(opId, next)
   }
 
   function resetAll() {
-    updateSettings(selectedOp, {})
+    updateSettings(opId, {})
   }
 
   // -- robot connection --
@@ -538,8 +545,8 @@ export default function ControlPanel() {
   // disabled "Stopping…" until a terminal status flips the op back to idle.
   const isStopping = isLive && sources.some((s) => s.status === "stopping")
   const runningOp = isLive ? (effectiveStatus?.command as OperationId) : null
-  const selectedLive = isLive && runningOp === selectedOp
-  const selectedStopping = isStopping && runningOp === selectedOp
+  const selectedLive = isLive && runningOp === opId
+  const selectedStopping = isStopping && runningOp === opId
 
   // Whether an update is currently unsafe to apply. `isLive` is the immediate,
   // local signal (reacts the instant an op starts/stops) so the banner blocks
@@ -638,11 +645,7 @@ export default function ControlPanel() {
     }
   }, [conn.state, updating, update?.remoteVersion, toast])
 
-  const meta = operationMeta(selectedOp)
-  const spec = useMemo(
-    () => commands.find((c) => c.id === selectedOp) ?? null,
-    [commands, selectedOp]
-  )
+  const spec = useMemo(() => commands.find((c) => c.id === opId) ?? null, [commands, opId])
 
   // Stop the running task (if any) and wait for it to actually exit before
   // returning, so a disconnect never tears the host/robot link down mid-cleanup.
@@ -673,7 +676,7 @@ export default function ControlPanel() {
       // Only ops that actually require cameras (collect-data / run-policy) are
       // gated on them. Teleop streams whatever cameras are configured but must
       // never be blocked by camera detection, and sim never touches hardware.
-      const isSimSelected = selectedOp === "teleop" && Boolean(settings.sim)
+      const isSimSelected = isSimRun(meta, settings)
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
         // dialog closed) instead of spawning a fresh enumeration on every start
@@ -715,7 +718,7 @@ export default function ControlPanel() {
       // the headset (and runs fine with none in sim). Newer hosts also hold the
       // spec in their settings store; sending it stays compatible with old ones.
       const camSpec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
-      const result = await startOperation(selectedOp, args, camSpec)
+      const result = await startOperation(opId, args, camSpec)
       setSession(result)
       // Fresh run — clear any stale phase; the live poll repopulates it.
       setPolicy(null)
@@ -837,7 +840,12 @@ export default function ControlPanel() {
           </div>
         )}
 
-        <OperationSelector selected={selectedOp} runningOp={runningOp} onSelect={selectOp} />
+        <OperationSelector
+          operations={operations}
+          selected={opId}
+          runningOp={runningOp}
+          onSelect={selectOp}
+        />
 
         {isLive && !selectedLive && (
           <p className="rounded-lg border border-amber-400/25 bg-amber-400/[0.05] p-3 text-xs text-amber-200/80">
@@ -884,18 +892,35 @@ export default function ControlPanel() {
   )
 }
 
+/** One column per operation on wide screens, spelled out so Tailwind emits the
+ *  classes; a host offering more than five wraps rather than shrinking. */
+const WIDE_COLUMNS: Record<number, string> = {
+  1: "lg:grid-cols-1",
+  2: "lg:grid-cols-2",
+  3: "lg:grid-cols-3",
+  4: "lg:grid-cols-4",
+  5: "lg:grid-cols-5",
+}
+
 function OperationSelector({
+  operations,
   selected,
   runningOp,
   onSelect,
 }: {
+  operations: OperationMeta[]
   selected: OperationId
   runningOp: OperationId | null
   onSelect: (op: OperationId) => void
 }) {
   return (
-    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
-      {OPERATIONS.map((op) => {
+    <div
+      className={cn(
+        "grid grid-cols-2 gap-3 sm:grid-cols-3",
+        WIDE_COLUMNS[Math.min(operations.length, 5)]
+      )}
+    >
+      {operations.map((op) => {
         const active = op.id === selected
         const running = op.id === runningOp
         return (
