@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 
@@ -390,9 +391,19 @@ class Cart:
             if time.monotonic() - self._target_time > cfg.command_timeout:
                 vx, vy, wz, lift_dir = 0.0, 0.0, 0.0, STOP
 
-            for i, target in enumerate((vx, vy, wz)):
-                delta = target - cmd[i]
-                cmd[i] += max(-max_delta, min(max_delta, delta))
+            # Slew the (vx, vy, wz) command as a single vector: cap the step's
+            # magnitude but keep its direction. Ramping each axis at its own
+            # fixed rate distorts direction — a mostly-forward command with a
+            # small lateral part would finish the lateral ramp almost
+            # instantly while forward is still climbing, veering the base
+            # sideways before it straightens out.
+            deltas = [t - c for t, c in zip((vx, vy, wz), cmd)]
+            norm = math.sqrt(sum(d * d for d in deltas))
+            if norm > max_delta:
+                k = max_delta / norm
+                deltas = [d * k for d in deltas]
+            for i, d in enumerate(deltas):
+                cmd[i] += d
 
             speeds = mix(cmd[0], cmd[1], cmd[2], cfg.max_speed, cfg.turn_scale)
             moving = any(abs(c) >= 1e-3 for c in cmd)
