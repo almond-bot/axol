@@ -157,8 +157,8 @@ class CartConfig:
 
     enabled: bool = False
     channel: str | None = DEFAULT_CHANNEL
-    max_speed: float = 10.0
-    turn_scale: float = 0.5
+    max_speed: float = 20.0
+    turn_scale: float = 1.0
     slew: float = 2.0
     deadzone: float = 0.15
     hold_kp: float = 60.0
