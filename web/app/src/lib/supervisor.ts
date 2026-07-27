@@ -40,6 +40,21 @@ export interface CommandSpec {
   error: string | null
   schema: SchemaNode[]
   required: string[]
+  // The operation surface (serve/commands.py CommandDef). Optional because a
+  // serve host older than the command registry doesn't send them — the panel
+  // then falls back to its built-in operation list (see OPERATIONS).
+  /** Runs in-process, so it gets an operation panel of its own. */
+  isOperation?: boolean
+  /** Needs at least one camera serial configured before it can start. */
+  requiresCameras?: boolean
+  /** Config keys the panel asks for per run; the rest come from Settings. */
+  perRunFields?: string[]
+  /** Drives episodes the panel can start / save / discard. */
+  episodeControl?: boolean
+  /** Arg name that means "no hardware", or null when the robot is required. */
+  simFlag?: string | null
+  /** Driven from the VR headset, so the panel shows the connect hint. */
+  usesHeadset?: boolean
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
@@ -289,14 +304,11 @@ export async function usbConnect(): Promise<UsbStatus> {
 // In-process operations (teleop / gravity-comp / collect-data / run-policy)
 // ---------------------------------------------------------------------------
 
-export type OperationId =
-  | "teleop"
-  | "gravity-comp"
-  | "collect-data"
-  | "run-policy"
-  | "replay-dataset"
+/** An in-process operation's id. Open-ended: the set comes from the connected
+ *  serve host's command registry, which a downstream package can add to. */
+export type OperationId = string
 
-/** run-policy episode lifecycle phase, surfaced so the control panel on any
+/** Episode lifecycle phase, surfaced so the control panel on any
  *  computer shows the right episode controls (not just the tab that started it). */
 export type PolicyPhase = "preparing" | "ready" | "recording" | "deciding" | "resetting"
 
@@ -609,11 +621,14 @@ export function computeArgs(
 }
 
 // ---------------------------------------------------------------------------
-// Per-run operation fields. Everything tunable-but-stable (stiffness, rates,
-// codecs, the inference server, …) lives in the shared Settings dialog and is
-// folded in server-side; the op panels only ask for what changes run to run.
-// Keys are the dotted draccus paths the backend understands (serve/commands.py
-// build_argv).
+// Operations. The connected serve host advertises which ones exist and what
+// each one needs (/api/commands), so a host with extra operations registered
+// gets panels for them here without a frontend change.
+//
+// Everything tunable-but-stable (stiffness, rates, codecs, the inference
+// server, …) lives in the shared Settings dialog and is folded in server-side;
+// the op panels only ask for what changes run to run. Field keys are the dotted
+// draccus paths the backend understands (serve/commands.py build_argv).
 // ---------------------------------------------------------------------------
 
 export interface OperationMeta {
@@ -628,8 +643,19 @@ export interface OperationMeta {
   requiresCameras: boolean
   /** Can run in sim (no hardware) — only teleop today. */
   simCapable: boolean
+  /** Arg that makes a run hardware-free; null when the robot is required. */
+  simFlag: string | null
+  /** Shows the episode start / save / discard controls while running. */
+  episodeControl: boolean
+  /** Shows the "point the headset at this machine" hint while running. */
+  usesHeadset: boolean
 }
 
+/**
+ * The operations every serve host has had since before the command registry.
+ * Used verbatim when the host's /api/commands predates it, so an up-to-date
+ * panel still drives an older robot.
+ */
 export const OPERATIONS: OperationMeta[] = [
   {
     id: "teleop",
@@ -639,6 +665,9 @@ export const OPERATIONS: OperationMeta[] = [
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
+    simFlag: "sim",
+    episodeControl: false,
+    usesHeadset: true,
   },
   {
     id: "gravity-comp",
@@ -648,6 +677,9 @@ export const OPERATIONS: OperationMeta[] = [
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
+    simFlag: null,
+    episodeControl: false,
+    usesHeadset: false,
   },
   {
     id: "collect-data",
@@ -657,6 +689,9 @@ export const OPERATIONS: OperationMeta[] = [
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
+    simFlag: null,
+    episodeControl: false,
+    usesHeadset: false,
   },
   {
     id: "replay-dataset",
@@ -666,6 +701,9 @@ export const OPERATIONS: OperationMeta[] = [
     requiresRobot: true,
     requiresCameras: false,
     simCapable: false,
+    simFlag: null,
+    episodeControl: false,
+    usesHeadset: false,
   },
   {
     id: "run-policy",
@@ -676,11 +714,41 @@ export const OPERATIONS: OperationMeta[] = [
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
+    simFlag: null,
+    episodeControl: true,
+    usesHeadset: false,
   },
 ]
 
-export function operationMeta(op: OperationId): OperationMeta {
-  return OPERATIONS.find((o) => o.id === op) as OperationMeta
+/**
+ * The operations the connected host offers, in catalog order.
+ *
+ * A host that predates the command registry answers /api/commands without the
+ * operation fields; there is then nothing to read them from, so fall back to
+ * the built-in list above rather than rendering an empty panel.
+ */
+export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
+  const ops = specs.filter((s) => s.isOperation)
+  if (ops.length === 0) return OPERATIONS
+  return ops.map((s) => ({
+    id: s.id,
+    label: s.label,
+    description: s.description,
+    fields: s.perRunFields ?? [],
+    // Every in-process operation drives the arms; only a sim run doesn't, and
+    // that's decided per run from simFlag.
+    requiresRobot: true,
+    requiresCameras: Boolean(s.requiresCameras),
+    simCapable: s.simCapable,
+    simFlag: s.simFlag ?? null,
+    episodeControl: Boolean(s.episodeControl),
+    usesHeadset: Boolean(s.usesHeadset),
+  }))
+}
+
+/** Whether this run is hardware-free (so it skips the robot / fault gates). */
+export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
+  return meta.simFlag != null && Boolean(settings[meta.simFlag])
 }
 
 /** Curated fields for an op, resolved from the introspected command schema. */

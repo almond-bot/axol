@@ -20,16 +20,13 @@ from pydantic import BaseModel
 from ..constants import URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
-from .commands import COMMANDS, command_specs
+from .commands import COMMANDS, command_specs, operation_ids
 from .manager import Session, SessionManager
 from .robot_link import RobotLink
 from .runner import OperationRunner
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
 from .update import SelfUpdater
-
-# The core operations run in-process via the OperationRunner.
-_OPERATIONS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"}
 
 
 class RunRequest(BaseModel):
@@ -549,15 +546,16 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/op/start")
     async def op_start(req: OpStartRequest) -> JSONResponse:
-        if req.op not in _OPERATIONS:
+        if req.op not in operation_ids():
             return JSONResponse(
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
         async with camera_reservation:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
-            # the arm. Sim teleop never touches the motors, so it stays allowed.
-            is_sim = req.op == "teleop" and bool(req.args.get("sim"))
+            # the arm. A sim run never touches the motors, so it stays allowed.
+            sim_flag = COMMANDS[req.op].sim_flag
+            is_sim = sim_flag is not None and bool(req.args.get(sim_flag))
             if not is_sim:
                 fault_response = await _motor_fault_response()
                 if fault_response is not None:
