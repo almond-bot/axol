@@ -141,6 +141,12 @@ class CartConfig:
         turn_scale:      Rotation weight relative to translation, in [0, 1].
         slew:            Max change of the normalized body command per second;
                          limits accel/decel so command steps ramp the wheels.
+        axis_snap_deg:   Translation headings within this many degrees of a
+                         cardinal axis (forward/back/left/right) are snapped
+                         onto that axis, absorbing off-axis thumb error during
+                         stick flicks so a "straight" command drives exactly
+                         straight. 0 disables. Deliberate diagonals (further
+                         off-axis than this) pass through unchanged.
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
         hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
@@ -160,7 +166,8 @@ class CartConfig:
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
-    slew: float = 2.0
+    slew: float = 1.0
+    axis_snap_deg: float = 15.0
     deadzone: float = 0.15
     hold_kp: float = 60.0
     hold_kd: float = 1.5
@@ -322,7 +329,22 @@ class Cart:
         def clamp(v: float) -> float:
             return max(-1.0, min(1.0, float(v)))
 
-        self._target = (clamp(vx), clamp(vy), clamp(wz), int(lift))
+        vx, vy, wz = clamp(vx), clamp(vy), clamp(wz)
+
+        # Snap near-cardinal translation onto the axis (see
+        # CartConfig.axis_snap_deg): thumbstick flicks are rarely perfectly
+        # straight, and without this the transient off-axis component steers
+        # the launch direction.
+        snap = math.radians(self._config.axis_snap_deg)
+        if snap > 0.0 and (vx != 0.0 or vy != 0.0):
+            heading = math.atan2(vy, vx)
+            nearest = round(heading / (math.pi / 2)) * (math.pi / 2)
+            if abs(heading - nearest) <= snap:
+                mag = math.hypot(vx, vy)
+                vx = mag * math.cos(nearest)
+                vy = mag * math.sin(nearest)
+
+        self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
 
     # ------------------------------------------------------------------
