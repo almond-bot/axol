@@ -55,6 +55,9 @@ export function CanAdapterDialog({
   const [left, setLeft] = useState(channels?.left ?? DEFAULTS.left)
   const [right, setRight] = useState(channels?.right ?? DEFAULTS.right)
   const [detected, setDetected] = useState<CanInterface[] | null>(null)
+  // Listing failed (offline host, or a serve release predating the
+  // /api/can/interfaces endpoint) — different from "queried, none found".
+  const [detectFailed, setDetectFailed] = useState(false)
 
   useEffect(() => {
     let active = true
@@ -63,7 +66,10 @@ export function CanAdapterDialog({
         if (active) setDetected(interfaces)
       })
       .catch(() => {
-        if (active) setDetected([])
+        if (active) {
+          setDetected([])
+          setDetectFailed(true)
+        }
       })
     return () => {
       active = false
@@ -133,8 +139,12 @@ export function CanAdapterDialog({
 
         {detected != null && detected.length === 0 && (
           <p className="rounded-md border border-amber-400/25 bg-amber-400/[0.05] p-2.5 text-xs leading-relaxed text-amber-100/90">
-            No CAN interfaces were detected on the host — plug in a CAN adapter, or type
-            the interface name it will have.
+            {detectFailed
+              ? "Couldn't list the host's CAN interfaces — the axol serve release on " +
+                "the host may be too old for this dashboard (update it), or the host " +
+                "is unreachable. You can still type an interface name."
+              : "No CAN interfaces were detected on the host — plug in a CAN adapter, " +
+                "or type the interface name it will have."}
           </p>
         )}
 

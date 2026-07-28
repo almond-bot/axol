@@ -137,7 +137,14 @@ async function json<T>(res: Response): Promise<T> {
     const body = await res.json().catch(() => ({}))
     throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
   }
-  return res.json() as Promise<T>
+  // A non-JSON 200 means whatever answered isn't axol serve (typically the
+  // static site itself when no host is configured, answering index.html for
+  // /api/*) — say that instead of surfacing a JSON SyntaxError.
+  try {
+    return (await res.json()) as T
+  } catch {
+    throw new Error("the host did not answer like an axol serve host — set the axol host address")
+  }
 }
 
 export interface ServerInfo {
