@@ -24,10 +24,36 @@ class KinematicsConfig:
             preventing slow null-space drift (e.g. unnecessary shoulder twist).
         manipulability_weight: Weight rewarding configurations with high manipulability.
         limit_weight: Weight penalising joint-limit violations.
-        self_collision_margin: Minimum clearance (m) enforced between collision bodies.
+        self_collision_margin: Minimum clearance (m) enforced between collision
+            bodies. Keep this below the arm-torso clearance of normal teleop
+            poses: a margin that is already violated at the folded rest pose
+            (e.g. the old 0.1 default) keeps the nonsmooth collision hinge
+            active during ordinary tracking, which makes the trust-region
+            solver reject steps — the arm freezes while small target errors
+            accumulate, then lurches once the error is large enough to punch
+            through (the teleop "stuck, then jumps" failure). 0.025 matches
+            ``VRTeleopConfig.reset_collision_margin``.
         self_collision_weight: Weight on the self-collision penalty.
         max_iterations: Maximum solver iterations per call.
-        cost_tolerance: Solver convergence tolerance.
+        cost_tolerance: Solver convergence tolerance — terminate when the
+            relative cost change of an iteration falls below this. jaxls also
+            applies it to *rejected* proposals (whose cost change is ~0), so a
+            loose value (the old 1e-2) makes one rejected step read as
+            "converged" and return the seed unchanged. Keep it small enough
+            that only genuine convergence trips it.
+        lambda_initial: Initial Levenberg-Marquardt damping. The per-tick solve
+            re-seeds from the previous solution, so the first proposal is taken
+            in a region where the linearisation may be poor (e.g. with the
+            self-collision cost active); a moderately damped start gets an
+            acceptable step in fewer rejections than the jaxls default (5e-4).
+        lambda_factor: Multiplier applied to the LM damping after each rejected
+            step. With the jaxls default (2.0) and ``max_iterations`` of 8,
+            damping can only grow 256x per solve — not enough to recover from a
+            rejected near-Gauss-Newton step near an active collision
+            constraint, so the solver used to return its seed unchanged for
+            many consecutive ticks (teleop froze) and then lurch once the
+            accumulated target error finally made a full step acceptable. 10.0
+            spans the useful damping range within the iteration budget.
         max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call, in radians.
         max_reach: Maximum allowed distance (m) from shoulder to end-effector target.
     """
@@ -39,9 +65,11 @@ class KinematicsConfig:
     posture_weight: float = 5.0
     manipulability_weight: float = 0.05
     limit_weight: float = 75.0
-    self_collision_margin: float = 0.1
+    self_collision_margin: float = 0.025
     self_collision_weight: float = 75.0
     max_iterations: int = 8
-    cost_tolerance: float = 1e-2
+    cost_tolerance: float = 1e-4
+    lambda_initial: float = 1e-2
+    lambda_factor: float = 10.0
     max_joint_delta: float = 0.0055 * 2 * math.pi
     max_reach: float = 0.8

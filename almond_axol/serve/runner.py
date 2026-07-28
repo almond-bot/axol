@@ -11,13 +11,19 @@ captured into a :class:`~almond_axol.serve.manager.Session` ring buffer (the
 same object the log WebSocket streams), so the UI sees live output exactly as
 it did for subprocesses.
 
-- teleop / gravity-comp are asyncio: they run on a dedicated event loop in a
-  worker thread and are stopped by cancelling the task (both already tear down
-  cleanly on ``CancelledError`` via their ``async with`` robot context).
-- collect-data / run-policy / replay-dataset are blocking/threaded: they run on
-  a worker thread and are stopped via a ``threading.Event`` (run-policy
-  additionally takes a queue-backed episode control for save/rerecord/quit from
-  the UI).
+Which operations exist, and how each one runs, comes entirely from the command
+registry (:mod:`.commands`) — nothing here is keyed on an operation's id, so a
+downstream package's registered operation runs on the same paths as the
+built-in five:
+
+- ``execution="async"`` (teleop / gravity-comp) runs ``await _run(cfg)`` on a
+  dedicated event loop in a worker thread, stopped by cancelling the task (both
+  tear down cleanly on ``CancelledError`` via their ``async with`` robot
+  context).
+- ``execution="thread"`` (collect-data / run-policy / replay-dataset) runs
+  ``_run(cfg, stop_event=...)`` on a worker thread, stopped via the
+  ``threading.Event``. An op declaring ``episode_control`` also gets
+  ``control=``, a queue-backed object taking save/rerecord/quit from the UI.
 
 Before a hardware operation starts the runner releases the robot link's CAN
 bus; when the operation ends it hands the bus back.
@@ -52,17 +58,16 @@ _logger = logging.getLogger(__name__)
 _STOP_GRACE_S = 6.0
 _FORCE_GRACE_S = 5.0
 
-# Operations that need exclusive ownership of the CAN bus (everything except
-# sim teleop, which is decided per-run from the ``sim`` arg).
-_HARDWARE_OPS = {
-    "teleop",
-    "gravity-comp",
-    "collect-data",
-    "run-policy",
-    "replay-dataset",
-}
-_ASYNC_OPS = {"teleop", "gravity-comp"}
-_OP_IDS = {"teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"}
+# The dataset recorder subprocess (``record_proc``'s "dataset-recorder") is
+# the one child the fast kill must spare: after Stop it is *finalizing* the
+# dataset — encoding the last episode, closing the parquet writers, writing
+# meta — and a SIGKILL there leaves unreadable parquet with no error anywhere.
+# Its shutdown is already bounded on its own (``DatasetRecorderProcess.close``
+# joins for up to 180s, then terminates it with a loud log), so the watchdog
+# first kills everything else (relay, IK worker — the joins the thread is
+# usually stuck on) and gives the recorder that long before killing it too.
+_RECORDER_PROC_NAME = "dataset-recorder"
+_FINALIZE_GRACE_S = 200.0
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
@@ -347,7 +352,8 @@ class OperationRunner:
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
-        # run-policy episode control (set while run-policy runs).
+        # Episode control of the live op (set while an op declaring
+        # episode_control runs, e.g. run-policy).
         self._policy_control: Any = None
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -382,7 +388,10 @@ class OperationRunner:
         cameras: dict[str, Any] | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ) -> Session:
-        if op_id not in _OP_IDS:
+        from .commands import COMMANDS
+
+        cmd = COMMANDS.get(op_id)
+        if cmd is None or not cmd.is_operation:
             raise KeyError(op_id)
         with self._lock:
             if self.is_running():
@@ -411,9 +420,9 @@ class OperationRunner:
                 if cameras is None:
                     cameras = self._settings.cameras()
 
-            # Fold the camera spec into the argv-style args for collect-data /
-            # run-policy (their camera serials are required draccus inputs).
-            if cameras and op_id in ("collect-data", "run-policy"):
+            # Fold the camera spec into the argv-style args for the ops whose
+            # camera serials are required draccus inputs.
+            if cameras and cmd.camera_mode == "argv":
                 args = self._merge_camera_args(args, cameras)
 
             cfg = self._build_config(op_id, args)
@@ -430,7 +439,7 @@ class OperationRunner:
         # the spec is now always present via the settings store — a host that
         # can't apply it (e.g. no ZED stack on a dev machine running sim) still
         # gets a camera-less teleop instead of a failed start.
-        if op_id == "teleop":
+        if cmd.camera_mode == "teleop":
             try:
                 self._attach_cameras_to_teleop(cfg, cameras, session)
             except Exception as exc:  # noqa: BLE001
@@ -439,8 +448,8 @@ class OperationRunner:
                     "continuing without cameras"
                 )
 
-        is_sim = op_id == "teleop" and bool(args.get("sim"))
-        needs_robot = op_id in _HARDWARE_OPS and not is_sim
+        is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
+        needs_robot = cmd.uses_can_bus and not is_sim
         log_level = self._log_level(args)
 
         session.status = "running"
@@ -453,7 +462,7 @@ class OperationRunner:
             except Exception as exc:  # noqa: BLE001
                 session.emit(f"[serve] robot release warning: {exc}")
 
-        if op_id in _ASYNC_OPS:
+        if cmd.execution == "async":
             target = self._run_async
         else:
             target = self._run_thread
@@ -520,15 +529,29 @@ class OperationRunner:
         return True
 
     def _await_stop(self, session: Session, thread: threading.Thread | None) -> None:
-        """Wait for the op to exit, force-killing its children if it stalls."""
+        """Wait for the op to exit, force-killing its children if it stalls.
+
+        Two-phase: the fast kill spares the dataset recorder (it is finalizing
+        the dataset — killing it corrupts the parquet files), which then gets
+        its own, much longer grace before it too is killed.
+        """
         if thread is None:
             return
         thread.join(timeout=_STOP_GRACE_S)
         if thread.is_alive():
             session.emit(
                 f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
-                "force-killing the operation's child processes"
+                "force-killing the operation's child processes (sparing the "
+                "dataset recorder)"
             )
+            spared = self._kill_op_children(session, spare={_RECORDER_PROC_NAME})
+            if spared and thread.is_alive():
+                session.emit(
+                    "[serve] waiting for the dataset recorder to finalize the "
+                    f"dataset (up to {_FINALIZE_GRACE_S:.0f}s)…"
+                )
+                thread.join(timeout=_FINALIZE_GRACE_S)
+        if thread.is_alive():
             self._kill_op_children(session)
             thread.join(timeout=_FORCE_GRACE_S)
         if thread.is_alive():
@@ -541,7 +564,9 @@ class OperationRunner:
                 "abandoned — restart axol serve if it persists"
             )
 
-    def _kill_op_children(self, session: Session) -> None:
+    def _kill_op_children(
+        self, session: Session, spare: set[str] | None = None
+    ) -> bool:
         """SIGKILL every subprocess this op spawned (relay, recorder, IK worker).
 
         The worker thread blocks on these children either while tearing down
@@ -549,6 +574,10 @@ class OperationRunner:
         joins) or while starting up (waiting on the IK worker's "ready" message
         across the pipe while it compiles JAX). Killing the children makes the
         blocked join/recv return so the thread can finish.
+
+        Children whose process name is in ``spare`` are left running (the
+        dataset recorder mid-finalize). Returns ``True`` if any such child was
+        spared, so the caller knows to keep waiting for it.
         """
         # Snapshot the targets under the lock and only if this is still the
         # op being stopped: a slow watchdog could otherwise wake after the
@@ -558,13 +587,21 @@ class OperationRunner:
         # we see the swap and bail — never a mix.
         with self._lock:
             if self._session is not session:
-                return
+                return False
             targets = [
                 c
                 for c in multiprocessing.active_children()
                 if c.pid not in self._baseline_children
             ]
+        spared_any = False
         for child in targets:
+            if spare and child.name in spare:
+                session.emit(
+                    f"[serve] sparing child process {child.name} "
+                    f"(pid {child.pid}) — dataset finalize in progress"
+                )
+                spared_any = True
+                continue
             session.emit(
                 f"[serve] killing child process {child.name} (pid {child.pid})"
             )
@@ -572,9 +609,10 @@ class OperationRunner:
                 child.kill()
             except Exception as exc:  # noqa: BLE001 - best-effort
                 session.emit(f"[serve] failed to kill pid {child.pid}: {exc}")
+        return spared_any
 
     def episode_command(self, command: str) -> bool:
-        """Forward a run-policy episode command (start/s/r/q) to its control."""
+        """Forward an episode command (start/s/r/q) to the live op's control."""
         control = self._policy_control
         if control is None:
             return False
@@ -582,7 +620,7 @@ class OperationRunner:
         return True
 
     def policy_state(self) -> dict[str, Any] | None:
-        """run-policy episode phase/message/count, or None if no policy is running.
+        """The live op's episode phase/message/count, or None if there is none.
 
         Read by /api/op/status so the control panel reflects whether an episode
         is recording or sitting at the between-episode gate on any computer.
@@ -826,10 +864,9 @@ class OperationRunner:
         self._async_loop = loop
 
         async def _wrap() -> None:
-            if op_id == "teleop":
-                from ..cli.teleop import _run as core
-            else:
-                from ..cli.gravity_comp import _run as core
+            from .commands import COMMANDS
+
+            core = COMMANDS[op_id].load_entrypoint()
             await core(cfg)
 
         with _Capture(session, log_level):
@@ -864,21 +901,20 @@ class OperationRunner:
         log_level: int,
         needs_robot: bool,
     ) -> None:
+        from .commands import COMMANDS
+
+        cmd = COMMANDS[op_id]
         with _Capture(session, log_level):
             try:
-                if op_id == "collect-data":
-                    from ..cli.collect_data import _run as core
-
-                    core(cfg, stop_event=self._stop_event)
-                elif op_id == "replay-dataset":
-                    from ..cli.replay_dataset import _run as core
-
+                core = cmd.load_entrypoint()
+                control_cls = cmd.load_episode_control()
+                if control_cls is None:
                     core(cfg, stop_event=self._stop_event)
                 else:
-                    from ..cli.run_policy import _QueuePolicyControl
-                    from ..cli.run_policy import _run as core
-
-                    control = _QueuePolicyControl(self._stop_event)
+                    # Episode decisions (save / rerecord / quit) arrive from the
+                    # API rather than stdin; the op blocks on this object and the
+                    # panel reads its phase back via policy_state().
+                    control = control_cls(self._stop_event)
                     self._policy_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
             except Exception as exc:  # noqa: BLE001

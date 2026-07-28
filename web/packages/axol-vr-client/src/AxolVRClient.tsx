@@ -89,6 +89,8 @@ export function AxolVRClient({
   const serverEpisodeRef = useRef<number | null | -1>(-1)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
+  // Change key of the last HUD state published to the server (see below).
+  const lastHudKeyRef = useRef("")
 
   useFrame(() => {
     // Attach onmessage to the WebSocket whenever it changes so we can receive
@@ -298,6 +300,34 @@ export function AxolVRClient({
       setState(AxolState.Recording)
       recordingPendingAtRef.current = null
       onPendingRecording?.(null)
+    }
+
+    // Publish the HUD-only state (armed confirmation popup, record countdown)
+    // to the server whenever it changes, so a dashboard watching the session
+    // can mirror what this headset would show — the operator may be driving
+    // with the controllers while the headset is off. Sent over the main
+    // WebSocket (the signaling transport); the server relays it to the other
+    // connected clients and clears it when we disconnect.
+    {
+      const pendingAt = recordingPendingAtRef.current
+      const confirm = pendingConfirmRef.current
+      const hudKey = `${confirm ?? ""}|${pendingAt !== null}`
+      if (hudKey !== lastHudKeyRef.current) {
+        lastHudKeyRef.current = hudKey
+        const ws = wsRef.current
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "hud",
+              value: {
+                confirm,
+                countdownRemainingMs:
+                  pendingAt !== null ? Math.max(0, 3000 - (Date.now() - pendingAt)) : null,
+              },
+            })
+          )
+        }
+      }
     }
 
     // Send each frame over every open transport: the wired USB `adb reverse`

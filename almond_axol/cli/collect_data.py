@@ -555,29 +555,28 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             relay.shutdown()
         raise
 
-    # Background perf samplers (per-second /proc CPU breakdown + Jetson GPU/EMC/
-    # NVENC/thermal). These were the instrumentation for the recording-jitter
-    # investigation; keep them available but only run + print them at DEBUG so the
-    # default INFO output stays the single loop-rate line. Labels map the known
-    # subprocesses (mp spawn children all report comm=python) so the IK solver,
-    # video relay, and dataset recorder are legible in the breakdown.
-    diag: SystemDiag | None = None
-    tegra: TegraStatsDiag | None = None
-    if _logger.isEnabledFor(logging.DEBUG):
-        diag_labels: dict[int, str] = {os.getpid(): "main"}
-        ik_proc = getattr(teleop, "_ik_process", None)
-        if ik_proc is not None and getattr(ik_proc, "pid", None):
-            diag_labels[ik_proc.pid] = "ik"
-        if relay is not None and getattr(relay, "_proc", None) is not None:
-            relay_pid = getattr(relay._proc, "pid", None)
-            if relay_pid:
-                diag_labels[relay_pid] = "relay"
-        if getattr(recorder, "pid", None):
-            diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
-        diag = SystemDiag(diag_labels, _logger)
-        diag.start()
-        tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
-        tegra.start()
+    # Background perf samplers (per-second /proc CPU + memory breakdown and
+    # Jetson GPU/EMC/NVENC/thermal), started unconditionally as in `axol teleop`
+    # so the two flows' lines line up and a collection session can be compared
+    # against the teleop baseline. Both keep their heavy system-wide tiers at
+    # DEBUG, so the default INFO output stays a couple of lines per second.
+    # Labels map the known subprocesses (mp spawn children all report
+    # comm=python) so the IK solver, video relay, and dataset recorder are
+    # legible in the breakdown.
+    diag_labels: dict[int, str] = {os.getpid(): "main"}
+    ik_proc = getattr(teleop, "_ik_process", None)
+    if ik_proc is not None and getattr(ik_proc, "pid", None):
+        diag_labels[ik_proc.pid] = "ik"
+    if relay is not None and getattr(relay, "_proc", None) is not None:
+        relay_pid = getattr(relay._proc, "pid", None)
+        if relay_pid:
+            diag_labels[relay_pid] = "relay"
+    if getattr(recorder, "pid", None):
+        diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
+    diag = SystemDiag(diag_labels, _logger)
+    diag.start()
+    tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
+    tegra.start()
 
     # Keep the relay's raw dataset branch closed until an episode records: the
     # raw VIC convert + shared-memory copy for every camera is the bulk of the
@@ -810,10 +809,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     finally:
         log_say("Stopping.")
 
-        if diag is not None:
-            diag.stop()
-        if tegra is not None:
-            tegra.stop()
+        diag.stop()
+        tegra.stop()
 
         robot.disconnect()
         teleop.disconnect()
