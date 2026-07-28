@@ -155,7 +155,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.left_channel",
                 label="Left arm CAN channel",
                 type="text",
-                help="SocketCAN interface for the left arm (e.g. can_left).",
+                help=(
+                    "SocketCAN interface for the left arm (e.g. can_alm_axol_l, "
+                    "or can0 for a non-Axol-hub adapter). 'null' disables the "
+                    "arm. Also used by the diagnostics dashboard's robot link."
+                ),
                 targets={
                     "teleop": ("left_channel",),
                     "gravity-comp": ("left_channel",),
@@ -168,7 +172,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.right_channel",
                 label="Right arm CAN channel",
                 type="text",
-                help="SocketCAN interface for the right arm (e.g. can_right).",
+                help=(
+                    "SocketCAN interface for the right arm (e.g. can_alm_axol_r, "
+                    "or can1 for a non-Axol-hub adapter). 'null' disables the "
+                    "arm. Also used by the diagnostics dashboard's robot link."
+                ),
                 targets={
                     "teleop": ("right_channel",),
                     "gravity-comp": ("right_channel",),
@@ -967,6 +975,32 @@ class SettingsStore:
         with self._lock:
             cams = self._data["cameras"]
             return dict(cams) if isinstance(cams, dict) else None
+
+    def can_channels(self) -> tuple[str | None, str | None]:
+        """The robot's (left, right) CAN interfaces from the shared settings.
+
+        Unset values fall back to the Axol hub's persistent interface names;
+        the ops' ``null`` convention (or an empty value) disables that arm —
+        e.g. a single non-hub adapter driving one arm only. The robot link and
+        the operations both resolve their channels from here, so a custom
+        adapter chosen once (Settings, or the dashboard's CAN adapter picker)
+        applies everywhere.
+        """
+        from ..constants import CAN_LEFT, CAN_RIGHT
+
+        with self._lock:
+            left = self._data["values"].get("robot.left_channel")
+            right = self._data["values"].get("robot.right_channel")
+
+        def norm(value: Any, default: str) -> str | None:
+            if value is None:
+                return default
+            text = str(value).strip()
+            if not text:
+                return default
+            return None if text.lower() in ("null", "none") else text
+
+        return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
 
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.

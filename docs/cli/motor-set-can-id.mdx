@@ -8,6 +8,7 @@ Changes a motor's CAN ID and persists it to flash. The motor must be the only de
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
 | `--current-id ID` | Current CAN ID (hex or decimal, required) |
 | `--new-id ID` | New CAN ID to assign (hex or decimal, required) |
 | `--type {myactuator,damiao}` | Motor type (required) |

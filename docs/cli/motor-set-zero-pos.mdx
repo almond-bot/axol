@@ -12,15 +12,18 @@ Sets the motor's zero-position reference to its current mechanical position (per
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
 | `--id ID` | CAN ID of the motor to zero, hex or decimal (required unless `--guided`) |
 | `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
-| `--guided` | Walk through every arm joint, zeroing each at its closer end stop |
+| `--guided` | Walk through the arm joints, zeroing each at its closer end stop |
+| `--joints j1,j2,…` | Subset of arm joints to walk in `--guided` mode (default: all seven; the gripper has no zero — it self-calibrates at enable time) |
 
-In `--guided` mode the CLI first asks you to hold **every** joint somewhere inside its operating range (away from the end stops) and press Enter **once** — it captures each joint's in-range start reference concurrently. It then walks the 7 arm joints one at a time (the gripper is auto-calibrated at runtime): for each, move it to the prompted end stop and press Enter. If the motion is in the expected direction the zero is committed immediately. If you moved the wrong way, the CLI keeps your starting reference and asks you to travel to the *other* end stop instead; pressing Enter there sets the zero. Press Ctrl-C to skip a joint.
+In `--guided` mode the CLI first asks you to hold every selected joint somewhere inside its operating range (away from the end stops) and press Enter **once** — it captures each joint's in-range start reference concurrently. It then walks the selected arm joints one at a time (the gripper is auto-calibrated at runtime): for each, move it to the prompted end stop and press Enter. If the motion is in the expected direction the zero is committed immediately. If you moved the wrong way, the CLI keeps your starting reference and asks you to travel to the *other* end stop instead; pressing Enter there sets the zero. Press Ctrl-C to skip a joint.
 
 ```bash
-axol motor.set-zero-pos --l --id 0x01      # single motor
-axol motor.set-zero-pos --l --guided       # all left-arm joints
+axol motor.set-zero-pos --l --id 0x01                        # single motor
+axol motor.set-zero-pos --l --guided                         # all left-arm joints
+axol motor.set-zero-pos --l --guided --joints wrist_2,wrist_3  # just the wrist Damiaos
 ```
 
 <Note>
