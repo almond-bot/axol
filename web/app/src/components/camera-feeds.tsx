@@ -1,9 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, ShieldCheck, VideoOff } from "lucide-react"
+import { Loader2, Maximize2, Minimize2, ShieldCheck, VideoOff } from "lucide-react"
 import { useAxolVideo, type CameraStreams } from "@almond/axol-vr-client"
 import { authorizeCert } from "@/lib/cert-accept"
 import { serverHttpBase } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
+
+/**
+ * Headset HUD state relayed by the VR server (`{"type":"hud",...}` messages):
+ * the armed save/discard confirmation popup and the record-start countdown.
+ * The headset app publishes it so the panel can mirror the popups the
+ * operator would see in VR — they may be driving with the controllers while
+ * the headset is off. Null when nothing is armed (or no headset connected).
+ */
+export interface VrHud {
+  confirm: "save" | "discard" | null
+  countdownRemainingMs: number | null
+}
 
 /**
  * Live camera feeds in the control panel, for driving a session with the
@@ -16,11 +28,30 @@ import { Button } from "@/components/ui/button"
  * single side-by-side track (`{name}_sbs`); only its left half is shown.
  * When both eyes arrive as separate tracks, only the left one is shown.
  *
+ * The same socket also carries the relayed headset HUD messages (see VrHud),
+ * surfaced through `onHud` so the episode UI can mirror the in-headset
+ * popups.
+ *
  * The VR server's self-signed certificate must be accepted per origin, so a
  * connection that keeps failing offers the same authorize-popup flow the VR
  * app uses (see lib/cert-accept.ts).
  */
-export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) {
+export function CameraFeeds({
+  host,
+  vrPort,
+  expanded = false,
+  onToggleFullscreen,
+  onHud,
+}: {
+  host: string
+  vrPort: number
+  /** Fullscreen operator view: let the feed grid grow to fill the screen. */
+  expanded?: boolean
+  /** Renders a fullscreen toggle in the header when provided. */
+  onToggleFullscreen?: () => void
+  /** Relayed headset HUD state (must be referentially stable, e.g. a setState). */
+  onHud?: (hud: VrHud | null) => void
+}) {
   const wsRef = useRef<WebSocket | null>(null)
   const [wsOpen, setWsOpen] = useState(false)
   // Consecutive failed connection attempts without ever opening — the
@@ -65,8 +96,32 @@ export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) 
         setWsOpen(true)
         setFailedAttempts(0)
       }
+      // Mirror the headset HUD: the server relays the driving client's
+      // popup/countdown state as `hud` messages on this same socket.
+      ws.addEventListener("message", (event: MessageEvent) => {
+        if (!onHud) return
+        try {
+          const msg = JSON.parse(event.data as string) as { type?: string; value?: unknown }
+          if (msg.type !== "hud") return
+          const v = msg.value as Partial<VrHud> | null
+          onHud(
+            v && typeof v === "object"
+              ? {
+                  confirm: v.confirm === "save" || v.confirm === "discard" ? v.confirm : null,
+                  countdownRemainingMs:
+                    typeof v.countdownRemainingMs === "number" ? v.countdownRemainingMs : null,
+                }
+              : null
+          )
+        } catch {
+          // not JSON (or not for us)
+        }
+      })
       ws.onclose = () => {
         if (wsRef.current === ws) wsRef.current = null
+        // The HUD publisher is unreachable through a dead socket: drop any
+        // mirrored popup rather than leave a stale dialog up.
+        onHud?.(null)
         if (closed) return
         setWsOpen(false)
         if (!opened) setFailedAttempts((n) => n + 1)
@@ -85,7 +140,7 @@ export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) 
         ws.close()
       }
     }
-  }, [hostname, vrPort])
+  }, [hostname, vrPort, onHud])
 
   const { streams, available } = useAxolVideo(wsRef, true)
 
@@ -115,16 +170,32 @@ export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) 
   const certHint = !wsOpen && failedAttempts >= 2
 
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+    <div
+      className={`flex flex-col gap-2 rounded-lg border border-white/10 bg-white/[0.02] p-3 ${
+        expanded ? "min-h-0 flex-1" : ""
+      }`}
+    >
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
           Camera feeds
         </span>
-        {feeds.length > 0 && <span className="font-mono text-[0.65rem] text-white/40">live</span>}
+        <div className="flex items-center gap-2">
+          {feeds.length > 0 && <span className="font-mono text-[0.65rem] text-white/40">live</span>}
+          {onToggleFullscreen && (
+            <button
+              type="button"
+              onClick={onToggleFullscreen}
+              title={expanded ? "Exit fullscreen (Esc)" : "Fullscreen operator view"}
+              className="text-white/40 transition-colors hover:text-white/80"
+            >
+              {expanded ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+            </button>
+          )}
+        </div>
       </div>
 
       {feeds.length > 0 ? (
-        <div className="grid grid-cols-2 gap-2">
+        <div className={`grid grid-cols-2 ${expanded ? "content-start gap-3" : "gap-2"}`}>
           {feeds.map((feed) => (
             <FeedTile
               key={feed.name}
