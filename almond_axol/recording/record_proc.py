@@ -1296,11 +1296,12 @@ def _verify_episodes_readable(dataset_root: "Path | str") -> None:
     footer) is invisible until something downstream tries to load the dataset —
     by which point the session is over and the operator has moved on. Reading
     the metadata back here names the bad file while the log still has the
-    context that produced it. Best-effort: never raises.
+    context that produced it.     Best-effort: never raises — it runs from a ``finally``, where an escaping
+    exception would mask the failure that got us here.
     """
-    from lerobot.datasets.utils import load_episodes
-
     try:
+        from lerobot.datasets.io_utils import load_episodes
+
         load_episodes(Path(dataset_root))
     except Exception as exc:  # noqa: BLE001 - diagnostic only
         _logger.error(
@@ -1320,9 +1321,15 @@ def _finalize_dataset(
 ) -> None:
     from lerobot.utils.utils import log_say
 
-    _close_dataset_writers(dataset)
+    try:
+        _close_dataset_writers(dataset)
+    finally:
+        # In a finally because the recovery path re-raises, and that is the
+        # case this check exists for: the writers have been closed by then
+        # either way, so this is where we find out whether the salvage worked.
+        if episodes_recorded > 0:
+            _verify_episodes_readable(config["dataset_root"])
     if episodes_recorded > 0:
-        _verify_episodes_readable(config["dataset_root"])
         with contextlib.suppress(Exception):
             _verify_videos_decodable(config["dataset_root"], since=session_start)
     if config["push_to_hub"] and episodes_recorded > 0:
