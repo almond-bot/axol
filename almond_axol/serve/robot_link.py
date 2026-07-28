@@ -83,6 +83,57 @@ def motor_faults(
     return faults
 
 
+def _flag(value: Any) -> bool:
+    """A submitted form flag: real booleans or the string \"true\"."""
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _joint_name_for_id(value: Any) -> str | None:
+    """Joint name for a motor CAN id (0x01–0x08 in Joint order), else None."""
+    try:
+        motor_id = int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+    joints = list(Joint)
+    if 1 <= motor_id <= len(joints):
+        return joints[motor_id - 1].name
+    return None
+
+
+def scoped_motor_faults(
+    faults: list[dict[str, Any]], args: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Filter faults down to the motors a command launch will actually touch.
+
+    Keys off the shared argument conventions of the motor-driving diagnostics:
+    the ``arm`` selector (``--l``/``--r``), the ROM tests' ``no_left`` /
+    ``no_right`` skips, a ``joints`` subset, and a single motor ``id``
+    (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
+    with only some motors on the bus can then run a scoped test without the
+    absent motors' "unreachable" faults blocking the launch — while faults on
+    the motors the run *does* drive still block it.
+    """
+    arm = str(args.get("arm") or "").strip().lower()
+    if arm in ("left", "right"):
+        faults = [f for f in faults if f["arm"] == arm]
+    if _flag(args.get("no_left")):
+        faults = [f for f in faults if f["arm"] != "left"]
+    if _flag(args.get("no_right")):
+        faults = [f for f in faults if f["arm"] != "right"]
+
+    joint_names: set[str] | None = None
+    joints = args.get("joints")
+    if isinstance(joints, str) and joints.strip():
+        joint_names = {p.strip().upper() for p in joints.split(",") if p.strip()}
+    elif not _flag(args.get("guided")):
+        joint = _joint_name_for_id(args.get("id") or args.get("current_id"))
+        if joint is not None:
+            joint_names = {joint}
+    if joint_names is not None:
+        faults = [f for f in faults if f["joint"].upper() in joint_names]
+    return faults
+
+
 def _format_error(exc: BaseException) -> str:
     """Short, human-readable error for the UI status pill.
 

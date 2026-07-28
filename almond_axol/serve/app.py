@@ -22,7 +22,7 @@ from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import COMMANDS, command_specs, operation_ids
 from .manager import Session, SessionManager
-from .robot_link import RobotLink
+from .robot_link import RobotLink, scoped_motor_faults
 from .runner import OperationRunner
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
@@ -232,9 +232,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return s, runner
         return manager.get(session_id), manager
 
-    async def _motor_fault_response() -> JSONResponse | None:
-        """Return the shared motor-fault rejection, or ``None`` when clear."""
+    async def _motor_fault_response(
+        scope_args: dict[str, Any] | None = None,
+    ) -> JSONResponse | None:
+        """Return the shared motor-fault rejection, or ``None`` when clear.
+
+        ``scope_args`` (a diagnostics launch's request args) narrows the check
+        to the motors that run will actually touch — an arm/joint-scoped run
+        (guided zeroing of a joint subset, a one-arm ROM test, a single-motor
+        tool) must not be blocked by faults on motors it never drives, e.g. a
+        bench arm with only some motors on the bus.
+        """
         faults = await asyncio.to_thread(robot.motor_faults)
+        if scope_args:
+            faults = scoped_motor_faults(faults, scope_args)
         if not faults:
             return None
         detail = ", ".join(
@@ -441,7 +452,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
         if command.drives_motors:
-            fault_response = await _motor_fault_response()
+            fault_response = await _motor_fault_response(scope_args=req.args)
             if fault_response is not None:
                 return fault_response
 
