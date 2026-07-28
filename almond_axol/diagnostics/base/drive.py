@@ -6,11 +6,10 @@ Logitech gamepad.
 
 This is a thin gamepad frontend over :class:`almond_axol.robot.cart.Cart`,
 which owns all the control logic (slew limiting, x-drive mixing, the MIT
-park hold, PMAX widening, lift GPIO edges) — the same class VR teleop
+park hold, PMAX widening, lift commands) — the same class VR teleop
 drives, so bench behavior and teleop behavior cannot drift apart. See the
 ``cart`` module docstring for wheel CAN IDs, body-frame conventions, and
-the parking details, and :mod:`almond_axol.robot.lift` for the JCB35N2
-lift protocol and wiring.
+the parking details.
 
 Controls (Logitech F310/F710 in XInput mode):
     Left stick    translate (up = forward, left = strafe left)
@@ -19,10 +18,11 @@ Controls (Logitech F310/F710 in XInput mode):
     LB or RB      deadman — hold to drive; release for a smooth stop
     B             quit (wheels stopped, motors disabled)
 
-The lift only moves while the deadman is held and the D-pad is pressed;
-releasing either stops it (the box also has its own anti-collision stop).
-Pass ``--lift-height-port`` (a serial device wired to lift RJ45 pin 2) to
-display live height; ``--no-lift`` disables the lift entirely.
+The D-pad commands the lift only while the deadman is held; releasing
+either stops it. Nothing physically moves until the lift PCB lands — the
+driver behind it is a no-op stub (see :mod:`almond_axol.robot.lift`), and
+the status line's height stays blank for the same reason. ``--no-lift``
+skips the lift entirely.
 
 Run directly (pygame ships in the ``gamepad`` extra):
     uv run --extra gamepad -m almond_axol.diagnostics.base.drive
@@ -144,16 +144,13 @@ async def _run(args: argparse.Namespace) -> None:
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
         lift=not args.no_lift,
-        lift_chip=args.lift_chip,
-        lift_up_gpio=args.lift_up_gpio,
-        lift_down_gpio=args.lift_down_gpio,
     )
     if args.no_can:
         print("--no-can: wheel motors disabled (gamepad + lift only).")
 
     height: HeightReader | None = None
-    if not args.no_lift and args.lift_height_port:
-        height = HeightReader(args.lift_height_port)
+    if not args.no_lift:
+        height = HeightReader()
 
     cart = Cart(config)
     await cart.enable()
@@ -228,32 +225,9 @@ def main(argv: list[str] | None = None) -> None:
         help="Skip the CAN bus (no wheel motion); gamepad and lift still work.",
     )
     parser.add_argument(
-        "--lift-chip",
-        default="/dev/gpiochip0",
-        help="gpiochip device for the lift button lines (default: /dev/gpiochip0)",
-    )
-    parser.add_argument(
-        "--lift-up-gpio",
-        type=int,
-        default=23,
-        help="GPIO line offset wired to lift RJ45 pin 7 (HS1, up) (default: 23)",
-    )
-    parser.add_argument(
-        "--lift-down-gpio",
-        type=int,
-        default=24,
-        help="GPIO line offset wired to lift RJ45 pin 8 (HS0, down) (default: 24)",
-    )
-    parser.add_argument(
-        "--lift-height-port",
-        default=None,
-        help="Serial device wired to lift RJ45 pin 2 (DTX) to display live "
-        "height, e.g. /dev/ttyAMA0. Default: off.",
-    )
-    parser.add_argument(
         "--no-lift",
         action="store_true",
-        help="Skip the lift entirely (no GPIOs are touched).",
+        help="Skip the lift entirely (the D-pad is ignored).",
     )
     args = parser.parse_args(argv)
 

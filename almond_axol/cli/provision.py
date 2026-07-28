@@ -16,6 +16,9 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       dropped on every ``uv tool upgrade``).
 * ``gst.build-zed`` — the patched zedxonesrc/zedsrc plugins (sensor-accurate
                       PTS so collected images line up with joint samples).
+* ``gyro.install``  — group access to the carrier board's BMI088 sampling
+                      timer, the cart heading hold's yaw reference (see
+                      :mod:`almond_axol.robot.gyro`).
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -34,6 +37,7 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from ..robot import gyro
 from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
@@ -83,6 +87,9 @@ def run(_args: object = None) -> None:
     # and never reboots — the new kernel driver loads on the next reboot, so
     # it just prints a notice.
     _step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
+    # Group access to the board IMU's sampling timer, so teleop can start the
+    # cart's yaw reference without root. Self-gates on the driver's presence.
+    _step("board IMU (gyro.install)", gyro.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)

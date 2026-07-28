@@ -427,7 +427,6 @@ def _relay_main(
     log_level: int,
     want_raw: bool = False,
     raw_cond: object = None,
-    imu_conn: multiprocessing.connection.Connection | None = None,
 ) -> None:
     """Relay subprocess entry point: open cameras, serve signaling requests.
 
@@ -438,12 +437,6 @@ def _relay_main(
     provide raw via gst still stream to the headset (encoded only) but are
     omitted from ``raw_meta`` so the parent can fall back to the in-process
     camera path.
-
-    A camera spec with ``imu: True`` (the overhead ZED, when the cart's
-    heading hold is enabled) is pinned to the SDK backend — the gst pipeline
-    owns the camera exclusively and its IMU metadata is unreachable from
-    Python — and its yaw rate is streamed to the parent over ``imu_conn``
-    (see :meth:`VideoRelayProcess.set_yaw_callback`).
     """
     logging.basicConfig(level=log_level)
 
@@ -496,25 +489,14 @@ def _relay_main(
             import tempfile
 
             socket_dir = tempfile.mkdtemp(prefix="axol-raw-")
-    imu_sources: list[object] = []
     for name, spec in cameras.items():
         # A camera participates per its spec: ``stream`` adds it to the headset
         # feed, ``record`` (only meaningful when the relay wants raw) adds it to
         # the dataset. A camera in neither is skipped — never opened.
         wants_stream = bool(spec.get("stream", True))
         wants_record = want_raw and bool(spec.get("record", True))
-        wants_imu = bool(spec.get("imu")) and imu_conn is not None
         if not (wants_stream or wants_record):
             continue
-        if wants_imu and wants_record:
-            # Recording requires the gst raw branch, which owns the camera
-            # exclusively — the SDK handle the IMU poller needs can't coexist.
-            _logger.warning(
-                "video relay: %s records via gst, so its IMU is unavailable; "
-                "cart heading hold disabled",
-                name,
-            )
-            wants_imu = False
         if wants_record:
             raw = _open_gst_camera_raw(name, spec, raw_cond, socket_dir)
             if raw is not None:
@@ -530,9 +512,7 @@ def _relay_main(
             # collect-data fall back to the in-process camera path.
             if not wants_stream:
                 continue
-        # An IMU camera skips the gst path on purpose: only the SDK handle
-        # exposes get_sensors_data, and one process/backend owns the camera.
-        gst = None if wants_imu else _open_gst_camera(name, spec)
+        gst = _open_gst_camera(name, spec)
         if gst is not None:
             cam, gst_sources = gst
             owned.append(cam)
@@ -542,30 +522,6 @@ def _relay_main(
         if cam is None:
             continue
         owned.append(cam)
-        if wants_imu:
-            zed = getattr(cam, "zed", None)
-            if zed is None:
-                _logger.warning(
-                    "video relay: %s has no SDK stereo handle; IMU unavailable "
-                    "(is the overhead camera a stereo ZED X?)",
-                    name,
-                )
-            else:
-                try:
-                    from ..zed.imu import ZedYawRateSource
-
-                    def _push(rate: float, _conn=imu_conn) -> None:
-                        try:
-                            _conn.send(rate)
-                        except (OSError, ValueError, BrokenPipeError):
-                            pass  # parent gone; poller exits with the process
-
-                    imu_src = ZedYawRateSource(_push)
-                    imu_src.attach(zed)
-                    imu_sources.append(imu_src)
-                    _logger.info("video relay: streaming %s IMU yaw rate", name)
-                except Exception as exc:  # noqa: BLE001 - video must not break
-                    _logger.warning("video relay: %s IMU source failed (%s)", name, exc)
         if spec.get("stereo"):
             # One grab, per-eye views. The head camera maps both eyes
             # (overhead_left / overhead_right); a wrist stereo camera maps only
@@ -676,11 +632,6 @@ def _relay_main(
     finally:
         if manager is not None:
             manager.shutdown()
-        for imu_src in imu_sources:
-            try:
-                imu_src.close()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001 - best-effort cleanup
-                pass
         for cam in owned:
             try:
                 cam.disconnect()
@@ -760,10 +711,6 @@ class VideoRelayProcess:
         """
         ctx = multiprocessing.get_context("spawn")
         self._conn, child_conn = ctx.Pipe()
-        # Dedicated one-way pipe for the IMU yaw-rate stream (~100 Hz floats):
-        # the signaling pipe above is strictly request/response, so streaming
-        # samples get their own channel.
-        self._imu_conn, imu_child = ctx.Pipe(duplex=False)
         # One Condition guards every source's shared-memory metadata; it must be
         # created here and passed at spawn so parent (readers) and child
         # (writers) share the same underlying primitive.
@@ -776,14 +723,12 @@ class VideoRelayProcess:
                 logging.getLogger().level or logging.INFO,
                 want_raw,
                 self._raw_cond,
-                imu_child,
             ),
             daemon=True,
             name="video-relay",
         )
         self._proc.start()
         child_conn.close()
-        imu_child.close()
         self._lock = threading.Lock()
 
         self.sources: list[str] = []
@@ -897,30 +842,6 @@ class VideoRelayProcess:
             None, self._send, ("close_all",)
         )
 
-    def set_yaw_callback(self, callback) -> None:
-        """Dispatch relay IMU yaw-rate samples (rad/s) to ``callback``.
-
-        Samples flow when a camera spec carried ``imu: True`` (the overhead
-        ZED with the cart heading hold enabled). The callback fires on a
-        dedicated daemon reader thread and must be cheap and thread-safe —
-        ``Cart.feed_yaw_rate`` only latches a tuple. The thread exits when
-        the relay closes its end of the pipe.
-        """
-
-        def _reader() -> None:
-            while True:
-                try:
-                    rate = self._imu_conn.recv()
-                except (EOFError, OSError):
-                    return
-                try:
-                    callback(float(rate))
-                except Exception:  # noqa: BLE001 - a bad callback must not spin
-                    _logger.exception("video relay: yaw callback failed")
-                    return
-
-        threading.Thread(target=_reader, daemon=True, name="relay-imu").start()
-
     def set_raw_enabled(self, enabled: bool) -> None:
         """Open/close the raw dataset branch in the relay (recording only).
 
@@ -955,9 +876,5 @@ class VideoRelayProcess:
             self._proc.join(timeout=2.0)
         try:
             self._conn.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
-        try:
-            self._imu_conn.close()
         except Exception:  # noqa: BLE001 - best-effort cleanup
             pass

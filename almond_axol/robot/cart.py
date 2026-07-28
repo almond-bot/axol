@@ -2,9 +2,9 @@
 
 The powered cart has four omni wheels mounted at 45° on the corners (an
 x-drive), each driven by a Damiao motor in VELOCITY mode on a dedicated
-CAN bus, plus a telescoping lift (a Jiecang JCB35N2 box driving two desk
-legs) commanded through handset-emulating GPIOs (see
-:mod:`almond_axol.robot.lift`). CAN IDs are fixed by convention:
+CAN bus, plus a telescoping lift whose driver is currently a no-op stub
+awaiting our own lift PCB (see :mod:`almond_axol.robot.lift`). CAN IDs are
+fixed by convention:
 
     id 1  front-left      id 2  front-right
     id 3  back-left       id 4  back-right
@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
-from .lift import DOWN, STOP, UP, JiecangLift
+from .lift import DOWN, STOP, UP, Lift
 
 _logger = logging.getLogger(__name__)
 
@@ -74,6 +74,15 @@ _SESSION_PMAX = 400.0
 # against anchoring a wheel that is still coasting (e.g. on a slope where
 # the velocity loop hasn't fully braked when the command reaches zero).
 _PARK_MAX_WHEEL_SPEED = 0.5
+
+# Rate of the per-cycle heading-hold trace line (CartConfig.yaw_log). The
+# hold's dynamics are ~1 s, so this resolves them without flooding a console
+# the 50 Hz command loop has to keep up with.
+_YAW_TRACE_HZ = 10.0
+
+# Seconds of driving with the IMU requested but no yaw sample ever fed
+# before the cart says the heading hold is dead.
+_YAW_SILENT_WARN_S = 3.0
 
 
 @dataclass(frozen=True)
@@ -141,16 +150,17 @@ class CartConfig:
         turn_scale:      Rotation weight relative to translation, in [0, 1].
         slew:            Max change of the normalized body command per second;
                          limits accel/decel so command steps ramp the wheels.
+                         The default takes 2s from rest to full deflection.
         axis_snap_deg:   Translation headings within this many degrees of a
                          cardinal axis (forward/back/left/right) are snapped
                          onto that axis, absorbing off-axis thumb error during
                          stick flicks so a "straight" command drives exactly
                          straight. 0 disables. Deliberate diagonals (further
                          off-axis than this) pass through unchanged.
-        imu:             Use the overhead ZED camera's IMU as the yaw
-                         reference for the heading hold (wired by teleop; see
-                         ``almond_axol.zed.imu``). Requires an ``overhead``
-                         camera and pins it to the video relay's SDK backend.
+        imu:             Use the carrier board's BMI088 as the yaw reference
+                         for the heading hold (wired by teleop; see
+                         ``almond_axol.robot.gyro``). Independent of the
+                         cameras — the overhead ZED keeps its gst pipeline.
         yaw_hold_gain:   Heading-hold feedback gain, normalized wz per rad of
                          heading error. While translating without a commanded
                          rotation, the yaw rate fed via :meth:`Cart.feed_yaw_rate`
@@ -160,6 +170,10 @@ class CartConfig:
                          inverted. Idle no-op unless yaw rates are actually
                          fed (and fresh).
         yaw_hold_max:    Clamp on the heading-hold correction (normalized wz).
+        yaw_log:         Trace the heading hold: a 10 Hz state line while the
+                         cart translates and a per-stroke summary of the
+                         heading it actually drifted (see :class:`_YawLog`).
+                         For diagnosing drift; off in normal operation.
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
         hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
@@ -169,30 +183,125 @@ class CartConfig:
         command_timeout: Seconds without a fresh :meth:`Cart.set_command`
                          before the target is forced to zero (and the lift
                          stopped). Protects against a dead command source.
-        lift:            Whether the telescoping lift is present.
-        lift_chip:       gpiochip device for the lift button lines.
-        lift_up_gpio:    GPIO line offset wired to lift RJ45 pin 7 (HS1, up).
-        lift_down_gpio:  GPIO line offset wired to lift RJ45 pin 8 (HS0, down).
+        lift:            Whether the telescoping lift is present. Its driver
+                         is a no-op until the lift PCB lands, so this only
+                         decides whether lift commands are routed at all.
     """
 
     enabled: bool = False
     channel: str | None = DEFAULT_CHANNEL
     max_speed: float = 20.0
     turn_scale: float = 1.0
-    slew: float = 1.0
+    slew: float = 0.5
     axis_snap_deg: float = 15.0
     imu: bool = False
     yaw_hold_gain: float = 2.0
     yaw_hold_max: float = 0.3
+    yaw_log: bool = False
     deadzone: float = 0.15
     hold_kp: float = 60.0
     hold_kd: float = 1.5
     frequency: float = 50.0
     command_timeout: float = 0.3
     lift: bool = True
-    lift_chip: str = "/dev/gpiochip0"
-    lift_up_gpio: int = 23
-    lift_down_gpio: int = 24
+
+
+class _YawLog:
+    """Per-stroke trace of the heading hold (see ``CartConfig.yaw_log``).
+
+    Fed every command cycle; emits a throttled state line while the cart is
+    translating and a summary when the stroke ends.
+
+    The number to read is the stroke's heading drift — ``yaw_err``, the
+    measured rotation since the stroke began. A stroke ending near zero means
+    the hold did its job and whatever drift is still visible is the lateral
+    slide along the unloaded diagonal, which no wheel command can correct
+    (``diagnostics/base/floor_sim.py``); a growing one means the hold isn't
+    working, and the rest of the line says why — no samples, stale samples, a
+    correction pinned at ``yaw_hold_max``, or a bias being integrated into the
+    error while the cart never sits still long enough to learn it.
+    """
+
+    def __init__(self) -> None:
+        self._t0: float | None = None  # stroke start, None between strokes
+        self._next_trace = 0.0
+        self._cycles = 0
+        self._held = 0
+        self._saturated = 0
+        self._corr_sum = 0.0
+        self._corr_max = 0.0
+        self._age_max = 0.0
+        self._err_last = 0.0  # the controller zeroes yaw_err as a stroke ends
+        self._samples0 = 0
+
+    def update(
+        self,
+        *,
+        now: float,
+        translating: bool,
+        held: bool,
+        rate: float | None,
+        bias: float,
+        err: float,
+        corr: float,
+        saturated: bool,
+        age: float | None,
+        samples: int,
+    ) -> None:
+        if not translating:
+            if self._t0 is not None:
+                self._summarize(now, bias, samples)
+                self._t0 = None
+            return
+
+        if self._t0 is None:
+            self._t0 = now
+            self._next_trace = now
+            self._cycles = self._held = self._saturated = 0
+            self._corr_sum = self._corr_max = self._age_max = 0.0
+            self._samples0 = samples
+
+        self._cycles += 1
+        self._held += int(held)
+        self._saturated += int(saturated)
+        self._corr_sum += abs(corr)
+        self._corr_max = max(self._corr_max, abs(corr))
+        self._err_last = err
+        if age is not None:
+            self._age_max = max(self._age_max, age)
+
+        if now >= self._next_trace:
+            self._next_trace = now + 1.0 / _YAW_TRACE_HZ
+            _logger.info(
+                "yaw t=%5.2fs rate=%s bias=%+.4f err=%+6.2fdeg corr=%+.3f%s age=%s",
+                now - self._t0,
+                f"{rate:+.4f}" if rate is not None else "none",
+                bias,
+                math.degrees(err),
+                corr,
+                " SAT" if saturated else "",
+                f"{age * 1e3:.0f}ms" if age is not None else "none",
+            )
+
+    def _summarize(self, now: float, bias: float, samples: int) -> None:
+        assert self._t0 is not None
+        dt = max(now - self._t0, 1e-6)
+        cycles = max(self._cycles, 1)
+        _logger.info(
+            "yaw stroke: %.1fs, heading drift %+.2fdeg, hold active %d%% of %d "
+            "cycles (|corr| mean %.3f max %.3f, saturated %d%%), imu %.0fHz "
+            "max age %.0fms, bias %+.4frad/s",
+            dt,
+            math.degrees(self._err_last),
+            round(100 * self._held / cycles),
+            self._cycles,
+            self._corr_sum / cycles,
+            self._corr_max,
+            round(100 * self._saturated / cycles),
+            (samples - self._samples0) / dt,
+            self._age_max * 1e3,
+            bias,
+        )
 
 
 class Cart:
@@ -216,7 +325,7 @@ class Cart:
         self._config = config
         self._bus: CanBus | None = None
         self._motors: list[MotorDriver] = []
-        self._lift: JiecangLift | None = None
+        self._lift: Lift | None = None
         self._task: asyncio.Task | None = None
 
         # Latched target, written from any thread (single-reference swap is
@@ -225,8 +334,11 @@ class Cart:
         self._target_time: float = 0.0
 
         # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
-        # written from any thread; None until a sensor feeds one.
+        # written from any thread; None until a sensor feeds one. The counter
+        # lets the command loop report the sensor's delivered rate, which is
+        # what distinguishes a slow source from a dead one.
         self._yaw_rate: tuple[float, float] | None = None
+        self._yaw_samples = 0
 
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -252,19 +364,12 @@ class Cart:
     # ------------------------------------------------------------------
 
     async def enable(self) -> None:
-        """Open the CAN bus, enable the wheel motors, init the lift GPIOs,
-        and start the command task."""
+        """Open the CAN bus, enable the wheel motors, init the lift, and start
+        the command task."""
         cfg = self._config
         if cfg.lift:
-            self._lift = JiecangLift(
-                cfg.lift_chip, cfg.lift_up_gpio, cfg.lift_down_gpio
-            )
-            _logger.info(
-                "cart lift: %s up=GPIO%d down=GPIO%d",
-                cfg.lift_chip,
-                cfg.lift_up_gpio,
-                cfg.lift_down_gpio,
-            )
+            self._lift = Lift()
+            _logger.info("cart lift: no-op driver — the lift will not move")
 
         if cfg.channel is not None:
             self._bus = CanBus(cfg.channel)
@@ -294,6 +399,15 @@ class Cart:
                 *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
             )
             _logger.info("cart wheels enabled on %s", cfg.channel)
+
+        if cfg.yaw_hold_gain != 0.0:
+            _logger.info(
+                "cart heading hold: gain=%.2f max=%.2f imu=%s%s",
+                cfg.yaw_hold_gain,
+                cfg.yaw_hold_max,
+                cfg.imu,
+                " (yaw_log on)" if cfg.yaw_log else "",
+            )
 
         self._task = asyncio.create_task(self._command_loop(), name="cart-command")
 
@@ -408,13 +522,14 @@ class Cart:
     def feed_yaw_rate(self, rate: float) -> None:
         """Latch an external yaw-rate sample (rad/s, CCW positive from above).
 
-        Fed by a gyro source (e.g. the overhead ZED IMU, see
-        ``almond_axol.zed.imu``) from any thread at any rate; the command
+        Fed by a gyro source (the board BMI088, see
+        ``almond_axol.robot.gyro``) from any thread at any rate; the command
         task's heading hold consumes the latest sample. Samples older than
         the staleness window are ignored, so a dead sensor simply disables
         the hold rather than freezing a stale correction.
         """
         self._yaw_rate = (float(rate), time.monotonic())
+        self._yaw_samples += 1
 
     # ------------------------------------------------------------------
     # Command task
@@ -474,6 +589,9 @@ class Cart:
         hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
         yaw_err = 0.0  # integrated heading error (rad) since the stroke start
         yaw_bias = 0.0  # gyro bias estimate (rad/s), learned while stopped
+        yaw_log = _YawLog() if cfg.yaw_log else None
+        warned_silent = False
+        t_loop0 = time.monotonic()
 
         while True:
             t_iter = time.perf_counter()
@@ -517,19 +635,60 @@ class Cart:
             translating = math.hypot(cmd[0], cmd[1]) > 0.1
             turning = abs(cmd[2]) > 0.05
             sample = self._yaw_rate
+            rate: float | None = None
+            age: float | None = None
+            held = saturated = False
             if cfg.yaw_hold_gain != 0.0 and sample is not None:
                 rate, ts = sample
-                if time.monotonic() - ts > 0.3:  # sensor died: drop the hold
+                age = time.monotonic() - ts
+                if age > 0.3:  # sensor died: drop the hold
                     yaw_err = 0.0
                 elif translating and not turning:
                     yaw_err += (rate - yaw_bias) * interval
-                    yaw_corr = -cfg.yaw_hold_gain * yaw_err
-                    yaw_corr = max(-cfg.yaw_hold_max, min(cfg.yaw_hold_max, yaw_corr))
+                    raw_corr = -cfg.yaw_hold_gain * yaw_err
+                    yaw_corr = max(-cfg.yaw_hold_max, min(cfg.yaw_hold_max, raw_corr))
+                    saturated = yaw_corr != raw_corr
+                    held = True
                 else:
                     yaw_err = 0.0
                     if not driving:
                         yaw_bias += 0.02 * (rate - yaw_bias)
             self.yaw_correction = yaw_corr
+
+            now = time.monotonic()
+            if yaw_log is not None:
+                yaw_log.update(
+                    now=now,
+                    translating=translating,
+                    held=held,
+                    rate=rate,
+                    bias=yaw_bias,
+                    err=yaw_err,
+                    corr=yaw_corr,
+                    saturated=saturated,
+                    age=age,
+                    samples=self._yaw_samples,
+                )
+
+            # An IMU that was asked for but never delivers is the quiet
+            # failure: an unprovisioned sampler or a stalled driver leaves the
+            # hold looking configured and doing nothing. Say it once, the
+            # first time it matters.
+            if (
+                not warned_silent
+                and cfg.imu
+                and cfg.yaw_hold_gain != 0.0
+                and driving
+                and self._yaw_rate is None
+                and now - t_loop0 > _YAW_SILENT_WARN_S
+            ):
+                warned_silent = True
+                _logger.warning(
+                    "cart heading hold: no yaw samples after %.0fs of driving — "
+                    "the hold is inert. Check that the board gyro opened "
+                    "(almond_axol.robot.gyro) earlier in this log.",
+                    _YAW_SILENT_WARN_S,
+                )
 
             speeds = mix(
                 cmd[0], cmd[1], cmd[2] + yaw_corr, cfg.max_speed, cfg.turn_scale

@@ -164,13 +164,6 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
                 spec["stream_sbs"] = True
         specs[name] = spec
 
-    # Cart heading hold: the overhead ZED doubles as the yaw gyro. The spec
-    # flag pins that camera to the relay's SDK backend (the gst pipeline owns
-    # the camera exclusively and hides its IMU) and starts the relay-side
-    # poller; the parent wires the samples to the cart in _run.
-    if cfg.cart.enabled and cfg.cart.imu and "overhead" in specs:
-        specs["overhead"]["imu"] = True
-
     relay = VideoRelayProcess(specs)
     if not relay.has_sources:
         relay.shutdown()
@@ -295,62 +288,29 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
         _logger.warning("failed to enable camera video: %s", exc)
 
 
-def _wire_cart_imu(
-    cfg: TeleopCmdConfig, cart: Any, relay: Any | None, cameras: list[tuple[str, Any]]
-) -> Any | None:
-    """Feed the cart's heading hold from the overhead ZED IMU (``--cart.imu``).
+def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
+    """Feed the cart's heading hold from the board BMI088 (``--cart.imu``).
 
-    The yaw source depends on who owns the overhead camera:
+    The yaw reference is the carrier board's own IMU rather than a camera, so
+    nothing here touches the video path — the overhead ZED keeps the relay's
+    GStreamer pipeline.
 
-    * video relay → the relay-side poller streams samples over its IMU pipe
-      (the spec flag set in :func:`_start_video_relay`);
-    * in-process SDK fallback → attach to the already-open stereo handle;
-    * no cameras configured → open the (only) stereo ZED for sensors alone.
-
-    Returns a :class:`~almond_axol.zed.imu.ZedYawRateSource` the caller must
-    close on exit when this process owns one, else ``None``. Best-effort: any
-    failure logs and leaves the cart without a heading hold (which is inert
-    when no yaw rates arrive).
+    Returns a :class:`~almond_axol.robot.gyro.BoardYawRateSource` the caller
+    must close on exit, or ``None``. Best-effort: any failure logs and leaves
+    the cart without a heading hold (which is inert when no yaw rates arrive,
+    and says so once the cart starts driving).
     """
     if cart is None or not cfg.cart.imu:
         return None
-    if relay is not None:
-        if "overhead" not in (cfg.cameras or {}):
-            _logger.warning(
-                "cart.imu: no 'overhead' camera configured; heading hold disabled"
-            )
-            return None
-        relay.set_yaw_callback(cart.feed_yaw_rate)
-        return None
-    # In-process fallback: stereo eyes are registered as {name}_{side} views
-    # wrapping one shared camera; walk back to the SDK handle.
-    overhead = next(
-        (
-            cam
-            for name, cam in cameras
-            if name == "overhead" or name.startswith("overhead_")
-        ),
-        None,
-    )
-    zed = getattr(getattr(overhead, "_parent", overhead), "zed", None)
     try:
-        from ..zed.imu import ZedYawRateSource
+        from ..robot.gyro import BoardYawRateSource
 
-        src = ZedYawRateSource(cart.feed_yaw_rate)
-        if zed is not None:
-            src.attach(zed)
-        elif not cfg.cameras:
-            src.open()  # sensors-only open of the stereo (overhead) ZED
-        else:
-            _logger.warning(
-                "cart.imu: the overhead camera exposes no SDK IMU handle "
-                "(mono, or failed to open); heading hold disabled"
-            )
-            return None
+        src = BoardYawRateSource(cart.feed_yaw_rate)
+        src.open()
         return src
     except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
         _logger.warning(
-            "cart.imu: could not start the ZED IMU source (%s); heading hold disabled",
+            "cart.imu: could not start the board gyro (%s); heading hold disabled",
             exc,
         )
         return None
@@ -398,7 +358,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         else:
             cameras = await asyncio.to_thread(_connect_zed_cameras, cfg, stereo_set)
             _register_zed_video(teleop, cameras)
-        imu_src = _wire_cart_imu(cfg, cart, relay, cameras)
+        imu_src = _wire_cart_imu(cfg, cart)
         try:
             await teleop.run()
         finally:
