@@ -9,8 +9,10 @@ version-fragile sysfs/debugfs nodes. ``tegrastats`` ships with every L4T and
 normalizes all of them into one line per interval, so we parse that instead.
 
 The sampler runs on its own thread, is Jetson-only (a clean no-op off-Tegra or
-when ``tegrastats`` is absent), and logs one compact INFO line per period so the
-record-start transition is visible next to the ``loop:`` / ``diag:`` lines. It
+when ``tegrastats`` is absent), and logs one compact DEBUG line per period so
+the record-start transition is visible next to the ``diag:`` lines when running
+with ``--log_level DEBUG`` (resource readouts stay out of the default INFO
+output). It
 also re-checks the engine-clock and CPU-governor pins at runtime (the boot-time
 ``axol jetson.setup`` is the only thing that sets them, and nothing verified they
 held under load).
@@ -125,7 +127,7 @@ class TegraStatsDiag(threading.Thread):
             parts.append(f"tmax={max(temps):.1f}C")
 
         parts.append("throttle=yes" if "throttl" in line.lower() else "throttle=none")
-        self._logger.info("tegra: %s", "  ".join(parts))
+        self._logger.debug("tegra: %s", "  ".join(parts))
 
     def _check_pins(self) -> None:
         """WARN if the NVENC/VIC engine clocks or CPU governor aren't pinned.
