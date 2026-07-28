@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 
@@ -40,7 +39,9 @@ class KinematicsConfig:
             applies it to *rejected* proposals (whose cost change is ~0), so a
             loose value (the old 1e-2) makes one rejected step read as
             "converged" and return the seed unchanged. Keep it small enough
-            that only genuine convergence trips it.
+            that only genuine convergence trips it: 1e-6 halves the residual
+            freeze rate at the reach boundary versus 1e-4 (the iteration
+            budget, not this tolerance, bounds the solve time).
         lambda_initial: Initial Levenberg-Marquardt damping. The per-tick solve
             re-seeds from the previous solution, so the first proposal is taken
             in a region where the linearisation may be poor (e.g. with the
@@ -54,7 +55,14 @@ class KinematicsConfig:
             many consecutive ticks (teleop froze) and then lurch once the
             accumulated target error finally made a full step acceptable. 10.0
             spans the useful damping range within the iteration budget.
-        max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call, in radians.
+        max_joint_delta: Maximum joint change per :meth:`KinematicsSolver.ik` call,
+            in radians. This bounds the release velocity of any residual solver
+            stall (stall ticks accumulate target error that is paid back at
+            this rate), so it directly caps command-velocity spikes at
+            kinematic boundaries and near shoulder singularities: 0.02 rad at
+            the ~72 Hz frame rate is ~1.4 rad/s per joint, comfortably above
+            normal tracking demand but half the old 0.0345-rad cap that let
+            catch-up sweeps hit 2.5+ rad/s on s1/s2.
         max_reach: Maximum allowed distance (m) from shoulder to end-effector target.
     """
 
@@ -68,8 +76,8 @@ class KinematicsConfig:
     self_collision_margin: float = 0.025
     self_collision_weight: float = 75.0
     max_iterations: int = 8
-    cost_tolerance: float = 1e-4
+    cost_tolerance: float = 1e-6
     lambda_initial: float = 1e-2
     lambda_factor: float = 10.0
-    max_joint_delta: float = 0.0055 * 2 * math.pi
+    max_joint_delta: float = 0.02
     max_reach: float = 0.8

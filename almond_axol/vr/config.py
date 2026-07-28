@@ -23,7 +23,12 @@ class VRServerConfig:
             consumer sees the raw latest-wins frame.
         interp_min_delay_s: Floor on the adaptive playout delay (seconds).
         interp_max_delay_s: Cap on the adaptive playout delay (seconds); bounds
-            the teleop latency added in exchange for smoothness.
+            the teleop latency added in exchange for smoothness. The delay is
+            adaptive, so this cap only matters on impaired links: it must cover
+            the wifi stall/burst lengths actually seen in the field (~250 ms),
+            or the playout buffer runs dry mid-stall and the target lurches
+            when the burst flushes. 0.35 rides through such stalls with
+            clean-link smoothness; a clean LAN still runs at ~zero added delay.
     """
 
     port: int = VR_PORT
@@ -31,4 +36,4 @@ class VRServerConfig:
     keyfile: str | None = None
     interp_enabled: bool = True
     interp_min_delay_s: float = 0.0
-    interp_max_delay_s: float = 0.1
+    interp_max_delay_s: float = 0.35

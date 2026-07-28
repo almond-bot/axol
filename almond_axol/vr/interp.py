@@ -52,7 +52,10 @@ class PoseInterpolator:
             (pure latest-wins, the original behaviour).
         min_delay_s: Floor on the playout delay (seconds).
         max_delay_s: Cap on the playout delay (seconds) — bounds the added
-            latency. Bursts longer than this still cause a small catch-up.
+            latency. Bursts longer than this still cause a small catch-up, so
+            it must cover the stall lengths seen on a bad wifi link (~250 ms);
+            the delay only grows when jitter is actually observed, so a clean
+            link runs at ~zero regardless of the cap.
         window_s: Sliding window over which arrival jitter is measured.
         max_frames: Hard cap on buffered frames (safety bound).
         pos_eps: Position change (metres) below which a re-render is considered
@@ -63,7 +66,7 @@ class PoseInterpolator:
         self,
         enabled: bool = True,
         min_delay_s: float = 0.0,
-        max_delay_s: float = 0.1,
+        max_delay_s: float = 0.35,
         window_s: float = 2.0,
         max_frames: int = 512,
         pos_eps: float = 1e-4,
