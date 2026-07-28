@@ -324,7 +324,7 @@ function EpisodeControls({
           {controls.map((c, i) => (
             <Button
               key={c.command}
-              variant={i === 0 ? "default" : armed === c.command ? "destructive" : "outline"}
+              variant={armed === c.command ? "destructive" : i === 0 ? "default" : "outline"}
               size="sm"
               onClick={() => click(c)}
             >

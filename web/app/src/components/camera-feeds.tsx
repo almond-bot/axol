@@ -91,12 +91,22 @@ export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) 
 
   // `available === false` means this socket's webrtc-request landed before the
   // op registered its video manager (or video is off). Recycle the socket on a
-  // timer so the next request can succeed once video comes up.
+  // timer so the next request can succeed once video comes up, and count the
+  // consecutive unavailable replies: the first few are the expected startup
+  // race, so only a persistent run means streaming is actually off.
+  const [unavailableRuns, setUnavailableRuns] = useState(0)
   useEffect(() => {
+    if (available === true) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setUnavailableRuns(0)
+      return
+    }
     if (available !== false) return
+    setUnavailableRuns((n) => n + 1)
     const t = setTimeout(() => wsRef.current?.close(), 5000)
     return () => clearTimeout(t)
   }, [available])
+  const videoOff = available === false && unavailableRuns >= 3
 
   const feeds = useMemo(() => selectFeeds(streams), [streams])
   // A repeatedly-failing connection is either the unaccepted self-signed cert
@@ -123,7 +133,7 @@ export function CameraFeeds({ host, vrPort }: { host: string; vrPort: number }) 
             />
           ))}
         </div>
-      ) : available === false ? (
+      ) : videoOff ? (
         <p className="flex items-center gap-2 text-xs text-white/45">
           <VideoOff className="size-3.5 shrink-0" />
           No camera stream from this operation — check that streaming is enabled in the camera
