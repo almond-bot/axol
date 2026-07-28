@@ -58,6 +58,17 @@ _logger = logging.getLogger(__name__)
 _STOP_GRACE_S = 6.0
 _FORCE_GRACE_S = 5.0
 
+# The dataset recorder subprocess (``record_proc``'s "dataset-recorder") is
+# the one child the fast kill must spare: after Stop it is *finalizing* the
+# dataset — encoding the last episode, closing the parquet writers, writing
+# meta — and a SIGKILL there leaves unreadable parquet with no error anywhere.
+# Its shutdown is already bounded on its own (``DatasetRecorderProcess.close``
+# joins for up to 180s, then terminates it with a loud log), so the watchdog
+# first kills everything else (relay, IK worker — the joins the thread is
+# usually stuck on) and gives the recorder that long before killing it too.
+_RECORDER_PROC_NAME = "dataset-recorder"
+_FINALIZE_GRACE_S = 200.0
+
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
 # own logs (``almond_axol.*``, ``can.*``, lerobot, jaxls, pyroki, etc.).
@@ -518,15 +529,29 @@ class OperationRunner:
         return True
 
     def _await_stop(self, session: Session, thread: threading.Thread | None) -> None:
-        """Wait for the op to exit, force-killing its children if it stalls."""
+        """Wait for the op to exit, force-killing its children if it stalls.
+
+        Two-phase: the fast kill spares the dataset recorder (it is finalizing
+        the dataset — killing it corrupts the parquet files), which then gets
+        its own, much longer grace before it too is killed.
+        """
         if thread is None:
             return
         thread.join(timeout=_STOP_GRACE_S)
         if thread.is_alive():
             session.emit(
                 f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
-                "force-killing the operation's child processes"
+                "force-killing the operation's child processes (sparing the "
+                "dataset recorder)"
             )
+            spared = self._kill_op_children(session, spare={_RECORDER_PROC_NAME})
+            if spared and thread.is_alive():
+                session.emit(
+                    "[serve] waiting for the dataset recorder to finalize the "
+                    f"dataset (up to {_FINALIZE_GRACE_S:.0f}s)…"
+                )
+                thread.join(timeout=_FINALIZE_GRACE_S)
+        if thread.is_alive():
             self._kill_op_children(session)
             thread.join(timeout=_FORCE_GRACE_S)
         if thread.is_alive():
@@ -539,7 +564,9 @@ class OperationRunner:
                 "abandoned — restart axol serve if it persists"
             )
 
-    def _kill_op_children(self, session: Session) -> None:
+    def _kill_op_children(
+        self, session: Session, spare: set[str] | None = None
+    ) -> bool:
         """SIGKILL every subprocess this op spawned (relay, recorder, IK worker).
 
         The worker thread blocks on these children either while tearing down
@@ -547,6 +574,10 @@ class OperationRunner:
         joins) or while starting up (waiting on the IK worker's "ready" message
         across the pipe while it compiles JAX). Killing the children makes the
         blocked join/recv return so the thread can finish.
+
+        Children whose process name is in ``spare`` are left running (the
+        dataset recorder mid-finalize). Returns ``True`` if any such child was
+        spared, so the caller knows to keep waiting for it.
         """
         # Snapshot the targets under the lock and only if this is still the
         # op being stopped: a slow watchdog could otherwise wake after the
@@ -556,13 +587,21 @@ class OperationRunner:
         # we see the swap and bail — never a mix.
         with self._lock:
             if self._session is not session:
-                return
+                return False
             targets = [
                 c
                 for c in multiprocessing.active_children()
                 if c.pid not in self._baseline_children
             ]
+        spared_any = False
         for child in targets:
+            if spare and child.name in spare:
+                session.emit(
+                    f"[serve] sparing child process {child.name} "
+                    f"(pid {child.pid}) — dataset finalize in progress"
+                )
+                spared_any = True
+                continue
             session.emit(
                 f"[serve] killing child process {child.name} (pid {child.pid})"
             )
@@ -570,6 +609,7 @@ class OperationRunner:
                 child.kill()
             except Exception as exc:  # noqa: BLE001 - best-effort
                 session.emit(f"[serve] failed to kill pid {child.pid}: {exc}")
+        return spared_any
 
     def episode_command(self, command: str) -> bool:
         """Forward an episode command (start/s/r/q) to the live op's control."""
