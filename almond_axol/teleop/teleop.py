@@ -41,8 +41,7 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
-from ..robot.cart import Cart, deadzone
-from ..robot.lift import DOWN, STOP, UP
+from ..robot.cart import Cart
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
@@ -453,40 +452,10 @@ class VRTeleop:
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
         if self._cart is not None:
-            self._update_cart(frame)
-
-    def _update_cart(self, frame) -> None:
-        """Map the frame's thumbstick state to a cart command.
-
-        Stick deflection is the deadman: the cart moves only while a stick is
-        pushed past its deadzone (or a stick click holds the lift), and it is
-        independent of the arm engage toggle — the base can be repositioned
-        without the arms mirroring, and vice versa. During a reset (X/Y press
-        or return-to-rest playback) the cart is forced to a stop so the base
-        doesn't creep while the arms replay their trajectory. Staleness is
-        handled inside :class:`Cart`: if frames stop arriving, its command
-        times out to a full stop.
-
-        Thread-safe (called from the VR server thread); ``Cart.set_command``
-        only latches the target.
-        """
-        assert self._cart is not None
-        if frame.reset or self._core.is_resetting:
-            self._cart.set_command(0.0, 0.0, 0.0, STOP)
-            return
-        dz = self._cart.config.deadzone
-        # WebXR sticks: +x right, +y pulled back → body frame +x forward,
-        # +y left, +wz CCW.
-        vx = -deadzone(frame.l_stick_y, dz)
-        vy = -deadzone(frame.l_stick_x, dz)
-        wz = -deadzone(frame.r_stick_x, dz)
-        if frame.r_stick_click and not frame.l_stick_click:
-            lift = UP
-        elif frame.l_stick_click and not frame.r_stick_click:
-            lift = DOWN
-        else:
-            lift = STOP
-        self._cart.set_command(vx, vy, wz, lift)
+            # The stick → cart mapping lives on Cart (shared with the
+            # collect-data flow). Resets force a stop so the base doesn't
+            # creep while the arms replay their return-to-rest trajectory.
+            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)

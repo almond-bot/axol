@@ -223,6 +223,19 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
             spec["stereo"] = False
         specs[name] = spec
 
+    # Cart heading hold (powered-cart robots): the overhead ZED doubles as the
+    # yaw gyro, same as native teleop. The spec flag pins that camera to the
+    # relay's SDK backend and starts the relay-side IMU poller; _run wires the
+    # samples to the cart once the teleop (which owns the cart) is connected.
+    cart_cfg = getattr(cfg.teleop_config, "cart", None)
+    if (
+        cart_cfg is not None
+        and cart_cfg.enabled
+        and cart_cfg.imu
+        and "overhead" in specs
+    ):
+        specs["overhead"]["imu"] = True
+
     relay = VideoRelayProcess(specs, want_raw=True)
     # Keep the relay if it can serve *either* branch: raw frames for the dataset
     # (the primary purpose for collect-data) or encoded streams for the headset.
@@ -475,6 +488,19 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             teleop.set_video_manager(relay)
         else:
             _register_camera_video(robot, teleop)
+
+        # Cart heading hold: feed the relay's overhead-ZED IMU samples to the
+        # cart (the spec flag was set in _start_video_relay). Only the relay
+        # path is wired — without a relay the hold stays inert (no yaw rates
+        # arrive), which the cart treats as "no gyro" rather than an error.
+        if teleop.cart is not None:
+            if use_relay and getattr(cfg.teleop_config, "cart").imu:
+                relay.set_yaw_callback(teleop.cart.feed_yaw_rate)
+            elif getattr(cfg.teleop_config, "cart").imu:
+                _logger.warning(
+                    "cart.imu: no video relay in this session; the cart runs "
+                    "without a heading hold."
+                )
     except BaseException:
         # Tear down teleop too: if a stop interrupts teleop.connect() while the
         # IK worker is still compiling JAX, its VR server thread is otherwise

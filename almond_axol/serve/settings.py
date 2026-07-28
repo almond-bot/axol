@@ -46,8 +46,9 @@ _OPS = ("teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset"
 # Dotted paths into the lerobot-based ops' shared robot config.
 _ROBOT = "robot_config"
 _AXOL = f"{_ROBOT}.axol_config"
-_VRT = "teleop_config.vr_teleop_config"
-_KIN = "teleop_config.kinematics_config"
+_TELEOP_CFG = "teleop_config"
+_VRT = f"{_TELEOP_CFG}.vr_teleop_config"
+_KIN = f"{_TELEOP_CFG}.kinematics_config"
 
 
 @dataclass(frozen=True)
@@ -213,6 +214,24 @@ SETTINGS: tuple[SettingCategory, ...] = (
                         f"{_AXOL}.left.gripper.max_speed",
                         f"{_AXOL}.right.gripper.max_speed",
                     ),
+                },
+            ),
+            SettingDef(
+                key="robot.cart_enabled",
+                label="Powered cart",
+                type="boolean",
+                help=(
+                    "This robot has the powered cart (x-drive omni base + "
+                    "telescoping lift). The headset thumbsticks then drive it "
+                    "during teleop and data collection: left stick translates, "
+                    "right stick x rotates, stick clicks run the lift. "
+                    "Operator mobility only — cart motion is never recorded "
+                    "into datasets and policies never control it. Cart "
+                    "parameters live under Advanced → Cart."
+                ),
+                targets={
+                    "teleop": ("cart.enabled",),
+                    "collect-data": (f"{_TELEOP_CFG}.cart.enabled",),
                 },
             ),
             SettingDef(
@@ -659,6 +678,13 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
         ref_op="teleop",
         ref_prefix="kinematics",
         targets={"teleop": "kinematics", "collect-data": _KIN},
+    ),
+    AdvancedSection(
+        key="cart",
+        label="Cart",
+        ref_op="teleop",
+        ref_prefix="cart",
+        targets={"teleop": "cart", "collect-data": f"{_TELEOP_CFG}.cart"},
     ),
     AdvancedSection(
         key="vr_server",

@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
-from .lift import STOP, JiecangLift
+from .lift import DOWN, STOP, UP, JiecangLift
 
 _logger = logging.getLogger(__name__)
 
@@ -155,11 +155,10 @@ class CartConfig:
                          heading error. While translating without a commanded
                          rotation, the yaw rate fed via :meth:`Cart.feed_yaw_rate`
                          is integrated into a heading error that is steered
-                         back to zero — the control law validated in
-                         ``diagnostics/base/floor_sim.py`` (GyroHold). 0
-                         disables; a *negative* gain compensates a sensor
-                         whose sign convention is inverted. Idle no-op unless
-                         yaw rates are actually fed (and fresh).
+                         back to zero. 0 disables; a *negative* gain
+                         compensates a sensor whose sign convention is
+                         inverted. Idle no-op unless yaw rates are actually
+                         fed (and fresh).
         yaw_hold_max:    Clamp on the heading-hold correction (normalized wz).
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
@@ -371,6 +370,41 @@ class Cart:
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
 
+    def apply_vr_frame(self, frame, resetting: bool = False) -> None:  # noqa: ANN001
+        """Map a headset :class:`~almond_axol.vr.models.VRFrame` to a command.
+
+        The single source of truth for the VR control mapping, shared by
+        plain teleop (``VRTeleop``) and data collection (``AxolVRTeleop``) so
+        the two flows cannot drift apart. Stick deflection is the deadman:
+        the cart moves only while a stick is pushed past its deadzone (or a
+        stick click holds the lift), independent of the arm engage toggle.
+
+        Args:
+            frame:     The incoming VR frame (only its stick fields are read).
+            resetting: True while the arms replay a reset trajectory (or the
+                       frame itself carries a reset) — forces a stop so the
+                       base doesn't creep during the return to rest.
+
+        Thread-safe (only latches the target); staleness is handled by the
+        command task, so a dead frame stream times out to a full stop.
+        """
+        if resetting or frame.reset:
+            self.set_command(0.0, 0.0, 0.0, STOP)
+            return
+        dz = self._config.deadzone
+        # WebXR sticks: +x right, +y pulled back → body frame +x forward,
+        # +y left, +wz CCW.
+        vx = -deadzone(frame.l_stick_y, dz)
+        vy = -deadzone(frame.l_stick_x, dz)
+        wz = -deadzone(frame.r_stick_x, dz)
+        if frame.r_stick_click and not frame.l_stick_click:
+            lift = UP
+        elif frame.l_stick_click and not frame.r_stick_click:
+            lift = DOWN
+        else:
+            lift = STOP
+        self.set_command(vx, vy, wz, lift)
+
     def feed_yaw_rate(self, rate: float) -> None:
         """Latch an external yaw-rate sample (rad/s, CCW positive from above).
 
@@ -468,11 +502,12 @@ class Cart:
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
 
             # Heading hold on an external yaw reference. NB: deliberately
-            # *not* torque feedback — a study of this exact plant
-            # (diagnostics/base/floor_sim.py) shows the drift mechanisms
-            # (lateral slide on an unloaded diagonal, radius-mismatch path
-            # curvature) are unobservable from wheel torque, while a gyro
-            # heading hold fixes everything fixable. While translating with
+            # *not* torque feedback — a simulation study of this exact plant
+            # showed the drift mechanisms (lateral slide on an unloaded
+            # diagonal, radius-mismatch path curvature) are unobservable from
+            # wheel torque, while a gyro heading hold fixes everything
+            # fixable (see the removed diagnostics/base/floor_sim.py in git
+            # history). While translating with
             # no commanded rotation, integrate the fed yaw rate into the
             # heading error since the stroke began and steer it out;
             # re-reference on stops and commanded turns (the operator is
