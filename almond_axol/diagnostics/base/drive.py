@@ -28,12 +28,14 @@ Run directly (pygame ships in the ``gamepad`` extra):
     uv run --extra gamepad -m almond_axol.diagnostics.base.drive
     uv run --extra gamepad -m almond_axol.diagnostics.base.drive --channel can0 --max-speed 5
     uv run --extra gamepad -m almond_axol.diagnostics.base.drive --no-can  # gamepad + lift only
+    uv run --extra gamepad -m almond_axol.diagnostics.base.drive --imu --yaw-log  # bench the heading hold
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 
 from ...robot.cart import DEFAULT_CHANNEL, WHEELS, Cart, CartConfig, deadzone
@@ -144,6 +146,8 @@ async def _run(args: argparse.Namespace) -> None:
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
         lift=not args.no_lift,
+        imu=args.imu,
+        yaw_log=args.yaw_log,
     )
     if args.no_can:
         print("--no-can: wheel motors disabled (gamepad + lift only).")
@@ -154,10 +158,26 @@ async def _run(args: argparse.Namespace) -> None:
 
     cart = Cart(config)
     await cart.enable()
+
+    # Same wiring as VR teleop (see cli/teleop.py's _wire_cart_imu): the board
+    # BMI088 feeds the heading hold; on failure the hold is simply inert.
+    imu_src = None
+    if args.imu:
+        try:
+            from ...robot.gyro import BoardYawRateSource
+
+            imu_src = BoardYawRateSource(cart.feed_yaw_rate)
+            imu_src.open()
+            print("--imu: board gyro feeding the heading hold.")
+        except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
+            print(f"--imu: could not start the board gyro ({exc}); hold disabled.")
+
     print("Cart enabled. Hold LB/RB to drive, D-pad for the lift, B to quit.")
     try:
         await _input_loop(pad, cart, height, args.deadzone)
     finally:
+        if imu_src is not None:
+            imu_src.close()
         await cart.disable()
         if height is not None:
             height.close()
@@ -229,7 +249,25 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Skip the lift entirely (the D-pad is ignored).",
     )
+    parser.add_argument(
+        "--imu",
+        action="store_true",
+        help="Feed the heading hold from the board BMI088 gyro, as VR teleop "
+        "does with --cart.imu (see almond_axol.robot.gyro).",
+    )
+    parser.add_argument(
+        "--yaw-log",
+        action="store_true",
+        help="Trace the heading hold (10 Hz state line + per-stroke drift "
+        "summary) — for diagnosing drift, usually together with --imu.",
+    )
     args = parser.parse_args(argv)
+
+    # The Cart and its yaw trace (--yaw-log) report through logging; without
+    # a handler those INFO lines would be dropped silently.
+    logging.basicConfig(
+        level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
+    )
 
     try:
         asyncio.run(_run(args))
