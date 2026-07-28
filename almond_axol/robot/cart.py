@@ -147,6 +147,20 @@ class CartConfig:
                          stick flicks so a "straight" command drives exactly
                          straight. 0 disables. Deliberate diagonals (further
                          off-axis than this) pass through unchanged.
+        imu:             Use the overhead ZED camera's IMU as the yaw
+                         reference for the heading hold (wired by teleop; see
+                         ``almond_axol.zed.imu``). Requires an ``overhead``
+                         camera and pins it to the video relay's SDK backend.
+        yaw_hold_gain:   Heading-hold feedback gain, normalized wz per rad of
+                         heading error. While translating without a commanded
+                         rotation, the yaw rate fed via :meth:`Cart.feed_yaw_rate`
+                         is integrated into a heading error that is steered
+                         back to zero — the control law validated in
+                         ``diagnostics/base/floor_sim.py`` (GyroHold). 0
+                         disables; a *negative* gain compensates a sensor
+                         whose sign convention is inverted. Idle no-op unless
+                         yaw rates are actually fed (and fresh).
+        yaw_hold_max:    Clamp on the heading-hold correction (normalized wz).
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
         hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
@@ -168,6 +182,9 @@ class CartConfig:
     turn_scale: float = 1.0
     slew: float = 1.0
     axis_snap_deg: float = 15.0
+    imu: bool = False
+    yaw_hold_gain: float = 2.0
+    yaw_hold_max: float = 0.3
     deadzone: float = 0.15
     hold_kp: float = 60.0
     hold_kd: float = 1.5
@@ -208,9 +225,14 @@ class Cart:
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
 
+        # Latest external yaw-rate sample (rad/s CCW, monotonic timestamp),
+        # written from any thread; None until a sensor feeds one.
+        self._yaw_rate: tuple[float, float] | None = None
+
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        self.yaw_correction: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
         self.park_failed: bool = False
@@ -235,7 +257,9 @@ class Cart:
         and start the command task."""
         cfg = self._config
         if cfg.lift:
-            self._lift = JiecangLift(cfg.lift_chip, cfg.lift_up_gpio, cfg.lift_down_gpio)
+            self._lift = JiecangLift(
+                cfg.lift_chip, cfg.lift_up_gpio, cfg.lift_down_gpio
+            )
             _logger.info(
                 "cart lift: %s up=GPIO%d down=GPIO%d",
                 cfg.lift_chip,
@@ -249,8 +273,7 @@ class Cart:
             # Wheel IDs 1-4 collide with the arm-bus MyActuator IDs in the
             # driver-inference table, so the Damiao protocol is forced.
             self._motors = [
-                make_driver(self._bus, w.motor_id, motor_type="damiao")
-                for w in WHEELS
+                make_driver(self._bus, w.motor_id, motor_type="damiao") for w in WHEELS
             ]
             # Widen the position-mapping range (RAM only) before enable()
             # reads it back, so multi-turn wheel positions stay valid for the
@@ -326,6 +349,7 @@ class Cart:
         the latest value; if no fresh command arrives within
         ``CartConfig.command_timeout`` the target decays to a full stop.
         """
+
         def clamp(v: float) -> float:
             return max(-1.0, min(1.0, float(v)))
 
@@ -346,6 +370,17 @@ class Cart:
 
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
+
+    def feed_yaw_rate(self, rate: float) -> None:
+        """Latch an external yaw-rate sample (rad/s, CCW positive from above).
+
+        Fed by a gyro source (e.g. the overhead ZED IMU, see
+        ``almond_axol.zed.imu``) from any thread at any rate; the command
+        task's heading hold consumes the latest sample. Samples older than
+        the staleness window are ignored, so a dead sensor simply disables
+        the hold rather than freezing a stale correction.
+        """
+        self._yaw_rate = (float(rate), time.monotonic())
 
     # ------------------------------------------------------------------
     # Command task
@@ -403,6 +438,8 @@ class Cart:
         max_delta = cfg.slew * interval
         cmd = [0.0, 0.0, 0.0]  # slewed (vx, vy, wz), normalized [-1, 1]
         hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
+        yaw_err = 0.0  # integrated heading error (rad) since the stroke start
+        yaw_bias = 0.0  # gyro bias estimate (rad/s), learned while stopped
 
         while True:
             t_iter = time.perf_counter()
@@ -427,19 +464,41 @@ class Cart:
             for i, d in enumerate(deltas):
                 cmd[i] += d
 
-            # NB: no torque-feedback "straightness" correction on purpose. A
-            # study of this exact plant (diagnostics/base/floor_sim.py) shows
-            # the x-drive geometry already pins yaw kinematically — any
-            # loaded diagonal pair constrains wz — and the yaw-weighted
-            # torque sum is ~ Iz·dwz/dt, so integrating it winds up on launch
-            # transients and then holds the base in a slow constant rotation,
-            # *adding* drift. The remaining real drift (lateral slide while a
-            # diagonal pair is unloaded, radius-mismatch path curvature) is
-            # unobservable/uncontrollable from torque alone; a heading hold
-            # needs an external yaw reference (gyro).
-            speeds = mix(cmd[0], cmd[1], cmd[2], cfg.max_speed, cfg.turn_scale)
             moving = any(abs(c) >= 1e-3 for c in cmd)
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
+
+            # Heading hold on an external yaw reference. NB: deliberately
+            # *not* torque feedback — a study of this exact plant
+            # (diagnostics/base/floor_sim.py) shows the drift mechanisms
+            # (lateral slide on an unloaded diagonal, radius-mismatch path
+            # curvature) are unobservable from wheel torque, while a gyro
+            # heading hold fixes everything fixable. While translating with
+            # no commanded rotation, integrate the fed yaw rate into the
+            # heading error since the stroke began and steer it out;
+            # re-reference on stops and commanded turns (the operator is
+            # choosing a new heading). The gyro bias is learned while the
+            # cart is stopped so it doesn't masquerade as rotation.
+            yaw_corr = 0.0
+            translating = math.hypot(cmd[0], cmd[1]) > 0.1
+            turning = abs(cmd[2]) > 0.05
+            sample = self._yaw_rate
+            if cfg.yaw_hold_gain != 0.0 and sample is not None:
+                rate, ts = sample
+                if time.monotonic() - ts > 0.3:  # sensor died: drop the hold
+                    yaw_err = 0.0
+                elif translating and not turning:
+                    yaw_err += (rate - yaw_bias) * interval
+                    yaw_corr = -cfg.yaw_hold_gain * yaw_err
+                    yaw_corr = max(-cfg.yaw_hold_max, min(cfg.yaw_hold_max, yaw_corr))
+                else:
+                    yaw_err = 0.0
+                    if not driving:
+                        yaw_bias += 0.02 * (rate - yaw_bias)
+            self.yaw_correction = yaw_corr
+
+            speeds = mix(
+                cmd[0], cmd[1], cmd[2] + yaw_corr, cfg.max_speed, cfg.turn_scale
+            )
 
             if self._lift is not None:
                 self._lift.command(lift_dir)
@@ -467,10 +526,7 @@ class Cart:
                             )
                     if hold_pos is None:
                         await asyncio.gather(
-                            *[
-                                m.set_velocity(s)
-                                for m, s in zip(self._motors, speeds)
-                            ]
+                            *[m.set_velocity(s) for m, s in zip(self._motors, speeds)]
                         )
                     self.send_failed = False
                 except asyncio.CancelledError:
