@@ -460,7 +460,9 @@ function OperatorDeck({
 
   if (!fullscreen) return <div className="flex flex-col gap-5">{body}</div>
   return (
-    <div className="fixed inset-0 z-50 flex flex-col gap-4 overflow-y-auto bg-[#0a0a0a] p-4 sm:p-6">
+    // overflow-hidden: the feed grid shrinks to the leftover height instead,
+    // so the episode state and every camera stay visible without scrolling.
+    <div className="fixed inset-0 z-50 flex flex-col gap-3 overflow-hidden bg-[#0a0a0a] p-4 sm:p-5">
       <div className="flex items-center justify-between gap-2">
         <span className="font-mono text-xs tracking-widest text-white/40 uppercase">
           {label} — operator view

@@ -195,12 +195,23 @@ export function CameraFeeds({
       </div>
 
       {feeds.length > 0 ? (
-        <div className={`grid grid-cols-2 ${expanded ? "content-start gap-3" : "gap-2"}`}>
+        <div
+          className={`grid grid-cols-2 ${expanded ? "min-h-0 flex-1 gap-3" : "gap-2"}`}
+          // In the fullscreen operator view the grid fills the remaining
+          // viewport height and splits it evenly across rows, so every feed
+          // (and the episode state above) is visible without scrolling.
+          style={
+            expanded
+              ? { gridTemplateRows: `repeat(${Math.ceil(feeds.length / 2)}, minmax(0, 1fr))` }
+              : undefined
+          }
+        >
           {feeds.map((feed) => (
             <FeedTile
               key={feed.name}
               feed={feed}
               wide={feeds.length % 2 === 1 && feed === feeds[0]}
+              fit={expanded}
             />
           ))}
         </div>
@@ -277,11 +288,29 @@ function selectFeeds(streams: CameraStreams): Feed[] {
   )
 }
 
-function FeedTile({ feed, wide }: { feed: Feed; wide: boolean }) {
+function FeedTile({ feed, wide, fit }: { feed: Feed; wide: boolean; fit: boolean }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   // Displayed aspect (width/height of the visible region). ZED streams are
   // 16:10 per eye; corrected from the track's real dimensions on metadata.
   const [aspect, setAspect] = useState(1.6)
+
+  // `fit` (the fullscreen operator view): the grid cell's height is fixed by
+  // the viewport, so size the tile to the largest aspect-true box inside the
+  // cell — like object-contain, but done by hand because the side-by-side
+  // crop needs the box itself (not just the video) at the single-eye aspect.
+  const cellRef = useRef<HTMLDivElement>(null)
+  const [cell, setCell] = useState<{ w: number; h: number } | null>(null)
+  useEffect(() => {
+    if (!fit) return
+    const el = cellRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      const r = el.getBoundingClientRect()
+      setCell({ w: r.width, h: r.height })
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [fit])
 
   useEffect(() => {
     const video = videoRef.current
@@ -292,12 +321,21 @@ function FeedTile({ feed, wide }: { feed: Feed; wide: boolean }) {
     })
   }, [feed.stream])
 
-  return (
+  const box = (
     <div
       className={`relative overflow-hidden rounded-lg border border-white/10 bg-black ${
-        wide ? "col-span-2" : ""
+        !fit && wide ? "col-span-2" : ""
       }`}
-      style={{ aspectRatio: aspect }}
+      style={
+        fit
+          ? cell
+            ? {
+                width: Math.floor(Math.min(cell.w, cell.h * aspect)),
+                height: Math.floor(Math.min(cell.w, cell.h * aspect) / aspect),
+              }
+            : { width: 0, height: 0 }
+          : { aspectRatio: aspect }
+      }
     >
       {/* For a side-by-side track the container is sized to one eye, and the
           height-fitted video is naturally twice its width — so exactly the
@@ -318,6 +356,16 @@ function FeedTile({ feed, wide }: { feed: Feed; wide: boolean }) {
       <span className="absolute bottom-1 left-1.5 rounded bg-black/60 px-1.5 py-0.5 font-mono text-[0.6rem] text-white/70">
         {feed.name.replace(/_/g, " ")}
       </span>
+    </div>
+  )
+
+  if (!fit) return box
+  return (
+    <div
+      ref={cellRef}
+      className={`flex min-h-0 min-w-0 items-center justify-center ${wide ? "col-span-2" : ""}`}
+    >
+      {box}
     </div>
   )
 }
