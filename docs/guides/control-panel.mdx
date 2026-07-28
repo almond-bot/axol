@@ -53,7 +53,7 @@ The same banner area also warns when the **control panel UI and the host backend
 
 The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
 
-- Enables the CAN interfaces, running [`can.setup`](/cli/can-setup) automatically the first time if the host hasn't been configured yet.
+- Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when the Axol Hub adapter is used and the host hasn't been configured yet. A non-hub SocketCAN adapter (chosen per arm in the **Robot** settings tab, or via the diagnostics dashboard's [CAN adapter picker](/guides/diagnostics-dashboard#choosing-can-adapters)) is brought up directly instead.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health as two rows of squares (grouped **L** / **R**): the top row is **CAN reachability**, the bottom row the motor's **error status**. Hover any square for the details (status, temperature).
 
 **Motor faults block everything.** The *N/16 motors* count only includes motors that are both reachable **and** error-free. While any motor is unreachable or reporting an error (over-temperature, over-current, stall, encoder error, …), every hardware operation's **Start** is blocked — both in the panel (a per-fault entry under *Before you can start*) and by the server itself — since driving through a faulted motor risks the arm. Sim teleop stays available.
