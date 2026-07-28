@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
-from .lift import DOWN, STOP, UP, JiecangLift
+from .lift import STOP, JiecangLift
 
 _logger = logging.getLogger(__name__)
 
