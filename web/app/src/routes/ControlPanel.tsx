@@ -870,6 +870,7 @@ export default function ControlPanel() {
           session={selectedLive ? effectiveStatus : null}
           host={viewerHost}
           viewerPort={viewerPort}
+          vrPort={hostInfo?.vrPort ?? 8000}
           startPhase={startPhase}
           policy={selectedLive ? policy : null}
           onStart={handleStart}
