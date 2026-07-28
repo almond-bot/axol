@@ -5,11 +5,7 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
-import {
-  fetchCanInterfaces,
-  type CanInterface,
-  type RobotChannels,
-} from "@/lib/supervisor"
+import { fetchCanInterfaces, type CanInterface, type RobotChannels } from "@/lib/supervisor"
 
 type ArmsMode = "both" | "left" | "right"
 
@@ -101,11 +97,10 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              Pick the SocketCAN interface of the adapter driving each arm — one adapter
-              is enough for a single arm (the other arm is then skipped everywhere). The
-              mapping is saved and applied to every diagnostic, calibration tool and
-              operation; reopen this dialog to change it. The Axol hub adapter&apos;s own
-              interfaces are the prefilled defaults.
+              Pick the SocketCAN interface of the adapter driving each arm — one adapter is enough
+              for a single arm (the other arm is then skipped everywhere). The mapping is saved and
+              applied to every diagnostic, calibration tool and operation; reopen this dialog to
+              change it. The Axol hub adapter&apos;s own interfaces are the prefilled defaults.
             </p>
           </div>
           <Button
