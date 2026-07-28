@@ -30,6 +30,7 @@ export function DiagnosticActions({
   activeSince,
   busy,
   disabled,
+  hiddenKeys,
   onLaunch,
   onStop,
 }: {
@@ -40,6 +41,11 @@ export function DiagnosticActions({
   activeSince: number | null
   busy: boolean
   disabled: boolean
+  /**
+   * Field keys the page decides for every dialog (e.g. the CAN channel
+   * arguments, injected from the configured adapter mapping at launch).
+   */
+  hiddenKeys?: string[]
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
 }) {
@@ -80,6 +86,7 @@ export function DiagnosticActions({
       {open && (
         <ActionDialog
           spec={open}
+          hideKeys={hiddenKeys}
           running={activeCommand === open.id}
           blocked={activeCommand != null && activeCommand !== open.id}
           busy={busy}

@@ -31,12 +31,13 @@ function initialMode(channels: RobotChannels | null | undefined): ArmsMode {
 }
 
 /**
- * Manual CAN interface selection for the robot link — the escape hatch when
- * the Axol hub CAN adapter (whose interfaces are named automatically by
- * `can.setup`) isn't attached and another adapter is used instead. One
- * interface is enough for a single arm; running both arms asks for both.
- * The choice is persisted on the host and reused by operations and
- * diagnostics until changed.
+ * The arm→CAN-adapter mapping for the robot link — opened from the CAN
+ * enable button (and the robot-link banners) and changeable at any time by
+ * reopening it. One interface is enough for a single arm; running both arms
+ * asks for both. Save & connect persists the mapping on the host, brings the
+ * interfaces up and (re)connects the link; every diagnostic, calibration
+ * tool and operation then follows it — an arm without an adapter is skipped
+ * automatically, and interface names never need to be retyped per run.
  */
 export function CanAdapterDialog({
   channels,
@@ -94,9 +95,11 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              The Axol hub adapter names its interfaces automatically. If it isn&apos;t
-              attached, pick the SocketCAN interface of the adapter driving each arm —
-              one adapter is enough for a single arm.
+              Pick the SocketCAN interface of the adapter driving each arm — one adapter
+              is enough for a single arm (the other arm is then skipped everywhere). The
+              mapping is saved and applied to every diagnostic, calibration tool and
+              operation; reopen this dialog to change it. The Axol hub adapter&apos;s own
+              interfaces are the prefilled defaults.
             </p>
           </div>
           <Button
@@ -159,7 +162,7 @@ export function CanAdapterDialog({
             Cancel
           </Button>
           <Button size="sm" onClick={() => onConnect(selection)} disabled={busy || !valid}>
-            {busy ? <Loader2 className="animate-spin" /> : <Plug />} Connect
+            {busy ? <Loader2 className="animate-spin" /> : <Plug />} Save &amp; connect
           </Button>
         </div>
       </Card>
