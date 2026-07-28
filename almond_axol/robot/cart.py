@@ -147,6 +147,17 @@ class CartConfig:
                          stick flicks so a "straight" command drives exactly
                          straight. 0 disables. Deliberate diagonals (further
                          off-axis than this) pass through unchanged.
+        yaw_trim_gain:   Torque-balance yaw trim: integrator gain in
+                         normalized-wz per Nm·s. Wheels in velocity mode all
+                         track their commanded speeds even with uneven ground
+                         contact, so a lightly-loaded wheel pushes less and
+                         the resulting net yaw moment curves the base without
+                         any kinematic error to observe. That moment *is*
+                         visible in the torque feedback: while translating
+                         with no commanded rotation, the yaw-weighted torque
+                         sum is integrated into a wz bias that steers against
+                         the imbalance. 0 disables.
+        yaw_trim_max:    Clamp on the accumulated yaw trim (normalized wz).
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
         hold_kp:         Position stiffness (Nm/rad) of the parked MIT hold;
@@ -168,6 +179,8 @@ class CartConfig:
     turn_scale: float = 1.0
     slew: float = 1.0
     axis_snap_deg: float = 15.0
+    yaw_trim_gain: float = 0.05
+    yaw_trim_max: float = 0.3
     deadzone: float = 0.15
     hold_kp: float = 60.0
     hold_kd: float = 1.5
@@ -208,9 +221,14 @@ class Cart:
         self._target: tuple[float, float, float, int] = (0.0, 0.0, 0.0, STOP)
         self._target_time: float = 0.0
 
+        # Latest per-wheel torque (Nm, motor frame), pushed by the feedback
+        # frames that answer each velocity command — no extra bus traffic.
+        self._torques: list[float] = [0.0] * len(WHEELS)
+
         # Introspection for status displays (updated by the command task).
         self.body_cmd: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.wheel_speeds: list[float] = [0.0] * len(WHEELS)
+        self.yaw_trim: float = 0.0
         self.lift_dir: int = STOP
         self.parked: bool = False
         self.park_failed: bool = False
@@ -271,6 +289,12 @@ class Cart:
             await asyncio.gather(
                 *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
             )
+            # Cache each wheel's torque from the feedback frame answering
+            # every velocity command (used by the yaw-trim integrator).
+            for i, m in enumerate(self._motors):
+                m.set_feedback_callback(
+                    lambda _pos, torq, i=i: self._torques.__setitem__(i, torq)
+                )
             _logger.info("cart wheels enabled on %s", cfg.channel)
 
         self._task = asyncio.create_task(self._command_loop(), name="cart-command")
@@ -403,6 +427,8 @@ class Cart:
         max_delta = cfg.slew * interval
         cmd = [0.0, 0.0, 0.0]  # slewed (vx, vy, wz), normalized [-1, 1]
         hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
+        yaw_trim = 0.0  # torque-balance wz bias (see CartConfig.yaw_trim_gain)
+        yaw_ema = 0.0  # low-passed yaw-weighted torque sum (Nm)
 
         while True:
             t_iter = time.perf_counter()
@@ -427,9 +453,33 @@ class Cart:
             for i, d in enumerate(deltas):
                 cmd[i] += d
 
-            speeds = mix(cmd[0], cmd[1], cmd[2], cfg.max_speed, cfg.turn_scale)
+            # Torque-balance yaw trim: with uneven wheel-ground contact the
+            # lightly-loaded wheel pushes less, so the yaw-weighted sum of
+            # wheel torques (the transpose of the wz mixing geometry) goes
+            # nonzero and the base curves even though every wheel tracks its
+            # commanded speed. Integrate the low-passed imbalance into a wz
+            # bias while translating straight; hold it during commanded turns
+            # (contact torques are then dominated by the turn itself) and
+            # reset it once the base stops.
+            translating = math.hypot(cmd[0], cmd[1]) > 0.1
+            turning = abs(cmd[2]) > 0.05
+            if self._motors and cfg.yaw_trim_gain != 0.0:
+                yaw_sum = sum(
+                    w.mw * WHEEL_SIGNS[w.motor_id] * t
+                    for w, t in zip(WHEELS, self._torques)
+                )
+                yaw_ema += 0.2 * (yaw_sum - yaw_ema)
+                if hold_pos is None and translating and not turning:
+                    yaw_trim -= cfg.yaw_trim_gain * yaw_ema * interval
+                    yaw_trim = max(-cfg.yaw_trim_max, min(cfg.yaw_trim_max, yaw_trim))
+
+            wz_eff = cmd[2] + (yaw_trim if translating else 0.0)
+            speeds = mix(cmd[0], cmd[1], wz_eff, cfg.max_speed, cfg.turn_scale)
             moving = any(abs(c) >= 1e-3 for c in cmd)
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
+            if not driving:
+                yaw_trim = 0.0
+                yaw_ema = 0.0
 
             if self._lift is not None:
                 self._lift.command(lift_dir)
@@ -472,6 +522,7 @@ class Cart:
 
             self.body_cmd = (cmd[0], cmd[1], cmd[2])
             self.wheel_speeds = speeds
+            self.yaw_trim = yaw_trim
             self.parked = hold_pos is not None
 
             elapsed = time.perf_counter() - t_iter
