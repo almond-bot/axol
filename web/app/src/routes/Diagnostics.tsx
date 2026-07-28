@@ -355,15 +355,20 @@ export default function Diagnostics() {
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
-  // The CAN quick buttons. `can.enable` on a non-hub adapter brings the
-  // configured interfaces up directly (`--channels …`) instead of running the
-  // hub startup script, which only knows the hub's named interfaces.
+  // The CAN quick buttons. `can.enable` runs the hub startup script only for
+  // the full hub-named pair — same rule as the server's connect bring-up
+  // (`RobotLink._uses_axol_hub`). Anything else (a one-arm setup, even
+  // hub-named, or renamed adapters) brings the configured interfaces up
+  // directly via `--channels …`.
   const launchCanCommand = (id: string) => {
     if (id === "can.enable") {
       const chans = [robot?.channels?.left, robot?.channels?.right].filter(
         (c): c is string => c != null && c !== ""
       )
-      if (chans.length > 0 && chans.some((c) => !HUB_CHANNELS.has(c))) {
+      const isHubPair =
+        new Set(chans).size === HUB_CHANNELS.size &&
+        chans.every((c) => HUB_CHANNELS.has(c))
+      if (chans.length > 0 && !isHubPair) {
         launch(id, { channels: chans.join(" ") })
         return
       }
