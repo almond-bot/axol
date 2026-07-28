@@ -24,6 +24,10 @@ class Joint(Enum):
 
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
+# The powered cart's wheel bus (its own single-channel adapter, separate from
+# the arm hub). NB: kernel interface names are capped at 15 chars (IFNAMSIZ),
+# so this can't be the more readable "can_alm_axol_base".
+CAN_BASE = "can_alm_axol_b"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 

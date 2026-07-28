@@ -1,13 +1,18 @@
 """
 axol can.setup
 
-Sets persistent CAN interface names for the Almond Axol arm CAN bus adapter
+Sets persistent CAN interface names for the Almond Axol CAN bus adapters
 and registers a root crontab @reboot entry to bring up the interfaces.
 
-The Almond Axol adapter (VID 0x1D50 / PID 0x606F) exposes two CAN channels
-on a single USB device:
+The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two CAN
+channels on a single USB device:
   channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
   channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+
+Robots on the powered cart additionally carry a single-channel candlelight
+adapter (same generic VID/PID) for the wheel bus, named can_alm_axol_b. The
+channel count tells the two apart: the hub always enumerates both channels
+under one serial, the cart adapter exactly one.
 """
 
 import re
@@ -15,7 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ...constants import CAN_LEFT, CAN_RIGHT
+from ...constants import CAN_BASE, CAN_LEFT, CAN_RIGHT
 from ...utils.sudo import run_root
 from . import driver
 
@@ -23,6 +28,7 @@ _VID = "1d50"
 _PID = "606f"
 _CAN_L = CAN_LEFT
 _CAN_R = CAN_RIGHT
+_CAN_B = CAN_BASE
 _BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
@@ -36,46 +42,68 @@ def _die(msg: str) -> None:
     sys.exit(1)
 
 
-def _detect_serials() -> list[str]:
-    """Return the serials of every attached Almond Axol CAN adapter (no prompts)."""
-    serials: list[str] = []
+def _udev_attr(info: str, attr: str) -> str:
+    """First value of ``attr`` in ``udevadm info -a`` output ('' if absent)."""
+    return next(
+        (line.split('"')[1] for line in info.splitlines() if attr in line),
+        "",
+    )
+
+
+def _scan_adapters() -> dict[str, dict]:
+    """Every attached gs_usb CAN adapter: serial -> {vid, pid, dev_ids}.
+
+    The dual-channel Axol arm hub shows up as one serial with dev_ids {0, 1};
+    a single-channel adapter (the cart's wheel-bus CANable, a UMI rig, ...)
+    as one serial with {0}. Matched on the gs_usb driver rather than a VID/PID
+    so CANable firmware variants that don't use the candlelight 1d50:606f IDs
+    still count; the Jetson's built-in mttcan controller has no USB serial and
+    is excluded either way.
+    """
+    adapters: dict[str, dict] = {}
     for iface_path in Path("/sys/class/net").glob("can*"):
         info = subprocess.run(
             ["udevadm", "info", "-a", "-p", str(iface_path)],
             capture_output=True,
             text=True,
         ).stdout
+        vid = _udev_attr(info, "ATTRS{idVendor}").lower()
+        pid = _udev_attr(info, "ATTRS{idProduct}").lower()
+        if 'DRIVERS=="gs_usb"' not in info and (vid, pid) != (_VID, _PID):
+            continue
+        serial = _udev_attr(info, "ATTRS{serial}")
+        if not serial:
+            continue
+        try:
+            dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
+        except ValueError:
+            continue
+        entry = adapters.setdefault(serial, {"vid": vid, "pid": pid, "dev_ids": set()})
+        entry["dev_ids"].add(dev_id)
+    return adapters
 
-        vid = next(
-            (
-                line.split('"')[1]
-                for line in info.splitlines()
-                if "ATTRS{idVendor}" in line
-            ),
-            "",
-        )
-        pid = next(
-            (
-                line.split('"')[1]
-                for line in info.splitlines()
-                if "ATTRS{idProduct}" in line
-            ),
-            "",
-        )
 
-        if vid.lower() == _VID and pid.lower() == _PID:
-            serial = next(
-                (
-                    line.split('"')[1]
-                    for line in info.splitlines()
-                    if "ATTRS{serial}" in line
-                ),
-                "",
-            )
-            if serial:
-                serials.append(serial)
+def _detect_serials() -> list[str]:
+    """Serials of every attached *dual-channel* Axol adapter — hub candidates.
 
-    return list(dict.fromkeys(serials))
+    Single-channel devices (the cart's wheel-bus adapter, UMI rigs) share the
+    generic VID/PID but can never be the hub, so they are excluded rather
+    than left to make the scan ambiguous.
+    """
+    return [
+        serial
+        for serial, a in _scan_adapters().items()
+        if len(a["dev_ids"]) >= 2 and (a["vid"], a["pid"]) == (_VID, _PID)
+    ]
+
+
+def _detect_base_serials(exclude: str) -> list[str]:
+    """Serials of attached single-channel adapters — cart wheel-bus candidates."""
+    return [
+        serial
+        for serial, a in _scan_adapters().items()
+        if len(a["dev_ids"]) == 1 and serial != exclude
+    ]
 
 
 def _serial_of_interface(iface: str) -> str | None:
@@ -94,8 +122,20 @@ def _serial_of_interface(iface: str) -> str | None:
     )
 
 
+def _rules_serial_for(name: str) -> str | None:
+    """The serial pinned to interface ``name`` in the written udev rules."""
+    try:
+        rules = _UDEV_RULES_FILE.read_text()
+    except OSError:
+        return None
+    match = re.search(
+        r'ATTRS\{serial\}=="([^"]+)"[^\n]*NAME="' + re.escape(name) + '"', rules
+    )
+    return match.group(1) if match else None
+
+
 def _configured_serial() -> str | None:
-    """The Axol adapter's serial as pinned by a *previous* setup, if any.
+    """The Axol hub adapter's serial as pinned by a *previous* setup, if any.
 
     Preferred over live adapter detection: other candlelight devices (e.g. a
     UMI rig's CAN adapter) share the same generic VID/PID, so a host with
@@ -106,12 +146,18 @@ def _configured_serial() -> str | None:
         serial = _serial_of_interface(iface)
         if serial:
             return serial
-    try:
-        rules = _UDEV_RULES_FILE.read_text()
-    except OSError:
-        return None
-    match = re.search(r'ATTRS\{serial\}=="([^"]+)"', rules)
-    return match.group(1) if match else None
+    return _rules_serial_for(_CAN_L) or _rules_serial_for(_CAN_R)
+
+
+def _configured_base_serial() -> str | None:
+    """The cart wheel-bus adapter's serial as pinned by a previous setup.
+
+    Never auto-detected outside the interactive ``axol can.setup`` flow: a
+    single-channel candlelight adapter is indistinguishable from unrelated
+    hardware (UMI rigs), so only a serial the operator has already confirmed
+    — a live ``can_alm_axol_b`` interface or a written udev rule — counts.
+    """
+    return _serial_of_interface(_CAN_B) or _rules_serial_for(_CAN_B)
 
 
 def _resolve_serial() -> str:
@@ -162,7 +208,7 @@ def _find_serial() -> str:
     return unique[int(idx)]
 
 
-def _write_udev_rules(serial: str) -> None:
+def _write_udev_rules(serial: str, base_serial: str | None = None) -> None:
     print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
     content = (
         f"# Almond Axol dual-channel CAN adapter\n"
@@ -172,6 +218,14 @@ def _write_udev_rules(serial: str) -> None:
         f"# Channel 1 -> right arm\n"
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
     )
+    if base_serial:
+        # Matched by serial alone: CANable firmware variants ship various
+        # VID/PIDs, and the serial already identifies the exact adapter.
+        content += (
+            f"# Powered-cart wheel bus (single-channel adapter)\n"
+            f"# Adapter serial: {base_serial}\n"
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{base_serial}", NAME="{_CAN_B}"\n'
+        )
     run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
     print("  Done.")
 
@@ -183,10 +237,14 @@ def _reload_udev() -> None:
     print("  Done.")
 
 
-def _rename_interfaces(serial: str) -> None:
+def _rename_interfaces(serial: str, base_serial: str | None = None) -> None:
     """Rename existing canX interfaces to their target names without replug."""
     print("Renaming CAN interfaces (requires sudo)...")
-    target = {0: _CAN_L, 1: _CAN_R}
+    # (adapter serial, channel dev_id) -> persistent name. The cart adapter is
+    # single-channel, so its only interface is dev_id 0.
+    target = {(serial, 0): _CAN_L, (serial, 1): _CAN_R}
+    if base_serial:
+        target[(base_serial, 0)] = _CAN_B
 
     for iface_path in Path("/sys/class/net").glob("can*"):
         iface = iface_path.name
@@ -196,31 +254,13 @@ def _rename_interfaces(serial: str) -> None:
             text=True,
         ).stdout
 
-        iface_serial = next(
-            (
-                line.split('"')[1]
-                for line in info.splitlines()
-                if "ATTRS{serial}" in line
-            ),
-            "",
-        )
-        if iface_serial != serial:
-            continue
-
-        dev_id_str = next(
-            (
-                line.split('"')[1]
-                for line in info.splitlines()
-                if "ATTR{dev_id}" in line
-            ),
-            "",
-        )
+        iface_serial = _udev_attr(info, "ATTRS{serial}")
         try:
-            dev_id = int(dev_id_str, 16)
+            dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
         except ValueError:
             continue
 
-        new_name = target.get(dev_id)
+        new_name = target.get((iface_serial, dev_id))
         if new_name is None or iface == new_name:
             continue
 
@@ -231,10 +271,10 @@ def _rename_interfaces(serial: str) -> None:
     print("  Done.")
 
 
-def _write_cron_script() -> None:
+def _write_cron_script(*, with_base: bool = False) -> None:
     print(f"Writing CAN startup script to {_CRON_SCRIPT}...")
     _CAN_DIR.mkdir(parents=True, exist_ok=True)
-    _CRON_SCRIPT.write_text(
+    script = (
         f"#!/bin/bash\n"
         f"# Bring up Almond Axol CAN interfaces\n"
         f"#\n"
@@ -254,6 +294,19 @@ def _write_cron_script() -> None:
         f'    ip link set "${{IFACE}}" up\n'
         f"done\n"
     )
+    if with_base:
+        script += (
+            f"\n# Powered-cart wheel bus: its own single-channel adapter, so no\n"
+            f"# flap-together dance — and skipped when absent, so an unplugged\n"
+            f"# cart never blocks the arm bring-up.\n"
+            f"if ip link show {_CAN_B} >/dev/null 2>&1; then\n"
+            f'    ip link set "{_CAN_B}" down 2>/dev/null || true\n'
+            f'    ip link set "{_CAN_B}" type can bitrate {_BITRATE}\n'
+            f'    ip link set "{_CAN_B}" txqueuelen {_TXQUEUELEN}\n'
+            f'    ip link set "{_CAN_B}" up\n'
+            f"fi\n"
+        )
+    _CRON_SCRIPT.write_text(script)
     _CRON_SCRIPT.chmod(0o755)
     print("  Done.")
 
@@ -382,31 +435,67 @@ def is_configured() -> bool:
     return _UDEV_RULES_FILE.exists() and _CRON_SCRIPT.exists()
 
 
-def ensure_setup(*, serial: str | None = None) -> None:
+def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -> None:
     """Run the full CAN configuration non-interactively (for the control panel).
 
-    Mirrors :func:`run` but resolves the adapter serial without prompting.
+    Mirrors :func:`run` but resolves the adapter serials without prompting.
     Each step is idempotent, so this is safe to call on a partially-configured
-    machine.
+    machine. The cart wheel-bus adapter is only ever *re*-pinned here (from a
+    previous setup's rules or a live interface); confirming a new one needs
+    the interactive flow — see :func:`_configured_base_serial`.
     """
     driver.ensure_driver()
     serial = serial or _resolve_serial()
-    _write_udev_rules(serial)
+    base_serial = base_serial or _configured_base_serial()
+    _write_udev_rules(serial, base_serial)
     _reload_udev()
-    _rename_interfaces(serial)
-    _write_cron_script()
+    _rename_interfaces(serial, base_serial)
+    _write_cron_script(with_base=base_serial is not None)
     _register_cron()
     bring_up_can()
+
+
+def _find_base_serial(hub_serial: str) -> str | None:
+    """Interactively pick the cart wheel-bus adapter, or None for no cart.
+
+    A previously pinned adapter is kept without prompting; otherwise any
+    attached single-channel candlelight adapter is offered. Opt-in ([y/N])
+    because a single-channel adapter isn't necessarily a cart — it could be
+    any other candlelight device on the host.
+    """
+    configured = _configured_base_serial()
+    if configured:
+        print(f"Cart wheel bus: keeping configured adapter (serial {configured}).")
+        return configured
+    candidates = _detect_base_serials(exclude=hub_serial)
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        prompt = (
+            f"Found a single-channel CAN adapter (serial {candidates[0]}). "
+            f"Use it as the powered cart's wheel bus ({_CAN_B})? [y/N]: "
+        )
+        return candidates[0] if input(prompt).strip().lower() == "y" else None
+    print("  Multiple single-channel CAN adapters found:")
+    for i, s in enumerate(candidates):
+        print(f"    [{i}] {s}")
+    choice = input(
+        f"  Index of the powered cart's wheel-bus adapter ({_CAN_B}), blank for none: "
+    ).strip()
+    return candidates[int(choice)] if choice else None
 
 
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     driver.ensure_driver()
     serial = _find_serial()
-    ensure_setup(serial=serial)
+    base_serial = _find_base_serial(serial)
+    ensure_setup(serial=serial, base_serial=base_serial)
 
     print()
     print("Setup complete.")
     print(f"  Left arm : {_CAN_L}")
     print(f"  Right arm: {_CAN_R}")
+    if base_serial:
+        print(f"  Cart     : {_CAN_B}")
     print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")

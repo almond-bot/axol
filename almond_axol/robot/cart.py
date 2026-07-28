@@ -48,6 +48,7 @@ import math
 import time
 from dataclasses import dataclass
 
+from ..constants import CAN_BASE
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
@@ -56,9 +57,9 @@ from .lift import DOWN, STOP, UP, Lift
 _logger = logging.getLogger(__name__)
 
 # The cart's wheels ride their own CAN interface, separate from the arm buses.
-# NB: kernel interface names are capped at 15 chars (IFNAMSIZ), so this can't
-# be the more readable "can_alm_axol_base".
-DEFAULT_CHANNEL = "can_alm_axol_b"
+# ``axol can.setup`` names the cart's adapter to this and includes it in the
+# @reboot bring-up alongside the arm channels.
+DEFAULT_CHANNEL = CAN_BASE
 
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
@@ -372,6 +373,14 @@ class Cart:
             _logger.info("cart lift: no-op driver — the lift will not move")
 
         if cfg.channel is not None:
+            # Seamless enable: bring the wheel interface up if it isn't yet
+            # (boot normally handles this via can.setup's @reboot script, but
+            # a freshly plugged adapter or a manual teardown shouldn't need a
+            # separate can.enable). A missing interface raises with its name.
+            from ..cli.can.setup import bring_up_interfaces, iface_up
+
+            if not iface_up(cfg.channel):
+                bring_up_interfaces([cfg.channel])
             self._bus = CanBus(cfg.channel)
             await self._bus.start()
             # Wheel IDs 1-4 collide with the arm-bus MyActuator IDs in the
