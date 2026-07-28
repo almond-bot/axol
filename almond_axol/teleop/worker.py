@@ -8,10 +8,12 @@ All intermediate computations stay in NumPy; the single JAX boundary is the
 
 from __future__ import annotations
 
+import logging
 import math
 import multiprocessing
 import multiprocessing.connection
 import os
+import time
 
 import jax.numpy as jnp
 import jaxlie
@@ -23,6 +25,18 @@ from ..vr.models import VRFrame
 from .config import VRTeleopConfig
 from .filter import OneEuroFilter
 from .trajectory import plan_collision_aware_trajectory
+
+_logger = logging.getLogger(__name__)
+
+# Freeze detection (see IKWorker._note_solve): warn when the solver keeps
+# returning its seed unchanged while the tracked targets move away — the
+# operator experiences the arm as stuck, then lurching once the solve breaks
+# free. Thresholds: how long the output must be frozen before warning, how far
+# the targets must have moved (so a still hand doesn't warn), and how often to
+# re-warn while the freeze persists.
+_FREEZE_WARN_AFTER_S = 0.5
+_FREEZE_MIN_TARGET_DRIFT_M = 0.005
+_FREEZE_REWARN_EVERY_S = 2.0
 
 # ---------------------------------------------------------------------------
 # NumPy-only helpers (no JAX dispatch overhead)
@@ -161,6 +175,14 @@ class IKWorker:
         self._solver.set_posture_pose(self.get_rest_q())
 
         self._active: bool = False
+        # Freeze detection state: when the last solve returned its seed
+        # unchanged, `_freeze_since` holds the wall time the freeze started and
+        # `_freeze_targets` the EE/elbow target positions at that moment, so a
+        # warning fires only when the targets kept moving away (a still hand
+        # legitimately produces an unchanged solution).
+        self._freeze_since: float | None = None
+        self._freeze_targets: np.ndarray | None = None
+        self._freeze_next_warn: float = _FREEZE_WARN_AFTER_S
         # Snap poses as (pos_3, rot_3x3) numpy tuples — no jaxlie overhead
         self._snap_ctrl: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._snap_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -216,6 +238,7 @@ class IKWorker:
         enabled = frame.l_lock and frame.r_lock
         if not enabled:
             self._active = False
+            self._clear_freeze()
             return q_current
 
         if not self._active:
@@ -279,6 +302,7 @@ class IKWorker:
 
         if not self._active:
             self._active = True
+            self._clear_freeze()
             self._engage_snap(
                 left_pos, left_rot, right_pos, right_rot, left_e, right_e, q_current
             )
@@ -310,13 +334,18 @@ class IKWorker:
             right_e - self._snap_elbow_ctrl["right"]
         )
 
-        return self._solver.ik(
+        q_new = self._solver.ik(
             q_current,
             left_pose=(tl_pos, tl_rot),
             right_pose=(tr_pos, tr_rot),
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
+        self._note_solve(
+            bool(np.array_equal(q_new, q_current)),
+            np.concatenate([tl_pos, tr_pos, elbow_l, elbow_r]),
+        )
+        return q_new
 
     def compute_reset_trajectory(
         self, q_current: np.ndarray, q_target: np.ndarray
@@ -345,6 +374,7 @@ class IKWorker:
         performs a fresh engage-snap from the current IK pose.
         """
         self._active = False
+        self._clear_freeze()
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}
@@ -355,6 +385,49 @@ class IKWorker:
         self._solver.set_posture_pose(self.get_rest_q())
 
     # -- Internal -----------------------------------------------------------
+
+    def _clear_freeze(self) -> None:
+        """Forget any in-progress freeze run (disengage / engage / reset)."""
+        self._freeze_since = None
+        self._freeze_targets = None
+        self._freeze_next_warn = _FREEZE_WARN_AFTER_S
+
+    def _note_solve(self, frozen: bool, targets: np.ndarray) -> None:
+        """Track seed-returning solves; WARN when the output freezes.
+
+        A single unchanged solution is normal (e.g. the hand is still, or the
+        target is held against a constraint). The failure mode worth flagging is
+        a *run* of solves that return the seed while the EE/elbow targets keep
+        moving away — the operator sees the arm stop responding, and the
+        accumulated error is released as a lurch once a solve finally makes
+        progress (see ``KinematicsConfig`` for the tuning that minimises this).
+
+        Args:
+            frozen: True when this solve returned ``q_current`` bit-identically.
+            targets: Concatenated EE + elbow target positions (m) of this solve,
+                used to measure how far the targets drifted during the freeze.
+        """
+        if not frozen:
+            self._clear_freeze()
+            return
+        now = time.monotonic()
+        if self._freeze_since is None or self._freeze_targets is None:
+            self._freeze_since = now
+            self._freeze_targets = targets
+            return
+        duration = now - self._freeze_since
+        drift = float(np.max(np.abs(targets - self._freeze_targets)))
+        if duration >= self._freeze_next_warn and drift >= _FREEZE_MIN_TARGET_DRIFT_M:
+            _logger.warning(
+                "IK frozen for %.1fs: solver keeps returning its seed while the "
+                "EE/elbow targets moved %.0f mm — it cannot make progress "
+                "(target likely conflicts with the self-collision margin or "
+                "joint limits); the arm holds, then catches up in a lurch when "
+                "the solve breaks free.",
+                duration,
+                drift * 1e3,
+            )
+            self._freeze_next_warn = duration + _FREEZE_REWARN_EVERY_S
 
     def _reset_pose_filters(self) -> None:
         """Clear the OneEuroFilter state for every controller and elbow stream."""

@@ -235,7 +235,9 @@ class SystemDiag(threading.Thread):
             percpu.sort()
             percpu_str = "[" + ",".join(f"{f:.0f}" for _, f in percpu) + "]"
 
-            # INFO tier: labelled procs (+ their gst children) CPU% / RSS + memory.
+            # First DEBUG tier: labelled procs (+ their gst children) CPU% /
+            # RSS + memory. Diagnostics stay out of the default INFO output;
+            # run with --log_level DEBUG to see them.
             cur_labeled = self._scan_labeled()
             lab_pct: list[tuple[float, str]] = []
             for pid, (jif, label) in cur_labeled.items():
@@ -252,7 +254,7 @@ class SystemDiag(threading.Thread):
             top_labeled = "  ".join(s for _, s in lab_pct) or "n/a"
 
             mem_avail, swap_free, swap_total = read_meminfo()
-            self._logger.info(
+            self._logger.debug(
                 "diag: cores>85%%=%d/%d sys=%.0f%% cpu%%=%s  %s  memavail=%s swap=%s/%s",
                 busy_cores,
                 ncpu,
@@ -264,8 +266,9 @@ class SystemDiag(threading.Thread):
                 _gib(swap_total),
             )
 
-            # DEBUG tier: full system-wide proc + main-thread breakdown (every
-            # /proc/<pid> + every thread of this process — too costly for INFO).
+            # Second DEBUG tier: full system-wide proc + main-thread breakdown
+            # (every /proc/<pid> + every thread of this process — costly, so
+            # still gated on the effective level before doing the scans).
             if not self._logger.isEnabledFor(logging.DEBUG):
                 continue
 
