@@ -332,6 +332,46 @@ def bring_up_can() -> None:
     )
 
 
+def iface_up(channel: str) -> bool:
+    """True when the interface exists and is administratively up (IFF_UP)."""
+    try:
+        flags = int(
+            (Path("/sys/class/net") / channel / "flags").read_text().strip(), 16
+        )
+    except (OSError, ValueError):
+        return False
+    return bool(flags & 0x1)
+
+
+def bring_up_interfaces(channels: list[str]) -> None:
+    """Configure and bring up arbitrary SocketCAN interfaces.
+
+    The non-Axol-hub counterpart of :func:`bring_up_can`, for setups running
+    on some other CAN adapter: no startup script, no udev naming, no RX-wedge
+    cycling — just per-interface bitrate / txqueuelen / up. Interfaces already
+    up are left untouched; a missing one raises ``RuntimeError`` naming it so
+    callers (CLI, control panel) can surface which channel to fix.
+    """
+    missing = [ch for ch in channels if not (Path("/sys/class/net") / ch).exists()]
+    if missing:
+        raise RuntimeError(f"CAN interface not found: {', '.join(missing)}")
+    for channel in channels:
+        if iface_up(channel):
+            print(f"  {channel}: already up.")
+            continue
+        print(f"  {channel}: bringing up at {_BITRATE} bit/s (requires sudo)...")
+        run_root(
+            ["ip", "link", "set", channel, "type", "can", "bitrate", str(_BITRATE)],
+            check=True,
+        )
+        run_root(
+            ["ip", "link", "set", channel, "txqueuelen", str(_TXQUEUELEN)],
+            check=True,
+        )
+        run_root(["ip", "link", "set", channel, "up"], check=True)
+    print("  Done.")
+
+
 def is_configured() -> bool:
     """True when persistent CAN config has been written by a prior setup.
 

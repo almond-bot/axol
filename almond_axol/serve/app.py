@@ -22,7 +22,7 @@ from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from .commands import COMMANDS, command_specs, operation_ids
 from .manager import Session, SessionManager
-from .robot_link import RobotLink
+from .robot_link import RobotLink, scoped_motor_faults
 from .runner import OperationRunner
 from .settings import SettingsStore, advanced_schema, settings_schema
 from .telemetry import DiagnosticsRunStore, TelemetryHub
@@ -71,6 +71,22 @@ class OpStartRequest(BaseModel):
     cameras: dict[str, Any] | None = None
 
 
+class RobotConnectRequest(BaseModel):
+    """Optional CAN interface selection for a robot-link connect.
+
+    ``channelsSet`` distinguishes "connect with the stored/default interfaces"
+    (an empty body) from an explicit selection. A ``None`` channel disables
+    that arm, so a single non-Axol-hub adapter can drive one arm only. The
+    selection is persisted to the shared settings
+    (``robot.left_channel`` / ``robot.right_channel``), so every operation and
+    later connects use it too.
+    """
+
+    leftChannel: str | None = None
+    rightChannel: str | None = None
+    channelsSet: bool = False
+
+
 class SettingsUpdateRequest(BaseModel):
     """Partial update of the shared operator settings (serve/settings.py).
 
@@ -116,6 +132,29 @@ def _lan_ip() -> str:
             return "127.0.0.1"
 
 
+# ARPHRD_CAN in /sys/class/net/<iface>/type — identifies CAN interfaces.
+_ARPHRD_CAN = "280"
+
+
+def _list_can_interfaces() -> list[dict[str, Any]]:
+    """Every SocketCAN network interface on this host (name + up state).
+
+    Lets the UI offer real choices when the Axol hub adapter isn't present
+    (its named interfaces missing) and the operator must pick the interface(s)
+    of whatever CAN adapter is attached instead.
+    """
+    interfaces: list[dict[str, Any]] = []
+    for iface in sorted(Path("/sys/class/net").glob("*")):
+        try:
+            if iface.joinpath("type").read_text().strip() != _ARPHRD_CAN:
+                continue
+            flags = int(iface.joinpath("flags").read_text().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        interfaces.append({"name": iface.name, "up": bool(flags & 0x1)})
+    return interfaces
+
+
 def _detect_cameras() -> dict[str, Any]:
     """Enumerate locally connected ZED cameras; never raises.
 
@@ -157,8 +196,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     manager = SessionManager()
     hub = TelemetryHub()
-    robot = RobotLink(hub=hub)
     settings = SettingsStore()
+    # The link opens the interfaces configured in the shared settings (the
+    # Axol hub's persistent names unless the operator picked others).
+    left_channel, right_channel = settings.can_channels()
+    robot = RobotLink(left_channel, right_channel, hub=hub)
     runner = OperationRunner(robot, settings=settings)
     runs = DiagnosticsRunStore(hub)
     # ZED devices are exclusive. Hold this across preview capture and operation
@@ -190,9 +232,20 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return s, runner
         return manager.get(session_id), manager
 
-    async def _motor_fault_response() -> JSONResponse | None:
-        """Return the shared motor-fault rejection, or ``None`` when clear."""
+    async def _motor_fault_response(
+        scope_args: dict[str, Any] | None = None,
+    ) -> JSONResponse | None:
+        """Return the shared motor-fault rejection, or ``None`` when clear.
+
+        ``scope_args`` (a diagnostics launch's request args) narrows the check
+        to the motors that run will actually touch — an arm/joint-scoped run
+        (guided zeroing of a joint subset, a one-arm ROM test, a single-motor
+        tool) must not be blocked by faults on motors it never drives, e.g. a
+        bench arm with only some motors on the bus.
+        """
         faults = await asyncio.to_thread(robot.motor_faults)
+        if scope_args:
+            faults = scoped_motor_faults(faults, scope_args)
         if not faults:
             return None
         detail = ", ".join(
@@ -264,13 +317,52 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def robot_status() -> dict[str, Any]:
         return robot.status()
 
-    @app.post("/api/robot/connect")
-    async def robot_connect() -> dict[str, Any]:
+    @app.post("/api/robot/connect", response_model=None)
+    async def robot_connect(
+        req: RobotConnectRequest | None = None,
+    ) -> dict[str, Any] | JSONResponse:
+        """Connect the robot link, optionally onto explicit CAN interfaces.
+
+        An explicit selection (``channelsSet``) is persisted to the shared
+        settings first; either way the link is (re)pointed at the settings'
+        channels, so an interface change takes effect on the next connect.
+        """
+        if req is not None and req.channelsSet:
+            if not req.leftChannel and not req.rightChannel:
+                return JSONResponse(
+                    {"error": "select a CAN interface for at least one arm"},
+                    status_code=400,
+                )
+            if robot.status()["state"] == "busy":
+                return JSONResponse(
+                    {"error": "cannot change CAN interfaces while a task owns the bus"},
+                    status_code=409,
+                )
+            settings.update(
+                values={
+                    "robot.left_channel": req.leftChannel or "null",
+                    "robot.right_channel": req.rightChannel or "null",
+                }
+            )
+        channels = settings.can_channels()
+        if channels != robot.channels():
+            if robot.status()["state"] == "busy":
+                return JSONResponse(
+                    {"error": "cannot change CAN interfaces while a task owns the bus"},
+                    status_code=409,
+                )
+            await asyncio.to_thread(robot.disconnect)
+            robot.set_channels(*channels)
         return await asyncio.to_thread(robot.connect)
 
     @app.post("/api/robot/disconnect")
     async def robot_disconnect() -> dict[str, Any]:
         return await asyncio.to_thread(robot.disconnect)
+
+    @app.get("/api/can/interfaces")
+    async def can_interfaces() -> dict[str, Any]:
+        """SocketCAN interfaces on this host, for the CAN adapter picker."""
+        return {"interfaces": await asyncio.to_thread(_list_can_interfaces)}
 
     @app.get("/api/robot/motors/{arm}/{joint}")
     async def robot_motor_details(arm: str, joint: str) -> JSONResponse:
@@ -360,7 +452,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
         if command.drives_motors:
-            fault_response = await _motor_fault_response()
+            fault_response = await _motor_fault_response(scope_args=req.args)
             if fault_response is not None:
                 return fault_response
 

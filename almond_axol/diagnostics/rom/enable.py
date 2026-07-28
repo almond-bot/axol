@@ -618,6 +618,8 @@ async def run_axol(
     no_right: bool = False,
     web_prompts: bool = False,
     capture: bool = True,
+    left_channel: str = CAN_LEFT,
+    right_channel: str = CAN_RIGHT,
 ) -> None:
     run_left = not no_left
     run_right = not no_right
@@ -650,8 +652,8 @@ async def run_axol(
         config.right.gripper.torque_limit = GRIPPER_TORQUE_LIMIT
     axol = Axol(
         config=config,
-        left_channel=None if no_left else CAN_LEFT,
-        right_channel=None if no_right else CAN_RIGHT,
+        left_channel=None if no_left else left_channel,
+        right_channel=None if no_right else right_channel,
     )
     robot = HardwareController(axol, present)
     await robot.enable()
@@ -808,6 +810,20 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
+        "--left-channel",
+        default=CAN_LEFT,
+        metavar="IFACE",
+        help="SocketCAN interface for the left arm, for setups without the "
+        "Axol hub CAN adapter (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--right-channel",
+        default=CAN_RIGHT,
+        metavar="IFACE",
+        help="SocketCAN interface for the right arm, for setups without the "
+        "Axol hub CAN adapter (default: %(default)s).",
+    )
+    parser.add_argument(
         "--web-prompts",
         action="store_true",
         help="Emit '[prompt] ...' markers and block on stdin for hands-on "
@@ -845,6 +861,8 @@ def run_cli(args: argparse.Namespace) -> None:
             no_right=args.no_right,
             web_prompts=args.web_prompts,
             capture=not args.no_capture,
+            left_channel=args.left_channel,
+            right_channel=args.right_channel,
         )
     )
 

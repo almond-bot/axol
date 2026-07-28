@@ -137,7 +137,14 @@ async function json<T>(res: Response): Promise<T> {
     const body = await res.json().catch(() => ({}))
     throw new Error((body as { error?: string }).error ?? `HTTP ${res.status}`)
   }
-  return res.json() as Promise<T>
+  // A non-JSON 200 means whatever answered isn't axol serve (typically the
+  // static site itself when no host is configured, answering index.html for
+  // /api/*) — say that instead of surfacing a JSON SyntaxError.
+  try {
+    return (await res.json()) as T
+  } catch {
+    throw new Error("the host did not answer like an axol serve host — set the axol host address")
+  }
 }
 
 export interface ServerInfo {
@@ -223,6 +230,12 @@ export interface MotorFault {
   temperature: number | null
 }
 
+/** The CAN interfaces the robot link opens; null = that arm is disabled. */
+export interface RobotChannels {
+  left: string | null
+  right: string | null
+}
+
 export interface RobotStatus {
   state: RobotState
   connected: boolean
@@ -233,6 +246,8 @@ export interface RobotStatus {
   reachableCount: number
   /** Faulted motors while connected (server-computed); [] otherwise. */
   faults?: MotorFault[]
+  /** Configured CAN interfaces (older hosts omit this). */
+  channels?: RobotChannels
 }
 
 /** Short display label for a fault, e.g. "L elbow — over temperature (78°C)". */
@@ -247,12 +262,37 @@ export async function fetchRobotStatus(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/status")))
 }
 
-export async function robotConnect(): Promise<RobotStatus> {
-  return json(await fetch(apiUrl("/api/robot/connect"), { method: "POST" }))
+/**
+ * Connect the robot link. An explicit `channels` selection (the CAN adapter
+ * picker, used when the Axol hub adapter isn't present) is persisted on the
+ * host and reused by every later connect and operation; omit it to connect
+ * with the stored/default interfaces.
+ */
+export async function robotConnect(channels?: RobotChannels): Promise<RobotStatus> {
+  const init: RequestInit = { method: "POST" }
+  if (channels) {
+    init.headers = { "Content-Type": "application/json" }
+    init.body = JSON.stringify({
+      leftChannel: channels.left,
+      rightChannel: channels.right,
+      channelsSet: true,
+    })
+  }
+  return json(await fetch(apiUrl("/api/robot/connect"), init))
 }
 
 export async function robotDisconnect(): Promise<RobotStatus> {
   return json(await fetch(apiUrl("/api/robot/disconnect"), { method: "POST" }))
+}
+
+/** One SocketCAN interface on the serve host. */
+export interface CanInterface {
+  name: string
+  up: boolean
+}
+
+export async function fetchCanInterfaces(): Promise<{ interfaces: CanInterface[] }> {
+  return json(await fetch(apiUrl("/api/can/interfaces")))
 }
 
 // ---------------------------------------------------------------------------

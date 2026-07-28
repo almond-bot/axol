@@ -20,7 +20,6 @@ import asyncio
 import logging
 import threading
 import time
-from pathlib import Path
 from typing import Any
 
 from ..constants import CAN_LEFT, CAN_RIGHT
@@ -47,9 +46,6 @@ STATE_CONNECTING = "connecting"
 STATE_CONNECTED = "connected"
 STATE_BUSY = "busy"
 STATE_ERROR = "error"
-
-# IFF_UP flag in /sys/class/net/<iface>/flags (administratively up).
-_IFF_UP = 0x1
 
 
 # Motor status names that are healthy at idle: OK, or DISABLED (motors sit
@@ -84,6 +80,57 @@ def motor_faults(
                 "temperature": m.get("temperature"),
             }
         )
+    return faults
+
+
+def _flag(value: Any) -> bool:
+    """A submitted form flag: real booleans or the string \"true\"."""
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _joint_name_for_id(value: Any) -> str | None:
+    """Joint name for a motor CAN id (0x01–0x08 in Joint order), else None."""
+    try:
+        motor_id = int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+    joints = list(Joint)
+    if 1 <= motor_id <= len(joints):
+        return joints[motor_id - 1].name
+    return None
+
+
+def scoped_motor_faults(
+    faults: list[dict[str, Any]], args: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Filter faults down to the motors a command launch will actually touch.
+
+    Keys off the shared argument conventions of the motor-driving diagnostics:
+    the ``arm`` selector (``--l``/``--r``), the ROM tests' ``no_left`` /
+    ``no_right`` skips, a ``joints`` subset, and a single motor ``id``
+    (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
+    with only some motors on the bus can then run a scoped test without the
+    absent motors' "unreachable" faults blocking the launch — while faults on
+    the motors the run *does* drive still block it.
+    """
+    arm = str(args.get("arm") or "").strip().lower()
+    if arm in ("left", "right"):
+        faults = [f for f in faults if f["arm"] == arm]
+    if _flag(args.get("no_left")):
+        faults = [f for f in faults if f["arm"] != "left"]
+    if _flag(args.get("no_right")):
+        faults = [f for f in faults if f["arm"] != "right"]
+
+    joint_names: set[str] | None = None
+    joints = args.get("joints")
+    if isinstance(joints, str) and joints.strip():
+        joint_names = {p.strip().upper() for p in joints.split(",") if p.strip()}
+    elif not _flag(args.get("guided")):
+        joint = _joint_name_for_id(args.get("id") or args.get("current_id"))
+        if joint is not None:
+            joint_names = {joint}
+    if joint_names is not None:
+        faults = [f for f in faults if f["joint"].upper() in joint_names]
     return faults
 
 
@@ -313,6 +360,34 @@ class RobotLink:
         """Current motor faults (see :func:`motor_faults`); [] when not connected."""
         return self.status()["faults"]
 
+    def channels(self) -> tuple[str | None, str | None]:
+        """The (left, right) CAN interfaces the link opens; None = arm disabled."""
+        left = next((a.channel for a in self._arms if a.side == "left"), None)
+        right = next((a.channel for a in self._arms if a.side == "right"), None)
+        return left, right
+
+    def set_channels(self, left_channel: str | None, right_channel: str | None) -> None:
+        """Swap the CAN interfaces the link uses (e.g. a non-Axol-hub adapter).
+
+        A ``None`` channel disables that arm, so a single-adapter setup can run
+        one arm only. No-op when nothing changes; raises ``RuntimeError`` while
+        the link (or a task borrowing its bus) is up, since the open buses
+        belong to the old interfaces.
+        """
+        if self.channels() == (left_channel, right_channel):
+            return
+        with self._lock:
+            if self._state not in (STATE_DISCONNECTED, STATE_ERROR):
+                raise RuntimeError(
+                    "disconnect the robot link before changing CAN interfaces"
+                )
+            self._arms = []
+            if left_channel:
+                self._arms.append(_ArmLink(left_channel, "left"))
+            if right_channel:
+                self._arms.append(_ArmLink(right_channel, "right"))
+        self.hub.clear_slow()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             state = self._state
@@ -333,11 +408,13 @@ class RobotLink:
                     }
                 )
         reachable = sum(1 for m in motors if m["reachable"])
+        left_channel, right_channel = self.channels()
         return {
             "state": state,
             "connected": state in (STATE_CONNECTED, STATE_BUSY),
             "error": error,
             "lastPing": last_ping,
+            "channels": {"left": left_channel, "right": right_channel},
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
@@ -432,19 +509,33 @@ class RobotLink:
 
     def _can_already_up(self) -> bool:
         """True when every CAN interface is administratively up (no sudo needed)."""
+        from ..cli.can.setup import iface_up
+
         if not self._arms:
             return False
-        for arm in self._arms:
-            try:
-                flags = int(
-                    Path(f"/sys/class/net/{arm.channel}/flags").read_text().strip(),
-                    16,
-                )
-            except (OSError, ValueError):
-                return False
-            if not (flags & _IFF_UP):
-                return False
-        return True
+        return all(iface_up(arm.channel) for arm in self._arms)
+
+    def _uses_axol_hub(self) -> bool:
+        """True when the link runs on the Axol hub's persistently-named pair.
+
+        Anything else — a renamed single adapter, a one-arm setup, a generic
+        ``can0`` — is a custom configuration whose bring-up must not run the
+        hub-specific ``can.setup`` (udev rules, interface renames, RX-wedge
+        recovery), just plain SocketCAN interface configuration.
+        """
+        return {arm.channel for arm in self._arms} == {CAN_LEFT, CAN_RIGHT}
+
+    def _enable_custom_can(self) -> None:
+        """Bring up user-chosen CAN interfaces (no Axol hub adapter present).
+
+        The interfaces must already exist; a missing one is reported by name
+        so the operator can pick another in the UI. Interfaces that are down
+        are configured (bitrate, txqueuelen) and brought up; ones already up
+        are left untouched. Shared with ``axol can.enable --channels``.
+        """
+        from ..cli.can.setup import bring_up_interfaces
+
+        bring_up_interfaces([arm.channel for arm in self._arms])
 
     def _enable_can(self) -> None:
         """Bring up the CAN interfaces.
@@ -471,8 +562,17 @@ class RobotLink:
 
         ``axol serve`` runs as root under the hosted install, so the privileged
         steps inside :func:`ensure_setup` run without a sudo prompt.
+
+        Custom (non-Axol-hub) interfaces skip all of that: they just need to
+        exist and be up (see :meth:`_enable_custom_can`).
         """
         from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
+
+        if not self._arms:
+            raise RuntimeError("No CAN interfaces configured")
+        if not self._uses_axol_hub():
+            self._enable_custom_can()
+            return
 
         if self._can_already_up():
             if rx_alive():

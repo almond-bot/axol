@@ -13,6 +13,7 @@ import {
   DiagnosticActions,
   type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
+import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
 import {
   TelemetryChart,
   type ChartSeries,
@@ -23,6 +24,7 @@ import {
   fetchCommands,
   fetchRobotStatus,
   fetchSessions,
+  flattenFields,
   robotConnect,
   sendSessionInput,
   setServerBase,
@@ -30,6 +32,7 @@ import {
   useSessionLogs,
   type CommandSpec,
   type FormValue,
+  type RobotChannels,
   type RobotState,
   type RobotStatus,
   type SessionInfo,
@@ -73,6 +76,14 @@ const STATE_BADGE: Record<
 // adoption effect) so its Stop button shows on any browser, not just the tab
 // that started it.
 const PAGE_COMMAND_IDS = ["can.setup", "can.enable", "motor.set-can-id", "motor.set-zero-pos"]
+
+// The Axol hub adapter's persistent interface names (created by can.setup).
+// A configured channel equal to its hub default is omitted from launches so
+// the commands run their own defaults.
+const HUB: Record<"left" | "right", string> = {
+  left: "can_alm_axol_l",
+  right: "can_alm_axol_r",
+}
 
 /**
  * Motor diagnostics dashboard: live per-motor status (health, temperature,
@@ -225,11 +236,45 @@ export default function Diagnostics() {
     return () => clearTimeout(t)
   }, [activeRun, activeStatus, commands, refreshRuns, toast])
 
+  // Fold the configured left/right adapter mapping (set in the CAN enable
+  // dialog, persisted on the host) into every launch, keyed by which channel
+  // arguments the command accepts: the two-arm tests get per-arm interface
+  // overrides plus a --no-left/--no-right skip for an arm with no adapter;
+  // the single-arm tools get --channel for whichever arm the dialog picked.
+  // Interface names never need to be typed into a run dialog.
+  const channelArgs = useCallback(
+    (command: string, args: Record<string, FormValue>): Record<string, FormValue> => {
+      const spec = commands.find((c) => c.id === command)
+      const channels = robot?.channels
+      if (!spec || !channels) return {}
+      const keys = new Set(flattenFields(spec.schema).map((f) => f.key))
+      const out: Record<string, FormValue> = {}
+      if (keys.has("left_channel")) {
+        if (channels.left && channels.left !== HUB.left) out.left_channel = channels.left
+        if (!channels.left && keys.has("no_left")) out.no_left = true
+      }
+      if (keys.has("right_channel")) {
+        if (channels.right && channels.right !== HUB.right) out.right_channel = channels.right
+        if (!channels.right && keys.has("no_right")) out.no_right = true
+      }
+      if (keys.has("channel") && keys.has("arm")) {
+        const side: "left" | "right" = args.arm === "right" ? "right" : "left"
+        const chan = channels[side]
+        if (chan && chan !== HUB[side]) out.channel = chan
+      }
+      return out
+    },
+    [commands, robot]
+  )
+
   const launch = useCallback(
     async (command: string, args: Record<string, FormValue>) => {
       setLaunchBusy(true)
       try {
-        const { run, session } = await startDiagnosticsRun(command, args)
+        const { run, session } = await startDiagnosticsRun(command, {
+          ...args,
+          ...channelArgs(command, args),
+        })
         setActiveRun({ command, session })
         if (run) setRuns((prev) => [run, ...prev])
       } catch (e) {
@@ -238,7 +283,7 @@ export default function Diagnostics() {
         setLaunchBusy(false)
       }
     },
-    [toast]
+    [toast, channelArgs]
   )
 
   const continuePrompt = useCallback(async () => {
@@ -276,6 +321,25 @@ export default function Diagnostics() {
       setRobotBusy(false)
     }
   }, [toast])
+
+  // Manual CAN interface selection — the fallback when the Axol hub adapter
+  // (and its auto-named interfaces) can't be found. The server persists the
+  // choice, so later connects and operations reuse it.
+  const [adapterOpen, setAdapterOpen] = useState(false)
+  const connectWithChannels = useCallback(
+    async (channels: RobotChannels) => {
+      setRobotBusy(true)
+      try {
+        setRobot(await robotConnect(channels))
+        setAdapterOpen(false)
+      } catch (e) {
+        toast.error(String(e))
+      } finally {
+        setRobotBusy(false)
+      }
+    },
+    [toast]
+  )
 
   // Auto-connect the robot link once after the host comes online if it's
   // sitting idle — same one-shot latch as the control panel, so a manual
@@ -328,6 +392,24 @@ export default function Diagnostics() {
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
+  // The configured arm→adapter mapping drives the whole page: the only arm
+  // with an adapter (single-arm setups) is pre-picked in the calibration
+  // tools, and channel fields never appear in run dialogs — they're injected
+  // by `channelArgs`. `no_left`/`no_right` stay visible only for arms that
+  // have an adapter (skipping a configured arm is still a per-run choice).
+  const onlySide: ArmSide | null =
+    robot?.channels && robot.channels.left && !robot.channels.right
+      ? "left"
+      : robot?.channels && robot.channels.right && !robot.channels.left
+        ? "right"
+        : null
+  const configHiddenKeys = useMemo(() => {
+    const keys = ["left_channel", "right_channel", "channel"]
+    if (robot?.channels && !robot.channels.left) keys.push("no_left")
+    if (robot?.channels && !robot.channels.right) keys.push("no_right")
+    return keys
+  }, [robot])
+
   // Adopt a diagnostics/CAN run that's already in flight so its Stop button,
   // live output and Continue prompt appear on *any* browser — not just the tab
   // that launched it. Without this, opening the dashboard on a second computer
@@ -373,6 +455,8 @@ export default function Diagnostics() {
     icon: typeof Tag
     description?: string
     modes?: ActionMode[]
+    /** Restrict the `--joints` picker's choices for this tool's dialog. */
+    pickerJoints?: readonly JointName[]
   }[] = [
     {
       key: "set-can-id",
@@ -385,6 +469,9 @@ export default function Diagnostics() {
       command: "motor.set-zero-pos",
       label: "Set zero position",
       icon: Crosshair,
+      // The gripper is absent from the guided picker: it self-calibrates
+      // against its hard stops at enable time and has no zero to set.
+      pickerJoints: JOINTS.filter((j) => j !== "GRIPPER"),
       modes: [
         {
           key: "single",
@@ -392,14 +479,14 @@ export default function Diagnostics() {
           description:
             "Set one motor's zero to its current mechanical position (persisted to " +
             "flash). Damiao motors need a power cycle afterwards.",
-          hideKeys: ["guided"],
+          hideKeys: ["guided", "joints"],
         },
         {
           key: "guided",
           label: "Guided",
           description:
-            "Walk every joint of one arm and zero each against its closer end stop — " +
-            "each step pauses with instructions and a Continue button.",
+            "Walk the selected joints of one arm and zero each against its closer " +
+            "end stop — each step pauses with instructions and a Continue button.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },
@@ -434,19 +521,44 @@ export default function Diagnostics() {
       <main className="safe-x mx-auto flex max-w-6xl flex-col gap-8 py-6 pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:py-8">
         {/* Robot link gate */}
         {robot && robot.state === "disconnected" && (
-          <div className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
             <p className="text-sm text-white/60">
               The robot link is disconnected — connect to start streaming motor telemetry.
             </p>
-            <Button size="sm" className="ml-auto" onClick={connectRobot} disabled={robotBusy}>
-              {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect robot
-            </Button>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setAdapterOpen(true)}
+                disabled={robotBusy}
+                title="Pick the CAN interface(s) to use when the Axol hub adapter isn't attached."
+              >
+                <Cable /> CAN adapter…
+              </Button>
+              <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
+                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect robot
+              </Button>
+            </div>
           </div>
         )}
         {robot?.state === "error" && robot.error && (
-          <p className="rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3 text-xs text-red-200/80">
-            {robot.error}
-          </p>
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-red-400/25 bg-red-400/[0.05] p-3">
+            <p className="text-xs text-red-200/80">{robot.error}</p>
+            <div className="ml-auto flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setAdapterOpen(true)}
+                disabled={robotBusy}
+                title="If the Axol hub CAN adapter can't be found, pick the interface(s) of the adapter you're using instead."
+              >
+                <Cable /> Choose CAN adapter
+              </Button>
+              <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
+                {robotBusy ? <Loader2 className="animate-spin" /> : null} Retry
+              </Button>
+            </div>
+          </div>
         )}
 
         {/* Motor status */}
@@ -463,16 +575,30 @@ export default function Diagnostics() {
                 const cmd = canCommand(id)
                 if (!cmd) return null
                 const running = activeRun?.command === id
+                // CAN enable is the page's home for the arm→adapter mapping:
+                // it opens the adapter dialog, whose Save & connect persists
+                // the choice and brings the interfaces up. Reopen it any time
+                // to remap. can.setup stays a direct launch (hub provisioning
+                // with visible output).
+                const onClick = running
+                  ? stopActive
+                  : id === "can.enable"
+                    ? () => setAdapterOpen(true)
+                    : () => launch(id, {})
                 return (
                   <Button
                     key={id}
                     variant="outline"
                     size="sm"
-                    title={cmd.description}
+                    title={
+                      id === "can.enable"
+                        ? "Choose which CAN adapter drives each arm (or a single arm) and bring the interfaces up. The mapping is saved and applied to every diagnostic and calibration run."
+                        : cmd.description
+                    }
                     disabled={
                       !serverOk || launchBusy || busyElsewhere || (activeRun != null && !running)
                     }
-                    onClick={() => (running ? stopActive() : launch(id, {}))}
+                    onClick={onClick}
                   >
                     {running ? (
                       <Loader2 className="animate-spin" />
@@ -627,6 +753,7 @@ export default function Diagnostics() {
             activeSince={activeRun?.session.startedAt ?? null}
             busy={launchBusy}
             disabled={!serverOk || busyElsewhere}
+            hiddenKeys={configHiddenKeys}
             onLaunch={launch}
             onStop={stopActive}
           />
@@ -643,6 +770,11 @@ export default function Diagnostics() {
           title={openTool.label}
           description={openTool.description}
           modes={openTool.modes}
+          pickerJoints={openTool.pickerJoints}
+          // The adapter mapping decides the interface (injected at launch);
+          // a single-arm config also decides the arm.
+          hideKeys={configHiddenKeys}
+          presetArgs={onlySide ? { arm: onlySide } : undefined}
           running={activeRun?.command === openTool.command}
           blocked={activeRun != null && activeRun.command !== openTool.command}
           busy={launchBusy}
@@ -653,6 +785,16 @@ export default function Diagnostics() {
           }}
           onStop={stopActive}
           onClose={() => setMotorTool(null)}
+        />
+      )}
+
+      {/* Manual CAN interface selection (non-Axol-hub adapters) */}
+      {adapterOpen && (
+        <CanAdapterDialog
+          channels={robot?.channels}
+          busy={robotBusy}
+          onConnect={connectWithChannels}
+          onClose={() => setAdapterOpen(false)}
         />
       )}
 
