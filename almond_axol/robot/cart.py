@@ -156,7 +156,11 @@ class CartConfig:
                          visible in the torque feedback: while translating
                          with no commanded rotation, the yaw-weighted torque
                          sum is integrated into a wz bias that steers against
-                         the imbalance. 0 disables.
+                         the imbalance. The bias is retained across stops —
+                         the imbalance is a chassis/floor property, so a
+                         relaunch starts already corrected instead of
+                         re-learning it (and drifting) every launch.
+                         0 disables.
         yaw_trim_max:    Clamp on the accumulated yaw trim (normalized wz).
         deadzone:        Stick deadzone (fraction of full deflection) applied
                          by input frontends (VR thumbsticks, gamepad).
@@ -179,7 +183,7 @@ class CartConfig:
     turn_scale: float = 1.0
     slew: float = 1.0
     axis_snap_deg: float = 15.0
-    yaw_trim_gain: float = 0.05
+    yaw_trim_gain: float = 0.15
     yaw_trim_max: float = 0.3
     deadzone: float = 0.15
     hold_kp: float = 60.0
@@ -459,27 +463,31 @@ class Cart:
             # nonzero and the base curves even though every wheel tracks its
             # commanded speed. Integrate the low-passed imbalance into a wz
             # bias while translating straight; hold it during commanded turns
-            # (contact torques are then dominated by the turn itself) and
-            # reset it once the base stops.
+            # (contact torques are then dominated by the turn itself). The
+            # accumulated bias is *kept* across stops — the imbalance is a
+            # chassis/floor property, so relaunching with the learned trim
+            # already applied is what makes the launch straight instead of
+            # drifting while the correction re-winds. Only the torque filter
+            # is reset at rest: parked feedback frames carry position-hold
+            # torques, not drive torques.
             translating = math.hypot(cmd[0], cmd[1]) > 0.1
             turning = abs(cmd[2]) > 0.05
             if self._motors and cfg.yaw_trim_gain != 0.0:
-                yaw_sum = sum(
-                    w.mw * WHEEL_SIGNS[w.motor_id] * t
-                    for w, t in zip(WHEELS, self._torques)
-                )
-                yaw_ema += 0.2 * (yaw_sum - yaw_ema)
                 if hold_pos is None and translating and not turning:
+                    yaw_sum = sum(
+                        w.mw * WHEEL_SIGNS[w.motor_id] * t
+                        for w, t in zip(WHEELS, self._torques)
+                    )
+                    yaw_ema += 0.2 * (yaw_sum - yaw_ema)
                     yaw_trim -= cfg.yaw_trim_gain * yaw_ema * interval
                     yaw_trim = max(-cfg.yaw_trim_max, min(cfg.yaw_trim_max, yaw_trim))
+                elif not translating:
+                    yaw_ema = 0.0
 
             wz_eff = cmd[2] + (yaw_trim if translating else 0.0)
             speeds = mix(cmd[0], cmd[1], wz_eff, cfg.max_speed, cfg.turn_scale)
             moving = any(abs(c) >= 1e-3 for c in cmd)
             driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
-            if not driving:
-                yaw_trim = 0.0
-                yaw_ema = 0.0
 
             if self._lift is not None:
                 self._lift.command(lift_dir)
