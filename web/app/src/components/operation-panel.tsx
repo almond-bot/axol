@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
 import {
   AlertTriangle,
   ExternalLink,
@@ -15,6 +15,7 @@ import {
   perRunFields,
   type CameraSpec,
   type CommandSpec,
+  type EpisodeControlSpec,
   type FormValue,
   type OperationMeta,
   type PolicyState,
@@ -23,6 +24,7 @@ import {
 } from "@/lib/supervisor"
 import { CuratedForm } from "@/components/config-form"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
+import { CameraFeeds } from "@/components/camera-feeds"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -50,6 +52,7 @@ export function OperationPanel({
   session,
   host,
   viewerPort,
+  vrPort,
   startPhase,
   policy,
   onStart,
@@ -71,6 +74,8 @@ export function OperationPanel({
   session: SessionInfo | null
   host: string
   viewerPort: number
+  /** VR/teleop WebSocket port on the serve host (camera-feed signaling). */
+  vrPort: number
   /** Progress label shown on the Start button while preparing (e.g. camera check). */
   startPhase: string | null
   /** run-policy episode phase/count (null unless run-policy is the live op). */
@@ -214,6 +219,10 @@ export function OperationPanel({
                 <EpisodeControls policy={policy} onEpisode={onEpisode} />
               )}
 
+              {/* Headset-driven ops stream their cameras over WebRTC; mirror
+                  the feeds here so a session can run with the headset off. */}
+              {meta.usesHeadset && live && !isSim && <CameraFeeds host={host} vrPort={vrPort} />}
+
               <RunningHints
                 usesHeadset={meta.usesHeadset}
                 session={live ? session : null}
@@ -229,6 +238,39 @@ export function OperationPanel({
   )
 }
 
+/** How long an armed confirm button waits for its second click (ms). */
+const CONFIRM_ARM_MS = 5000
+
+/**
+ * The panel's built-in run-policy button set, used when the server's snapshot
+ * doesn't carry its own `controls` (hosts predating server-driven controls).
+ */
+function legacyControls(phase: string): EpisodeControlSpec[] {
+  if (phase === "ready") return [{ command: "start", label: "Start episode" }]
+  if (phase === "recording" || phase === "deciding") {
+    return [
+      { command: "s", label: "Save" },
+      { command: "r", label: "Discard" },
+    ]
+  }
+  return []
+}
+
+function legacyStatus(phase: string): string {
+  switch (phase) {
+    case "recording":
+      return "Recording — Save to keep, Discard to re-record."
+    case "deciding":
+      return "Time cap reached — Save to keep, Discard to re-record."
+    case "ready":
+      return "Reset the scene, then start the episode."
+    case "resetting":
+      return "Returning to rest…"
+    default:
+      return "Preparing…"
+  }
+}
+
 function EpisodeControls({
   policy,
   onEpisode,
@@ -237,20 +279,34 @@ function EpisodeControls({
   onEpisode: (command: string) => void
 }) {
   const phase = policy?.phase ?? "preparing"
-  const ready = phase === "ready" // between-episode gate: start the next episode
-  // Episode in flight, or the safety-cap decision after it — Save/Discard apply.
-  const canChoose = phase === "recording" || phase === "deciding"
-  // Status line so both the initiator and any other computer see what's happening.
-  const status =
-    phase === "recording"
-      ? "Recording — Save to keep, Discard to re-record."
-      : phase === "deciding"
-        ? "Time cap reached — Save to keep, Discard to re-record."
-        : phase === "ready"
-          ? "Reset the scene, then start the episode."
-          : phase === "resetting"
-            ? "Returning to rest…"
-            : "Preparing…"
+  // Server-driven status/buttons when the op provides them (mirrors what the
+  // headset HUD would show, so a session can be driven with the headset off);
+  // the built-in run-policy set otherwise.
+  const controls = policy?.controls ?? legacyControls(phase)
+  const status = policy?.message ?? legacyStatus(phase)
+  // Which confirm-gated command is armed and awaiting its second click — the
+  // panel's stand-in for the headset's double-press save/discard confirmation.
+  const [armed, setArmed] = useState<string | null>(null)
+  useEffect(() => {
+    if (armed == null) return
+    const t = setTimeout(() => setArmed(null), CONFIRM_ARM_MS)
+    return () => clearTimeout(t)
+  }, [armed])
+  // A phase change invalidates a pending confirmation (the episode moved on).
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setArmed(null)
+  }, [phase])
+
+  function click(control: EpisodeControlSpec) {
+    if (control.confirm && armed !== control.command) {
+      setArmed(control.command)
+      return
+    }
+    setArmed(null)
+    onEpisode(control.command)
+  }
+
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
       <div className="flex items-center justify-between gap-2">
@@ -258,21 +314,25 @@ function EpisodeControls({
           Episode control
         </span>
         <span className="font-mono text-[0.65rem] text-white/40">
+          {policy?.episode != null && <span className="mr-2">episode {policy.episode}</span>}
           {policy?.episodesRecorded ?? 0} saved
         </span>
       </div>
       <span className="text-xs text-white/50">{status}</span>
-      <div className="flex flex-wrap gap-2">
-        <Button size="sm" disabled={!ready} onClick={() => onEpisode("start")}>
-          Start episode
-        </Button>
-        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("s")}>
-          Save
-        </Button>
-        <Button variant="outline" size="sm" disabled={!canChoose} onClick={() => onEpisode("r")}>
-          Discard
-        </Button>
-      </div>
+      {controls.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {controls.map((c, i) => (
+            <Button
+              key={c.command}
+              variant={i === 0 ? "default" : armed === c.command ? "destructive" : "outline"}
+              size="sm"
+              onClick={() => click(c)}
+            >
+              {armed === c.command ? `Confirm: ${c.label}?` : c.label}
+            </Button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

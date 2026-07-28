@@ -341,7 +341,8 @@ class OperationRunner:
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
-        # run-policy episode control (set while run-policy runs).
+        # Episode control of the live op (set while an op declaring
+        # episode_control runs, e.g. run-policy).
         self._policy_control: Any = None
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
@@ -571,7 +572,7 @@ class OperationRunner:
                 session.emit(f"[serve] failed to kill pid {child.pid}: {exc}")
 
     def episode_command(self, command: str) -> bool:
-        """Forward a run-policy episode command (start/s/r/q) to its control."""
+        """Forward an episode command (start/s/r/q) to the live op's control."""
         control = self._policy_control
         if control is None:
             return False
@@ -579,7 +580,7 @@ class OperationRunner:
         return True
 
     def policy_state(self) -> dict[str, Any] | None:
-        """run-policy episode phase/message/count, or None if no policy is running.
+        """The live op's episode phase/message/count, or None if there is none.
 
         Read by /api/op/status so the control panel reflects whether an episode
         is recording or sitting at the between-episode gate on any computer.

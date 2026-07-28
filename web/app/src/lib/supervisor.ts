@@ -349,12 +349,34 @@ export async function usbConnect(): Promise<UsbStatus> {
 export type OperationId = string
 
 /** Episode lifecycle phase, surfaced so the control panel on any
- *  computer shows the right episode controls (not just the tab that started it). */
-export type PolicyPhase = "preparing" | "ready" | "recording" | "deciding" | "resetting"
+ *  computer shows the right episode controls (not just the tab that started it).
+ *  Open-ended: a downstream package's episode control can define its own
+ *  phases (e.g. collect-data's "countdown" / "saving") — the panel renders the
+ *  server-driven `message`/`controls` then and never needs to know them. */
+export type PolicyPhase = string
+
+/** One episode-control button the running op offers right now (server-driven). */
+export interface EpisodeControlSpec {
+  /** Command pushed to /api/op/episode when clicked. */
+  command: string
+  label: string
+  /** Arm on first click and require a second, confirming click — the panel's
+   *  stand-in for the headset's double-press save/discard confirmation. */
+  confirm?: boolean
+}
 
 export interface PolicyState {
   phase: PolicyPhase
   episodesRecorded: number
+  /** Operator status line; when present it replaces the panel's built-in
+   *  phase text (lets the op mirror what the headset HUD would say). */
+  message?: string
+  /** Buttons to render; when present they replace the panel's built-in
+   *  run-policy Start/Save/Discard set. */
+  controls?: EpisodeControlSpec[]
+  /** 1-based number of the episode being recorded next/now, when the op
+   *  tracks a dataset episode index (mirrors the headset HUD readout). */
+  episode?: number
 }
 
 export interface OpStatus {
