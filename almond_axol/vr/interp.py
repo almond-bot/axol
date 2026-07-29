@@ -117,6 +117,13 @@ class PoseInterpolator:
         # Buffer of (capture_time_s, frame), kept sorted by capture time.
         self._caps: list[float] = []
         self._frames: list[VRFrame] = []
+        # Per-frame numeric vector (see _frame_vec), parallel to _caps/_frames.
+        # Precomputed at push time (~90 Hz) so the smoothing render in sample()
+        # is pure vectorized numpy — walking the pydantic models per sample was
+        # ~0.8 ms/call on Jetson, enough to slow the IK dispatch loop it runs
+        # on (in series with every solve) and cost more smoothness through a
+        # coarser IK staircase than the smoothing itself bought.
+        self._vecs: list[np.ndarray] = []
         # Recent (local_recv_s, transit_s) for jitter/offset estimation.
         self._transits: list[tuple[float, float]] = []
         self._clock_offset: float | None = None
@@ -136,6 +143,7 @@ class PoseInterpolator:
         with self._lock:
             self._caps.clear()
             self._frames.clear()
+            self._vecs.clear()
             self._transits.clear()
             self._clock_offset = None
             self._delay = self._min_delay
@@ -162,6 +170,7 @@ class PoseInterpolator:
             if self._t_is_client is not None and is_client != self._t_is_client:
                 self._caps.clear()
                 self._frames.clear()
+                self._vecs.clear()
                 self._transits.clear()
                 self._clock_offset = None
                 self._delay = self._min_delay
@@ -191,6 +200,7 @@ class PoseInterpolator:
             i = bisect.bisect_right(self._caps, cap_t)
             self._caps.insert(i, cap_t)
             self._frames.insert(i, frame)
+            self._vecs.insert(i, _frame_vec(frame))
 
             # Prune: keep a little history behind the current playout point
             # (which is held an extra half smoothing-window in the past).
@@ -202,10 +212,12 @@ class PoseInterpolator:
             if drop:
                 del self._caps[:drop]
                 del self._frames[:drop]
+                del self._vecs[:drop]
             extra = len(self._caps) - self._max_frames
             if extra > 0:
                 del self._caps[:extra]
                 del self._frames[:extra]
+                del self._vecs[:extra]
 
     def sample(self, now: float | None = None) -> VRFrame | None:
         """Render the current smoothed target frame.
@@ -256,16 +268,16 @@ class PoseInterpolator:
             # would blend them into a false target. Unstamped streams fall
             # through to the lerp path, which renders the latest frame.
             win_caps: list[float] | None = None
-            win_frames: list[VRFrame] | None = None
+            win_vecs: list[np.ndarray] | None = None
             if smoothing:
                 half_rej = self._half_smooth * _REJECT_WINDOW_MULT
                 lo = bisect.bisect_left(caps, play - half_rej)
                 hi = bisect.bisect_right(caps, play + half_rej)
                 if hi - lo >= 3:
                     win_caps = caps[lo:hi]
-                    win_frames = frames[lo:hi]
+                    win_vecs = self._vecs[lo:hi]
 
-            if win_frames is None:
+            if win_vecs is None:
                 if play <= caps[0]:
                     a = b = frames[0]
                     alpha = 0.0
@@ -280,9 +292,9 @@ class PoseInterpolator:
             last_out = self._last_out
             last_pos = self._last_pos
 
-        if win_frames is not None and win_caps is not None:
+        if win_vecs is not None and win_caps is not None:
             rendered, pos = _smooth_window(
-                win_frames,
+                win_vecs,
                 win_caps,
                 play,
                 self._half_smooth,
@@ -362,8 +374,37 @@ def _quat_weighted_mean(quats: np.ndarray, w: np.ndarray, ref_i: int) -> np.ndar
 _REJECT_WINDOW_MULT = 2.5
 
 
+# _frame_vec layout: 4 position streams, 2 quaternions, 2 grips.
+_VEC_POS = slice(0, 12)  # l_ee, r_ee, l_elbow, r_elbow (3 each)
+_VEC_LQ = slice(12, 16)
+_VEC_RQ = slice(16, 20)
+_VEC_GRIP = slice(20, 22)
+
+
+def _frame_vec(f: VRFrame) -> np.ndarray:
+    """Flatten a frame's motion fields into a (22,) float64 vector.
+
+    Computed once per received frame so the smoothing render never walks the
+    pydantic models on the hot sampling path.
+    """
+    lp, rp, le, re = f.l_ee.position, f.r_ee.position, f.l_elbow, f.r_elbow
+    lq, rq = f.l_ee.quaternion, f.r_ee.quaternion
+    return np.array(
+        [
+            lp.x, lp.y, lp.z,
+            rp.x, rp.y, rp.z,
+            le.x, le.y, le.z,
+            re.x, re.y, re.z,
+            lq.x, lq.y, lq.z, lq.w,
+            rq.x, rq.y, rq.z, rq.w,
+            f.l_grip, f.r_grip,
+        ],
+        dtype=np.float64,
+    )  # fmt: skip
+
+
 def _smooth_window(
-    frames: list[VRFrame],
+    vecs: list[np.ndarray],
     caps: list[float],
     play: float,
     half_window: float,
@@ -373,11 +414,12 @@ def _smooth_window(
 ) -> tuple[VRFrame, np.ndarray]:
     """Render the Gaussian-weighted, outlier-rejected mean pose of a window.
 
-    ``frames`` spans the wide *rejection* window; the Gaussian sigma comes from
-    the narrower smoothing ``half_window``, so frames beyond the smoothing
-    window carry negligible weight — *unless* the frames near the playout point
-    are rejected as glitches, in which case the nearest clean frames dominate
-    the renormalized weights and the output bridges smoothly across the glitch.
+    ``vecs`` (per-frame :func:`_frame_vec` vectors) spans the wide *rejection*
+    window; the Gaussian sigma comes from the narrower smoothing
+    ``half_window``, so frames beyond the smoothing window carry negligible
+    weight — *unless* the frames near the playout point are rejected as
+    glitches, in which case the nearest clean frames dominate the renormalized
+    weights and the output bridges smoothly across the glitch.
 
     Hampel rejection runs first: a frame whose EE or elbow position deviates
     from the window's component-wise median by more than
@@ -388,23 +430,24 @@ def _smooth_window(
     flagged; only a minority cluster far from the median is. Control state
     comes from ``latest``, exactly like :func:`_interpolate`.
     """
-    n = len(frames)
+    V = np.stack(vecs)  # (n, 22)
     t = np.array(caps, dtype=np.float64)
-    l_ee_p = np.array([_pos(f.l_ee.position) for f in frames])
-    r_ee_p = np.array([_pos(f.r_ee.position) for f in frames])
-    l_el = np.array([_pos(f.l_elbow) for f in frames])
-    r_el = np.array([_pos(f.r_elbow) for f in frames])
-    l_q = np.array([_quat(f.l_ee.quaternion) for f in frames])
-    r_q = np.array([_quat(f.r_ee.quaternion) for f in frames])
-    grips = np.array([[f.l_grip, f.r_grip] for f in frames], dtype=np.float64)
+    n = len(V)
 
     inlier = np.ones(n, dtype=bool)
     if outlier_k > 0.0:
-        for stream in (l_ee_p, r_ee_p, l_el, r_el):
-            med = np.median(stream, axis=0)
-            d = np.linalg.norm(stream - med, axis=1)
-            thresh = max(outlier_k * 1.4826 * float(np.median(d)), outlier_floor)
-            inlier &= d <= thresh
+        # (n, 4, 3): the four position streams of every frame. Medians use
+        # np.partition (upper median for even n) — np.median's generality is
+        # ~10x the cost on windows this small, and robust statistics don't
+        # care about the midpoint averaging.
+        P = V[:, _VEC_POS].reshape(n, 4, 3)
+        mid = n // 2
+        med = np.partition(P, mid, axis=0)[mid]  # (4, 3)
+        diff = P - med
+        d = np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))  # (n, 4)
+        mad = np.partition(d, mid, axis=0)[mid]  # (4,)
+        thresh = np.maximum(outlier_k * 1.4826 * mad, outlier_floor)
+        inlier = np.all(d <= thresh, axis=1)
         if int(inlier.sum()) < 2:
             # Degenerate (e.g. bimodal window mid-jump): rejecting almost
             # everything would leave a meaningless average, so keep all frames.
@@ -418,15 +461,19 @@ def _smooth_window(
     w /= w.sum()
 
     ref_i = int(np.argmax(w))
-    l_ee_pm = w @ l_ee_p
-    r_ee_pm = w @ r_ee_p
-    l_elm = w @ l_el
-    r_elm = w @ r_el
-    l_qm = _quat_weighted_mean(l_q, w, ref_i)
-    r_qm = _quat_weighted_mean(r_q, w, ref_i)
-    gm = w @ grips
+    mean = w @ V  # (22,) — correct for all linear fields; quats fixed below
+    l_qm = _quat_weighted_mean(V[:, _VEC_LQ], w, ref_i)
+    r_qm = _quat_weighted_mean(V[:, _VEC_RQ], w, ref_i)
     return _build_frame(
-        l_ee_pm, l_qm, r_ee_pm, r_qm, l_elm, r_elm, float(gm[0]), float(gm[1]), latest
+        mean[0:3],
+        l_qm,
+        mean[3:6],
+        r_qm,
+        mean[6:9],
+        mean[9:12],
+        float(mean[20]),
+        float(mean[21]),
+        latest,
     )
 
 
@@ -462,20 +509,43 @@ def _build_frame(
 ) -> tuple[VRFrame, np.ndarray]:
     """Assemble a rendered frame; motion from the args, control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
-    concatenated EE+elbow positions used for the change/identity check."""
-    frame = VRFrame(
-        l_ee=VRPose(
-            position=VRPosition(x=l_ee_p[0], y=l_ee_p[1], z=l_ee_p[2]),
-            quaternion=VRQuaternion(x=l_ee_q[0], y=l_ee_q[1], z=l_ee_q[2], w=l_ee_q[3]),
+    concatenated EE+elbow positions used for the change/identity check.
+
+    Uses ``model_construct`` (no validation) with explicit ``float()``
+    conversion: this runs per sample on the IK dispatch thread and the fields
+    are numerics we computed ourselves, so validation is pure overhead.
+    """
+    frame = VRFrame.model_construct(
+        l_ee=VRPose.model_construct(
+            position=VRPosition.model_construct(
+                x=float(l_ee_p[0]), y=float(l_ee_p[1]), z=float(l_ee_p[2])
+            ),
+            quaternion=VRQuaternion.model_construct(
+                x=float(l_ee_q[0]),
+                y=float(l_ee_q[1]),
+                z=float(l_ee_q[2]),
+                w=float(l_ee_q[3]),
+            ),
         ),
-        r_ee=VRPose(
-            position=VRPosition(x=r_ee_p[0], y=r_ee_p[1], z=r_ee_p[2]),
-            quaternion=VRQuaternion(x=r_ee_q[0], y=r_ee_q[1], z=r_ee_q[2], w=r_ee_q[3]),
+        r_ee=VRPose.model_construct(
+            position=VRPosition.model_construct(
+                x=float(r_ee_p[0]), y=float(r_ee_p[1]), z=float(r_ee_p[2])
+            ),
+            quaternion=VRQuaternion.model_construct(
+                x=float(r_ee_q[0]),
+                y=float(r_ee_q[1]),
+                z=float(r_ee_q[2]),
+                w=float(r_ee_q[3]),
+            ),
         ),
-        l_elbow=VRPosition(x=l_el[0], y=l_el[1], z=l_el[2]),
-        r_elbow=VRPosition(x=r_el[0], y=r_el[1], z=r_el[2]),
-        l_grip=l_grip,
-        r_grip=r_grip,
+        l_elbow=VRPosition.model_construct(
+            x=float(l_el[0]), y=float(l_el[1]), z=float(l_el[2])
+        ),
+        r_elbow=VRPosition.model_construct(
+            x=float(r_el[0]), y=float(r_el[1]), z=float(r_el[2])
+        ),
+        l_grip=float(l_grip),
+        r_grip=float(r_grip),
         # Control state is responsive: always the latest received, never delayed.
         l_lock=latest.l_lock,
         r_lock=latest.r_lock,
