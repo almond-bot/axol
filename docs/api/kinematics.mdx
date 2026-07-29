@@ -51,9 +51,11 @@ q = solver.ik(q, left_pose=(pos, rot))
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
-| `self_collision_margin` | `0.1` m | Minimum clearance between collision bodies |
+| `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
 | `self_collision_weight` | `75.0` | Self-collision penalty weight |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
-| `cost_tolerance` | `1e-2` | Convergence tolerance |
+| `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
+| `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |
+| `lambda_factor` | `10.0` | LM damping multiplier after each rejected step, so damping spans its useful range within the iteration budget |
 | `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call |
 | `max_reach` | `0.8` m | EE target clamped to this distance from shoulder |
