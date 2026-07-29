@@ -2,6 +2,7 @@
 
 from .axol import Axol, AxolArm, arm_limits, closer_end_stop
 from .base import RobotBase
+from .cart import Cart, CartConfig
 from .config import (
     ArmConfig,
     AxolConfig,
@@ -19,6 +20,8 @@ __all__ = [
     "closer_end_stop",
     "ArmConfig",
     "AxolConfig",
+    "Cart",
+    "CartConfig",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

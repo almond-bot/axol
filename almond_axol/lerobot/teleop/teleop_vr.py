@@ -52,6 +52,7 @@ from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
+from ...robot.cart import Cart
 from ...teleop.core import VRTeleopCore
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VRFrame, VRState
@@ -104,6 +105,13 @@ class AxolVRTeleop(Teleoperator):
         self._core = VRTeleopCore(
             config.vr_teleop_config, _logger, self._broadcast_tracking
         )
+
+        # Powered cart (x-drive base + telescoping lift), operator-only
+        # mobility on robots that have one: the thumbsticks reposition the
+        # base/lift during a session, exactly as in native teleop. Cart state
+        # is NOT part of the action/observation space — it is never recorded
+        # into the dataset and policies never control it.
+        self._cart: Cart | None = Cart(config.cart) if config.cart.enabled else None
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).
@@ -160,6 +168,16 @@ class AxolVRTeleop(Teleoperator):
         return True
 
     @property
+    def cart(self) -> Cart | None:
+        """The powered cart when configured (operator-only mobility), else None.
+
+        Exposed so the collect-data entry point can wire the video relay's
+        ZED IMU samples into the cart's heading hold. Deliberately absent
+        from ``action_features``: the cart is never part of the dataset.
+        """
+        return self._cart
+
+    @property
     def action_features(self) -> dict:
         return {key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS}
 
@@ -208,6 +226,11 @@ class AxolVRTeleop(Teleoperator):
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
         await self._vr_server.enable()
+
+        if self._cart is not None:
+            # Runs on this dedicated event loop, so the cart's command task
+            # lives here too — off the caller's synchronous control loop.
+            await self._cart.enable()
 
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
@@ -297,6 +320,12 @@ class AxolVRTeleop(Teleoperator):
             if self._ik_process.is_alive():
                 self._ik_process.terminate()
             self._ik_process = None
+
+        if self._cart is not None:
+            try:
+                await self._cart.disable()
+            except Exception:  # noqa: BLE001 - never block the VR teardown
+                _logger.exception("cart disable failed")
 
         if self._vr_server is not None:
             await self._vr_server.disable()
@@ -496,6 +525,11 @@ class AxolVRTeleop(Teleoperator):
 
         # Reset rising edge
         self._core.note_frame_reset(frame.reset)
+
+        if self._cart is not None:
+            # Shared stick → cart mapping (see Cart.apply_vr_frame). Resets
+            # force a stop so the base doesn't creep during return-to-rest.
+            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
         # Episode state transitions
         prev = self._prev_state

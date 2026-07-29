@@ -10,6 +10,7 @@ import {
 } from "lucide-react"
 import {
   cameraCount,
+  isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
   perRunFields,
@@ -92,15 +93,18 @@ export function OperationPanel({
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
   const isSim = isSimRun(meta, settings)
+  // Sim, or a run that never touches the arms (teleop's cart-only mode):
+  // either way the arm-connection and motor-fault gates don't apply.
+  const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
   const camCount = cameraCount(cameras)
 
   const blockers: string[] = []
-  if (meta.requiresRobot && !isSim && !robotOk) blockers.push("Connect Axol")
+  if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
   // A faulted motor blocks every hardware operation (the server refuses the
   // start too) — driving through an over-temp / stalled / unreachable motor
-  // risks the arm. Sim never touches the motors.
-  if (!isSim) {
+  // risks the arm. Sim and cart-only runs never touch the arm motors.
+  if (!robotFree) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
     }
@@ -219,11 +223,13 @@ export function OperationPanel({
                   status/controls, the mirrored headset popups, and the live
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
-              {live && (meta.episodeControl || (meta.usesHeadset && !isSim)) && (
+              {/* Skipped for robot-free runs: sim has the browser viewer, and
+                  cart-only has no camera relay or HUD popups to mirror. */}
+              {live && (meta.episodeControl || (meta.usesHeadset && !robotFree)) && (
                 <OperatorDeck
                   label={meta.label}
                   episodeControl={meta.episodeControl}
-                  showFeeds={meta.usesHeadset && !isSim}
+                  showFeeds={meta.usesHeadset && !robotFree}
                   policy={policy}
                   onEpisode={onEpisode}
                   host={host}

@@ -41,6 +41,7 @@ import numpy as np
 
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
+from ..robot.cart import Cart
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
@@ -63,6 +64,8 @@ class VRTeleop:
         config:            Teleop session parameters (rest poses, loop frequency).
         kinematics_config: IK solver parameters forwarded to the subprocess.
         vr_server_config:  VR WebSocket server parameters (port, TLS certs).
+        cart:              Powered cart (x-drive base + lift) for robots that
+                           have one; ``None`` for a static base.
     """
 
     def __init__(
@@ -72,6 +75,7 @@ class VRTeleop:
         config: VRTeleopConfig = VRTeleopConfig(),
         kinematics_config: KinematicsConfig = KinematicsConfig(),
         vr_server_config: VRServerConfig = VRServerConfig(),
+        cart: Cart | None = None,
     ) -> None:
         """Construct the teleoperation session.
 
@@ -83,8 +87,17 @@ class VRTeleop:
             config:            Teleop loop parameters (rest poses, frequency, velocity limits).
             kinematics_config: IK solver cost weights forwarded to the IK subprocess.
             vr_server_config:  VR WebSocket server parameters (port, TLS certs).
+            cart:              Powered cart (x-drive base + telescoping lift),
+                               or ``None`` for a robot on a static base. When
+                               present, the headset thumbsticks drive it: left
+                               stick translates, right stick x rotates, stick
+                               clicks run the lift (left down / right up).
+                               Deflection is the deadman — the cart is active
+                               whenever a stick leaves its deadzone,
+                               independent of the arm engage toggle.
         """
         self._robot = robot
+        self._cart = cart
         self._config = config
         self._kinematics_config = kinematics_config
         self._vr_server = VRServer(vr_server_config)
@@ -166,6 +179,11 @@ class VRTeleop:
         await loop.run_in_executor(None, self._vr_ready.wait)
 
         await self._robot.enable()
+        if self._cart is not None:
+            # After the arms so a cart failure (missing CAN interface, GPIO
+            # chip) surfaces before the IK worker spins up; its command task
+            # runs on this event loop.
+            await self._cart.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
@@ -234,6 +252,11 @@ class VRTeleop:
             self._vr_thread.join(timeout=5.0)
             self._vr_thread = None
 
+        if self._cart is not None:
+            try:
+                await self._cart.disable()
+            except Exception:  # noqa: BLE001 - never block the arm shutdown
+                _logger.exception("cart disable failed")
         await self._robot.disable()
 
     async def __aenter__(self) -> VRTeleop:
@@ -428,6 +451,11 @@ class VRTeleop:
             ):
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
+        if self._cart is not None:
+            # The stick → cart mapping lives on Cart (shared with the
+            # collect-data flow). Resets force a stop so the base doesn't
+            # creep while the arms replay their return-to-rest trajectory.
+            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)
