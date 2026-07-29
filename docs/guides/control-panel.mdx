@@ -110,7 +110,7 @@ Pick an operation from the selector. Each panel asks only for its **per-run inpu
 
 | Operation | Needs | Notes |
 |---|---|---|
-| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views). |
+| **Teleoperation** | Axol (or sim) | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If camera slots are assigned, the camera feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views) — and mirrored in the panel's [operator view](#operator-view). |
 | **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
 | **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
@@ -126,9 +126,15 @@ Per-run values (repo ids, task names, …) are remembered by your browser so the
 
 Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. The console captures not just the operation's Python output but also **native-library and subprocess output** — the ZED SDK, GStreamer, and CUDA, plus the spawned video-relay and recorder processes — so a camera or ZED failure surfaces its actual reason in the UI instead of a bare "exited". The console **auto-follows** new output only while you're scrolled to the bottom; scroll up to read earlier lines and it stops yanking you back down until you return to the bottom. The **download** button in the Logs header saves everything currently in the console to a timestamped `.log` file (disabled when there's no output) — handy for attaching to a bug report. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Host** / **Robot Disconnect** likewise wait for the running op to finish tearing down before proceeding.
 
+## Operator view
+
+While **teleoperation** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye.
+
+The **fullscreen** toggle on the camera-feeds header expands the feeds to a full-screen operator display that fits without scrolling; **Esc** or **Exit fullscreen** leaves. If the feeds never connect, the panel offers a one-tap button to **authorize** the stream server's self-signed certificate — the same one-time step the [VR app](/guides/vr-interface) uses.
+
 ## Run Policy episode controls
 
-While **Run policy** is live, an **Episode control** box appears in the operation card with three buttons:
+While **Run policy** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the saved-episode count, and these buttons:
 
 | Button | Effect |
 |---|---|
@@ -136,7 +142,7 @@ While **Run policy** is live, an **Episode control** box appears in the operatio
 | **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
 | **Discard** | Drop the current episode and return to the reset gate to redo it. |
 
-These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. To end the run entirely, use **Stop** in the card header.
+These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header.
 
 <Note>
   **Collect data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
