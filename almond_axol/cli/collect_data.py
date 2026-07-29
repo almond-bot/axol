@@ -104,6 +104,46 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
         _logger.warning("failed to enable camera video: %s", exc)
 
 
+def check_resume_consistency(dataset_root: "Path") -> None:
+    """Refuse to resume a dataset whose last session lost episodes.
+
+    A recorder subprocess killed before flushing (its "recorder subprocess
+    exited … before shutdown" error is in that session's log) loses the
+    episodes still buffered in its parquet writer, while ``info.json``'s
+    ``total_episodes`` — already bumped per save — survives. Resuming such a
+    dataset numbers the next episode past the lost ones, leaving a permanent
+    index gap. That gap is poison downstream: LeRobot's episode metadata
+    lookups are positional (``meta.episodes[i]`` is a row position, not a
+    key), so on a gapped dataset every episode after the gap silently
+    resolves to a *different* episode's video span. Refuse here, at the next
+    session's start, instead.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+
+    total = int(
+        json.loads((dataset_root / "meta" / "info.json").read_text())["total_episodes"]
+    )
+    indices: list[int] = []
+    for f in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        indices.extend(
+            pq.read_table(f, columns=["episode_index"])["episode_index"].to_pylist()
+        )
+    if sorted(indices) == list(range(total)):
+        return
+    missing = sorted(set(range(total)) - set(indices))
+    raise RuntimeError(
+        f"Dataset {dataset_root} is crash-inconsistent: info.json counts "
+        f"{total} episode(s) but meta/episodes holds {len(indices)}"
+        f"{f' (missing indices {missing})' if missing else ''}. A previous "
+        "session's recorder was killed before it flushed, so those episodes' "
+        "frames are gone. Recording more would number new episodes past the "
+        "gap. Renumber the surviving episodes to a contiguous 0..N-1 (data + "
+        "meta/episodes parquets, info.json totals) or start a fresh dataset."
+    )
+
+
 def _existing_dataset_resolution(dataset_root: "Path") -> str | None:
     """Resolution name of an existing dataset's recorded images, or ``None``.
 
@@ -354,6 +394,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             f"Delete the directory and rerun to start fresh:\n"
             f"  rm -rf {dataset_root}"
         )
+    if is_complete:
+        check_resume_consistency(dataset_root)
 
     # A resumed dataset's image resolution is fixed by its existing metadata, so
     # the relay must record at it regardless of the configured dataset_resolution
