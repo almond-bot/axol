@@ -57,20 +57,23 @@ class VRTeleopConfig:
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
             high-frequency jitter at the cost of a small fixed lag
-            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.5`` (~8 ms lag
-            at 120 Hz), which removes most IK noise without a perceptible
-            feel difference.
+            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
+            at 120 Hz), favouring smoothness over minimum latency.
         pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
             applied to raw VR controller positions, quaternions, and elbow
             positions **before** they enter the IK solver.  This is the
             primary tremor / tracking-noise kill knob.  Lower values give
             heavier smoothing at rest (more tremor rejection) at the cost of
             slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
-            to ``1.5`` Hz.
+            to ``0.8`` Hz, favouring smoothness over minimum latency (the
+            fixed-lag smoother in the VR server's pose interpolator does the
+            heavy lifting upstream).
         pose_beta: Speed coefficient for the One Euro Filter.  Raises the
             filter cutoff proportionally to the signal's instantaneous speed,
             keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``5.0``.
+            Increase if fast moves feel sticky.  Defaults to ``2.0`` so the
+            filter stays partially engaged during motion instead of opening
+            fully and passing noise through.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -126,8 +129,8 @@ class VRTeleopConfig:
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
     teleop_max_accel: float = 3.5 * 2 * math.pi
-    ik_alpha: float = 0.5
-    pose_min_cutoff: float = 1.5
-    pose_beta: float = 5.0
+    ik_alpha: float = 0.3
+    pose_min_cutoff: float = 0.8
+    pose_beta: float = 2.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
