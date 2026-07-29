@@ -17,7 +17,11 @@ class TrapezoidalFilter:
 
     The deceleration distance is computed from kinematics:
     ``v_stop = sqrt(2 * max_accel * distance)``
-    so the filter always arrives at the target without overshoot.
+    so the filter always arrives at the target without overshoot.  When a step
+    reaches the target, the internal velocity keeps the value realized by that
+    step (rather than resetting to zero) so continuously tracking a moving
+    target produces a smooth velocity profile instead of a snap / re-accelerate
+    limit cycle.
 
     Args:
         max_vel:   Maximum joint velocity in rad/s.
@@ -72,10 +76,15 @@ class TrapezoidalFilter:
         self._vel = self._vel + dv
 
         # Advance position; snap to target if we would overshoot this step.
+        # On snap, keep the velocity actually realized by the snap (|err|/dt,
+        # always a slowdown since |err| < |step|) instead of zeroing it:
+        # zeroing made every arrival a velocity discontinuity, so closely
+        # tracking a *moving* target limit-cycled through snap / re-accelerate
+        # every few steps and manufactured jerk from a perfectly smooth input.
         step = self._vel * self.dt
         overshoot = np.abs(step) > dist
         self._pos = np.where(overshoot, target, self._pos + step)
-        self._vel = np.where(overshoot, 0.0, self._vel)
+        self._vel = np.where(overshoot, err / self.dt, self._vel)
 
         return self._pos.copy()
 
