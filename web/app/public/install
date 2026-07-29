@@ -188,6 +188,13 @@ ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3
+# A stop during a recording session must outlive the serve layer's dataset
+# teardown: its stop watchdog gives the recorder subprocess up to 200s to
+# finalize the dataset (encode the last episode, flush parquet, write meta).
+# systemd's default 90s would SIGKILL the whole cgroup mid-finalize — episodes
+# still buffered in the recorder are lost, and resuming the dataset numbers
+# the next episode past them, permanently corrupting its episode indexing.
+TimeoutStopSec=240
 # Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
 Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1

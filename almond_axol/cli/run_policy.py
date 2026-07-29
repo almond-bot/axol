@@ -38,6 +38,7 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
+from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
 if TYPE_CHECKING:
@@ -920,6 +921,7 @@ def _run(
             shutil.rmtree(dataset_root)
 
         if is_complete:
+            check_resume_consistency(dataset_root)
             log_say(f"Resuming existing dataset at {dataset_root}.")
             dataset = LeRobotDataset.resume(
                 repo_id=repo_id,
