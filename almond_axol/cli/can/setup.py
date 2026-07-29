@@ -189,6 +189,13 @@ def _find_serial() -> str:
     unique = _detect_serials()
 
     if not unique:
+        # An unplugged hub on an already-configured host (e.g. re-running
+        # setup on a cart-only session) keeps its pinned serial — the udev
+        # rule and startup script stay valid for whenever it's reattached.
+        configured = _configured_serial()
+        if configured:
+            print(f"  No hub attached — keeping configured serial {configured}.")
+            return configured
         print(
             "\n  No adapter found. Enter the serial number manually (blank to abort):"
         )
@@ -278,21 +285,28 @@ def _write_cron_script(*, with_base: bool = False) -> None:
         f"#!/bin/bash\n"
         f"# Bring up Almond Axol CAN interfaces\n"
         f"#\n"
-        f"# Both interfaces are channels of one dual-channel gs_usb adapter.\n"
+        f"# The arm interfaces are channels of one dual-channel gs_usb adapter.\n"
         f"# Bring them down together, configure, then up together — flapping\n"
         f"# the channels one at a time (down/up L, then down/up R) toggles the\n"
         f"# adapter into a state where TX works but no RX frame is delivered.\n"
+        f"# Skipped entirely when the hub is unplugged (a cart-only session\n"
+        f"# must still bring up the wheel bus below).\n"
         f"set -euo pipefail\n\n"
-        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
-        f'    ip link set "${{IFACE}}" down 2>/dev/null || true\n'
-        f"done\n"
-        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
-        f'    ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
-        f'    ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
-        f"done\n"
-        f"for IFACE in {_CAN_L} {_CAN_R}; do\n"
-        f'    ip link set "${{IFACE}}" up\n'
-        f"done\n"
+        f"if ip link show {_CAN_L} >/dev/null 2>&1 "
+        f"&& ip link show {_CAN_R} >/dev/null 2>&1; then\n"
+        f"    for IFACE in {_CAN_L} {_CAN_R}; do\n"
+        f'        ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f"    done\n"
+        f"    for IFACE in {_CAN_L} {_CAN_R}; do\n"
+        f'        ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
+        f'        ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f"    done\n"
+        f"    for IFACE in {_CAN_L} {_CAN_R}; do\n"
+        f'        ip link set "${{IFACE}}" up\n'
+        f"    done\n"
+        f"else\n"
+        f'    echo "arm hub interfaces not present — skipping arm bring-up"\n'
+        f"fi\n"
     )
     if with_base:
         script += (
@@ -372,6 +386,15 @@ def bring_up_can() -> None:
     bounded retries and the warning instead of an error.
     """
     print("Bringing up CAN interfaces (requires sudo)...")
+    hub_present = (Path("/sys/class/net") / _CAN_L).exists() and (
+        Path("/sys/class/net") / _CAN_R
+    ).exists()
+    if not hub_present:
+        # Cart-only host state: the script still brings up the wheel bus; the
+        # RX-wedge probe/re-flap is hub-specific, so there's nothing to verify.
+        run_root(["bash", str(_CRON_SCRIPT)], check=True)
+        print("  Done — arm hub not attached, arm interfaces skipped.")
+        return
     for attempt in range(3):
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
         if rx_alive():
