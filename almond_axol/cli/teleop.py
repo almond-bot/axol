@@ -12,6 +12,7 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
     axol teleop --cart.enabled true                   # powered cart (base+lift)
+    axol teleop --cart_only                           # drive just the cart, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
 """
 
@@ -35,21 +36,21 @@ def _get_local_ip() -> str:
 
 
 def _normalize_sim_flag(argv: list[str]) -> list[str]:
-    """Let ``--sim`` be passed as a bare flag.
+    """Let ``--sim`` and ``--cart_only`` be passed as bare flags.
 
     draccus parses bool fields as value-taking arguments (``--sim true``),
-    so rewrite a standalone ``--sim`` (one that's followed by another flag
-    or nothing) into ``--sim true``. An explicit ``--sim true`` / ``--sim
+    so rewrite a standalone flag (one that's followed by another flag or
+    nothing) into ``--<flag> true``. An explicit ``--sim true`` / ``--sim
     false`` / ``--sim=...`` is left untouched.
     """
     out: list[str] = []
     i = 0
     while i < len(argv):
         tok = argv[i]
-        if tok == "--sim":
+        if tok in ("--sim", "--cart_only"):
             nxt = argv[i + 1] if i + 1 < len(argv) else None
             if nxt is None or nxt.startswith("-"):
-                out.extend(("--sim", "true"))
+                out.extend((tok, "true"))
                 i += 1
                 continue
         out.append(tok)
@@ -316,9 +317,53 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
         return None
 
 
+async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
+    """Drive only the powered cart from the headset — the arms stay cold.
+
+    No Axol construction, no IK, no arm CAN: just the VR server for the
+    thumbstick stream and the :class:`~almond_axol.robot.cart.Cart`. The
+    cart's own control mapping applies unchanged (stick deadman, reset stop,
+    staleness timeout — see ``Cart.apply_vr_frame``). Having a cart is
+    implied, so ``--cart.enabled`` is not consulted; the rest of the
+    ``cart.*`` parameters (channel, speeds, imu, ...) apply as usual.
+    """
+    from ..robot.cart import Cart
+    from ..vr import VRServer
+
+    cart = Cart(cfg.cart)
+    server = VRServer(cfg.vr_server)
+    server.set_mode("teleop")
+    # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
+    # arms there is no reset trajectory to wait out (resetting stays False).
+    server.set_on_frame(cart.apply_vr_frame)
+
+    await cart.enable()
+    imu_src = _wire_cart_imu(cfg, cart)
+    _logger.info(
+        "cart-only teleop: thumbsticks drive the cart (deadman — release "
+        "to stop); the arms are untouched"
+    )
+    try:
+        async with server:
+            await asyncio.Event().wait()  # until Ctrl-C / supervisor stop
+    finally:
+        if imu_src is not None:
+            await asyncio.to_thread(imu_src.close)
+        await cart.disable()
+
+
 async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
+
+    if cfg.cart_only:
+        if cfg.sim:
+            raise ValueError(
+                "cart-only teleop has no sim mode (there is no cart hardware "
+                "model in the visualizer) — drop --sim or --cart_only"
+            )
+        await _run_cart_only(cfg)
+        return
 
     if cfg.sim:
         robot = Sim()

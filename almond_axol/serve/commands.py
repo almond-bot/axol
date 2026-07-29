@@ -72,6 +72,7 @@ class CommandDef:
         requires_cameras: bool = False,
         camera_mode: str = "none",
         sim_flag: str | None = None,
+        robot_free_flags: tuple[str, ...] = (),
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
@@ -113,6 +114,10 @@ class CommandDef:
         # robot link and the motor-fault gate. None means it always needs the
         # robot.
         self.sim_flag = sim_flag
+        # Arg names that mean "doesn't touch the arms" without being sim
+        # (teleop's cart_only): the run skips the robot link and the
+        # motor-fault gate but still drives real, non-arm hardware.
+        self.robot_free_flags = robot_free_flags
         # Driven from the VR headset, so the panel tells the operator to point
         # the headset at this machine once the op is running.
         self.uses_headset = uses_headset
@@ -252,7 +257,7 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware.",
+        "browser without hardware, or cart-only to drive just the powered cart.",
         "Operate",
         "draccus",
         _teleop,
@@ -261,8 +266,9 @@ COMMANDS: dict[str, CommandDef] = {
         execution="async",
         camera_mode="teleop",
         sim_flag="sim",
+        robot_free_flags=("cart_only",),
         uses_headset=True,
-        per_run_fields=("sim",),
+        per_run_fields=("sim", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -460,6 +466,7 @@ def command_specs() -> list[dict[str, Any]]:
             "perRunFields": list(cmd.per_run_fields),
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
+            "robotFreeFlags": list(cmd.robot_free_flags),
             "usesHeadset": cmd.uses_headset,
         }
         try:

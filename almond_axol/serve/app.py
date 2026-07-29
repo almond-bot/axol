@@ -645,10 +645,14 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         async with camera_reservation:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
-            # the arm. A sim run never touches the motors, so it stays allowed.
-            sim_flag = COMMANDS[req.op].sim_flag
-            is_sim = sim_flag is not None and bool(req.args.get(sim_flag))
-            if not is_sim:
+            # the arm. A sim run never touches the motors, and a robot-free run
+            # (teleop's cart_only) never touches the *arms*, so both stay allowed.
+            cmd = COMMANDS[req.op]
+            is_sim = cmd.sim_flag is not None and bool(req.args.get(cmd.sim_flag))
+            robot_free = is_sim or any(
+                bool(req.args.get(flag)) for flag in cmd.robot_free_flags
+            )
+            if not robot_free:
                 fault_response = await _motor_fault_response()
                 if fault_response is not None:
                     return fault_response

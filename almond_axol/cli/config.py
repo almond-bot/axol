@@ -486,9 +486,18 @@ class TeleopCmdConfig:
     lift (left click down, right click up), independent of the arm engage
     toggle. Cart parameters live on the nested ``cart`` config — e.g.
     ``--cart.max_speed 5`` or ``--cart.channel can0``.
+
+    ``--cart_only`` drives *just* the cart: the arms are never constructed
+    and the Axol hub CAN channels are never touched — only the VR server
+    (thumbstick stream) and the cart run. Having a cart is implied, so
+    ``--cart.enabled`` is not consulted.
     """
 
     sim: bool = False
+    cart_only: bool = False
+    """Drive only the powered cart from the headset thumbsticks. The arms and
+    their CAN channels are left untouched (no Axol hub needed); the cart is
+    implied. Mutually exclusive with sim."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)

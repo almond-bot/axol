@@ -449,7 +449,13 @@ class OperationRunner:
                 )
 
         is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
-        needs_robot = cmd.uses_can_bus and not is_sim
+        # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
+        # arms, so the persistent robot link stays connected and its motor
+        # telemetry keeps streaming while the op runs.
+        robot_free = is_sim or any(
+            bool(args.get(flag)) for flag in cmd.robot_free_flags
+        )
+        needs_robot = cmd.uses_can_bus and not robot_free
         log_level = self._log_level(args)
 
         session.status = "running"

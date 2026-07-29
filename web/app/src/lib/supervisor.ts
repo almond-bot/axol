@@ -53,6 +53,8 @@ export interface CommandSpec {
   episodeControl?: boolean
   /** Arg name that means "no hardware", or null when the robot is required. */
   simFlag?: string | null
+  /** Arg names that skip the arm-robot gates without being sim (cart_only). */
+  robotFreeFlags?: string[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
 }
@@ -707,6 +709,9 @@ export interface OperationMeta {
   simCapable: boolean
   /** Arg that makes a run hardware-free; null when the robot is required. */
   simFlag: string | null
+  /** Args that skip the arm-robot gates without being sim (teleop's cart_only:
+   * real hardware, but the arms and their CAN bus are never touched). */
+  robotFreeFlags: string[]
   /** Shows the episode start / save / discard controls while running. */
   episodeControl: boolean
   /** Shows the "point the headset at this machine" hint while running. */
@@ -728,6 +733,7 @@ export const OPERATIONS: OperationMeta[] = [
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
+    robotFreeFlags: [],
     episodeControl: false,
     usesHeadset: true,
   },
@@ -740,6 +746,7 @@ export const OPERATIONS: OperationMeta[] = [
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
+    robotFreeFlags: [],
     episodeControl: false,
     usesHeadset: false,
   },
@@ -752,6 +759,7 @@ export const OPERATIONS: OperationMeta[] = [
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
+    robotFreeFlags: [],
     episodeControl: false,
     usesHeadset: false,
   },
@@ -764,6 +772,7 @@ export const OPERATIONS: OperationMeta[] = [
     requiresCameras: false,
     simCapable: false,
     simFlag: null,
+    robotFreeFlags: [],
     episodeControl: false,
     usesHeadset: false,
   },
@@ -777,6 +786,7 @@ export const OPERATIONS: OperationMeta[] = [
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
+    robotFreeFlags: [],
     episodeControl: true,
     usesHeadset: false,
   },
@@ -803,6 +813,7 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     requiresCameras: Boolean(s.requiresCameras),
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
+    robotFreeFlags: s.robotFreeFlags ?? [],
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
   }))
@@ -811,6 +822,16 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
 /** Whether this run is hardware-free (so it skips the robot / fault gates). */
 export function isSimRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
   return meta.simFlag != null && Boolean(settings[meta.simFlag])
+}
+
+/**
+ * Whether this run leaves the arms (and their CAN bus) untouched — sim, or a
+ * robot-free flag like teleop's cart_only. Such a run skips the "Connect
+ * Axol" and motor-fault gates; cart_only still drives real cart hardware.
+ */
+export function isRobotFreeRun(meta: OperationMeta, settings: Record<string, FormValue>): boolean {
+  if (isSimRun(meta, settings)) return true
+  return meta.robotFreeFlags.some((flag) => Boolean(settings[flag]))
 }
 
 /** Curated fields for an op, resolved from the introspected command schema. */
