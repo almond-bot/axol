@@ -234,7 +234,13 @@ class PoseInterpolator:
                 self._last_pos = None
                 return latest
 
-            play = (now - self._clock_offset) - self._delay - self._half_smooth
+            # The extra half-window playout shift only applies when smoothing
+            # is active (client-stamped streams); unstamped streams keep the
+            # undelayed playout point so they still render the latest frame.
+            smoothing = self._half_smooth > 0.0 and bool(self._t_is_client)
+            play = (now - self._clock_offset) - self._delay
+            if smoothing:
+                play -= self._half_smooth
             caps = self._caps
             frames = self._frames
 
@@ -244,9 +250,14 @@ class PoseInterpolator:
             # smoothing window so the Hampel median sees enough clean frames to
             # out-vote a glitch burst, at no extra latency (the history side is
             # already buffered; the future side is capped by what has arrived).
+            # Only client-stamped streams are smoothed: unstamped frames carry
+            # arrival timestamps, so a delivery burst collapses distinct poses
+            # onto near-identical time coordinates and the weighted average
+            # would blend them into a false target. Unstamped streams fall
+            # through to the lerp path, which renders the latest frame.
             win_caps: list[float] | None = None
             win_frames: list[VRFrame] | None = None
-            if self._half_smooth > 0.0:
+            if smoothing:
                 half_rej = self._half_smooth * _REJECT_WINDOW_MULT
                 lo = bisect.bisect_left(caps, play - half_rej)
                 hi = bisect.bisect_right(caps, play + half_rej)
