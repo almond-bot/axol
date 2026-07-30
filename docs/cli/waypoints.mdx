@@ -7,6 +7,8 @@ Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so 
 
 The line is held at the point the fingers close on, not at the gripper mount the kinematics chain ends at. The two are 145 mm apart, so holding the mount straight would swing the tip through an arc of several centimetres whenever the wrist reorients along the way.
 
+Each leg is timed on a minimum-jerk profile, starting and stopping with zero acceleration as well as zero velocity, so there is no jolt as the arm sets off for a waypoint or arrives at one. IK is solved sparsely along the line and splined up to the control rate rather than solved at every tick: the solver lands each sample a fraction of a milliradian off its neighbours' trend, and commanding those directly puts that wobble into the motion as acceleration noise.
+
 The entire path is solved before the arms move, so a waypoint the straight line cannot reach is reported while the robot is still standing still.
 
 An arm you never touched holds still. Recording captures both arms, and an arm resting in gravity compensation drifts a millimetre or two between recordings; tracking that has a 7-DOF arm hunting through its null space, swinging the elbow degrees to chase a millimetre of gripper. Below `--min_travel` and `--min_rotation` the leg pins that arm where it is instead.
@@ -41,12 +43,12 @@ Grippers are recorded with each waypoint. Cycle them with `g` (or the panel butt
 | `--play_only BOOL` | Skip teaching and replay the file straight away. Default `false` |
 | `--sim BOOL` | Preview a saved path in the browser visualizer instead of on the robot (implies `--play_only`). Default `false` |
 | `--loops INT` | Times to run the path; `0` replays until stopped. Default 1 |
-| `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg. Default 0.08 |
+| `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.08 |
 | `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 0.6 |
 | `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
 | `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
-| `--plan_rate_hz FLOAT` | IK solves per second of motion; the solved path is interpolated up to `--rate_hz` for playback. Trades planning time against how finely the line is sampled — raise it only if a path bows. Default 50 |
+| `--plan_rate_hz FLOAT` | Floor on IK solves per second of motion; how far the tip travels between solves caps it from the other side. The solved path is splined up to `--rate_hz` for playback. Default 10 |
 | `--min_travel FLOAT` | An arm whose gripper tip moves less than this (m) between two waypoints holds still for that leg. Default 0.01 |
 | `--min_rotation FLOAT` | Rotation counterpart to `--min_travel` (rad). Default 0.05 |
 | `--ease_in FLOAT` | Seconds spent blending onto the start of each leg, so the arm rejoins the plan smoothly instead of taking up the difference in one tick. Default 0.4 |

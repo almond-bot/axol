@@ -118,10 +118,11 @@ class WaypointsCmdConfig:
     """Times to run the path. 0 replays it until stopped."""
     pos_tolerance: float = 0.01
     """Largest tolerated deviation (m) from the straight line while planning."""
-    plan_rate_hz: float = 50.0
-    """IK solves per second of motion. The solved path is interpolated up to
-    ``rate_hz`` for playback, so this trades planning time against how finely
-    the straight line is sampled — raise it only if a path bows."""
+    plan_rate_hz: float = 10.0
+    """Floor on IK solves per second of motion; how far the tip may travel
+    between solves caps it from the other side. The solved path is splined up
+    to ``rate_hz`` for playback, and solving more finely than the line needs
+    only feeds the solver's own per-sample noise into the motion."""
     min_travel: float = 0.01
     """An arm whose gripper tip moves less than this (m) between two waypoints,
     and turns less than ``min_rotation``, holds still for that leg instead of
@@ -366,20 +367,22 @@ def _ease_in_offsets(
     sample, which reaches the same gripper pose as wherever the arm is now but
     can hold the elbow a degree or so differently. Commanding it outright puts
     that whole difference into one tick. These offsets start at exactly the
-    difference and fade to zero on a smoothstep, so the arm rejoins the plan
-    over ``seconds`` with no step in position or velocity at either end.
+    difference and fade to zero on the same minimum-jerk curve the legs
+    themselves use, so the arm rejoins the plan over ``seconds`` with no step
+    in position, velocity or acceleration at either end.
 
     Returns an empty array when there is nothing to take up.
     """
+    from ..kinematics.path import ease
+
     if q_now is None:
         return np.empty((0, 0), dtype=np.float32)
     offset = np.asarray(q_now, dtype=np.float32) - q_first
     n = max(0, round(seconds * rate))
     if n == 0 or not offset.any():
         return np.empty((0, 0), dtype=np.float32)
-    s = np.arange(n, dtype=np.float32) / n
-    decay = 1.0 - s * s * (3.0 - 2.0 * s)
-    return decay[:, None] * offset
+    decay = 1.0 - ease(np.arange(n) / n)
+    return (decay[:, None] * offset).astype(np.float32)
 
 
 # ----------------------------------------------------------------------
@@ -685,7 +688,12 @@ class _Session:
         return legs
 
     async def _stream(
-        self, solver: Any, trajectory: list[np.ndarray], grip: Grip
+        self,
+        solver: Any,
+        trajectory: list[np.ndarray],
+        grip: Grip,
+        *,
+        interruptible: bool = True,
     ) -> bool:
         """Send a planned leg at the control rate. False if it was stopped."""
         dt = 1.0 / self._cfg.rate_hz
@@ -693,7 +701,7 @@ class _Session:
             self._q_last, trajectory[0], self._cfg.ease_in, self._cfg.rate_hz
         )
         for step, q in enumerate(trajectory):
-            if self._interrupted():
+            if interruptible and self._interrupted():
                 return False
             loop_start = time.monotonic()
             if step < len(blend):
@@ -761,15 +769,11 @@ class _Session:
             rate=self._cfg.rate_hz,
             min_duration=rest_cfg.reset_min_duration,
         )
-        grip = await self._current_grip()
-        dt = 1.0 / self._cfg.rate_hz
-        for q in trajectory:
-            loop_start = time.monotonic()
-            left, right = _arm_command(q, solver, grip)
-            await self._send(left, right)
-            spent = time.monotonic() - loop_start
-            if spent < dt:
-                await asyncio.sleep(dt - spent)
+        # Not interruptible: this is the teardown that gets the arms home, and
+        # abandoning it would leave them stiff halfway there.
+        await self._stream(
+            solver, trajectory, await self._current_grip(), interruptible=False
+        )
 
     # -- main loop -------------------------------------------------------
 

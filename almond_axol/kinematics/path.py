@@ -17,10 +17,14 @@ Two details make the line straight *where it matters* and quick to compute:
   beyond it. Holding the mount to a straight line swings the tip through an
   arc as the wrist reorients, so the line is planned for the tip and converted
   back to a mount target for each solve.
-- **Solve coarse, emit fine.** IK runs at :data:`DEFAULT_PLAN_RATE`, well
-  under the control rate, and the solved joint vectors are interpolated up to
-  one per tick. Consecutive solves are milliseconds and a millimetre apart, so
-  the interpolation is invisible while the solve count drops several-fold.
+- **Solve coarse, spline fine.** IK runs a couple of dozen times a second, far
+  under the control rate, and a cubic spline fills in the ticks between. This
+  is not only cheaper: solving every tick commands the solver's own
+  sample-to-sample noise straight into the arm, and interpolating between
+  sparse solves leaves it behind.
+- **Minimum-jerk timing.** Legs start and stop with zero acceleration as well
+  as zero velocity (:func:`ease`), so there is no impulse at a departure or an
+  arrival.
 - **An arm that isn't going anywhere is pinned.** Below ``min_travel`` the
   taught difference is gravity-compensation drift, not intent, and tracking it
   makes a 7-DOF arm hunt through its null space: degrees of elbow swing to
@@ -36,19 +40,42 @@ into.
 from __future__ import annotations
 
 import logging
+from math import ceil
 
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
+from numpy.typing import ArrayLike
+from scipy.interpolate import CubicSpline
 
 from ..constants import GRIPPER_TIP_OFFSET
 from .solver import KinematicsSolver
 
 _logger = logging.getLogger(__name__)
 
-# Solves per second of motion. Above roughly this the extra solves only
-# re-derive what interpolation already gets right, at full IK cost apiece.
-DEFAULT_PLAN_RATE = 50.0
+# Solves per second of motion — a floor under the spacing caps below, and the
+# only one that binds on a slow leg, where the caps are met long before the
+# leg is over. Extra solves past this only re-derive what interpolation
+# already gets right, and they actively hurt: IK lands each sample a fraction
+# of a milliradian off its neighbours' trend (the flat direction of the cost,
+# not early stopping — more iterations do not help), and commanding those
+# samples directly turns that wobble into acceleration noise. Solving sparsely
+# and splining between leaves the wobble behind. Measured peak tip
+# acceleration on a 35 cm leg at 0.03 m/s: 0.073 m/s² at 20 Hz, 0.022 at 10 —
+# against 0.015 for the ideal profile.
+DEFAULT_PLAN_RATE = 10.0
+
+# Ceiling on how far the tip may travel, and how far it may turn, between two
+# solved samples. Sample spacing has to follow the path's geometry as well as
+# its duration: a fast leg covers more ground per second, and past roughly
+# 15 mm a sample the solver starts running into its own per-call joint-step
+# clamp and falls behind the line.
+MAX_STEP_M = 0.010
+MAX_STEP_RAD = 0.10
+
+# Samples are spaced evenly in time, and :func:`ease` runs at 1.875x the
+# average speed mid-segment, so that is the spacing the caps have to hold at.
+_PEAK_SPEED_FACTOR = 1.875
 
 # Below this rotation magnitude (rad) the Rodrigues expansion is replaced by
 # its first-order term, which is exact to float32 precision at that scale.
@@ -59,6 +86,23 @@ Pose = tuple[np.ndarray, np.ndarray]
 
 Offset = np.ndarray | tuple[float, float, float]
 """A tool point in the gripper link frame."""
+
+
+def ease(t: ArrayLike) -> np.ndarray:
+    """Minimum-jerk easing: ``6t⁵ - 15t⁴ + 10t³`` over ``t`` in ``[0, 1]``.
+
+    Both the first *and* second derivatives vanish at each end, so a move
+    starting or stopping on this curve does so with no step in acceleration.
+    The obvious cheaper choice, smoothstep, gets velocity right but steps
+    acceleration from zero to its peak the instant a leg begins — a jerk
+    impulse at every departure and arrival, which is exactly where a stiff
+    arm is felt to jolt (measured 6.8 m/s³ against 0.3 here).
+
+    The cost is a peakier profile for the same duration: this tops out at
+    1.875x the average speed where smoothstep reaches 1.5x.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    return t * t * t * (10.0 - 15.0 * t + 6.0 * t * t)
 
 
 class PathPlanningError(RuntimeError):
@@ -155,15 +199,21 @@ def _resample(solved: list[np.ndarray], n_out: int) -> list[np.ndarray]:
     configuration and the one IK settles into within a single planning
     interval, which is a velocity spike. Blending that difference out over a
     sensible time is the caller's job.
+
+    The interpolation is a clamped cubic spline rather than straight lines
+    between samples. Joining the samples with lines leaves a corner at each
+    one — a step in velocity, at the planning rate, that a stiff arm tracks
+    faithfully enough to feel. The spline is continuous in acceleration, and
+    clamping it holds the segment's ends at rest to match the motion profile.
     """
     if n_out <= len(solved):
         return solved
-    knots = np.arange(1, len(solved) + 1, dtype=np.float32) / len(solved)
-    values = np.asarray(solved, dtype=np.float32)
-    ticks = np.arange(1, n_out + 1, dtype=np.float32) / n_out
-    out = np.empty((n_out, values.shape[1]), dtype=np.float32)
-    for j in range(values.shape[1]):
-        out[:, j] = np.interp(ticks, knots, values[:, j])
+    knots = np.arange(1, len(solved) + 1, dtype=np.float64) / len(solved)
+    values = np.asarray(solved, dtype=np.float64)
+    ticks = np.arange(1, n_out + 1, dtype=np.float64) / n_out
+    spline = CubicSpline(knots, values, axis=0, bc_type="clamped")
+    # Ticks before the first knot would be extrapolated; hold them instead.
+    out = spline(np.clip(ticks, knots[0], knots[-1])).astype(np.float32)
     return list(out)
 
 
@@ -215,6 +265,7 @@ def plan_linear_segment(
     pos_tolerance: float = 0.01,
     ori_tolerance: float = 0.15,
     min_duration: float = 0.25,
+    settle_fraction: float = 0.05,
     max_settle_iters: int = 8,
     tracking_weight_scale: float = 10.0,
     label: str = "segment",
@@ -222,8 +273,8 @@ def plan_linear_segment(
     """Plan a straight-line Cartesian move between two taught joint vectors.
 
     Both gripper tips travel a straight world-frame line from their pose at
-    ``q_from`` to their pose at ``q_to`` while their orientations slerp, on a
-    smoothstep velocity profile. Samples are resolved to joint angles with
+    ``q_from`` to their pose at ``q_to`` while their orientations slerp, on the
+    minimum-jerk profile of :func:`ease`. Samples are resolved to joint angles with
     :meth:`KinematicsSolver.ik`, each seeded from the previous solution, then
     interpolated up to one joint vector per control tick.
 
@@ -238,12 +289,14 @@ def plan_linear_segment(
         q_from:          Starting joint configuration, full ``(N,)`` vector.
         q_to:            Target joint configuration, full ``(N,)`` vector.
         speed:           Cartesian speed (m/s) of the faster-travelling gripper
-                         tip, averaged over the segment.
+                         tip, averaged over the segment. The minimum-jerk
+                         profile peaks at 1.875x this mid-segment.
         ang_speed:       Angular speed (rad/s) applied the same way.
         rate:            Tick rate (Hz) the result will be played back at.
-        plan_rate:       Samples actually solved per second of motion. Capped
-                         at ``rate``; the solved vectors are interpolated up to
-                         ``rate`` afterwards.
+        plan_rate:       Floor on samples solved per second of motion, capped
+            at ``rate``. :data:`MAX_STEP_M` and :data:`MAX_STEP_RAD` raise the
+            count further when the tip covers ground quickly; the solved
+            vectors are splined up to ``rate`` afterwards.
         tool_offset:     Tip of the tool in the gripper link frame — the point
                          held to the straight line. Pass zeros to hold the
                          gripper mount itself (a gripperless arm).
@@ -256,14 +309,22 @@ def plan_linear_segment(
             millimetre while the elbow swings degrees. Pinning is also what
             you want physically: an arm nobody taught should not move.
         min_rotation:    Rotation counterpart to ``min_travel`` (rad).
-        pos_tolerance:   Maximum tolerated tip position error (m) at any sample.
-        ori_tolerance:   Maximum tolerated orientation error (rad).
+        pos_tolerance:   Tip position error (m) at which a sample is declared
+                         unreachable and the whole segment fails.
+        ori_tolerance:   Orientation counterpart to ``pos_tolerance`` (rad).
         min_duration:    Floor on the segment duration (s).
+        settle_fraction: Fraction of the tolerances a sample is re-solved down
+            to before moving on. Giving up as soon as a sample is merely
+            *acceptable* leaves each one a different distance behind its
+            target, and that difference — millimetres, varying sample to
+            sample — becomes acceleration noise on playback. The two numbers
+            answer different questions: how well a reachable sample should be
+            solved, and when to conclude one is not reachable at all.
         max_settle_iters: Extra solver calls allowed per sample.
             :meth:`KinematicsSolver.ik` clamps each call to
             ``KinematicsConfig.max_joint_delta``, so a sample needing a larger
             joint step (near a wrist flip, say) is re-solved against the same
-            target until it converges or this budget runs out.
+            target until it converges, stops improving, or this budget runs out.
         tracking_weight_scale: Factor applied to the solver's pose-cost weights
             while planning. The configured weights are balanced for live
             teleop, where the null-space terms usefully damp a noisy
@@ -307,40 +368,52 @@ def plan_linear_segment(
             )
 
     duration = min_duration
+    n_solve = 2
     for (p_start, _), (p_goal, _), w, is_pinned in zip(start, goal, logs, pinned):
         if is_pinned:
             continue
-        duration = max(
-            duration,
-            float(np.linalg.norm(p_goal - p_start)) / speed,
-            float(np.linalg.norm(w)) / ang_speed,
+        travel = float(np.linalg.norm(p_goal - p_start))
+        turn = float(np.linalg.norm(w))
+        duration = max(duration, travel / speed, turn / ang_speed)
+        n_solve = max(
+            n_solve,
+            ceil(_PEAK_SPEED_FACTOR * travel / MAX_STEP_M),
+            ceil(_PEAK_SPEED_FACTOR * turn / MAX_STEP_RAD),
         )
-    n_solve = max(2, round(duration * min(plan_rate, rate)))
+    n_solve = max(n_solve, round(duration * min(plan_rate, rate)))
 
     solved: list[np.ndarray] = []
     posture_before = solver.posture_pose
     weights_before = (solver.config.pos_weight, solver.config.ori_weight)
     solver.config.pos_weight = weights_before[0] * tracking_weight_scale
     solver.config.ori_weight = weights_before[1] * tracking_weight_scale
+
+    def tips_at(t: float) -> list[Pose]:
+        """Where both tips belong at time ``t`` in [0, 1] along the line.
+
+        A pinned arm keeps its starting pose rather than dropping out of the
+        call: passing ``None`` there would be a different JAX trace and cost a
+        fresh multi-second compile.
+        """
+        alpha = float(ease(t))
+        return [
+            (p_start, r_start)
+            if is_pinned
+            else (
+                (1.0 - alpha) * p_start + alpha * p_goal,
+                r_start @ _rodrigues(alpha * w),
+            )
+            for (p_start, r_start), (p_goal, _), w, is_pinned in zip(
+                start, goal, logs, pinned
+            )
+        ]
+
     q = q_from.copy()
     try:
         for i in range(n_solve):
             t = (i + 1) / n_solve
-            alpha = t * t * (3.0 - 2.0 * t)
-            # A pinned arm keeps its starting pose as its target rather than
-            # dropping out of the call: passing ``None`` there would be a
-            # different JAX trace and cost a fresh multi-second compile.
-            tips = [
-                (p_start, r_start)
-                if is_pinned
-                else (
-                    (1.0 - alpha) * p_start + alpha * p_goal,
-                    r_start @ _rodrigues(alpha * w),
-                )
-                for (p_start, r_start), (p_goal, _), w, is_pinned in zip(
-                    start, goal, logs, pinned
-                )
-            ]
+            alpha = float(ease(t))
+            tips = tips_at(t)
             # The solver aims the mount, so ask it for the mount pose that
             # puts the tip on the line.
             targets = [_remove_offset(tip, tool_offset) for tip in tips]
@@ -352,6 +425,7 @@ def plan_linear_segment(
                     posture[idx] = q_from[idx]
             solver.set_posture_pose(posture)
 
+            previous = np.inf
             for _ in range(max_settle_iters + 1):
                 q = solver.ik(q, left_pose=targets[0], right_pose=targets[1])
                 # Discard whatever the solve did to a pinned arm — with its
@@ -366,11 +440,15 @@ def plan_linear_segment(
                     )
                     for actual, target in zip(tip_poses(solver, q, tool_offset), tips)
                 ]
-                if all(
-                    pos <= pos_tolerance and ori <= ori_tolerance for pos, ori in errors
+                worst_pos = max(pos for pos, _ in errors)
+                if worst_pos <= pos_tolerance * settle_fraction and all(
+                    ori <= ori_tolerance * settle_fraction for _, ori in errors
                 ):
                     break
-            else:
+                if worst_pos > previous * 0.95:
+                    break  # as close as this target is going to get
+                previous = worst_pos
+            if any(pos > pos_tolerance or ori > ori_tolerance for pos, ori in errors):
                 worst = max(errors, key=lambda e: e[0])
                 raise PathPlanningError(
                     f"{label}: cannot reach {alpha:.0%} along the straight line "
@@ -390,4 +468,22 @@ def plan_linear_segment(
             label,
             drift,
         )
-    return _resample(solved, max(2, round(duration * rate)))
+
+    n_out = max(2, round(duration * rate))
+    out = _resample(solved, n_out)
+    # Only the solved samples have been checked so far. Between them the path
+    # is the spline's guess, so check there too — halfway between neighbouring
+    # samples, where a chord deviates most — and let a caller who has asked for
+    # more speed than the sampling supports hear about it before anything moves.
+    for i in range(len(solved) - 1):
+        t = (i + 1.5) / len(solved)
+        k = min(n_out - 1, max(0, round(t * n_out) - 1))
+        for actual, target in zip(tip_poses(solver, out[k], tool_offset), tips_at(t)):
+            error = float(np.linalg.norm(actual[0] - target[0]))
+            if error > pos_tolerance:
+                raise PathPlanningError(
+                    f"{label}: the path bows {error * 1e3:.0f} mm off the straight "
+                    f"line {t:.0%} of the way along, between solved samples. "
+                    "Lower the speed, or raise plan_rate."
+                )
+    return out
