@@ -42,7 +42,10 @@ class Waypoint:
 
     Attributes:
         left: Shape ``(8,)`` left-arm pose — 7 joint angles (rad, joint frame)
-            then the gripper normalised to ``[0, 1]``.
+            then the gripper normalised to ``[0, 1]``. The joint angles are
+            what the arm reported; the gripper is the opening to *command*
+            here, which for a grasp is fully closed rather than wherever the
+            fingers stalled against the object.
         right: Same for the right arm.
         label: Optional operator-facing name; defaults to the index at save
             time when unset.

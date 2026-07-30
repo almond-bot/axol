@@ -1177,7 +1177,7 @@ class Axol(RobotBase):
         self,
         kd: float = 0.5,
         free_joints: set[Joint] | None = None,
-        gripper_target: float | None = None,
+        gripper_targets: tuple[float | None, float | None] | None = None,
     ) -> None:
         """Put both arms into gravity-compensation mode for one cycle.
 
@@ -1187,7 +1187,7 @@ class Axol(RobotBase):
         held rigidly at their current position using their configured
         ``ArmConfig`` gains, with gravity feedforward. ``free_joints=None``
         frees all 7 arm joints on each side. The grippers are softly held at
-        their current positions.
+        their current positions unless ``gripper_targets`` asks otherwise.
 
         Telemetry must be active (positions are read from the cache) — call
         :meth:`start_telemetry` before driving this in a loop.
@@ -1198,16 +1198,18 @@ class Axol(RobotBase):
             free_joints: Set of arm joints to gravity-compensate. ``None`` (the
                 default) frees every arm joint. Joints not in this set are
                 held in place. The same filter is applied to both arms.
-            gripper_target: Normalised opening (0.0 = closed, 1.0 = open) to
-                drive both grippers to instead of holding them where they are.
-                Lets a flow operate the grippers while the arms stay
-                hand-guidable (``axol waypoints``).
+            gripper_targets: ``(left, right)`` normalised openings (0.0 =
+                closed, 1.0 = open) to drive each gripper to instead of
+                holding it where it is; ``None`` for either side holds that
+                one. Lets a flow grasp with one arm while the other stays
+                free (``axol waypoints``).
         """
+        left_target, right_target = gripper_targets or (None, None)
         tasks = []
         if self.left is not None:
-            tasks.append(self.left.gravity_compensate(kd, free_joints, gripper_target))
+            tasks.append(self.left.gravity_compensate(kd, free_joints, left_target))
         if self.right is not None:
-            tasks.append(self.right.gravity_compensate(kd, free_joints, gripper_target))
+            tasks.append(self.right.gravity_compensate(kd, free_joints, right_target))
         if tasks:
             await asyncio.gather(*tasks)
 

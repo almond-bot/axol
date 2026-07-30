@@ -13,7 +13,7 @@ The entire path is solved before the arms move, so a waypoint the straight line 
 
 An arm you never touched holds still. Recording captures both arms, and an arm resting in gravity compensation drifts a millimetre or two between recordings; tracking that has a 7-DOF arm hunting through its null space, swinging the elbow degrees to chase a millimetre of gripper. Below `--min_travel` and `--min_rotation` the leg pins that arm where it is instead.
 
-Playback runs at **full arm stiffness**, unlike the compliant defaults elsewhere: the path is validated before anything moves, and a soft arm sags off it and springs back. Hand-guiding is unaffected — gravity compensation zeroes the position gain on free joints either way — but a stiff arm will not yield if the path meets something unexpected. Lower it with `--axol.left_stiffness` / `--axol.right_stiffness` when the task wants compliance.
+Arm stiffness is the robot's own, shared with every other operation — the control panel's setting, or `--axol.left_stiffness` / `--axol.right_stiffness`. A stiffer arm holds a planned path more closely; a softer one sags off it, but rings less when something disturbs it and yields if the path meets an obstacle. Hand-guiding is unaffected either way, since gravity compensation zeroes the position gain on free joints.
 
 This command is configured via draccus — see [Command configuration](/cli/configuration).
 
@@ -26,14 +26,24 @@ On the terminal, single keys on stdin:
 | `Enter` | Record the pose both arms are in |
 | `u` | Undo the last waypoint |
 | `c` | Clear every waypoint |
-| `g` | Cycle the grippers: limp → open → closed |
+| `[` / `]` | Cycle the left / right gripper: limp → open → closed |
 | `p` | Play the path |
 | `s` | Stop playback and go back to teaching |
 | `q` | Quit |
 
 The same actions are buttons in the [control panel](/guides/control-panel) — the running session publishes them, so a path can be taught and replayed with no terminal at all.
 
-Grippers are recorded with each waypoint. Cycle them with `g` (or the panel button) to grasp an object before recording, and the same opening is reproduced at that waypoint on playback.
+## Grasping
+
+Each gripper is worked on its own, so one arm can carry something while the other is still being guided. Open or close a gripper before recording and the waypoint stores that as the opening to command there; on playback the arms hold still while it moves, so a grasp closes on the object at the waypoint rather than somewhere along the way.
+
+Grip force is the gripper's `torque_limit`, shared with every other operation and settable from the control panel. Force only exists where a command asks for more travel than the object allows, which is why closing records **fully closed** rather than wherever the fingers stopped — reproducing the stall position would bring them to rest against the object under no load at all. Set the torque for the object, not the opening.
+
+A gripper you leave alone keeps whatever the last waypoint asked for, and playback does not pause to work it. So a pick-and-place is four waypoints and two gripper moves: open above the object, close on it, carry it, open to let go.
+
+<Tip>
+  Teaching starts with both grippers limp, so you can set the fingers by hand. The first `[` or `]` powers that gripper and opens it.
+</Tip>
 
 ## Flags
 
@@ -46,7 +56,7 @@ Grippers are recorded with each waypoint. Cycle them with `g` (or the panel butt
 | `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.25 |
 | `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 1.2 |
 | `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
-| `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
+| `--grip_time FLOAT` | Seconds spent working the grippers to a waypoint's opening. Skipped where a waypoint leaves them as they are. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
 | `--plan_rate_hz FLOAT` | Floor on IK solves per second of motion; how far the tip travels between solves caps it from the other side. The solved path is splined up to `--rate_hz` for playback. Default 10 |
 | `--min_travel FLOAT` | An arm whose gripper tip moves less than this (m) between two waypoints holds still for that leg. Default 0.01 |
@@ -74,7 +84,7 @@ axol waypoints --speed 0.5                      # brisk
 The default puts the gripper at the same 0.47 m/s the robot already reaches driving itself between poses, and the straight lines are just as straight at any speed — the solver samples a leg by distance travelled, not by clock, so its accuracy does not change when you speed it up. What changes is acceleration, which grows with the square of the speed: 2 m/s² at the default, 8 at `--speed 0.5`, 16 at `--speed 0.7`. Past that a leg is over in a fraction of a second and the dwell at each waypoint dominates the cycle anyway.
 
 <Warning>
-  Playback runs stiff. A fast leg carries real momentum and the arm will not yield if the path meets something unexpected — work up to a speed with the workspace clear.
+  A fast leg carries real momentum, and a stiff arm will not yield if the path meets something unexpected — work up to a speed with the workspace clear.
 </Warning>
 
 ## The waypoint file
@@ -94,7 +104,7 @@ Waypoints are stored as the joint angles the arms actually reported, so a path i
 }
 ```
 
-Each arm entry is 7 joint angles in radians (`SHOULDER_1` … `WRIST_3`, joint frame, 0 = rest) followed by the gripper normalised to `[0, 1]`. The Cartesian pose the gripper travels through is derived from these by forward kinematics at planning time.
+Each arm entry is 7 joint angles in radians (`SHOULDER_1` … `WRIST_3`, joint frame, 0 = rest) followed by the gripper normalised to `[0, 1]`. The Cartesian pose the gripper travels through is derived from these by forward kinematics at planning time. The joint angles are what the arm reported; the gripper is the opening to *command* there — `0.0` for a grasp, whatever the fingers close to — so editing a path by hand means editing intent, not a measurement.
 
 <Tip>
   A 7-DOF arm can reach the same gripper pose several ways. Playback keeps the posture you taught by sweeping the solver's posture attractor between the recorded joint vectors, so the elbow follows the path you guided it along rather than swinging into an unexpected configuration.
