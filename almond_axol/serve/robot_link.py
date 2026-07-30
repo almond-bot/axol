@@ -294,6 +294,11 @@ class RobotLink:
         self._ping_task: asyncio.Task[Any] | None = None
         self._sample_task: asyncio.Task[Any] | None = None
         self._lock = threading.Lock()
+        # Joint set snapshotted when the buses open, so status() stays
+        # consistent with the motors actually being pinged even if the
+        # has_gripper setting is toggled mid-connection. None = link down;
+        # status() then reports the live setting (what the next connect uses).
+        self._active_joints: list[Joint] | None = None
 
     def _has_gripper(self) -> bool:
         if self._has_gripper_provider is None:
@@ -301,7 +306,15 @@ class RobotLink:
         return bool(self._has_gripper_provider())
 
     def _joints(self) -> list[Joint]:
-        """The motors this robot actually has (gripper excluded on the gripperless SKU)."""
+        """The motors this robot actually has (gripper excluded on the gripperless SKU).
+
+        While the link is up this is the connect-time snapshot matching the
+        opened motors; otherwise the current setting.
+        """
+        with self._lock:
+            active = self._active_joints
+        if active is not None:
+            return active
         return list(Joint) if self._has_gripper() else list(ARM_JOINTS)
 
     # -- thread plumbing ----------------------------------------------------
@@ -349,6 +362,9 @@ class RobotLink:
         self._set_state(STATE_DISCONNECTED)
         with self._lock:
             self._last_ping = None
+            # The snapshot describes the motors whose health was just cleared;
+            # status() now falls back to the live setting.
+            self._active_joints = None
         for arm in self._arms:
             arm.health = {}
         self.hub.clear_slow()
@@ -442,7 +458,7 @@ class RobotLink:
             "error": error,
             "lastPing": last_ping,
             "channels": {"left": left_channel, "right": right_channel},
-            "hasGripper": self._has_gripper(),
+            "hasGripper": Joint.GRIPPER in joints,
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
@@ -476,7 +492,11 @@ class RobotLink:
     # -- loop-side coroutines ----------------------------------------------
 
     async def _open_and_start(self) -> None:
-        joints = self._joints()
+        # Snapshot the joint set from the live setting for this connection;
+        # status() reports from the same snapshot until the link is torn down.
+        joints = list(Joint) if self._has_gripper() else list(ARM_JOINTS)
+        with self._lock:
+            self._active_joints = joints
         for arm in self._arms:
             await arm.open(joints)
         if self._ping_task is None or self._ping_task.done():
