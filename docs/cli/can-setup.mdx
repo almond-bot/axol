@@ -7,15 +7,18 @@ One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Installs 
 
 - Left arm → `can_alm_axol_l`
 - Right arm → `can_alm_axol_r`
+- Powered cart's wheel bus (if present) → `can_alm_axol_b`
 
 ```bash
 axol can.setup
 ```
+
+If a **single-channel** CAN adapter is also attached — the [powered cart](/guides/vr-interface#powered-cart)'s CANable, told apart from the dual-channel arm hub by its channel count — `can.setup` asks which one it is and pins it by serial to `can_alm_axol_b` in the same udev rules file. The `@reboot` startup script then brings it up alongside the arm channels, skipping it when the cart is absent so an unplugged cart never blocks the arms.
 
 <Note>
   `sudo` will be invoked automatically where required.
 </Note>
 
 <Info>
-  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook). If the Axol Hub is re-plugged mid-session without a restart, bring the interfaces back up with [`can.enable`](/cli/can-enable).
+  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook). If the Axol Hub is re-plugged mid-session without a restart, bring the interfaces back up with [`can.enable`](/cli/can-enable). You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
 </Info>
