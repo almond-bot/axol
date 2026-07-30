@@ -9,6 +9,10 @@ The line is held at the point the fingers close on, not at the gripper mount the
 
 The entire path is solved before the arms move, so a waypoint the straight line cannot reach is reported while the robot is still standing still.
 
+An arm you never touched holds still. Recording captures both arms, and an arm resting in gravity compensation drifts a millimetre or two between recordings; tracking that has a 7-DOF arm hunting through its null space, swinging the elbow degrees to chase a millimetre of gripper. Below `--min_travel` and `--min_rotation` the leg pins that arm where it is instead.
+
+Playback runs at **full arm stiffness**, unlike the compliant defaults elsewhere: the path is validated before anything moves, and a soft arm sags off it and springs back. Hand-guiding is unaffected — gravity compensation zeroes the position gain on free joints either way — but a stiff arm will not yield if the path meets something unexpected. Lower it with `--axol.left_stiffness` / `--axol.right_stiffness` when the task wants compliance.
+
 This command is configured via draccus — see [Command configuration](/cli/configuration).
 
 ## Driving a session
@@ -43,6 +47,9 @@ Grippers are recorded with each waypoint. Cycle them with `g` (or the panel butt
 | `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
 | `--plan_rate_hz FLOAT` | IK solves per second of motion; the solved path is interpolated up to `--rate_hz` for playback. Trades planning time against how finely the line is sampled — raise it only if a path bows. Default 50 |
+| `--min_travel FLOAT` | An arm whose gripper tip moves less than this (m) between two waypoints holds still for that leg. Default 0.01 |
+| `--min_rotation FLOAT` | Rotation counterpart to `--min_travel` (rad). Default 0.05 |
+| `--ease_in FLOAT` | Seconds spent blending onto the start of each leg, so the arm rejoins the plan smoothly instead of taking up the difference in one tick. Default 0.4 |
 | `--free_joints [J1,J2,...]` | Joints to gravity-compensate while teaching. Default `null` = all 7 |
 | `--kd FLOAT` | Velocity damping on free joints while teaching (Nm·s/rad). Default 0.25 |
 | `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |

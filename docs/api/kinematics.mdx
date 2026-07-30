@@ -48,6 +48,10 @@ q = solver.ik(q, left_pose=(pos, rot))
 
 The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. To keep that affordable, IK runs at `plan_rate` (50 Hz of motion by default) and the solved vectors are interpolated up to the playback rate — consecutive solves are a millimetre apart, so the interpolation costs nothing measurable in straightness. A sample that cannot be tracked within `pos_tolerance` raises `PathPlanningError` — nothing has moved at that point.
 
+An arm whose tip travels less than `min_travel` (and turns less than `min_rotation`) is pinned at `q_from` for the whole segment rather than tracked. Below that scale the difference between two taught configurations is drift rather than intent, and a redundant arm chasing it wanders through its null space — degrees of elbow for a millimetre of tip.
+
+The first vector returned is the configuration IK settles into at the start of the line, which reaches the same gripper pose as `q_from` but generally holds the elbow slightly differently. Commanding it directly puts that difference into a single tick, so plan each segment from the previous one's final vector and blend the remainder in over a few tenths of a second (`axol waypoints` does both).
+
 Planning calls `ik()` without elbow hints, which is a different JAX trace from the one `KinematicsSolver` warms up; call `path.warmup(solver)` once (off the hot path) to absorb that compile. This is what [`axol waypoints`](/cli/waypoints) replays — for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
 
 ```python

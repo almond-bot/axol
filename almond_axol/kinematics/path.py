@@ -21,6 +21,10 @@ Two details make the line straight *where it matters* and quick to compute:
   under the control rate, and the solved joint vectors are interpolated up to
   one per tick. Consecutive solves are milliseconds and a millimetre apart, so
   the interpolation is invisible while the solve count drops several-fold.
+- **An arm that isn't going anywhere is pinned.** Below ``min_travel`` the
+  taught difference is gravity-compensation drift, not intent, and tracking it
+  makes a 7-DOF arm hunt through its null space: degrees of elbow swing to
+  chase a millimetre of tip.
 
 Redundancy (7 DOF for a 6-DOF task) is resolved by the *taught* posture: the
 solver's posture attractor is swept from the start waypoint's joint vector to
@@ -140,20 +144,22 @@ def _rodrigues(w: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
-def _resample(
-    solved: list[np.ndarray], q_start: np.ndarray, n_out: int
-) -> list[np.ndarray]:
+def _resample(solved: list[np.ndarray], n_out: int) -> list[np.ndarray]:
     """Stretch ``solved`` to ``n_out`` evenly spaced joint vectors.
 
     ``solved`` covers the segment at the (coarser) planning rate, sample ``i``
-    landing at time ``(i + 1) / len(solved)``. ``q_start`` anchors time zero so
-    the first output tick interpolates from where the arm actually is; the last
-    output tick lands exactly on the final solved pose.
+    landing at time ``(i + 1) / len(solved)``; the last output tick therefore
+    lands exactly on the final solved pose. Ticks before the first solved
+    sample hold at it rather than ramping in from the caller's start pose:
+    that ramp would have to absorb the whole difference between the taught
+    configuration and the one IK settles into within a single planning
+    interval, which is a velocity spike. Blending that difference out over a
+    sensible time is the caller's job.
     """
     if n_out <= len(solved):
         return solved
-    knots = np.linspace(0.0, 1.0, len(solved) + 1)
-    values = np.asarray([q_start, *solved], dtype=np.float32)
+    knots = np.arange(1, len(solved) + 1, dtype=np.float32) / len(solved)
+    values = np.asarray(solved, dtype=np.float32)
     ticks = np.arange(1, n_out + 1, dtype=np.float32) / n_out
     out = np.empty((n_out, values.shape[1]), dtype=np.float32)
     for j in range(values.shape[1]):
@@ -204,6 +210,8 @@ def plan_linear_segment(
     rate: float,
     plan_rate: float = DEFAULT_PLAN_RATE,
     tool_offset: Offset = GRIPPER_TIP_OFFSET,
+    min_travel: float = 0.01,
+    min_rotation: float = 0.05,
     pos_tolerance: float = 0.01,
     ori_tolerance: float = 0.15,
     min_duration: float = 0.25,
@@ -239,6 +247,15 @@ def plan_linear_segment(
         tool_offset:     Tip of the tool in the gripper link frame — the point
                          held to the straight line. Pass zeros to hold the
                          gripper mount itself (a gripperless arm).
+        min_travel:      An arm whose tip moves less than this (m) between the
+            two configurations, and turns less than ``min_rotation``, is left
+            out of the solve and pinned at ``q_from`` instead. An arm the
+            operator never touched still records a millimetre or two of
+            gravity-compensation drift per waypoint, and asking IK to track
+            that has it hunting through the null space — the tip creeps a
+            millimetre while the elbow swings degrees. Pinning is also what
+            you want physically: an arm nobody taught should not move.
+        min_rotation:    Rotation counterpart to ``min_travel`` (rad).
         pos_tolerance:   Maximum tolerated tip position error (m) at any sample.
         ori_tolerance:   Maximum tolerated orientation error (rad).
         min_duration:    Floor on the segment duration (s).
@@ -257,7 +274,10 @@ def plan_linear_segment(
 
     Returns:
         One full ``(N,)`` joint vector per control tick at ``rate``, ending at
-        the configuration that reaches ``q_to``'s gripper poses.
+        the configuration that reaches ``q_to``'s gripper poses. The first
+        vector is the configuration IK settles into at the start of the line,
+        which is near ``q_from`` but generally not equal to it: the caller is
+        expected to blend into it (see ``ease_in`` in ``axol waypoints``).
 
     Raises:
         PathPlanningError: A sample could not be resolved within tolerance —
@@ -273,9 +293,23 @@ def plan_linear_segment(
     # Axis-angle deltas, precomputed per arm so each sample is a cheap
     # Rodrigues evaluation rather than a fresh matrix logarithm.
     logs = [_rot_log(s[1], g[1]) for s, g in zip(start, goal)]
+    arm_indices = (solver.left_indices, solver.right_indices)
+
+    pinned = [
+        float(np.linalg.norm(g[0] - s[0])) < min_travel
+        and float(np.linalg.norm(w)) < min_rotation
+        for s, g, w in zip(start, goal, logs)
+    ]
+    for side, is_pinned in zip(("left", "right"), pinned):
+        if is_pinned:
+            _logger.debug(
+                "%s: %s arm holds still (below the travel floor)", label, side
+            )
 
     duration = min_duration
-    for (p_start, _), (p_goal, _), w in zip(start, goal, logs):
+    for (p_start, _), (p_goal, _), w, is_pinned in zip(start, goal, logs, pinned):
+        if is_pinned:
+            continue
         duration = max(
             duration,
             float(np.linalg.norm(p_goal - p_start)) / speed,
@@ -293,22 +327,38 @@ def plan_linear_segment(
         for i in range(n_solve):
             t = (i + 1) / n_solve
             alpha = t * t * (3.0 - 2.0 * t)
+            # A pinned arm keeps its starting pose as its target rather than
+            # dropping out of the call: passing ``None`` there would be a
+            # different JAX trace and cost a fresh multi-second compile.
             tips = [
-                (
+                (p_start, r_start)
+                if is_pinned
+                else (
                     (1.0 - alpha) * p_start + alpha * p_goal,
                     r_start @ _rodrigues(alpha * w),
                 )
-                for (p_start, r_start), (p_goal, _), w in zip(start, goal, logs)
+                for (p_start, r_start), (p_goal, _), w, is_pinned in zip(
+                    start, goal, logs, pinned
+                )
             ]
             # The solver aims the mount, so ask it for the mount pose that
             # puts the tip on the line.
             targets = [_remove_offset(tip, tool_offset) for tip in tips]
             # Sweep the null-space attractor along the taught postures so the
             # elbow tracks how the arm was posed by hand.
-            solver.set_posture_pose(q_from * (1.0 - alpha) + q_to * alpha)
+            posture = q_from * (1.0 - alpha) + q_to * alpha
+            for idx, is_pinned in zip(arm_indices, pinned):
+                if is_pinned:
+                    posture[idx] = q_from[idx]
+            solver.set_posture_pose(posture)
 
             for _ in range(max_settle_iters + 1):
                 q = solver.ik(q, left_pose=targets[0], right_pose=targets[1])
+                # Discard whatever the solve did to a pinned arm — with its
+                # target already met, any movement is null-space wander.
+                for idx, is_pinned in zip(arm_indices, pinned):
+                    if is_pinned:
+                        q[idx] = q_from[idx]
                 errors = [
                     (
                         float(np.linalg.norm(actual[0] - target[0])),
@@ -340,4 +390,4 @@ def plan_linear_segment(
             label,
             drift,
         )
-    return _resample(solved, q_from, max(2, round(duration * rate)))
+    return _resample(solved, max(2, round(duration * rate)))

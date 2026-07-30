@@ -85,12 +85,22 @@ class WaypointsCmdConfig:
     then hold still for ``dwell``.
 
     The teaching side takes the same knobs as ``axol gravity-comp``
-    (``free_joints``, ``kd``); per-joint gains and stiffness come from the
-    nested ``axol`` config — e.g. ``--axol.left_stiffness 0.8``. IK cost
-    weights live on ``kinematics`` — e.g. ``--kinematics.max_reach 0.7``.
+    (``free_joints``, ``kd``); per-joint gains come from the nested ``axol``
+    config. IK cost weights live on ``kinematics`` — e.g.
+    ``--kinematics.max_reach 0.7``.
+
+    Unlike the compliant defaults the other commands run at, playback uses
+    **full arm stiffness**: the path is planned and validated before anything
+    moves, and a soft arm sags off it and springs back. Hand-guiding is
+    unaffected (gravity compensation zeroes the position gain on free joints
+    regardless), but a stiff arm does not yield if the path meets something
+    unexpected — lower it with ``--axol.left_stiffness`` / ``right_stiffness``
+    if the task calls for compliance.
     """
 
-    axol: AxolConfig = field(default_factory=AxolConfig)
+    axol: AxolConfig = field(
+        default_factory=lambda: AxolConfig(left_stiffness=1.0, right_stiffness=1.0)
+    )
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
@@ -112,6 +122,18 @@ class WaypointsCmdConfig:
     """IK solves per second of motion. The solved path is interpolated up to
     ``rate_hz`` for playback, so this trades planning time against how finely
     the straight line is sampled — raise it only if a path bows."""
+    min_travel: float = 0.01
+    """An arm whose gripper tip moves less than this (m) between two waypoints,
+    and turns less than ``min_rotation``, holds still for that leg instead of
+    being tracked. Keeps an arm the operator never touched from chasing the
+    millimetre of drift gravity compensation leaves between recordings."""
+    min_rotation: float = 0.05
+    """Rotation counterpart to ``min_travel`` (rad)."""
+    ease_in: float = 0.4
+    """Seconds spent blending onto the start of each planned leg. The arm ends
+    a leg in the configuration IK settled into, which reaches the taught
+    gripper pose by a slightly different elbow angle than the operator used;
+    without a blend that difference is taken up in a single tick."""
     free_joints: list[str] | None = None
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
@@ -335,6 +357,31 @@ def _blend(a: Grip, b: Grip, alpha: float) -> Grip:
     return (a[0] + (b[0] - a[0]) * alpha, a[1] + (b[1] - a[1]) * alpha)
 
 
+def _ease_in_offsets(
+    q_now: np.ndarray | None, q_first: np.ndarray, seconds: float, rate: float
+) -> np.ndarray:
+    """Per-tick corrections that walk a leg's opening ticks back to ``q_now``.
+
+    A planned leg starts at the configuration IK settled into for its first
+    sample, which reaches the same gripper pose as wherever the arm is now but
+    can hold the elbow a degree or so differently. Commanding it outright puts
+    that whole difference into one tick. These offsets start at exactly the
+    difference and fade to zero on a smoothstep, so the arm rejoins the plan
+    over ``seconds`` with no step in position or velocity at either end.
+
+    Returns an empty array when there is nothing to take up.
+    """
+    if q_now is None:
+        return np.empty((0, 0), dtype=np.float32)
+    offset = np.asarray(q_now, dtype=np.float32) - q_first
+    n = max(0, round(seconds * rate))
+    if n == 0 or not offset.any():
+        return np.empty((0, 0), dtype=np.float32)
+    s = np.arange(n, dtype=np.float32) / n
+    decay = 1.0 - s * s * (3.0 - 2.0 * s)
+    return decay[:, None] * offset
+
+
 # ----------------------------------------------------------------------
 # Session
 # ----------------------------------------------------------------------
@@ -373,6 +420,9 @@ class _Session:
         # Pose the playback starts from, sampled just before planning.
         self._q_start: np.ndarray | None = None
         self._grip_start: Grip = (0.0, 0.0)
+        # Last configuration commanded, so each leg can be blended onto rather
+        # than stepped into. None until playback has sent something.
+        self._q_last: np.ndarray | None = None
         # Why the session gave up, kept as the closing status message.
         self._failure: str | None = None
 
@@ -525,6 +575,7 @@ class _Session:
         solver = await asyncio.to_thread(self._solver_handle.get)
 
         self._q_start = await self._current_q(solver)
+        self._q_last = self._q_start
         self._grip_start = await self._current_grip()
         self._publish(
             "planning", f"Planning a path through {len(self._store)} waypoints…"
@@ -606,17 +657,24 @@ class _Session:
             # waypoint the same way it moves anywhere else.
             pairs.append((len(waypoints) - 1, 0))
         for i, j in pairs:
+            # Plan from where the previous leg actually ends, not from the
+            # taught pose it aimed at. IK reaches a taught gripper pose with
+            # its own elbow angle, and starting the next leg from the taught
+            # configuration instead would hand the arm that difference to
+            # take up as it sets off.
             legs.append(
                 (
                     plan_linear_segment(
                         solver,
-                        q_waypoints[i],
+                        legs[-1][0][-1],
                         q_waypoints[j],
                         speed=cfg.speed,
                         ang_speed=cfg.ang_speed,
                         rate=cfg.rate_hz,
                         plan_rate=cfg.plan_rate_hz,
                         tool_offset=self._tool_offset,
+                        min_travel=cfg.min_travel,
+                        min_rotation=cfg.min_rotation,
                         pos_tolerance=cfg.pos_tolerance,
                         label=f"waypoint {i + 1} → {j + 1}",
                     ),
@@ -631,10 +689,16 @@ class _Session:
     ) -> bool:
         """Send a planned leg at the control rate. False if it was stopped."""
         dt = 1.0 / self._cfg.rate_hz
-        for q in trajectory:
+        blend = _ease_in_offsets(
+            self._q_last, trajectory[0], self._cfg.ease_in, self._cfg.rate_hz
+        )
+        for step, q in enumerate(trajectory):
             if self._interrupted():
                 return False
             loop_start = time.monotonic()
+            if step < len(blend):
+                q = q + blend[step]
+            self._q_last = q
             left, right = _arm_command(q, solver, grip)
             await self._send(left, right)
             spent = time.monotonic() - loop_start
