@@ -131,6 +131,11 @@ def scoped_motor_faults(
             joint_names = {joint}
     if joint_names is not None:
         faults = [f for f in faults if f["joint"].upper() in joint_names]
+    elif _flag(args.get("guided")):
+        # Guided zeroing without an explicit subset walks the seven arm
+        # joints; the gripper is never touched (it has no zero to set), so
+        # a gripper fault must not block the launch.
+        faults = [f for f in faults if f["joint"].upper() != Joint.GRIPPER.name]
     return faults
 
 
