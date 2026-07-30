@@ -830,6 +830,14 @@ def _run(
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
+    # The teleop's action keys must match the robot's: propagate the SKU's
+    # gripper capability so the gripperless SKU commands/records no gripper
+    # channels (mirrors collect-data).
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+
     robot = AxolRobot(cfg.robot_config)
     teleop = DaggerVRTeleop(cfg.teleop_config)
     policy = _LocalPolicy(cfg.policy_path, cfg.policy_type, cfg.device, task)
