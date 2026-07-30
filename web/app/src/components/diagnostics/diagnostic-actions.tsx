@@ -370,6 +370,12 @@ export function ActionDialog({
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
+    // A restricted picker (e.g. no gripper) must send its joint list even
+    // when everything is selected: omitting --joints would fall through to
+    // the command's own default, which includes the excluded joints.
+    if (jointsField && pickerJoints && pickerJoints.length < JOINTS.length && args.joints == null) {
+      args.joints = pickerJoints.map((j) => j.toLowerCase()).join(",")
+    }
     if (hasWebPrompts) args.web_prompts = true
     Object.assign(args, effectivePresets)
     onLaunch(args)
