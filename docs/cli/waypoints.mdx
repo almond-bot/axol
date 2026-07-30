@@ -26,7 +26,7 @@ On the terminal, single keys on stdin:
 | `Enter` | Record the pose both arms are in |
 | `u` | Undo the last waypoint |
 | `c` | Clear every waypoint |
-| `[` / `]` | Cycle the left / right gripper: limp → open → closed |
+| `[` / `]` | Open or close the left / right gripper |
 | `p` | Play the path |
 | `s` | Stop playback and go back to teaching |
 | `q` | Quit |
@@ -35,14 +35,21 @@ The same actions are buttons in the [control panel](/guides/control-panel) — t
 
 ## Grasping
 
-Each gripper is worked on its own, so one arm can carry something while the other is still being guided. Open or close a gripper before recording and the waypoint stores that as the opening to command there; on playback the arms hold still while it moves, so a grasp closes on the object at the waypoint rather than somewhere along the way.
+A gripper is open or closed, nothing in between, and each one is worked on its own — `[` for the left, `]` for the right — so one arm can carry something while the other is still being guided. Both start open. Whatever state a gripper is in when you record is what that waypoint asks for, so a path always says what both grippers should be doing:
 
-Grip force is the gripper's `torque_limit`, shared with every other operation and settable from the control panel. Force only exists where a command asks for more travel than the object allows, which is why closing records **fully closed** rather than wherever the fingers stopped — reproducing the stall position would bring them to rest against the object under no load at all. Set the torque for the object, not the opening.
+```text
+[  ] guide above the object, record      -> both open
+[  ] press ], guide down, record         -> right closed: the grasp
+[  ] guide to the destination, record    -> right still closed: carrying
+[  ] press ], record                     -> right open: let go
+```
 
-A gripper you leave alone keeps whatever the last waypoint asked for, and playback does not pause to work it. So a pick-and-place is four waypoints and two gripper moves: open above the object, close on it, carry it, open to let go.
+On playback the arms hold still while a gripper moves, so the grasp closes on the object at its waypoint rather than somewhere along the way. Waypoints that change nothing do not pause for it.
+
+Grip force is the gripper's `torque_limit`, shared with every other operation and settable from the control panel. Force only exists where a command asks for more travel than the object allows, which is why closing records **fully closed** rather than wherever the fingers stopped against the object — reproducing the stall position would bring them to rest touching it under no load at all. Set the torque for the object; the opening is only ever open or closed.
 
 <Tip>
-  Teaching starts with both grippers limp, so you can set the fingers by hand. The first `[` or `]` powers that gripper and opens it.
+  Planning logs what each waypoint asks the grippers for before anything moves, and warns when a whole path leaves them alone — which looks exactly like a gripper that does not work.
 </Tip>
 
 ## Flags

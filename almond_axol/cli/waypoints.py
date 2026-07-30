@@ -12,12 +12,13 @@ Two ways to drive it. On the terminal, single keys on stdin:
     [Enter]  record the current pose      p  play the path
     u        undo the last waypoint       s  stop playback
     c        clear every waypoint         q  quit
-    [ / ]    cycle the left / right gripper: open, closed, limp
+    [ / ]    open or close the left / right gripper
 
-A waypoint stores the opening each gripper was told to hold when it was
-recorded, so closing on an object replays as a grasp at the configured torque
-limit rather than a touch. Leave a gripper alone and the waypoint keeps it as
-it is, and playback does not pause to work it.
+Grippers start open, and every waypoint records whether each one should be
+open or closed there. Closing on an object replays as a grasp at the gripper's
+configured torque limit rather than a touch, because what is stored is what
+the gripper was *told* to do and not where the fingers came to rest against
+the object. Waypoints that do not change a gripper do not pause to work it.
 
 In the ``axol serve`` control panel the same actions are buttons — the running
 session publishes them, so the panel needs no knowledge of this command.
@@ -65,10 +66,6 @@ _AT_POSE_EPSILON = 0.02
 
 # Per-arm gripper openings, normalised [0, 1].
 Grip = tuple[float, float]
-
-# Per-arm gripper commands while teaching: an opening to drive to, or None to
-# leave that gripper limp.
-GripTarget = tuple[float | None, float | None]
 
 # One planned move: the joint vectors to stream, the gripper openings held
 # while streaming them, and the openings to reach on arrival.
@@ -182,26 +179,17 @@ _KEYS: dict[str, str] = {
     "q": "quit",
 }
 
-# Fully open and fully closed are the only openings teaching commands. Grip
-# force comes from the gripper's configured torque limit, which only does
-# anything when the command asks for more travel than the object allows:
-# recording where the fingers happened to stall against it would replay as a
-# touch rather than a grasp.
+# A gripper is either open or closed — the two states a waypoint can ask for,
+# and all a grasp needs. Force comes from the gripper's configured torque
+# limit, which only does anything when the command asks for more travel than
+# the object allows: recording where the fingers happened to stall against it
+# would replay as a touch rather than a grasp.
 GRIP_OPEN = 1.0
 GRIP_CLOSED = 0.0
 
-# Cycling one gripper while teaching: limp (held wherever it is) -> open ->
-# closed, so an object can be grasped and then let go of entirely.
-_GRIP_CYCLE: dict[float | None, float | None] = {
-    None: GRIP_OPEN,
-    GRIP_OPEN: GRIP_CLOSED,
-    GRIP_CLOSED: None,
-}
-_GRIP_ACTIONS: dict[float | None, str] = {
-    None: "Open",
-    GRIP_OPEN: "Close",
-    GRIP_CLOSED: "Release",
-}
+
+def _toggle(opening: float) -> float:
+    return GRIP_CLOSED if opening == GRIP_OPEN else GRIP_OPEN
 
 
 class _StdinWaypointControl:
@@ -438,10 +426,10 @@ class _Session:
         )
         self._solver_handle = _SolverHandle(cfg.kinematics, self._tool_offset)
         self._free_joints = _resolve_free_joints(cfg.free_joints)
-        # Per-arm gripper command, (left, right). None leaves that gripper
-        # where it is; a value drives it there so the operator can grasp an
-        # object before recording the waypoint.
-        self._grip_target: GripTarget = (None, None)
+        # What each gripper is being told to do, (left, right). Grippers are
+        # open when a session starts, and every waypoint records whatever
+        # this is, so a taught path always says what both should be doing.
+        self._grip_target: Grip = (GRIP_OPEN, GRIP_OPEN)
         # True while the arms are held by motion_control rather than gravity
         # comp, so teardown knows whether parking at rest is safe.
         self._under_position_control = False
@@ -500,7 +488,7 @@ class _Session:
         left, right = await self._positions()
         return float(left[_GRIP]), float(right[_GRIP])
 
-    def _grippers(self) -> list[tuple[str, float | None]]:
+    def _grippers(self) -> list[tuple[str, float]]:
         """``(side, current command)`` for each gripper there is to operate.
 
         An absent arm, or the gripperless SKU, has nothing to work — offering
@@ -548,11 +536,9 @@ class _Session:
         if count >= 2:
             controls.append({"command": "play", "label": f"Play {count} waypoints"})
         for side, target in self._grippers():
+            action = "Close" if target == GRIP_OPEN else "Open"
             controls.append(
-                {
-                    "command": f"grip-{side}",
-                    "label": f"{_GRIP_ACTIONS[target]} {side} gripper",
-                }
+                {"command": f"grip-{side}", "label": f"{action} {side} gripper"}
             )
         if count:
             controls.append({"command": "undo", "label": "Undo last"})
@@ -611,10 +597,11 @@ class _Session:
                 await asyncio.sleep(dt - spent)
 
     def _cycle_grip(self, index: int) -> None:
-        """Step one gripper through limp -> open -> closed."""
-        target = list(self._grip_target)
-        target[index] = _GRIP_CYCLE[target[index]]
-        self._grip_target = (target[0], target[1])
+        """Open one gripper if it is closed, close it if it is open."""
+        left, right = self._grip_target
+        self._grip_target = (
+            (_toggle(left), right) if index == 0 else (left, _toggle(right))
+        )
         self._publish_teaching()
 
     async def _record(self) -> None:
@@ -622,12 +609,9 @@ class _Session:
         # Store what the gripper was *told* to do, not where it ended up. A
         # grasp stalls the fingers on the object well short of closed, and
         # replaying that measurement would bring them to rest against it
-        # under no load. Commanding closed again lets the torque limit set
-        # the grip force. Untouched grippers keep their measured opening,
-        # which is the right thing to hold for a path that grasps nothing.
-        for arm, target in zip((left, right), self._grip_target):
-            if target is not None:
-                arm[_GRIP] = target
+        # under no load rather than gripping. Commanding closed again lets
+        # the torque limit set the force.
+        left[_GRIP], right[_GRIP] = self._grip_target
         self._store.append(Waypoint(left=left, right=right))
         self._store.save(self._cfg.file)
         _logger.info("Recorded waypoint %d to %s", len(self._store), self._cfg.file)
@@ -688,6 +672,34 @@ class _Session:
                 if not await self._settle(solver, trajectory[-1], held, arrival):
                     return
 
+    def _log_grip_plan(self, grips: list[Grip]) -> None:
+        """Report what the grippers will do, before anything moves.
+
+        A path where they never change is a path taught without ever pressing
+        ``[`` or ``]``, which looks on playback exactly like a gripper that
+        does not work. Say so rather than let it look like a fault.
+        """
+        if not self._cfg.axol.has_gripper:
+            return
+        names = {GRIP_OPEN: "open", GRIP_CLOSED: "closed"}
+
+        def opening(value: float) -> str:
+            return names.get(value, f"{value:.2f}")
+
+        _logger.info(
+            "Grippers: %s",
+            "; ".join(
+                f"waypoint {i + 1} left {opening(left)}, right {opening(right)}"
+                for i, (left, right) in enumerate(grips)
+            ),
+        )
+        if len(set(grips)) == 1:
+            _logger.warning(
+                "Every waypoint asks for the same gripper openings, so the "
+                "grippers will not move during playback. Open or close one "
+                "with [ or ] before recording the waypoint it should happen at."
+            )
+
     def _plan(self, solver: Any) -> list[Leg]:
         """Plan every leg of the path. Runs off the event loop (JAX blocks)."""
         from ..kinematics.path import plan_linear_segment
@@ -700,6 +712,7 @@ class _Session:
         grips: list[Grip] = [
             (float(wp.left[_GRIP]), float(wp.right[_GRIP])) for wp in waypoints
         ]
+        self._log_grip_plan(grips)
 
         # The arms start wherever they were left (hand-guided, or at rest in
         # sim), which is not on the straight line, so the approach is a
