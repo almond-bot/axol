@@ -41,7 +41,7 @@ from typing import Any
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, GRIPPER_TIP_OFFSET
 from ..kinematics.config import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.config import AxolConfig
@@ -108,6 +108,10 @@ class WaypointsCmdConfig:
     """Times to run the path. 0 replays it until stopped."""
     pos_tolerance: float = 0.01
     """Largest tolerated deviation (m) from the straight line while planning."""
+    plan_rate_hz: float = 50.0
+    """IK solves per second of motion. The solved path is interpolated up to
+    ``rate_hz`` for playback, so this trades planning time against how finely
+    the straight line is sampled — raise it only if a path bows."""
     free_joints: list[str] | None = None
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
@@ -256,8 +260,11 @@ class _SolverHandle:
     operator is still hand-guiding the arms.
     """
 
-    def __init__(self, config: KinematicsConfig) -> None:
+    def __init__(
+        self, config: KinematicsConfig, tool_offset: tuple[float, float, float]
+    ) -> None:
         self._config = config
+        self._tool_offset = tool_offset
         self._solver: Any = None
         self._error: BaseException | None = None
         self._ready = threading.Event()
@@ -267,9 +274,11 @@ class _SolverHandle:
 
     def _build(self) -> None:
         try:
+            from ..kinematics.path import warmup
             from ..kinematics.solver import KinematicsSolver
 
             self._solver = KinematicsSolver(self._config)
+            warmup(self._solver, self._tool_offset)
         except BaseException as exc:  # noqa: BLE001 - re-raised from get()
             self._error = exc
         finally:
@@ -347,7 +356,12 @@ class _Session:
         self._stop = stop_event
         self._sim = cfg.sim
         self._store = WaypointSet.load(cfg.file)
-        self._solver_handle = _SolverHandle(cfg.kinematics)
+        # The frame held to the straight line: the point the fingers close on,
+        # or the mount itself on a gripperless arm.
+        self._tool_offset = (
+            GRIPPER_TIP_OFFSET if cfg.axol.has_gripper else (0.0, 0.0, 0.0)
+        )
+        self._solver_handle = _SolverHandle(cfg.kinematics, self._tool_offset)
         self._free_joints = _resolve_free_joints(cfg.free_joints)
         # None leaves the grippers where they are; a value drives them there
         # so the operator can grasp an object before recording the waypoint.
@@ -601,6 +615,8 @@ class _Session:
                         speed=cfg.speed,
                         ang_speed=cfg.ang_speed,
                         rate=cfg.rate_hz,
+                        plan_rate=cfg.plan_rate_hz,
+                        tool_offset=self._tool_offset,
                         pos_tolerance=cfg.pos_tolerance,
                         label=f"waypoint {i + 1} → {j + 1}",
                     ),

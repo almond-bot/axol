@@ -42,9 +42,13 @@ q = solver.ik(q, left_pose=(pos, rot))
 
 ## Straight-line paths
 
-`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both grippers along a **straight world-frame line** between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
+`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both **gripper tips** along a straight world-frame line between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
 
-The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. A sample that cannot be tracked within `pos_tolerance` raises `PathPlanningError` — nothing has moved at that point. This is what [`axol waypoints`](/cli/waypoints) replays; for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
+`fk()` and `ik()` work in the gripper *mount* frame, which the URDF chain ends at; the fingers close `GRIPPER_TIP_OFFSET` (145 mm along the link's -Z) beyond it. The planner holds the line at the tip and converts back to a mount target per solve, since a mount held straight swings the tip through an arc as the wrist reorients. `tip_poses(solver, q)` returns the tip frames directly.
+
+The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. To keep that affordable, IK runs at `plan_rate` (50 Hz of motion by default) and the solved vectors are interpolated up to the playback rate — consecutive solves are a millimetre apart, so the interpolation costs nothing measurable in straightness. A sample that cannot be tracked within `pos_tolerance` raises `PathPlanningError` — nothing has moved at that point.
+
+Planning calls `ik()` without elbow hints, which is a different JAX trace from the one `KinematicsSolver` warms up; call `path.warmup(solver)` once (off the hot path) to absorb that compile. This is what [`axol waypoints`](/cli/waypoints) replays — for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
 
 ```python
 from almond_axol.kinematics import KinematicsSolver, plan_linear_segment

@@ -1,7 +1,7 @@
 """Public re-exports for almond_axol.kinematics."""
 
 from .config import KinematicsConfig
-from .path import PathPlanningError, ee_poses, plan_linear_segment
+from .path import PathPlanningError, ee_poses, plan_linear_segment, tip_poses
 from .solver import KinematicsSolver
 
 __all__ = [
@@ -10,4 +10,5 @@ __all__ = [
     "PathPlanningError",
     "ee_poses",
     "plan_linear_segment",
+    "tip_poses",
 ]

@@ -3,7 +3,9 @@ title: "waypoints"
 description: "Teach poses by hand in gravity comp, then replay them as straight-line moves."
 ---
 
-Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so you can hand-guide them; every time you record, the pose both arms are in is appended to a waypoint file. On playback each gripper travels a **straight line in Cartesian space** from waypoint to waypoint — position interpolated linearly, orientation slerped — and every sample along the line is resolved to joint angles with the [IK solver](/api/kinematics), pausing at each waypoint to work the grippers.
+Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so you can hand-guide them; every time you record, the pose both arms are in is appended to a waypoint file. On playback each **gripper tip** travels a straight line in Cartesian space from waypoint to waypoint — position interpolated linearly, orientation slerped — and every sample along the line is resolved to joint angles with the [IK solver](/api/kinematics), pausing at each waypoint to work the grippers.
+
+The line is held at the point the fingers close on, not at the gripper mount the kinematics chain ends at. The two are 145 mm apart, so holding the mount straight would swing the tip through an arc of several centimetres whenever the wrist reorients along the way.
 
 The entire path is solved before the arms move, so a waypoint the straight line cannot reach is reported while the robot is still standing still.
 
@@ -40,6 +42,7 @@ Grippers are recorded with each waypoint. Cycle them with `g` (or the panel butt
 | `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
 | `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
+| `--plan_rate_hz FLOAT` | IK solves per second of motion; the solved path is interpolated up to `--rate_hz` for playback. Trades planning time against how finely the line is sampled — raise it only if a path bows. Default 50 |
 | `--free_joints [J1,J2,...]` | Joints to gravity-compensate while teaching. Default `null` = all 7 |
 | `--kd FLOAT` | Velocity damping on free joints while teaching (Nm·s/rad). Default 0.25 |
 | `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
