@@ -838,28 +838,39 @@ def _run(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-    robot = AxolRobot(cfg.robot_config)
-    teleop = DaggerVRTeleop(cfg.teleop_config)
-    policy = _LocalPolicy(cfg.policy_path, cfg.policy_type, cfg.device, task)
-
     # The out-of-process video relay owns the cameras and streams the headset
     # view; its raw branch is forced onto the pyshm transport so the frames
     # are readable HERE (policy observations) as well as by the recorder
     # subprocess (dataset). Required — there is no in-process fallback (see
-    # the module docstring).
-    relay = _start_video_relay(cfg, dataset_resolution, raw_transport="pyshm")
-    expected = set(cfg.robot_config.observation_cameras().keys())
-    if relay is None or not expected <= set(relay.raw_cameras):
+    # the module docstring). A failure anywhere in this setup stage tears the
+    # relay and the reset worker down instead of leaking them (mirrors
+    # collect-data's setup-failure cleanup) — the reset worker is already
+    # running, and a started relay holds the cameras.
+    relay = None
+    try:
+        robot = AxolRobot(cfg.robot_config)
+        teleop = DaggerVRTeleop(cfg.teleop_config)
+        policy = _LocalPolicy(cfg.policy_path, cfg.policy_type, cfg.device, task)
+
+        relay = _start_video_relay(cfg, dataset_resolution, raw_transport="pyshm")
+        expected = set(cfg.robot_config.observation_cameras().keys())
+        if relay is None or not expected <= set(relay.raw_cameras):
+            raise RuntimeError(
+                "collect-dagger requires the gst video relay with readable raw "
+                f"frames for {sorted(expected)} (got "
+                f"{sorted(relay.raw_cameras) if relay else 'no relay'}). Install "
+                "the GStreamer stack (`axol gst.install` + `axol gst.build-zed`) "
+                "and check the camera serials."
+            )
+        robot.set_external_cameras({k: relay.raw_cameras[k] for k in expected})
+    except BaseException:
         if relay is not None:
             relay.shutdown()
-        raise RuntimeError(
-            "collect-dagger requires the gst video relay with readable raw "
-            f"frames for {sorted(expected)} (got "
-            f"{sorted(relay.raw_cameras) if relay else 'no relay'}). Install "
-            "the GStreamer stack (`axol gst.install` + `axol gst.build-zed`) "
-            "and check the camera serials."
-        )
-    robot.set_external_cameras({k: relay.raw_cameras[k] for k in expected})
+        try:
+            reset_controller.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
 
     episodes_recorded = 0
     episode_idx = 0
@@ -1046,6 +1057,14 @@ def _run(
             # episode.
             final_rows = recorder.pause_episode()
             relay.set_raw_enabled(False)
+            # Close a span still open when the loop exited (the episode ended
+            # mid-intervention) at the final row count — exact, since capture
+            # is paused — so intervention_spans is complete for any consumer.
+            if control_thread.open_span_start is not None:
+                control_thread.intervention_spans.append(
+                    (control_thread.open_span_start, final_rows / float(fps))
+                )
+                control_thread.open_span_start = None
 
             if interrupted:
                 recorder.cancel_episode()
