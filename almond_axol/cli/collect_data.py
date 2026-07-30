@@ -378,6 +378,13 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 "dialog (or set its record_resolution / eyes)."
             )
 
+    # The teleop's action keys must match the robot's: propagate the SKU's
+    # gripper capability so the gripperless SKU records no gripper channels.
+    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
+        cfg.teleop_config, AxolVRTeleopConfig
+    ):
+        cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+
     robot = AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
 

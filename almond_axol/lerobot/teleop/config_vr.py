@@ -27,9 +27,16 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
                             the base/lift during a session, but cart state is
                             never recorded into the dataset and policies never
                             control it.
+        has_gripper:        Whether the robot has grippers. ``False`` (the
+                            gripperless SKU) drops the gripper keys from the
+                            emitted actions so they match the robot's action
+                            features. ``collect-data`` propagates this from
+                            ``AxolRobotConfig.axol_config.has_gripper``
+                            automatically.
     """
 
     vr_teleop_config: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics_config: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server_config: VRServerConfig = field(default_factory=VRServerConfig)
     cart: CartConfig = field(default_factory=CartConfig)
+    has_gripper: bool = True

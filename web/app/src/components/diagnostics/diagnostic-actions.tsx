@@ -31,6 +31,7 @@ export function DiagnosticActions({
   busy,
   disabled,
   hiddenKeys,
+  pickerJoints,
   onLaunch,
   onStop,
 }: {
@@ -46,6 +47,8 @@ export function DiagnosticActions({
    * arguments, injected from the configured adapter mapping at launch).
    */
   hiddenKeys?: string[]
+  /** The `--joints` picker's choices (gripperless SKUs drop GRIPPER). */
+  pickerJoints?: readonly JointName[]
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
 }) {
@@ -87,6 +90,7 @@ export function DiagnosticActions({
         <ActionDialog
           spec={open}
           hideKeys={hiddenKeys}
+          pickerJoints={pickerJoints}
           running={activeCommand === open.id}
           blocked={activeCommand != null && activeCommand !== open.id}
           busy={busy}
@@ -366,6 +370,12 @@ export function ActionDialog({
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
+    // A restricted picker (e.g. no gripper) must send its joint list even
+    // when everything is selected: omitting --joints would fall through to
+    // the command's own default, which includes the excluded joints.
+    if (jointsField && pickerJoints && pickerJoints.length < JOINTS.length && args.joints == null) {
+      args.joints = pickerJoints.map((j) => j.toLowerCase()).join(",")
+    }
     if (hasWebPrompts) args.web_prompts = true
     Object.assign(args, effectivePresets)
     onLaunch(args)

@@ -20,9 +20,9 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
-from ..constants import CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, Motor, MotorError
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
@@ -131,6 +131,11 @@ def scoped_motor_faults(
             joint_names = {joint}
     if joint_names is not None:
         faults = [f for f in faults if f["joint"].upper() in joint_names]
+    elif _flag(args.get("guided")):
+        # Guided zeroing without an explicit subset walks the seven arm
+        # joints; the gripper is never touched (it has no zero to set), so
+        # a gripper fault must not block the launch.
+        faults = [f for f in faults if f["joint"].upper() != Joint.GRIPPER.name]
     return faults
 
 
@@ -170,11 +175,16 @@ class _ArmLink:
     def lock(self, joint: Joint) -> asyncio.Lock:
         return self._locks[joint]
 
-    async def open(self) -> None:
+    async def open(self, joints: list[Joint]) -> None:
+        """Open the bus and construct one motor per joint in ``joints``.
+
+        The gripperless SKU passes the 7 arm joints only, so the absent
+        gripper motor is never pinged (and never reported unreachable).
+        """
         self._bus = CanBus(self.channel)
         await self._bus.start()
-        self._motors = {joint: Motor(self._bus, joint) for joint in Joint}
-        self._locks = {joint: asyncio.Lock() for joint in Joint}
+        self._motors = {joint: Motor(self._bus, joint) for joint in joints}
+        self._locks = {joint: asyncio.Lock() for joint in joints}
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -255,7 +265,19 @@ class RobotLink:
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
         hub: TelemetryHub | None = None,
+        has_gripper: Callable[[], bool] | None = None,
     ) -> None:
+        """Construct the link.
+
+        Args:
+            left_channel:  SocketCAN interface for the left arm; None disables.
+            right_channel: Same for the right arm.
+            hub:           Telemetry hub to publish sweeps into.
+            has_gripper:   Callable returning whether this robot has grippers
+                           (e.g. ``SettingsStore.has_gripper``), re-read on
+                           every connect. ``None`` means always ``True``.
+        """
+        self._has_gripper_provider = has_gripper
         self._arms: list[_ArmLink] = []
         if left_channel:
             self._arms.append(_ArmLink(left_channel, "left"))
@@ -277,6 +299,28 @@ class RobotLink:
         self._ping_task: asyncio.Task[Any] | None = None
         self._sample_task: asyncio.Task[Any] | None = None
         self._lock = threading.Lock()
+        # Joint set snapshotted when the buses open, so status() stays
+        # consistent with the motors actually being pinged even if the
+        # has_gripper setting is toggled mid-connection. None = link down;
+        # status() then reports the live setting (what the next connect uses).
+        self._active_joints: list[Joint] | None = None
+
+    def _has_gripper(self) -> bool:
+        if self._has_gripper_provider is None:
+            return True
+        return bool(self._has_gripper_provider())
+
+    def _joints(self) -> list[Joint]:
+        """The motors this robot actually has (gripper excluded on the gripperless SKU).
+
+        While the link is up this is the connect-time snapshot matching the
+        opened motors; otherwise the current setting.
+        """
+        with self._lock:
+            active = self._active_joints
+        if active is not None:
+            return active
+        return list(Joint) if self._has_gripper() else list(ARM_JOINTS)
 
     # -- thread plumbing ----------------------------------------------------
 
@@ -323,6 +367,9 @@ class RobotLink:
         self._set_state(STATE_DISCONNECTED)
         with self._lock:
             self._last_ping = None
+            # The snapshot describes the motors whose health was just cleared;
+            # status() now falls back to the live setting.
+            self._active_joints = None
         for arm in self._arms:
             arm.health = {}
         self.hub.clear_slow()
@@ -394,8 +441,9 @@ class RobotLink:
             error = self._error
             last_ping = self._last_ping
         motors: list[dict[str, Any]] = []
+        joints = self._joints()
         for arm in self._arms:
-            for joint in Joint:
+            for joint in joints:
                 h = arm.health.get(joint.name, {})
                 motors.append(
                     {
@@ -415,6 +463,7 @@ class RobotLink:
             "error": error,
             "lastPing": last_ping,
             "channels": {"left": left_channel, "right": right_channel},
+            "hasGripper": Joint.GRIPPER in joints,
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
@@ -448,8 +497,13 @@ class RobotLink:
     # -- loop-side coroutines ----------------------------------------------
 
     async def _open_and_start(self) -> None:
+        # Snapshot the joint set from the live setting for this connection;
+        # status() reports from the same snapshot until the link is torn down.
+        joints = list(Joint) if self._has_gripper() else list(ARM_JOINTS)
+        with self._lock:
+            self._active_joints = joints
         for arm in self._arms:
-            await arm.open()
+            await arm.open(joints)
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.ensure_future(self._ping_loop())
         if self._sample_task is None or self._sample_task.done():

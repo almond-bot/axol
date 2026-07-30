@@ -25,6 +25,7 @@ Each command is backed by a config dataclass (for example `TeleopCmdConfig` wrap
 ```bash
 axol teleop --axol.left_stiffness 0.8
 axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+axol teleop --axol.has_gripper false   # gripperless SKU
 axol collect-data --repo_id myorg/pick --task "pick" \
     --robot_config.axol_config.left_stiffness 0.8 \
     --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"

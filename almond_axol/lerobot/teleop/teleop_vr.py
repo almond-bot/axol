@@ -62,8 +62,6 @@ from .config_vr import AxolVRTeleopConfig
 _logger = logging.getLogger(__name__)
 
 _JOINTS = list(Joint)
-_LEFT_POS_KEYS = [f"left_{j.value}.pos" for j in _JOINTS]
-_RIGHT_POS_KEYS = [f"right_{j.value}.pos" for j in _JOINTS]
 
 
 class AxolVRTeleop(Teleoperator):
@@ -83,6 +81,14 @@ class AxolVRTeleop(Teleoperator):
     def __init__(self, config: AxolVRTeleopConfig) -> None:
         super().__init__(config)
         self.config = config
+
+        # The gripperless SKU drops the gripper key from each arm's action
+        # (matching AxolRobot's action features); the internal (16,) command
+        # layout is unchanged — the gripper slots just aren't emitted.
+        self._has_gripper = config.has_gripper
+        joints = _JOINTS if config.has_gripper else _JOINTS[:-1]
+        self._left_pos_keys = [f"left_{j.value}.pos" for j in joints]
+        self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
 
         # Async bridge
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -179,11 +185,11 @@ class AxolVRTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
-        return {key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS}
+        return {key: float for key in self._left_pos_keys + self._right_pos_keys}
 
     @property
     def feedback_features(self) -> dict:
-        return {key: float for key in _LEFT_POS_KEYS + _RIGHT_POS_KEYS}
+        return {key: float for key in self._left_pos_keys + self._right_pos_keys}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -481,11 +487,15 @@ class AxolVRTeleop(Teleoperator):
             if out is not None:
                 self._q_out = out
             q = self._q_out
+        # The core's output layout is fixed at (16,): left arm at [0:8], right
+        # at [8:16], grips in slots 7/15. On the gripperless SKU the shorter
+        # key lists simply skip the grip slots.
         action: RobotAction = {}
-        for i, key in enumerate(_LEFT_POS_KEYS):
+        offset = len(_JOINTS)
+        for i, key in enumerate(self._left_pos_keys):
             action[key] = float(q[i])
-        for i, key in enumerate(_RIGHT_POS_KEYS):
-            action[key] = float(q[8 + i])
+        for i, key in enumerate(self._right_pos_keys):
+            action[key] = float(q[offset + i])
         return action
 
     def get_teleop_events(self) -> dict[TeleopEvents | str, Any]:

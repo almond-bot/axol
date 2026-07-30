@@ -43,6 +43,7 @@ import {
   clearDiagnosticsRuns,
   fetchDiagnosticsRuns,
   jointLabel,
+  jointsFor,
   motorKey,
   startDiagnosticsRun,
   useTelemetryStream,
@@ -363,14 +364,20 @@ export default function Diagnostics() {
     localStorage.setItem("axolDiagArm", a)
   }
 
+  // The joints this robot actually has — the gripperless SKU drops GRIPPER
+  // from the motor tiles, chart series, and `--joints` pickers.
+  const joints = useMemo(() => jointsFor(robot?.hasGripper), [robot])
+
   const series: ChartSeries[] = useMemo(
     () =>
-      JOINTS.filter((j) => !hiddenJoints.has(j)).map((joint) => ({
-        key: motorKey(arm, joint),
-        label: jointLabel(joint),
-        color: JOINT_COLORS[joint],
-      })),
-    [arm, hiddenJoints]
+      joints
+        .filter((j) => !hiddenJoints.has(j))
+        .map((joint) => ({
+          key: motorKey(arm, joint),
+          label: jointLabel(joint),
+          color: JOINT_COLORS[joint],
+        })),
+    [arm, hiddenJoints, joints]
   )
 
   const linkState = robot?.state ?? stream.state
@@ -640,6 +647,7 @@ export default function Diagnostics() {
                 frames={stream.frames}
                 version={stream.version}
                 canInspect={linkState === "connected"}
+                joints={joints}
               />
             </div>
           ))}
@@ -698,7 +706,7 @@ export default function Diagnostics() {
               </Button>
             )}
           </div>
-          <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} />
+          <JointFilter hidden={hiddenJoints} onChange={setHiddenJoints} joints={joints} />
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
@@ -754,6 +762,7 @@ export default function Diagnostics() {
             busy={launchBusy}
             disabled={!serverOk || busyElsewhere}
             hiddenKeys={configHiddenKeys}
+            pickerJoints={joints}
             onLaunch={launch}
             onStop={stopActive}
           />

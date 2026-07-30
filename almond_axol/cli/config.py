@@ -299,6 +299,10 @@ _FIELD_HELP: dict[str, str] = {
         "or a 7-element list, one per joint."
     ),
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
+    "has_gripper": (
+        "Whether this robot has grippers. Set false for the gripperless SKU: "
+        "gripper motors are never enabled and gripper commands are ignored."
+    ),
     "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
     "max_speed": "Max gripper joint speed (rad/s).",
     "serial": "Serial number of the ZED camera to open (0 = slot unassigned).",
