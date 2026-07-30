@@ -26,6 +26,7 @@ import logging
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -140,7 +141,11 @@ class RunPolicyConfig:
 #
 # The CLI reads them from stdin (``s`` / ``r`` / ``q`` + Enter prompts); the
 # web control panel pushes them through a queue from the API. ``_run`` is
-# agnostic — it only calls the small surface below.
+# agnostic — it only calls the small surface below. ``begin_gate`` /
+# ``poll_gate`` are a non-blocking form of the between-episode gate for
+# ``collect-dagger``, whose idle phase has to keep ticking VR teleop while it
+# waits; ``begin_episode``'s optional subtask hook lets the operator switch a
+# running policy's instruction mid-episode (``--subtasks``).
 # ----------------------------------------------------------------------
 
 
@@ -152,21 +157,35 @@ class _StdinPolicyControl:
         self._result: dict[str, str | None] = {"choice": None}
         self._thread: "threading.Thread | None" = None
 
-    def await_continue(self, message: str) -> bool:
+    def await_continue(self, message: str, label: str = "Start episode") -> bool:
         try:
             input(message)
             return True
         except (EOFError, KeyboardInterrupt):
             return False
 
-    def begin_episode(self) -> None:
+    def begin_gate(self, message: str, label: str = "Start episode") -> None:
+        from lerobot.utils.utils import log_say
+
+        log_say(message)
+
+    def poll_gate(self) -> str | None:
+        # Terminal collect-dagger opens an episode from the VR record button
+        # only, so there is nothing to poll here.
+        return None
+
+    def begin_episode(
+        self,
+        on_subtask: "Callable[[int], None] | None" = None,
+        num_subtasks: int = 0,
+    ) -> None:
         from ..lerobot.rollout import stdin_watcher
 
         self._stop = threading.Event()
         self._result = {"choice": None}
         self._thread = threading.Thread(
             target=stdin_watcher,
-            args=(self._stop, self._result),
+            args=(self._stop, self._result, on_subtask, num_subtasks),
             name="axol-stdin-watcher",
             daemon=True,
         )
@@ -211,6 +230,8 @@ class _QueuePolicyControl:
         self._q: "queue.Queue[str]" = queue.Queue()
         self._stop = stop_event
         self._choice: str | None = None
+        self._on_subtask: "Callable[[int], None] | None" = None
+        self._num_subtasks = 0
         # Episode phase/count, read by the serve runner so the web control panel
         # on ANY connected computer can show the right controls (see snapshot()).
         self._state_lock = threading.Lock()
@@ -245,26 +266,63 @@ class _QueuePolicyControl:
         except queue.Empty:
             pass
 
-    def await_continue(self, message: str) -> bool:
-        import queue
+    @staticmethod
+    def _gate_decision(cmd: str) -> str | None:
+        """Map a queued command to a gate decision, or None to keep waiting."""
+        if cmd in ("continue", "start", "s"):
+            return "go"
+        return "quit" if cmd == "q" else None
 
+    def _take_subtask(self, cmd: str) -> bool:
+        """Route a subtask number to the live policy. True if ``cmd`` was one."""
+        if not (self._num_subtasks and self._on_subtask and cmd.isdigit()):
+            return False
+        idx = int(cmd)
+        if 1 <= idx <= self._num_subtasks:
+            self._on_subtask(idx)
+        return True
+
+    def begin_gate(self, message: str, label: str = "Start episode") -> None:
         from lerobot.utils.utils import log_say
 
         log_say(message)
         self._set_phase("ready")
+
+    def poll_gate(self) -> str | None:
+        """Non-blocking gate check, for callers that must keep ticking."""
+        import queue
+
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            decision = self._gate_decision(cmd)
+            if decision is not None:
+                return decision
+
+    def await_continue(self, message: str, label: str = "Start episode") -> bool:
+        import queue
+
+        self.begin_gate(message, label)
         while not self._stop.is_set():
             try:
                 cmd = self._q.get(timeout=0.25)
             except queue.Empty:
                 continue
-            if cmd in ("continue", "start", "s"):
-                return True
-            if cmd == "q":
-                return False
+            decision = self._gate_decision(cmd)
+            if decision is not None:
+                return decision == "go"
         return False
 
-    def begin_episode(self) -> None:
+    def begin_episode(
+        self,
+        on_subtask: "Callable[[int], None] | None" = None,
+        num_subtasks: int = 0,
+    ) -> None:
         self._choice = None
+        self._on_subtask = on_subtask
+        self._num_subtasks = num_subtasks
         self._drain()
         self._set_phase("recording")
 
@@ -273,14 +331,17 @@ class _QueuePolicyControl:
 
         if self._choice is not None:
             return self._choice
-        try:
-            cmd = self._q.get_nowait()
-        except queue.Empty:
-            return None
-        if cmd in ("s", "r", "q"):
-            self._choice = cmd
-            return cmd
-        return None
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            if cmd in ("s", "r", "q"):
+                self._choice = cmd
+                return cmd
+            # Subtask switches keep the episode running; anything else is
+            # ignored rather than mistaken for a decision.
+            self._take_subtask(cmd)
 
     def resolve_timeout(self, episode_time_s: int) -> str:
         import queue
@@ -306,6 +367,7 @@ class _QueuePolicyControl:
 
     def end_episode(self) -> None:
         # The episode ended; the loop returns to rest before the next gate.
+        self._on_subtask = None
         self._set_phase("resetting")
 
     def close(self) -> None:

@@ -118,7 +118,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -132,6 +132,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
+- [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)

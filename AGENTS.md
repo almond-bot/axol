@@ -38,4 +38,4 @@ For cloud development: `uv sync --extra sim` is sufficient.
 
 - Python 3.13+ is required (`.python-version` pins `3.13`). The VM ships with 3.12; use `uv python install 3.13` if needed.
 - The `uv` package manager must be on PATH (`$HOME/.local/bin`).
-- Hardware-dependent commands (`can.setup`, `motor.*`, `gravity-comp`, `tune.*`, `zed.*`, `collect-data`, `run-policy`) will fail without physical robot/CAN bus — this is expected.
+- Hardware-dependent commands (`can.setup`, `motor.*`, `gravity-comp`, `tune.*`, `zed.*`, `collect-data`, `collect-dagger`, `run-policy`) will fail without physical robot/CAN bus — this is expected.
