@@ -106,10 +106,14 @@ class WaypointsCmdConfig:
     right_channel: str | None = CAN_RIGHT
     file: str = field(default_factory=_default_file)
     """Waypoint file to record into and play back from (JSON)."""
-    speed: float = 0.08
-    """Cartesian speed (m/s) of the gripper along each straight-line leg."""
-    ang_speed: float = 0.6
-    """Angular speed (rad/s) of the gripper's reorientation along a leg."""
+    speed: float = 0.25
+    """Cartesian speed (m/s) of the gripper along each straight-line leg,
+    averaged over the leg; the minimum-jerk profile peaks at 1.875x this.
+    The default puts the tip at the same 0.47 m/s the robot already uses to
+    drive itself home between poses."""
+    ang_speed: float = 1.2
+    """Angular speed (rad/s) of the gripper's reorientation along a leg,
+    scaled to match ``speed`` so neither usually dominates the pace."""
     dwell: float = 0.5
     """Seconds to hold still at each waypoint after its grippers have moved."""
     grip_time: float = 0.75

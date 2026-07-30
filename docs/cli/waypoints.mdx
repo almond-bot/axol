@@ -43,8 +43,8 @@ Grippers are recorded with each waypoint. Cycle them with `g` (or the panel butt
 | `--play_only BOOL` | Skip teaching and replay the file straight away. Default `false` |
 | `--sim BOOL` | Preview a saved path in the browser visualizer instead of on the robot (implies `--play_only`). Default `false` |
 | `--loops INT` | Times to run the path; `0` replays until stopped. Default 1 |
-| `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.08 |
-| `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 0.6 |
+| `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg, averaged over the leg; the minimum-jerk profile peaks at 1.875x this mid-leg. Default 0.25 |
+| `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 1.2 |
 | `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
 | `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
 | `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
@@ -66,7 +66,16 @@ axol waypoints --file pick_place.json           # keep a named path
 axol waypoints --play_only --loops 0            # replay it until stopped
 axol waypoints --sim --file pick_place.json     # preview it in the browser
 axol waypoints --speed 0.03 --dwell 2           # slow, with a long pause
+axol waypoints --speed 0.5                      # brisk
 ```
+
+### Choosing a speed
+
+The default puts the gripper at the same 0.47 m/s the robot already reaches driving itself between poses, and the straight lines are just as straight at any speed — the solver samples a leg by distance travelled, not by clock, so its accuracy does not change when you speed it up. What changes is acceleration, which grows with the square of the speed: 2 m/s² at the default, 8 at `--speed 0.5`, 16 at `--speed 0.7`. Past that a leg is over in a fraction of a second and the dwell at each waypoint dominates the cycle anyway.
+
+<Warning>
+  Playback runs stiff. A fast leg carries real momentum and the arm will not yield if the path meets something unexpected — work up to a speed with the workspace clear.
+</Warning>
 
 ## The waypoint file
 
