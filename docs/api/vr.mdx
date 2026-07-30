@@ -47,6 +47,9 @@ async with VRServer() as vr:
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
 | `t` | `float \| None` | Client capture timestamp in ms (`performance.now()`), used by the pose interpolator. `None` falls back to latest-wins |
 | `seq` | `int \| None` | Monotonic frame counter set by the headset. The same `seq` arrives over both the USB and network transports; the server processes each logical frame once, via whichever transport delivers it first. `None` disables cross-transport de-duplication |
+| `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick axes (right = +1; pushed forward = -1). Drive the [powered cart](/guides/vr-interface#powered-cart)'s translation when one is configured |
+| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right = +1). Drives the powered cart's rotation |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers the cart's lift, right raises it. Neutral defaults keep older web builds (which omit these fields) compatible |
 
 ### Pose transports & USB/Wi-Fi fallback
 
