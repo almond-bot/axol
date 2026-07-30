@@ -12,7 +12,9 @@ class RobotBase(ABC):
     """Common interface for the Axol hardware robot and the viser simulation.
 
     All position values are in radians. Gripper is normalised
-    [0.0 closed, 1.0 open].
+    [0.0 closed, 1.0 open]. Arrays keep their (8,) shape on the gripperless
+    SKU (``AxolConfig.has_gripper = False``); the gripper element is simply
+    ignored on write and reported as 0.0 on read.
 
     Subclasses inherit ``__aenter__`` / ``__aexit__`` which call
     :meth:`enable` and :meth:`disable`, so they can be used with

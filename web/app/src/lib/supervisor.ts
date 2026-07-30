@@ -250,6 +250,8 @@ export interface RobotStatus {
   faults?: MotorFault[]
   /** Configured CAN interfaces (older hosts omit this). */
   channels?: RobotChannels
+  /** Whether this robot has grippers (older hosts omit this = true). */
+  hasGripper?: boolean
 }
 
 /** Short display label for a fault, e.g. "L elbow — over temperature (78°C)". */

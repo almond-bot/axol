@@ -128,6 +128,10 @@ class AxolArm:
     """Controls one 7-DOF + gripper arm over a single CAN bus.
 
     Not instantiated directly — access via ``axol.left`` or ``axol.right``.
+
+    On the gripperless SKU (``AxolConfig.has_gripper = False``) no gripper
+    motor is constructed: gripper commands (the last element of every
+    ``(8,)`` array) are ignored and gripper reads report ``0.0``.
     """
 
     def __init__(
@@ -149,7 +153,14 @@ class AxolArm:
         self._arm_config = config.left if is_left else config.right
         self._gravity_comp = gravity_comp
         self._is_left = is_left
-        self.motors: dict[Joint, Motor] = {joint: Motor(bus, joint) for joint in Joint}
+        self._has_gripper = config.has_gripper
+        # Gripperless SKU: the gripper motor is simply never constructed, so
+        # every loop over ``self.motors`` skips it automatically.
+        self.motors: dict[Joint, Motor] = {
+            joint: Motor(bus, joint)
+            for joint in Joint
+            if config.has_gripper or joint != Joint.GRIPPER
+        }
         # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
         # the impedance-control velocity FF and the friction model; a_des
         # feeds inertia FF (``j_eff``); v_meas feeds software damping
@@ -195,6 +206,17 @@ class AxolArm:
             ],
             dtype=float,
         )
+
+    def _pad_gripper(self, values: list) -> list:
+        """Insert a ``0.0`` placeholder in the gripper slot when absent.
+
+        Per-motor reads iterate ``self.motors`` (7 entries on the gripperless
+        SKU); this restores the public ``(8,)`` Joint-enum-order shape.
+        """
+        if not self._has_gripper:
+            values = list(values)
+            values.insert(self._gripper_i, 0.0)
+        return values
 
     # ------------------------------------------------------------------ #
     # Polling                                                              #
@@ -246,14 +268,15 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order. Arm joints are in
         radians in the joint frame (0 = rest position); the gripper is
         normalized to [0, 1] (0.0 = closed, 1.0 = fully open), consistent
-        with set_position_velocity and motion_control.
+        with set_position_velocity and motion_control. On the gripperless
+        SKU the gripper element is 0.0.
         """
-        joints = list(Joint)
-        values = [self.motors[j].position for j in joints]
+        values = self._pad_gripper([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
-        values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-        )
+        if self._has_gripper:
+            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
+                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+            )
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
@@ -261,9 +284,11 @@ class AxolArm:
     def torques(self) -> np.ndarray:
         """Latest cached joint torques (Nm / A). Requires start_telemetry().
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order (gripper element 0.0 on
+        the gripperless SKU).
         """
-        return np.array([m.torque for m in self.motors.values()], dtype=np.float32)
+        values = self._pad_gripper([m.torque for m in self.motors.values()])
+        return np.array(values, dtype=np.float32)
 
     # ------------------------------------------------------------------ #
     # Arm-wide commands                                                    #
@@ -302,13 +327,20 @@ class AxolArm:
         self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
 
     async def enable(self) -> None:
-        """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode."""
+        """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode.
+
+        On the gripperless SKU the gripper calibration and mode switch are
+        skipped (there is no gripper motor).
+        """
         await asyncio.gather(*[m.enable() for m in self.motors.values()])
         await asyncio.gather(
             *[m.set_control_mode(ControlMode.IMPEDANCE) for m in self.motors.values()]
         )
-        await self._calibrate_gripper()
-        await self.motors[Joint.GRIPPER].set_control_mode(ControlMode.POSITION_FORCE)
+        if self._has_gripper:
+            await self._calibrate_gripper()
+            await self.motors[Joint.GRIPPER].set_control_mode(
+                ControlMode.POSITION_FORCE
+            )
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -336,73 +368,85 @@ class AxolArm:
         Returns shape (8,) array in Joint enum order. Arm joints are in
         radians in the joint frame (0 = rest position); the gripper is
         normalized to [0, 1] (0.0 = closed, 1.0 = fully open), consistent
-        with set_position_velocity and motion_control.
+        with set_position_velocity and motion_control. On the gripperless
+        SKU the gripper element is 0.0.
         """
-        joints = list(Joint)
-        values = list(
-            await asyncio.gather(*[self.motors[j].get_position() for j in joints])
+        values = self._pad_gripper(
+            list(
+                await asyncio.gather(
+                    *[self.motors[j].get_position() for j in self.motors]
+                )
+            )
         )
         gripper_i = self._gripper_i
-        values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
-            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-        )
+        if self._has_gripper:
+            values[gripper_i] = (values[gripper_i] - self._limits_hi[gripper_i]) / (
+                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+            )
         arr = np.array(values, dtype=np.float32)
         return arr + self._joint_offsets.astype(np.float32)
 
     async def get_velocities(self) -> np.ndarray:
         """Return shaft velocity (rad/s) for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order (gripper element 0.0 on
+        the gripperless SKU).
         """
-        joints = list(Joint)
-        values = await asyncio.gather(*[self.motors[j].get_velocity() for j in joints])
-        return np.array(values, dtype=np.float32)
+        values = await asyncio.gather(
+            *[self.motors[j].get_velocity() for j in self.motors]
+        )
+        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
 
     async def get_torques(self) -> np.ndarray:
         """Return torque estimate for every joint, fetched concurrently.
 
         Damiao: Nm. MyActuator: phase current in A.
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order (gripper element 0.0 on
+        the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_torque() for m in self.motors.values()])
-        return np.array(values, dtype=np.float32)
+        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
 
     async def get_temperatures(self) -> np.ndarray:
         """Return motor temperature (°C) for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order (gripper element 0.0 on
+        the gripperless SKU).
         """
         values = await asyncio.gather(
             *[m.get_temperature() for m in self.motors.values()]
         )
-        return np.array(values, dtype=np.float32)
+        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
 
     async def get_voltages(self) -> np.ndarray:
         """Return bus voltage (V) for every joint, fetched concurrently.
 
-        Returns shape (8,) array in Joint enum order.
+        Returns shape (8,) array in Joint enum order (gripper element 0.0 on
+        the gripperless SKU).
         """
         values = await asyncio.gather(*[m.get_voltage() for m in self.motors.values()])
-        return np.array(values, dtype=np.float32)
+        return np.array(self._pad_gripper(list(values)), dtype=np.float32)
 
     async def get_error_codes(self) -> list[MotorStatus]:
         """Return MotorStatus for every joint, fetched concurrently.
 
-        Returns a list in Joint enum order.
+        Returns a list in Joint enum order. On the gripperless SKU the
+        gripper entry is omitted (7 entries).
         """
-        joints = list(Joint)
         values = await asyncio.gather(
-            *[self.motors[j].get_error_code() for j in joints]
+            *[self.motors[j].get_error_code() for j in self.motors]
         )
         return list(values)
 
     async def get_gains(self) -> list[MotorGains]:
         """Return PID gains for every joint, fetched concurrently.
 
-        Returns a list in Joint enum order.
+        Returns a list in Joint enum order. On the gripperless SKU the
+        gripper entry is omitted (7 entries).
         """
-        joints = list(Joint)
-        values = await asyncio.gather(*[self.motors[j].get_gains() for j in joints])
+        values = await asyncio.gather(
+            *[self.motors[j].get_gains() for j in self.motors]
+        )
         return list(values)
 
     # ------------------------------------------------------------------ #
@@ -450,14 +494,18 @@ class AxolArm:
 
         Args:
             positions: Shape (8,) array of target positions (rad) in Joint enum order,
-                       except gripper which is [0, 1].
+                       except gripper which is [0, 1] (ignored on the
+                       gripperless SKU).
             max_speed: Maximum speed for all joints (rad/s).
         """
         positions = positions.copy()
         gripper_i = self._gripper_i
-        positions[gripper_i] = self._limits_hi[gripper_i] + positions[gripper_i] * (
-            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-        )
+        if self._has_gripper:
+            positions[gripper_i] = self._limits_hi[gripper_i] + positions[gripper_i] * (
+                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+            )
+        else:
+            positions[gripper_i] = 0.0
         clipped = np.clip(positions, self._limits_lo, self._limits_hi)
         # Convert arm joints from joint frame to motor frame before sending.
         # Gripper offset is 0, so its raw motor value is unchanged.
@@ -466,6 +514,7 @@ class AxolArm:
             *[
                 self.motors[j].set_position_velocity(float(motor_targets[i]), max_speed)
                 for i, j in enumerate(Joint)
+                if j in self.motors
             ]
         )
 
@@ -473,12 +522,15 @@ class AxolArm:
         """Command target velocities using each motor's built-in speed controller.
 
         Args:
-            velocities: Shape (8,) array of target velocities (rad/s) in Joint enum order.
+            velocities: Shape (8,) array of target velocities (rad/s) in Joint
+                        enum order (gripper element ignored on the gripperless
+                        SKU).
         """
         await asyncio.gather(
             *[
                 self.motors[j].set_velocity(float(velocities[i]))
                 for i, j in enumerate(Joint)
+                if j in self.motors
             ]
         )
 
@@ -491,7 +543,8 @@ class AxolArm:
 
         The gripper uses POSITION_FORCE control: it tracks the target position
         at up to ``ArmConfig.gripper.max_speed`` (rad/s) with torque capped
-        at ``ArmConfig.gripper.torque_limit`` (Nm).
+        at ``ArmConfig.gripper.torque_limit`` (Nm). On the gripperless SKU
+        the gripper element is ignored.
 
         All positions are clipped to joint limits before being sent.
 
@@ -529,9 +582,12 @@ class AxolArm:
                 return
 
         gripper_i = self._gripper_i
-        q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
-            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-        )
+        if self._has_gripper:
+            q[gripper_i] = self._limits_hi[gripper_i] + q[gripper_i] * (
+                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
+            )
+        else:
+            q[gripper_i] = 0.0
         clipped = np.clip(q, self._limits_lo, self._limits_hi)
 
         # Velocity feedforward via differentiation of commanded positions (rad/s),
@@ -548,9 +604,6 @@ class AxolArm:
         except MotorError:
             v_meas = list(velocities)
 
-        gripper_max_speed = self._arm_config.gripper.max_speed
-        gripper_torque_limit = self._arm_config.gripper.torque_limit
-
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
         # ``arm_q`` is in joint frame, which matches the URDF convention.
@@ -560,7 +613,6 @@ class AxolArm:
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
         motor_targets = clipped - self._joint_offsets
-        gripper_pos = float(motor_targets[gripper_i])
 
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
@@ -579,14 +631,16 @@ class AxolArm:
                 t_ff,
             )
 
-        await asyncio.gather(
-            *[_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER],
-            self.motors[Joint.GRIPPER].set_position_force(
-                gripper_pos,
-                gripper_max_speed,
-                gripper_torque_limit,
-            ),
-        )
+        tasks = [_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER]
+        if self._has_gripper:
+            tasks.append(
+                self.motors[Joint.GRIPPER].set_position_force(
+                    float(motor_targets[gripper_i]),
+                    self._arm_config.gripper.max_speed,
+                    self._arm_config.gripper.torque_limit,
+                )
+            )
+        await asyncio.gather(*tasks)
         self._last_q_commanded = clipped
 
     async def gravity_compensate(
@@ -610,7 +664,7 @@ class AxolArm:
         repositioning the arm), call :meth:`reset_gravity_hold` between calls.
 
         The gripper is always softly held at its current position regardless
-        of ``free_joints``.
+        of ``free_joints`` (skipped on the gripperless SKU).
 
         Requires :meth:`start_telemetry` to be active so cached positions are
         fresh.
@@ -639,12 +693,6 @@ class AxolArm:
             self._gc_hold_q = arm_q.copy()
             self._gc_hold_free = free_set
 
-        gripper_i = self._gripper_i
-        gripper_pos = float(positions[gripper_i])
-        gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
-            self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
-        )
-
         # ``arm_q`` and ``_gc_hold_q`` are in joint frame; convert to motor
         # frame before sending to the impedance controller.
         arm_offsets = self._joint_offsets[: len(ARM_JOINTS)]
@@ -670,13 +718,19 @@ class AxolArm:
                 )
             )
         # Hold the gripper softly so it does not drift open/closed.
-        tasks.append(
-            self.motors[Joint.GRIPPER].set_position_force(
-                gripper_pos_raw,
-                self._arm_config.gripper.max_speed,
-                0.5,
+        if self._has_gripper:
+            gripper_i = self._gripper_i
+            gripper_pos = float(positions[gripper_i])
+            gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
+                self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
             )
-        )
+            tasks.append(
+                self.motors[Joint.GRIPPER].set_position_force(
+                    gripper_pos_raw,
+                    self._arm_config.gripper.max_speed,
+                    0.5,
+                )
+            )
         await asyncio.gather(*tasks)
 
     def reset_gravity_hold(self) -> None:
@@ -717,7 +771,8 @@ class AxolArm:
 class Axol(RobotBase):
     """Dual-arm Axol robot interface.
 
-    Opens one CAN bus per arm and constructs all 16 motor drivers on entry.
+    Opens one CAN bus per arm and constructs all 16 motor drivers on entry
+    (14 on the gripperless SKU, ``config.has_gripper = False``).
     Use as an async context manager to ensure the buses are cleanly shut down.
 
         async with Axol() as axol:

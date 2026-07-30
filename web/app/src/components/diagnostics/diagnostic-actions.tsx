@@ -31,6 +31,7 @@ export function DiagnosticActions({
   busy,
   disabled,
   hiddenKeys,
+  pickerJoints,
   onLaunch,
   onStop,
 }: {
@@ -46,6 +47,8 @@ export function DiagnosticActions({
    * arguments, injected from the configured adapter mapping at launch).
    */
   hiddenKeys?: string[]
+  /** The `--joints` picker's choices (gripperless SKUs drop GRIPPER). */
+  pickerJoints?: readonly JointName[]
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
 }) {
@@ -87,6 +90,7 @@ export function DiagnosticActions({
         <ActionDialog
           spec={open}
           hideKeys={hiddenKeys}
+          pickerJoints={pickerJoints}
           running={activeCommand === open.id}
           blocked={activeCommand != null && activeCommand !== open.id}
           busy={busy}

@@ -187,6 +187,25 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="robot.has_gripper",
+                label="Grippers fitted",
+                type="boolean",
+                help=(
+                    "This robot is the gripper-equipped SKU. Turn off for the "
+                    "gripperless SKU: the gripper motors are never enabled or "
+                    "calibrated, gripper commands are ignored, and gripper "
+                    "channels are dropped from recorded datasets. The gripper "
+                    "torque/speed settings below then have no effect."
+                ),
+                targets={
+                    "teleop": ("axol.has_gripper",),
+                    "gravity-comp": ("axol.has_gripper",),
+                    "collect-data": (f"{_AXOL}.has_gripper",),
+                    "run-policy": (f"{_AXOL}.has_gripper",),
+                    "replay-dataset": (f"{_AXOL}.has_gripper",),
+                },
+            ),
+            SettingDef(
                 key="robot.gripper_torque_limit",
                 label="Gripper torque limit (Nm)",
                 type="number",
@@ -1027,6 +1046,21 @@ class SettingsStore:
             return None if text.lower() in ("null", "none") else text
 
         return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
+
+    def has_gripper(self) -> bool:
+        """Whether this robot is the gripper-equipped SKU (default ``True``).
+
+        Read from the curated ``robot.has_gripper`` setting; the robot link
+        uses it to skip the gripper motors' pings, and the UI reads the
+        mirrored ``hasGripper`` field of ``/api/robot/status``.
+        """
+        with self._lock:
+            value = self._data["values"].get("robot.has_gripper")
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in ("false", "0", "no", "null")
+        return bool(value)
 
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.

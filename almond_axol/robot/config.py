@@ -408,6 +408,12 @@ class AxolConfig:
     Attributes:
         left:            Per-joint config for the left arm.
         right:           Per-joint config for the right arm.
+        has_gripper:     Whether this robot is a gripper-equipped SKU. Set to
+                         ``False`` for the gripperless SKU: the gripper motor
+                         is never constructed or calibrated, gripper commands
+                         (the last element of every ``(8,)`` joint array) are
+                         ignored, and gripper reads report ``0.0``. The array
+                         shapes of the public API are unchanged.
         max_step_rad:    Maximum allowed change in any arm joint (rad)
                          between consecutive ``motion_control`` calls.
                          Commands that exceed this are dropped and a warning
@@ -439,6 +445,7 @@ class AxolConfig:
     right: ArmConfig = field(
         default_factory=lambda: _build_arm(_RIGHT_FRICTION, is_left=False)
     )
+    has_gripper: bool = True
     max_step_rad: float = 0.5
     left_stiffness: float | list[float] = 0.5
     right_stiffness: float | list[float] = 0.5

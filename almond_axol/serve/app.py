@@ -200,7 +200,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # The link opens the interfaces configured in the shared settings (the
     # Axol hub's persistent names unless the operator picked others).
     left_channel, right_channel = settings.can_channels()
-    robot = RobotLink(left_channel, right_channel, hub=hub)
+    robot = RobotLink(
+        left_channel, right_channel, hub=hub, has_gripper=settings.has_gripper
+    )
     runner = OperationRunner(robot, settings=settings)
     runs = DiagnosticsRunStore(hub)
     # ZED devices are exclusive. Hold this across preview capture and operation

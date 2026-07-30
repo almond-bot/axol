@@ -22,6 +22,15 @@ export type JointName = (typeof JOINTS)[number]
 export type ArmSide = "left" | "right"
 
 /**
+ * The joints this robot actually has: the gripperless SKU drops the GRIPPER
+ * slot from motor grids, chart series, and joint pickers. `undefined` (status
+ * not loaded yet, or an older host that doesn't report it) keeps every joint.
+ */
+export function jointsFor(hasGripper: boolean | undefined): readonly JointName[] {
+  return hasGripper === false ? JOINTS.filter((j) => j !== "GRIPPER") : JOINTS
+}
+
+/**
  * Categorical palette for the eight joints, one fixed slot per joint (never
  * reassigned when series are filtered). Validated for the dark card surface
  * (#161618): all slots ≥3:1 contrast; adjacent-slot CVD separation sits in the
