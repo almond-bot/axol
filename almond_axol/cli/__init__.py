@@ -49,6 +49,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
+    "waypoints": (
+        "waypoints",
+        "Teach waypoints by hand, then replay them as straight-line moves.",
+    ),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "replay-dataset": (
         "replay_dataset",

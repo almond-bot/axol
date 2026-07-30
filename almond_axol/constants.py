@@ -35,6 +35,15 @@ ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 URDF_PATH: Path = Path(__file__).resolve().parent / "kinematics" / "urdf" / "axol.urdf"
 
 
+# Where the fingers close, in the gripper link frame (metres, FLU). The URDF
+# chain ends at the gripper mount, which is what forward kinematics and the IK
+# solver report; the gripper mesh runs 145 mm out along that link's -Z. Any
+# code that cares where the *tool* is — rather than where it is bolted on —
+# needs this offset, and the distance is large enough that ignoring it turns a
+# straight-line move into a visible arc as the wrist reorients.
+GRIPPER_TIP_OFFSET: tuple[float, float, float] = (0.0, 0.0, -0.145)
+
+
 # Single source of truth for URDF joint and body names. All helpers
 # (gravity comp, IK solver, simulation) compose ``f"{side}_{suffix}"`` from
 # these tables via the ``urdf_*_name`` helpers below.

@@ -21,7 +21,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
-from .config import TeleopCmdConfig, parse
+from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
     from ..teleop import VRTeleop
@@ -35,32 +35,9 @@ def _get_local_ip() -> str:
         return s.getsockname()[0]
 
 
-def _normalize_sim_flag(argv: list[str]) -> list[str]:
-    """Let ``--sim`` and ``--cart_only`` be passed as bare flags.
-
-    draccus parses bool fields as value-taking arguments (``--sim true``),
-    so rewrite a standalone flag (one that's followed by another flag or
-    nothing) into ``--<flag> true``. An explicit ``--sim true`` / ``--sim
-    false`` / ``--sim=...`` is left untouched.
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok in ("--sim", "--cart_only"):
-            nxt = argv[i + 1] if i + 1 < len(argv) else None
-            if nxt is None or nxt.startswith("-"):
-                out.extend((tok, "true"))
-                i += 1
-                continue
-        out.append(tok)
-        i += 1
-    return out
-
-
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, _normalize_sim_flag(argv))
+    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "cart_only"))
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.

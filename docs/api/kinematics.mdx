@@ -38,7 +38,35 @@ q = solver.ik(q, left_pose=(pos, rot))
 | `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
 | `fk(q)` | Forward kinematics → `(left_SE3, right_SE3)` |
 | `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
-| `set_posture_pose(q)` | Set the null-space attractor (home pose for joint drift prevention) |
+| `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
+
+## Straight-line paths
+
+`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both **gripper tips** along a straight world-frame line between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
+
+`fk()` and `ik()` work in the gripper *mount* frame, which the URDF chain ends at; the fingers close `GRIPPER_TIP_OFFSET` (145 mm along the link's -Z) beyond it. The planner holds the line at the tip and converts back to a mount target per solve, since a mount held straight swings the tip through an arc as the wrist reorients. `tip_poses(solver, q)` returns the tip frames directly.
+
+The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. Timing follows the minimum-jerk curve `ease()` — zero velocity *and* zero acceleration at both ends, so a leg neither jolts as it departs nor as it arrives, at the cost of peaking at 1.875x the average speed rather than smoothstep's 1.5x.
+
+IK does not run at every tick. It runs a couple of dozen times a second — `plan_rate` sets a floor, `MAX_STEP_M` and `MAX_STEP_RAD` a ceiling on how far the tip may travel between solves — and a clamped cubic spline fills in the rest. Solving more finely is not just wasted work but actively worse: each solve lands a fraction of a milliradian off its neighbours' trend (the cost's flat direction, not early stopping — more iterations do not change it), and commanding those samples directly turns that wobble into acceleration noise. Interpolating between sparse solves leaves it behind. Measured peak tip acceleration on a 35 cm leg was 1.7 m/s² solving every tick against 0.11 solving 20 a second, where the profile's own optimum is 0.105.
+
+Because the ceiling is a distance and the floor is rarely the binding one, a leg is sampled the same way however fast it is run, and accuracy does not degrade with speed: the same 35 cm leg holds its line to 0.74 mm and lands 0.02 mm from its target at 0.08 m/s and at 1.0 m/s alike, planning in 0.15 s either way. Speed buys itself in acceleration instead, which rises with its square.
+
+Two separate thresholds govern accuracy. `settle_fraction` is how close a sample is driven before the planner moves on, by re-solving against the same target; `pos_tolerance` and `ori_tolerance` are where a sample is declared unreachable and `PathPlanningError` is raised, before anything has moved. Conflating them leaves every sample a different distance behind its target, which is itself a source of acceleration noise. The delivered trajectory is then checked *between* solved samples too, where a chord deviates most from the line.
+
+An arm whose tip travels less than `min_travel` (and turns less than `min_rotation`) is pinned at `q_from` for the whole segment rather than tracked. Below that scale the difference between two taught configurations is drift rather than intent, and a redundant arm chasing it wanders through its null space — degrees of elbow for a millimetre of tip.
+
+The first vector returned is the configuration IK settles into at the start of the line, which reaches the same gripper pose as `q_from` but generally holds the elbow slightly differently. Commanding it directly puts that difference into a single tick, so plan each segment from the previous one's final vector and blend the remainder in over a few tenths of a second (`axol waypoints` does both).
+
+Planning calls `ik()` without elbow hints, which is a different JAX trace from the one `KinematicsSolver` warms up; call `path.warmup(solver)` once (off the hot path) to absorb that compile. This is what [`axol waypoints`](/cli/waypoints) replays — for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
+
+```python
+from almond_axol.kinematics import KinematicsSolver, plan_linear_segment
+
+solver = KinematicsSolver()
+for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=250.0):
+    await robot.motion_control(left=..., right=...)
+```
 
 ## `KinematicsConfig` fields
 

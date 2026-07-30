@@ -406,6 +406,15 @@ class KinematicsSolver:
         """
         self._posture_pose = jnp.asarray(q, dtype=jnp.float32)
 
+    @property
+    def posture_pose(self) -> np.ndarray:
+        """The global preferred posture, as set by :meth:`set_posture_pose`.
+
+        Lets a caller that sweeps the attractor (e.g. Cartesian path planning
+        in :mod:`almond_axol.kinematics.path`) restore what it found.
+        """
+        return np.asarray(self._posture_pose, dtype=np.float32)
+
     # -- Properties ----------------------------------------------------------
 
     @property
