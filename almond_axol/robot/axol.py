@@ -647,6 +647,7 @@ class AxolArm:
         self,
         kd: float = 0.5,
         free_joints: set[Joint] | None = None,
+        gripper_target: float | None = None,
     ) -> None:
         """Apply one cycle of gravity compensation.
 
@@ -663,8 +664,9 @@ class AxolArm:
         stays put for testing. To re-snapshot the hold position (e.g. after
         repositioning the arm), call :meth:`reset_gravity_hold` between calls.
 
-        The gripper is always softly held at its current position regardless
-        of ``free_joints`` (skipped on the gripperless SKU).
+        The gripper is softly held at its current position regardless of
+        ``free_joints`` (skipped on the gripperless SKU), unless
+        ``gripper_target`` asks for a different opening.
 
         Requires :meth:`start_telemetry` to be active so cached positions are
         fresh.
@@ -677,6 +679,11 @@ class AxolArm:
                 default) frees all 7 arm joints. Joints not in this set are
                 held rigidly at their initial position. ``Joint.GRIPPER`` is
                 ignored if present.
+            gripper_target: Normalised gripper opening to drive to
+                (0.0 = closed, 1.0 = fully open) at the configured torque
+                limit, for flows that operate the gripper while the arm is
+                hand-guided (``axol waypoints``). ``None`` (the default) holds
+                wherever the gripper currently is, softly.
         """
         free_set: frozenset[Joint] = (
             frozenset(ARM_JOINTS) if free_joints is None else frozenset(free_joints)
@@ -717,10 +724,17 @@ class AxolArm:
                     float(gravity[i]),
                 )
             )
-        # Hold the gripper softly so it does not drift open/closed.
+        # Hold the gripper softly so it does not drift open/closed — or drive
+        # it to the requested opening, at the full configured torque so it can
+        # actually grasp while the arm stays hand-guidable.
         if self._has_gripper:
             gripper_i = self._gripper_i
-            gripper_pos = float(positions[gripper_i])
+            if gripper_target is None:
+                gripper_pos = float(positions[gripper_i])
+                torque = 0.5
+            else:
+                gripper_pos = float(np.clip(gripper_target, 0.0, 1.0))
+                torque = self._arm_config.gripper.torque_limit
             gripper_pos_raw = self._limits_hi[gripper_i] + gripper_pos * (
                 self._limits_lo[gripper_i] - self._limits_hi[gripper_i]
             )
@@ -728,7 +742,7 @@ class AxolArm:
                 self.motors[Joint.GRIPPER].set_position_force(
                     gripper_pos_raw,
                     self._arm_config.gripper.max_speed,
-                    0.5,
+                    torque,
                 )
             )
         await asyncio.gather(*tasks)
@@ -1163,6 +1177,7 @@ class Axol(RobotBase):
         self,
         kd: float = 0.5,
         free_joints: set[Joint] | None = None,
+        gripper_target: float | None = None,
     ) -> None:
         """Put both arms into gravity-compensation mode for one cycle.
 
@@ -1183,12 +1198,16 @@ class Axol(RobotBase):
             free_joints: Set of arm joints to gravity-compensate. ``None`` (the
                 default) frees every arm joint. Joints not in this set are
                 held in place. The same filter is applied to both arms.
+            gripper_target: Normalised opening (0.0 = closed, 1.0 = open) to
+                drive both grippers to instead of holding them where they are.
+                Lets a flow operate the grippers while the arms stay
+                hand-guidable (``axol waypoints``).
         """
         tasks = []
         if self.left is not None:
-            tasks.append(self.left.gravity_compensate(kd, free_joints))
+            tasks.append(self.left.gravity_compensate(kd, free_joints, gripper_target))
         if self.right is not None:
-            tasks.append(self.right.gravity_compensate(kd, free_joints))
+            tasks.append(self.right.gravity_compensate(kd, free_joints, gripper_target))
         if tasks:
             await asyncio.gather(*tasks)
 

@@ -441,6 +441,34 @@ def parse(config_class: type[T], argv: list[str]) -> T:
         parser.parser.error(str(exc))
 
 
+def normalize_bool_flags(argv: list[str], *names: str) -> list[str]:
+    """Let the named bool fields be passed as bare flags.
+
+    draccus parses bool fields as value-taking arguments (``--sim true``), so
+    rewrite a standalone ``--sim`` (one followed by another flag or nothing)
+    into ``--sim true``. An explicit ``--sim true`` / ``--sim false`` /
+    ``--sim=...`` is left untouched.
+
+    Args:
+        argv: Raw argument list.
+        names: Field names to accept bare, without the leading dashes.
+    """
+    flags = {f"--{name}" for name in names}
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in flags:
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is None or nxt.startswith("-"):
+                out.extend((tok, "true"))
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 # ----------------------------------------------------------------------
 # Command configs that don't touch lerobot (kept import-cheap for sim).
 # ----------------------------------------------------------------------

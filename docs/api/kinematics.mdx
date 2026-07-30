@@ -38,7 +38,21 @@ q = solver.ik(q, left_pose=(pos, rot))
 | `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
 | `fk(q)` | Forward kinematics → `(left_SE3, right_SE3)` |
 | `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
-| `set_posture_pose(q)` | Set the null-space attractor (home pose for joint drift prevention) |
+| `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
+
+## Straight-line paths
+
+`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both grippers along a **straight world-frame line** between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
+
+The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. A sample that cannot be tracked within `pos_tolerance` raises `PathPlanningError` — nothing has moved at that point. This is what [`axol waypoints`](/cli/waypoints) replays; for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
+
+```python
+from almond_axol.kinematics import KinematicsSolver, plan_linear_segment
+
+solver = KinematicsSolver()
+for q in plan_linear_segment(solver, q_a, q_b, speed=0.08, ang_speed=0.6, rate=250.0):
+    await robot.motion_control(left=..., right=...)
+```
 
 ## `KinematicsConfig` fields
 

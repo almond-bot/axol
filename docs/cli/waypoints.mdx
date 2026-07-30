@@ -1,0 +1,84 @@
+---
+title: "waypoints"
+description: "Teach poses by hand in gravity comp, then replay them as straight-line moves."
+---
+
+Teach-and-repeat. The arms hold in [gravity compensation](/cli/gravity-comp) so you can hand-guide them; every time you record, the pose both arms are in is appended to a waypoint file. On playback each gripper travels a **straight line in Cartesian space** from waypoint to waypoint — position interpolated linearly, orientation slerped — and every sample along the line is resolved to joint angles with the [IK solver](/api/kinematics), pausing at each waypoint to work the grippers.
+
+The entire path is solved before the arms move, so a waypoint the straight line cannot reach is reported while the robot is still standing still.
+
+This command is configured via draccus — see [Command configuration](/cli/configuration).
+
+## Driving a session
+
+On the terminal, single keys on stdin:
+
+| Key | Action |
+|---|---|
+| `Enter` | Record the pose both arms are in |
+| `u` | Undo the last waypoint |
+| `c` | Clear every waypoint |
+| `g` | Cycle the grippers: limp → open → closed |
+| `p` | Play the path |
+| `s` | Stop playback and go back to teaching |
+| `q` | Quit |
+
+The same actions are buttons in the [control panel](/guides/control-panel) — the running session publishes them, so a path can be taught and replayed with no terminal at all.
+
+Grippers are recorded with each waypoint. Cycle them with `g` (or the panel button) to grasp an object before recording, and the same opening is reproduced at that waypoint on playback.
+
+## Flags
+
+| Flag | Description |
+|---|---|
+| `--file PATH` | Waypoint file to record into and play back from. Written after every change. Default `~/.almond/waypoints.json` |
+| `--play_only BOOL` | Skip teaching and replay the file straight away. Default `false` |
+| `--sim BOOL` | Preview a saved path in the browser visualizer instead of on the robot (implies `--play_only`). Default `false` |
+| `--loops INT` | Times to run the path; `0` replays until stopped. Default 1 |
+| `--speed FLOAT` | Cartesian speed (m/s) of the gripper along each leg. Default 0.08 |
+| `--ang_speed FLOAT` | Angular speed (rad/s) of the gripper's reorientation. Default 0.6 |
+| `--dwell FLOAT` | Seconds held still at each waypoint after its grippers have moved. Default 0.5 |
+| `--grip_time FLOAT` | Seconds spent moving the grippers to a waypoint's opening. Default 0.75 |
+| `--pos_tolerance FLOAT` | Largest tolerated deviation (m) from the straight line while planning. Default 0.01 |
+| `--free_joints [J1,J2,...]` | Joints to gravity-compensate while teaching. Default `null` = all 7 |
+| `--kd FLOAT` | Velocity damping on free joints while teaching (Nm·s/rad). Default 0.25 |
+| `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
+| `--rate_hz FLOAT` | Control loop and waypoint rate in Hz (default: 250) |
+| `--telemetry_hz FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
+| `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
+| `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
+
+```bash
+axol waypoints                                  # teach, then play
+axol waypoints --file pick_place.json           # keep a named path
+axol waypoints --play_only --loops 0            # replay it until stopped
+axol waypoints --sim --file pick_place.json     # preview it in the browser
+axol waypoints --speed 0.03 --dwell 2           # slow, with a long pause
+```
+
+## The waypoint file
+
+Waypoints are stored as the joint angles the arms actually reported, so a path is exact and can be edited or checked into a repository:
+
+```json
+{
+  "version": 1,
+  "waypoints": [
+    {
+      "label": "approach",
+      "left": [-0.157, 0.0, 0.0, 0.314, 0.0, 0.0, -0.157, 1.0],
+      "right": [0.157, 0.0, 0.0, -0.314, 0.0, 0.0, 0.157, 1.0]
+    }
+  ]
+}
+```
+
+Each arm entry is 7 joint angles in radians (`SHOULDER_1` … `WRIST_3`, joint frame, 0 = rest) followed by the gripper normalised to `[0, 1]`. The Cartesian pose the gripper travels through is derived from these by forward kinematics at planning time.
+
+<Tip>
+  A 7-DOF arm can reach the same gripper pose several ways. Playback keeps the posture you taught by sweeping the solver's posture attractor between the recorded joint vectors, so the elbow follows the path you guided it along rather than swinging into an unexpected configuration.
+</Tip>
+
+<Note>
+  Playback starts by moving to the first waypoint with a collision-aware joint-space move, and parks at the rest pose when the path finishes or is stopped. Quitting straight out of teaching skips that move — your hands are on a limp arm, so nothing stiffens up and drives home.
+</Note>

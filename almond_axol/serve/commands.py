@@ -178,6 +178,12 @@ def _gravity_comp() -> type:
     return GravityCompCmdConfig
 
 
+def _waypoints() -> type:
+    from ..cli.waypoints import WaypointsCmdConfig
+
+    return WaypointsCmdConfig
+
+
 def _collect_data() -> type:
     from ..cli.collect_data import CollectDataConfig
 
@@ -209,6 +215,18 @@ def _gravity_comp_run() -> Callable[..., Any]:
     from ..cli.gravity_comp import _run
 
     return _run
+
+
+def _waypoints_run() -> Callable[..., Any]:
+    from ..cli.waypoints import _run
+
+    return _run
+
+
+def _waypoints_control() -> Callable[..., Any]:
+    from ..cli.waypoints import _QueueWaypointControl
+
+    return _QueueWaypointControl
 
 
 def _collect_data_run() -> Callable[..., Any]:
@@ -282,6 +300,25 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_gravity_comp_run,
         execution="async",
         per_run_fields=("free_joints",),
+    ),
+    "waypoints": CommandDef(
+        "waypoints",
+        "waypoints",
+        "Waypoints",
+        "Hand-guide the arms in gravity comp to record waypoints, then replay "
+        "them as straight-line moves solved with inverse kinematics. Enable "
+        "simulation to preview a saved path in the browser.",
+        "Operate",
+        "draccus",
+        _waypoints,
+        sim_capable=True,
+        entrypoint=_waypoints_run,
+        episode_control=_waypoints_control,
+        sim_flag="sim",
+        # The gravity-comp side of a session takes the same config shape
+        # (axol.*, channels, kd, rates), so the settings table is inherited.
+        settings_like="gravity-comp",
+        per_run_fields=("file", "loops", "play_only", "sim"),
     ),
     "collect-data": CommandDef(
         "collect-data",
