@@ -13,6 +13,7 @@ from typing import Callable
 import can
 
 from .bus import CanBus
+from .config import DAMIAO_PARAMS, DamiaoParam
 from .driver import MotorDriver
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
@@ -85,6 +86,11 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
 
 class DamiaoMotor(MotorDriver):
     """MotorDriver implementation for Damiao motors using the MIT/position-force protocol."""
+
+    MOTOR_TYPE = "damiao"
+    PARAMS = DAMIAO_PARAMS
+    # Damiao publishes the whole register table, so a sweep has nothing to find.
+    PARAM_SWEEP_RANGE = None
 
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
         """Construct a Damiao driver.
@@ -243,6 +249,33 @@ class DamiaoMotor(MotorDriver):
         """Persist all RAM register values to flash (0xAA command)."""
         canid_l, canid_h = self._canid_bytes()
         await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xAA, 0x01, 0, 0, 0, 0]))
+
+    async def _config_read(self, index: int) -> float:
+        return float(await self._read_register(index))
+
+    async def _config_write(self, index: int, value: float) -> None:
+        await self._write_register(index, value)
+
+    async def _config_commit(self) -> None:
+        await self._store_parameters()
+
+    async def get_can_timeout(self) -> float:
+        """Return the loss-of-comms alarm time in milliseconds.
+
+        The motor raises :attr:`MotorStatus.LOST_COMM` when it goes this long
+        without a command. Zero disables the alarm.
+        """
+        return await self.read_config(DamiaoParam.TIMEOUT)
+
+    async def set_can_timeout(self, milliseconds: float) -> None:
+        """Set the loss-of-comms alarm time in milliseconds and persist it.
+
+        Pass 0 to disable the alarm. The register itself counts 50 µs ticks;
+        the conversion is handled by the parameter's scale.
+        """
+        if milliseconds < 0:
+            raise MotorError(f"CAN timeout must not be negative, got {milliseconds}")
+        await self.write_config(DamiaoParam.TIMEOUT, milliseconds)
 
     async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
         loop = asyncio.get_running_loop()

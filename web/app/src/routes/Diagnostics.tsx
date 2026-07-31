@@ -1,5 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Activity, Cable, Crosshair, Loader2, Radio, Tag, Wrench } from "lucide-react"
+import {
+  Activity,
+  Cable,
+  Crosshair,
+  ClipboardList,
+  Loader2,
+  Radio,
+  SlidersHorizontal,
+  Tag,
+  Upload,
+  Wrench,
+} from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { SiteNav } from "@/components/site-nav"
@@ -76,7 +87,15 @@ const STATE_BADGE: Record<
 // tools. Used to recognise an already-running session and adopt it (see the
 // adoption effect) so its Stop button shows on any browser, not just the tab
 // that started it.
-const PAGE_COMMAND_IDS = ["can.setup", "can.enable", "motor.set-can-id", "motor.set-zero-pos"]
+const PAGE_COMMAND_IDS = [
+  "can.setup",
+  "can.enable",
+  "motor.set-can-id",
+  "motor.set-zero-pos",
+  "motor.dump-config",
+  "motor.set-config",
+  "motor.flash",
+]
 
 // The Axol hub adapter's persistent interface names (created by can.setup).
 // A configured channel equal to its hub default is omitted from launches so
@@ -452,15 +471,18 @@ export default function Diagnostics() {
     }
   }, [serverOk, activeRun, diagCommands])
 
-  // Motor calibration tools surfaced as buttons in the Motors header. Zeroing
-  // is one button whose dialog tabs between "specific motor" and the guided
-  // walk of every joint (both back motor.set-zero-pos via presets).
+  // Per-motor service tools surfaced as buttons in the Motors header: CAN ID,
+  // zeroing, configuration parameters, and firmware. A tool with modes tabs
+  // between presets of one command — zeroing between "specific motor" and the
+  // guided walk of every joint, config between reading and writing.
   const MOTOR_TOOLS: {
     key: string
     command: string
     label: string
     icon: typeof Tag
     description?: string
+    presetArgs?: Record<string, FormValue>
+    hideKeys?: string[]
     modes?: ActionMode[]
     /** Restrict the `--joints` picker's choices for this tool's dialog. */
     pickerJoints?: readonly JointName[]
@@ -498,6 +520,58 @@ export default function Diagnostics() {
           hideKeys: ["id", "type"],
         },
       ],
+    },
+    {
+      key: "dump-config",
+      command: "motor.dump-config",
+      label: "Dump config",
+      icon: ClipboardList,
+      description:
+        "Read every configuration parameter from one motor, or all of them when the " +
+        "CAN ID is left blank. Works for MyActuator and Damiao alike. Read-only — the " +
+        "run log is kept in the history below, so this is what to capture before " +
+        "changing anything.",
+    },
+    {
+      key: "set-config",
+      command: "motor.set-config",
+      label: "Set config",
+      icon: SlidersHorizontal,
+      modes: [
+        {
+          key: "read",
+          label: "Read",
+          description:
+            "Read one configuration parameter without writing anything. Parameter " +
+            "names cover both motor families, including Damiao's CAN timeout.",
+          hideKeys: ["value", "force_protected", "yes"],
+        },
+        {
+          key: "write",
+          label: "Write",
+          description:
+            "Write one configuration parameter and persist it. Damiao's CAN timeout " +
+            "is in milliseconds. Protected parameters — factory calibration, CAN IDs, " +
+            "baud rate — need the override, since changing those can leave the motor " +
+            "unable to commutate or unreachable on the bus.",
+          // Running the dialog is the confirmation; the CLI prompt would other-
+          // wise block the session waiting on stdin.
+          presetArgs: { yes: true },
+        },
+      ],
+    },
+    {
+      key: "flash",
+      command: "motor.flash",
+      label: "Flash firmware",
+      icon: Upload,
+      description:
+        "Overwrite one motor's firmware from a .bin file on the robot host. Leave " +
+        "the arm powered and idle — nothing else may use the bus. An interrupted " +
+        "flash leaves the motor in its bootloader until you run this again.",
+      // Running the dialog is the confirmation; the CLI prompt would otherwise
+      // block the session waiting on stdin.
+      presetArgs: { yes: true },
     },
   ]
   const [motorTool, setMotorTool] = useState<string | null>(null)
@@ -772,12 +846,14 @@ export default function Diagnostics() {
         <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />
       </main>
 
-      {/* Motor calibration tool dialog (Set CAN ID / Set zero position) */}
+      {/* Per-motor service tool dialog (CAN ID / zero / config / firmware) */}
       {openTool && openToolSpec && (
         <ActionDialog
           spec={openToolSpec}
           title={openTool.label}
           description={openTool.description}
+          presetArgs={openTool.presetArgs}
+          hideKeys={openTool.hideKeys}
           modes={openTool.modes}
           pickerJoints={openTool.pickerJoints}
           // The adapter mapping decides the interface (injected at launch);
