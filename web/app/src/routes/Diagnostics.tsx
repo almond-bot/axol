@@ -852,14 +852,17 @@ export default function Diagnostics() {
           spec={openToolSpec}
           title={openTool.label}
           description={openTool.description}
-          presetArgs={openTool.presetArgs}
-          hideKeys={openTool.hideKeys}
           modes={openTool.modes}
           pickerJoints={openTool.pickerJoints}
           // The adapter mapping decides the interface (injected at launch);
-          // a single-arm config also decides the arm.
-          hideKeys={configHiddenKeys}
-          presetArgs={onlySide ? { arm: onlySide } : undefined}
+          // a single-arm config also decides the arm. The tool's own presets
+          // (e.g. skipping a CLI confirmation the dialog already covers) and
+          // hidden fields stack on top.
+          hideKeys={[...configHiddenKeys, ...(openTool.hideKeys ?? [])]}
+          presetArgs={{
+            ...(onlySide ? { arm: onlySide } : {}),
+            ...(openTool.presetArgs ?? {}),
+          }}
           running={activeRun?.command === openTool.command}
           blocked={activeRun != null && activeRun.command !== openTool.command}
           busy={launchBusy}

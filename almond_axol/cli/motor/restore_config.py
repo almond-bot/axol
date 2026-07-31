@@ -27,6 +27,7 @@ from ...motor.config import MotorParam
 from ...motor.driver import MotorDriver
 from ...motor.errors import MotorError
 from ...motor.motor import make_driver
+from . import add_side_and_channel_arguments, resolve_channel
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -37,9 +38,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
-    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
+    add_side_and_channel_arguments(p)
     p.add_argument("snapshot", type=Path, help="JSON file from motor.dump-config")
     p.add_argument(
         "--id",
@@ -132,7 +131,7 @@ async def _restore_motor(
 
 
 async def _run(args: argparse.Namespace) -> None:
-    channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
+    channel = resolve_channel(args)
 
     try:
         snapshot = json.loads(args.snapshot.read_text())
