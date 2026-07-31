@@ -118,7 +118,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -145,6 +145,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
 - [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
+- [`waypoints`](https://docs.almond.bot/cli/waypoints)
 
 ### Python API
 
