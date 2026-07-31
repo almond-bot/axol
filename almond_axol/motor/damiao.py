@@ -277,16 +277,38 @@ class DamiaoMotor(MotorDriver):
             raise MotorError(f"CAN timeout must not be negative, got {milliseconds}")
         await self.write_config(DamiaoParam.TIMEOUT, milliseconds)
 
-    async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
+    async def _request_feedback(
+        self, timeout: float = 0.1, attempts: int = 5
+    ) -> _MotorFeedback:
+        """Request a feedback frame, re-sending the request if a reply is missed.
+
+        Like the parameter-read reply (see :meth:`_read_register`), the 0xCC
+        feedback reply is a single unacknowledged CAN frame that is most often
+        dropped in the enable burst — e.g. the ``get_position`` that opens
+        gripper calibration, issued right after every motor on both arms has
+        cleared errors and read its registers at once. One dropped frame must
+        not abort the whole enable, so each attempt re-sends the request.
+        """
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[_MotorFeedback] = loop.create_future()
-        self._feedback_waiters.append(fut)
         canid_l, canid_h = self._canid_bytes()
-        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xCC, 0, 0, 0, 0, 0]))
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            raise MotorError(f"Damiao motor {self._motor_id:#04x} feedback timed out")
+        last_exc: asyncio.TimeoutError | None = None
+        for _ in range(attempts):
+            fut: asyncio.Future[_MotorFeedback] = loop.create_future()
+            self._feedback_waiters.append(fut)
+            await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xCC, 0, 0, 0, 0, 0]))
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+            finally:
+                # Drop our waiter unless a feedback frame already resolved it,
+                # so a late reply can't resolve a future from a previous attempt.
+                if fut in self._feedback_waiters:
+                    self._feedback_waiters.remove(fut)
+        raise MotorError(
+            f"Damiao motor {self._motor_id:#04x} feedback timed out "
+            f"after {attempts} attempts"
+        ) from last_exc
 
     async def _send_cmd(
         self,
@@ -352,7 +374,8 @@ class DamiaoMotor(MotorDriver):
             await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
             await asyncio.sleep(0.01)
             try:
-                feedback = await self._request_feedback()
+                # attempts=1: this loop already re-sends on a missed reply.
+                feedback = await self._request_feedback(attempts=1)
                 if feedback.status == _DamiaoStatus.DISABLED:
                     return
             except MotorError:
