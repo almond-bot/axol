@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
+from typing import Mapping
 
 from ..constants import Joint
 from .bus import CanBus
+from .config import MotorParam
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .errors import MotorError
@@ -22,10 +24,14 @@ from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _MotorType(Enum):
-    """Identifies which vendor protocol a joint's motor speaks."""
+    """Identifies which vendor protocol a joint's motor speaks.
 
-    MYACTUATOR = "myactuator"
-    DAMIAO = "damiao"
+    Values come from the drivers so the CLI, config snapshots, and this
+    mapping cannot drift apart.
+    """
+
+    MYACTUATOR = MyActuatorMotor.MOTOR_TYPE
+    DAMIAO = DamiaoMotor.MOTOR_TYPE
 
 
 @dataclass(frozen=True)
@@ -275,6 +281,61 @@ class Motor:
     async def get_voltage(self) -> float:
         """Return bus voltage in Volts."""
         return await self._driver.get_voltage()
+
+    async def get_low_voltage_threshold(self) -> float:
+        """Return the undervoltage protection threshold in Volts.
+
+        MyActuator only; raises MotorError on Damiao.
+        """
+        return await self._driver.get_low_voltage_threshold()
+
+    async def set_low_voltage_threshold(self, volts: float) -> None:
+        """Set the undervoltage protection threshold (V) and persist it to ROM.
+
+        MyActuator only; raises MotorError on Damiao. MyActuator motors already
+        apply the project-wide threshold on ``enable()``.
+        """
+        await self._driver.set_low_voltage_threshold(volts)
+
+    def resolve_config_param(self, name: str) -> MotorParam:
+        """Look a configuration parameter up by name for this motor's family."""
+        return type(self._driver).resolve_param(name)
+
+    async def read_config(self, param: MotorParam) -> float:
+        """Read one configuration parameter, in the unit its spec names."""
+        return await self._driver.read_config(param)
+
+    async def write_config(self, param: MotorParam, value: float) -> None:
+        """Write one configuration parameter and persist it to flash/ROM."""
+        await self._driver.write_config(param, value)
+
+    async def dump_config(
+        self, raw_range: range | None = None
+    ) -> dict[MotorParam | int, float]:
+        """Read every known configuration parameter."""
+        return await self._driver.dump_config(raw_range)
+
+    async def restore_config(
+        self, values: Mapping[MotorParam, float], *, include_protected: bool = False
+    ) -> list[MotorParam]:
+        """Write a saved configuration back and return the parameters changed."""
+        return await self._driver.restore_config(
+            values, include_protected=include_protected
+        )
+
+    async def get_can_timeout(self) -> float:
+        """Return the CAN loss-of-comms alarm time in milliseconds.
+
+        Damiao only; raises MotorError on MyActuator.
+        """
+        return await self._driver.get_can_timeout()
+
+    async def set_can_timeout(self, milliseconds: float) -> None:
+        """Set the CAN loss-of-comms alarm time in ms and persist it.
+
+        Damiao only; raises MotorError on MyActuator.
+        """
+        await self._driver.set_can_timeout(milliseconds)
 
     async def get_error_code(self) -> MotorStatus:
         """Return the current motor status / error code."""

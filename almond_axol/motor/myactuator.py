@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import re
 import struct
@@ -17,9 +18,12 @@ from typing import Callable
 import can
 
 from .bus import CanBus
+from .config import MYACTUATOR_PARAMS, PARAM_SWEEP_RANGE, MyActuatorParam
 from .driver import MotorDriver
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
+
+_logger = logging.getLogger(__name__)
 
 _MA_REQ = 0x140  # standard command request  → 0x140 + motor_id
 _MA_RESP = 0x240  # standard command response ← 0x240 + motor_id
@@ -44,6 +48,31 @@ _MA_WRITE_GAINS_ROM = (
     0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
 )
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
+
+# Configuration-parameter access. These two commands are absent from MyActuator's
+# published protocol (V4.4) — they were recovered from the vendor setup software,
+# which uses them for every "advanced" / protection parameter the GUI exposes.
+#
+#   request: [0xC0, 0x00, index, rw, v0, v1, v2, v3]
+#
+# where ``rw`` selects read or write and ``v0..v3`` are a little-endian float32
+# (the value in the parameter's display unit — Volts for the threshold below).
+# A read echoes the frame back with the stored value in bytes 4-7. Writes only
+# land in RAM; 0xC1 commits every parameter written since the last commit to ROM.
+_MA_PARAM_ACCESS = 0xC0
+_MA_PARAM_SAVE = 0xC1  # commit 0xC0 writes to ROM; sent with an empty payload
+_MA_PARAM_READ = 0x01  # byte 3 of a 0xC0 frame
+_MA_PARAM_WRITE = 0x00
+
+# Undervoltage threshold applied to every motor on enable(). Negative, so the
+# bus voltage can never fall below it and the motor never latches the level-2
+# undervoltage fault (status-1 bit 0x0004).
+_MA_LOW_VOLTAGE_THRESHOLD_V = -2.0
+
+# Match tolerance (V) when checking the stored threshold against the target.
+# Only a mismatch triggers a write, so an already-provisioned motor doesn't
+# burn a ROM write cycle on every enable().
+_MA_LOW_VOLTAGE_TOL_V = 0.05
 
 # Seconds to wait after a 0x76 system reset before the motor answers again.
 # Measured reboot time is ~1.12s; 2.0s leaves margin across motors/temperature.
@@ -153,6 +182,11 @@ def _model_max_torque(model: str | None) -> float:
 class MyActuatorMotor(MotorDriver):
     """MotorDriver implementation for MyActuator RMD motors using the 0x140-series protocol."""
 
+    MOTOR_TYPE = "myactuator"
+    PARAMS = MYACTUATOR_PARAMS
+    # The 0xC0 table is still incomplete, so a raw sweep has something to find.
+    PARAM_SWEEP_RANGE = PARAM_SWEEP_RANGE
+
     def __init__(self, bus: CanBus, motor_id: int, kt: float) -> None:
         """Construct a MyActuator driver.
 
@@ -243,6 +277,59 @@ class MyActuatorMotor(MotorDriver):
         chars = raw.split(b"\x00", 1)[0]
         return chars.decode("ascii", errors="ignore")
 
+    async def _read_param(self, index: int) -> float:
+        """Read configuration parameter ``index`` via 0xC0.
+
+        Every parameter shares one response CAN ID and command byte, so
+        concurrent reads on the same motor would race — keep them sequential.
+        """
+        data = bytes([_MA_PARAM_ACCESS, 0x00, index, _MA_PARAM_READ, 0, 0, 0, 0])
+        resp = await self._request(data)
+        return float(struct.unpack_from("<f", resp, 4)[0])
+
+    async def _write_param(
+        self, index: int, value: float, *, commit: bool = True
+    ) -> None:
+        """Write configuration parameter ``index`` via 0xC0.
+
+        A 0xC0 write only lands in RAM. Pass ``commit=False`` to defer the 0xC1
+        that flushes it to ROM, so a batch of writes costs one ROM cycle
+        instead of one per parameter.
+        """
+        data = bytes([_MA_PARAM_ACCESS, 0x00, index, _MA_PARAM_WRITE]) + struct.pack(
+            "<f", value
+        )
+        await self._request(data)
+        if commit:
+            await self._commit_params()
+
+    async def _commit_params(self) -> None:
+        """Commit every 0xC0 write made since the last commit to ROM."""
+        await self._request(self._cmd(_MA_PARAM_SAVE))
+
+    async def _apply_low_voltage_threshold(self) -> None:
+        """Bring the undervoltage threshold to :data:`_MA_LOW_VOLTAGE_THRESHOLD_V`.
+
+        Reads first so an already-provisioned motor is left untouched. A motor
+        that doesn't answer keeps whatever threshold it has — that only costs
+        the (optional) undervoltage suppression, so warn rather than fail the
+        whole enable().
+        """
+        try:
+            current = await self.get_low_voltage_threshold()
+            if math.isclose(
+                current, _MA_LOW_VOLTAGE_THRESHOLD_V, abs_tol=_MA_LOW_VOLTAGE_TOL_V
+            ):
+                return
+            await self.set_low_voltage_threshold(_MA_LOW_VOLTAGE_THRESHOLD_V)
+        except MotorError as exc:
+            _logger.warning(
+                "MyActuator motor %#04x: could not set undervoltage threshold to %.1f V (%s)",
+                self._motor_id,
+                _MA_LOW_VOLTAGE_THRESHOLD_V,
+                exc,
+            )
+
     async def _detect_capabilities(self) -> None:
         """Read firmware version + model once and configure MIT-command ranges.
 
@@ -277,6 +364,7 @@ class MyActuatorMotor(MotorDriver):
             await self._detect_capabilities()
         except MotorError:
             pass
+        await self._apply_low_voltage_threshold()
         await self._request(self._cmd(_MA_RELEASE_BRAKE))
 
     async def get_firmware_version(self) -> int | None:
@@ -350,6 +438,21 @@ class MyActuatorMotor(MotorDriver):
         resp = await self._get_status1()
         raw = struct.unpack_from("<H", resp, 4)[0]
         return raw * 0.1  # 0.1 V/LSB
+
+    async def get_low_voltage_threshold(self) -> float:
+        return await self._read_param(MyActuatorParam.LOW_VOLTAGE)
+
+    async def set_low_voltage_threshold(self, volts: float) -> None:
+        await self._write_param(MyActuatorParam.LOW_VOLTAGE, volts)
+
+    async def _config_read(self, index: int) -> float:
+        return await self._read_param(index)
+
+    async def _config_write(self, index: int, value: float) -> None:
+        await self._write_param(index, value, commit=False)
+
+    async def _config_commit(self) -> None:
+        await self._commit_params()
 
     async def get_error_code(self) -> MotorStatus:
         resp = await self._get_status1()
