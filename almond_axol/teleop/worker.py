@@ -168,6 +168,10 @@ class IKWorker:
         """
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
+        # Elbow hints are optional (kinematics.elbow_weight == 0 disables, the
+        # default): skip the whole elbow pipeline — filters, engage snapshots,
+        # target math — so the solve graph never carries the cost.
+        self._use_elbow = kinematics_config.elbow_weight > 0.0
 
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
         self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
@@ -291,14 +295,17 @@ class IKWorker:
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
         right_pos, right_rot = _vr_to_flu_np(*rp, *rq)
 
-        le = self._f_l_elbow.update(
-            np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
-        )
-        re = self._f_r_elbow.update(
-            np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z])
-        )
-        left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
-        right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
+        left_e: np.ndarray | None = None
+        right_e: np.ndarray | None = None
+        if self._use_elbow:
+            le = self._f_l_elbow.update(
+                np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
+            )
+            re = self._f_r_elbow.update(
+                np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z])
+            )
+            left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
+            right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
         if not self._active:
             self._active = True
@@ -327,12 +334,15 @@ class IKWorker:
             rotation_multiplier=rot_mult,
         )
 
-        elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
-            left_e - self._snap_elbow_ctrl["left"]
-        )
-        elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
-            right_e - self._snap_elbow_ctrl["right"]
-        )
+        elbow_l: np.ndarray | None = None
+        elbow_r: np.ndarray | None = None
+        if self._use_elbow:
+            elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
+                left_e - self._snap_elbow_ctrl["left"]
+            )
+            elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
+                right_e - self._snap_elbow_ctrl["right"]
+            )
 
         q_new = self._solver.ik(
             q_current,
@@ -341,9 +351,12 @@ class IKWorker:
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
+        targets = [tl_pos, tr_pos]
+        if elbow_l is not None and elbow_r is not None:
+            targets += [elbow_l, elbow_r]
         self._note_solve(
             bool(np.array_equal(q_new, q_current)),
-            np.concatenate([tl_pos, tr_pos, elbow_l, elbow_r]),
+            np.concatenate(targets),
         )
         return q_new
 
@@ -474,8 +487,8 @@ class IKWorker:
                 q,
                 left_pose=l_pose,
                 right_pose=r_pose,
-                left_elbow_pos=l_elbow,
-                right_elbow_pos=r_elbow,
+                left_elbow_pos=l_elbow if self._use_elbow else None,
+                right_elbow_pos=r_elbow if self._use_elbow else None,
             )
             if float(np.max(np.abs(q_new - q))) < tol:
                 return q_new
@@ -488,14 +501,16 @@ class IKWorker:
         left_rot: np.ndarray,
         right_pos: np.ndarray,
         right_rot: np.ndarray,
-        left_e: np.ndarray,
-        right_e: np.ndarray,
+        left_e: np.ndarray | None,
+        right_e: np.ndarray | None,
         q_current: np.ndarray,
     ) -> None:
         """Snapshot controller and FK poses at toggle engage.
 
         These snapshots become the origin against which subsequent controller
-        motion is measured to build relative EE and elbow targets in :meth:`step`.
+        motion is measured to build relative EE and elbow targets in
+        :meth:`step`. Elbow snapshots are ``None`` when elbow tracking is
+        disabled (``kinematics.elbow_weight == 0``) and are never read.
         """
         fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
 
@@ -612,5 +627,9 @@ def run_ik_worker(
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError):
+            # OSError covers ConnectionResetError/BrokenPipeError when the
+            # parent end closes abruptly (parent crash, or a shutdown that
+            # left an in-flight response unread — the close then RSTs this
+            # end). Exit cleanly instead of dying with a traceback.
             break
