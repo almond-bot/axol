@@ -235,6 +235,13 @@ class VRTeleop:
 
         if self._parent_conn is not None:
             try:
+                # Drain in-flight worker responses before closing: the dispatch
+                # thread can stop mid solve, and closing a connection with
+                # unread data RSTs the peer — the worker's blocking recv then
+                # dies with ConnectionResetError instead of reading the None
+                # shutdown sentinel.
+                while self._parent_conn.poll(0):
+                    self._parent_conn.recv()
                 self._parent_conn.send(None)
             except Exception:
                 pass
@@ -358,6 +365,20 @@ class VRTeleop:
                 prev_iter = now
                 loop_times.append(now)
                 if now - last_log >= 1.0 and len(loop_times) > 1:
+                    # Surface silent freeze modes: the control loop keeps
+                    # commanding the last smoothed target when either of these
+                    # dies, which reads as "teleop froze" with no explanation.
+                    if self._ik_process is not None and not self._ik_process.is_alive():
+                        _logger.error(
+                            "IK worker process died (exit code %s) — arms are "
+                            "holding the last target; restart teleop",
+                            self._ik_process.exitcode,
+                        )
+                    elif self._ik_thread is not None and not self._ik_thread.is_alive():
+                        _logger.error(
+                            "IK dispatch thread died — arms are holding the "
+                            "last target; restart teleop"
+                        )
                     total = loop_times[-1] - loop_times[0]
                     rate = (len(loop_times) - 1) / total
                     with self._ik_loop_times_lock:

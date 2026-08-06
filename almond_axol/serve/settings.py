@@ -423,7 +423,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "Weight on the elbow position hint — how strongly the arm "
-                    "follows the operator's elbow (position only)."
+                    "follows the operator's elbow (position only). 0 disables "
+                    "elbow tracking; the arm's swivel then follows the posture "
+                    "attractor instead of the headset's inferred elbow."
                 ),
                 targets={
                     "teleop": ("kinematics.elbow_weight",),

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 
 import jax
 import jax.numpy as jnp
@@ -36,10 +37,26 @@ _TORSO_LINKS: tuple[str, ...] = ("base", "s1")
 Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 """
 
+# Home-pose penetration (m) beyond which a capsule pair is considered
+# overlapping by construction and excluded from self-collision. Pairs within
+# this tolerance merely graze at the (never-teleoped) straight-down home pose
+# due to conservative capsule fits and must keep their protection — see
+# _build_robot_collision.
+_CAPSULE_GRAZE_TOL = 0.003
+
+# Collision-cost activation distance (m) for graze-kept pairs (see above).
+# Their capsules already touch at poses where the physical robot has real
+# clearance, so the fit itself embeds the safety buffer — stacking the full
+# ``self_collision_margin`` on top keeps the cost active across the entire
+# close-to-body work envelope, and the constant three-way fight between task,
+# posture, and collision gradients reads as jerk. A small activation distance
+# keeps these pairs silent until the capsules are genuinely about to touch.
+_GRAZE_PAIR_MARGIN = 0.008
+
 
 def _build_robot_collision(
-    urdf: yourdfpy.URDF, robot: pk.Robot
-) -> pk.collision.RobotCollision:
+    urdf: yourdfpy.URDF, robot: pk.Robot, default_margin: float
+) -> tuple[pk.collision.RobotCollision, np.ndarray]:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
     Each Axol arm is a serial chain attached to a static torso (``base`` +
@@ -52,10 +69,22 @@ def _build_robot_collision(
     pairs are filtered out (cross-arm contacts are unreachable, within-arm
     is constrained by joint limits, and torso<->torso is rigidly fixed).
 
-    A second pass excludes any remaining pair that is already penetrating
-    at the home pose — those are over-conservative capsule fits the IK
-    can never separate (e.g. ``base <-> shoulder`` capsules that overlap
-    by construction because the arms mount onto the torso).
+    A second pass excludes any remaining pair that penetrates by more than
+    ``_CAPSULE_GRAZE_TOL`` at the home pose — those are over-conservative
+    capsule fits the IK can never separate (e.g. ``base <-> shoulder``
+    capsules that overlap by construction because the arms mount onto the
+    torso, at -12 mm and worse). Pairs that merely *graze* at the home pose
+    are kept: the home pose (arm hanging straight down) is one teleop never
+    occupies, and dropping a grazing pair removes its collision protection
+    everywhere. ``base <-> e2`` (the elbow)     grazes at -1.4 mm and is exactly
+    the pair that keeps the elbow off the base — it used to be masked by the
+    operator elbow hint pulling the swivel outward; with elbow tracking
+    disabled it is the only thing standing between the elbow and the base.
+
+    Returns ``(collision_model, per_pair_margins)``: graze-kept pairs get the
+    reduced ``_GRAZE_PAIR_MARGIN`` activation distance (their capsule fits
+    already embed the clearance buffer), every other pair the configured
+    ``default_margin``.
     """
     link_names = [link.name for link in urdf.robot.links]
 
@@ -77,15 +106,24 @@ def _build_robot_collision(
     d = np.asarray(rc.compute_self_collision_distance(robot, q0))
     ai = np.asarray(rc.active_idx_i)
     aj = np.asarray(rc.active_idx_j)
-    for k in np.where(d < 0.0)[0]:
+    for k in np.where(d < -_CAPSULE_GRAZE_TOL)[0]:
         ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
 
     rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
+    d = np.asarray(
+        rc.compute_self_collision_distance(robot, q0)
+    )  # final active pair set
+    margins = np.where(
+        d <= 0.0, min(_GRAZE_PAIR_MARGIN, default_margin), default_margin
+    ).astype(np.float32)
     _logger.info(
-        "RobotCollision: restricted to %d torso<->arm pairs.",
+        "RobotCollision: restricted to %d torso<->arm pairs (%d graze-kept at "
+        "%.0f mm activation).",
         len(rc.active_idx_i),
+        int((d <= 0.0).sum()),
+        1e3 * _GRAZE_PAIR_MARGIN,
     )
-    return rc
+    return rc, margins
 
 
 # Convenience aliases for URDF link / joint names. The single source of
@@ -110,6 +148,47 @@ _RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 # ---------------------------------------------------------------------------
 
 
+# Full limit-approach damping applies when a joint moves toward its nearby
+# limit faster than this many radians per solve step (~0.24 rad/s at 120 Hz);
+# slower approaches get proportionally less.
+_LIMIT_GATE_STEP = 2e-3
+
+
+def _manip_translation(robot: pk.Robot, q: jax.Array, link_idx: jax.Array) -> jax.Array:
+    """Translational Yoshikawa manipulability of a link at configuration ``q``.
+
+    ``sqrt(det(J J^T))`` over the link-origin translation Jacobian — the same
+    measure pyroki's manipulability cost uses. Joints outside the link's chain
+    contribute zero columns, so this is automatically per-arm.
+    """
+
+    def translation(qq: jax.Array) -> jax.Array:
+        return jaxlie.SE3(robot.forward_kinematics(qq)[link_idx]).translation()
+
+    J = jax.jacfwd(translation)(q)  # (3, N)
+    return jnp.sqrt(jnp.maximum(jnp.linalg.det(J @ J.T), 1e-12))
+
+
+def _project_elbow(
+    elbow: jaxlie.SE3, shoulder: jax.Array, current_elbow_pos: jax.Array
+) -> jaxlie.SE3:
+    """Project an elbow target onto the robot's reachable elbow sphere.
+
+    The operator's elbow (different arm proportions, position-multiplier
+    scaling) generally lies off the sphere the robot's elbow actually lives on
+    (|shoulder->elbow| at the current configuration — the radius varies a few
+    cm with shoulder pose, so it is measured from FK rather than fixed). The
+    radial component of the raw target is unreachable by construction and
+    would inject a permanent residual that fights the EE cost through the
+    shared shoulder joints; only the swivel direction is kept.
+    """
+    r = jnp.linalg.norm(current_elbow_pos - shoulder)
+    d = elbow.translation() - shoulder
+    n = jnp.linalg.norm(d)
+    proj = shoulder + d * (r / jnp.maximum(n, 1e-6))
+    return jaxlie.SE3.from_rotation_and_translation(elbow.rotation(), proj)
+
+
 @functools.partial(jax.jit, static_argnames=("max_iterations",))
 def _solve_ik(
     robot: pk.Robot,
@@ -123,16 +202,25 @@ def _solve_ik(
     L_elbow_idx: jax.Array,
     R_elbow_idx: jax.Array,
     q_current: jax.Array,
+    q_prev: jax.Array,
     posture_pose: jax.Array,
+    left_joint_idx: jax.Array,
+    right_joint_idx: jax.Array,
+    shoulder_L: jax.Array,
+    shoulder_R: jax.Array,
     pos_weight: float,
     ori_weight: float,
     rest_weight: float,
     posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
-    self_collision_margin: float,
+    self_collision_margin: jax.Array,
     self_collision_weight: float,
-    elbow_weight: float,
+    elbow_weight_L: float,
+    elbow_weight_R: float,
+    manip_damping_threshold: float,
+    manip_damping_boost: float,
+    limit_damping_margin: float,
     max_iterations: int,
     cost_tolerance: float,
     lambda_initial: float,
@@ -140,8 +228,57 @@ def _solve_ik(
 ) -> jax.Array:
     JointVar = robot.joint_var_cls
 
+    # Adaptive damping (Chiaverini-style damped least squares): as an arm's
+    # translational manipulability at the seed drops toward the singular
+    # boundary, its joints' rest-cost weight ramps up quadratically, so the
+    # solver takes small conservative steps instead of thrashing between
+    # rank-deficient directions. Fully off above the threshold, so normal
+    # teleop is unaffected.
+    def _ramp(m: jax.Array) -> jax.Array:
+        return jnp.square(
+            jnp.clip(1.0 - m / jnp.maximum(manip_damping_threshold, 1e-9), 0.0, 1.0)
+        )
+
+    manip_L = _manip_translation(robot, q_current, L_ee_idx)
+    manip_R = _manip_translation(robot, q_current, R_ee_idx)
+    rest_w = jnp.full(q_current.shape, rest_weight, dtype=jnp.float32)
+    rest_w = rest_w.at[left_joint_idx].add(manip_damping_boost * _ramp(manip_L))
+    rest_w = rest_w.at[right_joint_idx].add(manip_damping_boost * _ramp(manip_R))
+
+    # Per-joint damping near joint limits, gated on approach direction: the
+    # limit cost is a hinge (e.g. shoulder_2 at -pi with the arm overhead, or
+    # the elbow's 0-rad limit at full extension), and an undamped approach
+    # slams into it. Damping is applied only to a joint *moving toward* its
+    # nearby limit — a joint parked against a limit by task pressure (common
+    # for a wrist during ordinary manipulation) is left free, otherwise the
+    # damping fights the task and rails the step limiter.
+    dist_lo = q_current - robot.joints.lower_limits
+    dist_hi = robot.joints.upper_limits - q_current
+    dist_to_limit = jnp.minimum(dist_lo, dist_hi)
+    limit_ramp = jnp.square(
+        jnp.clip(
+            1.0 - dist_to_limit / jnp.maximum(limit_damping_margin, 1e-9), 0.0, 1.0
+        )
+    )
+    vel = q_current - q_prev  # rad per solve step
+    toward = jnp.where(dist_lo < dist_hi, -vel, vel)
+    gate = jnp.clip(toward / _LIMIT_GATE_STEP, 0.0, 1.0)
+    rest_w = rest_w + manip_damping_boost * limit_ramp * gate
+
+    # Elbow targets: keep only the swivel direction (see _project_elbow).
+    if elbow_L is not None or elbow_R is not None:
+        fk_cur = robot.forward_kinematics(q_current)
+        if elbow_L is not None:
+            elbow_L = _project_elbow(
+                elbow_L, shoulder_L, jaxlie.SE3(fk_cur[L_elbow_idx]).translation()
+            )
+        if elbow_R is not None:
+            elbow_R = _project_elbow(
+                elbow_R, shoulder_R, jaxlie.SE3(fk_cur[R_elbow_idx]).translation()
+            )
+
     costs = [
-        pk.costs.rest_cost(JointVar(0), rest_pose=q_current, weight=rest_weight),
+        pk.costs.rest_cost(JointVar(0), rest_pose=q_current, weight=rest_w),
         pk.costs.rest_cost(JointVar(0), rest_pose=posture_pose, weight=posture_weight),
         pk.costs.manipulability_cost(
             robot,
@@ -182,7 +319,7 @@ def _solve_ik(
                 JointVar(0),
                 elbow_L,
                 jnp.array(L_elbow_idx, dtype=jnp.int32),
-                pos_weight=elbow_weight,
+                pos_weight=elbow_weight_L,
                 ori_weight=0.0,
             )
         )
@@ -194,7 +331,7 @@ def _solve_ik(
                 JointVar(0),
                 elbow_R,
                 jnp.array(R_elbow_idx, dtype=jnp.int32),
-                pos_weight=elbow_weight,
+                pos_weight=elbow_weight_R,
                 ori_weight=0.0,
             )
         )
@@ -237,13 +374,27 @@ def _solve_ik(
 # ---------------------------------------------------------------------------
 
 
-def _clamp_reach(pos: np.ndarray, center: np.ndarray, max_reach: float) -> np.ndarray:
-    """Clamp EE target position to within max_reach of center (shoulder position)."""
+def _clamp_reach(
+    pos: np.ndarray, center: np.ndarray, soft_start: float, cap: float
+) -> np.ndarray:
+    """Softly saturate an EE target's distance from ``center`` (the shoulder).
+
+    Identity below ``soft_start``; beyond it the radial distance follows a
+    tanh saturation that approaches (never reaches) ``cap``. The mapping is
+    C1-smooth — unit slope at the knee — so an operator sweeping through the
+    boundary produces no velocity discontinuity in the target, unlike a hard
+    radial projection. Keeping the cap below the straight-elbow distance means
+    the solver is never dragged onto the extension singularity (where the
+    elbow's 0-rad joint limit, the Jacobian rank drop, and the 1/manipulability
+    barrier all coincide).
+    """
     d = pos - center
-    dist = np.linalg.norm(d)
-    if dist > max_reach:
-        return (center + d * (max_reach / dist)).astype(np.float32)
-    return pos
+    dist = float(np.linalg.norm(d))
+    if dist <= soft_start:
+        return pos
+    span = max(cap - soft_start, 1e-6)
+    new_dist = soft_start + span * math.tanh((dist - soft_start) / span)
+    return (center + d * (new_dist / dist)).astype(np.float32)
 
 
 def _rot_3x3_to_wxyz(R: np.ndarray) -> np.ndarray:
@@ -359,7 +510,10 @@ class KinematicsSolver:
         _logger.info("Loading Axol URDF...")
         urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
         self.robot = pk.Robot.from_urdf(urdf)
-        self.robot_coll = _build_robot_collision(urdf, self.robot)
+        self.robot_coll, collision_margins = _build_robot_collision(
+            urdf, self.robot, config.self_collision_margin
+        )
+        self._collision_margins = jnp.asarray(collision_margins)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -384,6 +538,8 @@ class KinematicsSolver:
         self._right_shoulder_pos = np.asarray(
             jaxlie.SE3(fk0[R_sh_idx]).translation(), dtype=np.float32
         )
+        self._left_shoulder_jax = jnp.asarray(self._left_shoulder_pos)
+        self._right_shoulder_jax = jnp.asarray(self._right_shoulder_pos)
 
         # Determine left/right joint indices in ARM_JOINTS order so that
         # q[left_indices] / q[right_indices] align with rest_pose and motion_control.
@@ -391,10 +547,16 @@ class KinematicsSolver:
         name_to_idx = {n: i for i, n in enumerate(actuated)}
         self.left_indices = [name_to_idx[n] for n in _LEFT_JOINT_NAMES]
         self.right_indices = [name_to_idx[n] for n in _RIGHT_JOINT_NAMES]
+        self._left_idx_jax = jnp.asarray(self.left_indices, dtype=jnp.int32)
+        self._right_idx_jax = jnp.asarray(self.right_indices, dtype=jnp.int32)
 
         self._posture_pose = jnp.zeros(
             self.robot.joints.num_actuated_joints, dtype=jnp.float32
         )
+
+        # Seed of the previous ik() call: per-joint velocity estimate for the
+        # limit-approach damping gate. None until the first call (gate off).
+        self._q_prev: np.ndarray | None = None
 
         self._warmup()
 
@@ -453,9 +615,12 @@ class KinematicsSolver:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
         All positions and orientations must be expressed in the robot's world
-        frame (FLU). End-effector targets are clamped to ``config.max_reach``
-        from each shoulder before solving, and joint changes are clamped to
-        ``config.max_joint_delta`` per call.
+        frame (FLU). End-effector targets are soft-clamped between
+        ``config.reach_soft_start`` and ``config.max_reach`` from each shoulder
+        before solving; elbow hints are projected onto the robot's reachable
+        elbow sphere and faded out for overhead targets; joint steps are
+        rate-limited to ``config.max_joint_delta`` per call with a
+        direction-preserving scale.
 
         Args:
             q_current: Full ``(N,)`` joint array in radians used as the solver
@@ -475,19 +640,25 @@ class KinematicsSolver:
         cfg = self.config
 
         target_L: jaxlie.SE3 | None = None
+        lp: np.ndarray | None = None
         if left_pose is not None:
             lp, lr = left_pose
             lp = _clamp_reach(
-                np.asarray(lp, dtype=np.float32), self._left_shoulder_pos, cfg.max_reach
+                np.asarray(lp, dtype=np.float32),
+                self._left_shoulder_pos,
+                cfg.reach_soft_start,
+                cfg.max_reach,
             )
             target_L = _np_to_se3(lp, np.asarray(lr, dtype=np.float32))
 
         target_R: jaxlie.SE3 | None = None
+        rp: np.ndarray | None = None
         if right_pose is not None:
             rp, rr = right_pose
             rp = _clamp_reach(
                 np.asarray(rp, dtype=np.float32),
                 self._right_shoulder_pos,
+                cfg.reach_soft_start,
                 cfg.max_reach,
             )
             target_R = _np_to_se3(rp, np.asarray(rr, dtype=np.float32))
@@ -503,6 +674,16 @@ class KinematicsSolver:
             else None
         )
 
+        # Fade the elbow hint out for overhead work: the headset's body-model
+        # elbow is inferred rather than tracked and degrades sharply once the
+        # hand rises to shoulder height, exactly where the shoulder nears its
+        # joint limits and bad swivel targets do the most damage.
+        elbow_w_l = cfg.elbow_weight * self._elbow_fade(lp, self._left_shoulder_pos)
+        elbow_w_r = cfg.elbow_weight * self._elbow_fade(rp, self._right_shoulder_pos)
+
+        q_prev = self._q_prev if self._q_prev is not None else q_current
+        self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
+
         q_result = _solve_ik(
             self.robot,
             self.robot_coll,
@@ -515,27 +696,54 @@ class KinematicsSolver:
             self._l_elbow_idx_jax,
             self._r_elbow_idx_jax,
             jnp.asarray(q_current, dtype=jnp.float32),
+            jnp.asarray(q_prev, dtype=jnp.float32),
             self._posture_pose,
+            self._left_idx_jax,
+            self._right_idx_jax,
+            self._left_shoulder_jax,
+            self._right_shoulder_jax,
             cfg.pos_weight,
             cfg.ori_weight,
             cfg.rest_weight,
             cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
-            cfg.self_collision_margin,
+            self._collision_margins,
             cfg.self_collision_weight,
-            cfg.elbow_weight,
+            elbow_w_l,
+            elbow_w_r,
+            cfg.manip_damping_threshold,
+            cfg.manip_damping_boost,
+            cfg.limit_damping_margin,
             cfg.max_iterations,
             cfg.cost_tolerance,
             cfg.lambda_initial,
             cfg.lambda_factor,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
-        delta = np.clip(
-            q_result_np - q_current, -cfg.max_joint_delta, cfg.max_joint_delta
-        )
+        # Direction-preserving rate limit: scale the whole step so its largest
+        # component hits max_joint_delta, rather than clipping per joint. Per-
+        # joint clipping distorted the step direction (each joint saturated
+        # differently), pushing the commanded pose off the solver's path and
+        # releasing with a velocity discontinuity.
+        delta = q_result_np - q_current
+        max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
+        if max_abs > cfg.max_joint_delta:
+            delta = delta * (cfg.max_joint_delta / max_abs)
         q_out = (q_current + delta).astype(np.float32)
         return q_out
+
+    def _elbow_fade(
+        self, ee_target: np.ndarray | None, shoulder_pos: np.ndarray
+    ) -> float:
+        """Smoothstep fade factor (1 -> 0) for the elbow hint as the EE target
+        rises from shoulder height through ``config.elbow_fade_band`` above it."""
+        band = self.config.elbow_fade_band
+        if ee_target is None or band <= 0.0:
+            return 1.0
+        t = (float(ee_target[2]) - float(shoulder_pos[2])) / band
+        t = min(max(t, 0.0), 1.0)
+        return 1.0 - t * t * (3.0 - 2.0 * t)
 
     # -- Internal ------------------------------------------------------------
 
