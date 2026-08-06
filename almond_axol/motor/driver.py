@@ -72,6 +72,23 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        The state probe behind the idempotent ``Axol.enable()``: a holding
+        motor must not be reset (it is attached to instead), while a motor
+        reporting False holds nothing and can take the full bring-up.
+
+        Damiao: feedback status is ENABLED. Note this cannot distinguish an
+        actively-holding motor from one that was enabled but never commanded
+        (which holds no torque) — such a motor conservatively reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched;
+        on fleet firmware the running byte reads 1 only while the motor is
+        actively executing commands, so this matches "holding" exactly.
+        """
+        ...
+
+    @abstractmethod
     async def clear_errors(self) -> None:
         """Clear any latched motor error flags."""
         ...

@@ -34,6 +34,7 @@ asyncio.run(main())
 |---|---|
 | `enable()` / `disable()` | Enable motor / engage brake |
 | `attach(mode)` | Reconnect to an already-enabled motor without disturbing its torque state: verifies it is enabled, fault-free, and in `mode`, using reads only (`set_control_mode` would reboot a MyActuator motor, dropping torque for ~2 s) |
+| `is_holding()` | `True` if the motor is enabled and holding torque (read-only). Damiao: feedback status `ENABLED` (an enabled-but-never-commanded motor also reports `True`). MyActuator: status-1 running byte set and no fault latched |
 | `clear_errors()` | Clear latched error flags |
 | `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
 | `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |

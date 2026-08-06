@@ -387,6 +387,10 @@ class DamiaoMotor(MotorDriver):
                 f"for a full bring-up"
             )
 
+    async def is_holding(self) -> bool:
+        feedback = await self._request_feedback()
+        return feedback.status == _DamiaoStatus.ENABLED
+
     async def disable(self) -> None:
         max_attempts = 10
         for _ in range(max_attempts):

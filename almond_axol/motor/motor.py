@@ -166,6 +166,20 @@ class Motor:
         """Disable the motor and engage the brake."""
         await self._driver.disable()
 
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        Damiao: feedback status is ENABLED — note an enabled motor that was
+        never sent a command holds no torque but still reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched
+        (on fleet firmware the byte is 1 only while actively executing
+        commands).
+
+        This is the per-motor probe behind the idempotent
+        :meth:`Axol.enable`'s keep-holding-or-bring-up decision.
+        """
+        return await self._driver.is_holding()
+
     async def clear_errors(self) -> None:
         """Clear any latched motor error flags."""
         await self._driver.clear_errors()
