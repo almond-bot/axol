@@ -1,0 +1,26 @@
+---
+title: "motor.restore-config"
+description: "Write a saved configuration snapshot back to motors."
+---
+
+Writes a JSON snapshot produced by [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config) back to the motors it came from, returning them to a known-good configuration. Works for both motor families — each snapshot record carries the motor type it was taken from. This command is CLI-only (it reads a snapshot file from the robot host), so it isn't offered on the diagnostics dashboard.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
+| `snapshot` | JSON file from `motor.dump-config` (positional, required) |
+| `--id ID` | Restore only this motor CAN ID, hex or decimal. Omit to restore every motor in the snapshot |
+| `--include-protected` | Also write protected parameters — factory calibration, CAN IDs, baud rate (dangerous) |
+| `--yes` | Skip the confirmation prompt |
+
+Parameters already holding the saved value are skipped, so restoring onto a matching motor writes nothing. Read-only parameters are always skipped, and protected ones unless `--include-protected` is passed, since rewriting those can leave a motor unable to commutate or unreachable on the bus. A snapshot taken with `--raw` cannot be restored — its bare indices have no known meaning.
+
+```bash
+axol motor.restore-config --l arm-left.json            # every motor in the snapshot
+axol motor.restore-config --l --id 0x01 arm-left.json  # just one motor
+```
+
+<Note>
+  Pair this with `motor.dump-config`: dump a good motor to a snapshot, then restore that snapshot onto one that has drifted. The restore reports exactly which parameters it changed.
+</Note>

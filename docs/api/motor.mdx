@@ -57,6 +57,24 @@ asyncio.run(main())
 | `motor.has_position` | `True` once a position has been cached (i.e. telemetry has warmed up) |
 | `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
 
+## Configuration parameters
+
+Both motor families expose a named configuration table — MyActuator's `0xC0` parameters and Damiao's `0x7FF` registers — for servicing a motor over CAN without the vendor setup software. These back the [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config), [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config), and [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) commands; the CLI is the usual way in, but the same surface is on `Motor`.
+
+| Method | Description |
+|---|---|
+| `resolve_config_param(name)` | Look up a `MotorParam` by name for this motor's family |
+| `read_config(param)` | Read one parameter, in the unit its spec names |
+| `write_config(param, value)` | Write one parameter and persist it to flash/ROM |
+| `dump_config(raw_range=None)` | Read every known parameter; pass a `range` to sweep raw MyActuator indices |
+| `restore_config(values, *, include_protected=False)` | Write a saved config back; returns the parameters actually changed (protected ones skipped unless `include_protected`) |
+| `get_low_voltage_threshold()` / `set_low_voltage_threshold(volts)` | Undervoltage protection threshold (V); MyActuator only |
+| `get_can_timeout()` / `set_can_timeout(milliseconds)` | Loss-of-comms alarm time (ms); Damiao only |
+
+<Note>
+  MyActuator motors apply a low undervoltage threshold on `enable()` so a brief bus-voltage sag can't latch the level-2 undervoltage fault. Read-only parameters are never written, and protected ones (factory calibration, CAN IDs, baud rate) are skipped by a restore unless you opt in, since rewriting them can leave a motor unable to commutate or unreachable on the bus.
+</Note>
+
 ## `ControlMode` values
 
 | Value | Description |

@@ -1,0 +1,28 @@
+---
+title: "motor.dump-config"
+description: "Read every configuration parameter from one or all motors and save a snapshot."
+---
+
+Reads every configuration parameter from one motor (or all motors on the bus when `--id` is omitted) and prints them, optionally saving a JSON snapshot. Works for both motor families — MyActuator's `0xC0` parameters and Damiao's `0x7FF` registers — with the type inferred from the CAN ID. This is the first thing to capture when a motor is misbehaving: the saved snapshot is exactly what [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config) consumes to return the motor to a known-good state.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
+| `--id ID` | Motor CAN ID, hex or decimal. Omit to dump every motor on the bus (IDs 1–8) |
+| `--type {myactuator,damiao}` | Motor type (inferred from the ID if omitted) |
+| `--out FILE` | Write a JSON snapshot for `motor.restore-config` |
+| `--raw` | Sweep raw parameter indices instead of the known table, to surface indices not yet named (MyActuator only — Damiao's register table is complete) |
+
+Each parameter is printed with its value, unit, and an access tag: `(read-only)` for values the motor reports but won't accept (firmware versions, measured winding constants) and `(protected)` for factory calibration, CAN IDs, and baud rate. A `--raw` snapshot cannot be restored — its keys are bare indices with no known meaning — so it's for identification only.
+
+```bash
+axol motor.dump-config --l --id 0x01              # one motor
+axol motor.dump-config --l                        # every motor on the left bus
+axol motor.dump-config --l --out arm-left.json    # save a snapshot to restore later
+axol motor.dump-config --l --id 0x01 --raw        # sweep unnamed indices (MyActuator)
+```
+
+<Note>
+  Attach the printed output (or the saved snapshot) to a support thread — it's a complete picture of how a motor is configured, and restoring it later writes back only the parameters that actually differ.
+</Note>
