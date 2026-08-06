@@ -309,6 +309,13 @@ class AxolVRTeleop(Teleoperator):
 
         if self._parent_conn is not None:
             try:
+                # Drain in-flight worker responses before closing: the dispatch
+                # thread can stop mid solve, and closing a connection with
+                # unread data RSTs the peer — the worker's blocking recv then
+                # dies with ConnectionResetError instead of reading the None
+                # shutdown sentinel.
+                while self._parent_conn.poll(0):
+                    self._parent_conn.recv()
                 self._parent_conn.send(None)
             except Exception:
                 pass

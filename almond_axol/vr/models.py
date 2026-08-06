@@ -81,6 +81,15 @@ class VRFrame(BaseModel):
             and network transports; the server processes each logical frame
             exactly once, via whichever transport delivers it first. ``None``
             for senders that don't set it (then no cross-transport de-duplication).
+        l_tracked: True while the left controller's position is optically
+            tracked. ``False`` means the headset lost sight of the controller
+            (occlusion, edge of camera FOV, very fast motion) and the reported
+            position is inertially dead-reckoned (WebXR ``emulatedPosition``) —
+            it drifts while coasting and snaps when tracking re-acquires, so
+            the server's pose smoother excludes these frames and holds the last
+            clean pose instead. Defaults to True so older web builds (which
+            omit the field) keep the previous always-trusted behaviour.
+        r_tracked: Same as ``l_tracked`` for the right controller.
         l_stick_x: Left thumbstick x, [-1, 1], right = +1. With ``l_stick_y``
             it drives the powered cart's translation when one is configured
             (see :class:`almond_axol.robot.cart.Cart`). Neutral defaults keep
@@ -105,6 +114,8 @@ class VRFrame(BaseModel):
     state: VRState = VRState.TELEOP
     t: float | None = None
     seq: int | None = None
+    l_tracked: bool = True
+    r_tracked: bool = True
     l_stick_x: float = 0.0
     l_stick_y: float = 0.0
     r_stick_x: float = 0.0

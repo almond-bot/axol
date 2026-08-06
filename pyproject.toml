@@ -15,10 +15,14 @@ dependencies = [
     "fastapi>=0.135.2",
     "jax>=0.9.2",
     "jaxlie>=1.5.0",
+    "mink>=0.0.5,<1.2", # MuJoCo QP IK: the mink-qp teleop backend (1.2 forces mujoco>=3.11)
     "mujoco>=3.8.0",
+    "pin>=2.7", # Pinocchio: kinematics for the pink-qp teleop IK backend
+    "pin-pink>=3.0",
     "pydantic>=2.12.5",
     "pyroki",
     "python-can>=4.6.1",
+    "qpsolvers[daqp]>=4.0",
     "scipy>=1.17.1",
     "uvicorn[standard]>=0.42.0",
     "yourdfpy>=0.0.60",

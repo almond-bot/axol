@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,12 @@ if TYPE_CHECKING:
     from ..video.video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
+
+# Pose-frame arrival gap (s) above which the transport is considered stalled
+# (the headset streams at ~120 Hz, so 50 ms means ~6 consecutive frames are
+# stuck in flight) and minimum spacing (s) between stall warnings.
+_STALL_GAP_S = 0.05
+_STALL_LOG_EVERY_S = 5.0
 
 
 class VRServer:
@@ -118,6 +125,8 @@ class VRServer:
             enabled=config.interp_enabled,
             min_delay_s=config.interp_min_delay_s,
             max_delay_s=config.interp_max_delay_s,
+            smooth_window_s=config.interp_smooth_window_s,
+            outlier_k=config.interp_outlier_k,
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
@@ -125,6 +134,18 @@ class VRServer:
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
         self._webrtc: WebRTCManager | Any | None = None
+
+        # Optional JSONL capture of every validated inbound frame, so real
+        # headset sessions can be replayed through the offline IK benchmark
+        # (``--vr_server.capture_path session.jsonl``). Opened lazily on the
+        # first frame; append mode so restarts extend the same session file.
+        self._capture_path = config.capture_path
+        self._capture_file: Any | None = None
+        # Transport stall detection state (see _note_arrival).
+        self._last_arrival_t: float | None = None
+        self._last_stall_log_t: float = 0.0
+        self._stall_count: int = 0
+        self._worst_stall_s: float = 0.0
         # Dedicated pose data channel (low-latency control transport). Always
         # available — independent of whether any cameras are streaming.
         self._control = ControlChannelManager(self._ingest_pose_text)
@@ -326,8 +347,17 @@ class VRServer:
         self._client_count = 0
         self._active_clients.clear()
         # Fresh session next enable(): don't gate a reloaded headset's restarted
-        # seq counter against a stale high-water mark.
+        # seq counter against a stale high-water mark, and don't count the
+        # inter-session silence as a transport stall.
         self._last_seq = None
+        self._last_arrival_t = None
+
+        if self._capture_file is not None:
+            try:
+                self._capture_file.close()
+            except OSError:
+                pass
+            self._capture_file = None
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -388,9 +418,60 @@ class VRServer:
             self._last_seq = seq
 
         self._latest_frame = frame
+        self._note_arrival()
         self._interp.push(frame)
+        self._capture(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
+
+    def _note_arrival(self) -> None:
+        """Track pose-frame arrival gaps and surface transport stalls.
+
+        The headset produces frames at a steady ~120 Hz; long silences are a
+        transport problem (WiFi scan pauses, relayed-path bufferbloat) that no
+        amount of downstream filtering can hide — the arm holds, then lurches
+        through the motion captured during the gap. Field sessions showed
+        ~150 ms silences every ~10 s wrecking otherwise-fine IK, so make the
+        stalls visible: WARN with a running count, rate-limited to one log per
+        ``_STALL_LOG_EVERY_S``.
+        """
+        now = time.perf_counter()
+        prev = self._last_arrival_t
+        self._last_arrival_t = now
+        if prev is None:
+            return
+        gap = now - prev
+        if gap < _STALL_GAP_S:
+            return
+        self._stall_count += 1
+        self._worst_stall_s = max(self._worst_stall_s, gap)
+        if now - self._last_stall_log_t >= _STALL_LOG_EVERY_S:
+            self._last_stall_log_t = now
+            _logger.warning(
+                "VR pose stream stalled %.0f ms (%d stalls > %.0f ms this "
+                "session, worst %.0f ms) — teleop will hold then catch up; "
+                "check the headset WiFi link or use the USB tether.",
+                gap * 1e3,
+                self._stall_count,
+                _STALL_GAP_S * 1e3,
+                self._worst_stall_s * 1e3,
+            )
+
+    def _capture(self, frame: VRFrame) -> None:
+        """Append ``frame`` to the JSONL capture file when capture is enabled."""
+        if self._capture_path is None:
+            return
+        try:
+            if self._capture_file is None:
+                self._capture_file = open(  # noqa: SIM115 - held for the session
+                    self._capture_path, "a", encoding="utf-8"
+                )
+            record = frame.model_dump(mode="json")
+            record["recv_t"] = time.time()
+            self._capture_file.write(json.dumps(record) + "\n")
+        except Exception as exc:  # noqa: BLE001 - capture is best-effort
+            _logger.warning("VRFrame capture disabled: %s", exc)
+            self._capture_path = None
 
     def _ingest_pose_text(self, data: str) -> None:
         """Ingest a pose frame from the control data channel (text message).
@@ -560,6 +641,7 @@ class VRServer:
                 if server._client_count == 0:
                     server._latest_frame = None
                     server._last_seq = None
+                    server._last_arrival_t = None
                     server._interp.reset()
 
         return app

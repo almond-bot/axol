@@ -328,6 +328,7 @@ class VRTeleopCore:
         ik_interval = 1.0 / self.config.frequency
         last_frame = None
         recv_timeout_count = 0
+        last_dead_warn = 0.0
 
         while not stop_event.is_set():
             t0 = time.perf_counter()
@@ -368,16 +369,35 @@ class VRTeleopCore:
                 time.sleep(0.001)
                 continue
 
-            frame = get_frame()
+            # Guard the sampling + engage steps: an exception here previously
+            # killed this thread silently, freezing teleop at the last target
+            # with nothing in the logs.
+            try:
+                frame = get_frame()
+            except Exception:
+                self._logger.exception("VR frame sampling failed; keeping last target")
+                self._pace(t0, ik_interval)
+                continue
             if frame is None or frame is last_frame:
                 time.sleep(0.001)
                 continue
             last_frame = frame
 
-            self.update_engage(frame)
+            try:
+                self.update_engage(frame)
+            except Exception:
+                self._logger.exception("Engage update failed; keeping last target")
+                self._pace(t0, ik_interval)
+                continue
 
             if not process_alive():
-                self._logger.warning("IK process is not alive")
+                # Rate-limited: this used to log per iteration (~120 Hz).
+                if t0 - last_dead_warn >= 5.0:
+                    last_dead_warn = t0
+                    self._logger.error(
+                        "IK process is not alive — teleop is holding its last "
+                        "target; restart teleop to recover"
+                    )
                 self._pace(t0, ik_interval)
                 continue
 
