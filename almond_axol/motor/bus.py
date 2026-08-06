@@ -39,7 +39,15 @@ class CanBus:
         self._reader_task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        """Start the background frame-dispatch loop."""
+        """Start the background frame-dispatch loop. Idempotent.
+
+        A second call while the loop is already running is a no-op, so flows
+        that compose bus-starting steps (``Axol.connect`` querying state and
+        then delegating to ``attach``/``enable``) don't spawn duplicate
+        reader tasks.
+        """
+        if self._reader_task is not None and not self._reader_task.done():
+            return
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name=f"can_reader:{self._bus.channel_info}",

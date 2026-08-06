@@ -132,9 +132,53 @@ class Motor:
         """Enable the motor and release the brake."""
         await self._driver.enable()
 
+    async def attach(self, mode: ControlMode) -> None:
+        """Attach to an already-enabled motor without disturbing its torque state.
+
+        The reconnect counterpart to :meth:`enable` + :meth:`set_control_mode`,
+        for when a previous process left the motor enabled and holding (e.g.
+        it died mid-session). Re-reads the state needed for correct command
+        scaling and verifies the motor is enabled, fault-free, and — where the
+        hardware exposes a mode register (Damiao) — already in ``mode``. No
+        reset, brake, enable, or motion command is sent, so a motor holding
+        position keeps holding it throughout. In contrast,
+        :meth:`set_control_mode` reboots MyActuator motors, dropping torque
+        for ~2 s.
+
+        Args:
+            mode: Control mode the motor is expected to already be in.
+
+        Raises:
+            MotorError: If the motor is unreachable, disabled, faulted, or in
+                a different hardware control mode. Recover with a full
+                :meth:`enable` bring-up.
+        """
+        await self._driver.attach()
+        hw_mode = await self._driver.get_control_mode()
+        if hw_mode is not None and hw_mode != mode:
+            raise MotorError(
+                f"{self.joint} is in {hw_mode.name} mode, expected {mode.name} "
+                f"— attach is not possible; use enable() for a full bring-up"
+            )
+        self.mode = mode
+
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
         await self._driver.disable()
+
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        Damiao: feedback status is ENABLED — note an enabled motor that was
+        never sent a command holds no torque but still reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched
+        (on fleet firmware the byte is 1 only while actively executing
+        commands).
+
+        This is the per-motor probe behind the idempotent
+        :meth:`Axol.enable`'s keep-holding-or-bring-up decision.
+        """
+        return await self._driver.is_holding()
 
     async def clear_errors(self) -> None:
         """Clear any latched motor error flags."""
@@ -154,6 +198,11 @@ class Motor:
         Damiao: writes register 10 to match the requested mode.
         MyActuator: resets the motor (no persistent mode register; mode is
         determined per-command).
+
+        WARNING: the MyActuator reset drops torque for ~2 s — never switch
+        modes while the motor is holding a load (the joint falls). Bring the
+        arm to rest first, or use ``enable(hold=False)`` in flows that manage
+        modes themselves.
 
         Args:
             mode: Desired control mode.

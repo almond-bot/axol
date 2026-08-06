@@ -352,12 +352,8 @@ class DamiaoMotor(MotorDriver):
             data = struct.pack("<fHH", target_position, v_scaled, i_scaled)
             await self._raw_send(data, arb_id=0x300 + self._motor_id)
 
-    # ------------------------------------------------------------------ #
-    # Public API (implements MotorDriver)                                  #
-    # ------------------------------------------------------------------ #
-
-    async def enable(self) -> None:
-        await self.clear_errors()
+    async def _read_limits(self) -> None:
+        """Read the position/velocity/torque ranges used to scale MIT frames."""
         pmax, vmax, tmax = await asyncio.gather(
             self._read_register(_DM_REG_PMAX),
             self._read_register(_DM_REG_VMAX),
@@ -366,7 +362,34 @@ class DamiaoMotor(MotorDriver):
         self._p_max = float(pmax)
         self._v_max = float(vmax)
         self._t_max = float(tmax)
+
+    # ------------------------------------------------------------------ #
+    # Public API (implements MotorDriver)                                  #
+    # ------------------------------------------------------------------ #
+
+    async def enable(self) -> None:
+        await self.clear_errors()
+        await self._read_limits()
         await self._raw_send(bytes([0xFF] * 7 + [0xFC]))
+
+    async def attach(self) -> None:
+        # Reads only: limit registers for command/feedback scaling, then one
+        # feedback frame to confirm the motor is still enabled and holding.
+        # No clear-errors and no 0xFC enable — a fault or a disabled state
+        # means torque was already lost, and re-enabling here would mask that.
+        await self._read_limits()
+        feedback = await self._request_feedback()
+        if feedback.status != _DamiaoStatus.ENABLED:
+            status = _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
+            raise MotorError(
+                f"Damiao motor {self._motor_id:#04x} is {status.value}, not "
+                f"enabled and holding — attach is not possible; use enable() "
+                f"for a full bring-up"
+            )
+
+    async def is_holding(self) -> bool:
+        feedback = await self._request_feedback()
+        return feedback.status == _DamiaoStatus.ENABLED
 
     async def disable(self) -> None:
         max_attempts = 10

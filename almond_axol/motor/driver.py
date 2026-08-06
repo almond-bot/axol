@@ -49,8 +49,43 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
+    async def attach(self) -> None:
+        """Prepare to command an already-enabled motor without disturbing it.
+
+        The reconnect counterpart to :meth:`enable`, for when a previous
+        process left the motor enabled and holding (e.g. it died mid-session).
+        Re-reads whatever state the driver needs for correct command scaling
+        (limit registers, firmware capabilities) and verifies the motor is
+        enabled and fault-free — but sends no reset, brake, enable, or motion
+        command, so a motor that is holding position keeps holding it
+        throughout.
+
+        Raises MotorError if the motor is unreachable, disabled, or faulted:
+        attaching is only valid while the motor is still up, and anything else
+        needs a full :meth:`enable` bring-up.
+        """
+        ...
+
+    @abstractmethod
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
+        ...
+
+    @abstractmethod
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        The state probe behind the idempotent ``Axol.enable()``: a holding
+        motor must not be reset (it is attached to instead), while a motor
+        reporting False holds nothing and can take the full bring-up.
+
+        Damiao: feedback status is ENABLED. Note this cannot distinguish an
+        actively-holding motor from one that was enabled but never commanded
+        (which holds no torque) — such a motor conservatively reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched;
+        on fleet firmware the running byte reads 1 only while the motor is
+        actively executing commands, so this matches "holding" exactly.
+        """
         ...
 
     @abstractmethod
