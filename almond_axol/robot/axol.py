@@ -7,8 +7,11 @@ Provides :class:`AxolArm` (single-arm CAN bus controller) and :class:`Axol`
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
+import time
+from pathlib import Path
 
 import numpy as np
 
@@ -57,6 +60,59 @@ _GRIPPER_CALIB_MAX_STEPS = math.ceil(GRIPPER_TRAVEL / _GRIPPER_CALIB_STEP)
 # Impedance gains used only during gripper open-stop calibration.
 _GRIPPER_CALIB_KP = 50.0
 _GRIPPER_CALIB_KD = 1.0
+
+# The gripper open position varies per unit and is measured at runtime by
+# ``_calibrate_gripper()``. It is persisted here so ``attach()`` can restore
+# it without re-running the sweep (which physically forces the jaw open —
+# dropping anything held — and is the reason attach must not recalibrate).
+_GRIPPER_CALIB_PATH = Path.home() / ".almond" / "gripper_calibration.json"
+
+# Tolerance (rad) around the calibrated travel range when validating a
+# persisted calibration against the gripper's current position on attach().
+# A shaft position outside the range means the calibration no longer matches
+# the encoder (motor re-zeroed or power-cycled) and must not be trusted.
+_GRIPPER_CALIB_MARGIN = 0.35
+
+
+def _save_gripper_calibration(is_left: bool, open_pos: float) -> None:
+    """Persist one gripper's calibrated open position (raw motor rad).
+
+    A write failure only costs the ability to ``attach()`` later, so it is
+    logged rather than failing the enable that produced the calibration.
+    """
+    side = "left" if is_left else "right"
+    try:
+        data: dict = {}
+        if _GRIPPER_CALIB_PATH.exists():
+            data = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        data[side] = {"open_pos": open_pos, "saved_at": time.time()}
+        _GRIPPER_CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _GRIPPER_CALIB_PATH.write_text(json.dumps(data, indent=2))
+    except (OSError, ValueError) as exc:
+        _logger.warning(
+            "Could not persist %s gripper calibration to %s: %s",
+            side,
+            _GRIPPER_CALIB_PATH,
+            exc,
+        )
+
+
+def _load_gripper_calibration(is_left: bool) -> float:
+    """Return the persisted open position (raw motor rad) for one gripper.
+
+    Raises:
+        MotorError: If no calibration has been persisted for this arm.
+    """
+    side = "left" if is_left else "right"
+    try:
+        data = json.loads(_GRIPPER_CALIB_PATH.read_text())
+        return float(data[side]["open_pos"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise MotorError(
+            f"No persisted gripper calibration for the {side} arm in "
+            f"{_GRIPPER_CALIB_PATH} — run enable() once to calibrate before "
+            f"attach() can be used"
+        ) from exc
 
 
 def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
@@ -300,7 +356,9 @@ class AxolArm:
         Steps the gripper motor incrementally toward open until the torque
         magnitude drops to ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop).
         Updates ``_limits_lo[gripper_idx]`` (open) and ``_limits_hi[gripper_idx]``
-        (close) which are used for normalization and clipping.
+        (close) which are used for normalization and clipping, and persists the
+        open position so a later :meth:`attach` can restore it without moving
+        the gripper.
 
         Must be called with the gripper motor already enabled and in IMPEDANCE mode.
         """
@@ -317,14 +375,12 @@ class AxolArm:
             await asyncio.sleep(_GRIPPER_CALIB_SETTLE)
             torque = await motor.get_torque()
             if abs(torque) >= _GRIPPER_TORQUE_THRESHOLD:
-                open_pos = await motor.get_position()
-                self._limits_lo[gripper_i] = open_pos
-                self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
-                return
+                break
 
         open_pos = await motor.get_position()
         self._limits_lo[gripper_i] = open_pos
         self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
+        _save_gripper_calibration(self._is_left, open_pos)
 
     async def enable(self) -> None:
         """Enable all arm motors in IMPEDANCE mode and the gripper in POSITION_FORCE mode.
@@ -341,6 +397,67 @@ class AxolArm:
             await self.motors[Joint.GRIPPER].set_control_mode(
                 ControlMode.POSITION_FORCE
             )
+
+    async def attach(self) -> None:
+        """Reattach to an already-enabled arm without disturbing its torque state.
+
+        The reconnect counterpart to :meth:`enable`, for when a controlling
+        process died (or exited via :meth:`Axol.detach`) while the motors were
+        torqued on and holding. :meth:`enable` would drop the arm — its mode
+        switch reboots the MyActuator motors, and its gripper calibration
+        sweep forces the jaw open. This instead verifies every motor is
+        enabled, fault-free, and in the expected control mode, re-reads the
+        state needed for correct command scaling, and restores the gripper
+        calibration persisted by the last :meth:`enable` — all with reads
+        only, so the arm keeps holding its pose throughout.
+
+        The command history is seeded from the measured pose, so the
+        ``max_step_rad`` safety check applies to the very first
+        :meth:`motion_control` after attaching: resume commanding from the
+        arm's current positions, not from a stale or default target.
+
+        Raises:
+            MotorError: If any motor is unreachable, disabled, faulted, or in
+                an unexpected control mode, or if the persisted gripper
+                calibration is missing or no longer matches the encoder. The
+                arm is not in a cleanly-holding state; recover with a full
+                :meth:`enable` bring-up.
+        """
+        await asyncio.gather(
+            *[
+                m.attach(
+                    ControlMode.POSITION_FORCE
+                    if j == Joint.GRIPPER
+                    else ControlMode.IMPEDANCE
+                )
+                for j, m in self.motors.items()
+            ]
+        )
+
+        if self._has_gripper:
+            open_pos = _load_gripper_calibration(self._is_left)
+            current = await self.motors[Joint.GRIPPER].get_position()
+            if not (
+                open_pos - _GRIPPER_CALIB_MARGIN
+                <= current
+                <= open_pos + GRIPPER_TRAVEL + _GRIPPER_CALIB_MARGIN
+            ):
+                side = "left" if self._is_left else "right"
+                raise MotorError(
+                    f"Persisted {side} gripper calibration does not match the "
+                    f"motor: current position {current:.2f} rad is outside the "
+                    f"calibrated range [{open_pos:.2f}, "
+                    f"{open_pos + GRIPPER_TRAVEL:.2f}] rad (motor re-zeroed or "
+                    f"power-cycled?) — run enable() to recalibrate"
+                )
+            gripper_i = self._gripper_i
+            self._limits_lo[gripper_i] = open_pos
+            self._limits_hi[gripper_i] = open_pos + GRIPPER_TRAVEL
+
+        # Seed the max-step safety check from the held pose so the first
+        # motion_control cannot command a violent jump away from it. Only the
+        # arm-joint elements are compared (the gripper slot is masked out).
+        self._last_q_commanded = (await self.get_positions()).astype(float)
 
     async def disable(self) -> None:
         """Disable all motors and engage brakes."""
@@ -798,6 +915,17 @@ class Axol(RobotBase):
 
             await axol.motion_control(left=np.array([0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0]))
 
+    To reconnect to a robot that is already torqued on and holding (e.g. the
+    previous process died mid-session), use :meth:`attach` / :meth:`detach`
+    instead of ``enable()`` / ``disable()`` — ``enable()`` reboots the motors
+    and recalibrates the grippers, dropping the arms and anything held:
+
+        axol = Axol()
+        await axol.attach()  # arms keep holding throughout
+        pos_l, pos_r = await axol.get_positions()
+        # ... resume motion_control from the measured pose ...
+        await axol.detach()  # exit, leaving the robot holding
+
     Attributes:
         left:  AxolArm for the left arm.
         right: AxolArm for the right arm.
@@ -916,6 +1044,68 @@ class Axol(RobotBase):
         if self.right is not None:
             motor_tasks.append(self.right.enable())
         await asyncio.gather(*motor_tasks)
+
+    async def attach(self) -> None:
+        """Reconnect to an already-enabled robot without interrupting torque.
+
+        The recovery path for "the process died while the robot was torqued
+        on and holding": calling :meth:`enable` there would drop the arms —
+        its mode switch reboots the MyActuator motors (torque off for ~2 s)
+        and its gripper calibration sweep forces the jaws open. This instead
+        starts the CAN buses and re-verifies/restores per-motor state with
+        reads only, so the arms keep holding their pose. See
+        :meth:`AxolArm.attach` for the per-arm details.
+
+        After attaching, resume control from the robot's *measured* positions
+        (:meth:`get_positions`) — the first :meth:`motion_control` is checked
+        against the held pose, so a stale or default target is rejected
+        instead of yanking the arms.
+
+        Use :meth:`detach` (not :meth:`disable`) to end the session with the
+        robot still holding.
+
+        Raises:
+            MotorError: If any motor is unreachable, disabled, faulted, in an
+                unexpected control mode, or missing persisted gripper
+                calibration — i.e. the robot is not in a cleanly-holding
+                state. Recover with a full :meth:`enable` bring-up on a fresh
+                :class:`Axol` instance.
+        """
+        bus_tasks = []
+        if self.left is not None:
+            bus_tasks.append(self._left_bus.start())
+        if self.right is not None:
+            bus_tasks.append(self._right_bus.start())
+        await asyncio.gather(*bus_tasks)
+
+        arm_tasks = []
+        if self.left is not None:
+            arm_tasks.append(self.left.attach())
+        if self.right is not None:
+            arm_tasks.append(self.right.attach())
+        await asyncio.gather(*arm_tasks)
+
+    async def detach(self) -> None:
+        """Close the CAN buses, leaving all motors enabled and holding.
+
+        The counterpart to :meth:`attach` — ends this process's session
+        without torquing off, so the arms keep holding their pose and a later
+        process can :meth:`attach` again. Telemetry is stopped first.
+        """
+        tasks = []
+        if self.left is not None:
+            tasks.append(self.left.stop_telemetry())
+        if self.right is not None:
+            tasks.append(self.right.stop_telemetry())
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            close_tasks = []
+            if self.left is not None:
+                close_tasks.append(self._left_bus.close())
+            if self.right is not None:
+                close_tasks.append(self._right_bus.close())
+            await asyncio.gather(*close_tasks)
 
     async def disable(self) -> None:
         """Disable all motors and close CAN buses."""

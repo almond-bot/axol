@@ -48,11 +48,44 @@ asyncio.run(main())
 |---|---|
 | `enable()` | Start CAN buses, enable all motors, calibrate grippers |
 | `disable()` | Disable all motors and close CAN buses |
+| `attach()` | Reconnect to an already-enabled robot without interrupting torque — see [Reconnecting to a live robot](#reconnecting-to-a-live-robot) |
+| `detach()` | Close CAN buses leaving all motors enabled and holding |
 | `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
 | `wait_for_telemetry(timeout=5.0)` | Block until every motor has reported a position; call after `start_telemetry` before the first cached `positions` read |
 | `stop_telemetry()` | Stop background polling |
 | `clear_errors()` | Clear latched error flags on all motors |
 | `set_control_mode(mode)` | Set `ControlMode` on all motors |
+
+### Reconnecting to a live robot
+
+If a controlling process dies (or detaches) while the robot is torqued on, the motors keep holding their last commanded pose. Do **not** call `enable()` to reconnect: its control-mode switch reboots the MyActuator motors (torque drops for ~2 s and the arms fall), and its gripper calibration sweep forces the jaws open, dropping anything held.
+
+Use `attach()` instead. It starts the CAN buses and restores everything the process needs — firmware capabilities, scaling registers, the persisted gripper calibration from the last `enable()`, and the per-motor control-mode bookkeeping — using reads only, so the arms keep holding throughout. It verifies every motor is enabled, fault-free, and in the expected control mode, and raises `MotorError` if the robot is not in a cleanly-holding state (e.g. it was power-cycled — then a full `enable()` bring-up is required).
+
+```python
+import asyncio
+from almond_axol.robot import Axol
+
+async def main():
+    axol = Axol()
+    await axol.attach()                    # arms keep holding throughout
+    await axol.start_telemetry(500)
+    await axol.wait_for_telemetry()
+
+    # Resume from the *measured* pose — the arms are wherever the previous
+    # session left them, and attach() arms the max_step_rad safety check
+    # against that pose, so a stale or default target is rejected instead
+    # of yanking the arms.
+    left = axol.left.positions
+    await axol.motion_control(left=left)
+    # ... ramp toward your desired target from here ...
+
+    await axol.detach()                    # exit, leaving the robot holding
+
+asyncio.run(main())
+```
+
+`detach()` is the complement: it closes the buses without disabling the motors, so the robot keeps holding and a later process can `attach()` again. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
 
 ### State reads
 

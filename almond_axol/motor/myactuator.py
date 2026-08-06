@@ -367,6 +367,29 @@ class MyActuatorMotor(MotorDriver):
         await self._apply_low_voltage_threshold()
         await self._request(self._cmd(_MA_RELEASE_BRAKE))
 
+    async def attach(self) -> None:
+        # Reads only. The capability detection must succeed here (unlike
+        # enable(), which tolerates a silent motor still booting): a motor
+        # that doesn't answer can't be verified as holding. Crucially there
+        # is no 0x76 reset (that reboots the motor, killing torque for ~2 s)
+        # and no 0x77 brake release (that would drop an arm parked on its
+        # brake) — the whole point of attach is to leave torque untouched.
+        await self._detect_capabilities()
+        resp = await self._get_status1()
+        error_bits = struct.unpack_from("<H", resp, 6)[0]
+        if error_bits:
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x} has a latched fault "
+                f"({_ma_error_to_status(error_bits).value}) — attach is not "
+                f"possible; use enable() for a full bring-up"
+            )
+        if resp[3] != 0x01:  # status-1 byte 3: brake state, 1 = released
+            raise MotorError(
+                f"MyActuator motor {self._motor_id:#04x} brake is engaged "
+                f"(motor not enabled and holding) — attach is not possible; "
+                f"use enable() for a full bring-up"
+            )
+
     async def get_firmware_version(self) -> int | None:
         return await self._read_firmware_version()
 

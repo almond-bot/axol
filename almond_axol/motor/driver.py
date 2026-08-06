@@ -49,6 +49,24 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
+    async def attach(self) -> None:
+        """Prepare to command an already-enabled motor without disturbing it.
+
+        The reconnect counterpart to :meth:`enable`, for when a previous
+        process left the motor enabled and holding (e.g. it died mid-session).
+        Re-reads whatever state the driver needs for correct command scaling
+        (limit registers, firmware capabilities) and verifies the motor is
+        enabled and fault-free — but sends no reset, brake, enable, or motion
+        command, so a motor that is holding position keeps holding it
+        throughout.
+
+        Raises MotorError if the motor is unreachable, disabled, or faulted:
+        attaching is only valid while the motor is still up, and anything else
+        needs a full :meth:`enable` bring-up.
+        """
+        ...
+
+    @abstractmethod
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
         ...

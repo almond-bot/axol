@@ -132,6 +132,36 @@ class Motor:
         """Enable the motor and release the brake."""
         await self._driver.enable()
 
+    async def attach(self, mode: ControlMode) -> None:
+        """Attach to an already-enabled motor without disturbing its torque state.
+
+        The reconnect counterpart to :meth:`enable` + :meth:`set_control_mode`,
+        for when a previous process left the motor enabled and holding (e.g.
+        it died mid-session). Re-reads the state needed for correct command
+        scaling and verifies the motor is enabled, fault-free, and — where the
+        hardware exposes a mode register (Damiao) — already in ``mode``. No
+        reset, brake, enable, or motion command is sent, so a motor holding
+        position keeps holding it throughout. In contrast,
+        :meth:`set_control_mode` reboots MyActuator motors, dropping torque
+        for ~2 s.
+
+        Args:
+            mode: Control mode the motor is expected to already be in.
+
+        Raises:
+            MotorError: If the motor is unreachable, disabled, faulted, or in
+                a different hardware control mode. Recover with a full
+                :meth:`enable` bring-up.
+        """
+        await self._driver.attach()
+        hw_mode = await self._driver.get_control_mode()
+        if hw_mode is not None and hw_mode != mode:
+            raise MotorError(
+                f"{self.joint} is in {hw_mode.name} mode, expected {mode.name} "
+                f"— attach is not possible; use enable() for a full bring-up"
+            )
+        self.mode = mode
+
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
         await self._driver.disable()
