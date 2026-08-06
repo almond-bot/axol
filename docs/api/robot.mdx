@@ -47,15 +47,14 @@ asyncio.run(main())
 | Method | Description |
 |---|---|
 | `connect()` | Open the CAN buses only — nothing is actuated; all read APIs (`get_holding()`, `get_positions()`, ...) become usable for inspecting a robot of unknown state |
-| `enable()` | Bring every motor up. Idempotent per motor: joints already holding keep holding (reads only, gripper keeps its grasp); cold joints get the full bring-up incl. gripper calibration — see [Reconnecting to a live robot](#reconnecting-to-a-live-robot) |
+| `enable(hold=True)` | Bring every motor up. Idempotent per motor: joints already holding keep holding (reads only, gripper keeps its grasp); cold joints get the full bring-up incl. gripper calibration. With `hold=True` (default) the robot finishes actively holding its measured pose — see [Reconnecting to a live robot](#reconnecting-to-a-live-robot) |
 | `disable()` | Disable all motors and close CAN buses |
-| `attach()` | Strict reconnect: reads only, fails unless the whole robot is already holding |
 | `disconnect()` | Close CAN buses leaving motor torque exactly as it is |
 | `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
 | `wait_for_telemetry(timeout=5.0)` | Block until every motor has reported a position; call after `start_telemetry` before the first cached `positions` read |
 | `stop_telemetry()` | Stop background polling |
 | `clear_errors()` | Clear latched error flags on all motors |
-| `set_control_mode(mode)` | Set `ControlMode` on all motors |
+| `set_control_mode(mode)` | Set `ControlMode` on all motors. **MyActuator motors reboot to switch modes (torque off ~2 s)** — never call it while the arms hold a load; use `enable(hold=False)` in flows that manage modes themselves (Damiao takes a live mode flip in stride — it is a plain register write) |
 
 ### Reconnecting to a live robot
 
@@ -63,7 +62,8 @@ If a controlling process dies (or disconnects) while the robot is torqued on, th
 
 - joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its open-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that forces the jaws open;
 - **cold** joints get the classic full bring-up;
-- a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone.
+- a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
+- with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
 
 ```python
 import asyncio
@@ -93,11 +93,10 @@ asyncio.run(main())
 
 Notes:
 
-- `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting.
+- `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting. A process that must never actuate can `connect()`, check `get_holding()`, and only proceed when every joint is already holding.
+- Custom control modes: pass `enable(hold=False)` to leave freshly brought-up joints enabled but limp, then pick your mode with `set_control_mode()` (position/velocity/force). The reconnect machinery targets the impedance workflow — a session that died in another control mode is asked to `disable()` and re-enable rather than being reattached.
 - To force a fresh bring-up of a live robot (re-run gripper calibration, reset motors), call `disable()` first, then `enable()`.
 - One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
-- A motor only counts as holding once it has received a motion command; a session that died after enabling but before commanding holds no torque, so those joints just go through the full bring-up again.
-- `attach()` is the strict variant for processes that must never actuate: reads only, and it fails unless the whole robot is already holding.
 - `disconnect()` closes the buses without touching torque, so the robot keeps holding and a later process can reconnect. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
 
 ### State reads

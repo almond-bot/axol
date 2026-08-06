@@ -199,6 +199,11 @@ class Motor:
         MyActuator: resets the motor (no persistent mode register; mode is
         determined per-command).
 
+        WARNING: the MyActuator reset drops torque for ~2 s — never switch
+        modes while the motor is holding a load (the joint falls). Bring the
+        arm to rest first, or use ``enable(hold=False)`` in flows that manage
+        modes themselves.
+
         Args:
             mode: Desired control mode.
         """

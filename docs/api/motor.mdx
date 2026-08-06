@@ -37,7 +37,7 @@ asyncio.run(main())
 | `is_holding()` | `True` if the motor is enabled and holding torque (read-only). Damiao: feedback status `ENABLED` (an enabled-but-never-commanded motor also reports `True`). MyActuator: status-1 running byte set and no fault latched |
 | `clear_errors()` | Clear latched error flags |
 | `set_zero_position()` | Save current position as encoder zero (persisted to flash). Calibrated at a mechanical end stop, not the rest position |
-| `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands |
+| `set_control_mode(mode)` | Set `ControlMode`; required before mode-specific commands. **MyActuator motors reboot to switch (torque off ~2 s)** — never call it on a motor holding a load. Damiao is a plain register write; a live flip is non-disruptive |
 | `get_control_mode()` | Read active mode from hardware (`None` for MyActuator) |
 | `get_model()` | Motor model string, e.g. `"X8S2V"` (`None` for Damiao) |
 | `get_firmware_version()` | Firmware VersionDate `int`, e.g. `2026042402` (`None` for Damiao) |
