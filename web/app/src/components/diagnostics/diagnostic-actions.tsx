@@ -30,6 +30,8 @@ export function DiagnosticActions({
   activeSince,
   busy,
   disabled,
+  hiddenKeys,
+  pickerJoints,
   onLaunch,
   onStop,
 }: {
@@ -40,6 +42,13 @@ export function DiagnosticActions({
   activeSince: number | null
   busy: boolean
   disabled: boolean
+  /**
+   * Field keys the page decides for every dialog (e.g. the CAN channel
+   * arguments, injected from the configured adapter mapping at launch).
+   */
+  hiddenKeys?: string[]
+  /** The `--joints` picker's choices (gripperless SKUs drop GRIPPER). */
+  pickerJoints?: readonly JointName[]
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
 }) {
@@ -80,6 +89,8 @@ export function DiagnosticActions({
       {open && (
         <ActionDialog
           spec={open}
+          hideKeys={hiddenKeys}
+          pickerJoints={pickerJoints}
           running={activeCommand === open.id}
           blocked={activeCommand != null && activeCommand !== open.id}
           busy={busy}
@@ -133,7 +144,7 @@ export function ActiveRunPanel({
   return (
     <Card
       className={cn(
-        "fixed right-4 bottom-4 z-40 w-80 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl",
+        "fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] left-[max(1rem,env(safe-area-inset-left))] z-40 gap-2.5 bg-[#1a1a1a] p-4 shadow-2xl sm:left-auto sm:w-80",
         prompt ? "border-amber-400/50" : "border-emerald-400/30"
       )}
     >
@@ -159,9 +170,7 @@ export function ActiveRunPanel({
           </Button>
         </div>
       ) : (
-        line && (
-          <span className="truncate font-mono text-[0.7rem] text-white/45">{line}</span>
-        )
+        line && <span className="truncate font-mono text-[0.7rem] text-white/45">{line}</span>
       )}
       <Button
         variant="ghost"
@@ -177,32 +186,43 @@ export function ActiveRunPanel({
 }
 
 /**
- * Checkbox picker for a command's `--joints` subset (ROM tests). All checked
- * (the default) omits the flag so the command runs its own "all joints"
- * default; any subset is sent as the comma-separated joint list.
+ * Checkbox picker for a command's `--joints` subset (ROM tests, guided
+ * zeroing). All checked (the default) omits the flag so the command runs its
+ * own "all joints" default; any subset is sent as the comma-separated joint
+ * list. `joints` restricts the choices (e.g. guided zeroing has no gripper —
+ * it self-calibrates and has no zero to set).
  */
 function JointPicker({
   value,
   disabled,
   onChange,
+  joints = JOINTS,
 }: {
   value: FormValue | undefined
   disabled: boolean
   onChange: (value: string | null) => void
+  joints?: readonly JointName[]
 }) {
   const selected = useMemo(() => {
     const text = typeof value === "string" ? value.trim() : ""
-    if (!text) return new Set(JOINTS)
+    if (!text) return new Set(joints)
     const names = new Set(text.split(",").map((s) => s.trim().toUpperCase()))
-    return new Set(JOINTS.filter((j) => names.has(j)))
-  }, [value])
+    return new Set(joints.filter((j) => names.has(j)))
+  }, [value, joints])
 
   function toggle(joint: JointName) {
     const next = new Set(selected)
     if (next.has(joint)) next.delete(joint)
     else next.add(joint)
-    if (next.size === JOINTS.length) onChange(null) // all = command default
-    else onChange(JOINTS.filter((j) => next.has(j)).map((j) => j.toLowerCase()).join(","))
+    if (next.size === joints.length)
+      onChange(null) // all = command default
+    else
+      onChange(
+        joints
+          .filter((j) => next.has(j))
+          .map((j) => j.toLowerCase())
+          .join(",")
+      )
   }
 
   return (
@@ -210,9 +230,9 @@ function JointPicker({
       <div className="flex items-center gap-2">
         <span className="text-sm capitalize">Joints</span>
         <span className="text-xs text-white/35">
-          {selected.size === JOINTS.length ? "all" : `${selected.size} of ${JOINTS.length}`}
+          {selected.size === joints.length ? "all" : `${selected.size} of ${joints.length}`}
         </span>
-        {selected.size < JOINTS.length && (
+        {selected.size < joints.length && (
           <button
             type="button"
             onClick={() => onChange(null)}
@@ -224,7 +244,7 @@ function JointPicker({
         )}
       </div>
       <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
-        {JOINTS.map((joint) => {
+        {joints.map((joint) => {
           const on = selected.has(joint)
           return (
             <label
@@ -280,6 +300,7 @@ export function ActionDialog({
   presetArgs,
   hideKeys,
   modes,
+  pickerJoints,
   running,
   blocked,
   busy,
@@ -294,6 +315,8 @@ export function ActionDialog({
   presetArgs?: Record<string, FormValue>
   hideKeys?: string[]
   modes?: ActionMode[]
+  /** Restrict the `--joints` picker's choices (default: every joint). */
+  pickerJoints?: readonly JointName[]
   running: boolean
   blocked: boolean
   busy: boolean
@@ -347,6 +370,12 @@ export function ActionDialog({
     setMissing(miss)
     if (miss.length > 0) return
     const args = computeArgs(formFields, overrides)
+    // A restricted picker (e.g. no gripper) must send its joint list even
+    // when everything is selected: omitting --joints would fall through to
+    // the command's own default, which includes the excluded joints.
+    if (jointsField && pickerJoints && pickerJoints.length < JOINTS.length && args.joints == null) {
+      args.joints = pickerJoints.map((j) => j.toLowerCase()).join(",")
+    }
     if (hasWebPrompts) args.web_prompts = true
     Object.assign(args, effectivePresets)
     onLaunch(args)
@@ -417,6 +446,7 @@ export function ActionDialog({
             value={overrides.joints}
             disabled={running || busy}
             onChange={(v) => setOverride("joints", v)}
+            joints={pickerJoints}
           />
         )}
 
@@ -433,8 +463,8 @@ export function ActionDialog({
         {hasWebPrompts && (
           <p className="flex items-start gap-2 rounded-md border border-white/10 bg-white/[0.02] p-2.5 text-xs leading-relaxed text-white/45">
             <Hand className="mt-0.5 size-3.5 shrink-0 text-white/35" />
-            Hands-on steps pause the run and show a Continue button — the run waits for
-            you, then proceeds when you click it.
+            Hands-on steps pause the run and show a Continue button — the run waits for you, then
+            proceeds when you click it.
           </p>
         )}
 

@@ -51,11 +51,12 @@ _logger = logging.getLogger(__name__)
 _JOINTS = list(Joint)
 _LEFT_POS_KEYS = [f"left_{j.value}.pos" for j in _JOINTS]
 _RIGHT_POS_KEYS = [f"right_{j.value}.pos" for j in _JOINTS]
-_LEFT_TRQ_KEYS = [f"left_{j.value}.trq" for j in _JOINTS]
-_RIGHT_TRQ_KEYS = [f"right_{j.value}.trq" for j in _JOINTS]
 
 # The gripper position is observed in both joint and Cartesian modes — it is the
 # last entry of each arm's position vector (Joint.GRIPPER is last in the enum).
+# On the gripperless SKU (``axol_config.has_gripper = False``) the gripper keys
+# are dropped from the feature dicts entirely, so datasets and policies carry
+# only the channels the robot actually has (7 per arm instead of 8).
 _LEFT_GRIPPER_KEY = _LEFT_POS_KEYS[-1]
 _RIGHT_GRIPPER_KEY = _RIGHT_POS_KEYS[-1]
 
@@ -83,6 +84,16 @@ class AxolRobot(Robot):
     def __init__(self, config: AxolRobotConfig) -> None:
         super().__init__(config)
         self.config = config
+        # Feature keys for the joints this robot actually has: the gripperless
+        # SKU drops the trailing gripper key from each per-arm list. The arrays
+        # sent to / read from Axol keep their (8,) shape either way — only the
+        # dataset/policy feature dicts shrink.
+        self._has_gripper = config.axol_config.has_gripper
+        joints = _JOINTS if self._has_gripper else _JOINTS[:-1]
+        self._left_pos_keys = [f"left_{j.value}.pos" for j in joints]
+        self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
+        self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
+        self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -236,19 +247,17 @@ class AxolRobot(Robot):
 
         if self.config.observe_cartesian:
             # Each arm's 7 joint angles become a 6-axis EE pose; the gripper
-            # position is kept (it has no Cartesian equivalent).
-            state_keys = (
-                _LEFT_EE_KEYS
-                + [_LEFT_GRIPPER_KEY]
-                + _RIGHT_EE_KEYS
-                + [_RIGHT_GRIPPER_KEY]
-            )
+            # position is kept (it has no Cartesian equivalent) unless this is
+            # the gripperless SKU.
+            gripper_l = [_LEFT_GRIPPER_KEY] if self._has_gripper else []
+            gripper_r = [_RIGHT_GRIPPER_KEY] if self._has_gripper else []
+            state_keys = _LEFT_EE_KEYS + gripper_l + _RIGHT_EE_KEYS + gripper_r
         else:
-            state_keys = _LEFT_POS_KEYS + _RIGHT_POS_KEYS
+            state_keys = self._left_pos_keys + self._right_pos_keys
 
         features: dict[str, type | tuple] = {key: float for key in state_keys}
         if self.config.observe_torques:
-            for key in _LEFT_TRQ_KEYS + _RIGHT_TRQ_KEYS:
+            for key in self._left_trq_keys + self._right_trq_keys:
                 features[key] = float
 
         # Use the live camera dimensions (auto-detected from the camera on
@@ -271,15 +280,13 @@ class AxolRobot(Robot):
         if self._action_features is None:
             if self.config.observe_cartesian:
                 # Mirror the observation: command each arm by a 6-axis EE pose
-                # (resolved to joints via IK in send_action) plus gripper.
-                keys = (
-                    _LEFT_EE_KEYS
-                    + [_LEFT_GRIPPER_KEY]
-                    + _RIGHT_EE_KEYS
-                    + [_RIGHT_GRIPPER_KEY]
-                )
+                # (resolved to joints via IK in send_action) plus gripper (when
+                # this robot has one).
+                gripper_l = [_LEFT_GRIPPER_KEY] if self._has_gripper else []
+                gripper_r = [_RIGHT_GRIPPER_KEY] if self._has_gripper else []
+                keys = _LEFT_EE_KEYS + gripper_l + _RIGHT_EE_KEYS + gripper_r
             else:
-                keys = _LEFT_POS_KEYS + _RIGHT_POS_KEYS
+                keys = self._left_pos_keys + self._right_pos_keys
             self._action_features = {key: float for key in keys}
         return self._action_features
 
@@ -424,10 +431,12 @@ class AxolRobot(Robot):
         out: dict[str, float] = {}
         for key, val in zip(_LEFT_EE_KEYS, left_ee):
             out[key] = float(val)
-        out[_LEFT_GRIPPER_KEY] = float(left_pos[-1])
+        if self._has_gripper:
+            out[_LEFT_GRIPPER_KEY] = float(left_pos[len(_JOINTS) - 1])
         for key, val in zip(_RIGHT_EE_KEYS, right_ee):
             out[key] = float(val)
-        out[_RIGHT_GRIPPER_KEY] = float(right_pos[-1])
+        if self._has_gripper:
+            out[_RIGHT_GRIPPER_KEY] = float(right_pos[len(_JOINTS) - 1])
         return out
 
     def action_to_dataset(self, action: RobotAction) -> RobotAction:
@@ -442,9 +451,20 @@ class AxolRobot(Robot):
         """
         if not self.config.observe_cartesian:
             return action
-        left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
-        right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
+        left = self._pack_arm(action, self._left_pos_keys)
+        right = self._pack_arm(action, self._right_pos_keys)
         return dict(self._joints_to_cartesian(left, right))
+
+    def _pack_arm(self, action: RobotAction, keys: list[str]) -> np.ndarray:
+        """Pack one arm's action values into an (8,) Joint-enum-order vector.
+
+        On the gripperless SKU the action has no gripper key; the gripper slot
+        is padded with 0.0 (Axol ignores it).
+        """
+        values = [action[k] for k in keys]
+        if not self._has_gripper:
+            values.append(0.0)
+        return np.array(values, dtype=np.float32)
 
     def _joint_state(self) -> RobotObservation:
         """Build the non-camera part of an observation from the telemetry cache.
@@ -466,17 +486,17 @@ class AxolRobot(Robot):
         if self.config.observe_cartesian:
             obs.update(self._joints_to_cartesian(left_pos, right_pos))
         else:
-            for i, key in enumerate(_LEFT_POS_KEYS):
+            for i, key in enumerate(self._left_pos_keys):
                 obs[key] = float(left_pos[i])
-            for i, key in enumerate(_RIGHT_POS_KEYS):
+            for i, key in enumerate(self._right_pos_keys):
                 obs[key] = float(right_pos[i])
 
         if self.config.observe_torques:
             left_trq = self._axol.left.torques
             right_trq = self._axol.right.torques
-            for i, key in enumerate(_LEFT_TRQ_KEYS):
+            for i, key in enumerate(self._left_trq_keys):
                 obs[key] = float(left_trq[i])
-            for i, key in enumerate(_RIGHT_TRQ_KEYS):
+            for i, key in enumerate(self._right_trq_keys):
                 obs[key] = float(right_trq[i])
 
         return obs
@@ -607,8 +627,9 @@ class AxolRobot(Robot):
             left[i] = q_out[gi]
         for i, gi in enumerate(solver.right_indices):
             right[i] = q_out[gi]
-        left[-1] = action[_LEFT_GRIPPER_KEY]
-        right[-1] = action[_RIGHT_GRIPPER_KEY]
+        # The gripperless SKU has no gripper keys; Axol ignores the padded slot.
+        left[-1] = action[_LEFT_GRIPPER_KEY] if self._has_gripper else 0.0
+        right[-1] = action[_RIGHT_GRIPPER_KEY] if self._has_gripper else 0.0
         return left, right
 
     @check_if_not_connected
@@ -676,8 +697,8 @@ class AxolRobot(Robot):
         if _LEFT_EE_KEYS[0] in action:
             left, right = self._cartesian_action_to_targets(action)
         else:
-            left = np.array([action[k] for k in _LEFT_POS_KEYS], dtype=np.float32)
-            right = np.array([action[k] for k in _RIGHT_POS_KEYS], dtype=np.float32)
+            left = self._pack_arm(action, self._left_pos_keys)
+            right = self._pack_arm(action, self._right_pos_keys)
 
         await self._axol.motion_control(left=left, right=right)
 

@@ -81,7 +81,8 @@ Episodes are driven entirely from the Quest controllers. The movement controls a
 | 5 | X | **Reset** to rest pose; during the start countdown, cancels it. During a recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
 | 6 | A | **Record**: start a take (3-second countdown). During a recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording |
 | 7 | Y | **Exit** the VR session |
-| — | Right thumbstick (click) | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes; see [Camera views](/guides/vr-interface#camera-views) |
+| — | Right **B** | **Reset the camera screens** — re-anchor to the current gaze and clear moves + resizes; see [Camera views](/guides/vr-interface#camera-views) |
+| — | Thumbsticks | **Drive the [powered cart](/guides/vr-interface#powered-cart)** (robots so equipped) to reposition between takes — operator mobility only, so cart motion is **never recorded** into the dataset |
 
 <Note>
   The camera feeds are relayed to the headset during collection, so you can line up takes from the robot's point of view.
@@ -117,6 +118,10 @@ The HUD shows an **Episode N** readout (top-right) with the 1-based number of th
 | `Saving` | Episode being written to disk; controls blocked |
 
 Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown.
+
+<Note>
+  **Crash-safe resume.** Collection refuses to resume a dataset whose saved episodes don't form a contiguous `0…N-1` range — the tell-tale of a recorder killed mid-save, where buffered episodes were lost while the episode counter had already advanced. Recording past such a gap would silently misalign every later episode with a different episode's video, so it stops with guidance (renumber the survivors to be contiguous, or start a fresh dataset) instead. Keeping the host on a current release matters here too: the service now gives a recording session up to ~200 s to finalize when it's stopped, so a shutdown mid-save doesn't drop the take in the first place — [re-run the installer or press **Update**](/installation#staying-up-to-date) to pick this up on an older station.
+</Note>
 
 <Note>
   **Saved takes are integrity-checked.** If the camera encoder drops frames during a take (a feed-queue overflow under heavy load), the video no longer lines up with its recorded rows — so that episode is **discarded instead of saved**, with an error explaining why (in the CLI output / control panel log console). Re-record it rather than adding a misaligned episode to the dataset.

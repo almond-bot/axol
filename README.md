@@ -118,7 +118,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -130,12 +130,17 @@ Each operation can be driven from the web control panel or the CLI:
 - [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
+- [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config)
+- [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config)
+- [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config)
+- [`motor.flash`](https://docs.almond.bot/cli/motor-flash)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
 - [`provision`](https://docs.almond.bot/cli/provision)
+- [`zed.driver`](https://docs.almond.bot/cli/zed-driver)
 - [`zed.install`](https://docs.almond.bot/cli/zed-install)
 - [`gst.install`](https://docs.almond.bot/cli/gst-install)
 - [`gst.build-zed`](https://docs.almond.bot/cli/gst-build-zed)
@@ -144,6 +149,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
 - [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
+- [`waypoints`](https://docs.almond.bot/cli/waypoints)
 
 ### Python API
 

@@ -60,7 +60,7 @@ Relaying the ZED cameras to the headset grabs and **NVENC**-encodes frames on th
 axol provision
 ```
 
-This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops if the ZED SDK or `apt` isn't present. You can also run them individually.
+This runs the [Quest-over-USB](/guides/quest-over-usb) adb setup, the [`zed.driver`](/cli/zed-driver) ZED Box Duo camera-driver upgrade, the board-IMU group access (`gyro.install`, the [powered cart](/guides/vr-interface#powered-cart)'s heading-hold yaw source), [`zed.install`](/cli/zed-install), [`gst.install`](/cli/gst-install), and [`gst.build-zed`](/cli/gst-build-zed) in order; each self-gates and no-ops off the target hardware (no ZED SDK / `apt` / factory ZED Box Duo driver / board IMU). You can also run them individually.
 
 On a Jetson, pin the NVENC/VIC and CPU clocks for low-latency encode and a steady IK loop (the install script wires this into the systemd unit so it re-runs at every boot):
 
@@ -78,7 +78,7 @@ Before using any motor or robot commands, initialize the CAN hardware once:
 axol can.setup
 ```
 
-`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures, and [`can.enable`](/cli/can-enable) for bringing the interfaces back up after a mid-session replug.
+`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures — including the hotplug service that brings the interfaces back up on its own after a mid-session replug — and [`can.enable`](/cli/can-enable) for re-running the bring-up manually.
 
 ## Build the web UI
 

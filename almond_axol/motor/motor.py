@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
+from typing import Mapping
 
 from ..constants import Joint
 from .bus import CanBus
+from .config import MotorParam
 from .damiao import DamiaoMotor
 from .driver import MotorDriver
 from .errors import MotorError
@@ -22,10 +24,14 @@ from .types import ControlMode, MotorGains, MotorStatus
 
 
 class _MotorType(Enum):
-    """Identifies which vendor protocol a joint's motor speaks."""
+    """Identifies which vendor protocol a joint's motor speaks.
 
-    MYACTUATOR = "myactuator"
-    DAMIAO = "damiao"
+    Values come from the drivers so the CLI, config snapshots, and this
+    mapping cannot drift apart.
+    """
+
+    MYACTUATOR = MyActuatorMotor.MOTOR_TYPE
+    DAMIAO = DamiaoMotor.MOTOR_TYPE
 
 
 @dataclass(frozen=True)
@@ -126,9 +132,53 @@ class Motor:
         """Enable the motor and release the brake."""
         await self._driver.enable()
 
+    async def attach(self, mode: ControlMode) -> None:
+        """Attach to an already-enabled motor without disturbing its torque state.
+
+        The reconnect counterpart to :meth:`enable` + :meth:`set_control_mode`,
+        for when a previous process left the motor enabled and holding (e.g.
+        it died mid-session). Re-reads the state needed for correct command
+        scaling and verifies the motor is enabled, fault-free, and — where the
+        hardware exposes a mode register (Damiao) — already in ``mode``. No
+        reset, brake, enable, or motion command is sent, so a motor holding
+        position keeps holding it throughout. In contrast,
+        :meth:`set_control_mode` reboots MyActuator motors, dropping torque
+        for ~2 s.
+
+        Args:
+            mode: Control mode the motor is expected to already be in.
+
+        Raises:
+            MotorError: If the motor is unreachable, disabled, faulted, or in
+                a different hardware control mode. Recover with a full
+                :meth:`enable` bring-up.
+        """
+        await self._driver.attach()
+        hw_mode = await self._driver.get_control_mode()
+        if hw_mode is not None and hw_mode != mode:
+            raise MotorError(
+                f"{self.joint} is in {hw_mode.name} mode, expected {mode.name} "
+                f"— attach is not possible; use enable() for a full bring-up"
+            )
+        self.mode = mode
+
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
         await self._driver.disable()
+
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        Damiao: feedback status is ENABLED — note an enabled motor that was
+        never sent a command holds no torque but still reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched
+        (on fleet firmware the byte is 1 only while actively executing
+        commands).
+
+        This is the per-motor probe behind the idempotent
+        :meth:`Axol.enable`'s keep-holding-or-bring-up decision.
+        """
+        return await self._driver.is_holding()
 
     async def clear_errors(self) -> None:
         """Clear any latched motor error flags."""
@@ -148,6 +198,11 @@ class Motor:
         Damiao: writes register 10 to match the requested mode.
         MyActuator: resets the motor (no persistent mode register; mode is
         determined per-command).
+
+        WARNING: the MyActuator reset drops torque for ~2 s — never switch
+        modes while the motor is holding a load (the joint falls). Bring the
+        arm to rest first, or use ``enable(hold=False)`` in flows that manage
+        modes themselves.
 
         Args:
             mode: Desired control mode.
@@ -275,6 +330,61 @@ class Motor:
     async def get_voltage(self) -> float:
         """Return bus voltage in Volts."""
         return await self._driver.get_voltage()
+
+    async def get_low_voltage_threshold(self) -> float:
+        """Return the undervoltage protection threshold in Volts.
+
+        MyActuator only; raises MotorError on Damiao.
+        """
+        return await self._driver.get_low_voltage_threshold()
+
+    async def set_low_voltage_threshold(self, volts: float) -> None:
+        """Set the undervoltage protection threshold (V) and persist it to ROM.
+
+        MyActuator only; raises MotorError on Damiao. MyActuator motors already
+        apply the project-wide threshold on ``enable()``.
+        """
+        await self._driver.set_low_voltage_threshold(volts)
+
+    def resolve_config_param(self, name: str) -> MotorParam:
+        """Look a configuration parameter up by name for this motor's family."""
+        return type(self._driver).resolve_param(name)
+
+    async def read_config(self, param: MotorParam) -> float:
+        """Read one configuration parameter, in the unit its spec names."""
+        return await self._driver.read_config(param)
+
+    async def write_config(self, param: MotorParam, value: float) -> None:
+        """Write one configuration parameter and persist it to flash/ROM."""
+        await self._driver.write_config(param, value)
+
+    async def dump_config(
+        self, raw_range: range | None = None
+    ) -> dict[MotorParam | int, float]:
+        """Read every known configuration parameter."""
+        return await self._driver.dump_config(raw_range)
+
+    async def restore_config(
+        self, values: Mapping[MotorParam, float], *, include_protected: bool = False
+    ) -> list[MotorParam]:
+        """Write a saved configuration back and return the parameters changed."""
+        return await self._driver.restore_config(
+            values, include_protected=include_protected
+        )
+
+    async def get_can_timeout(self) -> float:
+        """Return the CAN loss-of-comms alarm time in milliseconds.
+
+        Damiao only; raises MotorError on MyActuator.
+        """
+        return await self._driver.get_can_timeout()
+
+    async def set_can_timeout(self, milliseconds: float) -> None:
+        """Set the CAN loss-of-comms alarm time in ms and persist it.
+
+        Damiao only; raises MotorError on MyActuator.
+        """
+        await self._driver.set_can_timeout(milliseconds)
 
     async def get_error_code(self) -> MotorStatus:
         """Return the current motor status / error code."""

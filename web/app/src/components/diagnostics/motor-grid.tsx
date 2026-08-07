@@ -10,6 +10,7 @@ import {
   jointLabel,
   motorKey,
   type ArmSide,
+  type JointName,
   type MotorDetails,
   type SlowReading,
   type TelemetryFrame,
@@ -69,12 +70,15 @@ export function MotorGrid({
   frames,
   version,
   canInspect,
+  joints = JOINTS,
 }: {
   arm: ArmSide
   slow: Record<string, SlowReading>
   frames: TelemetryFrame[]
   version: number
   canInspect: boolean
+  /** The joints this robot has (gripperless SKUs drop GRIPPER). */
+  joints?: readonly JointName[]
 }) {
   const [inspecting, setInspecting] = useState<string | null>(null)
   void version // tiles re-render with the stream tick so position stays fresh
@@ -83,7 +87,7 @@ export function MotorGrid({
 
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-      {JOINTS.map((joint) => {
+      {joints.map((joint) => {
         const key = motorKey(arm, joint)
         const reading = slow[key]
         const kind = statusKind(reading)
@@ -186,10 +190,7 @@ function MotorDetailsDialog({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
       onClick={onClose}
     >
-      <Card
-        className="w-full max-w-sm gap-3 bg-[#1a1a1a] p-5"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <Card className="w-full max-w-sm gap-3 bg-[#1a1a1a] p-5" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center gap-2">
           <span
             className="inline-block size-2.5 rounded-full"
@@ -228,9 +229,7 @@ function MotorDetailsDialog({
             {details.gains &&
               Object.entries(details.gains)
                 .filter(([, v]) => v != null)
-                .map(([k, v]) => (
-                  <DetailRow key={k} label={`Gain ${k}`} value={String(v)} />
-                ))}
+                .map(([k, v]) => <DetailRow key={k} label={`Gain ${k}`} value={String(v)} />)}
           </div>
         )}
       </Card>

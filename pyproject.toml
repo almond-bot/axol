@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "almond-axol"
-version = "0.1.12"
+version = "0.1.20"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
@@ -26,6 +26,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gamepad = ["pygame>=2.6"]
 lerobot = ["lerobot[dataset,viz,async]"]
 sim = ["viser>=1.0.24"]
 # Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS

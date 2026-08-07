@@ -14,6 +14,18 @@ buttons, and motor calibration tools. Everything else — install-time commands
 one-off checks (``motor.info`` / ``motor.health``, whose read set the
 dashboard's motor tiles show live), the remote ``inference-server``, and
 ``serve`` itself — stays CLI-only.
+
+``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
+browser form can only name a path on the serve host, so the dashboard offers
+the read half (``motor.dump-config``) and single-parameter writes instead.
+
+:data:`COMMANDS` is a registry rather than a fixed table: a package that builds
+on ``almond-axol`` can :func:`register` its own commands before calling
+:func:`~almond_axol.serve.create_app`, and they flow through the API and the
+web panel like the built-in ones. Everything the serve layer needs to launch a
+command — whether it runs in-process, what it does with cameras, which settings
+it inherits — is declared on its :class:`CommandDef` rather than branched on
+its id, so registration is the only integration point.
 """
 
 from __future__ import annotations
@@ -28,7 +40,22 @@ CATEGORY_ORDER = ["Operate", "Diagnostics", "Calibrate", "Setup"]
 
 
 class CommandDef:
-    """A launchable command and how to introspect its configuration."""
+    """A launchable command and how to introspect its configuration.
+
+    A command with an ``entrypoint`` is an *operation*: the serve layer runs it
+    in-process (:class:`~almond_axol.serve.runner.OperationRunner`) so it shares
+    the persistent robot connection, and the control panel gives it a panel of
+    its own. Everything else is spawned as a ``python -m <module> <cli>``
+    subprocess by :class:`~almond_axol.serve.manager.SessionManager`.
+
+    An operation's entrypoint must match one of::
+
+        def _run(cfg, *, stop_event=None, control=None) -> None:   # thread
+        async def _run(cfg) -> None:                               # async
+
+    ``control`` is passed only when ``episode_control`` is set; see that
+    argument for the object's protocol.
+    """
 
     def __init__(
         self,
@@ -44,6 +71,17 @@ class CommandDef:
         requires_hardware: bool = False,
         uses_can_bus: bool = True,
         drives_motors: bool = False,
+        entrypoint: Callable[[], Callable[..., Any]] | None = None,
+        execution: str = "thread",
+        requires_cameras: bool = False,
+        camera_mode: str = "none",
+        sim_flag: str | None = None,
+        robot_free_flags: tuple[str, ...] = (),
+        uses_headset: bool = False,
+        episode_control: Callable[[], Callable[..., Any]] | None = None,
+        per_run_fields: tuple[str, ...] = (),
+        settings_like: str | None = None,
+        module: str = "almond_axol",
     ) -> None:
         self.id = id
         self.cli = cli
@@ -61,11 +99,72 @@ class CommandDef:
         # operations. Connectivity repair commands intentionally leave this
         # false so they remain available when a motor cannot be reached.
         self.drives_motors = drives_motors
+        # Lazy loader for the in-process entrypoint; None makes this a
+        # subprocess command. Deferred like ``loader`` so a missing optional
+        # extra only marks this one command unavailable.
+        self._entrypoint = entrypoint
+        # "thread" | "async". Async ops own an event loop for their whole run
+        # (teleop's VR server, gravity-comp's telemetry) and are awaited;
+        # thread ops are called synchronously on a worker thread.
+        self.execution = execution
+        # Needs at least one camera serial configured before it can start.
+        self.requires_cameras = requires_cameras
+        # How the operator's camera spec reaches the config: "argv" folds
+        # serials into the argv-style args (the cameras are required draccus
+        # inputs), "teleop" attaches them to a built config's camera dict
+        # (unreachable via flat argv), "none" ignores it.
+        self.camera_mode = camera_mode
+        # Arg name that means "no hardware" for this op, so a sim run skips the
+        # robot link and the motor-fault gate. None means it always needs the
+        # robot.
+        self.sim_flag = sim_flag
+        # Arg names that mean "doesn't touch the arms" without being sim
+        # (teleop's cart_only): the run skips the robot link and the
+        # motor-fault gate but still drives real, non-arm hardware.
+        self.robot_free_flags = robot_free_flags
+        # Driven from the VR headset, so the panel tells the operator to point
+        # the headset at this machine once the op is running.
+        self.uses_headset = uses_headset
+        # Lazy loader for an episode-control class, constructed as
+        # ``cls(stop_event)`` and handed to the entrypoint as ``control``. It
+        # must expose ``push(command: str)`` for API-pushed decisions and
+        # ``snapshot() -> dict`` for the phase the panel renders.
+        self._episode_control = episode_control
+        # Config keys the panel surfaces per run; everything else comes from
+        # the shared settings, folded in server-side.
+        self.per_run_fields = per_run_fields
+        # Borrow another op's settings targets. Settings are declared as dotted
+        # config paths per op, so an op embedding the same config dataclasses
+        # inherits the whole mapping instead of re-declaring it.
+        self.settings_like = settings_like
+        # ``python -m <module>`` target for the subprocess path, so a command
+        # registered by a downstream package runs out of that package's CLI.
+        self.module = module
         self._loader = loader
+
+    @property
+    def is_operation(self) -> bool:
+        """Runs in-process (and gets a control-panel operation of its own)."""
+        return self._entrypoint is not None
+
+    @property
+    def has_episode_control(self) -> bool:
+        """Drives episodes the panel can save / rerecord / quit."""
+        return self._episode_control is not None
 
     def load(self) -> Any:
         """Return the config class (draccus) or ``add_parser`` fn (argparse)."""
         return self._loader()
+
+    def load_entrypoint(self) -> Callable[..., Any]:
+        """Return the in-process ``_run`` callable (operations only)."""
+        if self._entrypoint is None:
+            raise ValueError(f"{self.id} is not an in-process operation")
+        return self._entrypoint()
+
+    def load_episode_control(self) -> Callable[..., Any] | None:
+        """Return the episode-control class, or None when the op has none."""
+        return None if self._episode_control is None else self._episode_control()
 
 
 # -- draccus config-class loaders -------------------------------------------
@@ -81,6 +180,12 @@ def _gravity_comp() -> type:
     from ..cli.config import GravityCompCmdConfig
 
     return GravityCompCmdConfig
+
+
+def _waypoints() -> type:
+    from ..cli.waypoints import WaypointsCmdConfig
+
+    return WaypointsCmdConfig
 
 
 def _collect_data() -> type:
@@ -99,6 +204,57 @@ def _run_policy() -> type:
     from ..cli.run_policy import RunPolicyConfig
 
     return RunPolicyConfig
+
+
+# -- in-process entrypoint loaders ------------------------------------------
+
+
+def _teleop_run() -> Callable[..., Any]:
+    from ..cli.teleop import _run
+
+    return _run
+
+
+def _gravity_comp_run() -> Callable[..., Any]:
+    from ..cli.gravity_comp import _run
+
+    return _run
+
+
+def _waypoints_run() -> Callable[..., Any]:
+    from ..cli.waypoints import _run
+
+    return _run
+
+
+def _waypoints_control() -> Callable[..., Any]:
+    from ..cli.waypoints import _QueueWaypointControl
+
+    return _QueueWaypointControl
+
+
+def _collect_data_run() -> Callable[..., Any]:
+    from ..cli.collect_data import _run
+
+    return _run
+
+
+def _replay_dataset_run() -> Callable[..., Any]:
+    from ..cli.replay_dataset import _run
+
+    return _run
+
+
+def _run_policy_run() -> Callable[..., Any]:
+    from ..cli.run_policy import _run
+
+    return _run
+
+
+def _run_policy_control() -> Callable[..., Any]:
+    from ..cli.run_policy import _QueuePolicyControl
+
+    return _QueuePolicyControl
 
 
 # -- argparse add_parser loaders --------------------------------------------
@@ -123,11 +279,20 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware.",
+        "browser without hardware, or cart-only to drive just the powered cart.",
         "Operate",
         "draccus",
         _teleop,
         sim_capable=True,
+        entrypoint=_teleop_run,
+        execution="async",
+        camera_mode="teleop",
+        sim_flag="sim",
+        # umi drives the handheld rig's own CAN buses (can_alm_umi_l/r), so
+        # like cart_only it never touches the arms or their motor faults.
+        robot_free_flags=("cart_only", "umi"),
+        uses_headset=True,
+        per_run_fields=("sim", "umi", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -138,6 +303,28 @@ COMMANDS: dict[str, CommandDef] = {
         "draccus",
         _gravity_comp,
         requires_hardware=True,
+        entrypoint=_gravity_comp_run,
+        execution="async",
+        per_run_fields=("free_joints",),
+    ),
+    "waypoints": CommandDef(
+        "waypoints",
+        "waypoints",
+        "Waypoints",
+        "Hand-guide the arms in gravity comp to record waypoints, then replay "
+        "them as straight-line moves solved with inverse kinematics. Enable "
+        "simulation to preview a saved path in the browser.",
+        "Operate",
+        "draccus",
+        _waypoints,
+        sim_capable=True,
+        entrypoint=_waypoints_run,
+        episode_control=_waypoints_control,
+        sim_flag="sim",
+        # The gravity-comp side of a session takes the same config shape
+        # (axol.*, channels, kd, rates), so the settings table is inherited.
+        settings_like="gravity-comp",
+        per_run_fields=("file", "loops", "play_only", "sim"),
     ),
     "collect-data": CommandDef(
         "collect-data",
@@ -148,6 +335,13 @@ COMMANDS: dict[str, CommandDef] = {
         "draccus",
         _collect_data,
         requires_hardware=True,
+        entrypoint=_collect_data_run,
+        requires_cameras=True,
+        camera_mode="argv",
+        # umi records with the handheld rig (its own CAN buses) — the Axol
+        # arms and their motor-fault gate are not involved.
+        robot_free_flags=("umi",),
+        per_run_fields=("umi", "repo_id", "task"),
     ),
     "replay-dataset": CommandDef(
         "replay-dataset",
@@ -159,6 +353,8 @@ COMMANDS: dict[str, CommandDef] = {
         "draccus",
         _replay_dataset,
         requires_hardware=True,
+        entrypoint=_replay_dataset_run,
+        per_run_fields=("repo_id", "episode", "loop", "interpolate"),
     ),
     "run-policy": CommandDef(
         "run-policy",
@@ -169,6 +365,11 @@ COMMANDS: dict[str, CommandDef] = {
         "draccus",
         _run_policy,
         requires_hardware=True,
+        entrypoint=_run_policy_run,
+        requires_cameras=True,
+        camera_mode="argv",
+        episode_control=_run_policy_control,
+        per_run_fields=("policy_path", "policy_type", "task", "repo_id"),
     ),
     # -- Diagnostics ----------------------------------------------------------
     "diag.rom-enable": CommandDef(
@@ -228,6 +429,42 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.motor.set_can_id"),
         requires_hardware=True,
     ),
+    "motor.dump-config": CommandDef(
+        "motor.dump-config",
+        "motor.dump-config",
+        "Dump config",
+        "Read every configuration parameter from one or all motors, MyActuator "
+        "or Damiao. Read-only — the run log is the snapshot to attach to a "
+        "support thread.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.dump_config"),
+        requires_hardware=True,
+    ),
+    "motor.set-config": CommandDef(
+        "motor.set-config",
+        "motor.set-config",
+        "Set config parameter",
+        "Read or write a single configuration parameter on either motor family "
+        "— protection thresholds, position limits, motion planning caps, and "
+        "Damiao's CAN timeout.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.set_config"),
+        requires_hardware=True,
+    ),
+    "motor.flash": CommandDef(
+        "motor.flash",
+        "motor.flash",
+        "Flash firmware",
+        "Overwrite a MyActuator motor's firmware from a .bin on the robot host. "
+        "Nothing else may use the bus while it runs, and an interrupted flash "
+        "leaves the motor in its bootloader until the flash is re-run.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.flash"),
+        requires_hardware=True,
+    ),
     # -- Setup --------------------------------------------------------------
     "can.setup": CommandDef(
         "can.setup",
@@ -253,6 +490,25 @@ COMMANDS: dict[str, CommandDef] = {
 
 
 _schema_cache: dict[str, Schema] = {}
+
+
+def register(command: CommandDef) -> None:
+    """Add (or replace) a command in the catalog.
+
+    The integration point for packages built on ``almond-axol``: register
+    before :func:`~almond_axol.serve.create_app` and the command shows up in
+    the API and the web panel alongside the built-in ones. Re-registering an
+    id replaces it — a downstream package can substitute its own variant of a
+    built-in operation — and drops the stale schema so the new config is
+    introspected on next use.
+    """
+    COMMANDS[command.id] = command
+    _schema_cache.pop(command.id, None)
+
+
+def operation_ids() -> set[str]:
+    """Ids of the commands the serve layer runs in-process."""
+    return {cmd.id for cmd in COMMANDS.values() if cmd.is_operation}
 
 
 def get_schema(command_id: str) -> Schema:
@@ -284,6 +540,16 @@ def command_specs() -> list[dict[str, Any]]:
             "simCapable": cmd.sim_capable,
             "requiresHardware": cmd.requires_hardware,
             "usesCanBus": cmd.uses_can_bus,
+            # Everything the panel needs to build an operation's tile and form
+            # without knowing the command: older panels ignore these and fall
+            # back to their built-in list.
+            "isOperation": cmd.is_operation,
+            "requiresCameras": cmd.requires_cameras,
+            "perRunFields": list(cmd.per_run_fields),
+            "episodeControl": cmd.has_episode_control,
+            "simFlag": cmd.sim_flag,
+            "robotFreeFlags": list(cmd.robot_free_flags),
+            "usesHeadset": cmd.uses_headset,
         }
         try:
             schema = get_schema(cmd.id)

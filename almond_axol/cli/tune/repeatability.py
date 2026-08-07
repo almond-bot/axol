@@ -208,6 +208,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Gripper closing torque limit (Nm). Default 0.3.",
     )
     p.add_argument(
+        "--no-gripper",
+        action="store_true",
+        help=(
+            "Run on the gripperless SKU: the gripper motor is never enabled "
+            "or calibrated (--gripper-torque-limit is then ignored)."
+        ),
+    )
+    p.add_argument(
         "--dwell",
         type=float,
         default=0.5,
@@ -306,7 +314,9 @@ async def _run(args: argparse.Namespace) -> None:
     # Only the left arm actuates — disable the right channel entirely.
     axol_kwargs: dict = {"right_channel": None}
     axol_config = AxolConfig(
-        left_stiffness=args.stiffness, right_stiffness=args.stiffness
+        left_stiffness=args.stiffness,
+        right_stiffness=args.stiffness,
+        has_gripper=not args.no_gripper,
     )
     axol_config.left.gripper.torque_limit = args.gripper_torque_limit
     axol_config.right.gripper.torque_limit = args.gripper_torque_limit

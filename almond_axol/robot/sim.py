@@ -35,6 +35,9 @@ class Sim(RobotBase):
 
     Implements the same :class:`MotionControl` interface as :class:`Axol` so it
     can be used as a drop-in replacement for visualising motion without hardware.
+    The gripper element of each (8,) array is stored and echoed back but never
+    rendered (the URDF gripper is a fixed joint), so the sim behaves the same
+    for both the gripper-equipped and gripperless SKUs.
 
     Args:
         joint_names: Ordered list of actuated joint names matching the URDF.

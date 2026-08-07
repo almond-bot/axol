@@ -18,6 +18,7 @@ const ACRONYMS: Record<string, string> = {
   api: "API",
   tls: "TLS",
   com: "CoM",
+  imu: "IMU",
 }
 
 /**

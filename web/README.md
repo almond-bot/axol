@@ -97,6 +97,11 @@ Each frame sends a JSON message over the WebSocket:
   r_grip:  number    // right grip
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
+  l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — powered-cart strafe (ignored without a cart)
+  l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — powered-cart drive
+  r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — powered-cart rotation
+  l_stick_click: boolean  // left thumbstick pressed in — lift down while held
+  r_stick_click: boolean  // right thumbstick pressed in — lift up while held
   seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
 }
 ```
@@ -116,7 +121,11 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 | 5 | Left **X** | Reset pose; cancels a recording countdown. While recording, arms the **Discard episode?** confirmation — press **X** again to discard and re-record, or **A** to cancel and keep recording |
 | 7 | Left **Y** | Exit the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose |
 | 6 | Right **A** | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording — **data collection only** (no effect during plain teleop) |
-| — | Right thumbstick (click) | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
+| — | Right **B** | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
+| — | Left thumbstick | Drive the powered cart: forward/back + strafe (robots with a cart only; deadman — the base stops when released) |
+| — | Right thumbstick (x) | Rotate the powered cart |
+| — | Left thumbstick (click) | Lower the telescoping lift while held |
+| — | Right thumbstick (click) | Raise the telescoping lift while held |
 
 ## State machine
 
@@ -155,6 +164,8 @@ npm run dev --workspace=app
 
 - **VR**: open the printed localhost URL on your Quest browser, enter the hostname of the machine running the Almond Axol SDK, press **Connect**, then **Start** to enter the AR session.
 - **Control panel**: open `/control` in a normal browser. It talks to the `axol serve` API (default `https://localhost:8001`).
+
+The control panel's operations aren't hardcoded here: `/api/commands` tells it which ones the connected host offers and what each needs (per-run fields, cameras, a sim flag, episode controls), so a host with extra operations registered — see `register()` in `almond_axol/serve/commands.py` — gets panels for them with no change to this app. A host predating that API answers without those fields, and the panel falls back to the built-in list in `app/src/lib/supervisor.ts` so an up-to-date panel still drives an older robot.
 
 **Build**
 
@@ -202,6 +213,11 @@ class VRFrame(BaseModel):     # headset → server (every XR frame)
     r_grip: float
     reset: bool
     state: VRState             # one of TELEOP / DATA_COLLECTION / RECORDING
+    l_stick_x: float = 0.0     # thumbstick + click fields drive the powered
+    l_stick_y: float = 0.0     # cart (base + lift) when one is configured;
+    r_stick_x: float = 0.0     # neutral defaults keep older web builds working
+    l_stick_click: bool = False
+    r_stick_click: bool = False
 ```
 
 **Server → headset feedback**
@@ -220,6 +236,10 @@ The server also pushes `{ "type": "tracking", "value": true|false }` whenever th
 
 In absolute (UMI) mode the server additionally streams `{ "type": "urdf_state", "base": { "pos": [x,y,z], "quat": [x,y,z,w] } | null, "joints": { "<urdf joint>": rad, ... }, "engaged": bool }` at ~30 Hz. `base` is the robot base transform solved at engage (null before the first engage) in the same reference space as the controller poses; the app renders the robot URDF there (`RobotModel` in the app), fetching the model from the server's `https://<host>:8000/urdf/` static mount.
 
+The server additionally **relays a HUD message between clients**: the headset publishes its transient HUD state — the armed save/discard confirmation popup and the record-start countdown — as `{ "type": "hud", "value": { "confirm": "save" | "discard" | null, "countdownRemainingMs": number | null } }`, and the server stores it and forwards it to every *other* connected client (re-sent to late joiners), clearing it with a null broadcast when the publisher disconnects. The control panel subscribes to this on its camera-feed socket to mirror the in-headset popups, so a session can be watched from the dashboard with the headset off.
+
 **Camera video (WebRTC)**
 
 When the server has video sources registered (`VRServer.set_video_sources`, see `almond_axol/video/video.py`), the headset negotiates a WebRTC connection over the same WebSocket: it sends `{ "type": "webrtc-request" }`, the server replies with `{ "type": "webrtc-offer", "sdp": ..., "tracks": { mid: cameraName } }`, and the client answers with `{ "type": "webrtc-answer", "sdp": ... }`. The `useAxolVideo` hook implements the client side and returns the labelled video tracks. A stereo overhead arrives as a single side-by-side track, `overhead_sbs` (both eyes packed into one stream — one decoder session on the headset), which the app renders per-lens through a WebXR media layer; the SDK-fallback path (no gst) instead sends the two per-eye tracks `overhead_left` / `overhead_right`.
+
+The **control panel** joins the same `/ws` as one more **view-only** WebRTC client (`app/src/components/camera-feeds.tsx`, via `useAxolVideo`) to mirror these feeds in the panel — a headset-off operator view for headset-driven operations, with an optional fullscreen layout. There's no extra backend video path; the relay's encoders are shared. A side-by-side track is displayed cropped to its left eye, and a repeatedly-failing connection offers the same certificate-authorize flow the VR app uses.

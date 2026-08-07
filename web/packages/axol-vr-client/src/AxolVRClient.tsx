@@ -89,6 +89,8 @@ export function AxolVRClient({
   const serverEpisodeRef = useRef<number | null | -1>(-1)
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
+  // Change key of the last HUD state published to the server (see below).
+  const lastHudKeyRef = useRef("")
 
   useFrame(() => {
     // Attach onmessage to the WebSocket whenever it changes so we can receive
@@ -286,8 +288,8 @@ export function AxolVRClient({
       }
     }
 
-    // B (right) — previously toggled teleop ↔ data_collection. The mode is now
-    // fixed by the server (see modeRef), so B is intentionally inert.
+    // B (right) — handled in the app layer: it re-anchors the camera screens
+    // to the current gaze (see App.tsx). Nothing is sent to the server for it.
     void bEdge
 
     // Promote pending → recording after 3s
@@ -298,6 +300,34 @@ export function AxolVRClient({
       setState(AxolState.Recording)
       recordingPendingAtRef.current = null
       onPendingRecording?.(null)
+    }
+
+    // Publish the HUD-only state (armed confirmation popup, record countdown)
+    // to the server whenever it changes, so a dashboard watching the session
+    // can mirror what this headset would show — the operator may be driving
+    // with the controllers while the headset is off. Sent over the main
+    // WebSocket (the signaling transport); the server relays it to the other
+    // connected clients and clears it when we disconnect.
+    {
+      const pendingAt = recordingPendingAtRef.current
+      const confirm = pendingConfirmRef.current
+      const hudKey = `${confirm ?? ""}|${pendingAt !== null}`
+      if (hudKey !== lastHudKeyRef.current) {
+        lastHudKeyRef.current = hudKey
+        const ws = wsRef.current
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(
+            JSON.stringify({
+              type: "hud",
+              value: {
+                confirm,
+                countdownRemainingMs:
+                  pendingAt !== null ? Math.max(0, 3000 - (Date.now() - pendingAt)) : null,
+              },
+            })
+          )
+        }
+      }
     }
 
     // Send each frame over every open transport: the wired USB `adb reverse`
@@ -357,6 +387,15 @@ export function AxolVRClient({
     const l_lock = (leftSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
     const r_lock = (rightSource?.gamepad?.buttons[1]?.value ?? 0) >= 1.0
 
+    // Thumbstick state for the powered cart (xr-standard mapping: stick axes
+    // at axes[2]/[3], stick click at buttons[3]). Servers without a cart
+    // configured simply ignore these fields.
+    const l_stick_x = leftSource?.gamepad?.axes[2] ?? 0
+    const l_stick_y = leftSource?.gamepad?.axes[3] ?? 0
+    const r_stick_x = rightSource?.gamepad?.axes[2] ?? 0
+    const l_stick_click = leftSource?.gamepad?.buttons[3]?.pressed ?? false
+    const r_stick_click = rightSource?.gamepad?.buttons[3]?.pressed ?? false
+
     // Serialise once so both transports carry the identical frame (same seq),
     // letting the server treat them as one stream and de-dupe to whichever
     // arrives first.
@@ -371,6 +410,11 @@ export function AxolVRClient({
       r_grip,
       reset,
       state: stateRef.current,
+      l_stick_x,
+      l_stick_y,
+      r_stick_x,
+      l_stick_click,
+      r_stick_click,
       seq: ++seqRef.current,
       // Capture timestamp (ms). The server's pose interpolator uses this to
       // reconstruct the true motion cadence when frames arrive batched over a

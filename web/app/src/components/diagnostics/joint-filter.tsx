@@ -9,9 +9,12 @@ import { JOINTS, JOINT_COLORS, jointLabel, type JointName } from "@/lib/telemetr
 export function JointFilter({
   hidden,
   onChange,
+  joints = JOINTS,
 }: {
   hidden: Set<JointName>
   onChange: (hidden: Set<JointName>) => void
+  /** The joints this robot has (gripperless SKUs drop GRIPPER). */
+  joints?: readonly JointName[]
 }) {
   function toggle(joint: JointName) {
     const next = new Set(hidden)
@@ -22,7 +25,7 @@ export function JointFilter({
 
   return (
     <div className="flex flex-wrap items-center gap-1.5">
-      {JOINTS.map((joint) => {
+      {joints.map((joint) => {
         const off = hidden.has(joint)
         return (
           <button

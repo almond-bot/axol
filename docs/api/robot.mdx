@@ -46,13 +46,58 @@ asyncio.run(main())
 
 | Method | Description |
 |---|---|
-| `enable()` | Start CAN buses, enable all motors, calibrate grippers |
+| `connect()` | Open the CAN buses only — nothing is actuated; all read APIs (`get_holding()`, `get_positions()`, ...) become usable for inspecting a robot of unknown state |
+| `enable(hold=True)` | Bring every motor up. Idempotent per motor: joints already holding keep holding (reads only, gripper keeps its grasp); cold joints get the full bring-up incl. gripper calibration. With `hold=True` (default) the robot finishes actively holding its measured pose — see [Reconnecting to a live robot](#reconnecting-to-a-live-robot) |
 | `disable()` | Disable all motors and close CAN buses |
+| `disconnect()` | Close CAN buses leaving motor torque exactly as it is |
 | `start_telemetry(hz, torque=False)` | Begin background polling loop on all motors |
 | `wait_for_telemetry(timeout=5.0)` | Block until every motor has reported a position; call after `start_telemetry` before the first cached `positions` read |
 | `stop_telemetry()` | Stop background polling |
 | `clear_errors()` | Clear latched error flags on all motors |
-| `set_control_mode(mode)` | Set `ControlMode` on all motors |
+| `set_control_mode(mode)` | Set `ControlMode` on all motors. **MyActuator motors reboot to switch modes (torque off ~2 s)** — never call it while the arms hold a load; use `enable(hold=False)` in flows that manage modes themselves (Damiao takes a live mode flip in stride — it is a plain register write) |
+
+### Reconnecting to a live robot
+
+If a controlling process dies (or disconnects) while the robot is torqued on, the motors keep holding their last commanded pose. Startup code does not need to know whether that happened: `enable()` queries each motor and converges —
+
+- joints that are **already holding** are attached to with reads only (never reset — a reset reboots MyActuator motors and drops the arm for ~2 s), and a holding gripper keeps its grasp: its open-stop calibration is restored from the values persisted by the last full bring-up instead of re-running the sweep that forces the jaws open;
+- **cold** joints get the classic full bring-up;
+- a mixed robot (e.g. the previous session died mid-`enable`) simply gets the cold joints brought up while the holding ones are left alone;
+- with `hold=True` (the default) `enable()` finishes by commanding the measured pose once (configured gains + gravity feedforward — the arm is already there, so nothing moves), so "enabled" always means *actively holding*.
+
+```python
+import asyncio
+from almond_axol.robot import Axol
+
+async def main():
+    axol = Axol()
+    await axol.connect()                   # open buses; nothing actuated
+    held_l, held_r = await axol.get_holding()   # optional: inspect first
+    await axol.enable()                    # holding joints kept holding
+
+    await axol.start_telemetry(500)
+    await axol.wait_for_telemetry()
+
+    # Resume from the *measured* pose — after a reconnect the arms are
+    # wherever the previous session left them, and the max_step_rad safety
+    # check is seeded against that pose, so a stale or default target is
+    # rejected instead of yanking the arms.
+    left = axol.left.positions
+    await axol.motion_control(left=left)
+    # ... ramp toward your desired target from here ...
+
+    await axol.disconnect()                # exit, leaving torque as-is
+
+asyncio.run(main())
+```
+
+Notes:
+
+- `connect()` is optional — `enable()` opens the buses itself. Call it when you want to inspect state (`get_holding()`, positions, temperatures) before acting. A process that must never actuate can `connect()`, check `get_holding()`, and only proceed when every joint is already holding.
+- Custom control modes: pass `enable(hold=False)` to leave freshly brought-up joints enabled but limp, then pick your mode with `set_control_mode()` (position/velocity/force). The reconnect machinery targets the impedance workflow — a session that died in another control mode is asked to `disable()` and re-enable rather than being reattached.
+- To force a fresh bring-up of a live robot (re-run gripper calibration, reset motors), call `disable()` first, then `enable()`.
+- One corner intentionally raises `MotorError`: a gripper that is holding but has no valid persisted calibration — re-measuring would sweep the jaws open and drop whatever it grips. Empty the gripper, then `disable()` and `enable()`.
+- `disconnect()` closes the buses without touching torque, so the robot keeps holding and a later process can reconnect. Use `disable()` only when you actually want to torque off (with the arms in a safe pose).
 
 ### State reads
 
@@ -66,6 +111,7 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 | `get_temperatures()` | °C |
 | `get_voltages()` | V |
 | `get_error_codes()` | `list[MotorStatus]` |
+| `get_holding()` | `list[bool]` — enabled-and-holding per motor (read-only; usable right after `connect()`) |
 | `get_gains()` | `list[MotorGains]` |
 
 ### State writes
@@ -156,6 +202,7 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 
 | Field | Default | Description |
 |---|---|---|
+| `has_gripper` | `True` | Whether this robot is the gripper-equipped SKU. Set `False` for the gripperless SKU: the gripper motors are never constructed, enabled, or calibrated; the gripper element of every `(8,)` joint array is ignored on write and reported as `0.0` on read (array shapes are unchanged). LeRobot datasets recorded on a gripperless robot carry 7 channels per arm instead of 8. |
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
 | `left_stiffness` | `0.5` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). `0` keeps the per-joint compliant gains; `1` restores the pre-tuning industrial gains in `_STIFF_GAINS` (e.g. `shoulder_1` → `kp=500`); the default `0.5` is the geometric mean (e.g. `shoulder_1` `kp` ≈ 141). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness); `j_eff` / `kd_soft` scale linearly to 0 at `s=1`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
 | `right_stiffness` | `0.5` | Same, for the **right** arm. |

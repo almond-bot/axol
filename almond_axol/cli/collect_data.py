@@ -165,6 +165,46 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
         _logger.warning("failed to enable camera video: %s", exc)
 
 
+def check_resume_consistency(dataset_root: "Path") -> None:
+    """Refuse to resume a dataset whose last session lost episodes.
+
+    A recorder subprocess killed before flushing (its "recorder subprocess
+    exited … before shutdown" error is in that session's log) loses the
+    episodes still buffered in its parquet writer, while ``info.json``'s
+    ``total_episodes`` — already bumped per save — survives. Resuming such a
+    dataset numbers the next episode past the lost ones, leaving a permanent
+    index gap. That gap is poison downstream: LeRobot's episode metadata
+    lookups are positional (``meta.episodes[i]`` is a row position, not a
+    key), so on a gapped dataset every episode after the gap silently
+    resolves to a *different* episode's video span. Refuse here, at the next
+    session's start, instead.
+    """
+    import json
+
+    import pyarrow.parquet as pq
+
+    total = int(
+        json.loads((dataset_root / "meta" / "info.json").read_text())["total_episodes"]
+    )
+    indices: list[int] = []
+    for f in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
+        indices.extend(
+            pq.read_table(f, columns=["episode_index"])["episode_index"].to_pylist()
+        )
+    if sorted(indices) == list(range(total)):
+        return
+    missing = sorted(set(range(total)) - set(indices))
+    raise RuntimeError(
+        f"Dataset {dataset_root} is crash-inconsistent: info.json counts "
+        f"{total} episode(s) but meta/episodes holds {len(indices)}"
+        f"{f' (missing indices {missing})' if missing else ''}. A previous "
+        "session's recorder was killed before it flushed, so those episodes' "
+        "frames are gone. Recording more would number new episodes past the "
+        "gap. Renumber the surviving episodes to a contiguous 0..N-1 (data + "
+        "meta/episodes parquets, info.json totals) or start a fresh dataset."
+    )
+
+
 def _existing_dataset_resolution(dataset_root: "Path") -> str | None:
     """Resolution name of an existing dataset's recorded images, or ``None``.
 
@@ -412,6 +452,17 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     from ..lerobot.robot.config_umi import UmiRobotConfig
 
     umi_mode = isinstance(cfg.robot_config, UmiRobotConfig)
+
+    # The teleop's action keys must match the robot's: propagate the SKU's
+    # gripper capability so the gripperless SKU records no gripper channels.
+    # The UMI rig always has grippers, so only the real robot propagates.
+    if (
+        not umi_mode
+        and isinstance(cfg.robot_config, AxolRobotConfig)
+        and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
+    ):
+        cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
+
     robot = UmiRobot(cfg.robot_config) if umi_mode else AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
 
@@ -428,6 +479,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             f"Delete the directory and rerun to start fresh:\n"
             f"  rm -rf {dataset_root}"
         )
+    if is_complete:
+        check_resume_consistency(dataset_root)
 
     # A resumed dataset's image resolution is fixed by its existing metadata, so
     # the relay must record at it regardless of the configured dataset_resolution
@@ -525,6 +578,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # If any of this setup fails, tear the relay subprocess down so it doesn't
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
+    imu_src: Any | None = None  # board-gyro yaw source for the cart, if wired
     try:
         robot.connect()
 
@@ -549,11 +603,30 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             teleop.set_video_manager(relay)
         else:
             _register_camera_video(robot, teleop)
+
+        # Cart heading hold: feed the carrier board's BMI088 yaw rate to the
+        # cart, same as native teleop (see almond_axol.robot.gyro — nothing
+        # here touches the video path). Best-effort: on failure the hold is
+        # simply inert (no yaw rates arrive), which the cart logs once driving.
+        if teleop.cart is not None and teleop.cart.config.imu:
+            try:
+                from ..robot.gyro import BoardYawRateSource
+
+                imu_src = BoardYawRateSource(teleop.cart.feed_yaw_rate)
+                imu_src.open()
+            except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
+                _logger.warning(
+                    "cart.imu: could not start the board gyro (%s); heading "
+                    "hold disabled",
+                    exc,
+                )
     except BaseException:
         # Tear down teleop too: if a stop interrupts teleop.connect() while the
         # IK worker is still compiling JAX, its VR server thread is otherwise
         # left running and keeps holding its WebSocket port, so the next run
         # can't bind it. disconnect() is a no-op if connect() never ran.
+        if imu_src is not None:
+            imu_src.close()
         try:
             teleop.disconnect()
         except Exception:
@@ -603,29 +676,28 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             relay.shutdown()
         raise
 
-    # Background perf samplers (per-second /proc CPU breakdown + Jetson GPU/EMC/
-    # NVENC/thermal). These were the instrumentation for the recording-jitter
-    # investigation; keep them available but only run + print them at DEBUG so the
-    # default INFO output stays the single loop-rate line. Labels map the known
-    # subprocesses (mp spawn children all report comm=python) so the IK solver,
-    # video relay, and dataset recorder are legible in the breakdown.
-    diag: SystemDiag | None = None
-    tegra: TegraStatsDiag | None = None
-    if _logger.isEnabledFor(logging.DEBUG):
-        diag_labels: dict[int, str] = {os.getpid(): "main"}
-        ik_proc = getattr(teleop, "_ik_process", None)
-        if ik_proc is not None and getattr(ik_proc, "pid", None):
-            diag_labels[ik_proc.pid] = "ik"
-        if relay is not None and getattr(relay, "_proc", None) is not None:
-            relay_pid = getattr(relay._proc, "pid", None)
-            if relay_pid:
-                diag_labels[relay_pid] = "relay"
-        if getattr(recorder, "pid", None):
-            diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
-        diag = SystemDiag(diag_labels, _logger)
-        diag.start()
-        tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
-        tegra.start()
+    # Background perf samplers (per-second /proc CPU + memory breakdown and
+    # Jetson GPU/EMC/NVENC/thermal), started unconditionally as in `axol teleop`
+    # so the two flows' lines line up and a collection session can be compared
+    # against the teleop baseline. Both keep their heavy system-wide tiers at
+    # DEBUG, so the default INFO output stays a couple of lines per second.
+    # Labels map the known subprocesses (mp spawn children all report
+    # comm=python) so the IK solver, video relay, and dataset recorder are
+    # legible in the breakdown.
+    diag_labels: dict[int, str] = {os.getpid(): "main"}
+    ik_proc = getattr(teleop, "_ik_process", None)
+    if ik_proc is not None and getattr(ik_proc, "pid", None):
+        diag_labels[ik_proc.pid] = "ik"
+    if relay is not None and getattr(relay, "_proc", None) is not None:
+        relay_pid = getattr(relay._proc, "pid", None)
+        if relay_pid:
+            diag_labels[relay_pid] = "relay"
+    if getattr(recorder, "pid", None):
+        diag_labels[recorder.pid] = "recorder"  # type: ignore[union-attr]
+    diag = SystemDiag(diag_labels, _logger)
+    diag.start()
+    tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
+    tegra.start()
 
     # Keep the relay's raw dataset branch closed until an episode records: the
     # raw VIC convert + shared-memory copy for every camera is the bulk of the
@@ -887,11 +959,11 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     finally:
         log_say("Stopping.")
 
-        if diag is not None:
-            diag.stop()
-        if tegra is not None:
-            tegra.stop()
+        diag.stop()
+        tegra.stop()
 
+        if imu_src is not None:
+            imu_src.close()
         robot.disconnect()
         teleop.disconnect()
         # Recorder owns the dataset: finalize, optional push, and empty-dataset

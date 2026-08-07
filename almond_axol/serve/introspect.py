@@ -161,9 +161,13 @@ def _attribute_help(cls: type, name: str) -> str | None:
 def _field_docs(instance: Any) -> dict[str, str]:
     """Per-field help for a dataclass, sourced like the CLI ``--help``.
 
-    Precedence (later wins): class ``Attributes:`` / ``Args:`` docstring →
-    draccus attribute docstrings (inline/preceding comments) → the CLI's
-    curated overrides.
+    A field documented in the class ``Attributes:`` / ``Args:`` docstring
+    keeps that text; otherwise a draccus attribute docstring (inline or
+    preceding comment) applies, and the CLI's curated overrides beat those.
+    The curated map is keyed by bare field name — it exists to paper over
+    draccus mis-extractions — so it must not shadow an explicit docstring on
+    an unrelated class that happens to reuse the name (``cart.max_speed`` vs
+    the gripper's).
     """
     if not dataclasses.is_dataclass(instance):
         return {}
@@ -173,13 +177,15 @@ def _field_docs(instance: Any) -> dict[str, str]:
     if doc:
         out.update(_parse_doc_fields(doc))
     for field in dataclasses.fields(cls):
-        if field.name not in out:
-            comment = _attribute_help(cls, field.name)
-            if comment:
-                out[field.name] = comment
+        if field.name in out:
+            continue
         curated = _CURATED_FIELD_HELP.get(field.name)
         if curated:
             out[field.name] = curated
+            continue
+        comment = _attribute_help(cls, field.name)
+        if comment:
+            out[field.name] = comment
     return out
 
 

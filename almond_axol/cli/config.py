@@ -52,6 +52,7 @@ import numpy as np
 
 from ..constants import CAN_LEFT, CAN_RIGHT
 from ..kinematics.config import KinematicsConfig
+from ..robot.cart import CartConfig
 from ..robot.config import AxolConfig
 from ..teleop.config import VRTeleopConfig
 from ..vr.config import VRServerConfig
@@ -298,6 +299,10 @@ _FIELD_HELP: dict[str, str] = {
         "or a 7-element list, one per joint."
     ),
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
+    "has_gripper": (
+        "Whether this robot has grippers. Set false for the gripperless SKU: "
+        "gripper motors are never enabled and gripper commands are ignored."
+    ),
     "torque_limit": "Peak gripper output torque (Nm) in POSITION_FORCE mode.",
     "max_speed": "Max gripper joint speed (rad/s).",
     "serial": "Serial number of the ZED camera to open (0 = slot unassigned).",
@@ -436,6 +441,34 @@ def parse(config_class: type[T], argv: list[str]) -> T:
         parser.parser.error(str(exc))
 
 
+def normalize_bool_flags(argv: list[str], *names: str) -> list[str]:
+    """Let the named bool fields be passed as bare flags.
+
+    draccus parses bool fields as value-taking arguments (``--sim true``), so
+    rewrite a standalone ``--sim`` (one followed by another flag or nothing)
+    into ``--sim true``. An explicit ``--sim true`` / ``--sim false`` /
+    ``--sim=...`` is left untouched.
+
+    Args:
+        argv: Raw argument list.
+        names: Field names to accept bare, without the leading dashes.
+    """
+    flags = {f"--{name}" for name in names}
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in flags:
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is None or nxt.startswith("-"):
+                out.extend((tok, "true"))
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
+
+
 # ----------------------------------------------------------------------
 # Command configs that don't touch lerobot (kept import-cheap for sim).
 # ----------------------------------------------------------------------
@@ -478,6 +511,18 @@ class TeleopCmdConfig:
 
     The VR WebSocket server (port, TLS certs) lives on the nested
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
+
+    Robots on the powered cart (x-drive base + telescoping lift) enable it
+    with ``--cart.enabled true``; the thumbsticks then drive the base (left
+    stick translates, right stick x rotates) and the stick clicks run the
+    lift (left click down, right click up), independent of the arm engage
+    toggle. Cart parameters live on the nested ``cart`` config — e.g.
+    ``--cart.max_speed 5`` or ``--cart.channel can0``.
+
+    ``--cart_only`` drives *just* the cart: the arms are never constructed
+    and the Axol hub CAN channels are never touched — only the VR server
+    (thumbstick stream) and the cart run. Having a cart is implied, so
+    ``--cart.enabled`` is not consulted.
     """
 
     sim: bool = False
@@ -486,10 +531,15 @@ class TeleopCmdConfig:
     # the headset's URDF overlay — absolute pose mapping is forced on. No
     # robot, no cameras, no recording. Mutually exclusive with --sim.
     umi: bool = False
+    cart_only: bool = False
+    """Drive only the powered cart from the headset thumbsticks. The arms and
+    their CAN channels are left untouched (no Axol hub needed); the cart is
+    implied. Mutually exclusive with sim."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server: VRServerConfig = field(default_factory=VRServerConfig)
+    cart: CartConfig = field(default_factory=CartConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)

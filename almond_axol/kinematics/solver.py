@@ -135,6 +135,8 @@ def _solve_ik(
     elbow_weight: float,
     max_iterations: int,
     cost_tolerance: float,
+    lambda_initial: float,
+    lambda_factor: float,
 ) -> jax.Array:
     JointVar = robot.joint_var_cls
 
@@ -218,7 +220,10 @@ def _solve_ik(
         initial_vals=initial_vals,
         verbose=False,
         linear_solver="dense_cholesky",
-        trust_region=jaxls.TrustRegionConfig(),
+        trust_region=jaxls.TrustRegionConfig(
+            lambda_initial=lambda_initial,
+            lambda_factor=lambda_factor,
+        ),
         termination=jaxls.TerminationConfig(
             max_iterations=max_iterations,
             cost_tolerance=cost_tolerance,
@@ -401,6 +406,15 @@ class KinematicsSolver:
         """
         self._posture_pose = jnp.asarray(q, dtype=jnp.float32)
 
+    @property
+    def posture_pose(self) -> np.ndarray:
+        """The global preferred posture, as set by :meth:`set_posture_pose`.
+
+        Lets a caller that sweeps the attractor (e.g. Cartesian path planning
+        in :mod:`almond_axol.kinematics.path`) restore what it found.
+        """
+        return np.asarray(self._posture_pose, dtype=np.float32)
+
     # -- Properties ----------------------------------------------------------
 
     @property
@@ -513,6 +527,8 @@ class KinematicsSolver:
             cfg.elbow_weight,
             cfg.max_iterations,
             cfg.cost_tolerance,
+            cfg.lambda_initial,
+            cfg.lambda_factor,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
         delta = np.clip(

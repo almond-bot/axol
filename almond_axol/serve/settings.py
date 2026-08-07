@@ -40,14 +40,17 @@ _logger = logging.getLogger(__name__)
 
 SETTINGS_PATH = Path.home() / ".almond" / "settings.json"
 
-# Operation ids (mirrors serve.commands / serve.runner).
+# The built-in operations, whose dotted config paths the tables below spell
+# out. A registered operation joins the same tables through its
+# ``settings_like`` alias rather than re-declaring them (see _settings_op).
 _OPS = ("teleop", "gravity-comp", "collect-data", "run-policy", "replay-dataset")
 
 # Dotted paths into the lerobot-based ops' shared robot config.
 _ROBOT = "robot_config"
 _AXOL = f"{_ROBOT}.axol_config"
-_VRT = "teleop_config.vr_teleop_config"
-_KIN = "teleop_config.kinematics_config"
+_TELEOP_CFG = "teleop_config"
+_VRT = f"{_TELEOP_CFG}.vr_teleop_config"
+_KIN = f"{_TELEOP_CFG}.kinematics_config"
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,22 @@ class SettingCategory:
 
 def _all_ops(*keys: str) -> dict[str, tuple[str, ...]]:
     return {op: keys for op in _OPS}
+
+
+def _settings_op(op_id: str) -> str:
+    """Resolve an operation to the id whose targets it uses.
+
+    An operation registered by a downstream package usually embeds the same
+    config dataclasses as a built-in one, so its dotted paths are identical;
+    declaring ``settings_like="collect-data"`` on its
+    :class:`~almond_axol.serve.commands.CommandDef` inherits the whole table
+    instead of restating ~50 mappings. Unknown or unaliased ids resolve to
+    themselves and simply match nothing.
+    """
+    from .commands import COMMANDS
+
+    cmd = COMMANDS.get(op_id)
+    return cmd.settings_like if cmd is not None and cmd.settings_like else op_id
 
 
 def _lerobot_dataset_root() -> str:
@@ -137,7 +156,11 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.left_channel",
                 label="Left arm CAN channel",
                 type="text",
-                help="SocketCAN interface for the left arm (e.g. can_left).",
+                help=(
+                    "SocketCAN interface for the left arm (e.g. can_alm_axol_l, "
+                    "or can0 for a non-Axol-hub adapter). 'null' disables the "
+                    "arm. Also used by the diagnostics dashboard's robot link."
+                ),
                 targets={
                     "teleop": ("left_channel",),
                     "gravity-comp": ("left_channel",),
@@ -150,13 +173,36 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.right_channel",
                 label="Right arm CAN channel",
                 type="text",
-                help="SocketCAN interface for the right arm (e.g. can_right).",
+                help=(
+                    "SocketCAN interface for the right arm (e.g. can_alm_axol_r, "
+                    "or can1 for a non-Axol-hub adapter). 'null' disables the "
+                    "arm. Also used by the diagnostics dashboard's robot link."
+                ),
                 targets={
                     "teleop": ("right_channel",),
                     "gravity-comp": ("right_channel",),
                     "collect-data": (f"{_ROBOT}.right_channel",),
                     "run-policy": (f"{_ROBOT}.right_channel",),
                     "replay-dataset": (f"{_ROBOT}.right_channel",),
+                },
+            ),
+            SettingDef(
+                key="robot.has_gripper",
+                label="Grippers fitted",
+                type="boolean",
+                help=(
+                    "This robot is the gripper-equipped SKU. Turn off for the "
+                    "gripperless SKU: the gripper motors are never enabled or "
+                    "calibrated, gripper commands are ignored, and gripper "
+                    "channels are dropped from recorded datasets. The gripper "
+                    "torque/speed settings below then have no effect."
+                ),
+                targets={
+                    "teleop": ("axol.has_gripper",),
+                    "gravity-comp": ("axol.has_gripper",),
+                    "collect-data": (f"{_AXOL}.has_gripper",),
+                    "run-policy": (f"{_AXOL}.has_gripper",),
+                    "replay-dataset": (f"{_AXOL}.has_gripper",),
                 },
             ),
             SettingDef(
@@ -213,6 +259,24 @@ SETTINGS: tuple[SettingCategory, ...] = (
                         f"{_AXOL}.left.gripper.max_speed",
                         f"{_AXOL}.right.gripper.max_speed",
                     ),
+                },
+            ),
+            SettingDef(
+                key="robot.cart_enabled",
+                label="Powered cart",
+                type="boolean",
+                help=(
+                    "This robot has the powered cart (x-drive omni base + "
+                    "telescoping lift). The headset thumbsticks then drive it "
+                    "during teleop and data collection: left stick translates, "
+                    "right stick x rotates, stick clicks run the lift. "
+                    "Operator mobility only — cart motion is never recorded "
+                    "into datasets and policies never control it. Cart "
+                    "parameters live under Advanced → Cart."
+                ),
+                targets={
+                    "teleop": ("cart.enabled",),
+                    "collect-data": (f"{_TELEOP_CFG}.cart.enabled",),
                 },
             ),
             SettingDef(
@@ -661,6 +725,13 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
         targets={"teleop": "kinematics", "collect-data": _KIN},
     ),
     AdvancedSection(
+        key="cart",
+        label="Cart",
+        ref_op="teleop",
+        ref_prefix="cart",
+        targets={"teleop": "cart", "collect-data": f"{_TELEOP_CFG}.cart"},
+    ),
+    AdvancedSection(
         key="vr_server",
         label="VR server",
         ref_op="teleop",
@@ -950,14 +1021,58 @@ class SettingsStore:
             cams = self._data["cameras"]
             return dict(cams) if isinstance(cams, dict) else None
 
+    def can_channels(self) -> tuple[str | None, str | None]:
+        """The robot's (left, right) CAN interfaces from the shared settings.
+
+        Unset values fall back to the Axol hub's persistent interface names;
+        the ops' ``null`` convention (or an empty value) disables that arm —
+        e.g. a single non-hub adapter driving one arm only. The robot link and
+        the operations both resolve their channels from here, so a custom
+        adapter chosen once (Settings, or the dashboard's CAN adapter picker)
+        applies everywhere.
+        """
+        from ..constants import CAN_LEFT, CAN_RIGHT
+
+        with self._lock:
+            left = self._data["values"].get("robot.left_channel")
+            right = self._data["values"].get("robot.right_channel")
+
+        def norm(value: Any, default: str) -> str | None:
+            if value is None:
+                return default
+            text = str(value).strip()
+            if not text:
+                return default
+            return None if text.lower() in ("null", "none") else text
+
+        return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
+
+    def has_gripper(self) -> bool:
+        """Whether this robot is the gripper-equipped SKU (default ``True``).
+
+        Read from the curated ``robot.has_gripper`` setting; the robot link
+        uses it to skip the gripper motors' pings, and the UI reads the
+        mirrored ``hasGripper`` field of ``/api/robot/status``.
+        """
+        with self._lock:
+            value = self._data["values"].get("robot.has_gripper")
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() not in ("false", "0", "no", "null")
+        return bool(value)
+
     def merged_args(self, op_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Fold the shared settings into one op start's args.
 
         Later wins: curated setting values → advanced values (canonical keys
         translated to this op's dotted paths) → the request's own args. Keys
         the op's schema doesn't know are dropped later by ``build_argv``, so a
-        stale entry can never inject anything.
+        stale entry can never inject anything — which is also what makes an
+        inherited target table safe when an aliased op only shares part of the
+        original's config.
         """
+        target_op = _settings_op(op_id)
         merged: dict[str, Any] = {}
         with self._lock:
             values = dict(self._data["values"])
@@ -966,14 +1081,14 @@ class SettingsStore:
             setting = _SETTINGS_BY_KEY.get(key)
             if setting is None or value is None:
                 continue
-            for target in setting.targets.get(op_id, ()):
+            for target in setting.targets.get(target_op, ()):
                 merged[target] = value
         for key, value in advanced.items():
             section_key, _, subpath = key.partition(".")
             section = _ADVANCED_BY_KEY.get(section_key)
             if section is None or not subpath or value is None:
                 continue
-            prefix = section.targets.get(op_id)
+            prefix = section.targets.get(target_op)
             if prefix:
                 merged[f"{prefix}.{subpath}"] = value
         merged.update(args)

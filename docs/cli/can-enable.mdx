@@ -1,12 +1,18 @@
 ---
 title: "can.enable"
-description: "Bring the CAN interfaces back up after re-plugging the Axol Hub."
+description: "Manually re-run the CAN interface bring-up."
 ---
 
-Re-runs the CAN startup script to bring interfaces up after plugging in the Axol without a system restart. ([`can.setup`](/cli/can-setup) registers a `@reboot` cron hook, so this is only needed when the Axol Hub is re-plugged mid-session.) Requires [`can.setup`](/cli/can-setup) to have been run first.
+Re-runs the CAN startup script to configure and bring up the interfaces. Normally you don't need it: [`can.setup`](/cli/can-setup) registers a `@reboot` cron hook **and** a hotplug service that re-runs the bring-up whenever the Axol Hub (re-)enumerates, so both reboots and mid-session replugs recover on their own. It remains useful as a manual fallback (e.g. after stopping the interfaces yourself, or on a machine set up with an older `can.setup` that lacked the hotplug service). Requires [`can.setup`](/cli/can-setup) to have been run first.
+
+For setups without the Axol Hub CAN adapter, pass `--channels` to bring up other SocketCAN interfaces directly — one for a single arm, two for both. This skips the hub startup script (no `can.setup` needed): each named interface is configured (1 Mbit/s bitrate, txqueuelen) and brought up; interfaces already up are left untouched.
+
+The startup script also brings up the [powered cart](/guides/vr-interface#powered-cart)'s pinned wheel bus when one was configured, and skips any interface — arm hub or cart — that isn't attached, so a cart-only host (no arm hub) and an arm-only host (no cart) each come up cleanly. You rarely need to run this for the cart anyway: [`axol teleop`](/cli/teleop) brings the cart's interface up itself when it starts.
 
 ```bash
-axol can.enable
+axol can.enable                      # Axol Hub (startup script)
+axol can.enable --channels can0      # one non-hub adapter
+axol can.enable --channels can0 can1 # two adapters / channels
 ```
 
 For the handheld UMI rig's adapter (configured with `axol can.setup --umi`), pass `--umi`:

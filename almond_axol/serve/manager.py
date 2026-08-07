@@ -25,15 +25,21 @@ _LOG_BUFFER = 4000
 _QUEUE_MAX = 1000
 _STOP_GRACE_S = 6.0
 
+# The CLI package subprocess commands run out of, unless a command names
+# another (``CommandDef.module``).
+DEFAULT_MODULE = "almond_axol"
+
 
 async def spawn_proc(
-    argv_tail: list[str], *, stdin_pipe: bool = False
+    argv_tail: list[str], *, stdin_pipe: bool = False, module: str = DEFAULT_MODULE
 ) -> asyncio.subprocess.Process:
-    """Spawn ``python -m almond_axol <argv_tail>`` with merged, streamed stdout.
+    """Spawn ``python -m <module> <argv_tail>`` with merged, streamed stdout.
 
     Runs in its own session (process group) so the whole tree can be signalled
     on teardown, and uses the serving interpreter so ``axol`` need not be on
-    PATH. ``stdin_pipe`` opens a writable stdin so the UI can answer a
+    PATH. ``module`` is the CLI package to run — the default is this one, and a
+    registered command can name its own so a downstream package's commands run
+    out of its CLI. ``stdin_pipe`` opens a writable stdin so the UI can answer a
     command's interactive prompts (see :meth:`Session.send_input`); otherwise
     stdin is ``/dev/null`` so any stray ``input()`` fails fast instead of
     hanging.
@@ -43,7 +49,7 @@ async def spawn_proc(
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
-        "almond_axol",
+        module,
         *argv_tail,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -192,10 +198,14 @@ class SessionManager:
         if command_id not in COMMANDS:
             raise KeyError(command_id)
 
-        cli = COMMANDS[command_id].cli
+        cmd = COMMANDS[command_id]
         argv = build_argv(command_id, args)
         return await self.start_raw(
-            command_id, [cli, *argv], args=args, stdin_pipe=stdin_pipe
+            command_id,
+            [cmd.cli, *argv],
+            args=args,
+            stdin_pipe=stdin_pipe,
+            module=cmd.module,
         )
 
     async def start_raw(
@@ -205,16 +215,18 @@ class SessionManager:
         *,
         args: dict[str, Any] | None = None,
         stdin_pipe: bool = False,
+        module: str = DEFAULT_MODULE,
     ) -> Session:
         """Spawn an arbitrary ``axol`` invocation as a tracked session.
 
         ``argv_tail`` is the full CLI tail (subcommand + flags). ``stdin_pipe``
         keeps a writable stdin so the UI can answer interactive prompts.
+        ``module`` names the CLI package to run it out of.
         """
         session = Session(command_id, args or {})
         self._sessions[session.id] = session
         try:
-            proc = await spawn_proc(argv_tail, stdin_pipe=stdin_pipe)
+            proc = await spawn_proc(argv_tail, stdin_pipe=stdin_pipe, module=module)
         except OSError as exc:
             session.status = "error"
             session.error = f"Failed to launch command: {exc}"
@@ -223,7 +235,8 @@ class SessionManager:
 
         session.proc = proc
         session.status = "running"
-        session.emit(f"[serve] $ axol {' '.join(argv_tail)}".rstrip())
+        cli = "axol" if module == DEFAULT_MODULE else f"python -m {module}"
+        session.emit(f"[serve] $ {cli} {' '.join(argv_tail)}".rstrip())
         asyncio.create_task(self._pump(session))
         return session
 

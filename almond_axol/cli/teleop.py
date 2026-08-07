@@ -11,6 +11,8 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
+    axol teleop --cart.enabled true                   # powered cart (base+lift)
+    axol teleop --cart_only                           # drive just the cart, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
 """
 
@@ -19,7 +21,7 @@ import logging
 import socket
 from typing import TYPE_CHECKING, Any
 
-from .config import TeleopCmdConfig, parse
+from .config import TeleopCmdConfig, normalize_bool_flags, parse
 
 if TYPE_CHECKING:
     from ..teleop import VRTeleop
@@ -33,32 +35,9 @@ def _get_local_ip() -> str:
         return s.getsockname()[0]
 
 
-def _normalize_sim_flag(argv: list[str]) -> list[str]:
-    """Let ``--sim`` / ``--umi`` be passed as bare flags.
-
-    draccus parses bool fields as value-taking arguments (``--sim true``),
-    so rewrite a standalone ``--sim`` or ``--umi`` (one that's followed by
-    another flag or nothing) into ``--sim true`` / ``--umi true``. An explicit
-    ``--sim true`` / ``--sim false`` / ``--sim=...`` is left untouched.
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok in ("--sim", "--umi"):
-            nxt = argv[i + 1] if i + 1 < len(argv) else None
-            if nxt is None or nxt.startswith("-"):
-                out.extend((tok, "true"))
-                i += 1
-                continue
-        out.append(tok)
-        i += 1
-    return out
-
-
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, _normalize_sim_flag(argv))
+    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "umi", "cart_only"))
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
@@ -287,12 +266,89 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
         _logger.warning("failed to enable camera video: %s", exc)
 
 
+def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
+    """Feed the cart's heading hold from the board BMI088 (``--cart.imu``).
+
+    The yaw reference is the carrier board's own IMU rather than a camera, so
+    nothing here touches the video path — the overhead ZED keeps the relay's
+    GStreamer pipeline.
+
+    Returns a :class:`~almond_axol.robot.gyro.BoardYawRateSource` the caller
+    must close on exit, or ``None``. Best-effort: any failure logs and leaves
+    the cart without a heading hold (which is inert when no yaw rates arrive,
+    and says so once the cart starts driving).
+    """
+    if cart is None or not cfg.cart.imu:
+        return None
+    try:
+        from ..robot.gyro import BoardYawRateSource
+
+        src = BoardYawRateSource(cart.feed_yaw_rate)
+        src.open()
+        return src
+    except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
+        _logger.warning(
+            "cart.imu: could not start the board gyro (%s); heading hold disabled",
+            exc,
+        )
+        return None
+
+
+async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
+    """Drive only the powered cart from the headset — the arms stay cold.
+
+    No Axol construction, no IK, no arm CAN: just the VR server for the
+    thumbstick stream and the :class:`~almond_axol.robot.cart.Cart`. The
+    cart's own control mapping applies unchanged (stick deadman, reset stop,
+    staleness timeout — see ``Cart.apply_vr_frame``). Having a cart is
+    implied, so ``--cart.enabled`` is not consulted; the rest of the
+    ``cart.*`` parameters (channel, speeds, imu, ...) apply as usual.
+    """
+    from ..robot.cart import Cart
+    from ..vr import VRServer
+
+    cart = Cart(cfg.cart)
+    server = VRServer(cfg.vr_server)
+    server.set_mode("teleop")
+    # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
+    # arms there is no reset trajectory to wait out (resetting stays False).
+    server.set_on_frame(cart.apply_vr_frame)
+
+    await cart.enable()
+    imu_src = _wire_cart_imu(cfg, cart)
+    _logger.info(
+        "cart-only teleop: thumbsticks drive the cart (deadman — release "
+        "to stop); the arms are untouched"
+    )
+    try:
+        async with server:
+            await asyncio.Event().wait()  # until Ctrl-C / supervisor stop
+    finally:
+        if imu_src is not None:
+            await asyncio.to_thread(imu_src.close)
+        await cart.disable()
+
+
 async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim, Umi
     from ..teleop import VRTeleop
 
     if cfg.umi and cfg.sim:
         raise SystemExit("--umi and --sim are mutually exclusive")
+
+    if cfg.cart_only:
+        if cfg.sim:
+            raise ValueError(
+                "cart-only teleop has no sim mode (there is no cart hardware "
+                "model in the visualizer) — drop --sim or --cart_only"
+            )
+        if cfg.umi:
+            raise ValueError(
+                "--umi drives the handheld rig and --cart_only the powered "
+                "cart — pick one"
+            )
+        await _run_cart_only(cfg)
+        return
 
     if cfg.umi:
         # Handheld UMI rig bench mode: the Quest triggers drive the two real
@@ -320,11 +376,20 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
         )
+    # Powered-cart robots (--cart.enabled true) get the base + lift driven by
+    # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
+    # sim — there's no cart hardware model in the visualizer.
+    cart = None
+    if cfg.cart.enabled and not cfg.sim:
+        from ..robot.cart import Cart
+
+        cart = Cart(cfg.cart)
     async with VRTeleop(
         robot,
         config=cfg.teleop,
         kinematics_config=cfg.kinematics,
         vr_server_config=cfg.vr_server,
+        cart=cart,
     ) as teleop:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
@@ -341,9 +406,12 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         else:
             cameras = await asyncio.to_thread(_connect_zed_cameras, cfg, stereo_set)
             _register_zed_video(teleop, cameras)
+        imu_src = _wire_cart_imu(cfg, cart)
         try:
             await teleop.run()
         finally:
+            if imu_src is not None:
+                await asyncio.to_thread(imu_src.close)
             if relay is not None:
                 await asyncio.to_thread(relay.shutdown)
             for _name, cam in cameras:

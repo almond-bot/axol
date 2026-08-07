@@ -1,9 +1,9 @@
 ---
 title: "Command configuration"
-description: "How the teleop, gravity-comp, collect-data, replay-dataset, run-policy, and inference-server commands are configured with draccus."
+description: "How the teleop, gravity-comp, waypoints, collect-data, replay-dataset, run-policy, and inference-server commands are configured with draccus."
 ---
 
-Six commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
+Seven commands — [`teleop`](/cli/teleop), [`gravity-comp`](/cli/gravity-comp), [`waypoints`](/cli/waypoints), [`collect-data`](/cli/collect-data), [`replay-dataset`](/cli/replay-dataset), [`run-policy`](/cli/run-policy), and [`inference-server`](/cli/inference-server) — expose their **entire configuration** through [draccus](https://github.com/dlwh/draccus) instead of a fixed set of `argparse` flags. Every field of the underlying config dataclass is reachable from the command line, and the whole config can also be loaded from a file.
 
 The remaining commands (`can.*`, `motor.*`, `zed.*`, `gst.*`, `jetson.setup`, `provision`, `tune.*`, and `serve`) still use plain `argparse` flags and are unaffected by anything on this page.
 
@@ -25,6 +25,7 @@ Each command is backed by a config dataclass (for example `TeleopCmdConfig` wrap
 ```bash
 axol teleop --axol.left_stiffness 0.8
 axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
+axol teleop --axol.has_gripper false   # gripperless SKU
 axol collect-data --repo_id myorg/pick --task "pick" \
     --robot_config.axol_config.left_stiffness 0.8 \
     --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"

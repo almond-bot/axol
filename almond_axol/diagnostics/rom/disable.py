@@ -30,7 +30,7 @@ import math
 import sys
 import time
 
-from ...constants import Joint
+from ...constants import CAN_LEFT, CAN_RIGHT, Joint
 from ...motor import ControlMode
 from ...robot.axol import GRIPPER_TRAVEL, Axol, AxolArm
 
@@ -127,16 +127,18 @@ async def _disable(axol: Axol, present: set[Joint]) -> None:
 
 
 async def run(
-    no_left: bool, no_right: bool, present: set[Joint], web_prompts: bool = False
+    no_left: bool,
+    no_right: bool,
+    present: set[Joint],
+    web_prompts: bool = False,
+    left_channel: str = CAN_LEFT,
+    right_channel: str = CAN_RIGHT,
 ) -> None:
     """Open each present gripper sequentially, then disable the present motors."""
-    kwargs = {}
-    if no_left:
-        kwargs["left_channel"] = None
-    if no_right:
-        kwargs["right_channel"] = None
-
-    axol = Axol(**kwargs)
+    axol = Axol(
+        left_channel=None if no_left else left_channel,
+        right_channel=None if no_right else right_channel,
+    )
     has_gripper = Joint.GRIPPER in present
 
     # The motors are already enabled and holding (rom.enable left them up); only
@@ -185,6 +187,20 @@ def _add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-left", action="store_true", help="Skip the left arm.")
     parser.add_argument("--no-right", action="store_true", help="Skip the right arm.")
     parser.add_argument(
+        "--left-channel",
+        default=CAN_LEFT,
+        metavar="IFACE",
+        help="SocketCAN interface for the left arm, for setups without the "
+        "Axol hub CAN adapter (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--right-channel",
+        default=CAN_RIGHT,
+        metavar="IFACE",
+        help="SocketCAN interface for the right arm, for setups without the "
+        "Axol hub CAN adapter (default: %(default)s).",
+    )
+    parser.add_argument(
         "--joints",
         default=None,
         help="Comma-separated joints present on the bus (must match the rom.enable run). "
@@ -222,6 +238,8 @@ def run_cli(args: argparse.Namespace) -> None:
             no_right=args.no_right,
             present=present,
             web_prompts=args.web_prompts,
+            left_channel=args.left_channel,
+            right_channel=args.right_channel,
         )
     )
 

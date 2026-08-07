@@ -15,6 +15,7 @@ Examples:
     axol motor.set-zero-pos --l --id 0x01
     axol motor.set-zero-pos --r --id 0x06
     axol motor.set-zero-pos --l --guided
+    axol motor.set-zero-pos --l --guided --joints wrist_2,wrist_3
 """
 
 import argparse
@@ -22,11 +23,12 @@ import asyncio
 import math
 import sys
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT, Joint
+from ...constants import ARM_JOINTS, Joint
 from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
 from ...robot.axol import closer_end_stop
+from . import add_side_and_channel_arguments, resolve_channel
 
 # Marker prefix a --web-prompts step prints before blocking on stdin (same
 # convention as the ROM diagnostics); the dashboard shows a Continue button.
@@ -41,9 +43,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
-    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
+    add_side_and_channel_arguments(p)
     p.add_argument(
         "--id",
         type=lambda x: int(x, 0),
@@ -60,7 +60,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--guided",
         action="store_true",
-        help="Walk every arm joint, zeroing each at its closer end stop.",
+        help="Walk the arm joints, zeroing each at its closer end stop.",
+    )
+    p.add_argument(
+        "--joints",
+        default=None,
+        help="Comma-separated subset of arm joints to walk in --guided mode "
+        "(e.g. wrist_2,wrist_3). Default: all seven. One of: "
+        f"{', '.join(j.value for j in ARM_JOINTS)}.",
     )
     p.add_argument(
         "--web-prompts",
@@ -84,13 +91,43 @@ async def _run(args: argparse.Namespace) -> None:
         await _run_guided(args)
         return
 
+    if args.joints is not None:
+        raise SystemExit("error: --joints only applies to --guided mode.")
     if args.id is None:
         raise SystemExit("error: --id is required (or use --guided).")
     await _run_single(args)
 
 
+def _parse_arm_joints(spec: str | None) -> list[Joint]:
+    """Parse a ``--joints`` spec into an ordered subset of :data:`ARM_JOINTS`.
+
+    ``None`` or empty selects all seven arm joints. Names match the joint enum
+    values (e.g. ``shoulder_1``, ``elbow``). The gripper has no zero to set
+    (it self-calibrates against its hard stops at enable time), so it is not
+    a valid choice here.
+    """
+    if not spec:
+        return list(ARM_JOINTS)
+    by_value = {j.value: j for j in ARM_JOINTS}
+    selected: set[Joint] = set()
+    for raw in spec.split(","):
+        name = raw.strip().lower()
+        if not name:
+            continue
+        if name == Joint.GRIPPER.value:
+            raise SystemExit(
+                "The gripper has no zero to set — it self-calibrates against "
+                "its hard stops when enabled."
+            )
+        if name not in by_value:
+            valid = ", ".join(by_value)
+            raise SystemExit(f"Unknown joint '{name}'. Valid joints: {valid}")
+        selected.add(by_value[name])
+    return [j for j in ARM_JOINTS if j in selected] or list(ARM_JOINTS)
+
+
 async def _run_single(args: argparse.Namespace) -> None:
-    channel = CAN_LEFT if args.l else CAN_RIGHT
+    channel = resolve_channel(args)
     print(f"\nset-zero-pos — {channel}  id={args.id:#04x}")
 
     async with CanBus(channel) as bus:
@@ -209,33 +246,45 @@ async def _calibrate_joint(
 
 async def _run_guided(args: argparse.Namespace) -> None:
     is_left = args.l
-    channel = CAN_LEFT if is_left else CAN_RIGHT
+    channel = resolve_channel(args)
     side = "LEFT" if is_left else "RIGHT"
-    print(f"\nset-zero-pos --guided — {side} arm  ({channel})")
+    joints = _parse_arm_joints(args.joints)
+    joints_desc = (
+        "all joints"
+        if len(joints) == len(ARM_JOINTS)
+        else ", ".join(j.value for j in joints)
+    )
+    print(f"\nset-zero-pos --guided — {side} arm  ({channel})  |  {joints_desc}")
 
     async with CanBus(channel) as bus:
-        motors = {joint: Motor(bus, joint) for joint in ARM_JOINTS}
+        motors = {joint: Motor(bus, joint) for joint in joints}
 
-        # Capture an in-range start reference for every joint up front, so the
-        # operator positions the whole arm once rather than once per joint.
+        # Capture an in-range start reference for every selected joint up
+        # front, so the operator positions the arm once rather than once per
+        # joint.
+        hold_what = (
+            "EVERY joint somewhere inside its range"
+            if len(joints) == len(ARM_JOINTS)
+            else f"the selected joints ({joints_desc}) somewhere inside their range"
+        )
         if not _prompt(
-            "hold EVERY joint somewhere inside its range (away from the end stops)",
+            f"hold {hold_what} (away from the end stops)",
             args.web_prompts,
         ):
             print("\naborted.")
             return
         starts = dict(
             zip(
-                ARM_JOINTS,
-                await asyncio.gather(*[motors[j].get_position() for j in ARM_JOINTS]),
+                joints,
+                await asyncio.gather(*[motors[j].get_position() for j in joints]),
             )
         )
-        for joint in ARM_JOINTS:
+        for joint in joints:
             print(f"  {joint.name:<12} start: {_fmt(starts[joint])}")
 
         results: list[tuple[Joint, bool]] = []
         any_damiao = False
-        for joint in ARM_JOINTS:
+        for joint in joints:
             target, sign = closer_end_stop(joint, is_left)
             motor = motors[joint]
             try:

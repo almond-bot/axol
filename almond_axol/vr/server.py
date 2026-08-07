@@ -94,6 +94,15 @@ class VRServer:
         # readout — the default for plain teleop, which never sets it.
         self._episode: int | None = None
 
+        # Latest headset HUD state (armed save/discard confirmation popup,
+        # record countdown) published by the driving client via a ``hud``
+        # signaling message, and that client's id. Relayed to every *other*
+        # client so a dashboard can mirror what the headset would show (the
+        # operator may drive with the controllers while the headset is off);
+        # cleared — with a null broadcast — when the publisher disconnects.
+        self._hud: dict[str, Any] | None = None
+        self._hud_client: int | None = None
+
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
         # each ``seq`` once, from whichever transport delivers it first — the
@@ -238,6 +247,17 @@ class VRServer:
                 await ws.send_text(text)
             except Exception as exc:
                 _logger.warning("Failed to send feedback to client: %s", exc)
+
+    async def _broadcast_hud(self, exclude: WebSocket | None = None) -> None:
+        """Relay the current headset HUD state to (other) connected clients."""
+        text = json.dumps({"type": "hud", "value": self._hud})
+        for ws in list(self._active_clients):
+            if ws is exclude:
+                continue
+            try:
+                await ws.send_text(text)
+            except Exception as exc:
+                _logger.warning("Failed to relay hud to client: %s", exc)
 
     async def enable(self) -> None:
         """Start the WSS server in the background.
@@ -417,6 +437,16 @@ class VRServer:
                 await self._control.set_answer(client_id, sdp)
             return
 
+        # Headset HUD state (armed confirmation popup, record countdown):
+        # store it and relay to every other client so a dashboard can mirror
+        # the in-headset popups (see ``self._hud``).
+        if msg_type == "hud":
+            value = obj.get("value")
+            self._hud = value if isinstance(value, dict) else None
+            self._hud_client = client_id
+            await self._broadcast_hud(exclude=websocket)
+            return
+
         if self._webrtc is None:
             if msg_type == "webrtc-request":
                 await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
@@ -504,6 +534,15 @@ class VRServer:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort announce
                     _logger.warning("failed to send episode to client: %s", exc)
+            # And any live headset HUD state (armed popup / countdown), so a
+            # dashboard joining mid-dialog mirrors it immediately.
+            if server._hud is not None:
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "hud", "value": server._hud})
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send hud to client: %s", exc)
             try:
                 while True:
                     data = await websocket.receive_text()
@@ -519,6 +558,13 @@ class VRServer:
             finally:
                 server._active_clients.discard(websocket)
                 server._client_count = max(0, server._client_count - 1)
+                # The HUD publisher (the headset) left: clear its popups from
+                # every mirror so a dashboard doesn't show a stale dialog.
+                if server._hud_client == client_id:
+                    server._hud_client = None
+                    if server._hud is not None:
+                        server._hud = None
+                        await server._broadcast_hud()
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)

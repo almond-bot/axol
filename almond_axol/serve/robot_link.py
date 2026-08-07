@@ -20,10 +20,9 @@ import asyncio
 import logging
 import threading
 import time
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from ..constants import CAN_LEFT, CAN_RIGHT
+from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
 from ..motor import CanBus, Joint, Motor, MotorError
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
@@ -47,9 +46,6 @@ STATE_CONNECTING = "connecting"
 STATE_CONNECTED = "connected"
 STATE_BUSY = "busy"
 STATE_ERROR = "error"
-
-# IFF_UP flag in /sys/class/net/<iface>/flags (administratively up).
-_IFF_UP = 0x1
 
 
 # Motor status names that are healthy at idle: OK, or DISABLED (motors sit
@@ -84,6 +80,62 @@ def motor_faults(
                 "temperature": m.get("temperature"),
             }
         )
+    return faults
+
+
+def _flag(value: Any) -> bool:
+    """A submitted form flag: real booleans or the string \"true\"."""
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def _joint_name_for_id(value: Any) -> str | None:
+    """Joint name for a motor CAN id (0x01–0x08 in Joint order), else None."""
+    try:
+        motor_id = int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+    joints = list(Joint)
+    if 1 <= motor_id <= len(joints):
+        return joints[motor_id - 1].name
+    return None
+
+
+def scoped_motor_faults(
+    faults: list[dict[str, Any]], args: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Filter faults down to the motors a command launch will actually touch.
+
+    Keys off the shared argument conventions of the motor-driving diagnostics:
+    the ``arm`` selector (``--l``/``--r``), the ROM tests' ``no_left`` /
+    ``no_right`` skips, a ``joints`` subset, and a single motor ``id``
+    (ignored in guided zeroing, which walks ``joints`` instead). A bench setup
+    with only some motors on the bus can then run a scoped test without the
+    absent motors' "unreachable" faults blocking the launch — while faults on
+    the motors the run *does* drive still block it.
+    """
+    arm = str(args.get("arm") or "").strip().lower()
+    if arm in ("left", "right"):
+        faults = [f for f in faults if f["arm"] == arm]
+    if _flag(args.get("no_left")):
+        faults = [f for f in faults if f["arm"] != "left"]
+    if _flag(args.get("no_right")):
+        faults = [f for f in faults if f["arm"] != "right"]
+
+    joint_names: set[str] | None = None
+    joints = args.get("joints")
+    if isinstance(joints, str) and joints.strip():
+        joint_names = {p.strip().upper() for p in joints.split(",") if p.strip()}
+    elif not _flag(args.get("guided")):
+        joint = _joint_name_for_id(args.get("id") or args.get("current_id"))
+        if joint is not None:
+            joint_names = {joint}
+    if joint_names is not None:
+        faults = [f for f in faults if f["joint"].upper() in joint_names]
+    elif _flag(args.get("guided")):
+        # Guided zeroing without an explicit subset walks the seven arm
+        # joints; the gripper is never touched (it has no zero to set), so
+        # a gripper fault must not block the launch.
+        faults = [f for f in faults if f["joint"].upper() != Joint.GRIPPER.name]
     return faults
 
 
@@ -123,11 +175,16 @@ class _ArmLink:
     def lock(self, joint: Joint) -> asyncio.Lock:
         return self._locks[joint]
 
-    async def open(self) -> None:
+    async def open(self, joints: list[Joint]) -> None:
+        """Open the bus and construct one motor per joint in ``joints``.
+
+        The gripperless SKU passes the 7 arm joints only, so the absent
+        gripper motor is never pinged (and never reported unreachable).
+        """
         self._bus = CanBus(self.channel)
         await self._bus.start()
-        self._motors = {joint: Motor(self._bus, joint) for joint in Joint}
-        self._locks = {joint: asyncio.Lock() for joint in Joint}
+        self._motors = {joint: Motor(self._bus, joint) for joint in joints}
+        self._locks = {joint: asyncio.Lock() for joint in joints}
 
     async def close(self) -> None:
         if self._bus is not None:
@@ -208,7 +265,19 @@ class RobotLink:
         left_channel: str | None = CAN_LEFT,
         right_channel: str | None = CAN_RIGHT,
         hub: TelemetryHub | None = None,
+        has_gripper: Callable[[], bool] | None = None,
     ) -> None:
+        """Construct the link.
+
+        Args:
+            left_channel:  SocketCAN interface for the left arm; None disables.
+            right_channel: Same for the right arm.
+            hub:           Telemetry hub to publish sweeps into.
+            has_gripper:   Callable returning whether this robot has grippers
+                           (e.g. ``SettingsStore.has_gripper``), re-read on
+                           every connect. ``None`` means always ``True``.
+        """
+        self._has_gripper_provider = has_gripper
         self._arms: list[_ArmLink] = []
         if left_channel:
             self._arms.append(_ArmLink(left_channel, "left"))
@@ -230,6 +299,28 @@ class RobotLink:
         self._ping_task: asyncio.Task[Any] | None = None
         self._sample_task: asyncio.Task[Any] | None = None
         self._lock = threading.Lock()
+        # Joint set snapshotted when the buses open, so status() stays
+        # consistent with the motors actually being pinged even if the
+        # has_gripper setting is toggled mid-connection. None = link down;
+        # status() then reports the live setting (what the next connect uses).
+        self._active_joints: list[Joint] | None = None
+
+    def _has_gripper(self) -> bool:
+        if self._has_gripper_provider is None:
+            return True
+        return bool(self._has_gripper_provider())
+
+    def _joints(self) -> list[Joint]:
+        """The motors this robot actually has (gripper excluded on the gripperless SKU).
+
+        While the link is up this is the connect-time snapshot matching the
+        opened motors; otherwise the current setting.
+        """
+        with self._lock:
+            active = self._active_joints
+        if active is not None:
+            return active
+        return list(Joint) if self._has_gripper() else list(ARM_JOINTS)
 
     # -- thread plumbing ----------------------------------------------------
 
@@ -276,6 +367,9 @@ class RobotLink:
         self._set_state(STATE_DISCONNECTED)
         with self._lock:
             self._last_ping = None
+            # The snapshot describes the motors whose health was just cleared;
+            # status() now falls back to the live setting.
+            self._active_joints = None
         for arm in self._arms:
             arm.health = {}
         self.hub.clear_slow()
@@ -313,14 +407,43 @@ class RobotLink:
         """Current motor faults (see :func:`motor_faults`); [] when not connected."""
         return self.status()["faults"]
 
+    def channels(self) -> tuple[str | None, str | None]:
+        """The (left, right) CAN interfaces the link opens; None = arm disabled."""
+        left = next((a.channel for a in self._arms if a.side == "left"), None)
+        right = next((a.channel for a in self._arms if a.side == "right"), None)
+        return left, right
+
+    def set_channels(self, left_channel: str | None, right_channel: str | None) -> None:
+        """Swap the CAN interfaces the link uses (e.g. a non-Axol-hub adapter).
+
+        A ``None`` channel disables that arm, so a single-adapter setup can run
+        one arm only. No-op when nothing changes; raises ``RuntimeError`` while
+        the link (or a task borrowing its bus) is up, since the open buses
+        belong to the old interfaces.
+        """
+        if self.channels() == (left_channel, right_channel):
+            return
+        with self._lock:
+            if self._state not in (STATE_DISCONNECTED, STATE_ERROR):
+                raise RuntimeError(
+                    "disconnect the robot link before changing CAN interfaces"
+                )
+            self._arms = []
+            if left_channel:
+                self._arms.append(_ArmLink(left_channel, "left"))
+            if right_channel:
+                self._arms.append(_ArmLink(right_channel, "right"))
+        self.hub.clear_slow()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             state = self._state
             error = self._error
             last_ping = self._last_ping
         motors: list[dict[str, Any]] = []
+        joints = self._joints()
         for arm in self._arms:
-            for joint in Joint:
+            for joint in joints:
                 h = arm.health.get(joint.name, {})
                 motors.append(
                     {
@@ -333,11 +456,14 @@ class RobotLink:
                     }
                 )
         reachable = sum(1 for m in motors if m["reachable"])
+        left_channel, right_channel = self.channels()
         return {
             "state": state,
             "connected": state in (STATE_CONNECTED, STATE_BUSY),
             "error": error,
             "lastPing": last_ping,
+            "channels": {"left": left_channel, "right": right_channel},
+            "hasGripper": Joint.GRIPPER in joints,
             "motors": motors,
             "motorCount": len(motors),
             "reachableCount": reachable,
@@ -371,8 +497,13 @@ class RobotLink:
     # -- loop-side coroutines ----------------------------------------------
 
     async def _open_and_start(self) -> None:
+        # Snapshot the joint set from the live setting for this connection;
+        # status() reports from the same snapshot until the link is torn down.
+        joints = list(Joint) if self._has_gripper() else list(ARM_JOINTS)
+        with self._lock:
+            self._active_joints = joints
         for arm in self._arms:
-            await arm.open()
+            await arm.open(joints)
         if self._ping_task is None or self._ping_task.done():
             self._ping_task = asyncio.ensure_future(self._ping_loop())
         if self._sample_task is None or self._sample_task.done():
@@ -432,19 +563,33 @@ class RobotLink:
 
     def _can_already_up(self) -> bool:
         """True when every CAN interface is administratively up (no sudo needed)."""
+        from ..cli.can.setup import iface_up
+
         if not self._arms:
             return False
-        for arm in self._arms:
-            try:
-                flags = int(
-                    Path(f"/sys/class/net/{arm.channel}/flags").read_text().strip(),
-                    16,
-                )
-            except (OSError, ValueError):
-                return False
-            if not (flags & _IFF_UP):
-                return False
-        return True
+        return all(iface_up(arm.channel) for arm in self._arms)
+
+    def _uses_axol_hub(self) -> bool:
+        """True when the link runs on the Axol hub's persistently-named pair.
+
+        Anything else — a renamed single adapter, a one-arm setup, a generic
+        ``can0`` — is a custom configuration whose bring-up must not run the
+        hub-specific ``can.setup`` (udev rules, interface renames, RX-wedge
+        recovery), just plain SocketCAN interface configuration.
+        """
+        return {arm.channel for arm in self._arms} == {CAN_LEFT, CAN_RIGHT}
+
+    def _enable_custom_can(self) -> None:
+        """Bring up user-chosen CAN interfaces (no Axol hub adapter present).
+
+        The interfaces must already exist; a missing one is reported by name
+        so the operator can pick another in the UI. Interfaces that are down
+        are configured (bitrate, txqueuelen) and brought up; ones already up
+        are left untouched. Shared with ``axol can.enable --channels``.
+        """
+        from ..cli.can.setup import bring_up_interfaces
+
+        bring_up_interfaces([arm.channel for arm in self._arms])
 
     def _enable_can(self) -> None:
         """Bring up the CAN interfaces.
@@ -471,8 +616,17 @@ class RobotLink:
 
         ``axol serve`` runs as root under the hosted install, so the privileged
         steps inside :func:`ensure_setup` run without a sudo prompt.
+
+        Custom (non-Axol-hub) interfaces skip all of that: they just need to
+        exist and be up (see :meth:`_enable_custom_can`).
         """
         from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
+
+        if not self._arms:
+            raise RuntimeError("No CAN interfaces configured")
+        if not self._uses_axol_hub():
+            self._enable_custom_can()
+            return
 
         if self._can_already_up():
             if rx_alive():

@@ -7,6 +7,9 @@ Probes all 16 motors (8 per arm) and reports which responded. For each motor it 
 
 The command iterates the left arm (`CAN_LEFT`) then the right arm (`CAN_RIGHT`), printing one line per joint. It exits with status `1` if any motor failed to respond, making it suitable for scripts and provisioning checks.
 
+`--left-channel` / `--right-channel` override the SocketCAN interface used for each arm, for setups without the Axol hub CAN adapter; `--no-left` / `--no-right` skip an arm entirely (e.g. a one-arm rig, so a missing arm doesn't fail the check).
+
 ```bash
 axol motor.health
+axol motor.health --no-right --left-channel can0   # one arm on a non-hub CAN adapter
 ```

@@ -15,6 +15,7 @@ import asyncio
 
 from ...motor.bus import CanBus
 from ...motor.motor import make_driver
+from . import add_side_and_channel_arguments, resolve_channel
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
@@ -25,9 +26,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true", help="Left arm (can_alm_axol_l)")
-    side.add_argument("--r", action="store_true", help="Right arm (can_alm_axol_r)")
+    add_side_and_channel_arguments(p)
     p.add_argument(
         "--current-id",
         required=True,
@@ -57,7 +56,7 @@ def run(args: argparse.Namespace) -> None:
 
 
 async def _run(args: argparse.Namespace) -> None:
-    channel = "can_alm_axol_l" if args.l else "can_alm_axol_r"
+    channel = resolve_channel(args)
     print(f"\nset-can-id — {channel}  {args.current_id:#04x} → {args.new_id:#04x}")
 
     async with CanBus(channel) as bus:

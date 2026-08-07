@@ -1254,6 +1254,65 @@ def _verify_videos_decodable(
     return bad
 
 
+def _close_dataset_writers(dataset: "LeRobotDataset") -> None:
+    """Run ``dataset.finalize()``, guaranteeing the parquet footers get written.
+
+    A parquet file is only readable once its writer is closed — that is what
+    appends the row-group index and the trailing ``PAR1`` magic. LeRobot keeps
+    two writers open for a whole session (the data rows, and ``meta/episodes``,
+    which buffers ten episodes per row group) and closes both in
+    ``DatasetWriter.finalize()`` — but only as steps 3 and 4, behind the image
+    writer drain (step 1) and the video encoder flush (step 2). Anything raising
+    in those first two steps leaves both files footerless, which loses *every*
+    episode the session recorded: pyarrow can't locate a single row group
+    without the footer, so ``load_episodes`` fails and the dataset can no longer
+    be read, resumed, or shipped.
+
+    Video and image teardown failures are real but recoverable (at worst one
+    episode's video is bad); losing the metadata is not. So close the writers
+    even when ``finalize()`` blows up, and re-raise afterwards so the caller
+    still reports the original failure.
+    """
+    try:
+        dataset.finalize()
+    except Exception:
+        _logger.exception(
+            "dataset.finalize() failed — closing the parquet writers directly so "
+            "the episodes recorded this session stay readable"
+        )
+        writer = getattr(dataset, "writer", None)
+        if writer is not None:
+            with contextlib.suppress(Exception):
+                writer.close_writer()
+        with contextlib.suppress(Exception):
+            dataset.meta.finalize()
+        raise
+
+
+def _verify_episodes_readable(dataset_root: "Path | str") -> None:
+    """Log loudly if ``meta/episodes`` can't be read back after finalize.
+
+    The failure mode this guards against (a parquet file left without its
+    footer) is invisible until something downstream tries to load the dataset —
+    by which point the session is over and the operator has moved on. Reading
+    the metadata back here names the bad file while the log still has the
+    context that produced it.     Best-effort: never raises — it runs from a ``finally``, where an escaping
+    exception would mask the failure that got us here.
+    """
+    try:
+        from lerobot.datasets.io_utils import load_episodes
+
+        load_episodes(Path(dataset_root))
+    except Exception as exc:  # noqa: BLE001 - diagnostic only
+        _logger.error(
+            "meta/episodes at %s is unreadable after finalize (%s) — the episode "
+            "metadata parquet is corrupt, so the dataset cannot be resumed or "
+            "shipped as-is",
+            dataset_root,
+            exc,
+        )
+
+
 def _finalize_dataset(
     dataset: "LeRobotDataset",
     config: dict,
@@ -1262,7 +1321,14 @@ def _finalize_dataset(
 ) -> None:
     from lerobot.utils.utils import log_say
 
-    dataset.finalize()
+    try:
+        _close_dataset_writers(dataset)
+    finally:
+        # In a finally because the recovery path re-raises, and that is the
+        # case this check exists for: the writers have been closed by then
+        # either way, so this is where we find out whether the salvage worked.
+        if episodes_recorded > 0:
+            _verify_episodes_readable(config["dataset_root"])
     if episodes_recorded > 0:
         with contextlib.suppress(Exception):
             _verify_videos_decodable(config["dataset_root"], since=session_start)
@@ -1623,10 +1689,16 @@ def _recorder_main(
                 conn.send(("cancelled",))
     finally:
         stop_capture()
-        with contextlib.suppress(Exception):
+        try:
             _finalize_dataset(
                 dataset, config, episodes_recorded, session_start=session_start
             )
+        except Exception:
+            # Never let this take the subprocess down before the cameras are
+            # released, but do not swallow it either: a failed finalize is how
+            # a session's episode metadata ends up unreadable, and suppressing
+            # it left the operator with only the downstream parquet error.
+            _logger.exception("recorder failed to finalize the dataset")
         for cam in cameras.values():
             with contextlib.suppress(Exception):
                 cam.close()
@@ -1757,8 +1829,30 @@ class DatasetRecorderProcess:
             pass
         self._proc.join(timeout=_SAVE_TIMEOUT_S)
         if self._proc.is_alive():
+            # SIGTERM: the child dies where it stands, without running the
+            # finally that finalizes the dataset. Nothing here can recover from
+            # that, so at least say so — the alternative is an unreadable
+            # dataset with no explanation anywhere in the log.
+            _logger.error(
+                "recorder did not shut down within %.0fs — killing it; the "
+                "dataset was not finalized and its parquet files are likely "
+                "unreadable",
+                _SAVE_TIMEOUT_S,
+            )
             self._proc.terminate()
             self._proc.join(timeout=5.0)
+        elif self._proc.exitcode:
+            # A child that died on its own (a crash, or the OOM killer) never
+            # ran its finalize either, and until now that was indistinguishable
+            # from a clean shutdown: join() returns instantly on an already-dead
+            # process, so the session went on to validate and upload as if all
+            # was well.
+            _logger.error(
+                "recorder subprocess exited with %s before shutdown — the "
+                "dataset was not finalized and its parquet files are likely "
+                "unreadable",
+                self._proc.exitcode,
+            )
         with contextlib.suppress(Exception):
             self._conn.close()
         with contextlib.suppress(Exception):

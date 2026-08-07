@@ -47,6 +47,9 @@ async with VRServer() as vr:
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
 | `t` | `float \| None` | Client capture timestamp in ms (`performance.now()`), used by the pose interpolator. `None` falls back to latest-wins |
 | `seq` | `int \| None` | Monotonic frame counter set by the headset. The same `seq` arrives over both the USB and network transports; the server processes each logical frame once, via whichever transport delivers it first. `None` disables cross-transport de-duplication |
+| `l_stick_x` / `l_stick_y` | `float [-1, 1]` | Left thumbstick axes (right = +1; pushed forward = -1). Drive the [powered cart](/guides/vr-interface#powered-cart)'s translation when one is configured |
+| `r_stick_x` | `float [-1, 1]` | Right thumbstick x (right = +1). Drives the powered cart's rotation |
+| `l_stick_click` / `r_stick_click` | `bool` | Thumbstick press-in — left lowers the cart's lift, right raises it. Neutral defaults keep older web builds (which omit these fields) compatible |
 
 ### Pose transports & USB/Wi-Fi fallback
 
@@ -63,6 +66,8 @@ On connect the server also announces its **operating mode** — `{"type": "mode"
 During data collection the server likewise pushes the current **episode number** — `{"type": "episode", "value": N}` (1-based) — which the headset renders as an `Episode N` HUD readout. [`axol collect-data`](/cli/collect-data) announces it at the start of each episode via `AxolVRTeleop.send_feedback_episode(episode)`, which both stores the value on the server (`VRServer.set_episode()`, re-sent on connect so a mid-session headset shows the right number) and broadcasts a live update to connected clients. Plain teleop never sets it, so the readout stays hidden.
 
 Teleop additionally broadcasts `{"type": "tracking", "value": true|false}` whenever the engage toggle changes, so the headset knows when the robot is being controlled — it uses this to only allow repositioning and resizing the camera screens (a trigger gesture) while tracking is disengaged.
+
+The server also **relays HUD state between clients**. The driving client (the headset) publishes its transient HUD — an armed save/discard confirmation popup and the record-start countdown — as `{"type": "hud", "value": {...}}`; the server stores the latest value, forwards it to every *other* connected client, re-sends it to one that joins mid-dialog, and clears it with a null broadcast when the publisher disconnects. The web control panel uses this to mirror the in-headset popups so a session can be followed from the dashboard.
 
 ## Camera video to the headset
 

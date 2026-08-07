@@ -9,6 +9,7 @@ Repeatability test for the **left arm**: moves rest → pose **A** once, then bo
 |---|---|
 | `--cycles INT` | Number of A→B→A round trips; `0` (default) = run until Ctrl-C |
 | `--gripper-torque-limit FLOAT` | Gripper closing torque limit in Nm (default: 0.3) |
+| `--no-gripper` | Run on the gripperless SKU — the gripper motor is never enabled or calibrated (`--gripper-torque-limit` is then ignored) |
 | `--dwell FLOAT` | Seconds to hold at each waypoint except B (default: 0.5) |
 | `--dwell-b FLOAT` | Seconds to hold at pose B before returning to A (default: 3.0) |
 | `--rate FLOAT` | Control loop / waypoint rate in Hz — higher = finer steps and smoother playback at the same speed (default: 250) |

@@ -7,12 +7,18 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``adb``           — Android Debug Bridge + the Oculus udev rule, for
                       streaming Quest controller poses over a USB
                       ``adb reverse`` tunnel (see :mod:`almond_axol.utils.adb`).
+* ``zed.driver``    — replaces the ZED Box Duo's known-bad factory GMSL
+                      capture driver with the pinned release (takes effect on
+                      the next reboot; never reboots itself).
 * ``zed.install``   — the pyzed bindings (not on PyPI; needs the ZED SDK).
 * ``gst.install``   — the GStreamer + PyGObject ``appsink`` stack (PyGObject
                       builds against the system gobject-introspection and is
                       dropped on every ``uv tool upgrade``).
 * ``gst.build-zed`` — the patched zedxonesrc/zedsrc plugins (sensor-accurate
                       PTS so collected images line up with joint samples).
+* ``gyro.install``  — group access to the carrier board's BMI088 sampling
+                      timer, the cart heading hold's yaw reference (see
+                      :mod:`almond_axol.robot.gyro`).
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -31,9 +37,11 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from ..robot import gyro
 from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
+from .zed import driver as zed_driver
 from .zed import install as zed_install
 
 _logger = logging.getLogger(__name__)
@@ -54,7 +62,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def _step(label: str, fn: Callable[[], None]) -> None:
+def _step(label: str, fn: Callable[[], object]) -> None:
     """Run one provisioning step; log and continue on failure (best-effort)."""
     try:
         fn()
@@ -73,6 +81,15 @@ def run(_args: object = None) -> None:
     # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
     # on apt-get.
     _step("adb (Quest-over-USB)", adb.install)
+    # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
+    # replace it with the pinned release. Self-gates on the factory package
+    # being present (ensure_driver, not run: a *quiet* no-op everywhere else)
+    # and never reboots — the new kernel driver loads on the next reboot, so
+    # it just prints a notice.
+    _step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
+    # Group access to the board IMU's sampling timer, so teleop can start the
+    # cart's yaw reference without root. Self-gates on the driver's presence.
+    _step("board IMU (gyro.install)", gyro.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:
         _step("pyzed (zed.install)", zed_install.run)
