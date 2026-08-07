@@ -1,8 +1,12 @@
 """
 axol can.setup
 
-Sets persistent CAN interface names for the Almond Axol CAN bus adapters
-and registers a root crontab @reboot entry to bring up the interfaces.
+Sets persistent CAN interface names for the Almond Axol CAN bus adapters,
+registers a root crontab @reboot entry to bring up the interfaces, and
+installs a udev-triggered systemd unit that re-runs the bring-up whenever the
+adapter (re-)enumerates — so a mid-session USB drop of the hub (EMI from the
+arms can kick it off the bus, most visibly on Raspberry Pi 5 hosts) heals
+itself without operator action.
 
 The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two CAN
 channels on a single USB device:
@@ -13,6 +17,11 @@ Robots on the powered cart additionally carry a single-channel candlelight
 adapter (same generic VID/PID) for the wheel bus, named can_alm_axol_b. The
 channel count tells the two apart: the hub always enumerates both channels
 under one serial, the cart adapter exactly one.
+
+On Raspberry Pi 5 hosts the setup additionally raises the RP1 USB
+controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
+the disconnects at their source; the hotplug bring-up covers whatever still
+gets through.
 """
 
 import re
@@ -35,6 +44,20 @@ _TXQUEUELEN = 512
 _UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
 _CAN_DIR = Path.home() / ".almond" / "can"
 _CRON_SCRIPT = _CAN_DIR / "startup.sh"
+
+# Hotplug bring-up: pulled in via the udev rules (SYSTEMD_WANTS) whenever an
+# adapter (re-)enumerates, so interfaces recreated by a mid-session USB drop
+# come back configured and up without operator action.
+_HOTPLUG_UNIT = "axol-can-up.service"
+_HOTPLUG_UNIT_FILE = Path("/etc/systemd/system") / _HOTPLUG_UNIT
+
+# Raspberry Pi 5 RP1 USB EMI-tolerance quirk (see _setup_rp1_usb_quirk).
+_RP1_QUIRK_SCRIPT = _CAN_DIR / "rp1-usb-quirk.sh"
+_RP1_QUIRK_UNIT = "axol-rp1-usb-quirk.service"
+_RP1_QUIRK_UNIT_FILE = Path("/etc/systemd/system") / _RP1_QUIRK_UNIT
+# GUCTL1 register of each RP1 xHCI controller (DWC3 global registers live at
+# base + 0xc100; the Pi 5 has one controller per USB-A port pair).
+_RP1_GUCTL1_REGS = ("0x1f0020c11c", "0x1f0030c11c")
 
 
 def _die(msg: str) -> None:
@@ -224,6 +247,12 @@ def _write_udev_rules(serial: str, base_serial: str | None = None) -> None:
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x0", NAME="{_CAN_L}"\n'
         f"# Channel 1 -> right arm\n"
         f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
+        f"# Every (re-)enumeration — boot or a mid-session USB drop — pulls in\n"
+        f"# the bring-up service so the channels come back configured and up.\n"
+        f"# Tagged on the USB device rather than the net interfaces: the NAME=\n"
+        f"# rules above put every real hotplug add mid-rename, and systemd\n"
+        f'# skips SYSTEMD_WANTS on renaming devices ("device is renaming").\n'
+        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
     )
     if base_serial:
         # Matched by serial alone: CANable firmware variants ship various
@@ -232,6 +261,7 @@ def _write_udev_rules(serial: str, base_serial: str | None = None) -> None:
             f"# Powered-cart wheel bus (single-channel adapter)\n"
             f"# Adapter serial: {base_serial}\n"
             f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{base_serial}", NAME="{_CAN_B}"\n'
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{base_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
         )
     run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
     print("  Done.")
@@ -285,6 +315,10 @@ def _write_cron_script(*, with_base: bool = False) -> None:
         f"#!/bin/bash\n"
         f"# Bring up Almond Axol CAN interfaces\n"
         f"#\n"
+        f"# Runs at boot (@reboot root crontab) and on every (re-)enumeration\n"
+        f"# of the adapter (udev -> {_HOTPLUG_UNIT}), so a mid-session USB\n"
+        f"# drop of the hub comes back configured without operator action.\n"
+        f"#\n"
         f"# The arm interfaces are channels of one dual-channel gs_usb adapter.\n"
         f"# Bring them down together, configure, then up together — flapping\n"
         f"# the channels one at a time (down/up L, then down/up R) toggles the\n"
@@ -292,6 +326,19 @@ def _write_cron_script(*, with_base: bool = False) -> None:
         f"# Skipped entirely when the hub is unplugged (a cart-only session\n"
         f"# must still bring up the wheel bus below).\n"
         f"set -euo pipefail\n\n"
+        f"# Boot and hotplug triggers can race (the hub's two channels fire one\n"
+        f"# udev add event each) — serialize whole runs.\n"
+        f'exec 9>"/run/lock/axol-can-up.lock"\n'
+        f"flock 9\n\n"
+        f"# The two channels enumerate a beat apart, so the trigger for the\n"
+        f"# first can run before the second exists. Give the pair a moment.\n"
+        f"for _ in $(seq 1 30); do\n"
+        f"    if ip link show {_CAN_L} >/dev/null 2>&1 "
+        f"&& ip link show {_CAN_R} >/dev/null 2>&1; then\n"
+        f"        break\n"
+        f"    fi\n"
+        f"    sleep 0.1\n"
+        f"done\n\n"
         f"if ip link show {_CAN_L} >/dev/null 2>&1 "
         f"&& ip link show {_CAN_R} >/dev/null 2>&1; then\n"
         f"    for IFACE in {_CAN_L} {_CAN_R}; do\n"
@@ -335,6 +382,105 @@ def _register_cron() -> None:
         new_crontab = existing.rstrip("\n") + "\n" + cron_entry + "\n"
         run_root(["crontab", "-"], input_text=new_crontab, check=True)
         print(f"  Added: {cron_entry}")
+
+
+def _write_hotplug_unit() -> None:
+    """Install the systemd unit the udev rules pull in on adapter hotplug.
+
+    udev tags the adapter's net devices with ``SYSTEMD_WANTS=axol-can-up.service``
+    (see :func:`_write_udev_rules`), so every (re-)enumeration — boot or a
+    mid-session USB drop — runs the startup script and the interfaces come
+    back configured and up within a second, no operator action needed.
+    """
+    print(f"Writing hotplug bring-up unit to {_HOTPLUG_UNIT_FILE} (requires sudo)...")
+    content = (
+        f"# Installed by `axol can.setup`. Pulled in by {_UDEV_RULES_FILE}\n"
+        f"# whenever an Axol CAN adapter (re-)enumerates: a mid-session USB\n"
+        f"# drop recreates the interfaces down and unconfigured, and this\n"
+        f"# service brings them back up without operator action.\n"
+        f"[Unit]\n"
+        f"Description=Bring up Almond Axol CAN interfaces on adapter hotplug\n"
+        f"\n"
+        f"[Service]\n"
+        f"Type=oneshot\n"
+        f"ExecStart=/bin/bash {_CRON_SCRIPT}\n"
+    )
+    run_root(["tee", str(_HOTPLUG_UNIT_FILE)], input_text=content, check=True)
+    run_root(["systemctl", "daemon-reload"], check=True)
+    print("  Done.")
+
+
+def _is_raspberry_pi_5() -> bool:
+    """True on Raspberry Pi 5 family boards (the RP1-southbridge USB ports)."""
+    try:
+        model = Path("/proc/device-tree/model").read_text()
+    except OSError:
+        return False
+    return "Raspberry Pi 5" in model
+
+
+def _setup_rp1_usb_quirk() -> None:
+    """Raise the RP1 xHCI's EMI tolerance on Raspberry Pi 5 hosts.
+
+    The Pi 5's RP1 USB controllers ship with a hair-trigger loss-of-activity /
+    babble detector. Electrical noise from the arms' motor drivers coupling
+    into the hub's full-speed USB link trips it, and the kernel disables the
+    port (``usb usb3-port1: disabled by hub (EMI?), re-enabling...``) or the
+    adapter drops off the bus entirely — disconnects that the same robot never
+    shows on ZED Box / Jetson hosts. Setting bit 0 (the LOA filter) of each
+    controller's GUCTL1 register makes the detector ride out those glitches;
+    it's the workaround recommended by Raspberry Pi engineers
+    (forums.raspberrypi.com/viewtopic.php?t=363780).
+
+    The register resets on reboot, so this installs a boot-time oneshot unit
+    and also applies it immediately. No-op on non-Pi-5 hosts.
+    """
+    if not _is_raspberry_pi_5():
+        return
+    if not Path("/usr/bin/busybox").exists():
+        print(
+            "WARNING: busybox not found — skipping the RP1 USB EMI quirk "
+            "(install busybox and re-run `axol can.setup`)."
+        )
+        return
+    print("Applying RP1 USB EMI-tolerance quirk (Pi 5 only, requires sudo)...")
+    _CAN_DIR.mkdir(parents=True, exist_ok=True)
+    regs = " ".join(_RP1_GUCTL1_REGS)
+    script = (
+        f"#!/bin/bash\n"
+        f"# Raspberry Pi 5 (RP1) USB EMI-tolerance quirk for the Axol CAN hub.\n"
+        f"#\n"
+        f"# Sets bit 0 (LOA filter enable) of GUCTL1 in each RP1 xHCI\n"
+        f"# controller so EMI glitches on the hub's full-speed link no longer\n"
+        f'# disable the port ("disabled by hub (EMI?)" disconnects in dmesg).\n'
+        f"# Recommended by Raspberry Pi engineers:\n"
+        f"#   https://forums.raspberrypi.com/viewtopic.php?t=363780\n"
+        f"#\n"
+        f"# The register resets on reboot; {_RP1_QUIRK_UNIT} re-applies it.\n"
+        f"set -euo pipefail\n\n"
+        f"for reg in {regs}; do\n"
+        f'    val=$(busybox devmem "$reg")\n'
+        f'    busybox devmem "$reg" 32 $(( val | 1 ))\n'
+        f"done\n"
+    )
+    _RP1_QUIRK_SCRIPT.write_text(script)
+    _RP1_QUIRK_SCRIPT.chmod(0o755)
+    unit = (
+        f"# Installed by `axol can.setup` on Raspberry Pi 5 hosts.\n"
+        f"[Unit]\n"
+        f"Description=RP1 USB EMI-tolerance quirk for the Axol CAN hub\n"
+        f"\n"
+        f"[Service]\n"
+        f"Type=oneshot\n"
+        f"ExecStart=/bin/bash {_RP1_QUIRK_SCRIPT}\n"
+        f"\n"
+        f"[Install]\n"
+        f"WantedBy=multi-user.target\n"
+    )
+    run_root(["tee", str(_RP1_QUIRK_UNIT_FILE)], input_text=unit, check=True)
+    run_root(["systemctl", "daemon-reload"], check=True)
+    run_root(["systemctl", "enable", "--now", _RP1_QUIRK_UNIT], check=True)
+    print("  Done.")
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -455,7 +601,11 @@ def is_configured() -> bool:
     full :func:`ensure_setup` (first time on a machine) or can just bring the
     already-named interfaces up.
     """
-    return _UDEV_RULES_FILE.exists() and _CRON_SCRIPT.exists()
+    return (
+        _UDEV_RULES_FILE.exists()
+        and _CRON_SCRIPT.exists()
+        and _HOTPLUG_UNIT_FILE.exists()
+    )
 
 
 def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -> None:
@@ -471,10 +621,15 @@ def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -
     serial = serial or _resolve_serial()
     base_serial = base_serial or _configured_base_serial()
     _write_udev_rules(serial, base_serial)
+    _write_cron_script(with_base=base_serial is not None)
+    _write_hotplug_unit()
     _reload_udev()
     _rename_interfaces(serial, base_serial)
-    _write_cron_script(with_base=base_serial is not None)
     _register_cron()
+    try:
+        _setup_rp1_usb_quirk()
+    except Exception as exc:  # noqa: BLE001 - the quirk must never block CAN setup
+        print(f"  WARNING: RP1 USB quirk setup failed: {exc}")
     bring_up_can()
 
 
@@ -522,3 +677,9 @@ def run(_args: object = None) -> None:
     if base_serial:
         print(f"  Cart     : {_CAN_B}")
     print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
+    print(
+        f"  Hotplug  : {_HOTPLUG_UNIT} (re-runs the startup script whenever "
+        f"the adapter re-enumerates, e.g. after a mid-session USB drop)"
+    )
+    if _is_raspberry_pi_5():
+        print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")
