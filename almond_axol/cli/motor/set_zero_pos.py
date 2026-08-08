@@ -2,10 +2,15 @@
 axol motor.set-zero-pos
 
 Set the zero position of a single motor, or use ``--guided`` to zero every
-arm joint against its closer end stop. Guided mode first captures an in-range
-start reference for all joints at once, then walks each joint to its end stop
-and zeros it. The current mechanical position becomes the new zero reference
+arm joint against an end stop. Guided mode first captures an in-range start
+reference for all joints at once, then walks each joint to its end stop and
+zeros it. The current mechanical position becomes the new zero reference
 (persisted to flash).
+
+Most joints are zeroed at one specific end stop (the closer one). WRIST_2 and
+WRIST_3 accept EITHER end stop — their stops are not laser-aligned, so per
+unit one may be better placed than the other; move to whichever you trust and
+the runtime detects the side automatically from the encoder reading.
 
 Note: each motor's encoder zero is calibrated at one of the joint's
 mechanical END STOPS, not at the robot's rest position. ``AxolArm`` adds a
@@ -27,7 +32,7 @@ from ...constants import ARM_JOINTS, Joint
 from ...motor.bus import CanBus
 from ...motor.damiao import DamiaoMotor
 from ...motor.motor import Motor, make_driver
-from ...robot.axol import closer_end_stop
+from ...robot.axol import EITHER_STOP_JOINTS, closer_end_stop
 from . import add_side_and_channel_arguments, resolve_channel
 
 # Marker prefix a --web-prompts step prints before blocking on stdin (same
@@ -60,7 +65,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--guided",
         action="store_true",
-        help="Walk the arm joints, zeroing each at its closer end stop.",
+        help="Walk the arm joints, zeroing each at an end stop "
+        "(wrist_2/wrist_3 accept either side).",
     )
     p.add_argument(
         "--joints",
@@ -180,6 +186,58 @@ def _fmt(rad: float) -> str:
     return f"{rad:+.4f} rad ({math.degrees(rad):+.1f}°)"
 
 
+async def _calibrate_joint_either_stop(
+    motor: Motor,
+    joint: Joint,
+    p_start: float,
+    magnitude_rad: float,
+    web_prompts: bool,
+) -> bool:
+    """Zero one joint at whichever of its two end stops the operator chose.
+
+    For :data:`EITHER_STOP_JOINTS` (symmetric limits ±``magnitude_rad``):
+    the operator moves from the in-range start reference ``p_start`` to
+    either stop; the direction of travel identifies which one, and the
+    runtime later re-detects the side from the encoder reading, so no side
+    needs to be recorded. Returns ``True`` on success.
+    """
+    mag_deg = math.degrees(magnitude_rad)
+    print(f"\n— {joint.name}  →  EITHER end stop (±{mag_deg:.1f}°) —")
+    print(f"     start: {_fmt(p_start)}")
+
+    while True:
+        if not _prompt(
+            f"{joint.name}: move to EITHER end stop (+{mag_deg:.1f}° or "
+            f"-{mag_deg:.1f}° — whichever is better placed)",
+            web_prompts,
+        ):
+            return False
+        p_end = await motor.get_position()
+        print(f"     end:   {_fmt(p_end)}")
+
+        delta = p_end - p_start
+        print(f"     moved: {_fmt(delta)}")
+
+        if abs(delta) < _MIN_MOTION_RAD:
+            print("    ✗ no motion — retry.")
+            continue
+
+        mag_diff = abs(abs(delta) - magnitude_rad)
+        if mag_diff > _MAGNITUDE_WARN_RAD:
+            print(
+                f"    ⚠  moved {math.degrees(abs(delta)):.1f}°, expected"
+                f" ~{mag_deg:.1f}° — make sure you're against the stop."
+            )
+
+        chosen_deg = math.copysign(mag_deg, delta)
+        await motor.set_zero_position()
+        print(
+            f"    ✓ zeroed at the {chosen_deg:+.1f}° end stop at {_fmt(p_end)} "
+            f"(side is auto-detected at runtime)."
+        )
+        return True
+
+
 async def _calibrate_joint(
     motor: Motor,
     joint: Joint,
@@ -288,9 +346,14 @@ async def _run_guided(args: argparse.Namespace) -> None:
             target, sign = closer_end_stop(joint, is_left)
             motor = motors[joint]
             try:
-                ok = await _calibrate_joint(
-                    motor, joint, starts[joint], target, sign, args.web_prompts
-                )
+                if joint in EITHER_STOP_JOINTS:
+                    ok = await _calibrate_joint_either_stop(
+                        motor, joint, starts[joint], abs(target), args.web_prompts
+                    )
+                else:
+                    ok = await _calibrate_joint(
+                        motor, joint, starts[joint], target, sign, args.web_prompts
+                    )
             except KeyboardInterrupt:
                 print("\naborted.")
                 break

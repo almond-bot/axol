@@ -6,7 +6,7 @@ description: "Set a motor's zero-position reference to its current mechanical po
 Sets the motor's zero-position reference to its current mechanical position (persisted to flash). Damiao motors require a power cycle afterward.
 
 <Warning>
-  Each motor's encoder zero is calibrated at one of the joint's mechanical **end stops**, **not** at the robot's rest position. In `--guided` mode the CLI drives every joint to its closer end stop and zeroes there; in single-`--id` mode you are responsible for holding the joint at the intended end stop before zeroing. `AxolArm` carries a per-joint offset so the public API stays in joint frame (`0` = rest).
+  Each motor's encoder zero is calibrated at one of the joint's mechanical **end stops**, **not** at the robot's rest position. In `--guided` mode the CLI walks every joint to an end stop and zeroes there; in single-`--id` mode you are responsible for holding the joint at the intended end stop before zeroing. `AxolArm` carries a per-joint offset so the public API stays in joint frame (`0` = rest).
 </Warning>
 
 | Flag | Description |
@@ -15,10 +15,12 @@ Sets the motor's zero-position reference to its current mechanical position (per
 | `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
 | `--id ID` | CAN ID of the motor to zero, hex or decimal (required unless `--guided`) |
 | `--type {myactuator,damiao}` | Motor type (inferred from `--id` if omitted) |
-| `--guided` | Walk through the arm joints, zeroing each at its closer end stop |
+| `--guided` | Walk through the arm joints, zeroing each at an end stop |
 | `--joints j1,j2,…` | Subset of arm joints to walk in `--guided` mode (default: all seven; the gripper has no zero — it self-calibrates at enable time) |
 
 In `--guided` mode the CLI first asks you to hold every selected joint somewhere inside its operating range (away from the end stops) and press Enter **once** — it captures each joint's in-range start reference concurrently. It then walks the selected arm joints one at a time (the gripper is auto-calibrated at runtime): for each, move it to the prompted end stop and press Enter. If the motion is in the expected direction the zero is committed immediately. If you moved the wrong way, the CLI keeps your starting reference and asks you to travel to the *other* end stop instead; pressing Enter there sets the zero. Press Ctrl-C to skip a joint.
+
+`wrist_2` and `wrist_3` are special: their end stops are the only ones that are not laser-aligned, so per unit one stop can be better placed than the other. For these two joints the guided flow accepts **either** end stop — move to whichever you trust and press Enter. Which side a robot was zeroed at is detected automatically at runtime from the encoder reading (zeroed at the upper stop, all readings are ≤ 0; at the lower stop, ≥ 0), so no side has to be recorded anywhere and robots zeroed by the older forced-side flow keep working unchanged. The only requirement: don't park these joints exactly at an end stop when connecting, since that one position is ambiguous.
 
 ```bash
 axol motor.set-zero-pos --l --id 0x01                        # single motor
@@ -27,5 +29,5 @@ axol motor.set-zero-pos --l --guided --joints wrist_2,wrist_3  # just the wrist 
 ```
 
 <Note>
-  After `--guided` calibration each motor's encoder zero coincides with its calibration end stop. `AxolArm` carries a per-joint offset internally so the public API (`positions`, `motion_control`, etc.) stays in joint frame (`0` = rest position). Damiao motors (`WRIST_2`, `WRIST_3`) need a power cycle for the new zero to take effect.
+  After `--guided` calibration each motor's encoder zero coincides with its calibration end stop. `AxolArm` carries a per-joint offset internally so the public API (`positions`, `motion_control`, etc.) stays in joint frame (`0` = rest position); for `wrist_2`/`wrist_3` the offset's sign is detected from the encoder at connect time. Damiao motors (`WRIST_2`, `WRIST_3`) need a power cycle for the new zero to take effect.
 </Note>
