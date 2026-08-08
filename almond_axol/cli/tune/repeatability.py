@@ -83,6 +83,11 @@ def _build_pose(
     calibration end stop). The control stack works in joint frame (0 = rest),
     where ``joint = motor + closer_end_stop(j, is_left)[0]``. The right arm is
     held at its rest configuration so only the left arm differs from rest.
+
+    Note: this static conversion assumes wrist_2/wrist_3 were zeroed at their
+    historical (closer) end stop. If the arm is re-zeroed at the other stop
+    (the guided flow now accepts either side), the pasted poses are stale —
+    re-pose the arm and paste fresh numbers, as the module docstring says.
     """
     q = q_rest.copy()
     for i, j in enumerate(ARM_JOINTS):

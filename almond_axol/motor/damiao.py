@@ -124,13 +124,31 @@ class DamiaoMotor(MotorDriver):
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
+    # Payload byte 2 of register-protocol traffic addressed by [id_lo, id_hi]:
+    # 0x33 read replies (handled), plus 0x55 write acks, 0xAA store acks, and
+    # 0xCC feedback-request echoes, which carry no data we consume but must
+    # never reach the feedback decoder (see _on_message).
+    _REGISTER_TRAFFIC_CMDS = frozenset({0x33, 0x55, 0xAA, 0xCC})
+
     def _on_message(self, msg: can.Message) -> None:
         if len(msg.data) != 8:
             return
         data = bytes(msg.data)
 
-        if data[1] <= 0x0F and data[2] == 0x33 and data[3] <= 81:
-            if (data[0] | (data[1] << 8)) == self._motor_id:
+        # Register-protocol traffic: [id_lo, id_hi, cmd, rid, ...]. Only the
+        # 0x33 read reply carries data we consume, but the motor also acks
+        # 0x55 writes / 0xAA stores by echoing the frame on its MST_ID —
+        # observed live when enable()'s set_control_mode (register 10 write)
+        # races the next position read: the ack [id_lo, 0x00, 0x55, rid, ...]
+        # passed the feedback checks below and decoded to ≈ -12.47 rad
+        # (position bytes 0x0055), a physically impossible -714° that
+        # poisoned the cached position. Swallow the whole ack/echo family
+        # here. (In principle a real feedback frame could match this
+        # signature, but only with the position in the bottom ~6% of the
+        # ±p_max range AND that exact low byte — unreachable on a jointed
+        # arm, and the 0x33 branch has always accepted the same trade-off.)
+        if data[1] <= 0x0F and data[2] in self._REGISTER_TRAFFIC_CMDS and data[3] <= 81:
+            if (data[0] | (data[1] << 8)) == self._motor_id and data[2] == 0x33:
                 self._handle_register_reply(data)
             return
 

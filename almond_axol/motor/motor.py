@@ -292,6 +292,11 @@ class Motor:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     @property
+    def telemetry_active(self) -> bool:
+        """True while the background telemetry polling loop is running."""
+        return self._telemetry_task is not None
+
+    @property
     def has_position(self) -> bool:
         """True once a position has been cached by telemetry or a set_impedance() response."""
         return self._position is not None
