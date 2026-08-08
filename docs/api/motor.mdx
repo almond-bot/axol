@@ -55,6 +55,7 @@ asyncio.run(main())
 | `set_acceleration(acceleration, deceleration)` | Acceleration ramp (rad/s²) |
 | `set_can_id(can_id)` | Change CAN ID (persisted to flash) |
 | `start_telemetry(hz, torque=False)` / `stop_telemetry()` | Background polling loop |
+| `motor.telemetry_active` | `True` while the background polling loop is running (`get_position()` / `get_torque()` do direct reads and raise while it is) |
 | `motor.position` | Cached position (rad); populated by telemetry or `set_impedance` responses |
 | `motor.has_position` | `True` once a position has been cached (i.e. telemetry has warmed up) |
 | `motor.torque` | Cached torque (Nm); populated by telemetry with `torque=True` |
