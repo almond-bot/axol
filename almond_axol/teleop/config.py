@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,6 +110,24 @@ class VRTeleopConfig:
             mounting height so datasets stay consistent across operators of
             different heights. ``None`` (default) lets the fit take the
             vertical position from the held grippers.
+        tcp_transform_left: Calibrated tracker→gripper SE(3) transform for the
+            left rig as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed
+            in the tracker's local frame), measured by ``axol umi.calibrate``.
+            When set, ``absolute_mode`` maps each tracked pose through it —
+            recorded TCP poses become mount-independent and wrist rotations
+            stop smearing into position error — instead of absorbing the
+            whole controller→gripper offset into the engage snapshot. ``None``
+            falls back to the engage-snapshot absorption.
+        tcp_transform_right: Same for the right rig.
+        tracker_key: Identity key of the active tracker (e.g. ``"quest"``,
+            ``"survive:T20"``, ``"ultimate:<mac>"``) used to select the
+            matching per-tracker entry from the saved calibration file when
+            ``tcp_transform_left`` / ``tcp_transform_right`` are unset.
+            ``None`` (default) derives the key from the saved tracker config
+            (``~/.almond/tracker/config.json`` present → its backend/devices;
+            absent → ``"quest"``). Set it explicitly when that presumption is
+            wrong, e.g. teleoperating with the Quest on a machine that also
+            has a Vive backend configured.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -156,6 +177,9 @@ class VRTeleopConfig:
     rotation_multiplier: float = 1.0
     absolute_mode: bool = False
     base_height: float | None = None
+    tcp_transform_left: list[float] | None = None
+    tcp_transform_right: list[float] | None = None
+    tracker_key: str | None = None
 
 
 def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
@@ -171,6 +195,15 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     which on the rig is pure pose↔image misalignment (and visible slack in the
     headset's URDF overlay); a higher cutoff keeps the solution pinned to the
     hand at the price of passing through a little tremor.
+
+    Also loads any saved ``axol umi.calibrate`` tracker→gripper transforms
+    into ``tcp_transform_left`` / ``tcp_transform_right`` (explicitly set
+    values win over the file). The calibration file is keyed per tracker
+    identity; the entry matching the active tracker (``config.tracker_key``,
+    or derived — see :func:`almond_axol.umi.calibration.tracker_key_for_side`)
+    is selected per side. A missing entry for the active tracker is warned
+    about loudly: the session would otherwise silently record uncalibrated
+    (engage-snapshot) TCP poses.
     """
     config.absolute_mode = True
     config.ik_alpha = 1.0
@@ -178,3 +211,51 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     config.teleop_max_accel = 1e6
     config.engage_max_vel = 1e6
     config.pose_min_cutoff = 5.0
+
+    if config.tcp_transform_left is None or config.tcp_transform_right is None:
+        from ..umi.calibration import (
+            LEGACY_TRACKER_KEY,
+            UMI_TCP_TRANSFORM_FILE,
+            load_tcp_transforms,
+            tracker_key_for_side,
+        )
+
+        saved = load_tcp_transforms()
+        for side in ("left", "right"):
+            attr = f"tcp_transform_{side}"
+            if getattr(config, attr) is not None:
+                continue
+            key, reason = tracker_key_for_side(side, override=config.tracker_key)
+            entries = saved.get(side, {})
+            if key in entries:
+                setattr(config, attr, entries[key])
+                _logger.info(
+                    "UMI %s: loaded tracker→gripper calibration for tracker %r (%s).",
+                    side,
+                    key,
+                    reason,
+                )
+            elif LEGACY_TRACKER_KEY in entries:
+                setattr(config, attr, entries[LEGACY_TRACKER_KEY])
+                _logger.warning(
+                    "UMI %s: no calibration for the active tracker %r (%s) — "
+                    "falling back to a LEGACY entry measured with an unknown "
+                    "tracker. If the tracker changed since, this transform "
+                    "is wrong; re-run `axol umi.calibrate`.",
+                    side,
+                    key,
+                    reason,
+                )
+            else:
+                _logger.warning(
+                    "UMI %s: NO tracker→gripper calibration for the active "
+                    "tracker %r (%s) in %s — absolute mode will absorb the "
+                    "whole controller→gripper offset into the engage "
+                    "snapshot, so recorded TCP poses will be mount-dependent "
+                    "and wrist rotations will smear into position error. Run "
+                    "`axol umi.calibrate` before collecting data.",
+                    side,
+                    key,
+                    reason,
+                    UMI_TCP_TRANSFORM_FILE,
+                )

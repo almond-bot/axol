@@ -127,8 +127,12 @@ class AxolVRTeleop(Teleoperator):
         self._q_out = np.zeros(16, dtype=np.float32)
         self._q_lock = threading.Lock()
 
-        # Episode state
+        # Episode state. The three latches are set on the VR event-loop
+        # thread (_on_vr_frame) and read-then-cleared on the control loop
+        # (get_teleop_events); ``_event_lock`` makes that swap atomic so a
+        # press landing between the read and the clear is never lost.
         self._prev_state: VRState = VRState.TELEOP
+        self._event_lock = threading.Lock()
         self._rerecord_latch: bool = False
         self._terminate_latch: bool = False
         self._start_recording_latch: bool = False
@@ -527,17 +531,56 @@ class AxolVRTeleop(Teleoperator):
         """
         return self._core.last_pose_host_ts
 
+    def tcp_poses(self) -> dict | None:
+        """Latest base-frame TCP target per side (absolute/UMI mode only).
+
+        ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}`` in the robot
+        base frame — the tracked ground-truth pose the IK solver chased for
+        the latest action. UMI data collection records this per dataset row
+        so training can use raw TCP trajectories (e.g. UMI-style relative EE
+        actions) independent of the joint solutions. ``None`` before the
+        first solve or outside absolute mode.
+        """
+        return self._core.last_tcp
+
+    def tcp_last_change_ts(self) -> float | None:
+        """Monotonic time the tracked TCP pose last took a *new* value.
+
+        ``time.perf_counter`` seconds of the last IK reply whose TCP differed
+        from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
+        A tracker dropout / IK stall keeps replying with an identical pose,
+        so UMI data collection compares this against "now" to count stale
+        frames — frozen poses recorded under fresh row timestamps. ``None``
+        before the first absolute-mode solve.
+        """
+        return self._core.last_tcp_change_ts
+
+    def is_engaged(self) -> bool:
+        """Whether teleop tracking is currently engaged (both grips squeezed).
+
+        Mirrors the shared core's engage toggle. While disengaged the IK
+        target — and therefore the recorded TCP — holds still even though the
+        operator's hands move, and the *next* engage re-fits the world→base
+        transform; UMI data collection uses this to count disengaged frames
+        and to flag mid-episode re-engages that invalidate an episode.
+        """
+        return self._core.teleop_enabled
+
     def get_teleop_events(self) -> dict[TeleopEvents | str, Any]:
         """Return episode control events derived from VRState transitions.
 
         Consumes and clears any latched events. Call once per control step.
+        The read-and-clear happens under ``_event_lock`` (shared with the VR
+        frame callback's latch writes), so a state transition arriving
+        between the read and the clear cannot be silently dropped.
         """
-        rerecord = self._rerecord_latch
-        terminate = self._terminate_latch
-        start_recording = self._start_recording_latch
-        self._rerecord_latch = False
-        self._terminate_latch = False
-        self._start_recording_latch = False
+        with self._event_lock:
+            rerecord = self._rerecord_latch
+            terminate = self._terminate_latch
+            start_recording = self._start_recording_latch
+            self._rerecord_latch = False
+            self._terminate_latch = False
+            self._start_recording_latch = False
         return {
             TeleopEvents.IS_INTERVENTION: False,
             TeleopEvents.TERMINATE_EPISODE: terminate,
@@ -570,20 +613,24 @@ class AxolVRTeleop(Teleoperator):
             # force a stop so the base doesn't creep during return-to-rest.
             self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
-        # Episode state transitions
+        # Episode state transitions. Latch writes take _event_lock so they
+        # can't land inside get_teleop_events' read-then-clear and vanish.
         prev = self._prev_state
         curr = frame.state
         if prev == VRState.DATA_COLLECTION and curr == VRState.RECORDING:
-            self._start_recording_latch = True
+            with self._event_lock:
+                self._start_recording_latch = True
 
         if prev == VRState.RECORDING and curr == VRState.DATA_COLLECTION:
             if frame.reset:
                 # Discard episode — consume the reset so it doesn't trigger
                 # rest-pose move.
-                self._rerecord_latch = True
+                with self._event_lock:
+                    self._rerecord_latch = True
                 self._core.clear_reset_request()
             else:
-                self._terminate_latch = True
+                with self._event_lock:
+                    self._terminate_latch = True
         self._prev_state = curr
 
     # ------------------------------------------------------------------

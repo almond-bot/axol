@@ -641,35 +641,59 @@ class EncodedAuReader:
     close = disconnect
 
 
-class SnapshotWriter:
-    """Control-process side: publish the latest joint/action snapshot.
+# Snapshot ring depth: ~0.5 s of history at the 120 Hz control rate — plenty
+# for the recorder's nearest-timestamp pose↔image pairing (the match target is
+# within a frame interval or two of "now").
+_SNAP_RING_SLOTS = 64
 
-    A lock-free single-slot seqlock over one shared-memory block of float64s
-    (``[ts, *joint_obs_vals, *action_vals]`` in fixed ``obs_keys`` / ``action_keys``
-    order). The control loop calls :meth:`write` every tick; the cost is a handful
-    of dict lookups + an aligned float store — no pickle, no lock, no blocking, so
-    it stays off the hot path. The recorder subprocess reads it via
-    :class:`SnapshotReader`. Single-writer / single-reader.
+
+class SnapshotWriter:
+    """Control-process side: publish joint/action snapshots into a shm ring.
+
+    A lock-free seqlock ring over one shared-memory block: ``_SNAP_RING_SLOTS``
+    slots of float64s (``[ts, *joint_obs_vals, *action_vals]`` in fixed
+    ``obs_keys`` / ``action_keys`` order), each guarded by its own seq counter,
+    plus a global committed-write count. The control loop calls :meth:`write`
+    every tick; the cost is a handful of dict lookups + aligned float stores —
+    no pickle, no lock, no blocking, so it stays off the hot path. The recorder
+    subprocess reads via :class:`SnapshotReader`: either the newest snapshot
+    (``read_latest``) or the one whose timestamp is nearest a camera frame's
+    capture time (``read_nearest`` — UMI pose↔image pairing). Single-writer /
+    single-reader.
     """
 
     def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
         n = len(self._obs_keys) + len(self._action_keys)
+        self._slot_len = 1 + n
+        header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
         self._shm = shared_memory.SharedMemory(
-            create=True, size=_SNAP_HEADER_BYTES + 8 * (1 + n)
+            create=True, size=header_bytes + 8 * _SNAP_RING_SLOTS * self._slot_len
         )
         self.name = self._shm.name
         self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
-        self._data = np.ndarray(
-            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+        self._slot_seq = np.ndarray(
+            (_SNAP_RING_SLOTS,),
+            dtype="<i8",
+            buffer=self._shm.buf,
+            offset=_SNAP_HEADER_BYTES,
         )
-        self._meta["seq"][0] = 0
+        self._data = np.ndarray(
+            (_SNAP_RING_SLOTS, self._slot_len),
+            dtype="<f8",
+            buffer=self._shm.buf,
+            offset=header_bytes,
+        )
+        self._meta["seq"][0] = 0  # committed-write count
+        self._slot_seq[:] = 0
 
     def write(self, joint_obs: dict, action: dict, ts: float) -> None:
-        """Pack one snapshot into the slot (seq odd while writing, even when done)."""
-        self._meta["seq"][0] += 1  # odd: write in progress
-        d = self._data
+        """Pack one snapshot into the next ring slot (per-slot seqlock)."""
+        c = int(self._meta["seq"][0])
+        slot = c % _SNAP_RING_SLOTS
+        self._slot_seq[slot] += 1  # odd: write in progress
+        d = self._data[slot]
         d[0] = ts
         i = 1
         for k in self._obs_keys:
@@ -678,10 +702,12 @@ class SnapshotWriter:
         for k in self._action_keys:
             d[i] = action[k]
             i += 1
-        self._meta["seq"][0] += 1  # even: committed
+        self._slot_seq[slot] += 1  # even: committed
+        self._meta["seq"][0] = c + 1
 
     def close(self) -> None:
         self._meta = None  # type: ignore[assignment]
+        self._slot_seq = None  # type: ignore[assignment]
         self._data = None  # type: ignore[assignment]
         try:
             self._shm.close()
@@ -691,11 +717,11 @@ class SnapshotWriter:
 
 
 class SnapshotReader:
-    """Recorder-subprocess side: read the latest joint/action snapshot.
+    """Recorder-subprocess side: read joint/action snapshots from the shm ring.
 
     Attaches to a :class:`SnapshotWriter`'s block by name and reconstructs the
     ``(joint_obs, action, ts)`` dicts using the same key order. Returns ``None``
-    before the first write (mirroring the in-process ``_SnapshotPublisher.latest``
+    before the first write (mirroring the in-process ``_SnapshotPublisher``
     contract), so the caller can skip a tick just as it did before.
     """
 
@@ -703,35 +729,83 @@ class SnapshotReader:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
         n = len(self._obs_keys) + len(self._action_keys)
+        self._slot_len = 1 + n
+        header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
         self._shm = shared_memory.SharedMemory(name=name)
         self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
+        self._slot_seq = np.ndarray(
+            (_SNAP_RING_SLOTS,),
+            dtype="<i8",
+            buffer=self._shm.buf,
+            offset=_SNAP_HEADER_BYTES,
+        )
         self._data = np.ndarray(
-            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+            (_SNAP_RING_SLOTS, self._slot_len),
+            dtype="<f8",
+            buffer=self._shm.buf,
+            offset=header_bytes,
         )
 
-    def read_latest(self) -> tuple[dict, dict, float] | None:
-        # SPSC seqlock: retry while the writer is mid-write (odd seq) or laps us
-        # (seq changed across the copy). Writes are sub-microsecond so this
-        # converges on the first try in practice; bail to None on the rare miss.
+    def _read_slot(self, slot: int) -> np.ndarray | None:
+        """Copy one slot consistently (per-slot seqlock), or ``None`` on miss."""
         for _ in range(8):
-            s1 = int(self._meta["seq"][0])
+            s1 = int(self._slot_seq[slot])
             if s1 == 0:
-                return None  # no snapshot published yet
+                return None  # never written
             if s1 & 1:
                 continue  # writer mid-write
-            snap = np.array(self._data, dtype="<f8")
-            if int(self._meta["seq"][0]) != s1:
-                continue  # writer lapped us mid-copy
-            ts = float(snap[0])
-            vals = snap[1:]
-            no = len(self._obs_keys)
-            joint_obs = {k: float(vals[i]) for i, k in enumerate(self._obs_keys)}
-            action = {k: float(vals[no + i]) for i, k in enumerate(self._action_keys)}
-            return joint_obs, action, ts
+            snap = np.array(self._data[slot], dtype="<f8")
+            if int(self._slot_seq[slot]) == s1:
+                return snap
         return None
+
+    def _to_dicts(self, snap: np.ndarray) -> tuple[dict, dict, float]:
+        ts = float(snap[0])
+        vals = snap[1:]
+        no = len(self._obs_keys)
+        joint_obs = {k: float(vals[i]) for i, k in enumerate(self._obs_keys)}
+        action = {k: float(vals[no + i]) for i, k in enumerate(self._action_keys)}
+        return joint_obs, action, ts
+
+    def read_latest(self) -> tuple[dict, dict, float] | None:
+        count = int(self._meta["seq"][0])
+        if count == 0:
+            return None
+        snap = self._read_slot((count - 1) % _SNAP_RING_SLOTS)
+        return self._to_dicts(snap) if snap is not None else None
+
+    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float] | None:
+        """Return the buffered snapshot whose timestamp is nearest ``target_ts``.
+
+        Pairs a camera frame's capture time with the pose/action snapshot
+        captured closest to it (both on the system-wide ``perf_counter``
+        timeline) instead of whatever happened to be newest — the residual
+        skew is recorded per row as ``pose_lag``. Falls back over any slot the
+        writer is concurrently updating; returns ``None`` before the first
+        write.
+        """
+        count = int(self._meta["seq"][0])
+        if count == 0:
+            return None
+        best: np.ndarray | None = None
+        best_err = float("inf")
+        for back in range(min(count, _SNAP_RING_SLOTS)):
+            slot = (count - 1 - back) % _SNAP_RING_SLOTS
+            snap = self._read_slot(slot)
+            if snap is None:
+                continue
+            err = abs(float(snap[0]) - target_ts)
+            if err < best_err:
+                best, best_err = snap, err
+            elif best is not None and float(snap[0]) < target_ts:
+                # Timestamps decrease as we walk back; once past the target
+                # and no longer improving, stop.
+                break
+        return self._to_dicts(best) if best is not None else None
 
     def close(self) -> None:
         self._meta = None  # type: ignore[assignment]
+        self._slot_seq = None  # type: ignore[assignment]
         self._data = None  # type: ignore[assignment]
         if self._shm is not None:
             try:

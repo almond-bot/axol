@@ -113,6 +113,19 @@ class VRTeleopCore:
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
+        # Absolute (UMI) mode: latest base-frame TCP target per side
+        # ({"left": [x,y,z,qx,qy,qz,qw], "right": [...]}), the tracked
+        # ground-truth pose behind the joint solution. ``None`` before the
+        # first solve / outside absolute mode.
+        self.last_tcp: dict | None = None
+        # Monotonic (``time.perf_counter``) time of the last IK reply whose
+        # ``tcp_msg`` *differed* from the previous one — i.e. when
+        # ``last_tcp`` last took a new value. A frozen tracker / stalled IK
+        # keeps replying with an identical TCP, so consumers (UMI data
+        # collection) compare this against "now" to detect stale poses being
+        # recorded under fresh row timestamps. ``None`` until the first
+        # absolute-mode solve.
+        self.last_tcp_change_ts: float | None = None
         self._last_urdf_broadcast = 0.0
         self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
@@ -410,12 +423,19 @@ class VRTeleopCore:
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:
-                    # Absolute (UMI) mode replies are ("q", q, base_msg);
-                    # relative mode replies are the bare joint array.
+                    # Absolute (UMI) mode replies are ("q", q, base_msg,
+                    # tcp_msg); relative mode replies are the bare joint array.
                     if isinstance(result, tuple) and result[0] == "q":
-                        _, q_arr, base_msg = result
+                        _, q_arr, base_msg, tcp_msg = result
                         self.set_target(q_arr)
                         self.abs_base = base_msg
+                        # Stamp the last *changed* TCP (cheap compare: two
+                        # 7-float lists per side) so recording can tell a
+                        # live pose stream from a frozen one — a dropout /
+                        # IK stall replays the same TCP forever.
+                        if tcp_msg is not None and tcp_msg != self.last_tcp:
+                            self.last_tcp_change_ts = time.perf_counter()
+                        self.last_tcp = tcp_msg
                         self._maybe_broadcast_urdf_state()
                     else:
                         self.set_target(result)

@@ -234,10 +234,40 @@ class IKWorker:
         # offset ``(p_off, R_off)`` expressed in the controller's local frame.
         self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
         self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        # Calibrated tracker→gripper transforms from ``axol umi.calibrate``
+        # (per side, ``(p_off_3, R_off_3x3)`` in the tracker's local frame).
+        # When present for a side, engage uses it verbatim instead of
+        # absorbing the mount offset into the engage snapshot.
+        self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for side, tf in (
+            ("left", config.tcp_transform_left),
+            ("right", config.tcp_transform_right),
+        ):
+            if tf is not None:
+                self._tcp_transforms[side] = (
+                    np.asarray(tf[:3], dtype=np.float64),
+                    _quat_xyzw_to_matrix(*tf[3:]).astype(np.float64),
+                )
+        # Quaternion sign continuity for the calibrated pose mapping (see
+        # :meth:`_apply_tcp_transform`).
+        self._last_mapped_quat: dict[str, np.ndarray] = {}
+        if self._tcp_transforms and config.absolute_mode:
+            _logger.info(
+                "absolute mode: using calibrated tracker→gripper transforms for %s",
+                sorted(self._tcp_transforms),
+            )
         # JSON-safe copy of the base transform for the headset (VR world
         # coords), so the web client can render the URDF at the engage-
         # calibrated base. ``None`` until the first engage.
         self.abs_base_msg: dict[str, list[float]] | None = None
+        # Latest absolute-mode TCP target per side, in the robot base frame:
+        # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
+        # tracked ground-truth pose the IK solver chases — UMI data collection
+        # records it per row so training can use raw TCP trajectories instead
+        # of (or alongside) the IK joint solutions. Holds the last engaged
+        # target while disengaged (mirroring the latched virtual joints);
+        # seeded from rest FK so it is never ``None`` in absolute mode.
+        self.last_tcp_msg: dict[str, list[float]] | None = None
 
         freq = config.frequency
         mc = config.pose_min_cutoff
@@ -266,6 +296,7 @@ class IKWorker:
             # the first engage, stalling the session for the compile time.
             fk_l, fk_r = self._rest_fk_poses()
             self._solver.ik(self.get_rest_q(), left_pose=fk_l, right_pose=fk_r)
+            self.last_tcp_msg = self._encode_tcp_msg(fk_l, fk_r)
 
     # -- Properties the main process needs ----------------------------------
 
@@ -428,12 +459,16 @@ class IKWorker:
             # the pose held when tracking was last disabled.
             self._reset_pose_filters()
 
-        lp = self._f_l_pos.update(
+        # Apply the calibrated tracker→gripper transform (when present) to the
+        # *raw* pose, before filtering: the signal of interest is the physical
+        # gripper, and filtering the tracker pose instead would let the mount
+        # lever arm leak filter lag into the gripper position during wrist
+        # rotations (filtering does not commute with a rigid transform).
+        lp_raw, lq_raw = self._apply_tcp_transform(
+            "left",
             np.array(
                 [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
-            )
-        )
-        lq = self._f_l_quat.update(
+            ),
             np.array(
                 [
                     frame.l_ee.quaternion.x,
@@ -441,15 +476,13 @@ class IKWorker:
                     frame.l_ee.quaternion.z,
                     frame.l_ee.quaternion.w,
                 ]
-            )
+            ),
         )
-        lq = lq / np.linalg.norm(lq)
-        rp = self._f_r_pos.update(
+        rp_raw, rq_raw = self._apply_tcp_transform(
+            "right",
             np.array(
                 [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
-            )
-        )
-        rq = self._f_r_quat.update(
+            ),
             np.array(
                 [
                     frame.r_ee.quaternion.x,
@@ -457,8 +490,13 @@ class IKWorker:
                     frame.r_ee.quaternion.z,
                     frame.r_ee.quaternion.w,
                 ]
-            )
+            ),
         )
+        lp = self._f_l_pos.update(lp_raw)
+        lq = self._f_l_quat.update(lq_raw)
+        lq = lq / np.linalg.norm(lq)
+        rp = self._f_r_pos.update(rp_raw)
+        rq = self._f_r_quat.update(rq_raw)
         rq = rq / np.linalg.norm(rq)
 
         l_pos, l_rot = (
@@ -476,12 +514,21 @@ class IKWorker:
             # Anchor the null-space posture at rest (not q_current) so arm
             # configurations stay consistent across operators and episodes.
             self._solver.set_posture_pose(self.get_rest_q())
+            # At engage the offsets make the controller poses coincide with
+            # rest FK by construction, so the targets equal rest FK exactly.
+            self.last_tcp_msg = self._encode_tcp_msg(
+                self._absolute_target("left", l_pos, l_rot),
+                self._absolute_target("right", r_pos, r_rot),
+            )
             return q_current
 
+        left_target = self._absolute_target("left", l_pos, l_rot)
+        right_target = self._absolute_target("right", r_pos, r_rot)
+        self.last_tcp_msg = self._encode_tcp_msg(left_target, right_target)
         return self._solver.ik(
             q_current,
-            left_pose=self._absolute_target("left", l_pos, l_rot),
-            right_pose=self._absolute_target("right", r_pos, r_rot),
+            left_pose=left_target,
+            right_pose=right_target,
         )
 
     def compute_reset_trajectory(
@@ -519,6 +566,11 @@ class IKWorker:
         self._abs_base = None
         self._abs_offset = {}
         self.abs_base_msg = None
+        if self._config.absolute_mode:
+            # The reset trajectory returns the arms to rest, so the recorded
+            # TCP stream should land there too rather than hold the last
+            # engaged target.
+            self.last_tcp_msg = self._encode_tcp_msg(*self._rest_fk_poses())
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
         # restores the default rest-pose attractor.
@@ -557,17 +609,25 @@ class IKWorker:
         left one, and its translation chosen so the rest-pose FK gripper
         midpoint lands on the measured gripper midpoint (``base_height``, when
         set, pins the vertical component to the robot's real mounting height
-        instead). Each controller's rigid offset to its gripper TCP is then
-        whatever makes the engage pose coincide exactly with rest FK — this
-        absorbs the physical mount transform, URDF frame conventions, and the
-        operator's residual alignment error in one snapshot. Alignment quality
-        at engage therefore bounds the episode's absolute accuracy.
+        instead).
+
+        A side with a calibrated tracker→gripper transform (``axol
+        umi.calibrate``) arrives here already mapped to the physical gripper
+        pose (see :meth:`_apply_tcp_transform`), so its engage offset is
+        identity — recorded poses are mount-independent, wrist rotations
+        don't smear into position error, and the operator's residual
+        alignment error at engage stays visible instead of being baked in.
+        An uncalibrated side gets whatever offset makes the engage pose
+        coincide exactly with rest FK — absorbing the physical mount
+        transform, URDF frame conventions, and the operator's alignment
+        error in one snapshot; its alignment quality at engage then bounds
+        the episode's absolute accuracy.
         """
         fk_l, fk_r = self._rest_fk_poses()
 
-        # The controller origins stand in for the gripper TCPs; the physical
-        # controller→gripper lever arm is absorbed into the per-side engage
-        # offsets below, so no measured calibration is needed.
+        # The measured poses stand in for the gripper TCPs (exactly the TCPs
+        # for calibrated sides; controller origins otherwise, their lever arm
+        # absorbed into the per-side engage offsets below).
         fk_l_anchor, fk_r_anchor = fk_l[0], fk_r[0]
 
         # URDF base frame: +x = left, +y = forward, +z = up. Base up aligns
@@ -604,19 +664,60 @@ class IKWorker:
         }
 
         def _offset(
+            side: str,
             ctrl_pos: np.ndarray,
             ctrl_rot: np.ndarray,
             fk_pose: tuple[np.ndarray, np.ndarray],
         ) -> tuple[np.ndarray, np.ndarray]:
+            if side in self._tcp_transforms:
+                # Pose already mapped to the gripper by _apply_tcp_transform.
+                return np.zeros(3), np.eye(3)
             fk_pos, fk_rot = fk_pose
             r_off = ctrl_rot.T @ (R_wb @ fk_rot)
             p_w_tcp = R_wb @ fk_pos + t_wb
             return ctrl_rot.T @ (p_w_tcp - ctrl_pos), r_off
 
         self._abs_offset = {
-            "left": _offset(l_pos, l_rot, fk_l),
-            "right": _offset(r_pos, r_rot, fk_r),
+            "left": _offset("left", l_pos, l_rot, fk_l),
+            "right": _offset("right", r_pos, r_rot, fk_r),
         }
+
+    def _apply_tcp_transform(
+        self, side: str, pos: np.ndarray, quat: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map a raw tracker pose to the gripper pose via the calibration.
+
+        No-op when the side has no calibrated transform. Returns
+        ``(pos_3, quat_xyzw)``; the output quaternion's sign is kept
+        continuous with the previous frame so the One Euro quaternion filter
+        never sees a representation flip.
+        """
+        tf = self._tcp_transforms.get(side)
+        if tf is None:
+            return pos, quat
+        p_x, R_x = tf
+        R_c = _quat_xyzw_to_matrix(*quat).astype(np.float64)
+        out_pos = np.asarray(pos, dtype=np.float64) + R_c @ p_x
+        out_quat = np.array(_matrix_to_quat_xyzw(R_c @ R_x))
+        prev = self._last_mapped_quat.get(side)
+        if prev is not None and float(np.dot(out_quat, prev)) < 0.0:
+            out_quat = -out_quat
+        self._last_mapped_quat[side] = out_quat
+        return out_pos, out_quat
+
+    @staticmethod
+    def _encode_tcp_msg(
+        left: tuple[np.ndarray, np.ndarray],
+        right: tuple[np.ndarray, np.ndarray],
+    ) -> dict[str, list[float]]:
+        """Pack two base-frame ``(pos, rot)`` poses as JSON-safe pos+quat lists."""
+
+        def _enc(pose: tuple[np.ndarray, np.ndarray]) -> list[float]:
+            pos, rot = pose
+            quat = _matrix_to_quat_xyzw(np.asarray(rot, dtype=np.float64))
+            return [float(pos[0]), float(pos[1]), float(pos[2]), *quat]
+
+        return {"left": _enc(left), "right": _enc(right)}
 
     def _absolute_target(
         self, side: str, pos: np.ndarray, rot: np.ndarray
@@ -676,6 +777,7 @@ class IKWorker:
 
     def _reset_pose_filters(self) -> None:
         """Clear the OneEuroFilter state for every controller and elbow stream."""
+        self._last_mapped_quat = {}
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()
@@ -858,9 +960,10 @@ def run_ik_worker(
                 q = worker.step(msg, q)
                 if config.absolute_mode:
                     # Absolute (UMI) mode replies carry the engage-calibrated
-                    # base transform so the adapter can stream it (with the
-                    # joint solution) to the headset's URDF overlay.
-                    conn.send(("q", q.copy(), worker.abs_base_msg))
+                    # base transform (for the headset's URDF overlay) and the
+                    # base-frame TCP targets (recorded per dataset row by UMI
+                    # data collection) alongside the joint solution.
+                    conn.send(("q", q.copy(), worker.abs_base_msg, worker.last_tcp_msg))
                 else:
                     conn.send(q.copy())
         except (EOFError, KeyboardInterrupt):

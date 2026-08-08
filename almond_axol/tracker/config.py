@@ -33,6 +33,16 @@ class TrackerConfig:
         ultimate_up_axis: Up axis of the Ultimate tracker's SLAM world
             frame (``"z"`` or ``"y"``). ``"z"`` converts through the z-up →
             y-up basis change; ``"y"`` passes through. Verify at bring-up.
+        trigger_can_left:  SocketCAN interface of the left rig's trigger
+            node (e.g. ``"can_alm_umi_l"``), or ``None`` when the rig has
+            no trigger (grip then streams as 1.0 = open). The trigger is
+            a binary switch (open/close) — no calibration fields.
+        trigger_can_right: SocketCAN interface of the right rig's trigger
+            node, or ``None``.
+        allow_single_side: Let the bridge run with only one side's
+            tracker bound. Off by default: absolute-mode (UMI) engagement
+            fits the base transform from BOTH controller positions, so
+            the placeholder pose streamed for an unbound side corrupts it.
     """
 
     backend: str = "survive"
@@ -40,6 +50,9 @@ class TrackerConfig:
     right: str | None = None
     ultimate_quat_order: str = "xyzw"
     ultimate_up_axis: str = "z"
+    trigger_can_left: str | None = None
+    trigger_can_right: str | None = None
+    allow_single_side: bool = False
 
 
 def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:

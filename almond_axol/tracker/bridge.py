@@ -7,15 +7,21 @@ rate from the latest tracker poses, stamps ``t`` (monotonic ms, for the
 server's pose interpolator) and ``seq``, and ships it over WSS (the
 server's self-signed certificate is not verified).
 
-Engage/reset control is a stopgap until the rig's button PCB exists (see
-:class:`StdinControls`): Enter toggles tracking engage, ``r`` triggers a
-reset. The toggle is realised as a short pulse of both lock bits — the
-shared teleop core enables on a rising edge of both locks together and
-disables on a rising edge of either, so one pulse toggles either way.
+Grip comes from the axol_umi trigger node's CAN messages when one is
+configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
+the binary trigger switch drives ``l_grip``/``r_grip`` (pressed = close,
+released = open). Engage/reset come
+from :class:`StdinControls` (the trigger frame carries no buttons —
+session controls arrive with a later PCB revision): Enter toggles
+tracking engage, ``r`` triggers a reset. The toggle is realised as a
+short pulse of both lock bits — the shared teleop core enables on a
+rising edge of both locks together and disables on a rising edge of
+either, so one pulse toggles either way.
 
 A side whose tracker stops reporting (occlusion, SLAM relocalising)
 holds its last good pose rather than going quiet, so IK never chases a
-glitch and the operator can recover by re-engaging.
+glitch and the operator can recover by re-engaging. A stale trigger
+node likewise holds its last grip command, never jumping on a dropout.
 """
 
 from __future__ import annotations
@@ -32,6 +38,7 @@ import numpy as np
 
 from ..utils.ports import VR_PORT
 from .base import TrackerPose, TrackerSource
+from .trigger import TriggerReader
 
 _logger = logging.getLogger(__name__)
 
@@ -103,6 +110,13 @@ class TrackerBridge:
         port:   VR server port.
         hz:     Frame streaming rate.
         controls: Engage/reset input; defaults to :class:`StdinControls`.
+        left_trigger:  Started trigger-node reader for the left side, or
+            ``None`` (grip streams as 1.0 = open).
+        right_trigger: Trigger-node reader for the right side, or ``None``.
+        allow_single_side: Permit exactly one bound side. Off by default
+            because absolute-mode (UMI) engagement fits the shared base
+            transform from BOTH controller positions, so the placeholder
+            pose streamed for an unbound side corrupts the fit.
     """
 
     def __init__(
@@ -115,10 +129,23 @@ class TrackerBridge:
         port: int = VR_PORT,
         hz: float = 120.0,
         controls: StdinControls | None = None,
+        left_trigger: TriggerReader | None = None,
+        right_trigger: TriggerReader | None = None,
+        allow_single_side: bool = False,
     ) -> None:
         if left is None and right is None:
             raise ValueError(
                 "no tracker is bound to either side — run `axol tracker.identify` first"
+            )
+        if (left is None or right is None) and not allow_single_side:
+            bound = "left" if right is None else "right"
+            raise ValueError(
+                f"only the {bound} side has a tracker bound. Absolute-mode (UMI) "
+                "engagement solves the shared world→robot base transform from "
+                "BOTH controller positions, so streaming the built-in placeholder "
+                "pose for the unbound side corrupts the engage base fit. Bind "
+                "both trackers (`axol tracker.identify`), or pass "
+                "--allow-single-side if you accept the corrupted fit."
             )
         self._source = source
         self._keys = {"left": left, "right": right}
@@ -126,6 +153,12 @@ class TrackerBridge:
         self._port = port
         self._hz = hz
         self._controls = controls or StdinControls()
+
+        self._triggers = {"left": left_trigger, "right": right_trigger}
+        # Last grip streamed per side; held across trigger dropouts so a stale
+        # node never commands a jump. Open until the first frame arrives.
+        self._grip_held = {"left": 1.0, "right": 1.0}
+        self._warned_trigger: dict[str, bool] = {"left": False, "right": False}
 
         self._seq = 0
         self._engaged = False
@@ -162,6 +195,33 @@ class TrackerBridge:
         if held is not None:
             return held.pos, held.quat
         return _DEFAULT_POSE[side]
+
+    def _side_grip(self, side: str) -> float:
+        """Return the grip command to stream for one side.
+
+        Fresh trigger data wins; a configured-but-stale trigger holds the
+        last streamed grip (with a rate-limited warning) so a dropout never
+        commands a jump. A side with no trigger configured streams 1.0
+        (open), matching the pre-PCB behaviour.
+        """
+        reader = self._triggers[side]
+        if reader is None:
+            return 1.0
+        grip = reader.grip()
+        if grip is not None and not reader.is_stale():
+            self._grip_held[side] = grip
+            if self._warned_trigger[side]:
+                self._warned_trigger[side] = False
+                _logger.info("%s trigger node is reporting again", side)
+        elif not self._warned_trigger[side]:
+            self._warned_trigger[side] = True
+            _logger.warning(
+                "%s trigger node is %s — holding grip %.2f",
+                side,
+                "stale" if grip is not None else "not reporting",
+                self._grip_held[side],
+            )
+        return self._grip_held[side]
 
     def compose_frame(self) -> dict:
         """Build one VRFrame JSON object from the latest tracker poses."""
@@ -214,13 +274,20 @@ class TrackerBridge:
         if self._reset_pulse > 0:
             self._reset_pulse -= 1
 
-        # Grip placeholders (open) until the analog pot PCB exists.
-        frame["l_grip"] = 1.0
-        frame["r_grip"] = 1.0
+        frame["l_grip"] = self._side_grip("left")
+        frame["r_grip"] = self._side_grip("right")
 
         self._seq += 1
         frame["seq"] = self._seq
-        frame["t"] = now * 1000.0  # monotonic ms, like performance.now()
+        # Stamp with the tracker sample's *capture* time (monotonic ms, like
+        # performance.now()), not compose time: the server's interpolator
+        # reconstructs this instant as ``t_host``, and UMI recording aligns
+        # dataset rows and camera exposures on it — stamping compose time
+        # would fold the tracker→bridge latency into every recorded pose.
+        # With two trackers the freshest capture stands in for both (the
+        # sides sample within a driver poll of each other).
+        cap_ts = [p.t for p in self._held.values()]
+        frame["t"] = (max(cap_ts) if cap_ts else now) * 1000.0
         return frame
 
     # -- Streaming -----------------------------------------------------------

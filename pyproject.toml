@@ -27,7 +27,9 @@ dependencies = [
 
 [project.optional-dependencies]
 gamepad = ["pygame>=2.6"]
-lerobot = ["lerobot[dataset,viz,async]"]
+# training backs `axol umi.train` (LeRobot's trainer: accelerate + wandb);
+# diffusion adds the diffusers dependency for --policy.type diffusion.
+lerobot = ["lerobot[dataset,viz,async,training,diffusion]"]
 sim = ["viser>=1.0.24"]
 # Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS
 # client; hidapi backs the Ultimate Tracker dongle path. libsurvive (Tracker

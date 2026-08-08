@@ -10,8 +10,11 @@ server exactly like a headset would — nothing downstream changes.
 
 Backend + left/right binding come from ``~/.almond/tracker/config.json``
 (written by ``axol tracker.identify``); every field can be overridden on
-the command line. Interim controls until the rig's button PCB exists:
-Enter toggles engage, ``r`` resets, ``q`` quits.
+the command line. When a rig's CAN trigger node is configured
+(``--trigger-can-left`` / ``--trigger-can-right``), its binary trigger
+switch drives the grip command (pressed = close, released = open);
+engage/reset stay on stdin (Enter toggles engage, ``r`` resets, ``q``
+quits) until the button PCB exists.
 """
 
 from __future__ import annotations
@@ -62,14 +65,35 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         default=120.0,
         help="Frame streaming rate. Default: 120.",
     )
+    parser.add_argument(
+        "--trigger-can-left",
+        default=None,
+        help="SocketCAN interface of the left rig's trigger node "
+        "(e.g. can_alm_umi_l); overrides the saved config.",
+    )
+    parser.add_argument(
+        "--trigger-can-right",
+        default=None,
+        help="SocketCAN interface of the right rig's trigger node; "
+        "overrides the saved config.",
+    )
+    parser.add_argument(
+        "--allow-single-side",
+        action="store_true",
+        help="Run with only one side's tracker bound. WARNING: absolute-mode "
+        "(UMI) engagement fits the base transform from BOTH controller "
+        "positions, so the placeholder pose streamed for the unbound side "
+        "corrupts it.",
+    )
     parser.set_defaults(func=run)
 
 
 def run(args) -> None:  # type: ignore[no-untyped-def]
-    """Open the tracker backend and stream frames until quit."""
+    """Open the tracker backend (and trigger PCBs) and stream frames until quit."""
     from ..tracker import create_source, load_tracker_config
     from ..tracker.bridge import TrackerBridge
     from ..tracker.synthetic import LEFT_KEY, RIGHT_KEY
+    from ..tracker.trigger import TriggerReader
 
     logging.basicConfig(level=logging.INFO, force=True)
 
@@ -81,9 +105,22 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     if config.backend == "synthetic" and left is None and right is None:
         left, right = LEFT_KEY, RIGHT_KEY
 
+    if args.trigger_can_left is not None:
+        config.trigger_can_left = args.trigger_can_left
+    if args.trigger_can_right is not None:
+        config.trigger_can_right = args.trigger_can_right
+    allow_single_side = args.allow_single_side or config.allow_single_side
+
+    triggers: dict[str, TriggerReader] = {}
     source = create_source(config)
     source.start()
     try:
+        for side, channel in (
+            ("left", config.trigger_can_left),
+            ("right", config.trigger_can_right),
+        ):
+            if channel:
+                triggers[side] = TriggerReader(channel)
         bridge = TrackerBridge(
             source,
             left=left,
@@ -91,9 +128,14 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             host=args.host,
             port=args.port,
             hz=args.hz,
+            left_trigger=triggers.get("left"),
+            right_trigger=triggers.get("right"),
+            allow_single_side=allow_single_side,
         )
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         pass
     finally:
+        for reader in triggers.values():
+            reader.close()
         source.stop()

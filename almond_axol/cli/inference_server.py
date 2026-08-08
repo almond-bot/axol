@@ -55,6 +55,10 @@ def main(argv: list[str]) -> None:
 
     disable_observation_similarity_filter()
 
+    # Register the UMI relative-EE processor steps so checkpoints trained with
+    # `axol umi.train` deserialize their processor pipelines here.
+    from ..umi import processor as _umi_processor  # noqa: F401
+
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 

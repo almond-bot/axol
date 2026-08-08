@@ -723,25 +723,37 @@ def install_encoded_dataset_encoder() -> bool:
 
 
 class _SnapshotPublisher:
-    """Single-slot in-process publisher (the no-relay fallback's snapshot sink).
+    """In-process snapshot ring (the no-relay fallback's snapshot sink).
 
-    The control loop calls :meth:`write` every tick; the capture thread reads the
-    latest via :meth:`read_latest`. Returns ``None`` before the first write. The
-    method names mirror :class:`~almond_axol.video.shm_frames.SnapshotReader` so the
-    capture loop is identical in both paths.
+    The control loop calls :meth:`write` every tick; the capture thread reads
+    via :meth:`read_latest` or :meth:`read_nearest`. Returns ``None`` before
+    the first write. The method names mirror
+    :class:`~almond_axol.video.shm_frames.SnapshotReader` so the capture loop
+    is identical in both paths.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, maxlen: int = 64) -> None:
+        import collections
+
         self._lock = threading.Lock()
-        self._latest: tuple[dict, dict, float] | None = None
+        self._ring: collections.deque[tuple[dict, dict, float]] = collections.deque(
+            maxlen=maxlen
+        )
 
     def write(self, joint_obs: dict, action: dict, ts: float) -> None:
         with self._lock:
-            self._latest = (joint_obs, action, ts)
+            self._ring.append((joint_obs, action, ts))
 
     def read_latest(self) -> tuple[dict, dict, float] | None:
         with self._lock:
-            return self._latest
+            return self._ring[-1] if self._ring else None
+
+    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float] | None:
+        """Snapshot whose timestamp is nearest ``target_ts`` (see SnapshotReader)."""
+        with self._lock:
+            if not self._ring:
+                return None
+            return min(self._ring, key=lambda s: abs(s[2] - target_ts))
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +791,9 @@ def run_capture_loop(
     *,
     cameras: dict[str, Any],
     read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot_nearest: (
+        Callable[[float], tuple[dict, dict, float] | None] | None
+    ) = None,
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
     fps: int,
@@ -792,10 +807,16 @@ def run_capture_loop(
     """Capture dataset rows at ``fps`` Hz until ``stop_event`` is set.
 
     Each tick sleeps until ``T_n = recording_start + n/fps``, waits for a frame
-    with ``capture_perf_ts >= T_n`` from every camera, pulls the latest
-    joint+action snapshot, and appends one dataset row. A camera read timeout
-    reuses the previous frame for that camera (or skips the tick if none yet).
-    Any fatal error is reported via ``on_error`` instead of dying silently.
+    with ``capture_perf_ts >= T_n`` from every camera, pulls the joint+action
+    snapshot, and appends one dataset row. A camera read timeout reuses the
+    previous frame for that camera (or skips the tick if none yet). Any fatal
+    error is reported via ``on_error`` instead of dying silently.
+
+    ``read_snapshot_nearest`` (optional) enables nearest-timestamp pose↔image
+    pairing: the row's snapshot is the one whose capture time is closest to
+    the row's freshest camera exposure time (both on the system-wide
+    ``perf_counter`` timeline), instead of whichever was newest when the loop
+    got around to reading (latest-wins). ``None`` keeps latest-wins.
 
     ``record_event`` (optional) gates mid-episode capture: while cleared the
     loop idles without appending rows, and on the next set it re-anchors its
@@ -832,9 +853,18 @@ def run_capture_loop(
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
-                _logger.warning(
-                    "capture loop saw no fresh snapshot within 5s; exiting."
+                # A capture thread that dies here records *zero* rows for the
+                # episode; report it like any other capture failure so the
+                # operator hears about it at save instead of discovering an
+                # empty episode later.
+                msg = (
+                    "capture loop saw no fresh snapshot within 5s of episode "
+                    "start — the control loop isn't publishing; no dataset "
+                    "rows will be recorded for this episode"
                 )
+                _logger.error(msg)
+                if on_error is not None:
+                    on_error(msg)
                 return
         if stop_event.is_set():
             return
@@ -918,16 +948,30 @@ def run_capture_loop(
                 tick += 1
                 continue
 
-            snap = read_snapshot()
+            # Pair the row with the snapshot captured nearest the freshest
+            # camera exposure time (UMI pose↔image alignment); latest-wins
+            # when no nearest reader was provided.
+            row_cap_ts = max(cap for (_f, cap, _r) in frames.values())
+            snap = (
+                read_snapshot_nearest(row_cap_ts)
+                if read_snapshot_nearest is not None
+                else read_snapshot()
+            )
             if snap is None:
                 tick += 1
                 continue
-            joint_obs, action, _snap_ts = snap
+            joint_obs, action, snap_ts = snap
 
             obs: dict[str, Any] = dict(joint_obs)
             for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
                 obs[cam_key] = frame
             obs_processed = robot_obs_proc(obs)
+            # Residual pose↔image skew for this row: freshest camera exposure
+            # time minus the snapshot's capture time (both on the system-wide
+            # perf_counter timeline). Only recorded when the dataset declares
+            # an ``observation.pose_lag`` feature (UMI mode) — otherwise
+            # build_dataset_frame ignores the value.
+            obs_processed["pose_lag"] = row_cap_ts - snap_ts
 
             obs_frame = build_dataset_frame(
                 dataset.features, obs_processed, prefix=OBS_STR
@@ -959,6 +1003,9 @@ def run_encoded_capture_loop(
     *,
     cameras: dict[str, Any],
     read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot_nearest: (
+        Callable[[float], tuple[dict, dict, float] | None] | None
+    ) = None,
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
     fps: int,
@@ -1007,9 +1054,16 @@ def run_encoded_capture_loop(
             if stop_event.wait(0.02):
                 return
             if time.perf_counter() > first_deadline:
-                _logger.warning(
-                    "encoded capture loop saw no fresh snapshot within 5s; exiting."
+                # Same as run_capture_loop: dying silently here yields a
+                # zero-row episode nobody hears about until much later.
+                msg = (
+                    "encoded capture loop saw no fresh snapshot within 5s of "
+                    "episode start — the control loop isn't publishing; no "
+                    "dataset rows will be recorded for this episode"
                 )
+                _logger.error(msg)
+                if on_error is not None:
+                    on_error(msg)
                 return
             last_snap = read_snapshot()
         if stop_event.is_set():
@@ -1020,8 +1074,8 @@ def run_encoded_capture_loop(
         for cam in cameras.values():
             cam.flush()
 
-        def read_au(cam: Any, deadline: float) -> bytes | None:
-            """Pop the next AU by ``deadline``, waking every poll for stop_event.
+        def read_au(cam: Any, deadline: float) -> tuple[bytes, float] | None:
+            """Pop the next ``(au, recv_ts)`` by ``deadline``, waking every poll.
 
             Once the deadline has passed, still makes one non-blocking attempt:
             a camera whose AU is already queued must advance even when an
@@ -1031,10 +1085,9 @@ def run_encoded_capture_loop(
             while not stop_event.is_set():
                 remaining_ms = (deadline - time.perf_counter()) * 1000.0
                 try:
-                    au, _recv = cam.read_next_au(
+                    return cam.read_next_au(
                         timeout_ms=min(_ENCODED_POLL_MS, max(remaining_ms, 0.0))
                     )
-                    return au
                 except TimeoutError:
                     if remaining_ms <= 0:
                         return None
@@ -1058,12 +1111,16 @@ def run_encoded_capture_loop(
             # advances any camera whose AU is already queued.
             row_deadline = time.perf_counter() + budget
             aus: dict[str, bytes] = {}
+            row_recv_ts = 0.0
             missing_first = False
             for cam_key, cam in cameras.items():
-                au = read_au(cam, row_deadline)
-                if au is not None:
+                popped = read_au(cam, row_deadline)
+                if popped is not None:
+                    au, recv_ts = popped
                     aus[cam_key] = au
                     last_au[cam_key] = au
+                    if recv_ts > row_recv_ts:
+                        row_recv_ts = recv_ts
                 elif cam_key in last_au:
                     aus[cam_key] = last_au[cam_key]
                     repeats += 1
@@ -1085,7 +1142,17 @@ def run_encoded_capture_loop(
                 )
             primed = True
 
-            snap = read_snapshot()
+            # Pair the row with the snapshot captured nearest the row's AU
+            # arrival time (encoded AUs carry no exposure timestamp, so
+            # arrival stands in); latest-wins when no nearest reader was
+            # provided. A full-stall row (every camera re-muxed its previous
+            # AU) has no fresh arrival — fall back to "now".
+            pair_ts = row_recv_ts if row_recv_ts else time.perf_counter()
+            snap = (
+                read_snapshot_nearest(pair_ts)
+                if read_snapshot_nearest is not None
+                else read_snapshot()
+            )
             if snap is None:
                 # Seqlock retry miss (writer mid-update). Reuse the previous
                 # tick's snapshot rather than skipping the row: the AUs are
@@ -1094,13 +1161,18 @@ def run_encoded_capture_loop(
                 # dropped picture) while later rows kept advancing.
                 snap = last_snap
             last_snap = snap
-            joint_obs, action, _snap_ts = snap
+            joint_obs, action, snap_ts = snap
 
             # Process joint obs alone, then inject the AU bytes as the video
             # values: build_dataset_frame copies video values verbatim, so each
             # AU reaches feed_frame unmodified (the obs processor never sees, and
             # so never mangles, the encoded bytes).
             obs_processed = robot_obs_proc(dict(joint_obs))
+            # Residual pose↔image skew (see run_capture_loop). Encoded AUs
+            # carry no exposure timestamp, so the AU arrival time stands in —
+            # it overstates the true skew by the encode+transport latency.
+            # Only recorded when the dataset declares observation.pose_lag.
+            obs_processed["pose_lag"] = pair_ts - snap_ts
             for cam_key, au in aus.items():
                 obs_processed[cam_key] = au
 
@@ -1172,6 +1244,25 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
         streaming_encoding=True,
         encoder_threads=_ENCODER_THREADS,
         vcodec=config["vcodec"],
+    )
+
+
+def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
+    """Zero-phase low-pass the buffered episode's EE pose track before save.
+
+    Active only when the recorder config carries a positive ``smooth_ee_hz``
+    cutoff — collect-data sets it for UMI sessions, where the pose track comes
+    from the VR tracker and carries broadband measurement noise on the order
+    of the per-frame motion. On-robot sessions (encoder FK) leave it unset.
+    See :func:`almond_axol.umi.smoothing.smooth_episode_ee_poses`.
+    """
+    cutoff_hz = float(config.get("smooth_ee_hz") or 0.0)
+    if cutoff_hz <= 0.0:
+        return
+    from ..umi.smoothing import smooth_episode_ee_poses
+
+    smooth_episode_ee_poses(
+        dataset.writer.episode_buffer, dataset.meta.features, config["fps"], cutoff_hz
     )
 
 
@@ -1370,6 +1461,10 @@ class InProcessRecorder:
         # DatasetRecorderProcess.pause_episode/resume_episode/frame_count.
         self._record = threading.Event()
         self._frames: dict[str, int] = {"n": 0}
+        # Fatal capture-thread failure for the current episode, surfaced at
+        # save_episode — same contract as the recorder subprocess's
+        # ``capture_error`` (an episode whose capture died must not save).
+        self._capture_error: dict[str, str | None] = {"v": None}
         self._episodes_recorded = 0
         self._session_start = time.time()
 
@@ -1386,6 +1481,7 @@ class InProcessRecorder:
         self._dataset.clear_episode_buffer()
         self._record.set()
         self._frames["n"] = 0
+        self._capture_error["v"] = None
         reset_dropped_frames()
         self._stop = threading.Event()
         self._thread = threading.Thread(
@@ -1393,6 +1489,7 @@ class InProcessRecorder:
             kwargs=dict(
                 cameras=self._robot.cameras,
                 read_snapshot=self._publisher.read_latest,
+                read_snapshot_nearest=self._publisher.read_nearest,
                 dataset=self._dataset,
                 robot_obs_proc=self._robot_obs_proc,
                 fps=self._config["fps"],
@@ -1401,6 +1498,7 @@ class InProcessRecorder:
                 stop_event=self._stop,
                 record_event=self._record,
                 frame_counter=self._frames,
+                on_error=lambda m: self._capture_error.__setitem__("v", m),
             ),
             name="axol-capture",
             daemon=True,
@@ -1427,10 +1525,28 @@ class InProcessRecorder:
             self._thread.join()
             self._thread = None
 
+    def stop_capture(self) -> None:
+        """Stop the capture thread WITHOUT saving or clearing the buffer.
+
+        Call the moment an episode terminates — before any post-episode robot
+        motion (gripper valve close, return-to-rest) — so the capture thread
+        can't keep appending rows that pair a frozen snapshot with
+        reused/stale camera frames (the "junk tail" every episode would
+        otherwise carry). ``save_episode`` / ``cancel_episode`` remain valid
+        afterwards and operate on the buffer as frozen here. Idempotent.
+        """
+        self._stop_capture()
+
     def save_episode(self) -> None:
         from ..lerobot.nvenc_encoder import dropped_frames
 
         self._stop_capture()
+        if self._capture_error["v"] is not None:
+            # Mirrors the recorder subprocess: a dead capture thread means the
+            # buffered episode is empty or truncated — surface it instead of
+            # silently saving.
+            self._dataset.clear_episode_buffer()
+            raise RuntimeError(f"episode capture failed: {self._capture_error['v']}")
         n_dropped = dropped_frames()
         if n_dropped:
             # Mirrors the recorder subprocess: a dropped frame's row still
@@ -1441,6 +1557,7 @@ class InProcessRecorder:
                 "(feed queue overflow) — the episode's video is misaligned "
                 "with its rows; episode discarded."
             )
+        _maybe_smooth_episode(self._dataset, self._config)
         self._dataset.save_episode()
         self._episodes_recorded += 1
 
@@ -1601,6 +1718,7 @@ def _recorder_main(
                 loop_kwargs = dict(
                     cameras=cameras,
                     read_snapshot=snap_reader.read_latest,
+                    read_snapshot_nearest=snap_reader.read_nearest,
                     dataset=dataset,
                     robot_obs_proc=robot_obs_proc,
                     fps=config["fps"],
@@ -1649,6 +1767,13 @@ def _recorder_main(
                     conn.send(("resumed", frame_counter["n"]))
             elif kind == "frame_count":
                 conn.send(("frame_count", frame_counter["n"]))
+            elif kind == "stop_capture":
+                # Freeze the episode: stop the capture thread but keep the
+                # buffered rows (and any capture_error) intact, so the caller
+                # can run post-episode robot motion (valve close, rest move)
+                # without junk rows being appended, then decide save/cancel.
+                stop_capture()
+                conn.send(("capture_stopped", frame_counter["n"]))
             elif kind == "save_episode":
                 stop_capture()
                 from ..lerobot.nvenc_encoder import dropped_frames
@@ -1674,6 +1799,7 @@ def _recorder_main(
                 else:
                     try:
                         t_save = time.perf_counter()
+                        _maybe_smooth_episode(dataset, config)
                         dataset.save_episode()
                         _logger.info(
                             "save_episode took %.1fs", time.perf_counter() - t_save
@@ -1803,6 +1929,28 @@ class DatasetRecorderProcess:
     def frame_count(self) -> int:
         """Rows captured in the current episode (dataset time = n / fps)."""
         return self._episode_gate("frame_count", "frame_count")
+
+    def stop_capture(self) -> None:
+        """Stop the capture thread WITHOUT saving or clearing the buffer.
+
+        Call the moment an episode terminates — before any post-episode robot
+        motion (gripper valve close, return-to-rest) — so the recorder's
+        capture thread can't keep appending rows that pair a frozen snapshot
+        with reused/re-muxed camera frames (the "junk tail"). The buffered
+        rows and any pending capture error survive; ``save_episode`` /
+        ``cancel_episode`` remain valid afterwards. Idempotent.
+
+        Uses the save timeout rather than the lightweight command timeout:
+        the reply waits for the capture thread to join, which can take up to
+        its 10 s join budget on a wedged camera read.
+        """
+        with self._lock:
+            self._conn.send(("stop_capture",))
+            if not self._conn.poll(_SAVE_TIMEOUT_S):
+                raise RuntimeError("recorder did not answer stop_capture in time")
+            msg = self._conn.recv()
+        if msg[0] != "capture_stopped":
+            raise RuntimeError(f"recorder stop_capture failed: {msg!r}")
 
     def save_episode(self) -> None:
         with self._lock:

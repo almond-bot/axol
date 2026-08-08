@@ -22,8 +22,9 @@ built-in five:
   context).
 - ``execution="thread"`` (collect-data / run-policy / replay-dataset) runs
   ``_run(cfg, stop_event=...)`` on a worker thread, stopped via the
-  ``threading.Event``. An op declaring ``episode_control`` also gets
-  ``control=``, a queue-backed object taking save/rerecord/quit from the UI.
+  ``threading.Event``. An op declaring ``episode_control`` (run-policy,
+  collect-data, waypoints) also gets ``control=``, a queue-backed object
+  taking save/rerecord/quit from the UI.
 
 Before a hardware operation starts the runner releases the robot link's CAN
 bus; when the operation ends it hands the bus back.
@@ -353,8 +354,10 @@ class OperationRunner:
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
         # Episode control of the live op (set while an op declaring
-        # episode_control runs, e.g. run-policy).
-        self._policy_control: Any = None
+        # episode_control runs, e.g. run-policy or collect-data): a
+        # queue-backed object with push()/snapshot() that the op's episode
+        # loop drains.
+        self._episode_control: Any = None
 
     # -- lookup / subscribe (mirrors SessionManager so app.py can reuse it) --
 
@@ -618,8 +621,11 @@ class OperationRunner:
         return spared_any
 
     def episode_command(self, command: str) -> bool:
-        """Forward an episode command (start/s/r/q) to the live op's control."""
-        control = self._policy_control
+        """Forward an episode command (start/s/r/q) to the live op's control.
+
+        Returns ``False`` when no op with episode control is running.
+        """
+        control = self._episode_control
         if control is None:
             return False
         control.push(command)
@@ -628,10 +634,11 @@ class OperationRunner:
     def policy_state(self) -> dict[str, Any] | None:
         """The live op's episode phase/message/count, or None if there is none.
 
-        Read by /api/op/status so the control panel reflects whether an episode
-        is recording or sitting at the between-episode gate on any computer.
+        Read by /api/op/status (as the ``policy`` key, kept for UI
+        compatibility) so the control panel reflects whether an episode is
+        recording or sitting at the between-episode gate on any computer.
         """
-        control = self._policy_control
+        control = self._episode_control
         return control.snapshot() if control is not None else None
 
     async def shutdown(self) -> None:
@@ -921,7 +928,7 @@ class OperationRunner:
                     # API rather than stdin; the op blocks on this object and the
                     # panel reads its phase back via policy_state().
                     control = control_cls(self._stop_event)
-                    self._policy_control = control
+                    self._episode_control = control
                     core(cfg, stop_event=self._stop_event, control=control)
             except Exception as exc:  # noqa: BLE001
                 self._mark_terminal(
@@ -929,7 +936,7 @@ class OperationRunner:
                 )
                 session.emit(f"[serve] error: {session.error}")
             finally:
-                self._policy_control = None
+                self._episode_control = None
         self._finish(session, needs_robot)
 
     # -- shared teardown ----------------------------------------------------
