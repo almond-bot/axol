@@ -15,18 +15,16 @@ axol can.setup
 
 If a **single-channel** CAN adapter is also attached — the [powered cart](/guides/vr-interface#powered-cart)'s CANable, told apart from the dual-channel arm hub by its channel count — `can.setup` asks which one it is and pins it by serial to `can_alm_axol_b` in the same udev rules file. The `@reboot` startup script then brings it up alongside the arm channels, skipping it when the cart is absent so an unplugged cart never blocks the arms.
 
-For the handheld UMI data-collection rig — **two off-the-shelf single-channel CANable adapters** (candleLight `1d50:606f` or CANable 2.0 `16d0:117e`), one wired to each Damiao gripper — pass `--umi`. Setup lists the attached adapters by USB serial and asks which one is the left gripper. It uses its own udev rule file and startup script, so the robot and the rig can be configured on the same machine:
+For the handheld UMI data-collection rig, pass `--umi`. The rig uses the **same dual-channel CAN board as the arm hub** (one USB device pinned by serial), with one gripper bus per channel — each bus carries that side's Damiao gripper motor (ID `0x008`) and the axol_umi trigger node (ID `0x009`):
 
-- Left gripper's adapter → `can_alm_umi_l`
-- Right gripper's adapter → `can_alm_umi_r`
+- Channel 0 → `can_alm_umi_l` (left gripper)
+- Channel 1 → `can_alm_umi_r` (right gripper)
 
 ```bash
 axol can.setup --umi
 ```
 
-<Note>
-  CANable 2.0 support requires the vendored `gs_usb` driver build that claims `16d0:117e`; `can.setup` rebuilds and reloads the driver automatically when the installed one is older.
-</Note>
+The UMI profile gets its own udev rule file, startup script, and hotplug bring-up unit, so the robot and the rig can be configured on the same machine, and a replug of the handheld (common — it's handheld) brings its interfaces back up without operator action. Serials claimed by one profile's rules are excluded when scanning for the other's adapter, so having both plugged in stays unambiguous.
 
 <Note>
   `sudo` will be invoked automatically where required.

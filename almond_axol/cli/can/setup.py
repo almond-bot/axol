@@ -24,14 +24,14 @@ the disconnects at their source; the hotplug bring-up covers whatever still
 gets through.
 
 ``axol can.setup --umi`` configures the handheld UMI data-collection rig
-instead: **two off-the-shelf single-channel CANable adapters** (candleLight
-1d50:606f or CANable 2.0 16d0:117e), one per gripper, each keyed by its USB
-serial:
-  adapter A -> can_alm_umi_l   (left gripper)
-  adapter B -> can_alm_umi_r   (right gripper)
-Which adapter is left is chosen interactively at setup. The two profiles use
-separate udev rule files and startup scripts, so a machine can have both the
-robot and the UMI rig configured at once.
+instead. The rig uses the **same dual-channel board** as the arm hub (one
+USB device, keyed by its serial), with one gripper bus per channel:
+  channel 0 (dev_id 0x0) -> can_alm_umi_l  (left gripper: motor + trigger)
+  channel 1 (dev_id 0x1) -> can_alm_umi_r  (right gripper)
+The two profiles use separate udev rule files, startup scripts, and hotplug
+units, so a machine can have both the robot and the UMI rig configured at
+once — serials claimed by one profile's rules are excluded when scanning
+for the other's adapter.
 """
 
 import re
@@ -62,7 +62,11 @@ _CAN_DIR = Path.home() / ".almond" / "can"
 
 @dataclass(frozen=True)
 class _Profile:
-    """One adapter's persistent-naming setup (rule file, names, bring-up script)."""
+    """One adapter's persistent-naming setup (rule file, names, bring-up script).
+
+    Both profiles describe the same dual-channel gs_usb board: channel 0
+    (``dev_id`` 0x0) is the left interface, channel 1 the right.
+    """
 
     label: str
     left: str
@@ -74,6 +78,14 @@ class _Profile:
     # Lock file serializing runs of the bring-up script (boot and hotplug
     # triggers can race; see _write_cron_script).
     lock_name: str
+    # Hotplug bring-up: pulled in via the udev rules (SYSTEMD_WANTS) whenever
+    # the adapter (re-)enumerates, so interfaces recreated by a mid-session
+    # USB drop come back configured and up without operator action.
+    hotplug_unit: str
+
+    @property
+    def hotplug_unit_file(self) -> Path:
+        return Path("/etc/systemd/system") / self.hotplug_unit
 
 
 _AXOL_PROFILE = _Profile(
@@ -84,6 +96,7 @@ _AXOL_PROFILE = _Profile(
     cron_script=_CAN_DIR / "startup.sh",
     probe_joint=Joint.SHOULDER_1,
     lock_name="axol-can-up.lock",
+    hotplug_unit="axol-can-up.service",
 )
 
 _UMI_PROFILE = _Profile(
@@ -94,13 +107,8 @@ _UMI_PROFILE = _Profile(
     cron_script=_CAN_DIR / "startup_umi.sh",
     probe_joint=Joint.GRIPPER,
     lock_name="axol-can-umi-up.lock",
+    hotplug_unit="axol-can-umi-up.service",
 )
-
-# Hotplug bring-up: pulled in via the udev rules (SYSTEMD_WANTS) whenever an
-# adapter (re-)enumerates, so interfaces recreated by a mid-session USB drop
-# come back configured and up without operator action.
-_HOTPLUG_UNIT = "axol-can-up.service"
-_HOTPLUG_UNIT_FILE = Path("/etc/systemd/system") / _HOTPLUG_UNIT
 
 # Raspberry Pi 5 RP1 USB EMI-tolerance quirk (see _setup_rp1_usb_quirk).
 _RP1_QUIRK_SCRIPT = _CAN_DIR / "rp1-usb-quirk.sh"
@@ -180,46 +188,6 @@ def _detect_base_serials(exclude: str) -> list[str]:
     ]
 
 
-# USB IDs the UMI rig accepts: any gs_usb-compatible single-channel CANable —
-# candleLight-flashed (1d50:606f), CANable 2.0 stock firmware (16d0:117e), or
-# original candleLight (1209:2323). The vendored driver claims all of these.
-_UMI_USB_IDS = {("1d50", "606f"), ("16d0", "117e"), ("1209", "2323")}
-
-
-def _usb_attr(info: str, attr: str) -> str:
-    """First value of ``ATTRS{attr}`` (or ``ATTR{attr}``) in udevadm output."""
-    for line in info.splitlines():
-        if f"{{{attr}}}" in line and '=="' in line:
-            return line.split('=="')[1].split('"')[0]
-    return ""
-
-
-def _detect_umi_adapters() -> list[tuple[str, str, str]]:
-    """``(serial, vid, pid)`` of every attached UMI-compatible CAN adapter.
-
-    Scans the bound CAN network interfaces, so an adapter the running
-    ``gs_usb`` driver doesn't claim (e.g. a CANable 2.0 against an old driver
-    build) is invisible here — ``driver.ensure_driver()`` runs first to
-    prevent that. The Jetson's built-in mttcan controller has no USB vendor
-    attributes and is skipped naturally.
-    """
-    out: list[tuple[str, str, str]] = []
-    seen: set[str] = set()
-    for iface_path in sorted(Path("/sys/class/net").glob("can*")):
-        info = subprocess.run(
-            ["udevadm", "info", "-a", "-p", str(iface_path)],
-            capture_output=True,
-            text=True,
-        ).stdout
-        vid = _usb_attr(info, "idVendor").lower()
-        pid = _usb_attr(info, "idProduct").lower()
-        serial = _usb_attr(info, "serial")
-        if (vid, pid) in _UMI_USB_IDS and serial and serial not in seen:
-            seen.add(serial)
-            out.append((serial, vid, pid))
-    return out
-
-
 def _serials_in_rules(rules_file: Path) -> set[str]:
     """Every adapter serial a previously-written rules file is keyed on."""
     try:
@@ -249,10 +217,10 @@ def _serial_of_interface(iface: str) -> str | None:
     )
 
 
-def _rules_serial_for(name: str) -> str | None:
-    """The serial pinned to interface ``name`` in the robot-arm udev rules."""
+def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
+    """The serial pinned to interface ``name`` in a profile's udev rules."""
     try:
-        rules = _AXOL_PROFILE.rules_file.read_text()
+        rules = (rules_file or _AXOL_PROFILE.rules_file).read_text()
     except OSError:
         return None
     match = re.search(
@@ -261,20 +229,20 @@ def _rules_serial_for(name: str) -> str | None:
     return match.group(1) if match else None
 
 
-def _configured_serial() -> str | None:
-    """The Axol hub adapter's serial as pinned by a *previous* setup, if any.
+def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
+    """A profile's adapter serial as pinned by a *previous* setup, if any.
 
-    Preferred over live adapter detection: other candlelight devices (e.g. a
-    UMI rig's CAN adapter) share the same generic VID/PID, so a host with
-    several attached is ambiguous to a fresh scan — but not to a machine
-    that has already named its Axol interfaces or written its udev rules.
+    Preferred over live adapter detection: the arm hub and the UMI rig use
+    the same dual-channel board (same VID/PID), so a host with both attached
+    is ambiguous to a fresh scan — but not to a machine that has already
+    named the profile's interfaces or written its udev rules.
     """
-    for iface in (_AXOL_PROFILE.left, _AXOL_PROFILE.right):
+    for iface in (profile.left, profile.right):
         serial = _serial_of_interface(iface)
         if serial:
             return serial
-    return _rules_serial_for(_AXOL_PROFILE.left) or _rules_serial_for(
-        _AXOL_PROFILE.right
+    return _rules_serial_for(profile.left, profile.rules_file) or _rules_serial_for(
+        profile.right, profile.rules_file
     )
 
 
@@ -297,10 +265,10 @@ def _resolve_serial() -> str:
     an already-configured host works no matter how many other candlelight
     adapters are attached. Only a genuinely fresh machine falls back to live
     detection, where serials the UMI rig's rules already claim are excluded —
-    the handheld CANables share the hub's USB ID (1d50:606f), so with the rig
-    plugged in they would otherwise make the robot's adapter ambiguous. Raises
-    ``RuntimeError`` when zero or several candidates remain, since that needs
-    the interactive ``axol can.setup`` flow to disambiguate.
+    the rig uses the same dual-channel board as the hub (1d50:606f), so with
+    the rig plugged in it would otherwise make the robot's adapter ambiguous.
+    Raises ``RuntimeError`` when zero or several candidates remain, since that
+    needs the interactive ``axol can.setup`` flow to disambiguate.
     """
     configured = _configured_serial()
     if configured:
@@ -322,20 +290,21 @@ def _find_serial(profile: _Profile) -> str:
 
     unique = _detect_serials()
 
-    # Hide serials the UMI profile's rules already claim (a candleLight
-    # CANable shares the hub's USB ID) so the obvious single-adapter case
-    # stays promptless.
-    claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
+    # The arm hub and the UMI rig use the same dual-channel board, so hide
+    # serials the *other* profile's rules already claim — the obvious
+    # single-adapter case then stays promptless even with both attached.
+    other = _UMI_PROFILE if profile is _AXOL_PROFILE else _AXOL_PROFILE
+    claimed = _serials_in_rules(other.rules_file)
     if claimed and len(unique) > 1:
         unique = [s for s in unique if s not in claimed]
 
     if not unique:
-        # An unplugged hub on an already-configured host (e.g. re-running
+        # An unplugged adapter on an already-configured host (e.g. re-running
         # setup on a cart-only session) keeps its pinned serial — the udev
         # rule and startup script stay valid for whenever it's reattached.
-        configured = _configured_serial()
+        configured = _configured_serial(profile)
         if configured:
-            print(f"  No hub attached — keeping configured serial {configured}.")
+            print(f"  No adapter attached — keeping configured serial {configured}.")
             return configured
         print(
             "\n  No adapter found. Enter the serial number manually (blank to abort):"
@@ -356,110 +325,6 @@ def _find_serial(profile: _Profile) -> str:
     return unique[int(idx)]
 
 
-def _find_umi_assignment(
-    left_serial: str | None = None, right_serial: str | None = None
-) -> dict[str, tuple[str, str, str]]:
-    """Map the two UMI channel names to attached adapters.
-
-    Returns ``{interface_name: (serial, vid, pid)}`` for the left and right
-    grippers. Requires two UMI-compatible adapters to be attached (the serial
-    the robot-arm rules claim is excluded). Explicit ``left_serial`` /
-    ``right_serial`` win; otherwise the choice is prompted interactively, or —
-    with no TTY (the control panel's runner) — auto-assigned in detection
-    order with a loud note on how to swap.
-    """
-    adapters = _detect_umi_adapters()
-    claimed = _serials_in_rules(_AXOL_PROFILE.rules_file)
-    adapters = [a for a in adapters if a[0] not in claimed]
-
-    if len(adapters) < 2:
-        _die(
-            f"Found {len(adapters)} UMI-compatible CAN adapter(s); need 2 "
-            "(one per gripper). Check both CANables are plugged in and the "
-            "gs_usb driver claims them (`axol can.driver`, then replug)."
-        )
-
-    print("  Found adapters:")
-    for i, (serial, vid, pid) in enumerate(adapters):
-        print(f"    [{i}] {serial}  ({vid}:{pid})")
-
-    by_serial = {a[0]: a for a in adapters}
-    if left_serial or right_serial:
-        if not (left_serial and right_serial):
-            _die("Pass both --left and --right serials (or neither).")
-        for s in (left_serial, right_serial):
-            if s not in by_serial:
-                _die(f"Serial {s} is not among the detected adapters above.")
-        return {
-            _UMI_PROFILE.left: by_serial[left_serial],
-            _UMI_PROFILE.right: by_serial[right_serial],
-        }
-
-    if not sys.stdin.isatty():
-        left, right = adapters[0], adapters[1]
-        print(
-            f"  No TTY — auto-assigning: LEFT={left[0]}  RIGHT={right[0]}.\n"
-            "  If the sides are swapped, swap the two USB plugs, or re-run "
-            "with --left/--right serials."
-        )
-        return {_UMI_PROFILE.left: left, _UMI_PROFILE.right: right}
-
-    idx_l = int(input("  Index of the LEFT gripper's adapter [0]: ").strip() or "0")
-    left = adapters[idx_l]
-    remaining = [a for i, a in enumerate(adapters) if i != idx_l]
-    if len(remaining) == 1:
-        right = remaining[0]
-        print(f"  Right gripper: {right[0]} ({right[1]}:{right[2]})")
-    else:
-        for i, (serial, vid, pid) in enumerate(remaining):
-            print(f"    [{i}] {serial}  ({vid}:{pid})")
-        idx_r = int(
-            input("  Index of the RIGHT gripper's adapter [0]: ").strip() or "0"
-        )
-        right = remaining[idx_r]
-    return {_UMI_PROFILE.left: left, _UMI_PROFILE.right: right}
-
-
-def _write_umi_udev_rules(assign: dict[str, tuple[str, str, str]]) -> None:
-    """Write per-serial rules naming each single-channel adapter's interface."""
-    print(f"Writing udev rules to {_UMI_PROFILE.rules_file} (requires sudo)...")
-    lines = [f"# {_UMI_PROFILE.label}: one single-channel CANable per gripper"]
-    for name, (serial, vid, pid) in assign.items():
-        side = "left" if name == _UMI_PROFILE.left else "right"
-        lines.append(f"# {side} gripper — adapter serial {serial}")
-        lines.append(
-            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{vid}", '
-            f'ATTRS{{idProduct}}=="{pid}", ATTRS{{serial}}=="{serial}", '
-            f'NAME="{name}"'
-        )
-    run_root(
-        ["tee", str(_UMI_PROFILE.rules_file)],
-        input_text="\n".join(lines) + "\n",
-        check=True,
-    )
-    print("  Done.")
-
-
-def _rename_umi_interfaces(assign: dict[str, tuple[str, str, str]]) -> None:
-    """Rename the assigned adapters' interfaces to their target names now."""
-    print("Renaming CAN interfaces (requires sudo)...")
-    by_serial = {serial: name for name, (serial, _vid, _pid) in assign.items()}
-    for iface_path in Path("/sys/class/net").glob("can*"):
-        iface = iface_path.name
-        info = subprocess.run(
-            ["udevadm", "info", "-a", "-p", str(iface_path)],
-            capture_output=True,
-            text=True,
-        ).stdout
-        new_name = by_serial.get(_usb_attr(info, "serial"))
-        if new_name is None or iface == new_name:
-            continue
-        print(f"  {iface} -> {new_name}")
-        run_root(["ip", "link", "set", iface, "down"], check=True)
-        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
-    print("  Done.")
-
-
 def _write_udev_rules(
     serial: str, profile: _Profile, base_serial: str | None = None
 ) -> None:
@@ -476,7 +341,7 @@ def _write_udev_rules(
         f"# Tagged on the USB device rather than the net interfaces: the NAME=\n"
         f"# rules above put every real hotplug add mid-rename, and systemd\n"
         f'# skips SYSTEMD_WANTS on renaming devices ("device is renaming").\n'
-        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
+        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
     )
     if base_serial:
         # Matched by serial alone: CANable firmware variants ship various
@@ -485,7 +350,7 @@ def _write_udev_rules(
             f"# Powered-cart wheel bus (single-channel adapter)\n"
             f"# Adapter serial: {base_serial}\n"
             f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{base_serial}", NAME="{_CAN_B}"\n'
-            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{base_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{base_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
         )
     run_root(["tee", str(profile.rules_file)], input_text=content, check=True)
     print("  Done.")
@@ -542,7 +407,7 @@ def _write_cron_script(profile: _Profile, *, with_base: bool = False) -> None:
         f"# Bring up {profile.label} CAN interfaces\n"
         f"#\n"
         f"# Runs at boot (@reboot root crontab) and on every (re-)enumeration\n"
-        f"# of the adapter (udev -> {_HOTPLUG_UNIT}), so a mid-session USB\n"
+        f"# of the adapter (udev -> {profile.hotplug_unit}), so a mid-session USB\n"
         f"# drop of the hub comes back configured without operator action.\n"
         f"#\n"
         f"# The interfaces are brought down together, configured, then up\n"
@@ -610,28 +475,33 @@ def _register_cron(profile: _Profile) -> None:
         print(f"  Added: {cron_entry}")
 
 
-def _write_hotplug_unit() -> None:
+def _write_hotplug_unit(profile: _Profile) -> None:
     """Install the systemd unit the udev rules pull in on adapter hotplug.
 
-    udev tags the adapter's net devices with ``SYSTEMD_WANTS=axol-can-up.service``
+    udev tags the adapter's USB device with ``SYSTEMD_WANTS=<hotplug unit>``
     (see :func:`_write_udev_rules`), so every (re-)enumeration — boot or a
     mid-session USB drop — runs the startup script and the interfaces come
-    back configured and up within a second, no operator action needed.
+    back configured and up within a second, no operator action needed. The
+    UMI rig gets its own unit: the handheld is unplugged far more often
+    than the arm hub.
     """
-    print(f"Writing hotplug bring-up unit to {_HOTPLUG_UNIT_FILE} (requires sudo)...")
+    print(
+        f"Writing hotplug bring-up unit to {profile.hotplug_unit_file} "
+        "(requires sudo)..."
+    )
     content = (
-        f"# Installed by `axol can.setup`. Pulled in by {_AXOL_PROFILE.rules_file}\n"
-        f"# whenever an Axol CAN adapter (re-)enumerates: a mid-session USB\n"
-        f"# drop recreates the interfaces down and unconfigured, and this\n"
+        f"# Installed by `axol can.setup`. Pulled in by {profile.rules_file}\n"
+        f"# whenever the adapter (re-)enumerates: a mid-session USB drop\n"
+        f"# recreates the interfaces down and unconfigured, and this\n"
         f"# service brings them back up without operator action.\n"
         f"[Unit]\n"
-        f"Description=Bring up Almond Axol CAN interfaces on adapter hotplug\n"
+        f"Description=Bring up {profile.label} CAN interfaces on adapter hotplug\n"
         f"\n"
         f"[Service]\n"
         f"Type=oneshot\n"
-        f"ExecStart=/bin/bash {_AXOL_PROFILE.cron_script}\n"
+        f"ExecStart=/bin/bash {profile.cron_script}\n"
     )
-    run_root(["tee", str(_HOTPLUG_UNIT_FILE)], input_text=content, check=True)
+    run_root(["tee", str(profile.hotplug_unit_file)], input_text=content, check=True)
     run_root(["systemctl", "daemon-reload"], check=True)
     print("  Done.")
 
@@ -718,17 +588,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--umi",
         action="store_true",
-        help=f"Configure the handheld UMI rig adapters ({CAN_UMI_LEFT} / {CAN_UMI_RIGHT}).",
-    )
-    parser.add_argument(
-        "--left",
-        metavar="SERIAL",
-        help="UMI only: USB serial of the LEFT gripper's adapter (skips the prompt).",
-    )
-    parser.add_argument(
-        "--right",
-        metavar="SERIAL",
-        help="UMI only: USB serial of the RIGHT gripper's adapter (skips the prompt).",
+        help="Configure the handheld UMI rig's dual-channel adapter "
+        f"(channel 0 -> {CAN_UMI_LEFT}, channel 1 -> {CAN_UMI_RIGHT}).",
     )
     parser.set_defaults(func=run)
 
@@ -848,7 +709,7 @@ def is_configured() -> bool:
     return (
         _AXOL_PROFILE.rules_file.exists()
         and _AXOL_PROFILE.cron_script.exists()
-        and _HOTPLUG_UNIT_FILE.exists()
+        and _AXOL_PROFILE.hotplug_unit_file.exists()
     )
 
 
@@ -871,8 +732,7 @@ def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -
 def _configure(serial: str, profile: _Profile, base_serial: str | None = None) -> None:
     _write_udev_rules(serial, profile, base_serial=base_serial)
     _write_cron_script(profile, with_base=base_serial is not None)
-    if profile is _AXOL_PROFILE:
-        _write_hotplug_unit()
+    _write_hotplug_unit(profile)
     _reload_udev()
     _rename_interfaces(serial, profile, base_serial=base_serial)
     _register_cron(profile)
@@ -889,9 +749,10 @@ def _find_base_serial(hub_serial: str) -> str | None:
 
     A previously pinned adapter is kept without prompting; otherwise any
     attached single-channel candlelight adapter is offered — except serials
-    the UMI rig's rules already claim (its handheld CANables are also
-    single-channel). Opt-in ([y/N]) because a single-channel adapter isn't
-    necessarily a cart — it could be any other candlelight device on the host.
+    the UMI rig's rules already claim (a belt-and-braces guard; the rig's
+    board is dual-channel, so it should never appear here). Opt-in ([y/N])
+    because a single-channel adapter isn't necessarily a cart — it could be
+    any other candlelight device on the host.
     """
     configured = _configured_base_serial()
     if configured:
@@ -930,36 +791,26 @@ def run(args: object = None) -> None:
         time.sleep(2.0)
 
     if profile is _UMI_PROFILE:
-        assign = _find_umi_assignment(
-            getattr(args, "left", None), getattr(args, "right", None)
-        )
-        _write_umi_udev_rules(assign)
-        _write_cron_script(profile)
-        _reload_udev()
-        _rename_umi_interfaces(assign)
-        _register_cron(profile)
-        bring_up_can(profile)
-        print()
-        print("Setup complete.")
-        print(f"  Left  : {profile.left}")
-        print(f"  Right : {profile.right}")
-        print(f"  Startup  : {profile.cron_script} (runs at @reboot via root crontab)")
-        return
-
-    serial = _find_serial(profile)
-    base_serial = _find_base_serial(serial)
-    ensure_setup(serial=serial, base_serial=base_serial)
+        # Same dual-channel board as the arm hub: channel 0 -> left gripper,
+        # channel 1 -> right. No cart / RP1 handling on the rig profile.
+        serial = _find_serial(profile)
+        _configure(serial, profile)
+        base_serial = None
+    else:
+        serial = _find_serial(profile)
+        base_serial = _find_base_serial(serial)
+        ensure_setup(serial=serial, base_serial=base_serial)
 
     print()
     print("Setup complete.")
-    print(f"  Left arm : {profile.left}")
-    print(f"  Right arm: {profile.right}")
+    print(f"  Left  : {profile.left}")
+    print(f"  Right : {profile.right}")
     if base_serial:
         print(f"  Cart     : {_CAN_B}")
     print(f"  Startup  : {profile.cron_script} (runs at @reboot via root crontab)")
     print(
-        f"  Hotplug  : {_HOTPLUG_UNIT} (re-runs the startup script whenever "
+        f"  Hotplug  : {profile.hotplug_unit} (re-runs the startup script whenever "
         f"the adapter re-enumerates, e.g. after a mid-session USB drop)"
     )
-    if _is_raspberry_pi_5():
+    if profile is _AXOL_PROFILE and _is_raspberry_pi_5():
         print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")
