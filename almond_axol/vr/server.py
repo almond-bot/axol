@@ -122,6 +122,14 @@ class VRServer:
         self._video_expected: bool = False
         # webrtc-requests parked while video is still starting: id → socket.
         self._video_pending: dict[int, WebSocket] = {}
+        # Clients whose offer is currently being created. Offer creation
+        # awaits (signaling pipe, ICE gathering), so a client's retry request
+        # can land while its parked request is being flushed; creating a
+        # second offer then would close the in-flight peer connection
+        # mid-negotiation and can follow a good offer with an erroneous
+        # ``webrtc-unavailable``. Guarded per client in _send_webrtc_offer
+        # (single event loop, so a plain set suffices).
+        self._video_offering: set[int] = set()
         # Event loop this server runs on (captured in enable()) so video
         # registration from another thread can schedule the pending flush.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -400,6 +408,7 @@ class VRServer:
         self._client_count = 0
         self._active_clients.clear()
         self._video_pending.clear()
+        self._video_offering.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -550,30 +559,43 @@ class VRServer:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
 
     async def _send_webrtc_offer(self, websocket: WebSocket, client_id: int) -> None:
-        """Create a fresh per-client offer and send it (unavailable on failure)."""
-        webrtc = self._webrtc
-        if webrtc is None:
-            await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+        """Create a fresh per-client offer and send it (unavailable on failure).
+
+        No-op while an offer for the same client is already being created —
+        the pending flush and a concurrent request retry would otherwise race,
+        with the later ``create_offer`` tearing down the earlier one's peer
+        connection mid-negotiation. The in-flight offer (sent to this same
+        socket) answers the skipped request.
+        """
+        if client_id in self._video_offering:
             return
+        self._video_offering.add(client_id)
         try:
-            sdp, tracks = await webrtc.create_offer(client_id)
-        except Exception as exc:  # noqa: BLE001 - degrade to no video
-            _logger.error("failed to create webrtc offer: %s", exc)
-            await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
-            return
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "webrtc-offer",
-                    "sdp": sdp,
-                    "tracks": tracks,
-                    # Same TURN/STUN servers the aiortc peer used, so the
-                    # browser gathers a matching relay candidate. Empty on
-                    # a LAN (no env config) — harmless to the headset.
-                    "iceServers": client_ice_servers(),
-                }
+            webrtc = self._webrtc
+            if webrtc is None:
+                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                return
+            try:
+                sdp, tracks = await webrtc.create_offer(client_id)
+            except Exception as exc:  # noqa: BLE001 - degrade to no video
+                _logger.error("failed to create webrtc offer: %s", exc)
+                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                return
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "webrtc-offer",
+                        "sdp": sdp,
+                        "tracks": tracks,
+                        # Same TURN/STUN servers the aiortc peer used, so the
+                        # browser gathers a matching relay candidate. Empty on
+                        # a LAN (no env config) — harmless to the headset.
+                        "iceServers": client_ice_servers(),
+                    }
+                )
             )
-        )
+        finally:
+            self._video_offering.discard(client_id)
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
