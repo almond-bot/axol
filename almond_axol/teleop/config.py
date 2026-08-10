@@ -84,6 +84,15 @@ class VRTeleopConfig:
             controller since engage is converted to axis-angle and its angle
             is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
+        disengage_timeout: Auto-disengage when no VR pose frame has arrived
+            for this many seconds while teleop is engaged — the operator left
+            VR (headset doffed, session exited without pressing X/Y) or the
+            link dropped.  Without it the engage toggle survives the gap, so
+            the next frames after re-entering VR are tracked against the old
+            engage snapshot and the arms jerk toward wherever the controllers
+            now are.  The headset streams poses at 72+ Hz while presenting,
+            so anything beyond a few hundred ms is a real gap, not jitter.
+            ``0`` disables the timeout.  Defaults to ``0.5`` s.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -131,3 +140,4 @@ class VRTeleopConfig:
     pose_beta: float = 5.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
+    disengage_timeout: float = 0.5

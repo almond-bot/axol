@@ -280,6 +280,20 @@ class VRTeleop:
     async def __aexit__(self, *_: object) -> None:
         await self.disable()
 
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare that camera video will be registered once it finishes starting.
+
+        Call before ``async with`` / :meth:`enable` when cameras are
+        configured: the VR server starts accepting headsets long before the
+        video relay finishes opening the cameras, and an early video request
+        would otherwise be answered "unavailable" — hiding the camera screens
+        for the whole session. With this set, early requests wait
+        (``webrtc-pending``) and receive their offer the moment
+        :meth:`set_video_manager` / :meth:`set_video_sources` lands. See
+        :meth:`almond_axol.vr.server.VRServer.set_video_expected`.
+        """
+        self._vr_server.set_video_expected(expected)
+
     def set_video_sources(self, sources: dict[str, object] | None) -> None:
         """Stream camera frames to the headset via WebRTC.
 

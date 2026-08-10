@@ -110,6 +110,22 @@ class VRServer:
         # restarts) isn't locked out.
         self._last_seq: int | None = None
 
+        # Whether camera video is expected to become available this session.
+        # Camera bring-up (relay subprocess, ZED open, NVENC init) can take
+        # tens of seconds after this server starts accepting connections; a
+        # headset that sends ``webrtc-request`` in that window must not be
+        # told ``webrtc-unavailable`` (it would give up and show no cameras
+        # for the whole session). While True and no manager is registered
+        # yet, such requests are parked in ``_video_pending`` and answered
+        # with ``webrtc-pending``, then resolved with a real offer — or an
+        # honest ``webrtc-unavailable`` — once video setup concludes.
+        self._video_expected: bool = False
+        # webrtc-requests parked while video is still starting: id → socket.
+        self._video_pending: dict[int, WebSocket] = {}
+        # Event loop this server runs on (captured in enable()) so video
+        # registration from another thread can schedule the pending flush.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         self._latest_frame: VRFrame | None = None
         # Adaptive playout buffer: reconstructs a smooth pose stream from
         # batched/jittered network arrivals. Consumers that want smoothing read
@@ -179,6 +195,22 @@ class VRServer:
         """
         self._episode = episode
 
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare whether camera video is expected to become available.
+
+        Call (before :meth:`enable`, or any time earlier than the first
+        headset connection) when cameras are configured but still starting:
+        ``webrtc-request``s that arrive before :meth:`set_video_manager` /
+        :meth:`set_video_sources` registers a manager are then parked and
+        answered with ``{"type": "webrtc-pending"}`` — the headset keeps its
+        "connecting cameras" state — and receive their offer automatically
+        the moment video setup concludes (or ``webrtc-unavailable`` if it
+        concludes without video). Without this, an early request is told
+        video is unavailable and the headset shows no camera screens for the
+        rest of the session.
+        """
+        self._video_expected = expected
+
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Register per-camera video sources to stream to the headset.
 
@@ -200,6 +232,7 @@ class VRServer:
         """
         if not sources:
             self._webrtc = None
+            self._conclude_video_setup()
             return
         try:
             from ..video.video import WebRTCManager, webrtc_available
@@ -216,8 +249,10 @@ class VRServer:
                 exc,
             )
             self._webrtc = None
+            self._conclude_video_setup()
             return
         _logger.info("wrist video enabled for: %s", ", ".join(sources))
+        self._conclude_video_setup()
 
     def set_video_manager(self, manager: Any | None) -> None:
         """Register a pre-built WebRTC manager (e.g. an out-of-process relay).
@@ -231,6 +266,41 @@ class VRServer:
         self._webrtc = manager
         if manager is not None:
             _logger.info("wrist video enabled (external manager)")
+        self._conclude_video_setup()
+
+    def _conclude_video_setup(self) -> None:
+        """Resolve parked ``webrtc-request``s now that video setup finished.
+
+        Called by :meth:`set_video_manager` / :meth:`set_video_sources` from
+        any thread. Clients parked on ``webrtc-pending`` are answered on the
+        server's event loop: a fresh offer when a manager was registered, or
+        ``webrtc-unavailable`` when setup concluded without video. Video is
+        no longer "expected" either way — later requests are answered
+        directly from the registered manager (or its absence).
+        """
+        self._video_expected = False
+        loop = self._loop
+        if loop is None or not self._video_pending:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._flush_video_pending(), loop)
+        except RuntimeError:
+            pass  # server loop already shut down
+
+    async def _flush_video_pending(self) -> None:
+        """Answer every parked video request (runs on the server loop)."""
+        pending = list(self._video_pending.items())
+        self._video_pending.clear()
+        for client_id, ws in pending:
+            if ws not in self._active_clients:
+                continue
+            try:
+                if self._webrtc is None:
+                    await ws.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                else:
+                    await self._send_webrtc_offer(ws, client_id)
+            except Exception as exc:  # noqa: BLE001 - keep serving other clients
+                _logger.warning("failed to resolve pending video request: %s", exc)
 
     @property
     def connected(self) -> bool:
@@ -266,6 +336,10 @@ class VRServer:
         """
         if self._server_task is not None:
             return
+
+        # Captured so video registration (called from other threads) can
+        # schedule the pending-request flush onto this loop.
+        self._loop = asyncio.get_running_loop()
 
         if not os.path.isfile(self._certfile) or not os.path.isfile(self._keyfile):
             _logger.info("creating self-signed certificate")
@@ -325,6 +399,8 @@ class VRServer:
 
         self._client_count = 0
         self._active_clients.clear()
+        self._video_pending.clear()
+        self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
         self._last_seq = None
@@ -446,29 +522,23 @@ class VRServer:
 
         if self._webrtc is None:
             if msg_type == "webrtc-request":
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                if self._video_expected:
+                    # Cameras are configured but still starting: park the
+                    # request (answered with a real offer when video setup
+                    # concludes — see _conclude_video_setup) and tell the
+                    # headset to keep its connecting state meanwhile.
+                    self._video_pending[client_id] = websocket
+                    await websocket.send_text(json.dumps({"type": "webrtc-pending"}))
+                else:
+                    await websocket.send_text(
+                        json.dumps({"type": "webrtc-unavailable"})
+                    )
             return
 
         if msg_type == "webrtc-request":
-            try:
-                sdp, tracks = await self._webrtc.create_offer(client_id)
-            except Exception as exc:
-                _logger.error("failed to create webrtc offer: %s", exc)
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
-                return
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "webrtc-offer",
-                        "sdp": sdp,
-                        "tracks": tracks,
-                        # Same TURN/STUN servers the aiortc peer used, so the
-                        # browser gathers a matching relay candidate. Empty on
-                        # a LAN (no env config) — harmless to the headset.
-                        "iceServers": client_ice_servers(),
-                    }
-                )
-            )
+            # A direct answer supersedes any parked copy of this request.
+            self._video_pending.pop(client_id, None)
+            await self._send_webrtc_offer(websocket, client_id)
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
@@ -478,6 +548,32 @@ class VRServer:
                     _logger.error("failed to apply webrtc answer: %s", exc)
         else:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
+
+    async def _send_webrtc_offer(self, websocket: WebSocket, client_id: int) -> None:
+        """Create a fresh per-client offer and send it (unavailable on failure)."""
+        webrtc = self._webrtc
+        if webrtc is None:
+            await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+            return
+        try:
+            sdp, tracks = await webrtc.create_offer(client_id)
+        except Exception as exc:  # noqa: BLE001 - degrade to no video
+            _logger.error("failed to create webrtc offer: %s", exc)
+            await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+            return
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "webrtc-offer",
+                    "sdp": sdp,
+                    "tracks": tracks,
+                    # Same TURN/STUN servers the aiortc peer used, so the
+                    # browser gathers a matching relay candidate. Empty on
+                    # a LAN (no env config) — harmless to the headset.
+                    "iceServers": client_ice_servers(),
+                }
+            )
+        )
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
@@ -539,6 +635,7 @@ class VRServer:
                     pass
             finally:
                 server._active_clients.discard(websocket)
+                server._video_pending.pop(client_id, None)
                 server._client_count = max(0, server._client_count - 1)
                 # The HUD publisher (the headset) left: clear its popups from
                 # every mirror so a dashboard doesn't show a stale dialog.

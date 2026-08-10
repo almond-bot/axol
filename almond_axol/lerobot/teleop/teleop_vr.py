@@ -96,6 +96,9 @@ class AxolVRTeleop(Teleoperator):
 
         # VR + IK
         self._vr_server: VRServer | None = None
+        # Whether camera video will be registered after connect (stashed here
+        # since the VR server doesn't exist yet; applied in _connect_async).
+        self._video_expected = False
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
         # IK dispatch runs in a dedicated daemon thread (not an asyncio task on
@@ -231,6 +234,9 @@ class AxolVRTeleop(Teleoperator):
         # Lock the headset HUD to data collection: the operator can record
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
+        # Park early headset video requests until set_video_manager /
+        # set_video_sources lands (they run after the caller's camera setup).
+        self._vr_server.set_video_expected(self._video_expected)
         await self._vr_server.enable()
 
         if self._cart is not None:
@@ -373,6 +379,22 @@ class AxolVRTeleop(Teleoperator):
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         """Accept robot observation. Currently a no-op — IK worker maintains its own state."""
         pass
+
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare that camera video will be registered after :meth:`connect`.
+
+        Call before :meth:`connect` when cameras are configured: the VR server
+        starts accepting headsets during the IK worker's JAX compile, well
+        before :meth:`set_video_manager` / :meth:`set_video_sources` runs, and
+        an early video request would otherwise be answered "unavailable" —
+        hiding the camera screens for the whole session. With this set, early
+        requests wait (``webrtc-pending``) and receive their offer once video
+        registration lands. See
+        :meth:`almond_axol.vr.server.VRServer.set_video_expected`.
+        """
+        self._video_expected = expected
+        if self._vr_server is not None:
+            self._vr_server.set_video_expected(expected)
 
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Stream wrist-camera frames to the headset via WebRTC.

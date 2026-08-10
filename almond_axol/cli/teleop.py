@@ -358,13 +358,21 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         from ..robot.cart import Cart
 
         cart = Cart(cfg.cart)
-    async with VRTeleop(
+    teleop = VRTeleop(
         robot,
         config=cfg.teleop,
         kinematics_config=cfg.kinematics,
         vr_server_config=cfg.vr_server,
         cart=cart,
-    ) as teleop:
+    )
+    if cfg.cameras:
+        # The VR server accepts headsets long before the cameras finish
+        # opening (IK compile + relay bring-up can take minutes). Declare
+        # video as expected so an early headset request waits for the offer
+        # instead of being told there is no video — which would silently hide
+        # the camera screens until the operator re-enters VR.
+        teleop.set_video_expected(True)
+    async with teleop:
         # Prefer the out-of-process relay (gst-native cameras + WebRTC in
         # a subprocess, isolated from the control loops); fall back to
         # in-process sources when it isn't applicable.
@@ -380,6 +388,11 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         else:
             cameras = await asyncio.to_thread(_connect_zed_cameras, cfg, stereo_set)
             _register_zed_video(teleop, cameras)
+            if not cameras:
+                # Camera setup concluded with nothing to stream: release any
+                # headsets parked on webrtc-pending with an honest
+                # unavailable instead of leaving them connecting forever.
+                teleop.set_video_sources(None)
         imu_src = _wire_cart_imu(cfg, cart)
         try:
             await teleop.run()

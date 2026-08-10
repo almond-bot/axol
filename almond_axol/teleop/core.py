@@ -22,8 +22,10 @@ Threading contract (identical for both adapters):
     *only* place the smoothing filters are advanced, so it must run at the
     steady control rate, not the slower/jittery IK rate.
 The few cross-thread float writes (``max_vel`` / ``engage_time`` set on the IK
-thread and read on the control loop; ``reset_interp`` touched by both) are
-single-word and benign — this matches the original design of both adapters.
+thread and read on the control loop; ``reset_interp`` touched by both; the
+pose heartbeat ``_last_frame_time`` set on the VR thread and read on the IK
+thread) are single-word and benign — this matches the original design of both
+adapters.
 """
 
 from __future__ import annotations
@@ -114,6 +116,13 @@ class VRTeleopCore:
         self._prev_reset: bool = False
         self._reset_latched: bool = False
 
+        # Arrival time of the most recent raw VR frame (written on the VR
+        # server thread in note_frame_reset, read on the IK thread). Drives
+        # the stale-stream auto-disengage: identity-stable render frames make
+        # "no new frame from get_frame()" indistinguishable from an operator
+        # holding perfectly still, so staleness must be measured at ingest.
+        self._last_frame_time: float | None = None
+
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)
     # ------------------------------------------------------------------
@@ -164,8 +173,11 @@ class VRTeleopCore:
         """Latch a reset on the rising edge of the VR reset button.
 
         Called from the VR frame callback for every frame so a short press
-        can't be missed while the IK loop blocks on ``conn.recv``.
+        can't be missed while the IK loop blocks on ``conn.recv``. Doubles as
+        the pose-stream heartbeat for the stale-stream auto-disengage (see
+        :meth:`_maybe_disengage_stale`).
         """
+        self._last_frame_time = time.perf_counter()
         if reset and not self._prev_reset:
             self._reset_latched = True
         self._prev_reset = reset
@@ -370,6 +382,7 @@ class VRTeleopCore:
 
             frame = get_frame()
             if frame is None or frame is last_frame:
+                self._maybe_disengage_stale(conn, last_frame, process_alive)
                 time.sleep(0.001)
                 continue
             last_frame = frame
@@ -406,6 +419,69 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _maybe_disengage_stale(
+        self,
+        conn: multiprocessing.connection.Connection,
+        last_frame: object,
+        process_alive: Callable[[], bool],
+    ) -> None:
+        """Auto-disengage when the raw pose stream stops while engaged.
+
+        The pose stream only flows while the headset is presenting, so a gap
+        beyond ``config.disengage_timeout`` means the operator left VR (or the
+        link died) — through *any* exit path, including ones that never deliver
+        the Y-press reset frame (system menu, headset doffed, app crash, WiFi
+        drop). Staying engaged across the gap is what makes the arms jerk on
+        the next VR entry: the resumed frames are measured against the old
+        engage snapshot, so the target jumps by however far the controllers
+        moved in the meantime. Disengaging freezes the arms in place and makes
+        re-entry inert until the operator deliberately re-engages (which takes
+        a fresh engage snapshot at the new controller pose — no jump).
+
+        Runs on the IK thread. Frame arrivals are timestamped at ingest
+        (:meth:`note_frame_reset`) rather than via ``get_frame`` identity,
+        which cannot distinguish "stream stopped" from "operator perfectly
+        still" (the interpolator's render frame is identity-stable while the
+        pose holds).
+        """
+        timeout = self.config.disengage_timeout
+        if not self.teleop_enabled or timeout <= 0:
+            return
+        last_seen = self._last_frame_time
+        if last_seen is None:
+            return
+        gap = time.perf_counter() - last_seen
+        if gap < timeout:
+            return
+        self.teleop_enabled = False
+        self._logger.info(
+            "Teleop disabled: no VR poses for %.2fs (operator left VR or the "
+            "link dropped); re-engage with both grips",
+            gap,
+        )
+        self._broadcast(False)
+        # Also deactivate the IK worker so its next engaged frame performs a
+        # fresh engage-snap. Without this, a client that resumes already
+        # holding both grips (or a reconnecting SDK client streaming
+        # l_lock/r_lock true) would have its first frame solved against the
+        # stale snapshot — the exact jump this disengage exists to prevent.
+        if last_frame is not None and process_alive():
+            try:
+                conn.send(
+                    last_frame.model_copy(  # type: ignore[attr-defined]
+                        update={"l_lock": False, "r_lock": False}
+                    )
+                )
+                result = recv_with_timeout(conn, _IK_RECV_TIMEOUT)
+                if result is not None:
+                    self.set_target(result)
+                else:
+                    self._logger.warning(
+                        "IK recv timeout during stale-stream disengage"
+                    )
+            except Exception as e:  # noqa: BLE001 - keep the loop alive
+                self._logger.error("IK disengage dispatch error: %s", e)
 
     @staticmethod
     def _pace(t0: float, interval: float) -> None:
