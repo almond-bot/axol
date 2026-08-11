@@ -439,8 +439,8 @@ class AxolVRTeleop(Teleoperator):
         """Play the pending return-to-rest guarded; see the shared engine.
 
         Thin passthrough to :meth:`VRTeleopCore.guarded_return`, which owns
-        the compliant-move / contact-watchdog / gravity-comp-fallback
-        sequencing shared with native ``axol teleop``. The caller supplies
+        the contact-watchdog / gravity-comp-fallback sequencing shared with
+        native ``axol teleop``. The caller supplies
         the flow-specific hooks (robot commands, gravity cycle, residuals,
         announcements); await from a coroutine on the robot's event loop
         with a reset already pending or playing.

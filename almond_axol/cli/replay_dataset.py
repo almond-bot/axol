@@ -86,12 +86,11 @@ class ReplayDatasetConfig:
     # returning to rest between takes. Off by default (a single replay). Either
     # way the arm returns to the rest pose before the operation exits.
     loop: bool = False
-    # Contact watchdog for every return-to-rest: the move plays at the
-    # fully-compliant gain endpoint, and a joint torque residual (measured
-    # minus modeled gravity, Nm) sustained above this drops the arms into a
-    # limp gravity-comp hold instead of pulling through. Replay has no
-    # interactive retry channel, so the hold lasts until the run is stopped
-    # (Ctrl+C or the UI's Stop). 0 disables the watchdog.
+    # Contact watchdog for every return-to-rest: a joint torque residual
+    # (measured minus modeled gravity, Nm) sustained above this drops the
+    # arms into a limp gravity-comp hold instead of pulling through. Replay
+    # has no interactive retry channel, so the hold lasts until the run is
+    # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
@@ -217,9 +216,8 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     def _go_to_rest(
         message: str = "Returning to rest pose.", *, final: bool = False
     ) -> None:
-        # Guarded: the move plays at the fully-compliant gain endpoint and a
-        # sustained torque residual (contact) drops the arms into a limp
-        # gravity-comp hold. Replay has no interactive retry channel, so the
+        # Guarded: a sustained torque residual (contact) drops the arms into
+        # a limp gravity-comp hold. Replay has no interactive retry channel, so the
         # hold lasts until the run is stopped — `rested` then stays False and
         # the teardown skips its redundant return attempt. The teardown's own
         # return (``final=True``) must play even though the stop flag is

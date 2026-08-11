@@ -11,14 +11,13 @@ While saving, the VR headset is pushed into the SAVING state so recording
 controls are blocked until save_episode() completes.
 
 After an episode ends the arms return to rest automatically, but *guarded*:
-the move plays at the fully-compliant gain endpoint (gravity/friction
-feedforward still carries the arms), and a torque-residual watchdog compares
-measured torque against the gravity model. Unexpected contact — a gripper
-still hooked on the scene, or the operator grabbing an arm — trips the
-watchdog: the move stops where it is and the arms drop into a limp
-gravity-compensation hold so they can be hand-guided clear (the episode
-saves in the background meanwhile). Pressing reset (X) then replans the
-collision-aware return-to-rest from wherever the arms were left.
+a torque-residual watchdog compares measured torque against the gravity
+model while the move plays. Unexpected contact — a gripper still hooked on
+the scene, or the operator grabbing an arm — trips the watchdog: the move
+stops where it is and the arms drop into a limp gravity-compensation hold
+so they can be hand-guided clear (the episode saves in the background
+meanwhile). Pressing reset (X) then replans the collision-aware
+return-to-rest from wherever the arms were left.
 
 Recording continues until Ctrl+C.
 
@@ -313,10 +312,9 @@ class CollectDataConfig:
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
     vcodec: str = field(default_factory=default_vcodec)
-    # Every return-to-rest is guarded: it plays at the fully-compliant gain
-    # endpoint and a torque watchdog drops the arms into a limp gravity-comp
-    # hold on unexpected contact (reset replans from wherever they were
-    # left). The knobs live on the shared teleop config —
+    # Every return-to-rest is guarded: a torque watchdog drops the arms into
+    # a limp gravity-comp hold on unexpected contact (reset replans from
+    # wherever they were left). The knobs live on the shared teleop config —
     # ``--teleop_config.vr_teleop_config.reset_torque_threshold`` (0 disables
     # the watchdog) and ``.reset_gravity_comp_kd`` — the same fields `axol
     # teleop` uses, so the two flows behave identically.
@@ -797,8 +795,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
         return recording, rerecord
 
-    # Guarded return-to-rest: the sequencing (compliant move, torque watchdog,
-    # gravity-comp fallback, reset-press retry) lives in the shared engine
+    # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
+    # fallback, reset-press retry) lives in the shared engine
     # (VRTeleopCore.guarded_return — the same one native `axol teleop` runs),
     # bound here to this flow's robot, processors, and headset states.
     vrt_cfg = cfg.teleop_config.vr_teleop_config
@@ -825,7 +823,6 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             send_step=_guard_send_step,
             gravity_step=_guard_gravity_step,
             torque_residuals=robot.torque_residuals,
-            set_compliant_gains=robot.set_compliant_gains,
             reset_command_state=robot.reset_command_state,
             get_positions=lambda: robot.positions,
             stopped=_stopped,
@@ -901,13 +898,12 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                     recorder.cancel_episode()
                 break
 
-            # Return home right away, but *guarded*: the move plays at the
-            # fully-compliant gains and bails into a limp gravity-comp hold
-            # on contact (see _return_home_loop), so a gripper still hooked
-            # on the scene means a gentle, briefly-held tug — not a yank.
-            # The episode is saved/discarded on this thread in parallel; on
-            # a save the headset stays in SAVING (controls blocked) until
-            # the write completes.
+            # Return home right away, but *guarded*: the move bails into a
+            # limp gravity-comp hold on contact (see _return_home_loop), so
+            # a gripper still hooked on the scene means a brief tug — not a
+            # sustained yank. The episode is saved/discarded on this thread
+            # in parallel; on a save the headset stays in SAVING (controls
+            # blocked) until the write completes.
             home_future = asyncio.run_coroutine_threadsafe(
                 _return_home_loop(), robot.event_loop
             )

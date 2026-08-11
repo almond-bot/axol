@@ -130,12 +130,11 @@ class RunPolicyConfig:
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
     temporal_ensemble_coeff: float = 0.01
-    # Contact watchdog for the between-episode return-to-rest: the move plays
-    # at the fully-compliant gain endpoint, and a joint torque residual
-    # (measured minus modeled gravity, Nm) sustained above this drops the
-    # arms into a limp gravity-comp hold instead of pulling through — free
-    # them by hand, then continue (Enter / the panel's Start) to replan from
-    # wherever they were left. 0 disables the watchdog.
+    # Contact watchdog for the between-episode return-to-rest: a joint torque
+    # residual (measured minus modeled gravity, Nm) sustained above this
+    # drops the arms into a limp gravity-comp hold instead of pulling
+    # through — free them by hand, then continue (Enter / the panel's Start)
+    # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
@@ -1018,10 +1017,10 @@ def _run(
     def _return_to_rest_guarded() -> bool:
         """Guarded return to rest; ``False`` when the operator aborted.
 
-        Plays at the fully-compliant gain endpoint with the torque watchdog;
-        on contact the arms drop into a limp gravity-comp hold, and the
-        normal continue gate (Enter on the terminal, Start on the control
-        panel) retries from wherever they were hand-guided to.
+        Plays with the torque watchdog live; on contact the arms drop into
+        a limp gravity-comp hold, and the normal continue gate (Enter on
+        the terminal, Start on the control panel) retries from wherever
+        they were hand-guided to.
         """
         return reset_controller.return_to_rest(
             robot,

@@ -284,13 +284,13 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Reset contact threshold (Nm)",
                 type="number",
                 help=(
-                    "Contact watchdog for every return-to-rest move (played "
-                    "at fully-compliant gains): a joint torque this far (Nm) "
-                    "from the gravity model, sustained, stops the move and "
-                    "drops the arms into a limp gravity-comp hold — free "
-                    "them by hand, then press reset (VR) or continue (panel/"
-                    "terminal) to replan from where they are. Raise if "
-                    "normal returns false-trip; 0 disables the watchdog."
+                    "Contact watchdog for every return-to-rest move: a "
+                    "joint torque this far (Nm) from the gravity model, "
+                    "sustained, stops the move and drops the arms into a "
+                    "limp gravity-comp hold — free them by hand, then press "
+                    "reset (VR) or continue (panel/terminal) to replan from "
+                    "where they are. Raise if normal returns false-trip; 0 "
+                    "disables the watchdog."
                 ),
                 targets={
                     "teleop": ("teleop.reset_torque_threshold",),

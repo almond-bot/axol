@@ -116,8 +116,9 @@ class IKResetController:
     ) -> bool:
         """Plan and play a guarded collision-aware trajectory to the rest pose.
 
-        The move plays at the fully-compliant gain endpoint; a torque
-        residual sustained above ``torque_threshold`` (see
+        The move plays at the normal session gains — accurate tracking of
+        the collision-checked path — while a torque residual sustained above
+        ``torque_threshold`` (see
         :class:`~almond_axol.robot.control.ContactWatchdog`) means it hit
         something — a gripper still hooked on the scene, an operator
         grabbing an arm — so the move stops where it is and the arms drop
@@ -131,13 +132,10 @@ class IKResetController:
           fires (or Ctrl+C), then aborts — there is no interactive channel
           to retry from.
 
-        Session gains are always restored on the way out.
-
         Args:
             robot: Connected robot to drive.
             torque_threshold: Contact watchdog threshold (Nm); ``0``
-                disables it (the move stays compliant but always plays
-                through).
+                disables it (the move always plays through).
             gravity_comp_kd: Velocity damping for the hold's free joints.
             wait_retry: Blocking operator gate; ``True`` = retry.
             stopped: Flow shutdown flag, polled during play and hold.
@@ -148,22 +146,18 @@ class IKResetController:
             (stopped, or the operator declined the retry).
         """
         self.wait_ready()
-        robot.set_compliant_gains(True)
-        try:
-            while True:
-                outcome = self._play_to_rest(robot, torque_threshold, stopped)
-                if outcome != "contact":
-                    return outcome == "done"
-                if on_contact is not None:
-                    on_contact()
-                if not self._hold_limp(robot, gravity_comp_kd, wait_retry, stopped):
-                    return False
-                # The arms were hand-guided during the hold: clear the stale
-                # command history so the max-step safety check doesn't reject
-                # the first command of the replanned move.
-                robot.reset_command_state()
-        finally:
-            robot.set_compliant_gains(False)
+        while True:
+            outcome = self._play_to_rest(robot, torque_threshold, stopped)
+            if outcome != "contact":
+                return outcome == "done"
+            if on_contact is not None:
+                on_contact()
+            if not self._hold_limp(robot, gravity_comp_kd, wait_retry, stopped):
+                return False
+            # The arms were hand-guided during the hold: clear the stale
+            # command history so the max-step safety check doesn't reject
+            # the first command of the replanned move.
+            robot.reset_command_state()
 
     def _play_to_rest(
         self,
@@ -180,11 +174,7 @@ class IKResetController:
         import numpy as np
 
         from ..constants import Joint
-        from ..robot.control import (
-            SETTLE_TIMEOUT_S,
-            SETTLE_TOL_RAD,
-            ContactWatchdog,
-        )
+        from ..robot.control import ContactWatchdog
         from ..teleop.filter import ResetInterpolator
 
         assert self._conn is not None
@@ -218,7 +208,6 @@ class IKResetController:
         joints = list(Joint)
         play_hz = float(self._vr_cfg.frequency)
         period = 1.0 / play_hz
-        action: dict[str, float] | None = None
         while interp.is_active():
             if stopped is not None and stopped():
                 return "stopped"
@@ -228,7 +217,7 @@ class IKResetController:
                 break
             arm_left = np.asarray(new_q)[self._left_indices]
             arm_right = np.asarray(new_q)[self._right_indices]
-            action = {}
+            action: dict[str, float] = {}
             for j in joints:
                 if j in ARM_JOINTS:
                     ai = ARM_JOINTS.index(j)
@@ -250,40 +239,6 @@ class IKResetController:
                 )
                 return "contact"
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
-
-        # Arrival settle: keep holding the final target at compliant gains
-        # until the tracking error decays, so the caller's session-gain
-        # restore multiplies ~zero error (no snap at the rest pose). The
-        # watchdog stays live — a grab at arrival trips like anywhere else.
-        if action is not None:
-            q_final = np.asarray(traj[-1])
-            final_left = q_final[self._left_indices]
-            final_right = q_final[self._right_indices]
-            cap = time.perf_counter() + SETTLE_TIMEOUT_S
-            while time.perf_counter() < cap:
-                if stopped is not None and stopped():
-                    return "stopped"
-                t0 = time.perf_counter()
-                robot.send_action(action)
-                tripped = watchdog.update(robot.torque_residuals())
-                if tripped is not None:
-                    joint, residual = tripped
-                    _logger.warning(
-                        "return-to-rest contact: %s torque residual %.1f "
-                        "exceeds %.1f — going limp",
-                        joint,
-                        residual,
-                        torque_threshold,
-                    )
-                    return "contact"
-                pos_l, pos_r = robot.positions
-                err = max(
-                    float(np.max(np.abs(np.asarray(pos_l[:7]) - final_left))),
-                    float(np.max(np.abs(np.asarray(pos_r[:7]) - final_right))),
-                )
-                if err < SETTLE_TOL_RAD:
-                    break
-                time.sleep(max(0.0, period - (time.perf_counter() - t0)))
         return "done"
 
     def _hold_limp(

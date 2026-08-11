@@ -744,20 +744,6 @@ class AxolRobot(Robot):
         assert self._axol is not None
         self._axol.reset_command_state()
 
-    def set_compliant_gains(self, enabled: bool) -> None:
-        """Switch both arms between session and fully-compliant gains.
-
-        ``True`` runs subsequent commands at the fully-compliant (``s=0``)
-        endpoint of the stiffness blend, so a move yields on unexpected
-        contact instead of pushing through it; ``False`` restores the
-        session gains. See
-        :meth:`almond_axol.robot.axol.AxolArm.set_compliant_gains`. Mutates
-        plain Python state on the arm wrappers, so it runs directly without
-        the event loop; takes effect from the next command.
-        """
-        assert self._axol is not None
-        self._axol.set_compliant_gains(enabled)
-
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Per-arm measured-minus-gravity torques, ``(left, right)``.
 

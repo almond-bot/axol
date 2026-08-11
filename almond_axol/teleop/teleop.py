@@ -338,15 +338,14 @@ class VRTeleop:
         tegra = TegraStatsDiag(_logger)
         tegra.start()
 
-        # Guarded return-to-rest needs torque feedback, the compliant gain
-        # endpoint, and gravity comp — hardware (Axol) only. The Sim target has
-        # none of those (and nothing physical to protect), so its resets play
-        # through the normal path below.
+        # Guarded return-to-rest needs torque feedback and gravity comp —
+        # hardware (Axol) only. The Sim target has neither (and nothing
+        # physical to protect), so its resets play through the normal path
+        # below.
         guard = all(
             hasattr(self._robot, attr)
             for attr in (
                 "torque_residuals",
-                "set_compliant_gains",
                 "gravity_compensate",
                 "reset_command_state",
             )
@@ -387,15 +386,14 @@ class VRTeleop:
             while True:
                 # Every rest move — the startup trajectory, an X reset, the
                 # Y-exit reset — plays through the shared guarded engine on
-                # hardware: compliant gains, torque watchdog, and a limp
-                # gravity-comp hold on contact (reset replans from wherever
-                # the arms are left). See VRTeleopCore.guarded_return.
+                # hardware: torque watchdog, and a limp gravity-comp hold on
+                # contact (reset replans from wherever the arms are left).
+                # See VRTeleopCore.guarded_return.
                 if guard and self._core.is_resetting:
                     await self._core.guarded_return(
                         send_step=_guard_send_step,
                         gravity_step=_guard_gravity_step,
                         torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
-                        set_compliant_gains=self._robot.set_compliant_gains,  # type: ignore[attr-defined]
                         reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
                         get_positions=_guard_positions,
                         stopped=lambda: False,  # unwound by task cancellation

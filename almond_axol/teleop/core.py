@@ -37,11 +37,7 @@ from collections.abc import Awaitable, Callable
 
 import numpy as np
 
-from ..robot.control import (
-    SETTLE_TIMEOUT_S,
-    SETTLE_TOL_RAD,
-    ContactWatchdog,
-)
+from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 
@@ -415,7 +411,6 @@ class VRTeleopCore:
         send_step: Callable[[], Awaitable[object]],
         gravity_step: Callable[[], Awaitable[object]],
         torque_residuals: Callable[[], tuple[object, object]],
-        set_compliant_gains: Callable[[bool], None],
         reset_command_state: Callable[[], None],
         get_positions: Callable[[], tuple[np.ndarray, np.ndarray]],
         stopped: Callable[[], bool],
@@ -425,19 +420,19 @@ class VRTeleopCore:
         vr_alive: Callable[[], bool] | None = None,
         move_timeout_s: float = 30.0,
     ) -> None:
-        """Play the pending return-to-rest guarded: compliant and contact-aware.
+        """Play the pending return-to-rest guarded by the contact watchdog.
 
         The single engine behind every VR-flow rest move (native ``axol
         teleop`` and ``collect-data``), so the sequencing cannot drift
         between them. Await with a reset already pending or playing
         (``is_resetting``); returns once the arms are home or the flow
-        stopped. The move plays at the fully-compliant gain endpoint; a
-        torque residual sustained above ``config.reset_torque_threshold``
-        (see :class:`~almond_axol.robot.control.ContactWatchdog`) cancels it
+        stopped. The move plays at the normal session gains — accurate
+        tracking of the collision-checked path — and a torque residual
+        sustained above ``config.reset_torque_threshold`` (see
+        :class:`~almond_axol.robot.control.ContactWatchdog`) cancels it
         where it is and drops the arms into a limp gravity-comp hold. The
         operator hand-guides them clear and presses reset, which replans
-        from wherever they were left. Session gains are always restored on
-        the way out.
+        from wherever they were left.
 
         Args:
             send_step: Advance the flow's control pipeline by one step —
@@ -447,8 +442,6 @@ class VRTeleopCore:
             gravity_step: Apply one gravity-compensation cycle (the hold).
             torque_residuals: ``(left, right)`` per-joint measured-minus-
                 gravity torques, ``None`` for an absent arm.
-            set_compliant_gains: Switch the arms between session gains
-                (``False``) and the fully-compliant endpoint (``True``).
             reset_command_state: Clear the robot's command history after the
                 arms moved out-of-band (max-step safety check).
             get_positions: Measured ``(left, right)`` arm positions used to
@@ -470,20 +463,6 @@ class VRTeleopCore:
         """
         interval = 1.0 / self.config.frequency
 
-        def _check_contact(watchdog: ContactWatchdog) -> bool:
-            tripped = watchdog.update(torque_residuals())
-            if tripped is None:
-                return False
-            joint, residual = tripped
-            self._logger.warning(
-                "return-to-rest contact: %s torque residual %.1f "
-                "exceeds %.1f — going limp",
-                joint,
-                residual,
-                self.config.reset_torque_threshold,
-            )
-            return True
-
         async def _play() -> str:
             """One guarded play attempt: ``done`` | ``contact`` | ``stopped``."""
             watchdog = ContactWatchdog(self.config.reset_torque_threshold)
@@ -494,129 +473,74 @@ class VRTeleopCore:
                     return "stopped"
                 deadline += interval
                 await send_step()
-                if _check_contact(watchdog):
+                tripped = watchdog.update(torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    self._logger.warning(
+                        "return-to-rest contact: %s torque residual %.1f "
+                        "exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        self.config.reset_torque_threshold,
+                    )
                     return "contact"
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
             return "stopped" if stopped() else "done"
 
-        def _settle_error() -> float:
-            """Worst arm-joint tracking error vs. the held target (rad)."""
-            q = self.q
-            if q is None:
-                return 0.0
-            pos_l, pos_r = get_positions()
-            err = 0.0
-            if pos_l is not None and self.left_indices:
-                err = max(
-                    err,
-                    float(
-                        np.max(
-                            np.abs(
-                                q[self.left_indices]
-                                - np.asarray(pos_l[:7], dtype=np.float32)
-                            )
-                        )
-                    ),
-                )
-            if pos_r is not None and self.right_indices:
-                err = max(
-                    err,
-                    float(
-                        np.max(
-                            np.abs(
-                                q[self.right_indices]
-                                - np.asarray(pos_r[:7], dtype=np.float32)
-                            )
-                        )
-                    ),
-                )
-            return err
-
-        async def _settle() -> str:
-            """Hold the target at compliant gains until the arms catch up.
-
-            The session-gain restore on the way out multiplies whatever
-            tracking error remains by the gain step, so restoring straight
-            off the trajectory's compliant lag shows up as a small snap at
-            the rest pose. Keep commanding the target until the error decays
-            below tolerance (or the cap), with the watchdog still live so a
-            grab at arrival trips like anywhere else.
-            """
-            watchdog = ContactWatchdog(self.config.reset_torque_threshold)
-            cap = time.perf_counter() + SETTLE_TIMEOUT_S
+        while not stopped():
+            outcome = await _play()
+            if outcome != "contact":
+                return
+            # Freeze the IK pipeline before the arms go limp — a reset
+            # latched during the hold must not dispatch from a solution
+            # the hand-guided arms no longer match — then drop the
+            # interrupted plan.
+            self.pause_ik()
+            self.cancel_reset()
+            if on_contact is not None:
+                on_contact()
+            announce("Contact. Arms are free — press reset to continue.")
             deadline = time.perf_counter()
-            while time.perf_counter() < cap:
-                if stopped():
-                    return "stopped"
+            orphan_since: float | None = None
+            orphaned = False
+            while not stopped() and not self.reset_pending:
                 deadline += interval
-                await send_step()
-                if _check_contact(watchdog):
-                    return "contact"
-                if _settle_error() < SETTLE_TOL_RAD:
-                    return "done"
+                await gravity_step()
+                if hold_tick is not None:
+                    hold_tick()
+                # Orphaned hold: the VR frame stream is dead (Y-exit
+                # return, headset died), so the reset press that ends
+                # this hold can never arrive. After the grace period,
+                # stop waiting and settle where the arms are.
+                if vr_alive is not None:
+                    now = time.perf_counter()
+                    if vr_alive():
+                        orphan_since = None
+                    elif orphan_since is None:
+                        orphan_since = now
+                    elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
+                        orphaned = True
+                        break
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
-            return "done"
-
-        set_compliant_gains(True)
-        try:
-            while not stopped():
-                outcome = await _play()
-                if outcome == "done":
-                    outcome = await _settle()
-                if outcome != "contact":
-                    return
-                # Freeze the IK pipeline before the arms go limp — a reset
-                # latched during the hold must not dispatch from a solution
-                # the hand-guided arms no longer match — then drop the
-                # interrupted plan.
-                self.pause_ik()
-                self.cancel_reset()
-                if on_contact is not None:
-                    on_contact()
-                announce("Contact. Arms are free — press reset to continue.")
-                deadline = time.perf_counter()
-                orphan_since: float | None = None
-                orphaned = False
-                while not stopped() and not self.reset_pending:
-                    deadline += interval
-                    await gravity_step()
-                    if hold_tick is not None:
-                        hold_tick()
-                    # Orphaned hold: the VR frame stream is dead (Y-exit
-                    # return, headset died), so the reset press that ends
-                    # this hold can never arrive. After the grace period,
-                    # stop waiting and settle where the arms are.
-                    if vr_alive is not None:
-                        now = time.perf_counter()
-                        if vr_alive():
-                            orphan_since = None
-                        elif orphan_since is None:
-                            orphan_since = now
-                        elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
-                            orphaned = True
-                            break
-                    await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
-                if stopped():
-                    return
-                # Hand position control back from wherever the operator left
-                # the arms: clear the stale command history (max-step safety
-                # check) and re-seed the pipeline from the measured
-                # positions, so the first commands hold the true pose with
-                # no transient — and, on a reset press, the replan starts
-                # from it.
-                reset_command_state()
-                pos_l, pos_r = get_positions()
-                self.resync_to_positions(pos_l, pos_r)
-                self.resume_ik()
-                if orphaned:
-                    announce(
-                        "No headset connected — holding position here. "
-                        "Reconnect and press reset to return to rest."
-                    )
-                    return
-                announce("Returning to rest pose.")
-        finally:
-            set_compliant_gains(False)
+            if stopped():
+                return
+            # Hand position control back from wherever the operator left
+            # the arms: clear the stale command history (max-step safety
+            # check) and re-seed the pipeline from the measured
+            # positions, so the first commands hold the true pose with
+            # no transient — and, on a reset press, the replan starts
+            # from it.
+            reset_command_state()
+            pos_l, pos_r = get_positions()
+            self.resync_to_positions(pos_l, pos_r)
+            self.resume_ik()
+            if orphaned:
+                announce(
+                    "No headset connected — holding position here. "
+                    "Reconnect and press reset to return to rest."
+                )
+                return
+            announce("Returning to rest pose.")
 
     # ------------------------------------------------------------------
     # IK dispatch loop (IK thread)

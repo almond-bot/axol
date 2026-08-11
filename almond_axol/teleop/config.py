@@ -38,17 +38,15 @@ class VRTeleopConfig:
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
         reset_torque_threshold: Contact watchdog for guarded return-to-rest
-            moves (hardware only). The move plays at the fully-compliant
-            gain endpoint; if any arm joint's torque residual (measured
-            minus modeled gravity, in the motor's torque units — Nm on
-            Damiao) stays above this for a sustained window, the move is
-            judged to have hit something — a gripper still hooked on the
+            moves (hardware only). If any arm joint's torque residual
+            (measured minus modeled gravity, in the motor's torque units —
+            Nm on Damiao) stays above this for a sustained window, the move
+            is judged to have hit something — a gripper still hooked on the
             scene, or an operator grabbing an arm — and the arms drop into
             a limp gravity-comp hold until reset is pressed again, which
             replans from wherever the arms were left. Raise if normal
             returns false-trip on the friction / model-error background;
-            ``0`` disables the watchdog (the move stays compliant but
-            always plays through). Defaults to ``4.0``.
+            ``0`` disables the watchdog. Defaults to ``4.0``.
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
