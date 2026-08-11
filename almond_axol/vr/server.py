@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,15 @@ if TYPE_CHECKING:
     from ..video.video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
+
+# How recently (seconds) a client must have delivered a pose frame to still
+# count as one of the operator's live connections when deciding whether the
+# operator is gone (see ``set_on_operator_gone``). Long enough that the
+# paired transports of one headset (USB tunnel + network standby) shield
+# each other through a quit's near-simultaneous socket closes; short enough
+# that a stale connection which streamed poses minutes ago can't mask a
+# real quit.
+_OPERATOR_RECENCY_S = 10.0
 
 
 class VRServer:
@@ -110,6 +120,36 @@ class VRServer:
         # restarts) isn't locked out.
         self._last_seq: int | None = None
 
+        # Whether camera video is expected to become available this session.
+        # Camera bring-up (relay subprocess, ZED open, NVENC init) can take
+        # tens of seconds after this server starts accepting connections; a
+        # headset that sends ``webrtc-request`` in that window must not be
+        # told ``webrtc-unavailable`` (it would give up and show no cameras
+        # for the whole session). While True and no manager is registered
+        # yet, such requests are parked in ``_video_pending`` and answered
+        # with ``webrtc-pending``, then resolved with a real offer — or an
+        # honest ``webrtc-unavailable`` — once video setup concludes.
+        self._video_expected: bool = False
+        # webrtc-requests parked while video is still starting: id → socket.
+        self._video_pending: dict[int, WebSocket] = {}
+        # Clients whose offer is currently being created. Offer creation
+        # awaits (signaling pipe, ICE gathering), so a client's retry request
+        # can land while its parked request is being flushed; creating a
+        # second offer then would close the in-flight peer connection
+        # mid-negotiation and can follow a good offer with an erroneous
+        # ``webrtc-unavailable``. Guarded per client in _send_webrtc_offer
+        # (single event loop, so a plain set suffices).
+        self._video_offering: set[int] = set()
+        # Same guard for the control (pose) channel offers.
+        self._control_offering: set[int] = set()
+        # Offer-creation tasks in flight (offers are built off the WebSocket
+        # receive loop — see _handle_signaling); referenced here so the event
+        # loop can't garbage-collect a running task.
+        self._signaling_tasks: set[asyncio.Task[None]] = set()
+        # Event loop this server runs on (captured in enable()) so video
+        # registration from another thread can schedule the pending flush.
+        self._loop: asyncio.AbstractEventLoop | None = None
+
         self._latest_frame: VRFrame | None = None
         # Adaptive playout buffer: reconstructs a smooth pose stream from
         # batched/jittered network arrivals. Consumers that want smoothing read
@@ -121,6 +161,19 @@ class VRServer:
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
+        # Monotonic time of the last valid pose frame per client (socket or
+        # its control data channel) — i.e. the operator's connections, as
+        # opposed to view-only ones like the control panel's camera mirror.
+        # When a pose-sending client disconnects and no *other* client has
+        # sent a pose recently (see _OPERATOR_RECENCY_S), the operator is
+        # gone for good (a quit/crash closes the socket; merely pausing —
+        # e.g. the Quest system menu — keeps it open) and
+        # ``_on_operator_gone`` fires. Recency matters: membership must not
+        # be sticky, or a lingering connection that streamed poses once
+        # (say, a desktop tab that briefly ran the emulated XR session)
+        # would block the quit handling for the whole session.
+        self._pose_last: dict[int, float] = {}
+        self._on_operator_gone: Callable[[], None] | None = None
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
@@ -157,6 +210,23 @@ class VRServer:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
 
+    def set_on_operator_gone(self, callback: Callable[[], None] | None) -> None:
+        """Called when the operator's pose-sending connections are gone.
+
+        Pose-sending clients are the operator's connections (headset app,
+        USB tunnel) — view-only clients such as the control panel's camera
+        mirror never send poses and don't count. The callback fires on the
+        server's event loop when a pose-sending client's socket closes and
+        no other client has delivered a pose within ``_OPERATOR_RECENCY_S``:
+        a quit or crash of the VR app, as opposed to a pause (Quest system
+        menu, doffed headset) which keeps the socket open. The recency test
+        keeps a stale connection that streamed poses once (e.g. an abandoned
+        browser tab) from masking a real quit. Teleop uses this to return
+        the arms to rest, since an app quit can't reliably deliver the
+        Y-exit reset frame.
+        """
+        self._on_operator_gone = callback
+
     def set_mode(self, mode: str | None) -> None:
         """Set the operating mode announced to headsets on connect.
 
@@ -179,6 +249,22 @@ class VRServer:
         """
         self._episode = episode
 
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare whether camera video is expected to become available.
+
+        Call (before :meth:`enable`, or any time earlier than the first
+        headset connection) when cameras are configured but still starting:
+        ``webrtc-request``s that arrive before :meth:`set_video_manager` /
+        :meth:`set_video_sources` registers a manager are then parked and
+        answered with ``{"type": "webrtc-pending"}`` — the headset keeps its
+        "connecting cameras" state — and receive their offer automatically
+        the moment video setup concludes (or ``webrtc-unavailable`` if it
+        concludes without video). Without this, an early request is told
+        video is unavailable and the headset shows no camera screens for the
+        rest of the session.
+        """
+        self._video_expected = expected
+
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Register per-camera video sources to stream to the headset.
 
@@ -200,6 +286,7 @@ class VRServer:
         """
         if not sources:
             self._webrtc = None
+            self._conclude_video_setup()
             return
         try:
             from ..video.video import WebRTCManager, webrtc_available
@@ -216,8 +303,10 @@ class VRServer:
                 exc,
             )
             self._webrtc = None
+            self._conclude_video_setup()
             return
         _logger.info("wrist video enabled for: %s", ", ".join(sources))
+        self._conclude_video_setup()
 
     def set_video_manager(self, manager: Any | None) -> None:
         """Register a pre-built WebRTC manager (e.g. an out-of-process relay).
@@ -231,6 +320,41 @@ class VRServer:
         self._webrtc = manager
         if manager is not None:
             _logger.info("wrist video enabled (external manager)")
+        self._conclude_video_setup()
+
+    def _conclude_video_setup(self) -> None:
+        """Resolve parked ``webrtc-request``s now that video setup finished.
+
+        Called by :meth:`set_video_manager` / :meth:`set_video_sources` from
+        any thread. Clients parked on ``webrtc-pending`` are answered on the
+        server's event loop: a fresh offer when a manager was registered, or
+        ``webrtc-unavailable`` when setup concluded without video. Video is
+        no longer "expected" either way — later requests are answered
+        directly from the registered manager (or its absence).
+        """
+        self._video_expected = False
+        loop = self._loop
+        if loop is None or not self._video_pending:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._flush_video_pending(), loop)
+        except RuntimeError:
+            pass  # server loop already shut down
+
+    async def _flush_video_pending(self) -> None:
+        """Answer every parked video request (runs on the server loop)."""
+        pending = list(self._video_pending.items())
+        self._video_pending.clear()
+        for client_id, ws in pending:
+            if ws not in self._active_clients:
+                continue
+            try:
+                if self._webrtc is None:
+                    await ws.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                else:
+                    await self._send_webrtc_offer(ws, client_id)
+            except Exception as exc:  # noqa: BLE001 - keep serving other clients
+                _logger.warning("failed to resolve pending video request: %s", exc)
 
     @property
     def connected(self) -> bool:
@@ -267,6 +391,10 @@ class VRServer:
         if self._server_task is not None:
             return
 
+        # Captured so video registration (called from other threads) can
+        # schedule the pending-request flush onto this loop.
+        self._loop = asyncio.get_running_loop()
+
         if not os.path.isfile(self._certfile) or not os.path.isfile(self._keyfile):
             _logger.info("creating self-signed certificate")
             create_self_signed_cert(self._certfile, self._keyfile)
@@ -282,6 +410,13 @@ class VRServer:
             log_level="info",
             ssl_certfile=self._certfile,
             ssl_keyfile=self._keyfile,
+            # Keepalives stay at uvicorn's defaults (20s ping / 20s timeout).
+            # Tighter pings were tried for faster dead-peer detection, but
+            # with the camera RTP saturating the operator's WiFi a pong can
+            # take >5s on a perfectly healthy link, and killing the pose
+            # socket then tears down video and teleop with it. Exits with a
+            # lost FIN are covered by the pose-silence backstop instead
+            # (VRTeleopConfig.exit_reset_timeout).
         )
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(
@@ -325,6 +460,12 @@ class VRServer:
 
         self._client_count = 0
         self._active_clients.clear()
+        self._video_pending.clear()
+        self._video_offering.clear()
+        self._control_offering.clear()
+        self._signaling_tasks.clear()
+        self._pose_last.clear()
+        self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
         self._last_seq = None
@@ -361,15 +502,22 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
-        self._ingest_frame_obj(obj)
+        if self._ingest_frame_obj(obj):
+            self._pose_last[client_id] = time.monotonic()
 
-    def _ingest_frame_obj(self, obj: Any) -> None:
-        """Validate a decoded pose object and publish it to the consumer."""
+    def _ingest_frame_obj(self, obj: Any) -> bool:
+        """Validate a decoded pose object and publish it to the consumer.
+
+        Returns True when the object was a valid pose frame — including one
+        dropped by the seq dedup below, so a transport that only ever loses
+        the arrival race (e.g. the network standby while USB wins) still
+        counts as a pose sender.
+        """
         try:
             frame = VRFrame.model_validate(obj)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
-            return
+            return False
 
         # The headset streams identical frames (same ``seq``) over both the
         # wired USB tunnel and the network (WebRTC data channel / WebSocket).
@@ -384,19 +532,22 @@ class VRServer:
         seq = frame.seq
         if seq is not None:
             if self._last_seq is not None and seq <= self._last_seq:
-                return
+                return True
             self._last_seq = seq
 
         self._latest_frame = frame
         self._interp.push(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
+        return True
 
-    def _ingest_pose_text(self, data: str) -> None:
+    def _ingest_pose_text(self, client_id: int, data: str) -> None:
         """Ingest a pose frame from the control data channel (text message).
 
         Mirrors the WebSocket pose path; signaling never arrives here, so a
         message carrying a ``type`` field is ignored rather than validated.
+        ``client_id`` is the owning signaling client, so pose-sender tracking
+        stays accurate when the channel (not the socket) carries the poses.
         """
         try:
             obj = json.loads(data)
@@ -405,7 +556,8 @@ class VRServer:
             return
         if isinstance(obj, dict) and "type" in obj:
             return
-        self._ingest_frame_obj(obj)
+        if self._ingest_frame_obj(obj):
+            self._pose_last[client_id] = time.monotonic()
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -416,17 +568,17 @@ class VRServer:
         # Control data channel (pose transport): negotiated independently of the
         # cameras, so it's handled before the video-availability check below and
         # works even when no video sources are registered.
+        #
+        # Offer creation is offloaded to a task: this handler runs on the
+        # socket's sequential receive loop, and an inline await (ICE
+        # gathering, the relay pipe round-trip) would queue every following
+        # message behind it — pose frames stall into bursts, and a queued
+        # webrtc/control *answer* applies only after a queued retry has
+        # already replaced its peer connection, so negotiation never
+        # completes.
         if msg_type == "control-request":
-            sdp = await self._control.create_offer(client_id)
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "control-offer",
-                        "sdp": sdp,
-                        "iceServers": client_ice_servers(),
-                    }
-                )
-            )
+            if client_id not in self._control_offering:
+                self._spawn(self._send_control_offer(websocket, client_id))
             return
         if msg_type == "control-answer":
             sdp = obj.get("sdp")
@@ -446,29 +598,31 @@ class VRServer:
 
         if self._webrtc is None:
             if msg_type == "webrtc-request":
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+                if self._video_expected:
+                    # Cameras are configured but still starting: park the
+                    # request (answered with a real offer when video setup
+                    # concludes — see _conclude_video_setup) and tell the
+                    # headset to keep its connecting state meanwhile.
+                    self._video_pending[client_id] = websocket
+                    await websocket.send_text(json.dumps({"type": "webrtc-pending"}))
+                else:
+                    await websocket.send_text(
+                        json.dumps({"type": "webrtc-unavailable"})
+                    )
             return
 
         if msg_type == "webrtc-request":
-            try:
-                sdp, tracks = await self._webrtc.create_offer(client_id)
-            except Exception as exc:
-                _logger.error("failed to create webrtc offer: %s", exc)
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
+            # A direct answer supersedes any parked copy of this request.
+            self._video_pending.pop(client_id, None)
+            if client_id in self._video_offering:
+                # An offer for this client is already being built (its retry
+                # landed mid-flight): that offer answers this request too.
+                # Tell the client to keep waiting rather than starting a
+                # competing negotiation.
+                await websocket.send_text(json.dumps({"type": "webrtc-pending"}))
                 return
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "webrtc-offer",
-                        "sdp": sdp,
-                        "tracks": tracks,
-                        # Same TURN/STUN servers the aiortc peer used, so the
-                        # browser gathers a matching relay candidate. Empty on
-                        # a LAN (no env config) — harmless to the headset.
-                        "iceServers": client_ice_servers(),
-                    }
-                )
-            )
+            # Built off the receive loop — see the control-request comment.
+            self._spawn(self._send_webrtc_offer(websocket, client_id))
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
@@ -478,6 +632,80 @@ class VRServer:
                     _logger.error("failed to apply webrtc answer: %s", exc)
         else:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
+
+    def _spawn(self, coro: Any) -> None:
+        """Run a signaling coroutine as its own task on the server loop.
+
+        The task set holds a strong reference so a running task can't be
+        garbage-collected mid-flight.
+        """
+        task = asyncio.create_task(coro)
+        self._signaling_tasks.add(task)
+        task.add_done_callback(self._signaling_tasks.discard)
+
+    async def _send_control_offer(self, websocket: WebSocket, client_id: int) -> None:
+        """Create and send the control-channel offer. Runs as its own task.
+
+        Guarded per client like the video offers; never raises (a send to a
+        just-disconnected socket is normal churn).
+        """
+        if client_id in self._control_offering:
+            return
+        self._control_offering.add(client_id)
+        try:
+            sdp = await self._control.create_offer(client_id)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "control-offer",
+                        "sdp": sdp,
+                        "iceServers": client_ice_servers(),
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - task context; log and move on
+            _logger.warning("control offer for client %d failed: %s", client_id, exc)
+        finally:
+            self._control_offering.discard(client_id)
+
+    async def _send_webrtc_offer(self, websocket: WebSocket, client_id: int) -> None:
+        """Create a fresh per-client offer and send it (unavailable on failure).
+
+        Runs as its own task (or from the pending flush); never raises. No-op
+        while an offer for the same client is already being created — the
+        pending flush and a concurrent request retry would otherwise race,
+        with the later ``create_offer`` tearing down the earlier one's peer
+        connection mid-negotiation. The in-flight offer (sent to this same
+        socket) answers the skipped request.
+        """
+        if client_id in self._video_offering:
+            return
+        self._video_offering.add(client_id)
+        try:
+            webrtc = self._webrtc
+            if webrtc is None:
+                payload: dict[str, Any] = {"type": "webrtc-unavailable"}
+            else:
+                try:
+                    sdp, tracks = await webrtc.create_offer(client_id)
+                    payload = {
+                        "type": "webrtc-offer",
+                        "sdp": sdp,
+                        "tracks": tracks,
+                        # Same TURN/STUN servers the aiortc peer used, so the
+                        # browser gathers a matching relay candidate. Empty on
+                        # a LAN (no env config) — harmless to the headset.
+                        "iceServers": client_ice_servers(),
+                    }
+                except Exception as exc:  # noqa: BLE001 - degrade to no video
+                    _logger.error("failed to create webrtc offer: %s", exc)
+                    payload = {"type": "webrtc-unavailable"}
+            try:
+                await websocket.send_text(json.dumps(payload))
+            except Exception as exc:  # noqa: BLE001 - client left mid-offer
+                _logger.warning("failed to send webrtc reply: %s", exc)
+        finally:
+            self._video_offering.discard(client_id)
 
     def _build_app(self) -> FastAPI:
         app = FastAPI()
@@ -539,6 +767,7 @@ class VRServer:
                     pass
             finally:
                 server._active_clients.discard(websocket)
+                server._video_pending.pop(client_id, None)
                 server._client_count = max(0, server._client_count - 1)
                 # The HUD publisher (the headset) left: clear its popups from
                 # every mirror so a dashboard doesn't show a stale dialog.
@@ -550,6 +779,38 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
+                # A pose-sending client (the operator) disconnected — a
+                # quit/crash closes the socket, unlike a pause (system menu,
+                # doffed headset) which keeps it open. The operator is gone
+                # when no *other* client has sent a pose recently: a sibling
+                # transport of the same headset (USB tunnel + network
+                # standby) is fresh through a quit's near-simultaneous
+                # closes, while a stale connection that streamed poses
+                # minutes ago (an abandoned tab) doesn't mask the quit.
+                # Best-effort so it can't leak the socket accounting.
+                if server._pose_last.pop(client_id, None) is not None:
+                    if not server._pose_last:
+                        # Last pose sender gone: drop the buffered pose state
+                        # *now* rather than when every client disconnects — a
+                        # view-only client (the control panel's camera mirror)
+                        # can stay connected across the operator's app
+                        # relaunches, and a relaunched headset restarts its
+                        # seq counter at 1, so a kept high-water mark would
+                        # silently drop every frame it sends (no poses, no
+                        # engage) until the panel also left.
+                        server._latest_frame = None
+                        server._last_seq = None
+                        server._interp.reset()
+                    now = time.monotonic()
+                    others_recent = any(
+                        now - t <= _OPERATOR_RECENCY_S
+                        for t in server._pose_last.values()
+                    )
+                    if not others_recent and server._on_operator_gone:
+                        try:
+                            server._on_operator_gone()
+                        except Exception:  # noqa: BLE001 - never break cleanup
+                            _logger.exception("operator-gone callback failed")
                 # Last operator gone: drop buffered pose state so a fresh
                 # session's capture timestamps aren't blended with this one's
                 # stale frames (which would drive IK with incoherent poses

@@ -717,6 +717,19 @@ class AxolRobot(Robot):
             self._axol.gravity_compensate(kd=kd, free_joints=free_joints), self._loop
         ).result(timeout=1.0)
 
+    async def gravity_compensate_async(
+        self, kd: float = 0.5, free_joints: set[Joint] | None = None
+    ) -> None:
+        """Await one gravity-compensation cycle on the robot's event loop.
+
+        Must be awaited from a coroutine already running on
+        :attr:`event_loop` (mirroring :meth:`send_action_async`) — used by
+        ``collect-data``'s contact-fallback gravity-comp hold, whose loop runs on
+        the robot's loop. See :meth:`gravity_compensate` for semantics.
+        """
+        assert self._axol is not None
+        await self._axol.gravity_compensate(kd=kd, free_joints=free_joints)
+
     def reset_command_state(self) -> None:
         """Clear cached command history after an out-of-band move.
 
@@ -730,3 +743,15 @@ class AxolRobot(Robot):
         """
         assert self._axol is not None
         self._axol.reset_command_state()
+
+    def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm measured-minus-gravity torques, ``(left, right)``.
+
+        Each present arm contributes a shape ``(7,)`` array (Nm) in arm-joint
+        order — the contact-detection signal for guarded moves. Reads only
+        the telemetry cache (kept fresh by streaming command replies), so it
+        costs no CAN traffic and is safe from any thread. See
+        :meth:`almond_axol.robot.axol.AxolArm.torque_residuals`.
+        """
+        assert self._axol is not None
+        return self._axol.torque_residuals()

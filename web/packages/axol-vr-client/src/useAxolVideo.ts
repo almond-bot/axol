@@ -7,6 +7,16 @@ export type CameraStreams = Record<string, MediaStream>
 
 const POLL_MS = 300
 
+// Re-send `webrtc-request` at this cadence until an offer arrives. The
+// robot's cameras can take a while to start after its server begins accepting
+// connections; during that window the server answers "webrtc-pending" (new
+// servers, which also push the offer when ready) or "webrtc-unavailable" (old
+// servers, which never retry on their own) — either way, without a retry the
+// feed would stay absent for the whole session even once the cameras are up.
+// The request is a tiny JSON message on the already-open teleop socket, so
+// retrying is harmless even against a robot that genuinely has no cameras.
+const REQUEST_RETRY_MS = 2000
+
 // Receiver jitter-buffer target (ms). A *zero* buffer minimises latency but
 // leaves no time for a NACK retransmit of a dropped/reordered RTP packet, so
 // the decoder presents an incomplete frame — corrupt macroblocks that flash as
@@ -32,9 +42,15 @@ const JITTER_BUFFER_MS = 100
  * A `message` *listener* is used (not `ws.onmessage`) so this coexists with the
  * pose client's own `onmessage` handler on the same socket.
  *
+ * The request is retried until an offer lands (see REQUEST_RETRY_MS), and a
+ * failed/closed peer connection clears the negotiated state so the retry loop
+ * renegotiates — the feed recovers on its own once the robot's cameras come
+ * (back) up instead of requiring the operator to leave and re-enter VR.
+ *
  * `enabled` gates negotiation — pass `true` only while the headset is presenting
  * so video isn't decoded on the 2D landing page. Returns the current streams and
- * `available`: `null` until known, `false` if the server reports no video.
+ * `available`: `null` until known (or while the server reports video is still
+ * starting via `webrtc-pending`), `false` if the server reports no video.
  */
 export function useAxolVideo(
   wsRef: RefObject<WebSocket | null>,
@@ -46,7 +62,11 @@ export function useAxolVideo(
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const attachedWsRef = useRef<WebSocket | null>(null)
   const listenerRef = useRef<((e: MessageEvent) => void) | null>(null)
-  const requestedRef = useRef(false)
+  // When the last webrtc-request was sent (0 = not yet), and whether an offer
+  // has landed for it. Requests keep re-sending until an offer arrives, and a
+  // dead peer connection clears `offerSeen` so the loop renegotiates.
+  const lastRequestAtRef = useRef(0)
+  const offerSeenRef = useRef(false)
 
   useEffect(() => {
     if (!enabled) return
@@ -67,7 +87,8 @@ export function useAxolVideo(
       if (ws && listenerRef.current) ws.removeEventListener("message", listenerRef.current)
       attachedWsRef.current = null
       listenerRef.current = null
-      requestedRef.current = false
+      lastRequestAtRef.current = 0
+      offerSeenRef.current = false
       closePc()
     }
 
@@ -109,6 +130,10 @@ export function useAxolVideo(
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           setStreams({})
+          // Let the retry loop renegotiate a fresh connection. Only remotely
+          // caused failures land here — a local pc.close() (detach / socket
+          // swap / re-offer) doesn't fire this handler.
+          offerSeenRef.current = false
         }
       }
 
@@ -137,10 +162,17 @@ export function useAxolVideo(
         iceServers?: RTCIceServer[]
       }
       if (m.type === "webrtc-offer" && typeof m.sdp === "string") {
+        offerSeenRef.current = true
         setAvailable(true)
         handleOffer(m.sdp, m.tracks ?? {}, m.iceServers ?? []).catch(() => {
-          /* negotiation failed; leave streams empty */
+          // Negotiation failed; let the retry loop request a fresh offer.
+          offerSeenRef.current = false
         })
+      } else if (m.type === "webrtc-pending") {
+        // The robot's cameras are configured but still starting; the server
+        // will push the offer when they're up. Stay in the "connecting"
+        // state (spinner visible) rather than reporting no video.
+        setAvailable(null)
       } else if (m.type === "webrtc-unavailable") {
         setAvailable(false)
       }
@@ -156,7 +188,8 @@ export function useAxolVideo(
           attachedWsRef.current.removeEventListener("message", listenerRef.current)
         attachedWsRef.current = null
         listenerRef.current = null
-        requestedRef.current = false
+        lastRequestAtRef.current = 0
+        offerSeenRef.current = false
         closePc()
         setStreams({})
         setAvailable(null)
@@ -167,12 +200,14 @@ export function useAxolVideo(
         attachedWsRef.current = ws
         ws.addEventListener("message", onMessage)
       }
-      if (!requestedRef.current) {
-        requestedRef.current = true
+      // Keep requesting until an offer lands (first request fires
+      // immediately; see REQUEST_RETRY_MS for why this retries).
+      if (!offerSeenRef.current && Date.now() - lastRequestAtRef.current >= REQUEST_RETRY_MS) {
+        lastRequestAtRef.current = Date.now()
         try {
           ws.send(JSON.stringify({ type: "webrtc-request" }))
         } catch {
-          requestedRef.current = false
+          lastRequestAtRef.current = 0
         }
       }
     }, POLL_MS)

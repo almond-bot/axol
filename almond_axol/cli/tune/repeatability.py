@@ -299,8 +299,7 @@ async def _run(args: argparse.Namespace) -> None:
     # Report the FK gripper position at each waypoint so the operator can
     # eyeball the geometry before any motors move.
     for name, q_wp in (("rest", q_rest), ("A", q_a), ("B", q_b)):
-        se3, _ = solver.fk(q_wp)
-        p = np.asarray(se3.translation())
+        (p, _), _ = solver.fk(q_wp)
         print(f"  left gripper @ {name:4} → ({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}) m")
 
     # The arm moves rest → A once, then bounces A → B → A → B … for every

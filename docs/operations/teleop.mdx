@@ -83,11 +83,15 @@ The easiest way is from the app itself: when you press **Connect** and the certi
 | 2 | Right grip | Same as above |
 | 3 | Left trigger | Actuate left gripper |
 | 4 | Right trigger | Actuate right gripper |
-| 5 | X | **Reset** — returns both arms to the rest pose |
-| 7 | Y | **Exit AR** — closes the VR session |
+| 5 | X | **Reset** — returns both arms to the rest pose; also retries the return out of the contact hold (below) |
+| 7 | Y | **Exit AR** — closes the VR session (the arms return to rest on the way out) |
 
 <Note>
   Grip is a toggle, not a hold. Press both grips together to start moving the arms; press either grip on its own to freeze them.
+</Note>
+
+<Note>
+  On hardware, every return to rest — an **X** reset, the **Y**-exit return, and the startup move — is **guarded**: a torque watchdog compares each joint against the gravity model while the move plays. If the move meets unexpected resistance (something still grasped, or you grabbing an arm), it stops where it is and the arms drop into a limp **gravity-compensation hold** — hand-guide them clear, then press **X** to replan home from wherever you left them. If no headset is connected to press **X** (a **Y**-exit return, or the headset died), the hold settles into a position hold where the arms are after ~30 s; reconnect and press **X** to send them home. Tune with the **Reset contact threshold** in the control panel's Robot settings (`--teleop.reset_torque_threshold` on the CLI; `0` disables the watchdog). Not available in `--sim` (no torque feedback — and nothing to protect).
 </Note>
 
 <Note>

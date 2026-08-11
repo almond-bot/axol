@@ -37,6 +37,19 @@ class VRTeleopConfig:
         reset_collision_weight: Cost weight on self-collision penalty during
             reset trajectory generation.
         reset_max_iterations: Maximum solver iterations per reset waypoint.
+        reset_torque_threshold: Contact watchdog for guarded return-to-rest
+            moves (hardware only). If any arm joint's torque residual
+            (measured minus modeled gravity, in the motor's torque units —
+            Nm on Damiao) stays above this for a sustained window, the move
+            is judged to have hit something — a gripper still hooked on the
+            scene, or an operator grabbing an arm — and the arms drop into
+            a limp gravity-comp hold until reset is pressed again, which
+            replans from wherever the arms were left. Raise if normal
+            returns false-trip on the friction / model-error background;
+            ``0`` disables the watchdog. Defaults to ``4.0``.
+        reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
+            joints during the contact-fallback gravity-comp hold; same
+            semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
         engage_max_vel: Maximum joint velocity (rad/s) used by the
             trapezoidal filter when teleop is first engaged after a
             rest-pose trajectory (startup or reset).  Slows the transition from
@@ -84,6 +97,29 @@ class VRTeleopConfig:
             controller since engage is converted to axis-angle and its angle
             is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
+        disengage_timeout: Auto-disengage when no VR pose frame has arrived
+            for this many seconds while teleop is engaged — the operator left
+            VR (headset doffed, session exited without pressing X/Y) or the
+            link dropped.  Without it the engage toggle survives the gap, so
+            the next frames after re-entering VR are tracked against the old
+            engage snapshot and the arms jerk toward wherever the controllers
+            now are.  The headset streams poses at 72+ Hz while presenting,
+            so anything beyond a few hundred ms is a real gap, not jitter.
+            ``0`` disables the timeout.  Defaults to ``0.5`` s.
+        reset_on_disconnect: Return the arms to the rest pose when the
+            operator's last pose-sending connection closes while the arms are
+            away from rest — quitting the VR app (e.g. via the Quest menu)
+            can't reliably deliver the Y-exit reset frame.  Pausing without
+            quitting (system menu, doffed headset) keeps the socket open and
+            only auto-disengages; the arms hold in place.  Defaults to True.
+        exit_reset_timeout: Also return the arms to rest when no VR pose
+            frame has arrived for this many seconds while the arms are away
+            from rest.  This is the backstop for exits whose socket close is
+            delayed or lost — a killed headset app whose TCP FIN never went
+            out (WiFi power-save after quitting, a crash, a link drop) —
+            and it means stepping away mid-session parks the arms safely.
+            Long enough that a normal Quest-menu visit doesn't trigger it.
+            ``0`` disables.  Defaults to ``10`` s.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -122,6 +158,8 @@ class VRTeleopConfig:
     reset_collision_margin: float = 0.025
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
+    reset_torque_threshold: float = 4.0
+    reset_gravity_comp_kd: float = 0.25
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
@@ -131,3 +169,6 @@ class VRTeleopConfig:
     pose_beta: float = 5.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
+    disengage_timeout: float = 0.5
+    reset_on_disconnect: bool = True
+    exit_reset_timeout: float = 10.0

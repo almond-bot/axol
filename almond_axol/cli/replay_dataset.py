@@ -86,6 +86,15 @@ class ReplayDatasetConfig:
     # returning to rest between takes. Off by default (a single replay). Either
     # way the arm returns to the rest pose before the operation exits.
     loop: bool = False
+    # Contact watchdog for every return-to-rest: a joint torque residual
+    # (measured minus modeled gravity, Nm) sustained above this drops the
+    # arms into a limp gravity-comp hold instead of pulling through. Replay
+    # has no interactive retry channel, so the hold lasts until the run is
+    # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
+    reset_torque_threshold: float = 4.0
+    # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
+    # semantics as `axol gravity-comp --kd`.
+    reset_gravity_comp_kd: float = 0.25
     log_level: LogLevel = "INFO"
 
 
@@ -201,14 +210,33 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # right after a loop iteration already ended at rest).
     rested = False
 
-    def _go_to_rest(message: str = "Returning to rest pose.") -> None:
-        nonlocal rested
-        log_say(message)
-        reset_controller.return_to_rest(robot)
-        rested = True
-
     def _stopped() -> bool:
         return stop_event.is_set()
+
+    def _go_to_rest(
+        message: str = "Returning to rest pose.", *, final: bool = False
+    ) -> None:
+        # Guarded: a sustained torque residual (contact) drops the arms into
+        # a limp gravity-comp hold. Replay has no interactive retry channel, so the
+        # hold lasts until the run is stopped — `rested` then stays False and
+        # the teardown skips its redundant return attempt. The teardown's own
+        # return (``final=True``) must play even though the stop flag is
+        # already set, so it passes no stop hook; on contact it aborts
+        # immediately instead of holding (nothing could end that hold).
+        nonlocal rested
+        log_say(message)
+        rested = reset_controller.return_to_rest(
+            robot,
+            torque_threshold=cfg.reset_torque_threshold,
+            gravity_comp_kd=cfg.reset_gravity_comp_kd,
+            stopped=None if final else _stopped,
+            on_contact=None
+            if final
+            else lambda: log_say(
+                "Contact during return to rest — arms are limp. Free them, "
+                "then stop the run."
+            ),
+        )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
     # by linearly blending between consecutive recorded actions. Episode timing
@@ -326,7 +354,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # force-kills the worker mid-move.
         if robot.is_connected and not rested:
             try:
-                _go_to_rest("Replay finished. Returning to rest pose.")
+                _go_to_rest("Replay finished. Returning to rest pose.", final=True)
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 
