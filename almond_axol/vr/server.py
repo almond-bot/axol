@@ -410,14 +410,13 @@ class VRServer:
             log_level="info",
             ssl_certfile=self._certfile,
             ssl_keyfile=self._keyfile,
-            # Detect dead peers quickly (uvicorn defaults are 20s/20s): a
-            # killed headset app doesn't always deliver its TCP FIN (WiFi
-            # power-save right after quitting), and the operator-gone handling
-            # (return the arms to rest) waits on the disconnect. Browsers
-            # answer pings in the network stack, so an alive-but-paused page
-            # (Quest system menu) is unaffected.
-            ws_ping_interval=5.0,
-            ws_ping_timeout=5.0,
+            # Keepalives stay at uvicorn's defaults (20s ping / 20s timeout).
+            # Tighter pings were tried for faster dead-peer detection, but
+            # with the camera RTP saturating the operator's WiFi a pong can
+            # take >5s on a perfectly healthy link, and killing the pose
+            # socket then tears down video and teleop with it. Exits with a
+            # lost FIN are covered by the pose-silence backstop instead
+            # (VRTeleopConfig.exit_reset_timeout).
         )
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(
@@ -790,6 +789,18 @@ class VRServer:
                 # minutes ago (an abandoned tab) doesn't mask the quit.
                 # Best-effort so it can't leak the socket accounting.
                 if server._pose_last.pop(client_id, None) is not None:
+                    if not server._pose_last:
+                        # Last pose sender gone: drop the buffered pose state
+                        # *now* rather than when every client disconnects — a
+                        # view-only client (the control panel's camera mirror)
+                        # can stay connected across the operator's app
+                        # relaunches, and a relaunched headset restarts its
+                        # seq counter at 1, so a kept high-water mark would
+                        # silently drop every frame it sends (no poses, no
+                        # engage) until the panel also left.
+                        server._latest_frame = None
+                        server._last_seq = None
+                        server._interp.reset()
                     now = time.monotonic()
                     others_recent = any(
                         now - t <= _OPERATOR_RECENCY_S
