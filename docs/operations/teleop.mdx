@@ -91,7 +91,7 @@ The easiest way is from the app itself: when you press **Connect** and the certi
 </Note>
 
 <Note>
-  On hardware, every return to rest — an **X** reset, the **Y**-exit return, and the startup move — is **guarded**: it plays at the softest gains the arms are tuned for, and a torque watchdog compares each joint against the gravity model. If the move meets unexpected resistance (something still grasped, or you grabbing an arm), it stops where it is and the arms drop into a limp **gravity-compensation hold** — hand-guide them clear, then press **X** to replan home from wherever you left them. Tune with the **Reset contact threshold** in the control panel's Robot settings (`--teleop.reset_torque_threshold` on the CLI; `0` disables the watchdog). Not available in `--sim` (no torque feedback — and nothing to protect).
+  On hardware, every return to rest — an **X** reset, the **Y**-exit return, and the startup move — is **guarded**: it plays at the softest gains the arms are tuned for, and a torque watchdog compares each joint against the gravity model. If the move meets unexpected resistance (something still grasped, or you grabbing an arm), it stops where it is and the arms drop into a limp **gravity-compensation hold** — hand-guide them clear, then press **X** to replan home from wherever you left them. If no headset is connected to press **X** (a **Y**-exit return, or the headset died), the hold settles into a position hold where the arms are after ~30 s; reconnect and press **X** to send them home. Tune with the **Reset contact threshold** in the control panel's Robot settings (`--teleop.reset_torque_threshold` on the CLI; `0` disables the watchdog). Not available in `--sim` (no torque feedback — and nothing to protect).
 </Note>
 
 <Note>

@@ -834,6 +834,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             # button) when contact trips, so unblock it.
             on_contact=lambda: teleop.send_feedback_state(VRState.DATA_COLLECTION),
             hold_tick=_guard_hold_tick,
+            vr_alive=teleop.vr_alive,
         )
 
     async def _return_home_loop() -> None:

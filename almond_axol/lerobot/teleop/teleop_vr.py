@@ -165,6 +165,18 @@ class AxolVRTeleop(Teleoperator):
         with self._rate_lock:
             return self._window_hz(self._vr_frame_times)
 
+    def vr_alive(self, within_s: float = 2.0) -> bool:
+        """True while VR frames have arrived within the last ``within_s``.
+
+        The guarded-return contact hold uses this to detect an *orphaned*
+        hold — the headset exited XR or died, so the reset press that would
+        end it can never arrive — and settle instead of waiting forever.
+        Thread-safe.
+        """
+        with self._rate_lock:
+            last = self._vr_frame_times[-1] if self._vr_frame_times else None
+        return last is not None and (time.perf_counter() - last) < within_s
+
     @property
     def is_connected(self) -> bool:
         return self._vr_server is not None

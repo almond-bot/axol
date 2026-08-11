@@ -43,6 +43,12 @@ from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
+# How long a guarded-return contact hold keeps waiting for a reset press
+# after the VR frame stream has gone dead (headset exited XR or died —
+# nobody is left to press reset). Long enough to free a hooked gripper
+# calmly; then the hold settles into a position hold where the arms are.
+_HOLD_ORPHAN_GRACE_S = 30.0
+
 
 def recv_with_timeout(
     conn: multiprocessing.connection.Connection,
@@ -412,6 +418,7 @@ class VRTeleopCore:
         announce: Callable[[str], None],
         on_contact: Callable[[], None] | None = None,
         hold_tick: Callable[[], None] | None = None,
+        vr_alive: Callable[[], bool] | None = None,
         move_timeout_s: float = 30.0,
     ) -> None:
         """Play the pending return-to-rest guarded: compliant and contact-aware.
@@ -448,6 +455,13 @@ class VRTeleopCore:
                 (e.g. unblock the headset's reset button).
             hold_tick: Flow hook run every hold cycle (e.g. consume teleop
                 events so a stray record press is answered).
+            vr_alive: Whether VR frames are still arriving. When given, a
+                contact hold whose frame stream has been dead for a grace
+                period is *orphaned* — the reset press that ends it can
+                never come (a Y-exit return, a headset that died) — so the
+                hold settles into a position hold where the arms are and
+                the guarded return ends; reconnecting and pressing reset
+                resumes the normal path. ``None`` waits indefinitely.
             move_timeout_s: Cap on each individual play attempt.
         """
         interval = 1.0 / self.config.frequency
@@ -492,23 +506,45 @@ class VRTeleopCore:
                     on_contact()
                 announce("Contact. Arms are free — press reset to continue.")
                 deadline = time.perf_counter()
+                orphan_since: float | None = None
+                orphaned = False
                 while not stopped() and not self.reset_pending:
                     deadline += interval
                     await gravity_step()
                     if hold_tick is not None:
                         hold_tick()
+                    # Orphaned hold: the VR frame stream is dead (Y-exit
+                    # return, headset died), so the reset press that ends
+                    # this hold can never arrive. After the grace period,
+                    # stop waiting and settle where the arms are.
+                    if vr_alive is not None:
+                        now = time.perf_counter()
+                        if vr_alive():
+                            orphan_since = None
+                        elif orphan_since is None:
+                            orphan_since = now
+                        elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
+                            orphaned = True
+                            break
                     await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
                 if stopped():
                     return
                 # Hand position control back from wherever the operator left
                 # the arms: clear the stale command history (max-step safety
                 # check) and re-seed the pipeline from the measured
-                # positions, so the reset replans from the true pose and the
-                # first commands hold it with no transient.
+                # positions, so the first commands hold the true pose with
+                # no transient — and, on a reset press, the replan starts
+                # from it.
                 reset_command_state()
                 pos_l, pos_r = get_positions()
                 self.resync_to_positions(pos_l, pos_r)
                 self.resume_ik()
+                if orphaned:
+                    announce(
+                        "No headset connected — holding position here. "
+                        "Reconnect and press reset to return to rest."
+                    )
+                    return
                 announce("Returning to rest pose.")
         finally:
             set_compliant_gains(False)

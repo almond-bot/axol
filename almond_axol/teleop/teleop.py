@@ -370,6 +370,15 @@ class VRTeleop:
                 right_arm.positions if right_arm is not None else None,
             )
 
+        def _guard_vr_alive() -> bool:
+            # Frames within the last ~2s: a Y-exit ends the XR session (the
+            # stream stops instantly), so a contact hold on the way out has
+            # no headset left to press reset — the engine settles it instead
+            # of waiting forever.
+            with self._vr_frame_times_lock:
+                last = self._vr_frame_times[-1] if self._vr_frame_times else None
+            return last is not None and (time.perf_counter() - last) < 2.0
+
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
@@ -391,6 +400,7 @@ class VRTeleop:
                         get_positions=_guard_positions,
                         stopped=lambda: False,  # unwound by task cancellation
                         announce=_logger.info,
+                        vr_alive=_guard_vr_alive,
                     )
                     # Re-anchor pacing after the excursion so the next cycle
                     # doesn't try to catch up on the elapsed time.
