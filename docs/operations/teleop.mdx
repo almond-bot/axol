@@ -95,6 +95,10 @@ The easiest way is from the app itself: when you press **Connect** and the certi
 </Note>
 
 <Note>
+  **Leaving VR is handled for you.** If pose updates stop while tracking is engaged — you doff the headset, open the system menu, or the link drops — the arms **auto-disengage** (freeze in place) after about half a second, so re-entering VR re-engages cleanly instead of snapping the arms toward wherever the controllers drifted during the gap. And if you **quit the VR app** (Quest menu) or step away with the arms away from rest, they **return home on their own** — the same guarded return **X** / **Y** trigger — rather than being stranded mid-scene. A brief pause and return simply resumes.
+</Note>
+
+<Note>
   On a robot with the **powered Axol Cart**, the headset thumbsticks drive the cart's base and lift during teleop — see [Powered cart](/guides/vr-interface#powered-cart). Enable it with the control panel's **Powered cart** toggle or [`axol teleop --cart.enabled true`](/cli/teleop), or drive just the cart with the arms left untouched using **Cart only** / [`axol teleop --cart_only`](/cli/teleop).
 </Note>
 
