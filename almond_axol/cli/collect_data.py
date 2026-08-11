@@ -10,6 +10,15 @@ Episode boundaries are driven by VR controller commands:
 While saving, the VR headset is pushed into the SAVING state so recording
 controls are blocked until save_episode() completes.
 
+After an episode ends the arms return to rest automatically, but *guarded*:
+a torque-residual watchdog compares measured torque against the gravity
+model while the move plays. Unexpected contact — a gripper still hooked on
+the scene, or the operator grabbing an arm — trips the watchdog: the move
+stops where it is and the arms drop into a limp gravity-compensation hold
+so they can be hand-guided clear (the episode saves in the background
+meanwhile). Pressing reset (X) then replans the collision-aware
+return-to-rest from wherever the arms were left.
+
 Recording continues until Ctrl+C.
 
 The teleop loop runs at ``--teleop_hz`` and publishes the latest
@@ -303,6 +312,12 @@ class CollectDataConfig:
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
     vcodec: str = field(default_factory=default_vcodec)
+    # Every return-to-rest is guarded: a torque watchdog drops the arms into
+    # a limp gravity-comp hold on unexpected contact (reset replans from
+    # wherever they were left). The knobs live on the shared teleop config —
+    # ``--teleop_config.vr_teleop_config.reset_torque_threshold`` (0 disables
+    # the watchdog) and ``.reset_gravity_comp_kd`` — the same fields `axol
+    # teleop` uses, so the two flows behave identically.
     root: str | None = None
     push_to_hub: bool = False
     rerun_ip: str | None = None
@@ -723,6 +738,18 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         # jittery interval shows up as jerk.
         deadline = time.perf_counter()
         while not _stopped():
+            # A reset playing outside a recording — the startup move at
+            # session start, or a reset press during the pre-record phase —
+            # runs through the same guarded engine as the post-episode
+            # return, so *every* rest move yields on contact. (During a
+            # recording the trajectory streams through the normal path: the
+            # discard flow consumes its reset press, and a headset-exit
+            # reset mid-take is deliberately left as-is.)
+            if not recording and teleop.is_resetting:
+                await _guarded_return()
+                deadline = time.perf_counter()
+                prev_t0["v"] = 0.0
+                continue
             deadline += teleop_interval
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
@@ -775,17 +802,50 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
 
         return recording, rerecord
 
-    async def _reset_loop() -> None:
-        reset_deadline = time.perf_counter() + 30.0
-        deadline = time.perf_counter()
-        while teleop.is_resetting and time.perf_counter() < reset_deadline:
-            if _stopped():
-                break
-            deadline += teleop_interval
-            joint_obs = robot.get_joint_observation()
-            act = teleop.get_action()
-            await robot.send_action_async(robot_action_proc((act, joint_obs)))
-            await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+    # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
+    # fallback, reset-press retry) lives in the shared engine
+    # (VRTeleopCore.guarded_return — the same one native `axol teleop` runs),
+    # bound here to this flow's robot, processors, and headset states.
+    vrt_cfg = cfg.teleop_config.vr_teleop_config
+
+    async def _guard_send_step() -> None:
+        joint_obs = robot.get_joint_observation()
+        act = teleop.get_action()
+        await robot.send_action_async(robot_action_proc((act, joint_obs)))
+
+    async def _guard_gravity_step() -> None:
+        await robot.gravity_compensate_async(kd=vrt_cfg.reset_gravity_comp_kd)
+
+    def _guard_hold_tick() -> None:
+        # Recording can't start while the arms are limp: answer a start press
+        # by snapping the headset back to DATA_COLLECTION.
+        events = teleop.get_teleop_events()
+        if events.get("start_recording"):
+            teleop.send_feedback_state(VRState.DATA_COLLECTION)
+            log_say("Press reset to return to rest before recording.")
+
+    async def _guarded_return() -> None:
+        """Play the pending reset guarded; await on the robot's event loop."""
+        await teleop.guarded_return(
+            send_step=_guard_send_step,
+            gravity_step=_guard_gravity_step,
+            torque_residuals=robot.torque_residuals,
+            reset_command_state=robot.reset_command_state,
+            get_positions=lambda: robot.positions,
+            stopped=_stopped,
+            announce=log_say,
+            # The headset may still be in SAVING (which blocks the reset
+            # button) when contact trips, so unblock it.
+            on_contact=lambda: teleop.send_feedback_state(VRState.DATA_COLLECTION),
+            hold_tick=_guard_hold_tick,
+            vr_alive=teleop.vr_alive,
+        )
+
+    async def _return_home_loop() -> None:
+        """Post-episode return: request the reset, then play it guarded."""
+        log_say("Returning to rest pose.")
+        teleop.request_reset()
+        await _guarded_return()
 
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
@@ -803,6 +863,24 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             except BaseException:
                 fut.cancel()
             raise
+
+    def _wrap_up_episode(recording: bool, rerecord: bool) -> None:
+        """Save or discard the just-ended episode and announce the result."""
+        nonlocal episodes_recorded
+        if rerecord:
+            log_say("Re-recording episode.")
+            if recording:
+                recorder.cancel_episode()
+        elif recording:
+            log_say("Saving episode…")
+            recorder.save_episode()
+            episodes_recorded += 1
+            log_say(
+                f"Saved episode {recorder.episode_count()} "
+                f"({episodes_recorded} this session)."
+            )
+        else:
+            log_say("Episode ended before recording started, skipping.")
 
     try:
         while not _stopped():
@@ -827,28 +905,30 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                     recorder.cancel_episode()
                 break
 
-            log_say("Returning to rest pose.")
-            teleop.request_reset()
-            _run_on_robot_loop(_reset_loop())
-            # Drain VR events fired during the reset move.
+            # Return home right away, but *guarded*: the move bails into a
+            # limp gravity-comp hold on contact (see _return_home_loop), so
+            # a gripper still hooked on the scene means a brief tug — not a
+            # sustained yank. The episode is saved/discarded on this thread
+            # in parallel; on a save the headset stays in SAVING (controls
+            # blocked) until the write completes.
+            home_future = asyncio.run_coroutine_threadsafe(
+                _return_home_loop(), robot.event_loop
+            )
+            try:
+                _wrap_up_episode(recording, rerecord)
+                home_future.result()
+            except BaseException:
+                # Ctrl+C or a failed save: unwind the guarded return so it
+                # stops commanding the robot before teardown.
+                loop_stop.set()
+                try:
+                    home_future.result(timeout=5.0)
+                except BaseException:
+                    home_future.cancel()
+                raise
+            # Drain VR events fired during the return, then unblock the
+            # headset for the next take.
             teleop.get_teleop_events()
-
-            if rerecord:
-                log_say("Re-recording episode.")
-                if recording:
-                    recorder.cancel_episode()
-                continue
-
-            if recording:
-                log_say("Saving episode…")
-                recorder.save_episode()
-                episodes_recorded += 1
-                log_say(
-                    f"Saved episode {recorder.episode_count()} "
-                    f"({episodes_recorded} this session)."
-                )
-            else:
-                log_say("Episode ended before recording started, skipping.")
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
 
     except KeyboardInterrupt:
