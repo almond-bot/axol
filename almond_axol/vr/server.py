@@ -39,8 +39,11 @@ from typing import TYPE_CHECKING, Any
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
+from ..constants import URDF_PATH
 from ..utils.certs import ACCEPT_PAGE_HTML, CERTFILE, KEYFILE, create_self_signed_cert
 from ..utils.ports import open_listen_socket
 from .config import VRServerConfig
@@ -53,6 +56,12 @@ if TYPE_CHECKING:
     from ..video.video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
+
+# Sequence-dedup stream key for pose frames arriving over the WebRTC control
+# data channel. The ControlChannelManager callback carries no client identity,
+# so all control-channel traffic shares one dedup stream — fine in practice,
+# since at most one headset drives teleop over the control channel at a time.
+_CONTROL_STREAM = "control"
 
 
 class VRServer:
@@ -100,15 +109,18 @@ class VRServer:
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
 
-        # The headset streams identical frames (same ``seq``) over both the USB
-        # tunnel and the network (WebRTC data channel / WebSocket). We process
-        # each ``seq`` once, from whichever transport delivers it first — the
-        # lower-latency one, i.e. USB while the cable is up and the network the
-        # instant USB goes quiet. ``_last_seq`` is the highest seq processed so
-        # far; later/duplicate copies (seq <= it) are dropped. Reset to ``None``
-        # when all clients disconnect so a reloaded headset (whose counter
-        # restarts) isn't locked out.
-        self._last_seq: int | None = None
+        # Per-stream sequence dedup: each sender's ``seq`` counter is its own
+        # monotonic stream, so the highest seq processed so far is tracked per
+        # connection (keyed by the websocket's id, or ``_CONTROL_STREAM`` for
+        # the WebRTC pose data channel) and a frame with seq <= that stream's
+        # high-water mark — a duplicate or an out-of-order straggler within
+        # that stream — is dropped. Keeping the marks per stream (not global)
+        # lets independent senders with unrelated counters coexist, e.g. the
+        # tracker bridge plus a Quest/web client monitoring the session; with
+        # a single global mark they mutually silence each other. A stream's
+        # entry is removed when its connection closes, so a reconnecting
+        # sender whose counter restarts low isn't locked out.
+        self._last_seq: dict[Any, int] = {}
 
         self._latest_frame: VRFrame | None = None
         # Adaptive playout buffer: reconstructs a smooth pose stream from
@@ -136,9 +148,9 @@ class VRServer:
     def get_frame(self) -> VRFrame | None:
         """Return the most recent frame received, or None if none yet.
 
-        When the headset streams over both USB and the network, this is the
-        first-arriving copy of each frame — USB while the cable is up, the
-        network fallback once USB goes quiet (see :meth:`_ingest_frame_obj`).
+        Duplicate/out-of-order frames within each sender's stream are dropped
+        before reaching here (see :meth:`_ingest_frame_obj`), so this is the
+        newest frame of whichever stream delivered last.
         """
         return self._latest_frame
 
@@ -327,7 +339,7 @@ class VRServer:
         self._active_clients.clear()
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
-        self._last_seq = None
+        self._last_seq.clear()
 
     # ------------------------------------------------------------------
     # Async context manager
@@ -361,31 +373,36 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
-        self._ingest_frame_obj(obj)
+        self._ingest_frame_obj(obj, client_id)
 
-    def _ingest_frame_obj(self, obj: Any) -> None:
-        """Validate a decoded pose object and publish it to the consumer."""
+    def _ingest_frame_obj(self, obj: Any, stream: Any) -> None:
+        """Validate a decoded pose object and publish it to the consumer.
+
+        ``stream`` identifies the connection the frame arrived on (the
+        websocket's ``client_id``, or ``_CONTROL_STREAM`` for the pose data
+        channel); sequence dedup is scoped to it.
+        """
         try:
             frame = VRFrame.model_validate(obj)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
             return
 
-        # The headset streams identical frames (same ``seq``) over both the
-        # wired USB tunnel and the network (WebRTC data channel / WebSocket).
-        # Process each seq once, from whichever transport delivered it first:
-        # USB wins while the cable is up (lower latency), and the moment USB
-        # goes quiet the next network frame is the first arrival for its seq and
-        # takes over with no reconnect. Dropping the slower duplicate also means
-        # ``on_frame`` (the reset/recording state-edge latches) fires exactly
-        # once per frame, the interpolator buffers each capture once, and a
-        # transport that resumes mid-stream can't rewind to a stale pose. Frames
-        # without a seq (non-headset senders) skip dedup.
+        # Each sender stamps ``seq`` monotonically within its own connection,
+        # so process each seq once *per stream*: a copy with seq <= the
+        # stream's high-water mark is a duplicate or an out-of-order straggler
+        # (e.g. batched network arrivals delivered late) and is dropped, which
+        # keeps ``on_frame`` (the reset/recording state-edge latches) firing
+        # exactly once per frame and stops a resumed stream rewinding to a
+        # stale pose. Dedup is per stream, not global, so independent
+        # concurrent senders (the tracker bridge plus a monitoring web client)
+        # never silence each other. Frames without a seq skip dedup.
         seq = frame.seq
         if seq is not None:
-            if self._last_seq is not None and seq <= self._last_seq:
+            last = self._last_seq.get(stream)
+            if last is not None and seq <= last:
                 return
-            self._last_seq = seq
+            self._last_seq[stream] = seq
 
         self._latest_frame = frame
         self._interp.push(frame)
@@ -405,7 +422,7 @@ class VRServer:
             return
         if isinstance(obj, dict) and "type" in obj:
             return
-        self._ingest_frame_obj(obj)
+        self._ingest_frame_obj(obj, _CONTROL_STREAM)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -483,6 +500,21 @@ class VRServer:
         app = FastAPI()
         server = self
 
+        # The web app is served from a different origin (axol.almond.bot or a
+        # dev server), so its fetches of the URDF/meshes below need CORS. The
+        # WebSocket path is unaffected (WS is not subject to CORS).
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET"],
+            allow_headers=["*"],
+        )
+
+        # Robot model for the headset's URDF overlay (absolute/UMI mode): the
+        # web client fetches /urdf/axol.urdf and resolves its
+        # package://assembly/... mesh references against /urdf/.
+        app.mount("/urdf", StaticFiles(directory=str(URDF_PATH.parent)), name="urdf")
+
         @app.get("/__accept")
         async def _accept() -> HTMLResponse:
             """Self-closing page the web UI opens to approve the self-signed cert."""
@@ -550,16 +582,18 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
+                # Forget this connection's seq high-water mark so a reconnecting
+                # sender (whose counter restarts low) isn't dropped as stale.
+                server._last_seq.pop(client_id, None)
                 # Last operator gone: drop buffered pose state so a fresh
                 # session's capture timestamps aren't blended with this one's
                 # stale frames (which would drive IK with incoherent poses
-                # until the playout buffer drains), and forget the seq
-                # high-water mark so a reloaded headset (whose counter restarts
-                # low) isn't dropped as stale. A USB→network failover keeps one
-                # client connected, so it doesn't reset here.
+                # until the playout buffer drains), and clear any remaining
+                # seq marks (the control-channel stream has no disconnect
+                # callback of its own).
                 if server._client_count == 0:
                     server._latest_frame = None
-                    server._last_seq = None
+                    server._last_seq.clear()
                     server._interp.reset()
 
         return app

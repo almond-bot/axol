@@ -43,10 +43,37 @@ from ...robot.axol import Axol
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
+    from ...kinematics.config import KinematicsConfig
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
 
 _logger = logging.getLogger(__name__)
+
+
+def default_tracking_ik_config() -> "KinematicsConfig":
+    """Tracking-grade IK solver config for executing Cartesian policy actions.
+
+    The ``KinematicsConfig`` defaults are the *soft* arm-teleop profile
+    (pos_weight=50, ori_weight=10, self_collision_margin=0.1): comfortable for
+    a human driving the arms, but it lets the rest/posture regularizers and
+    the 10 cm collision standoff shove commanded poses ~9 mm off target. A
+    policy replays absolute end-effector poses from its training data, so
+    deployment needs the accurate-tracking weights instead. Those are exactly
+    the Mantis UMI overrides (pos_weight=200, ori_weight=120,
+    margin=0.02, ... — see ``UMI_KINEMATICS_OVERRIDES`` and its rationale in
+    :mod:`almond_axol.kinematics.config`), applied here via
+    :func:`apply_umi_kinematics_profile` so the two stay in lock-step.
+
+    Returns:
+        A fresh config; mutate the result (or pass your own via
+        ``AxolRobot(..., ik_config=...)``) to override individual fields.
+    """
+    from ...kinematics.config import KinematicsConfig, apply_umi_kinematics_profile
+
+    config = KinematicsConfig()
+    apply_umi_kinematics_profile(config)
+    return config
+
 
 _JOINTS = list(Joint)
 _LEFT_POS_KEYS = [f"left_{j.value}.pos" for j in _JOINTS]
@@ -76,12 +103,23 @@ class AxolRobot(Robot):
 
     Args:
         config: Hardware channels, camera configs, and gain config.
+        ik_config: Solver weights for the Cartesian-action IK solver (built
+            lazily by :meth:`_ensure_ik`; run-policy only — collect-data and
+            teleop command joints and never build it). Defaults to
+            :func:`default_tracking_ik_config`. Kept a constructor argument
+            rather than an ``AxolRobotConfig`` field because that config is
+            shared with (and serialized by) consumers that never run IK.
     """
 
     config_class = AxolRobotConfig
     name = "axol"
 
-    def __init__(self, config: AxolRobotConfig) -> None:
+    def __init__(
+        self,
+        config: AxolRobotConfig,
+        *,
+        ik_config: "KinematicsConfig | None" = None,
+    ) -> None:
         super().__init__(config)
         self.config = config
         # Feature keys for the joints this robot actually has: the gripperless
@@ -94,6 +132,7 @@ class AxolRobot(Robot):
         self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
+        self._ik_config = ik_config
         self._axol: Axol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -316,12 +355,16 @@ class AxolRobot(Robot):
 
         _logger.info("AxolRobot connected.")
 
-    async def _connect_async(self) -> None:
-        self._axol = Axol(
+    def _build_hardware(self) -> Axol:
+        """Construct the hardware driver. Overridden by the Mantis UMI subclass."""
+        return Axol(
             self.config.axol_config,
             left_channel=self.config.left_channel,
             right_channel=self.config.right_channel,
         )
+
+    async def _connect_async(self) -> None:
+        self._axol = self._build_hardware()
         await self._axol.enable()
         if self.config.telemetry_hz > 0:
             await self._axol.start_telemetry(
@@ -548,13 +591,21 @@ class AxolRobot(Robot):
 
         Built on first use rather than on connect so the joint-action paths
         (collect-data, teleop) never pay for the solver's URDF load, collision
-        model, and IK JIT warmup.
+        model, and IK JIT warmup. Uses the ``ik_config`` passed at
+        construction, defaulting to the tracking-grade profile
+        (:func:`default_tracking_ik_config`) — the soft ``KinematicsConfig``
+        defaults would systematically distort commanded policy poses by ~9 mm.
         """
         if self._ik is None:
             from ...kinematics.solver import KinematicsSolver
 
+            ik_config = (
+                self._ik_config
+                if self._ik_config is not None
+                else default_tracking_ik_config()
+            )
             _logger.info("Building IK solver for Cartesian actions...")
-            self._ik = KinematicsSolver()
+            self._ik = KinematicsSolver(ik_config)
 
             # The solver warms up its *with-elbow* IK graph, but our Cartesian
             # sends pass no elbow hint — a distinct graph that would otherwise

@@ -93,8 +93,9 @@ export function OperationPanel({
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
   const isSim = isSimRun(meta, settings)
-  // Sim, or a run that never touches the arms (teleop's cart-only mode):
-  // either way the arm-connection and motor-fault gates don't apply.
+  // Sim, or a run that never touches the arms (teleop's cart-only mode, or
+  // the Mantis UMI on its own CAN buses): either way the
+  // arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
   const camCount = cameraCount(cameras)
@@ -103,7 +104,7 @@ export function OperationPanel({
   if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
   // A faulted motor blocks every hardware operation (the server refuses the
   // start too) — driving through an over-temp / stalled / unreachable motor
-  // risks the arm. Sim and cart-only runs never touch the arm motors.
+  // risks the arm. Sim, cart-only, and UMI runs never touch the arm motors.
   if (!robotFree) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)

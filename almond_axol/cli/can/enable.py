@@ -3,6 +3,7 @@ axol can.enable
 
 Runs the CAN startup script to bring up the Almond Axol CAN interfaces.
 Requires can.setup to have been run at least once to generate the script.
+``--umi`` brings up the Mantis UMI's interfaces instead of the arm's.
 
 For setups without the Axol hub CAN adapter, pass ``--channels`` to bring up
 other SocketCAN interfaces directly instead (no startup script needed):
@@ -13,16 +14,21 @@ other SocketCAN interfaces directly instead (no startup script needed):
 
 import argparse
 
-from .setup import _CRON_SCRIPT, bring_up_can, bring_up_interfaces
+from .setup import _AXOL_PROFILE, _UMI_PROFILE, bring_up_can, bring_up_interfaces
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.enable`` subcommand."""
-    p = subparsers.add_parser(
+    parser = subparsers.add_parser(
         "can.enable",
         help="Bring up CAN interfaces using the startup script.",
     )
-    p.add_argument(
+    parser.add_argument(
+        "--umi",
+        action="store_true",
+        help="Bring up the Mantis UMI interfaces instead of the arm's.",
+    )
+    parser.add_argument(
         "--channels",
         nargs="+",
         default=None,
@@ -31,14 +37,15 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "(e.g. --channels can0 can1), for setups without the Axol hub CAN "
         "adapter. Skips the hub startup script.",
     )
-    p.set_defaults(func=run)
+    parser.set_defaults(func=run)
 
 
 def run(args: argparse.Namespace | None = None) -> None:
     """Bring up the CAN interfaces.
 
-    Default: the Axol hub's saved startup script (with its RX-wedge recovery).
-    With ``--channels``: plain per-interface bring-up of the named interfaces.
+    Default: the Axol hub's saved startup script (with its RX-wedge recovery);
+    ``--umi`` selects the Mantis UMI's script instead. With ``--channels``: plain
+    per-interface bring-up of the named interfaces.
     """
     channels = getattr(args, "channels", None)
     if channels:
@@ -50,9 +57,20 @@ def run(args: argparse.Namespace | None = None) -> None:
             raise SystemExit(1) from None
         return
 
-    if not _CRON_SCRIPT.exists():
-        print(f"ERROR: Startup script not found at {_CRON_SCRIPT}.")
-        print("Run 'axol can.setup' first, or pass --channels for a non-hub adapter.")
+    profile = _UMI_PROFILE if getattr(args, "umi", False) else _AXOL_PROFILE
+    if not profile.cron_script.exists():
+        print(f"ERROR: Startup script not found at {profile.cron_script}.")
+        setup_cmd = (
+            "axol can.setup --umi" if profile is _UMI_PROFILE else "axol can.setup"
+        )
+        print(
+            f"Run '{setup_cmd}' first"
+            + (
+                ", or pass --channels for a non-hub adapter."
+                if profile is _AXOL_PROFILE
+                else "."
+            )
+        )
         raise SystemExit(1)
 
-    bring_up_can()
+    bring_up_can(profile)

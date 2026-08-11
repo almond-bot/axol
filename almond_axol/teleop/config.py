@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
+
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -84,6 +87,48 @@ class VRTeleopConfig:
             controller since engage is converted to axis-angle and its angle
             is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
+        absolute_mode: Mantis UMI mapping. Instead of re-applying
+            controller *deltas* onto the robot's engage-time FK pose (normal
+            teleop), the engage rising edge solves a world-anchored robot
+            **base transform** — gravity-aligned, positioned/oriented so the
+            rest-pose FK gripper poses coincide with the two controllers'
+            current poses — and every subsequent frame maps the controller
+            pose 1:1 into that fixed base frame as an absolute IK target.
+            Engaging is therefore the alignment act: the operator holds both
+            grippers at the agreed start pose (matching the robot's rest
+            pose relative to the task scene) and squeezes both grips. The
+            offset between each controller and its gripper TCP (mount
+            geometry, URDF frame conventions) is absorbed by the same
+            engage snapshot. Elbow hints are ignored in this mode — human
+            elbow positions say nothing about the robot's preferred null-space
+            posture. ``position_multiplier`` / ``rotation_multiplier`` do not
+            apply (the mapping is 1:1 by construction). Defaults to ``False``.
+        base_height: Optional fixed height (metres) of the robot base origin
+            above the VR floor (the WebXR ``local-floor`` reference space) in
+            ``absolute_mode``. When set, the engage-time base fit pins the
+            base's vertical position to it — matching the robot's real
+            mounting height so datasets stay consistent across operators of
+            different heights. ``None`` (default) lets the fit take the
+            vertical position from the held grippers.
+        tcp_transform_left: Tracker→gripper SE(3) transform for the left rig
+            as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed in the
+            tracker's local frame) — the rig's factory design constant, or a
+            per-unit override from ``~/.almond/umi/tcp_transform.json``.
+            When set, ``absolute_mode`` maps each tracked pose through it —
+            recorded TCP poses become mount-independent and wrist rotations
+            stop smearing into position error — instead of absorbing the
+            whole controller→gripper offset into the engage snapshot. ``None``
+            falls back to the engage-snapshot absorption.
+        tcp_transform_right: Same for the right rig.
+        tracker_key: Identity key of the active tracker (e.g. ``"quest"``,
+            ``"survive:T20"``, ``"ultimate:<mac>"``) used to select the
+            matching per-tracker entry from the saved calibration file when
+            ``tcp_transform_left`` / ``tcp_transform_right`` are unset.
+            ``None`` (default) derives the key from the saved tracker config
+            (``~/.almond/tracker/config.json`` present → its backend/devices;
+            absent → ``"quest"``). Set it explicitly when that presumption is
+            wrong, e.g. teleoperating with the Quest on a machine that also
+            has a Vive backend configured.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -131,3 +176,105 @@ class VRTeleopConfig:
     pose_beta: float = 5.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
+    absolute_mode: bool = False
+    base_height: float | None = None
+    tcp_transform_left: list[float] | None = None
+    tcp_transform_right: list[float] | None = None
+    tracker_key: str | None = None
+
+
+def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
+    """Force the Mantis UMI mapping/faithfulness profile in place.
+
+    Shared by ``collect-data --umi`` and ``teleop --umi`` so the two flows
+    behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
+    alignment act), and transparent smoothing — the EMA and trapezoid filters
+    exist to protect a physical arm and only add lag between the solution and
+    where the hand actually was, so with no arm to protect the joints should
+    follow the raw IK output. The One Euro cutoff is raised for the same
+    reason: its rest-tremor smoothing costs ~100 ms of lag at slow speeds,
+    which on the rig is pure pose↔image misalignment (and visible slack in the
+    headset's URDF overlay); a higher cutoff keeps the solution pinned to the
+    hand at the price of passing through a little tremor.
+
+    Also resolves the tracker→gripper transform per side into
+    ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
+    explicitly set config values; the override-file entry for the active
+    tracker (``config.tracker_key``, or derived — see
+    :func:`almond_axol.umi.calibration.tracker_key_for_side`); the rig's
+    factory design transform for the tracker family
+    (:data:`~almond_axol.umi.calibration.DESIGN_TCP_TRANSFORMS` — a design
+    constant, so it applies out of the box); a legacy unkeyed override
+    entry. A tracker with none of these is warned about loudly: the session
+    would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
+    """
+    config.absolute_mode = True
+    config.ik_alpha = 1.0
+    config.teleop_max_vel = 1e6
+    config.teleop_max_accel = 1e6
+    config.engage_max_vel = 1e6
+    config.pose_min_cutoff = 5.0
+
+    if config.tcp_transform_left is None or config.tcp_transform_right is None:
+        from ..umi.calibration import (
+            LEGACY_TRACKER_KEY,
+            UMI_TCP_TRANSFORM_FILE,
+            design_transform_for,
+            load_tcp_transforms,
+            tracker_key_for_side,
+        )
+
+        saved = load_tcp_transforms()
+        for side in ("left", "right"):
+            attr = f"tcp_transform_{side}"
+            if getattr(config, attr) is not None:
+                continue
+            key, reason = tracker_key_for_side(side, override=config.tracker_key)
+            entries = saved.get(side, {})
+            design = design_transform_for(side, key)
+            if key in entries:
+                setattr(config, attr, entries[key])
+                _logger.info(
+                    "UMI %s: loaded tracker→gripper calibration for tracker %r (%s).",
+                    side,
+                    key,
+                    reason,
+                )
+            elif design is not None:
+                setattr(config, attr, design)
+                _logger.info(
+                    "UMI %s: using the rig's factory tracker→gripper transform "
+                    "for tracker %r (%s) — a design constant of the standard "
+                    "mount. A per-unit entry in %s overrides it.",
+                    side,
+                    key,
+                    reason,
+                    UMI_TCP_TRANSFORM_FILE,
+                )
+            elif LEGACY_TRACKER_KEY in entries:
+                setattr(config, attr, entries[LEGACY_TRACKER_KEY])
+                _logger.warning(
+                    "UMI %s: no transform for the active tracker %r (%s) — "
+                    "falling back to a LEGACY entry measured with an unknown "
+                    "tracker. If the tracker changed since, this transform "
+                    "is wrong; re-key or delete the entry in %s.",
+                    side,
+                    key,
+                    reason,
+                    UMI_TCP_TRANSFORM_FILE,
+                )
+            else:
+                _logger.warning(
+                    "UMI %s: NO tracker→gripper transform for the active "
+                    "tracker %r (%s) — no factory design constant covers this "
+                    "tracker family and %s has no entry for it. Absolute mode "
+                    "will absorb the whole controller→gripper offset into the "
+                    "engage snapshot, so recorded TCP poses will be "
+                    "mount-dependent and wrist rotations will smear into "
+                    "position error. Add a measured transform to the file "
+                    "before collecting data.",
+                    side,
+                    key,
+                    reason,
+                    UMI_TCP_TRANSFORM_FILE,
+                )

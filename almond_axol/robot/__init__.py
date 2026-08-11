@@ -18,6 +18,7 @@ from .config import (
     PositionForceConfig,
 )
 from .sim import Sim
+from .umi import Umi, UmiGripperArm
 
 __all__ = [
     "RobotBase",
@@ -35,4 +36,6 @@ __all__ = [
     "JointConfig",
     "PositionForceConfig",
     "Sim",
+    "Umi",
+    "UmiGripperArm",
 ]

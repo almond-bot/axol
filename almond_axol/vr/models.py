@@ -81,6 +81,13 @@ class VRFrame(BaseModel):
             and network transports; the server processes each logical frame
             exactly once, via whichever transport delivers it first. ``None``
             for senders that don't set it (then no cross-transport de-duplication).
+        t_host:  Estimated capture time of this frame's poses on the *host*
+            clock (``time.perf_counter`` seconds), stamped server-side by the
+            pose interpolator from ``t`` and its headset↔host clock-offset
+            estimate. This is the timestamp dataset rows should be aligned to
+            when the pose stream is the ground truth (UMI recording): it names
+            when the hand actually was at this pose, not when the frame was
+            played out. ``None`` until the interpolator has seen the frame.
         l_stick_x: Left thumbstick x, [-1, 1], right = +1. With ``l_stick_y``
             it drives the powered cart's translation when one is configured
             (see :class:`almond_axol.robot.cart.Cart`). Neutral defaults keep
@@ -105,6 +112,7 @@ class VRFrame(BaseModel):
     state: VRState = VRState.TELEOP
     t: float | None = None
     seq: int | None = None
+    t_host: float | None = None
     l_stick_x: float = 0.0
     l_stick_y: float = 0.0
     r_stick_x: float = 0.0

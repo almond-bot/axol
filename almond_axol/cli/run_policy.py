@@ -116,6 +116,11 @@ class RunPolicyConfig:
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     episode_time_s: int = 120
     fps: int = 60
+    # Escape hatch for the training-fps sanity check: when the checkpoint
+    # records the fps its dataset was collected at (see _training_fps) and it
+    # differs from --fps, run-policy refuses to start — actions would replay
+    # at the wrong speed. Set true only for deliberate speed experiments.
+    allow_fps_mismatch: bool = False
     # Video codec for the recorded LeRobot dataset; defaults per-platform (see
     # _default_vcodec). Override with any of LeRobot's VALID_VIDEO_CODECS
     # (e.g. auto, h264, libsvtav1).
@@ -352,6 +357,106 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
     )
 
 
+def _training_fps(policy_path: str) -> int | None:
+    """Best-effort lookup of the fps the checkpoint was trained at.
+
+    Reads ``train_config.json`` next to the model (written by LeRobot's
+    trainer; absent for hand-built checkpoints or not-yet-downloaded Hub repo
+    ids, in which case the caller skips the check). LeRobot's train config
+    records no fps field of its own, so the value comes from, in order:
+
+    - a top-level ``fps`` key, honoured in case a pipeline stamps one in;
+    - the training dataset's ``meta/info.json`` (the authoritative dataset
+      fps), located via the recorded ``dataset.root`` / ``dataset.repo_id``.
+
+    Args:
+        policy_path: ``--policy_path`` as given (local dir or Hub repo id).
+
+    Returns:
+        The training fps, or ``None`` when nothing conclusive was found.
+    """
+    import json
+    from pathlib import Path
+
+    model_dir = Path(policy_path)
+    if not model_dir.is_dir():
+        return None
+    train_config_path = model_dir / "train_config.json"
+    if not train_config_path.is_file():
+        return None
+    try:
+        train_cfg = json.loads(train_config_path.read_text())
+    except (OSError, ValueError):
+        _logger.warning(
+            "Unreadable train_config.json at %s; skipping the fps sanity check.",
+            train_config_path,
+        )
+        return None
+
+    fps = train_cfg.get("fps")
+    if isinstance(fps, (int, float)):
+        return int(fps)
+
+    dataset_cfg = train_cfg.get("dataset") or {}
+    candidates: list[Path] = []
+    root = dataset_cfg.get("root")
+    if root:
+        candidates.append(Path(root))
+    repo_id = dataset_cfg.get("repo_id")
+    if repo_id:
+        from lerobot.utils.constants import HF_LEROBOT_HOME
+
+        candidates.append(HF_LEROBOT_HOME / repo_id)
+    for candidate in candidates:
+        info_path = candidate / "meta" / "info.json"
+        if not info_path.is_file():
+            continue
+        try:
+            fps = json.loads(info_path.read_text()).get("fps")
+        except (OSError, ValueError):
+            continue
+        if isinstance(fps, (int, float)):
+            return int(fps)
+    return None
+
+
+def _check_training_fps(cfg: RunPolicyConfig) -> None:
+    """Refuse to run when ``--fps`` differs from the checkpoint's training fps.
+
+    A policy trained on 30 Hz data but executed at 60 Hz replays every action
+    chunk at double speed (and drifts the chunk-timestep bookkeeping), so a
+    detectable mismatch is a hard error unless ``--allow_fps_mismatch`` is
+    set. When the training fps cannot be determined (see :func:`_training_fps`)
+    the check is skipped with a warning rather than guessing.
+    """
+    trained_fps = _training_fps(cfg.policy_path)
+    if trained_fps is None:
+        _logger.warning(
+            "Could not determine the fps the policy at %s was trained at "
+            "(no readable train_config.json / dataset meta); skipping the "
+            "fps sanity check. Make sure --fps matches the training data.",
+            cfg.policy_path,
+        )
+        return
+    if trained_fps == cfg.fps:
+        return
+    if cfg.allow_fps_mismatch:
+        _logger.warning(
+            "--fps %d does not match the policy's training fps %d; continuing "
+            "because --allow_fps_mismatch is set.",
+            cfg.fps,
+            trained_fps,
+        )
+        return
+    raise ValueError(
+        f"--fps {cfg.fps} does not match the fps this policy was trained at "
+        f"({trained_fps}, recorded by the checkpoint's train_config.json / "
+        f"training-dataset meta). Actions would replay at the wrong speed. "
+        f"Pass --fps {trained_fps}, or --allow_fps_mismatch true to override "
+        f"deliberately."
+    )
+
+
 def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
     """Entry point for the policy-server child process.
 
@@ -370,10 +475,135 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     disable_observation_similarity_filter()
 
+    # Register the UMI relative-EE processor steps so checkpoints trained with
+    # `axol umi.train` deserialize their processor pipelines here.
+    from ..umi import processor as _umi_processor  # noqa: F401
+
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
     serve(PolicyServerConfig(**server_cfg_dict))
+
+
+def _snap_to_newest_indices(
+    action_features: "list[str] | dict[str, Any]",
+) -> tuple[int, ...]:
+    """Indices of the action dims that bypass temporal-ensemble averaging.
+
+    These dims snap to the newest contributing chunk's value instead of the
+    recency-weighted average (see ``_ensemble_chunks``). Derived from the
+    action feature names — never hardcoded positions — so they track both the
+    joint layout (16-dim, grippers at 7/15, no EE axes) and the Cartesian
+    layout (14-dim, grippers at 6/13, EE rotation axes at 3-5/10-12):
+
+    - Grippers (``*gripper.pos``): averaging would smear bang-bang grasp
+      commands into a slow squeeze.
+    - Rotation-vector dims (``*_ee.rx/.ry/.rz``): rotation vectors
+      double-cover SO(3), and the composed absolute rotvecs the UMI policy
+      emits are canonicalized to angle in [0, pi]. Two nearly identical
+      orientations near the pi boundary can therefore arrive as ``+pi*a``
+      and ``-pi*a`` in successive chunks; their weighted average is ~the
+      identity rotation — a violent wrist snap through the workspace.
+      Averaging rotvecs is only valid for nearby representatives, which the
+      ensemble cannot guarantee, so orientation follows the newest chunk
+      verbatim.
+
+    Args:
+        action_features: The robot's ordered action feature names (dict keys
+            or list), e.g. ``AxolRobot.action_features``.
+
+    Returns:
+        Sorted tuple of flat action-vector indices to snap.
+    """
+    return tuple(
+        i
+        for i, key in enumerate(action_features)
+        if key.endswith("gripper.pos") or key.endswith((".rx", ".ry", ".rz"))
+    )
+
+
+def _ensemble_chunks(
+    chunks: "list[tuple[int, Any]]",
+    grid_min_ts: int,
+    coeff: float,
+    snap_indices: tuple[int, ...],
+) -> "tuple[Any, list[int]] | None":
+    """Blend overlapping action chunks over a shared timestep grid (ACT Alg. 2).
+
+    Each grid timestep ``ts >= grid_min_ts`` covered by at least one chunk
+    gets ``ensembled[ts] = Σ wᵢ · chunkᵢ[ts] / Σ wᵢ`` with ``wᵢ =
+    exp(-coeff · i)`` and ``i = 0`` the oldest chunk. Dims listed in
+    ``snap_indices`` (grippers + rotation vectors — see
+    :func:`_snap_to_newest_indices`) bypass the average and take the newest
+    contributing chunk's value verbatim. Pure function (no client state) so
+    the aggregation math is unit-testable; the rebuild is one batched op over
+    an ``(n_chunks, n_ts, action_dim)`` grid, sub-ms even with ~20 chunks in
+    flight.
+
+    Args:
+        chunks: ``(origin_timestep, packed_actions)`` per buffered chunk,
+            sorted oldest-first, with ``packed_actions`` a
+            ``(chunk_len, action_dim)`` tensor.
+        grid_min_ts: First timestep to emit (the caller passes
+            ``latest_action + 1``).
+        coeff: Exponential recency-decay coefficient.
+        snap_indices: Flat action dims that snap to the newest chunk.
+
+    Returns:
+        ``(ensembled, contributed)`` where ``ensembled`` is an
+        ``(n_ts, action_dim)`` tensor over the grid starting at
+        ``grid_min_ts`` and ``contributed`` lists the grid offsets covered
+        by at least one chunk — or ``None`` when no chunk reaches
+        ``grid_min_ts``.
+    """
+    import torch
+
+    grid_max_ts = max(origin + packed.shape[0] - 1 for origin, packed in chunks)
+    if grid_min_ts > grid_max_ts:
+        return None
+
+    sample = chunks[0][1]
+    n_chunks = len(chunks)
+    n_ts = grid_max_ts - grid_min_ts + 1
+    dtype = sample.dtype
+    device = sample.device
+    action_dim = sample.shape[1]
+
+    # ``mask[ci, ts]`` is 1.0 where chunk ``ci`` covers ``ts``.
+    action_grid = torch.zeros((n_chunks, n_ts, action_dim), dtype=dtype, device=device)
+    mask = torch.zeros((n_chunks, n_ts), dtype=dtype, device=device)
+    for ci, (origin, packed) in enumerate(chunks):
+        chunk_max = origin + packed.shape[0] - 1
+        lo = max(origin, grid_min_ts)
+        hi = min(chunk_max, grid_max_ts)
+        if lo > hi:
+            continue
+        src_start = lo - origin
+        src_stop = hi - origin + 1
+        dst_start = lo - grid_min_ts
+        dst_stop = hi - grid_min_ts + 1
+        action_grid[ci, dst_start:dst_stop] = packed[src_start:src_stop]
+        mask[ci, dst_start:dst_stop] = 1.0
+
+    chunk_weights = torch.exp(
+        -coeff * torch.arange(n_chunks, dtype=dtype, device=device)
+    )
+    weighted_mask = chunk_weights.unsqueeze(1) * mask  # (n_chunks, n_ts)
+    norm = weighted_mask.sum(dim=0).clamp(min=1e-12)
+    ensembled = (action_grid * weighted_mask.unsqueeze(-1)).sum(dim=0) / norm.unsqueeze(
+        -1
+    )  # (n_ts, action_dim)
+
+    # Snap carve-out: overwrite the snap dims with the newest contributing
+    # chunk's value via a reverse-cumsum one-hot (cheaper than ``torch.max``
+    # on tiny CPU tensors).
+    reverse_cumsum = mask.flip(0).cumsum(dim=0).flip(0)
+    newest_mask = mask * (reverse_cumsum == 1).to(dtype)
+    for sidx in snap_indices:
+        ensembled[:, sidx] = (action_grid[:, :, sidx] * newest_mask).sum(dim=0)
+
+    contributed = mask.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+    return ensembled, contributed
 
 
 # ----------------------------------------------------------------------
@@ -410,7 +640,7 @@ def _build_axol_robot_client(
         map_robot_keys_to_lerobot_features,
     )
     from lerobot.async_inference.robot_client import RobotClient
-    from lerobot.transport import services_pb2_grpc
+    from lerobot.transport import services_pb2, services_pb2_grpc
     from lerobot.transport.utils import grpc_channel_options
 
     class AxolRobotClient(RobotClient):  # type: ignore[misc, valid-type]
@@ -476,16 +706,14 @@ def _build_axol_robot_client(
 
             self.config = config
             self.robot = robot
-            # Indices of the gripper entries in the flat action vector, derived
-            # from the robot's action space so it tracks both the joint layout
-            # (16-dim, grippers at 7/15) and the Cartesian layout (14-dim,
-            # grippers at 6/13). ``_temporal_ensemble_aggregate`` snaps these to
-            # the newest contributing chunk so bang-bang grasps aren't smeared.
-            self._gripper_indices = tuple(
-                i
-                for i, key in enumerate(robot.action_features)
-                if key.endswith("gripper.pos")
-            )
+            # Action dims that snap to the newest contributing chunk instead
+            # of being recency-averaged: grippers (bang-bang grasps must not
+            # be smeared) and Cartesian rotation-vector dims (rotvec
+            # double-cover — averaging is only valid for nearby
+            # representatives; see _snap_to_newest_indices for the full
+            # rationale). Derived from the robot's action space so it tracks
+            # both the joint and Cartesian layouts.
+            self._snap_indices = _snap_to_newest_indices(list(robot.action_features))
             self._publisher = publisher
             self._aggregate_strategy = aggregate_strategy
             self._temporal_ensemble_coeff = float(temporal_ensemble_coeff)
@@ -533,7 +761,24 @@ def _build_axol_robot_client(
             self.must_go.set()
 
         def reset_episode_state(self) -> None:
-            """Reset queues + flags so threads can run a fresh episode."""
+            """Reset client queues/flags AND the server's per-episode state.
+
+            Observation timesteps restart at 0 every episode, but the
+            ``PolicyServer`` keeps its ``_predicted_timesteps`` set (and
+            observation queue) across episodes. Without a server-side reset,
+            ``_obs_sanity_checks`` silently drops every later-episode
+            observation whose timestep collided with episode 1, and the run
+            executes one chunk then freezes. Re-issuing the ``Ready`` RPC —
+            exactly the server-reset part of the ``start()`` handshake — fixes
+            that: its handler runs ``PolicyServer._reset_server()``, which
+            clears the predicted-timestep set and observation queue and
+            nothing else. The policy/processors are loaded only by
+            ``SendPolicyInstructions``, which ``start()`` sends once per run,
+            so ``Ready`` is safe to re-send mid-connection. (The server's
+            ``last_processed_obs`` is left in place, but the first observation
+            of an episode is must-go and bypasses the similarity check.)
+            """
+            self.stub.Ready(services_pb2.Empty())
             with self.action_queue_lock:
                 self.action_queue = Queue()
                 self.action_queue_size = []
@@ -586,14 +831,12 @@ def _build_axol_robot_client(
         def _temporal_ensemble_aggregate(self, incoming_actions):  # type: ignore[no-untyped-def]
             """Aggregate buffered chunks with ACT Algorithm 2.
 
-            Each future timestep ``ts > latest_action`` covered by at
-            least one buffered chunk gets ``commanded[ts] = Σ wᵢ ·
-            chunkᵢ[ts] / Σ wᵢ`` with ``wᵢ = exp(-coeff · i)`` and
-            ``i = 0`` the oldest chunk. ``_gripper_indices`` bypass the
-            average and snap to the newest contributing chunk's value.
-            The rebuild is one batched op over an
-            ``(n_chunks, n_ts, action_dim)`` grid, sub-ms even with
-            ~20 chunks in flight.
+            Maintains the chunk buffer (append the incoming chunk, drop
+            fully-executed ones) and delegates the blend to the pure
+            :func:`_ensemble_chunks`: every future timestep
+            ``ts > latest_action`` gets a recency-weighted average, except
+            the ``_snap_indices`` dims (grippers + rotation vectors), which
+            snap to the newest contributing chunk's value.
 
             Args:
                 incoming_actions: Latest action chunk from the policy
@@ -646,57 +889,17 @@ def _build_axol_robot_client(
 
             # Grid: every future timestep covered by ≥1 buffered chunk.
             grid_min_ts = latest_action + 1
-            grid_max_ts = max(
-                origin + packed.shape[0] - 1 for origin, packed, _ in self._chunk_buffer
+            result = _ensemble_chunks(
+                [(origin, packed) for origin, packed, _ in self._chunk_buffer],
+                grid_min_ts=grid_min_ts,
+                coeff=self._temporal_ensemble_coeff,
+                snap_indices=self._snap_indices,
             )
-            if grid_min_ts > grid_max_ts:
+            if result is None:
                 self._install_future_queue(Queue())
                 return
+            ensembled, contributed_indices = result
 
-            n_ts = grid_max_ts - grid_min_ts + 1
-            dtype = sample.dtype
-            device = sample.device
-            action_dim = sample.shape[0]
-
-            # ``mask[ci, ts]`` is 1.0 where chunk ``ci`` covers ``ts``.
-            action_grid = torch.zeros(
-                (n_chunks, n_ts, action_dim), dtype=dtype, device=device
-            )
-            mask = torch.zeros((n_chunks, n_ts), dtype=dtype, device=device)
-            for ci, (origin, packed, _) in enumerate(self._chunk_buffer):
-                chunk_max = origin + packed.shape[0] - 1
-                lo = max(origin, grid_min_ts)
-                hi = min(chunk_max, grid_max_ts)
-                if lo > hi:
-                    continue
-                src_start = lo - origin
-                src_stop = hi - origin + 1
-                dst_start = lo - grid_min_ts
-                dst_stop = hi - grid_min_ts + 1
-                action_grid[ci, dst_start:dst_stop] = packed[src_start:src_stop]
-                mask[ci, dst_start:dst_stop] = 1.0
-
-            coeff = self._temporal_ensemble_coeff
-            chunk_weights = torch.exp(
-                -coeff * torch.arange(n_chunks, dtype=dtype, device=device)
-            )
-            weighted_mask = chunk_weights.unsqueeze(1) * mask  # (n_chunks, n_ts)
-            norm = weighted_mask.sum(dim=0).clamp(min=1e-12)
-            ensembled = (action_grid * weighted_mask.unsqueeze(-1)).sum(
-                dim=0
-            ) / norm.unsqueeze(-1)  # (n_ts, action_dim)
-
-            # Gripper carve-out: snap to the newest contributing chunk via
-            # a reverse-cumsum one-hot (cheaper than ``torch.max`` on tiny
-            # CPU tensors).
-            reverse_cumsum = mask.flip(0).cumsum(dim=0).flip(0)
-            newest_mask = mask * (reverse_cumsum == 1).to(dtype)
-            for gidx in self._gripper_indices:
-                ensembled[:, gidx] = (action_grid[:, :, gidx] * newest_mask).sum(dim=0)
-
-            contributed_indices = (
-                mask.any(dim=0).nonzero(as_tuple=False).flatten().tolist()
-            )
             future_queue = Queue()
             for ti in contributed_indices:
                 future_queue.put(
@@ -871,6 +1074,10 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
     robot_config = cfg.robot_config
+
+    # Fail fast (before any hardware or server spawn) if --fps disagrees with
+    # the fps the checkpoint was trained at.
+    _check_training_fps(cfg)
 
     # Finalize the camera set before the robot opens the cameras: prune the
     # unassigned placeholder slots (at least one must be set, and should be the

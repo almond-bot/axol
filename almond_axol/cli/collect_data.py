@@ -7,8 +7,21 @@ Episode boundaries are driven by VR controller commands:
   - RECORDING → DATA_COLLECTION:              stop; save episode (success)
   - RECORDING → DATA_COLLECTION + reset btn:  stop; discard episode (rerecord)
 
+and/or, when launched from the web control panel (``axol serve``), by episode
+commands pushed through :class:`_QueueEpisodeControl` (``POST
+/api/op/episode``): ``start`` begins recording after a spoken 3-second
+countdown, ``s`` terminates + saves, ``r`` discards + re-records, ``q`` quits
+the session. Both sources are live at once — either can start or end an
+episode.
+
 While saving, the VR headset is pushed into the SAVING state so recording
 controls are blocked until save_episode() completes.
+
+At save time each episode passes a data-quality gate (see
+:func:`evaluate_episode_qa`): episodes with a mid-recording re-engage, too
+many frozen-TCP frames, or too many disengaged frames are discarded and
+re-recorded instead of silently saved (``--qa_gate false`` disables the
+refusal; the QA summary is always logged).
 
 Recording continues until Ctrl+C.
 
@@ -25,6 +38,7 @@ timestamp.
 import asyncio
 import logging
 import os
+import queue
 import socket
 import threading
 import time
@@ -52,6 +66,76 @@ if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
 
 _logger = logging.getLogger(__name__)
+
+
+def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
+    """Rewrite the parsed config for Mantis UMI collection (``--umi``).
+
+    Robot side: swap a plain :class:`AxolRobotConfig` for
+    :class:`UmiRobotConfig` (handheld grippers on ``can_alm_umi_l/r``, virtual
+    arms), carrying over every field the operator may have set and only
+    replacing CAN channels still at the robot-arm defaults. Teleop side: force
+    the UMI mapping/faithfulness profile —
+
+    - ``absolute_mode``: controllers map to world-anchored absolute targets
+      (the engage squeeze is the start-pose alignment act);
+    - ``ik_alpha = 1.0`` and effectively-unbounded trapezoid limits: those
+      filters exist to protect a physical arm and only add lag between the
+      recorded action and where the hand actually was — with no arm to
+      protect, the recorded joints should follow the raw IK solution.
+
+    Applied after parsing, so it overrides these specific teleop fields even if
+    set on the CLI (a warning is logged); other teleop knobs (One Euro, rest
+    poses, frequency) pass through untouched.
+    """
+    from dataclasses import fields
+
+    from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
+    from ..lerobot.robot.config_umi import UmiRobotConfig
+
+    if isinstance(cfg.robot_config, AxolRobotConfig) and not isinstance(
+        cfg.robot_config, UmiRobotConfig
+    ):
+        kwargs = {
+            f.name: getattr(cfg.robot_config, f.name)
+            for f in fields(cfg.robot_config)
+            if f.init
+        }
+        if kwargs.get("left_channel") == CAN_LEFT:
+            kwargs["left_channel"] = CAN_UMI_LEFT
+        if kwargs.get("right_channel") == CAN_RIGHT:
+            kwargs["right_channel"] = CAN_UMI_RIGHT
+        # The rig has no overhead camera; drop the placeholder slot so the
+        # camera dialog / CLI surface matches the hardware (an explicitly
+        # assigned serial is kept — someone may rig a scene camera).
+        cameras = dict(kwargs.get("cameras") or {})
+        overhead = cameras.get("overhead")
+        if overhead is not None and int(getattr(overhead, "serial", 0) or 0) <= 0:
+            cameras.pop("overhead")
+        kwargs["cameras"] = cameras
+        cfg.robot_config = UmiRobotConfig(**kwargs)
+
+    # UMI datasets are Cartesian: state/action are absolute base-frame EE
+    # poses (+ gripper), the same schema on-robot collection produces with
+    # ``observe_cartesian`` — so rig and robot episodes mix in one dataset,
+    # train with ``axol umi.train``, and deploy with ``run-policy``. The
+    # rig's virtual joints are IK artifacts and are not recorded.
+    if not getattr(cfg.robot_config, "observe_cartesian", False):
+        _logger.info("--umi: forcing observe_cartesian (EE-pose dataset schema).")
+    cfg.robot_config.observe_cartesian = True
+
+    if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
+        from ..kinematics.config import apply_umi_kinematics_profile
+        from ..teleop.config import apply_umi_teleop_profile
+
+        tc = cfg.teleop_config.vr_teleop_config
+        if not tc.absolute_mode or tc.ik_alpha != 1.0:
+            _logger.info(
+                "--umi: forcing absolute_mode, ik_alpha=1.0, and transparent "
+                "trapezoid limits on the teleop config."
+            )
+        apply_umi_teleop_profile(tc)
+        apply_umi_kinematics_profile(cfg.teleop_config.kinematics_config)
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -284,12 +368,25 @@ class CollectDataConfig:
     configs (cameras, per-joint gains, IK, VR server); nest into
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
+
+    ``--umi true`` records with the Mantis UMI instead of the robot:
+    grippers on ``can_alm_umi_l/r``, wrist cameras only, absolute
+    (world-anchored) pose mapping, dataset rows stamped with the VR pose
+    capture time, and the Cartesian EE-pose schema (state/action are absolute
+    base-frame poses from the tracker, same schema as on-robot
+    ``observe_cartesian`` collection). See :func:`_apply_umi_profile`.
     """
 
     repo_id: str
     task: str
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
+    umi: bool = False
+    # UMI only: zero-phase low-pass cutoff (Hz) applied to the recorded EE pose
+    # track at episode save, removing broadband tracker noise without lag
+    # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for
+    # on-robot collection, whose FK poses come from joint encoders.
+    umi_smooth_hz: float = 10.0
     fps: int = 60
     teleop_hz: int = 120
     # Resolution the recorded dataset video is downscaled to (on the relay's VIC,
@@ -305,9 +402,196 @@ class CollectDataConfig:
     vcodec: str = field(default_factory=default_vcodec)
     root: str | None = None
     push_to_hub: bool = False
+    # Refuse to save episodes the quality gate marks corrupt — a mid-recording
+    # re-engage (frame shift), > 5% frozen-TCP frames, or > 1% disengaged
+    # frames (see evaluate_episode_qa): the episode is discarded and
+    # re-recorded with a loud spoken/logged explanation. Set false as an
+    # escape hatch (debugging the gate, or deliberately recording unusual
+    # sessions) — the per-episode QA summary is still logged, the bad episode
+    # is just saved anyway. Only UMI episodes can fail the gate; on-robot
+    # episodes read poses from joint encoders and always pass.
+    qa_gate: bool = True
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
+
+
+# ----------------------------------------------------------------------
+# Episode quality gate
+# ----------------------------------------------------------------------
+
+# A tracked TCP that hasn't taken a new value for longer than this while
+# recording counts as a "stale frame": the tracker / IK stream is frozen but
+# rows keep landing with fresh timestamps, so training would see a hand that
+# holds perfectly still and then teleports.
+_QA_STALE_TCP_S = 0.25
+# Verdict thresholds, as fractions of recorded control ticks (ticks ≈ dataset
+# rows — the loop publishes one snapshot per tick). Exceeding either marks the
+# episode bad; a mid-recording re-engage is always fatal (frame shift).
+_QA_MAX_STALE_FRACTION = 0.05
+_QA_MAX_DISENGAGED_FRACTION = 0.01
+
+
+@dataclass
+class EpisodeQAStats:
+    """Per-episode data-quality counters, collected while recording.
+
+    Populated by ``_episode_loop`` in UMI mode, one increment per control
+    tick while an episode is recording. On-robot collection leaves everything
+    at zero — its poses come from joint encoders, so the tracker failure
+    modes measured here can't occur and the episode always passes the gate.
+    """
+
+    # Control ticks recorded (denominator for the fractions below).
+    total_frames: int = 0
+    # Ticks where the tracked TCP hadn't changed for > _QA_STALE_TCP_S:
+    # tracker dropout, IK stall, or a frozen pose stream. Only counted once a
+    # TCP has been seen at all (pre-first-solve rows fall back to FK).
+    stale_frames: int = 0
+    # Ticks recorded while teleop tracking was disengaged: the recorded pose
+    # holds still while the operator's hands actually move.
+    disengaged_frames: int = 0
+    # Tracking re-engaged (False -> True) while recording. The engage squeeze
+    # re-fits the world->base transform, silently shifting the frame of every
+    # later row — the episode mixes two incompatible coordinate frames and is
+    # unusable regardless of the other counters.
+    reengaged_while_recording: bool = False
+    # Worst pose-stream age (tick time minus pose capture time) seen while
+    # recording, in seconds. Reported in the QA summary; not itself a gate.
+    max_pose_lag_s: float = 0.0
+
+    @property
+    def stale_fraction(self) -> float:
+        """Stale ticks as a fraction of recorded ticks (0.0 when empty)."""
+        return self.stale_frames / self.total_frames if self.total_frames else 0.0
+
+    @property
+    def disengaged_fraction(self) -> float:
+        """Disengaged ticks as a fraction of recorded ticks (0.0 when empty)."""
+        return self.disengaged_frames / self.total_frames if self.total_frames else 0.0
+
+
+def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
+    """Quality verdict for a recorded episode: ``(ok, reasons)``.
+
+    ``ok`` is ``False`` when the episode is corrupt beyond use:
+
+    - tracking re-engaged mid-recording (world->base re-fit shifts the frame
+      of every later row — always fatal), or
+    - stale-frame fraction above :data:`_QA_MAX_STALE_FRACTION` (5%), or
+    - disengaged-frame fraction above :data:`_QA_MAX_DISENGAGED_FRACTION` (1%).
+
+    ``reasons`` lists the human-readable failures (empty when ``ok``). A pure
+    function of the counters so the verdict logic is unit-testable without
+    hardware; the caller decides what the verdict means (save vs. discard —
+    see ``CollectDataConfig.qa_gate``).
+    """
+    reasons: list[str] = []
+    if stats.reengaged_while_recording:
+        reasons.append(
+            "tracking re-engaged mid-recording — the world-to-base transform "
+            "was re-fit, so later rows are in a different frame than earlier "
+            "ones"
+        )
+    if stats.stale_fraction > _QA_MAX_STALE_FRACTION:
+        reasons.append(
+            f"{100 * stats.stale_fraction:.1f}% of frames recorded a frozen "
+            f"TCP pose (limit {100 * _QA_MAX_STALE_FRACTION:.0f}%; tracker "
+            "dropout or IK stall)"
+        )
+    if stats.disengaged_fraction > _QA_MAX_DISENGAGED_FRACTION:
+        reasons.append(
+            f"{100 * stats.disengaged_fraction:.1f}% of frames were recorded "
+            f"while tracking was disengaged (limit "
+            f"{100 * _QA_MAX_DISENGAGED_FRACTION:.0f}%)"
+        )
+    return (not reasons, reasons)
+
+
+# ----------------------------------------------------------------------
+# Episode control: how web start/save/rerecord/quit decisions arrive.
+#
+# VR headset state transitions (teleop.get_teleop_events()) always drive the
+# episode loop; a web control panel can additionally push commands through
+# this queue from the serve API. Mirrors run_policy's _QueuePolicyControl but
+# is a deliberately parallel class (neither CLI imports from the other):
+# collect-data's loop has a different shape — recording starts *inside* the
+# control loop on an event, not between blocking await_continue gates.
+# ----------------------------------------------------------------------
+
+# Spoken/logged countdown between a web "start" command and the actual
+# recorder.start_episode, so the operator can pick up the rig / settle.
+_START_COUNTDOWN_S = 3.0
+
+
+class _QueueEpisodeControl:
+    """Web episode control for collect-data: API-pushed queue commands.
+
+    Commands (pushed by ``POST /api/op/episode`` via the serve runner):
+
+    - ``"start"`` (alias ``"continue"``): begin recording after a spoken
+      ``_START_COUNTDOWN_S`` countdown;
+    - ``"s"``: terminate the running episode and save it;
+    - ``"r"``: terminate the running episode and discard it (re-record);
+    - ``"q"``: quit the whole collection session (discarding any episode in
+      flight).
+
+    Either source can drive an episode: VR events keep working for Quest
+    operators, and a panel command is honored even if recording was started
+    from the headset (and vice versa). ``snapshot()`` matches the shape of
+    run-policy's control so ``/api/op/status`` renders both ops identically.
+    """
+
+    def __init__(self, stop_event: "threading.Event | None" = None) -> None:
+        # stop_event is part of the serve runner's episode-control constructor
+        # contract (see OperationRunner._run_thread); this control only ever
+        # polls non-blocking, so it has no waits to interrupt with it.
+        del stop_event
+        self._q: "queue.Queue[str]" = queue.Queue()
+        # Episode phase/count, read by the serve runner so the web control
+        # panel on ANY connected computer can show the right controls.
+        self._state_lock = threading.Lock()
+        self._phase = "preparing"
+        self._episodes_recorded = 0
+
+    def push(self, command: str) -> None:
+        """Queue a command from the API. Safe from any thread."""
+        self._q.put(command)
+
+    def poll_command(self) -> str | None:
+        """Pop the next valid pending command without blocking, or ``None``.
+
+        Unknown commands are dropped (the API surface is shared with
+        run-policy, whose ``"continue"`` alias maps to ``"start"`` here).
+        Called once per control tick by the episode loop.
+        """
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            if cmd == "continue":
+                cmd = "start"
+            if cmd in ("start", "s", "r", "q"):
+                return cmd
+
+    def set_phase(self, phase: str) -> None:
+        """Publish the episode phase (``ready`` | ``recording`` | ``resetting``)."""
+        with self._state_lock:
+            self._phase = phase
+
+    def note_saved(self) -> None:
+        """Count a saved episode for the status snapshot."""
+        with self._state_lock:
+            self._episodes_recorded += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        """Thread-safe phase/count for ``/api/op/status`` (run-policy shape)."""
+        with self._state_lock:
+            return {
+                "phase": self._phase,
+                "episodesRecorded": self._episodes_recorded,
+            }
 
 
 def main(argv: list[str]) -> None:
@@ -325,7 +609,20 @@ def main(argv: list[str]) -> None:
     _run(cfg)
 
 
-def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) -> None:
+def _run(
+    cfg: CollectDataConfig,
+    stop_event: "threading.Event | None" = None,
+    control: "_QueueEpisodeControl | None" = None,
+) -> None:
+    """Run the collection session until quit/stop.
+
+    ``stop_event`` (optional) aborts the session from another thread (the
+    serve runner's Stop). ``control`` (optional) is a
+    :class:`_QueueEpisodeControl` carrying web-panel episode commands, merged
+    with the VR headset events inside the episode loop; ``None`` (plain CLI)
+    leaves the VR headset as the only episode-control source.
+    """
+    import numpy as np
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
@@ -335,9 +632,14 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     from lerobot.utils.utils import log_say
     from lerobot.utils.visualization_utils import init_rerun
 
-    from ..lerobot.robot.robot_axol import AxolRobot
+    from ..lerobot.robot.robot_axol import _LEFT_EE_KEYS, _RIGHT_EE_KEYS, AxolRobot
+    from ..lerobot.robot.robot_umi import UmiRobot
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
+    from ..umi.relative import quat_xyzw_to_rotvec
     from ..vr.models import VRState
+
+    if cfg.umi:
+        _apply_umi_profile(cfg)
 
     repo_id = cfg.repo_id
     task = cfg.task
@@ -378,14 +680,21 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 "dialog (or set its record_resolution / eyes)."
             )
 
+    from ..lerobot.robot.config_umi import UmiRobotConfig
+
+    umi_mode = isinstance(cfg.robot_config, UmiRobotConfig)
+
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
-    if isinstance(cfg.robot_config, AxolRobotConfig) and isinstance(
-        cfg.teleop_config, AxolVRTeleopConfig
+    # The Mantis UMI always has grippers, so only the real robot propagates.
+    if (
+        not umi_mode
+        and isinstance(cfg.robot_config, AxolRobotConfig)
+        and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-    robot = AxolRobot(cfg.robot_config)
+    robot = UmiRobot(cfg.robot_config) if umi_mode else AxolRobot(cfg.robot_config)
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
@@ -513,6 +822,17 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         features = {**action_features, **obs_features}
         obs_keys = list(robot.get_joint_observation().keys())
         action_keys = list(robot.action_features.keys())
+        if umi_mode:
+            # ``observation.pose_lag`` is the residual pose↔image skew per row
+            # (camera capture time minus pose capture time), injected by the
+            # capture loop for training-time latency handling. On-robot
+            # sessions appended to this dataset (collect-data resume,
+            # run-policy recording) fill it too.
+            features["observation.pose_lag"] = {
+                "dtype": "float32",
+                "shape": (1,),
+                "names": ["pose_lag"],
+            }
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
@@ -577,6 +897,9 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         "rerun_port": rerun_port,
         "push_to_hub": push_to_hub,
         "log_level": cfg.log_level,
+        # Tracked (VR) poses carry measurement noise the robot's encoder FK
+        # doesn't — smooth only UMI episodes (see record_proc._maybe_smooth_episode).
+        "smooth_ee_hz": cfg.umi_smooth_hz if umi_mode else 0.0,
     }
     try:
         if is_complete:
@@ -661,6 +984,10 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     max_gap = {"v": 0.0}
     max_slip = {"v": 0.0}
     prev_t0 = {"v": 0.0}
+    # UMI only: worst pose-stream age (tick time minus pose capture time) in the
+    # window — transit + playout delay + filter lag, the residual misalignment
+    # between what the wrist cameras saw and the pose the row records.
+    max_pose_lag = {"v": 0.0}
 
     def _maybe_log_rate(t0: float) -> None:
         nonlocal last_rate_log, sect
@@ -675,12 +1002,22 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
-        _logger.info(
-            "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
-            loop_hz,
-            teleop.vr_hz(),
-            teleop.ik_hz(),
-        )
+        if umi_mode:
+            _logger.info(
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  pose_lag: %.0f ms",
+                loop_hz,
+                teleop.vr_hz(),
+                teleop.ik_hz(),
+                1e3 * max_pose_lag["v"],
+            )
+            max_pose_lag["v"] = 0.0
+        else:
+            _logger.info(
+                "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz",
+                loop_hz,
+                teleop.vr_hz(),
+                teleop.ik_hz(),
+            )
         # Jitter detail (maxgap/maxslip = "the thread lost the CPU") and the
         # per-section breakdown stay at DEBUG so INFO is just the rate line.
         if time_sections:
@@ -705,9 +1042,47 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
-    async def _episode_loop() -> tuple[bool, bool]:
+    async def _episode_loop() -> tuple[bool, bool, EpisodeQAStats]:
         recording = False
         rerecord = False
+        # Per-episode data-quality counters (UMI mode; see EpisodeQAStats).
+        # Reset when recording actually starts so the pre-record phase never
+        # pollutes the verdict.
+        stats = EpisodeQAStats()
+        # Latest tracked TCP poses, held across ticks so a slow IK reply
+        # never reverts a row to FK-of-joints mid-stream. ``None`` until the
+        # first IK solve (those early rows fall back to FK, which the worker
+        # seeds from the rest pose anyway).
+        last_tcp: dict[str, list[float]] | None = None
+        # Web-start countdown: deadline + the next whole second to announce.
+        countdown_end: float | None = None
+        countdown_next_say = 0
+        # Capture-health ack: ~2 s into recording, poll the recorder's row
+        # count once and shout if nothing has been captured (a silently dead
+        # capture thread otherwise only surfaces at save).
+        recording_started_at: float | None = None
+        capture_checked = False
+        # Engage-edge tracking for the re-engage-while-recording flag.
+        was_engaged = teleop.is_engaged()
+
+        def _start_recording() -> None:
+            """Open the relay's raw branch and start a recorder episode."""
+            nonlocal recording, stats, recording_started_at, capture_checked
+            nonlocal was_engaged
+            recording = True
+            stats = EpisodeQAStats()
+            recording_started_at = time.perf_counter()
+            capture_checked = False
+            was_engaged = teleop.is_engaged()
+            if relay is not None:
+                relay.set_raw_enabled(True)
+            recorder.start_episode(task)
+            log_say("Recording started.")
+            if control is not None:
+                control.set_phase("recording")
+            # Reflect the recording state on the headset HUD (no-op for the
+            # VR-initiated start, where the headset already switched itself).
+            teleop.send_feedback_state(VRState.RECORDING)
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -741,24 +1116,136 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
             # arm is still commanded with the teleop joint targets above, so its
             # motion is unchanged — only the stored representation differs.
-            recorder.publish(joint_obs, robot.action_to_dataset(act_processed), t0)
+            #
+            # Row timestamp: on the robot the loop tick is correct (state and
+            # image both describe the physical robot at t0). On the Mantis UMI the
+            # pose stream *is* the plant's ground truth, so the row is stamped
+            # with the pose's capture time — the moment the hand was actually
+            # there — keeping it on the same capture timeline as the camera
+            # exposure timestamps.
+            row_ts = t0
+            act_ds = robot.action_to_dataset(act_processed)
+            if umi_mode:
+                pose_ts = teleop.pose_capture_ts()
+                if pose_ts is not None:
+                    row_ts = pose_ts
+                    lag = t0 - pose_ts
+                    if lag > max_pose_lag["v"]:
+                        max_pose_lag["v"] = lag
+                    if recording and lag > stats.max_pose_lag_s:
+                        stats.max_pose_lag_s = lag
+                # Overwrite the EE dims of both the state and the action with
+                # the tracked ground-truth TCP pose: on the rig the tracker
+                # (not IK-solved virtual joints roundtripped through FK) is
+                # where the gripper physically is, and training must not
+                # inherit filter/solver artifacts. Grippers stay as-is —
+                # measured feedback in the state, commanded in the action.
+                tcp = teleop.tcp_poses()
+                if tcp is not None:
+                    last_tcp = tcp
+                if last_tcp is not None:
+                    joint_obs = dict(joint_obs)
+                    act_ds = dict(act_ds)
+                    for keys, pose in (
+                        (_LEFT_EE_KEYS, last_tcp["left"]),
+                        (_RIGHT_EE_KEYS, last_tcp["right"]),
+                    ):
+                        pose6 = [
+                            *pose[:3],
+                            *quat_xyzw_to_rotvec(np.asarray(pose[3:7])),
+                        ]
+                        joint_obs.update(zip(keys, pose6))
+                        act_ds.update(zip(keys, pose6))
+            recorder.publish(joint_obs, act_ds, row_ts)
 
+            # Per-episode QA counters (UMI only — encoder-FK poses can't go
+            # stale). Frozen TCPs and disengaged spans record a motionless
+            # pose under fresh timestamps; a re-engage re-fits the world→base
+            # transform and shifts the frame of every later row.
+            if umi_mode and recording:
+                stats.total_frames += 1
+                engaged = teleop.is_engaged()
+                if not engaged:
+                    stats.disengaged_frames += 1
+                elif not was_engaged:
+                    stats.reengaged_while_recording = True
+                was_engaged = engaged
+                change_ts = teleop.tcp_last_change_ts()
+                if change_ts is not None and t0 - change_ts > _QA_STALE_TCP_S:
+                    stats.stale_frames += 1
+
+            # Capture-health ack: recorder.start_episode has no feedback, so
+            # ~2 s in, check that rows are actually landing (one cheap
+            # round-trip; a dead capture thread otherwise stays silent until
+            # save).
+            if (
+                recording
+                and not capture_checked
+                and recording_started_at is not None
+                and t0 - recording_started_at >= 2.0
+            ):
+                capture_checked = True
+                try:
+                    rows = recorder.frame_count()
+                except Exception as exc:  # noqa: BLE001 - check is advisory
+                    _logger.warning("capture health check failed: %s", exc)
+                    rows = -1
+                if rows == 0:
+                    log_say(
+                        "WARNING: recording for 2 seconds but the recorder "
+                        "has captured zero rows — check the cameras and the "
+                        "recorder log."
+                    )
+
+            # Merge the two episode-control sources: VR headset state
+            # transitions and (when serving) web-panel queue commands.
             events = teleop.get_teleop_events()
+            cmd = control.poll_command() if control is not None else None
+
+            if cmd == "q":
+                # Quit the session; the caller discards any in-flight episode
+                # (same path as Ctrl+C / the serve Stop button).
+                log_say("Quit requested from the control panel.")
+                loop_stop.set()
+                break
+
+            if not recording:
+                # Web start arms a spoken countdown so the operator can pick
+                # up the rig / settle before rows land; Save/Discard clicked
+                # during it cancel the start. A VR start (below) is immediate
+                # — the headset operator is already holding the grips.
+                if cmd == "start" and countdown_end is None:
+                    log_say(f"Recording starts in {int(_START_COUNTDOWN_S)} seconds.")
+                    countdown_end = t0 + _START_COUNTDOWN_S
+                    countdown_next_say = int(_START_COUNTDOWN_S) - 1
+                    if control is not None:
+                        control.set_phase("recording")
+                elif cmd in ("s", "r") and countdown_end is not None:
+                    countdown_end = None
+                    log_say("Start cancelled.")
+                    if control is not None:
+                        control.set_phase("ready")
+                if countdown_end is not None:
+                    remaining = countdown_end - time.perf_counter()
+                    if remaining <= 0:
+                        countdown_end = None
+                        _start_recording()
+                    elif int(remaining) + 1 <= countdown_next_say:
+                        countdown_next_say = int(remaining)
+                        log_say(f"{countdown_next_say + 1}…")
 
             if events.get("start_recording") and not recording:
-                recording = True
-                # Open the relay's raw branch so the recorder has frames, then
-                # tell the recorder to start an episode.
-                if relay is not None:
-                    relay.set_raw_enabled(True)
-                recorder.start_episode(task)
-                log_say("Recording started.")
+                countdown_end = None
+                _start_recording()
 
-            if events[TeleopEvents.TERMINATE_EPISODE]:
+            if events[TeleopEvents.TERMINATE_EPISODE] or (recording and cmd == "s"):
                 teleop.send_feedback_state(VRState.SAVING)
                 break
-            if events[TeleopEvents.RERECORD_EPISODE]:
+            if events[TeleopEvents.RERECORD_EPISODE] or (recording and cmd == "r"):
                 rerecord = True
+                # Block headset controls during the discard + reset (pushed
+                # back to DATA_COLLECTION once the rerecord path completes).
+                teleop.send_feedback_state(VRState.SAVING)
                 break
 
             await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
@@ -766,7 +1253,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
-        return recording, rerecord
+        return recording, rerecord, stats
 
     async def _reset_loop() -> None:
         reset_deadline = time.perf_counter() + 30.0
@@ -803,15 +1290,28 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             # Surface the (1-based) episode number in the headset HUD so the
             # operator can see which episode they're about to record.
             teleop.send_feedback_episode(episode_idx + 1)
+            if control is not None:
+                control.set_phase("ready")
             log_say(
-                f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
+                f"Episode {episode_idx + 1}: robot is at rest pose. Press "
+                "record on the VR controller (or Start in the control panel) "
+                "when ready."
             )
 
-            recording, rerecord = _run_on_robot_loop(_episode_loop())
+            recording, rerecord, qa = _run_on_robot_loop(_episode_loop())
+
+            # The episode is over the moment the loop breaks: freeze the
+            # recorder's row stream NOW, before the gripper valve close /
+            # return-to-rest below — otherwise the capture thread keeps
+            # pairing the frozen final snapshot with reused/re-muxed camera
+            # frames until save/cancel, and every episode (saved or
+            # discarded) ends with a junk tail of rows that were never
+            # teleoperated.
+            if recording:
+                recorder.stop_capture()
 
             # Recording done — close the raw branch so the rest-pose/reset and
-            # next pre-record phase stay light. (The recorder stops its own
-            # capture loop on save/cancel, below.)
+            # next pre-record phase stay light.
             if relay is not None:
                 relay.set_raw_enabled(False)
 
@@ -820,22 +1320,57 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                     recorder.cancel_episode()
                 break
 
+            if control is not None:
+                control.set_phase("resetting")
             log_say("Returning to rest pose.")
             teleop.request_reset()
             _run_on_robot_loop(_reset_loop())
             # Drain VR events fired during the reset move.
             teleop.get_teleop_events()
 
+            # Episode QA: always log the one-line verdict; a bad episode is
+            # refused at save and downgraded to discard + re-record unless
+            # the gate is disabled (cfg.qa_gate — escape hatch).
+            if recording:
+                qa_ok, qa_reasons = evaluate_episode_qa(qa)
+                _logger.info(
+                    "episode QA: frames=%d stale=%d (%.1f%%) disengaged=%d "
+                    "(%.1f%%) reengaged=%s max_pose_lag=%.0fms -> %s",
+                    qa.total_frames,
+                    qa.stale_frames,
+                    100 * qa.stale_fraction,
+                    qa.disengaged_frames,
+                    100 * qa.disengaged_fraction,
+                    qa.reengaged_while_recording,
+                    1e3 * qa.max_pose_lag_s,
+                    "OK" if qa_ok else "BAD",
+                )
+                if not qa_ok and not rerecord:
+                    if cfg.qa_gate:
+                        log_say(
+                            "Episode REJECTED by the quality gate — "
+                            "discarding and re-recording. " + " ".join(qa_reasons)
+                        )
+                        rerecord = True
+                    else:
+                        _logger.warning(
+                            "qa_gate is off — saving a bad episode anyway: %s",
+                            "; ".join(qa_reasons),
+                        )
+
             if rerecord:
                 log_say("Re-recording episode.")
                 if recording:
                     recorder.cancel_episode()
+                teleop.send_feedback_state(VRState.DATA_COLLECTION)
                 continue
 
             if recording:
                 log_say("Saving episode…")
                 recorder.save_episode()
                 episodes_recorded += 1
+                if control is not None:
+                    control.note_saved()
                 log_say(
                     f"Saved episode {recorder.episode_count()} "
                     f"({episodes_recorded} this session)."

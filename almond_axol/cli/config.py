@@ -526,6 +526,11 @@ class TeleopCmdConfig:
     """
 
     sim: bool = False
+    # Mantis UMI bench mode: drive the two handheld grippers (on
+    # can_alm_umi_l/r) from the Quest triggers while the arms exist only as
+    # the headset's URDF overlay — absolute pose mapping is forced on. No
+    # robot, no cameras, no recording. Mutually exclusive with --sim.
+    umi: bool = False
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is

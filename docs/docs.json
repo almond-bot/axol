@@ -73,6 +73,7 @@
               "cli/motor-restore-config",
               "cli/motor-flash",
               "cli/teleop",
+              "cli/tracker",
               "cli/collect-data",
               "cli/replay-dataset",
               "cli/run-policy",

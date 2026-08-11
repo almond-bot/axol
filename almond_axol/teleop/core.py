@@ -80,10 +80,15 @@ class VRTeleopCore:
         config: VRTeleopConfig,
         logger: logging.Logger,
         broadcast_tracking: Callable[[bool], None],
+        broadcast_json: Callable[[dict], None] | None = None,
     ) -> None:
         self.config = config
         self._logger = logger
         self._broadcast = broadcast_tracking
+        # Optional generic server→headset JSON push (fire-and-forget), used in
+        # absolute (UMI) mode to stream the calibrated base + joint solution
+        # for the headset's URDF overlay.
+        self._broadcast_json = broadcast_json
 
         dt = 1.0 / config.frequency
         self.ema_left = AlphaSmoothFilter(config.ik_alpha)
@@ -98,6 +103,31 @@ class VRTeleopCore:
 
         # Raw IK solution (full URDF vector) + per-arm joint indices into it.
         self.q: np.ndarray | None = None
+        # Host-clock capture time of the VR pose behind the latest IK target
+        # (``VRFrame.t_host``). UMI recording stamps dataset rows with this so
+        # they align to when the hand was actually at the pose, not to the
+        # control-loop tick that consumed it. ``None`` until the first solve
+        # (or when the transport doesn't provide capture times).
+        self.last_pose_host_ts: float | None = None
+        # Absolute (UMI) mode: the engage-calibrated base transform in VR world
+        # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
+        # worker. ``None`` before the first engage / outside absolute mode.
+        self.abs_base: dict | None = None
+        # Absolute (UMI) mode: latest base-frame TCP target per side
+        # ({"left": [x,y,z,qx,qy,qz,qw], "right": [...]}), the tracked
+        # ground-truth pose behind the joint solution. ``None`` before the
+        # first solve / outside absolute mode.
+        self.last_tcp: dict | None = None
+        # Monotonic (``time.perf_counter``) time of the last IK reply whose
+        # ``tcp_msg`` *differed* from the previous one — i.e. when
+        # ``last_tcp`` last took a new value. A frozen tracker / stalled IK
+        # keeps replying with an identical TCP, so consumers (UMI data
+        # collection) compare this against "now" to detect stale poses being
+        # recorded under fresh row timestamps. ``None`` until the first
+        # absolute-mode solve.
+        self.last_tcp_change_ts: float | None = None
+        self._last_urdf_broadcast = 0.0
+        self._urdf_joint_names: list[str] | None = None
         self.left_indices: list[int] = []
         self.right_indices: list[int] = []
         self.l_grip: float = 0.0
@@ -393,7 +423,23 @@ class VRTeleopCore:
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:
-                    self.set_target(result)
+                    # Absolute (UMI) mode replies are ("q", q, base_msg,
+                    # tcp_msg); relative mode replies are the bare joint array.
+                    if isinstance(result, tuple) and result[0] == "q":
+                        _, q_arr, base_msg, tcp_msg = result
+                        self.set_target(q_arr)
+                        self.abs_base = base_msg
+                        # Stamp the last *changed* TCP (cheap compare: two
+                        # 7-float lists per side) so recording can tell a
+                        # live pose stream from a frozen one — a dropout /
+                        # IK stall replays the same TCP forever.
+                        if tcp_msg is not None and tcp_msg != self.last_tcp:
+                            self.last_tcp_change_ts = time.perf_counter()
+                        self.last_tcp = tcp_msg
+                        self._maybe_broadcast_urdf_state()
+                    else:
+                        self.set_target(result)
+                    self.last_pose_host_ts = getattr(frame, "t_host", None)
                     recv_timeout_count = 0
                     on_ik_sample(time.perf_counter())
                 else:
@@ -406,6 +452,52 @@ class VRTeleopCore:
                 self._logger.error("IK dispatch error: %s", e)
 
             self._pace(t0, ik_interval)
+
+    def _maybe_broadcast_urdf_state(self) -> None:
+        """Push the URDF overlay state to the headset, throttled to ~60 Hz.
+
+        Only meaningful in absolute (UMI) mode: the message carries the
+        engage-calibrated base transform in VR world coords plus the current
+        IK joint solution keyed by URDF joint name (arm joints + the actuated
+        gripper finger joints from the live trigger values), so the web client
+        can render the virtual robot exactly where the calibration placed it.
+        The client hides the robot while ``base`` is null (before the first
+        engage).
+        """
+        if self._broadcast_json is None or self.q is None:
+            return
+        now = time.perf_counter()
+        if now - self._last_urdf_broadcast < 1.0 / 60.0:
+            return
+        self._last_urdf_broadcast = now
+
+        from ..constants import (
+            GRIPPER_URDF_OPEN,
+            urdf_arm_joint_names,
+            urdf_gripper_joint_name,
+        )
+
+        if self._urdf_joint_names is None:
+            self._urdf_joint_names = urdf_arm_joint_names(
+                is_left=True
+            ) + urdf_arm_joint_names(is_left=False)
+        indices = self.left_indices + self.right_indices
+        joints = {
+            name: float(self.q[qi]) for name, qi in zip(self._urdf_joint_names, indices)
+        }
+        # Animate the gripper fingers from the live trigger values: the grip
+        # scalar is [0 = closed, 1 = open]; the URDF finger joint is prismatic
+        # [0 = closed, GRIPPER_URDF_OPEN = open] and its opposing finger mimics.
+        joints[urdf_gripper_joint_name(is_left=True)] = self.l_grip * GRIPPER_URDF_OPEN
+        joints[urdf_gripper_joint_name(is_left=False)] = self.r_grip * GRIPPER_URDF_OPEN
+        self._broadcast_json(
+            {
+                "type": "urdf_state",
+                "base": self.abs_base,
+                "joints": joints,
+                "engaged": self.teleop_enabled,
+            }
+        )
 
     @staticmethod
     def _pace(t0: float, interval: float) -> None:

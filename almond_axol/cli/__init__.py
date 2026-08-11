@@ -7,6 +7,12 @@ import sys
 from ..utils.dotenv import load_local_env
 from . import provision as provision_cmd
 from . import serve as serve_cmd
+from . import (
+    tracker_bridge,
+    tracker_identify,
+    umi_latency,
+    umi_session,
+)
 from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
@@ -63,6 +69,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Replay a recorded dataset episode on the robot.",
     ),
     "run-policy": ("run_policy", "Run a trained policy on the robot."),
+    "umi.train": (
+        "umi_train",
+        "lerobot-train with UMI chunk-relative EE actions (any policy type).",
+    ),
     "inference-server": (
         "inference_server",
         "Serve policy inference for run-policy --server_host.",
@@ -97,6 +107,10 @@ def main() -> None:
     can_setup.add_parser(subparsers)
     can_enable.add_parser(subparsers)
     can_driver.add_parser(subparsers)
+    umi_session.add_parser(subparsers)
+    umi_latency.add_parser(subparsers)
+    tracker_bridge.add_parser(subparsers)
+    tracker_identify.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
