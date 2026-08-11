@@ -99,6 +99,14 @@ class VRTeleopConfig:
             can't reliably deliver the Y-exit reset frame.  Pausing without
             quitting (system menu, doffed headset) keeps the socket open and
             only auto-disengages; the arms hold in place.  Defaults to True.
+        exit_reset_timeout: Also return the arms to rest when no VR pose
+            frame has arrived for this many seconds while the arms are away
+            from rest.  This is the backstop for exits whose socket close is
+            delayed or lost — a killed headset app whose TCP FIN never went
+            out (WiFi power-save after quitting, a crash, a link drop) —
+            and it means stepping away mid-session parks the arms safely.
+            Long enough that a normal Quest-menu visit doesn't trigger it.
+            ``0`` disables.  Defaults to ``10`` s.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -148,3 +156,4 @@ class VRTeleopConfig:
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
     reset_on_disconnect: bool = True
+    exit_reset_timeout: float = 10.0

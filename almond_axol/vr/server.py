@@ -410,6 +410,14 @@ class VRServer:
             log_level="info",
             ssl_certfile=self._certfile,
             ssl_keyfile=self._keyfile,
+            # Detect dead peers quickly (uvicorn defaults are 20s/20s): a
+            # killed headset app doesn't always deliver its TCP FIN (WiFi
+            # power-save right after quitting), and the operator-gone handling
+            # (return the arms to rest) waits on the disconnect. Browsers
+            # answer pings in the network stack, so an alive-but-paused page
+            # (Quest system menu) is unaffected.
+            ws_ping_interval=5.0,
+            ws_ping_timeout=5.0,
         )
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(

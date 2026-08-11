@@ -442,18 +442,26 @@ class VRTeleopCore:
         last_frame: object,
         process_alive: Callable[[], bool],
     ) -> None:
-        """Auto-disengage when the raw pose stream stops while engaged.
+        """Safety handling for a stopped pose stream, in two stages.
 
         The pose stream only flows while the headset is presenting, so a gap
-        beyond ``config.disengage_timeout`` means the operator left VR (or the
-        link died) — through *any* exit path, including ones that never deliver
-        the Y-press reset frame (system menu, headset doffed, app crash, WiFi
-        drop). Staying engaged across the gap is what makes the arms jerk on
-        the next VR entry: the resumed frames are measured against the old
-        engage snapshot, so the target jumps by however far the controllers
-        moved in the meantime. Disengaging freezes the arms in place and makes
-        re-entry inert until the operator deliberately re-engages (which takes
-        a fresh engage snapshot at the new controller pose — no jump).
+        means the operator left VR (or the link died) — through *any* exit
+        path, including ones that never deliver the Y-press reset frame
+        (system menu, headset doffed, app crash, WiFi drop).
+
+        Stage 1 (``disengage_timeout``): force-disengage. Staying engaged
+        across the gap is what makes the arms jerk on the next VR entry: the
+        resumed frames are measured against the old engage snapshot, so the
+        target jumps by however far the controllers moved in the meantime.
+        Disengaging freezes the arms in place and makes re-entry inert until
+        the operator deliberately re-engages (fresh engage snapshot — no
+        jump).
+
+        Stage 2 (``exit_reset_timeout``): return to rest. The prompt path for
+        a quit is the operator-gone disconnect notification
+        (:meth:`request_reset_if_away`), but a killed app's socket close can
+        be delayed or lost entirely (WiFi power-save right after quitting, a
+        crash); sustained silence sends the arms home regardless.
 
         Runs on the IK thread. Frame arrivals are timestamped at ingest
         (:meth:`note_frame_reset`) rather than via ``get_frame`` identity,
@@ -461,43 +469,55 @@ class VRTeleopCore:
         still" (the interpolator's render frame is identity-stable while the
         pose holds).
         """
-        timeout = self.config.disengage_timeout
-        if not self.teleop_enabled or timeout <= 0:
-            return
         last_seen = self._last_frame_time
         if last_seen is None:
             return
         gap = time.perf_counter() - last_seen
-        if gap < timeout:
-            return
-        self.teleop_enabled = False
-        self._logger.info(
-            "Teleop disabled: no VR poses for %.2fs (operator left VR or the "
-            "link dropped); re-engage with both grips",
-            gap,
-        )
-        self._broadcast(False)
-        # Also deactivate the IK worker so its next engaged frame performs a
-        # fresh engage-snap. Without this, a client that resumes already
-        # holding both grips (or a reconnecting SDK client streaming
-        # l_lock/r_lock true) would have its first frame solved against the
-        # stale snapshot — the exact jump this disengage exists to prevent.
-        if last_frame is not None and process_alive():
-            try:
-                conn.send(
-                    last_frame.model_copy(  # type: ignore[attr-defined]
-                        update={"l_lock": False, "r_lock": False}
+
+        timeout = self.config.disengage_timeout
+        if self.teleop_enabled and 0 < timeout <= gap:
+            self.teleop_enabled = False
+            self._logger.info(
+                "Teleop disabled: no VR poses for %.2fs (operator left VR or "
+                "the link dropped); re-engage with both grips",
+                gap,
+            )
+            self._broadcast(False)
+            # Also deactivate the IK worker so its next engaged frame performs
+            # a fresh engage-snap. Without this, a client that resumes already
+            # holding both grips (or a reconnecting SDK client streaming
+            # l_lock/r_lock true) would have its first frame solved against the
+            # stale snapshot — the exact jump this disengage exists to prevent.
+            if last_frame is not None and process_alive():
+                try:
+                    conn.send(
+                        last_frame.model_copy(  # type: ignore[attr-defined]
+                            update={"l_lock": False, "r_lock": False}
+                        )
                     )
-                )
-                result = recv_with_timeout(conn, _IK_RECV_TIMEOUT)
-                if result is not None:
-                    self.set_target(result)
-                else:
-                    self._logger.warning(
-                        "IK recv timeout during stale-stream disengage"
-                    )
-            except Exception as e:  # noqa: BLE001 - keep the loop alive
-                self._logger.error("IK disengage dispatch error: %s", e)
+                    result = recv_with_timeout(conn, _IK_RECV_TIMEOUT)
+                    if result is not None:
+                        self.set_target(result)
+                    else:
+                        self._logger.warning(
+                            "IK recv timeout during stale-stream disengage"
+                        )
+                except Exception as e:  # noqa: BLE001 - keep the loop alive
+                    self._logger.error("IK disengage dispatch error: %s", e)
+
+        # Backstop for exits whose socket close is delayed or never arrives
+        # (a killed app whose TCP FIN was lost to WiFi power-save, a crash, a
+        # link drop): after a longer silence, send the arms home like the
+        # disconnect path would have. A no-op at rest, so an operator who
+        # never engaged can idle in the menu indefinitely.
+        reset_after = self.config.exit_reset_timeout
+        if 0 < reset_after <= gap and not self._at_rest and not self.is_resetting:
+            self._logger.info(
+                "Returning to rest: no VR poses for %.1fs and the arms are "
+                "away from rest",
+                gap,
+            )
+            self._reset_latched = True
 
     @staticmethod
     def _pace(t0: float, interval: float) -> None:
