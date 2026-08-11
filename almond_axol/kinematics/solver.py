@@ -55,6 +55,51 @@ _RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 
 
 # ---------------------------------------------------------------------------
+# Bounded manipulability cost
+# ---------------------------------------------------------------------------
+
+# Saturation point of the reciprocal manipulability barrier. pyroki's
+# manipulability_residual uses 1e-6, which lets the residual's Jacobian grow
+# like 1/manip^2 ~ 1e12 near a singular pose (e.g. the all-zero straight-arm
+# pose, where the Yoshikawa index is ~1e-16). Rows that large make the float32
+# Gauss-Newton normal matrix indefinite after rounding, and cuSolver's
+# Cholesky then returns NaN — every LM step is rejected and ik() silently
+# returns its seed (CPU LAPACK only survives the same matrix by rounding
+# luck). 1e-2 caps the Jacobian factor at 1e4, keeping the worst-case rows
+# the same order as the pose cost, while barely changing the cost away from
+# singularities (residual 15.4 -> 13.3 at a typical healthy index of 0.065).
+_MANIP_BARRIER_EPS = 1e-2
+
+
+def _manip_yoshikawa(
+    cfg: jax.Array, robot: pk.Robot, target_link_index: jax.Array
+) -> jax.Array:
+    """Yoshikawa manipulability index of one link's translation Jacobian."""
+    jacobian = jax.jacfwd(
+        lambda q: jaxlie.SE3(robot.forward_kinematics(q)).translation()
+    )(cfg)[target_link_index]
+    return jnp.sqrt(jnp.maximum(0.0, jnp.linalg.det(jacobian @ jacobian.T)))
+
+
+def _bounded_manipulability_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    joint_var: jaxls.Var[jax.Array],
+    target_link_indices: jax.Array,
+    weight: jax.Array | float,
+) -> jax.Array:
+    """pyroki's manipulability residual with the barrier bounded near singularities."""
+    cfg = vals[joint_var]
+    manip = jax.vmap(_manip_yoshikawa, in_axes=(None, None, 0))(
+        cfg, robot, target_link_indices
+    )
+    return (weight / (manip + _MANIP_BARRIER_EPS)).flatten()
+
+
+_bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residual)
+
+
+# ---------------------------------------------------------------------------
 # JIT-compiled core solve
 # ---------------------------------------------------------------------------
 
@@ -86,13 +131,13 @@ def _solve_ik(
     cost_tolerance: float,
     lambda_initial: float,
     lambda_factor: float,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     JointVar = robot.joint_var_cls
 
     costs = [
         pk.costs.rest_cost(JointVar(0), rest_pose=q_current, weight=rest_weight),
         pk.costs.rest_cost(JointVar(0), rest_pose=posture_pose, weight=posture_weight),
-        pk.costs.manipulability_cost(
+        _bounded_manipulability_cost(
             robot,
             JointVar(0),
             jnp.array([L_ee_idx, R_ee_idx], dtype=jnp.int32),
@@ -165,7 +210,7 @@ def _solve_ik(
     )
     problem = jaxls.LeastSquaresProblem(costs, [var_joints])
     analyzed = problem.analyze()
-    solution_vals = analyzed.solve(
+    solution_vals, summary = analyzed.solve(
         initial_vals=initial_vals,
         verbose=False,
         linear_solver="dense_cholesky",
@@ -177,8 +222,12 @@ def _solve_ik(
             max_iterations=max_iterations,
             cost_tolerance=cost_tolerance,
         ),
+        return_summary=True,
     )
-    return solution_vals[var_joints][0]
+    # cost_history holds each iteration's proposed cost; a NaN entry means a
+    # step proposal evaluated to NaN (numerically degenerate problem), which
+    # jaxls silently rejects. Surfaced so ik() can warn instead of freezing.
+    return solution_vals[var_joints][0], summary.cost_history
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +411,7 @@ class KinematicsSolver:
         self._posture_pose = jnp.zeros(
             self.robot.joints.num_actuated_joints, dtype=jnp.float32
         )
+        self._last_solve_had_nan = False
 
         self._warmup()
 
@@ -481,7 +531,7 @@ class KinematicsSolver:
             else None
         )
 
-        q_result = _solve_ik(
+        q_result, cost_history = _solve_ik(
             self.robot,
             self.robot_coll,
             target_L,
@@ -509,6 +559,26 @@ class KinematicsSolver:
             cfg.lambda_factor,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
+
+        # NaN step proposals are rejected inside the solve, so they never show
+        # up in the output — a solve where they happened can only return the
+        # seed (or whatever earlier iterations reached). Historically this
+        # froze teleop with no trace; warn on the transition into that state.
+        nan_proposals = bool(np.isnan(np.asarray(cost_history)).any())
+        if nan_proposals and not self._last_solve_had_nan:
+            made_progress = not np.array_equal(
+                q_result_np, np.asarray(q_current, dtype=np.float32)
+            )
+            _logger.warning(
+                "IK solve hit NaN step proposals (numerically degenerate problem, "
+                "e.g. a seed at a straight-limb singularity or a non-finite "
+                "target); %s.",
+                "later iterations recovered"
+                if made_progress
+                else "solver made no progress and returned the seed",
+            )
+        self._last_solve_had_nan = nan_proposals
+
         delta = np.clip(
             q_result_np - q_current, -cfg.max_joint_delta, cfg.max_joint_delta
         )
