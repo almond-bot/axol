@@ -23,8 +23,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- `uv run pytest` — the regression suite in `tests/` covers the VR server's signaling + operator-lifecycle handling and the teleop engage-state machine. It runs real `VRServer` instances on loopback test ports; no robot, cameras, or JAX are needed (~30 s). The dev dependency group (pytest, websockets) installs with a plain `uv sync`.
-- Beyond the suite, validate changes by importing the package and exercising the `Sim`-based code paths.
+- No automated test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
 
 ### Dependency extras
 
