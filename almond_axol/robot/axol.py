@@ -26,7 +26,7 @@ from ..motor import (
     MotorStatus,
 )
 from .base import RobotBase
-from .config import AxolConfig
+from .config import ArmConfig, AxolConfig
 from .control import Differentiator, compute_friction
 from .gravity import GravityCompensator
 
@@ -272,6 +272,7 @@ class AxolArm:
         config: AxolConfig,
         gravity_comp: GravityCompensator,
         is_left: bool = True,
+        compliant_arm_config: "ArmConfig | None" = None,
     ) -> None:
         """Construct an AxolArm.
 
@@ -280,9 +281,25 @@ class AxolArm:
             config:       Full dual-arm gains config; the correct side is selected via ``is_left``.
             gravity_comp: Shared MuJoCo-based gravity compensator (one per Axol).
             is_left:      ``True`` for the left arm, ``False`` for the right.
+            compliant_arm_config: This arm's gains at the fully-compliant
+                (``s=0``) endpoint of the stiffness blend, captured before
+                :meth:`AxolConfig.resolved` baked the session stiffness in.
+                Enables :meth:`set_compliant_gains`; ``None`` falls back to
+                the session gains (the switch becomes a no-op).
         """
         self._config = config
         self._arm_config = config.left if is_left else config.right
+        # Session gains vs. the fully-compliant endpoint, switchable at
+        # runtime for phases that must yield on contact (e.g. the guarded
+        # return-to-rest after a collect-data episode). Only kp/kd/j_eff/
+        # kd_soft differ between the two (see config._blend_joint); friction,
+        # inertials, and gripper parameters are identical.
+        self._arm_config_session = self._arm_config
+        self._arm_config_compliant = (
+            compliant_arm_config
+            if compliant_arm_config is not None
+            else self._arm_config
+        )
         self._gravity_comp = gravity_comp
         self._is_left = is_left
         self._has_gripper = config.has_gripper
@@ -1154,6 +1171,42 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n)
         self._meas_vel_diff = Differentiator(n=n)
 
+    def set_compliant_gains(self, enabled: bool) -> None:
+        """Switch :meth:`motion_control` between session and compliant gains.
+
+        ``True`` runs subsequent commands at the fully-compliant (``s=0``)
+        endpoint of the stiffness blend — the softest gain set the arm is
+        tuned to track with — regardless of the session's configured
+        stiffness; ``False`` restores the session gains. Used for moves that
+        must yield on unexpected contact (e.g. the guarded return-to-rest
+        after a collect-data episode). Gravity, friction, and inertia
+        feedforward are unaffected, so tracking authority drops without the
+        arm sagging. Takes effect from the next command; mutates plain
+        Python state, so it is safe to call from any thread.
+        """
+        self._arm_config = (
+            self._arm_config_compliant if enabled else self._arm_config_session
+        )
+
+    def torque_residuals(self) -> np.ndarray:
+        """Measured minus model-gravity torque per arm joint, shape (7,).
+
+        Both terms are evaluated at the cached measured positions, so during
+        slow, quasi-static moves the residual background is just friction
+        plus tracking effort; unexpected contact (a gripper still hooked on
+        the scene, an operator grabbing the arm) shows up as a residual well
+        above that background. Units are the motor's reported torque units
+        (Nm on Damiao). Entries are in :data:`ARM_JOINTS` order; the gripper
+        is excluded (position-force mode — its torque tracks grasp effort,
+        not contact). Requires fresh feedback (telemetry or streaming
+        commands, whose replies refresh the position/torque cache).
+        """
+        positions = self.positions
+        arm_q = positions[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        tau = self.torques[: len(ARM_JOINTS)].astype(np.float32)
+        return tau - gravity
+
 
 class Axol(RobotBase):
     """Dual-arm Axol robot interface.
@@ -1229,6 +1282,13 @@ class Axol(RobotBase):
         # Bake stiffness into the per-joint gains exactly once, here at the
         # single robot-construction boundary. ``resolved()`` is idempotent,
         # so this is safe even if the caller already resolved the config.
+        # The pre-resolve per-joint gains *are* the fully-compliant (s=0)
+        # endpoint of the blend; capture them first so the arms can be
+        # switched to full compliance at runtime (see
+        # AxolArm.set_compliant_gains). On an already-resolved config they
+        # equal the session gains and the switch degrades to a no-op.
+        compliant_left: ArmConfig = config.left
+        compliant_right: ArmConfig = config.right
         config = config.resolved()
 
         self._gravity_comp = GravityCompensator(config)
@@ -1236,7 +1296,11 @@ class Axol(RobotBase):
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
             self.left = AxolArm(
-                self._left_bus, config, self._gravity_comp, is_left=True
+                self._left_bus,
+                config,
+                self._gravity_comp,
+                is_left=True,
+                compliant_arm_config=compliant_left,
             )
         else:
             self.left = None
@@ -1244,7 +1308,11 @@ class Axol(RobotBase):
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
             self.right = AxolArm(
-                self._right_bus, config, self._gravity_comp, is_left=False
+                self._right_bus,
+                config,
+                self._gravity_comp,
+                is_left=False,
+                compliant_arm_config=compliant_right,
             )
         else:
             self.right = None
@@ -1699,3 +1767,26 @@ class Axol(RobotBase):
             self.left.reset_command_state()
         if self.right is not None:
             self.right.reset_command_state()
+
+    def set_compliant_gains(self, enabled: bool) -> None:
+        """Switch both arms between session and fully-compliant gains.
+
+        See :meth:`AxolArm.set_compliant_gains`. Takes effect from the next
+        ``motion_control`` command; safe to call from any thread.
+        """
+        if self.left is not None:
+            self.left.set_compliant_gains(enabled)
+        if self.right is not None:
+            self.right.set_compliant_gains(enabled)
+
+    def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm measured-minus-gravity torques, ``(left, right)``.
+
+        Each present arm contributes a shape ``(7,)`` array in
+        :data:`ARM_JOINTS` order (``None`` for an absent arm). See
+        :meth:`AxolArm.torque_residuals` for semantics; reads only the
+        telemetry cache, so it costs no CAN traffic.
+        """
+        left = self.left.torque_residuals() if self.left is not None else None
+        right = self.right.torque_residuals() if self.right is not None else None
+        return left, right

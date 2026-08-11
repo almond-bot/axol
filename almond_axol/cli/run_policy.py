@@ -130,6 +130,16 @@ class RunPolicyConfig:
     chunk_size_threshold: float = 0.9
     aggregate_fn: AggregateFn = "temporal_ensemble"
     temporal_ensemble_coeff: float = 0.01
+    # Contact watchdog for the between-episode return-to-rest: the move plays
+    # at the fully-compliant gain endpoint, and a joint torque residual
+    # (measured minus modeled gravity, Nm) sustained above this drops the
+    # arms into a limp gravity-comp hold instead of pulling through — free
+    # them by hand, then continue (Enter / the panel's Start) to replan from
+    # wherever they were left. 0 disables the watchdog.
+    reset_torque_threshold: float = 4.0
+    # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
+    # semantics as `axol gravity-comp --kd`.
+    reset_gravity_comp_kd: float = 0.25
     rerun_ip: str | None = None
     rerun_port: int = 9876
     log_level: LogLevel = "INFO"
@@ -1005,6 +1015,24 @@ def _run(
     reset_controller.start()
     log_say("Started IK reset worker (collision-aware return-to-rest).")
 
+    def _return_to_rest_guarded() -> bool:
+        """Guarded return to rest; ``False`` when the operator aborted.
+
+        Plays at the fully-compliant gain endpoint with the torque watchdog;
+        on contact the arms drop into a limp gravity-comp hold, and the
+        normal continue gate (Enter on the terminal, Start on the control
+        panel) retries from wherever they were hand-guided to.
+        """
+        return reset_controller.return_to_rest(
+            robot,
+            torque_threshold=cfg.reset_torque_threshold,
+            gravity_comp_kd=cfg.reset_gravity_comp_kd,
+            stopped=stop_event.is_set,
+            wait_retry=lambda: control.await_continue(
+                "Contact during return to rest. Free the arms, then continue to retry."
+            ),
+        )
+
     client = None
     episodes_recorded = 0
     try:
@@ -1060,7 +1088,8 @@ def _run(
             robot.prepare_cartesian_actions()
 
         log_say("Returning to rest pose.")
-        reset_controller.return_to_rest(robot)
+        if not _return_to_rest_guarded():
+            return
         if not control.await_continue(
             "Reset the scene, then press Enter to start the first episode."
         ):
@@ -1181,7 +1210,8 @@ def _run(
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 log_say("Returning to rest pose.")
-                reset_controller.return_to_rest(robot)
+                if not _return_to_rest_guarded():
+                    break
                 if not control.await_continue(
                     "Reset the scene, then press Enter to start."
                 ):
@@ -1195,7 +1225,8 @@ def _run(
             control.note_saved()
             log_say(f"Saved episode {episodes_recorded}.")
             log_say("Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            if not _return_to_rest_guarded():
+                break
             if not control.await_continue(
                 "Reset the scene, then press Enter to start the next episode."
             ):

@@ -338,12 +338,65 @@ class VRTeleop:
         tegra = TegraStatsDiag(_logger)
         tegra.start()
 
+        # Guarded return-to-rest needs torque feedback, the compliant gain
+        # endpoint, and gravity comp — hardware (Axol) only. The Sim target has
+        # none of those (and nothing physical to protect), so its resets play
+        # through the normal path below.
+        guard = all(
+            hasattr(self._robot, attr)
+            for attr in (
+                "torque_residuals",
+                "set_compliant_gains",
+                "gravity_compensate",
+                "reset_command_state",
+            )
+        )
+
+        async def _guard_send_step() -> None:
+            left, right = self.step()
+            if left is not None:
+                await self._robot.motion_control(left=left, right=right)
+
+        async def _guard_gravity_step() -> None:
+            await self._robot.gravity_compensate(  # type: ignore[attr-defined]
+                kd=self._config.reset_gravity_comp_kd
+            )
+
+        def _guard_positions() -> tuple[np.ndarray | None, np.ndarray | None]:
+            left_arm = getattr(self._robot, "left", None)
+            right_arm = getattr(self._robot, "right", None)
+            return (
+                left_arm.positions if left_arm is not None else None,
+                right_arm.positions if right_arm is not None else None,
+            )
+
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
         deadline = time.perf_counter()
         try:
             while True:
+                # Every rest move — the startup trajectory, an X reset, the
+                # Y-exit reset — plays through the shared guarded engine on
+                # hardware: compliant gains, torque watchdog, and a limp
+                # gravity-comp hold on contact (reset replans from wherever
+                # the arms are left). See VRTeleopCore.guarded_return.
+                if guard and self._core.is_resetting:
+                    await self._core.guarded_return(
+                        send_step=_guard_send_step,
+                        gravity_step=_guard_gravity_step,
+                        torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
+                        set_compliant_gains=self._robot.set_compliant_gains,  # type: ignore[attr-defined]
+                        reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                        get_positions=_guard_positions,
+                        stopped=lambda: False,  # unwound by task cancellation
+                        announce=_logger.info,
+                    )
+                    # Re-anchor pacing after the excursion so the next cycle
+                    # doesn't try to catch up on the elapsed time.
+                    deadline = time.perf_counter()
+                    prev_iter = 0.0
+                    continue
                 deadline += interval
                 t_start = time.perf_counter()
                 left, right = self.step()
