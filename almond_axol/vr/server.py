@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import socket
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,15 @@ if TYPE_CHECKING:
     from ..video.video import WebRTCManager
 
 _logger = logging.getLogger(__name__)
+
+# How recently (seconds) a client must have delivered a pose frame to still
+# count as one of the operator's live connections when deciding whether the
+# operator is gone (see ``set_on_operator_gone``). Long enough that the
+# paired transports of one headset (USB tunnel + network standby) shield
+# each other through a quit's near-simultaneous socket closes; short enough
+# that a stale connection which streamed poses minutes ago can't mask a
+# real quit.
+_OPERATOR_RECENCY_S = 10.0
 
 
 class VRServer:
@@ -145,14 +155,18 @@ class VRServer:
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
-        # Clients that have delivered at least one valid pose frame (over the
-        # socket or their control data channel) — i.e. the operator's
-        # connections, as opposed to view-only ones like the control panel's
-        # camera mirror. When the last of them disconnects, the operator is
+        # Monotonic time of the last valid pose frame per client (socket or
+        # its control data channel) — i.e. the operator's connections, as
+        # opposed to view-only ones like the control panel's camera mirror.
+        # When a pose-sending client disconnects and no *other* client has
+        # sent a pose recently (see _OPERATOR_RECENCY_S), the operator is
         # gone for good (a quit/crash closes the socket; merely pausing —
         # e.g. the Quest system menu — keeps it open) and
-        # ``_on_operator_gone`` fires.
-        self._pose_clients: set[int] = set()
+        # ``_on_operator_gone`` fires. Recency matters: membership must not
+        # be sticky, or a lingering connection that streamed poses once
+        # (say, a desktop tab that briefly ran the emulated XR session)
+        # would block the quit handling for the whole session.
+        self._pose_last: dict[int, float] = {}
         self._on_operator_gone: Callable[[], None] | None = None
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
@@ -191,16 +205,19 @@ class VRServer:
         self._on_frame = callback
 
     def set_on_operator_gone(self, callback: Callable[[], None] | None) -> None:
-        """Called when the last pose-sending client disconnects.
+        """Called when the operator's pose-sending connections are gone.
 
         Pose-sending clients are the operator's connections (headset app,
         USB tunnel) — view-only clients such as the control panel's camera
         mirror never send poses and don't count. The callback fires on the
-        server's event loop when the last one's socket closes: a quit or
-        crash of the VR app, as opposed to a pause (Quest system menu,
-        doffed headset) which keeps the socket open. Teleop uses it to
-        return the arms to rest, since an app quit can't reliably deliver
-        the Y-exit reset frame.
+        server's event loop when a pose-sending client's socket closes and
+        no other client has delivered a pose within ``_OPERATOR_RECENCY_S``:
+        a quit or crash of the VR app, as opposed to a pause (Quest system
+        menu, doffed headset) which keeps the socket open. The recency test
+        keeps a stale connection that streamed poses once (e.g. an abandoned
+        browser tab) from masking a real quit. Teleop uses this to return
+        the arms to rest, since an app quit can't reliably deliver the
+        Y-exit reset frame.
         """
         self._on_operator_gone = callback
 
@@ -432,7 +449,7 @@ class VRServer:
         self._active_clients.clear()
         self._video_pending.clear()
         self._video_offering.clear()
-        self._pose_clients.clear()
+        self._pose_last.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -471,7 +488,7 @@ class VRServer:
             return
 
         if self._ingest_frame_obj(obj):
-            self._pose_clients.add(client_id)
+            self._pose_last[client_id] = time.monotonic()
 
     def _ingest_frame_obj(self, obj: Any) -> bool:
         """Validate a decoded pose object and publish it to the consumer.
@@ -525,7 +542,7 @@ class VRServer:
         if isinstance(obj, dict) and "type" in obj:
             return
         if self._ingest_frame_obj(obj):
-            self._pose_clients.add(client_id)
+            self._pose_last[client_id] = time.monotonic()
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -704,15 +721,22 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
-                # The last pose-sending client (the operator) is gone for
-                # good — a quit/crash closes the socket, unlike a pause
-                # (system menu, doffed headset) which keeps it open. Fired
-                # before the count-based cleanup below so consumers see the
-                # final pose state; best-effort so it can't leak the socket
-                # accounting.
-                if client_id in server._pose_clients:
-                    server._pose_clients.discard(client_id)
-                    if not server._pose_clients and server._on_operator_gone:
+                # A pose-sending client (the operator) disconnected — a
+                # quit/crash closes the socket, unlike a pause (system menu,
+                # doffed headset) which keeps it open. The operator is gone
+                # when no *other* client has sent a pose recently: a sibling
+                # transport of the same headset (USB tunnel + network
+                # standby) is fresh through a quit's near-simultaneous
+                # closes, while a stale connection that streamed poses
+                # minutes ago (an abandoned tab) doesn't mask the quit.
+                # Best-effort so it can't leak the socket accounting.
+                if server._pose_last.pop(client_id, None) is not None:
+                    now = time.monotonic()
+                    others_recent = any(
+                        now - t <= _OPERATOR_RECENCY_S
+                        for t in server._pose_last.values()
+                    )
+                    if not others_recent and server._on_operator_gone:
                         try:
                             server._on_operator_gone()
                         except Exception:  # noqa: BLE001 - never break cleanup

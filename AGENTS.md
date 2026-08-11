@@ -34,6 +34,8 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 For cloud development: `uv sync --extra sim` is sufficient.
 
+**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band wheels — `pyzed` and the self-built CUDA `jaxlib` / `jax_cuda12_*` from `~/.almond/wheels/` — and an exact sync silently removes them, which kills camera streaming (`No module named 'lerobot'`) and drops IK to CPU jax. Use `uv sync --extra sim --extra lerobot` and reinstall the wheels from `~/.almond/wheels/` (`uv pip install ~/.almond/wheels/*.whl`) afterwards.
+
 ### Gotchas
 
 - Python 3.13+ is required (`.python-version` pins `3.13`). The VM ships with 3.12; use `uv python install 3.13` if needed.
