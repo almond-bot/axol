@@ -46,9 +46,9 @@ import time
 from typing import Any
 
 import numpy as np
+from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint

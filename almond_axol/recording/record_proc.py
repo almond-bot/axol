@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
+    from lerobot.configs.video import RGBEncoderConfig
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 _logger = logging.getLogger("almond_axol.recording.record_proc")
@@ -95,30 +96,38 @@ def default_vcodec() -> str:
     return "h264" if platform.machine() == "aarch64" else "auto"
 
 
-def _tune_software_encoder() -> None:
-    """Patch LeRobot's libx264 options: ``preset=veryfast g=30`` (idempotent)."""
-    import lerobot.datasets.video_utils as _vu
+def make_rgb_encoder(vcodec: str) -> "RGBEncoderConfig":
+    """Build the dataset's RGB encoder config for the chosen codec.
 
-    if getattr(_vu, "_axol_encoder_tuned", False):
-        return
-    _orig_get_codec_options = _vu._get_codec_options
+    Replaces the old ``_get_codec_options`` monkeypatch: since LeRobot moved
+    all codec tuning onto encoder-config objects, the tuning now rides the
+    ``RGBEncoderConfig`` handed to ``LeRobotDataset.create/resume``, which
+    LeRobot forwards to every encode path (streaming encoder, batch workers,
+    video-info metadata). For the CPU codecs we keep the tuned options —
+    ``preset=veryfast`` and a ``g=`` :data:`_ENCODER_GOP` GOP instead of
+    LeRobot's near-every-frame keyframe default — so the software fallback
+    stays realtime on Tegra; other codecs keep LeRobot's defaults.
+    """
+    from lerobot.configs.video import RGBEncoderConfig
 
-    def _tuned(
-        vcodec: str, g: int | None = 2, crf: int | None = 30, preset=None
-    ) -> dict:
-        options = _orig_get_codec_options(vcodec, g=g, crf=crf, preset=preset)
-        if vcodec in ("h264", "hevc"):
-            options["preset"] = "veryfast"
-            options["g"] = str(_ENCODER_GOP)
-        return options
-
-    _vu._get_codec_options = _tuned
-    _vu._axol_encoder_tuned = True
-    _logger.info(
-        "tuned software video encoder: preset=veryfast g=%d threads=%d",
-        _ENCODER_GOP,
-        _ENCODER_THREADS,
-    )
+    cfg = RGBEncoderConfig(vcodec=vcodec)  # resolves "auto" to a concrete codec
+    if cfg.vcodec in ("h264", "hevc"):
+        # bf=0 disables B-frames: x264/x265 presets otherwise emit reordered
+        # (pts != dts) packets whose 2-frame lead-in defeats the exact-k/fps
+        # re-stamp in _concat_constant_fps — the first chunk frame would sit
+        # ~2/fps after 0 and every episode-0 timestamp lookup would miss.
+        cfg = RGBEncoderConfig(
+            vcodec=cfg.vcodec,
+            preset="veryfast",
+            g=_ENCODER_GOP,
+            extra_options={"bf": 0},
+        )
+        _logger.info(
+            "tuned software video encoder: preset=veryfast g=%d bf=0 threads=%d",
+            _ENCODER_GOP,
+            _ENCODER_THREADS,
+        )
+    return cfg
 
 
 # How many leading packets of the first input the fps probe reads. The chunk
@@ -251,6 +260,14 @@ def _concat_constant_fps(
                         packet.pts = frame_idx * step
                         packet.dts = frame_idx * step
                         packet.duration = step
+                        # The stamped values are in the k/fps grid time base, not
+                        # the source's; declare it so mux()'s rescale (from
+                        # packet.time_base to the muxer's actual track timescale)
+                        # starts from the right unit. Without this a source whose
+                        # tb differs from the grid (e.g. the accumulated chunk
+                        # after the mp4 muxer picked its own timescale) lands at
+                        # the wrong instants.
+                        packet.time_base = time_base
                         packet.stream = out_stream
                         dst.mux(packet)
                         frame_idx += 1
@@ -270,6 +287,7 @@ def _concat_constant_fps(
                             pad.pts = frame_idx * step
                             pad.dts = frame_idx * step
                             pad.duration = step
+                            pad.time_base = time_base
                             pad.stream = out_stream
                             dst.mux(pad)
                             frame_idx += 1
@@ -303,6 +321,10 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
         with av.open(tmp_output_video_path, mode="w") as dst:
             out_streams: dict[int, object] = {}  # input stream index -> output stream
             offsets: dict[object, int] = {}  # output stream -> next start dts (out tb)
+            # Time base the shifted values are computed in, captured at stream
+            # creation: once the header is written the muxer may report its own
+            # track timescale from out_stream.time_base, so it can't be re-read.
+            out_tbs: dict[object, Fraction] = {}
 
             for file_idx, input_path in enumerate(input_video_paths):
                 with av.open(str(input_path), mode="r") as src:
@@ -318,6 +340,7 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
                             out_stream.time_base = in_stream.time_base
                             out_streams[in_stream.index] = out_stream
                             offsets[out_stream] = 0
+                            out_tbs[out_stream] = Fraction(in_stream.time_base)
 
                     for packet in src.demux():
                         if packet.dts is None:  # demux flushing packet
@@ -325,9 +348,8 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
                         out_stream = out_streams.get(packet.stream.index)
                         if out_stream is None:
                             continue
-                        ratio = Fraction(packet.stream.time_base) / Fraction(
-                            out_stream.time_base
-                        )
+                        out_tb = out_tbs[out_stream]
+                        ratio = Fraction(packet.stream.time_base) / out_tb
                         dts = int(round(packet.dts * ratio))
                         pts = (
                             None
@@ -343,6 +365,9 @@ def _concat_shift_rebased(input_video_paths: list, output_video_path: "Path") ->
                         packet.dts = dts + shift
                         packet.pts = None if pts is None else pts + shift
                         packet.duration = dur
+                        # Declare the unit the shifted values are in so mux()'s
+                        # rescale to the actual track timescale starts from it.
+                        packet.time_base = out_tb
                         packet.stream = out_stream
 
                         end = packet.dts + dur
@@ -655,14 +680,17 @@ def install_dataset_encoder() -> bool:
         return True
 
     if not hw_dataset_encoder_available():
-        _tune_software_encoder()
+        # No NVENC: the stock streaming encoder runs with the tuned
+        # RGBEncoderConfig built in _open_dataset (see make_rgb_encoder).
         return False
 
     # The relay ships NV12 to the recorder, which the NVENC encoder feeds straight
     # through; teach LeRobot's frame validation to accept that packed layout.
     _patch_frame_validation()
 
-    def _build_nvenc(fps, vcodec, encoder_queue_maxsize, encoder_threads):
+    def _build_nvenc(
+        fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+    ):
         # Ignore LeRobot's shallow default (30); NvencStreamingEncoder uses its own
         # deeper feed queue to ride out gst pipeline spin-up. See _FEED_QUEUE_MAXSIZE.
         return NvencStreamingEncoder(fps=fps)
@@ -706,7 +734,9 @@ def install_encoded_dataset_encoder() -> bool:
 
     _patch_frame_validation_encoded()
 
-    def _build_mux(fps, vcodec, encoder_queue_maxsize, encoder_threads):
+    def _build_mux(
+        fps, rgb_encoder, depth_encoder, encoder_queue_maxsize, encoder_threads
+    ):
         return H264MuxStreamingEncoder(fps=fps)
 
     LeRobotDataset._build_streaming_encoder = staticmethod(_build_mux)
@@ -1152,6 +1182,7 @@ def run_encoded_capture_loop(
 def _open_dataset(config: dict) -> "LeRobotDataset":
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    rgb_encoder = make_rgb_encoder(config["vcodec"])
     if config["is_complete"]:
         return LeRobotDataset.resume(
             repo_id=config["repo_id"],
@@ -1159,7 +1190,7 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
             image_writer_threads=4,
             streaming_encoding=True,
             encoder_threads=_ENCODER_THREADS,
-            vcodec=config["vcodec"],
+            rgb_encoder=rgb_encoder,
         )
     return LeRobotDataset.create(
         repo_id=config["repo_id"],
@@ -1171,7 +1202,7 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
         image_writer_threads=4,
         streaming_encoding=True,
         encoder_threads=_ENCODER_THREADS,
-        vcodec=config["vcodec"],
+        rgb_encoder=rgb_encoder,
     )
 
 

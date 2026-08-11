@@ -12,8 +12,10 @@
 set -euo pipefail
 
 INSTALL_URL="https://axol.almond.bot/install"
+# GitHub stays the source of truth for what the latest release is; the package
+# itself installs from PyPI (published by the release workflow), which is a
+# prebuilt wheel — no repo clone or local build.
 REPO_URL="https://github.com/almond-bot/axol"
-REPO="git+${REPO_URL}"
 # `video` is intentionally omitted: headset-video support is system-level
 # (GStreamer NVENC + PyGObject + the patched zed-gstreamer source plugins),
 # provisioned below by `axol provision`, not via a PyPI extra (see
@@ -65,22 +67,24 @@ UV="$(command -v uv || echo "${BIN_DIR}/uv")"
 # -- axol ---------------------------------------------------------------------
 
 # Installs track releases, not main: resolve the newest release tag (vX.Y.Z)
-# and pin the install to it. The `axol serve` self-updater performs the same
-# tag-pinned reinstall when a newer release appears (serve/update.py) — keep
-# the requirement here and there in sync.
+# and install that exact version from PyPI (the release workflow publishes
+# every release there). The `axol serve` self-updater performs the same
+# version-pinned reinstall when a newer release appears (serve/update.py) —
+# keep the requirement here and there in sync.
 say "Resolving the latest release..."
 LATEST_TAG="$(git ls-remote --tags "${REPO_URL}" "refs/tags/v*" \
     | awk -F/ '{print $NF}' | sed 's/\^{}$//' \
     | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -u -V | tail -n1)"
 [ -n "${LATEST_TAG}" ] || die "No release tags (vX.Y.Z) found on ${REPO_URL}."
+VERSION="${LATEST_TAG#v}"
 say "Latest release: ${LATEST_TAG}."
 
-say "Installing axol ${LATEST_TAG} from GitHub (extras: ${EXTRAS}) — this can take a few minutes..."
+say "Installing axol ${VERSION} from PyPI (extras: ${EXTRAS}) — this can take a few minutes..."
 mkdir -p "${UV_TOOL_DIR}" "${UV_PYTHON_INSTALL_DIR}"
 UV_TOOL_BIN_DIR="${BIN_DIR}" "${UV}" tool install \
     --python "${PYTHON_VERSION}" \
     --force \
-    "almond-axol[${EXTRAS}] @ ${REPO}@${LATEST_TAG}"
+    "almond-axol[${EXTRAS}]==${VERSION}"
 
 # uv creates the tool venv + managed Python with the root umask; make sure every
 # user can read/traverse them (dirs + already-executable files only, via 'X') so

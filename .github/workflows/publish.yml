@@ -1,0 +1,60 @@
+# Publish almond-axol and lerobot_robot_axol to PyPI on every published
+# GitHub release, via PyPI trusted publishing (OIDC) — no tokens or secrets
+# required.
+#
+# The two packages publish from separate jobs with distinct environment
+# claims: PyPI *pending* publishers are unique on (owner, repo, workflow,
+# environment) — the project name is not part of the key — so two projects
+# cannot both register against identical claims (pypi/warehouse#16920).
+#
+# One-time PyPI setup (org owner): on the organization's Publishing page
+# (https://pypi.org/manage/organization/<org>/publishing/), add two pending
+# publishers, both with owner `almond-bot`, repository `axol`, workflow
+# `publish.yml`:
+#   - project `almond-axol`, environment blank
+#   - project `lerobot_robot_axol`, environment `pypi-plugin`
+# The first release after that creates the PyPI projects owned by the
+# organization. (The `pypi-plugin` GitHub environment is created automatically
+# the first time the job runs; it needs no configuration.)
+#
+# The published almond-axol version is whatever `version` in pyproject.toml
+# says at the release tag — the release flow already bumps it per release.
+# The plugin's version lives in plugins/lerobot_robot_axol/pyproject.toml and
+# only needs bumping when the plugin itself changes (skip-existing keeps
+# unbumped re-uploads harmless).
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-sdk:
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  publish-plugin:
+    runs-on: ubuntu-latest
+    # Distinct OIDC environment claim; see the header comment.
+    environment: pypi-plugin
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build --project plugins/lerobot_robot_axol
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: plugins/lerobot_robot_axol/dist
+          skip-existing: true
