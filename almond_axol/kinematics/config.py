@@ -35,6 +35,13 @@ class KinematicsConfig:
             Acts as a persistent attractor toward the home/rest configuration,
             preventing slow null-space drift (e.g. unnecessary shoulder twist).
         manipulability_weight: Weight rewarding configurations with high manipulability.
+            The residual is a reciprocal barrier on the Yoshikawa index, bounded
+            near singularities (saturating at index ~1e-2 rather than pyroki's
+            1e-6): the unbounded barrier gives ~1e9-scale Jacobian rows at a
+            singular seed (e.g. an arm at the all-zero straight pose), whose
+            float32 normal matrix is indefinite after rounding — cuSolver's
+            Cholesky then NaNs, every LM step is rejected, and ik() silently
+            returns its seed on GPU while CPU LAPACK survives by rounding luck.
         limit_weight: Weight penalising joint-limit violations.
         self_collision_margin: Minimum clearance (m) enforced between collision
             bodies. Keep this below the arm-torso clearance of normal teleop

@@ -568,8 +568,11 @@ function SettingRow({
           const raw = e.target.value
           if (raw === "") return onChange(field.key, null)
           if (field.type === "number") {
+            // Store a number only when the text round-trips exactly, so
+            // mid-edit states like "0." aren't rewritten to "0" under the
+            // cursor (see parseComponent in config-form.tsx).
             const n = Number(raw)
-            return onChange(field.key, Number.isFinite(n) ? n : raw)
+            return onChange(field.key, Number.isFinite(n) && String(n) === raw.trim() ? n : raw)
           }
           onChange(field.key, raw)
         }}

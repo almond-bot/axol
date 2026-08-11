@@ -17,121 +17,29 @@ import jaxlie
 import jaxls
 import numpy as np
 import pyroki as pk
-import yourdfpy
 
 from ..constants import (
-    URDF_PATH,
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
 )
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
+from .model import (
+    collision_activation_margins,
+    shared_robot,
+    shared_robot_collision,
+)
 
 _logger = logging.getLogger(__name__)
 
 
-_TORSO_LINKS: tuple[str, ...] = ("base", "s1")
-"""Static body links that the arms must not collide into.
+Pose = tuple[np.ndarray, np.ndarray]
+"""A frame as ``(position (3,), rotation (3, 3))`` numpy arrays, world frame (FLU).
 
-Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
+The format :meth:`KinematicsSolver.fk` returns and :meth:`KinematicsSolver.ik`
+takes, so a pose can be read, edited, and solved for without conversion.
 """
-
-# Home-pose penetration (m) beyond which a capsule pair is considered
-# overlapping by construction and excluded from self-collision. Pairs within
-# this tolerance merely graze at the (never-teleoped) straight-down home pose
-# due to conservative capsule fits and must keep their protection — see
-# _build_robot_collision.
-_CAPSULE_GRAZE_TOL = 0.003
-
-# Per-pair collision-cost activation distances are derived from each pair's
-# clearance at the home pose: ``clamp(home_clearance - _MARGIN_REST_BUFFER,
-# _MARGIN_FLOOR, self_collision_margin)``. Pairs that *live* near their
-# activation shell (the wrists and grippers pass within 10-17 mm of the base
-# during ordinary close-over-table work, and the elbow capsules graze at
-# rest) would otherwise keep the cost hinge active across the entire work
-# envelope — replaying recorded deburring sessions showed base<->wrist pairs
-# inside a uniform 25 mm activation for up to 59% of all frames, and every
-# crossing of the shell pulses the (weight-150) gradient into the arm, which
-# reads as path-specific jitter. Deriving the margin from the home clearance
-# keeps such pairs silent in their normal envelope while pairs with generous
-# clearance keep the full early-warning distance.
-_MARGIN_FLOOR = 0.008
-_MARGIN_REST_BUFFER = 0.002
-
-
-def _build_robot_collision(
-    urdf: yourdfpy.URDF, robot: pk.Robot, default_margin: float
-) -> tuple[pk.collision.RobotCollision, np.ndarray]:
-    """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
-
-    Each Axol arm is a serial chain attached to a static torso (``base`` +
-    ``s1``). pyroki's PCA capsule fit produces conservative single-capsule-
-    per-link shapes that always overlap at adjacent-link joint interfaces,
-    so blanket self-collision causes persistent jitter the IK cannot
-    resolve. We restrict the active pair set to the only collisions that
-    actually matter: any link pair where exactly one side is the torso
-    and the other is an arm link. Within-arm, cross-arm, and torso<->torso
-    pairs are filtered out (cross-arm contacts are unreachable, within-arm
-    is constrained by joint limits, and torso<->torso is rigidly fixed).
-
-    A second pass excludes any remaining pair that penetrates by more than
-    ``_CAPSULE_GRAZE_TOL`` at the home pose — those are over-conservative
-    capsule fits the IK can never separate (e.g. ``base <-> shoulder``
-    capsules that overlap by construction because the arms mount onto the
-    torso, at -12 mm and worse). Pairs that merely *graze* at the home pose
-    are kept: the home pose (arm hanging straight down) is one teleop never
-    occupies, and dropping a grazing pair removes its collision protection
-    everywhere. ``base <-> e2`` (the elbow)     grazes at -1.4 mm and is exactly
-    the pair that keeps the elbow off the base — it used to be masked by the
-    operator elbow hint pulling the swivel outward; with elbow tracking
-    disabled it is the only thing standing between the elbow and the base.
-
-    Returns ``(collision_model, per_pair_margins)`` where each pair's
-    activation distance is derived from its home-pose clearance (see
-    ``_MARGIN_FLOOR`` / ``_MARGIN_REST_BUFFER``): pairs that normally operate
-    near their shell get a proportionally smaller activation distance, pairs
-    with generous clearance keep the configured ``default_margin``.
-    """
-    link_names = [link.name for link in urdf.robot.links]
-
-    def is_arm(n: str) -> bool:
-        return n.startswith("left_") or n.startswith("right_")
-
-    def is_torso(n: str) -> bool:
-        return n in _TORSO_LINKS
-
-    ignore: set[tuple[str, str]] = set()
-    for i, a in enumerate(link_names):
-        for b in link_names[i + 1 :]:
-            keep = (is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))
-            if not keep:
-                ignore.add((a, b))
-
-    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
-    q0 = jnp.zeros(robot.joints.num_actuated_joints)
-    d = np.asarray(rc.compute_self_collision_distance(robot, q0))
-    ai = np.asarray(rc.active_idx_i)
-    aj = np.asarray(rc.active_idx_j)
-    for k in np.where(d < -_CAPSULE_GRAZE_TOL)[0]:
-        ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
-
-    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
-    d = np.asarray(
-        rc.compute_self_collision_distance(robot, q0)
-    )  # final active pair set
-    floor = min(_MARGIN_FLOOR, default_margin)
-    margins = np.clip(d - _MARGIN_REST_BUFFER, floor, default_margin).astype(np.float32)
-    _logger.info(
-        "RobotCollision: restricted to %d torso<->arm pairs (%d below the "
-        "default %.0f mm activation, floor %.0f mm).",
-        len(rc.active_idx_i),
-        int((margins < default_margin).sum()),
-        1e3 * default_margin,
-        1e3 * floor,
-    )
-    return rc, margins
-
 
 # Convenience aliases for URDF link / joint names. The single source of
 # truth for these strings lives in :mod:`almond_axol.constants`; the helpers
@@ -151,6 +59,51 @@ _RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 
 
 # ---------------------------------------------------------------------------
+# Bounded manipulability cost
+# ---------------------------------------------------------------------------
+
+# Saturation point of the reciprocal manipulability barrier. pyroki's
+# manipulability_residual uses 1e-6, which lets the residual's Jacobian grow
+# like 1/manip^2 ~ 1e12 near a singular pose (e.g. the all-zero straight-arm
+# pose, where the Yoshikawa index is ~1e-16). Rows that large make the float32
+# Gauss-Newton normal matrix indefinite after rounding, and cuSolver's
+# Cholesky then returns NaN — every LM step is rejected and ik() silently
+# returns its seed (CPU LAPACK only survives the same matrix by rounding
+# luck). 1e-2 caps the Jacobian factor at 1e4, keeping the worst-case rows
+# the same order as the pose cost, while barely changing the cost away from
+# singularities (residual 15.4 -> 13.3 at a typical healthy index of 0.065).
+_MANIP_BARRIER_EPS = 1e-2
+
+
+def _manip_yoshikawa(
+    cfg: jax.Array, robot: pk.Robot, target_link_index: jax.Array
+) -> jax.Array:
+    """Yoshikawa manipulability index of one link's translation Jacobian."""
+    jacobian = jax.jacfwd(
+        lambda q: jaxlie.SE3(robot.forward_kinematics(q)).translation()
+    )(cfg)[target_link_index]
+    return jnp.sqrt(jnp.maximum(0.0, jnp.linalg.det(jacobian @ jacobian.T)))
+
+
+def _bounded_manipulability_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    joint_var: jaxls.Var[jax.Array],
+    target_link_indices: jax.Array,
+    weight: jax.Array | float,
+) -> jax.Array:
+    """pyroki's manipulability residual with the barrier bounded near singularities."""
+    cfg = vals[joint_var]
+    manip = jax.vmap(_manip_yoshikawa, in_axes=(None, None, 0))(
+        cfg, robot, target_link_indices
+    )
+    return (weight / (manip + _MANIP_BARRIER_EPS)).flatten()
+
+
+_bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residual)
+
+
+# ---------------------------------------------------------------------------
 # JIT-compiled core solve
 # ---------------------------------------------------------------------------
 
@@ -159,21 +112,6 @@ _RIGHT_JOINT_NAMES = urdf_arm_joint_names(is_left=False)
 # limit faster than this many radians per solve step (~0.24 rad/s at 120 Hz);
 # slower approaches get proportionally less.
 _LIMIT_GATE_STEP = 2e-3
-
-
-def _manip_translation(robot: pk.Robot, q: jax.Array, link_idx: jax.Array) -> jax.Array:
-    """Translational Yoshikawa manipulability of a link at configuration ``q``.
-
-    ``sqrt(det(J J^T))`` over the link-origin translation Jacobian — the same
-    measure pyroki's manipulability cost uses. Joints outside the link's chain
-    contribute zero columns, so this is automatically per-arm.
-    """
-
-    def translation(qq: jax.Array) -> jax.Array:
-        return jaxlie.SE3(robot.forward_kinematics(qq)[link_idx]).translation()
-
-    J = jax.jacfwd(translation)(q)  # (3, N)
-    return jnp.sqrt(jnp.maximum(jnp.linalg.det(J @ J.T), 1e-12))
 
 
 def _project_elbow(
@@ -232,7 +170,7 @@ def _solve_ik(
     cost_tolerance: float,
     lambda_initial: float,
     lambda_factor: float,
-) -> jax.Array:
+) -> tuple[jax.Array, jax.Array]:
     JointVar = robot.joint_var_cls
 
     # Adaptive damping (Chiaverini-style damped least squares): as an arm's
@@ -246,8 +184,8 @@ def _solve_ik(
             jnp.clip(1.0 - m / jnp.maximum(manip_damping_threshold, 1e-9), 0.0, 1.0)
         )
 
-    manip_L = _manip_translation(robot, q_current, L_ee_idx)
-    manip_R = _manip_translation(robot, q_current, R_ee_idx)
+    manip_L = _manip_yoshikawa(q_current, robot, L_ee_idx)
+    manip_R = _manip_yoshikawa(q_current, robot, R_ee_idx)
     rest_w = jnp.full(q_current.shape, rest_weight, dtype=jnp.float32)
     rest_w = rest_w.at[left_joint_idx].add(manip_damping_boost * _ramp(manip_L))
     rest_w = rest_w.at[right_joint_idx].add(manip_damping_boost * _ramp(manip_R))
@@ -287,7 +225,7 @@ def _solve_ik(
     costs = [
         pk.costs.rest_cost(JointVar(0), rest_pose=q_current, weight=rest_w),
         pk.costs.rest_cost(JointVar(0), rest_pose=posture_pose, weight=posture_weight),
-        pk.costs.manipulability_cost(
+        _bounded_manipulability_cost(
             robot,
             JointVar(0),
             jnp.array([L_ee_idx, R_ee_idx], dtype=jnp.int32),
@@ -360,7 +298,7 @@ def _solve_ik(
     )
     problem = jaxls.LeastSquaresProblem(costs, [var_joints])
     analyzed = problem.analyze()
-    solution_vals = analyzed.solve(
+    solution_vals, summary = analyzed.solve(
         initial_vals=initial_vals,
         verbose=False,
         linear_solver="dense_cholesky",
@@ -372,8 +310,12 @@ def _solve_ik(
             max_iterations=max_iterations,
             cost_tolerance=cost_tolerance,
         ),
+        return_summary=True,
     )
-    return solution_vals[var_joints][0]
+    # cost_history holds each iteration's proposed cost; a NaN entry means a
+    # step proposal evaluated to NaN (numerically degenerate problem), which
+    # jaxls silently rejects. Surfaced so ik() can warn instead of freezing.
+    return solution_vals[var_joints][0], summary.cost_history
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +417,14 @@ def _pos3_to_se3(pos: np.ndarray) -> jaxlie.SE3:
     )
 
 
+def _se3_to_pose(se3: jaxlie.SE3) -> Pose:
+    """Convert an SE3 to the numpy ``(pos, rot_3x3)`` format :meth:`KinematicsSolver.ik` takes."""
+    return (
+        np.asarray(se3.translation(), dtype=np.float32),
+        np.asarray(se3.rotation().as_matrix(), dtype=np.float32),
+    )
+
+
 # ---------------------------------------------------------------------------
 # KinematicsSolver
 # ---------------------------------------------------------------------------
@@ -498,13 +448,21 @@ class KinematicsSolver:
         pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
         rot = np.eye(3, dtype=np.float32)
         q = solver.ik(q, left_pose=(pos, rot))
+
+        # fk returns the same (pos, rot_3x3) format ik takes, so nudging a
+        # pose is a round trip:
+        (l_pos, l_rot), _ = solver.fk(q)
+        q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
     """
 
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
-        """Load the bundled Axol URDF, build the pyroki robot and collision model, and warm up JIT.
+        """Build (or reuse) the robot model and warm up JIT.
 
-        Resolves link and joint indices, computes fixed shoulder positions, and
-        triggers JAX JIT compilation via a dummy solve so the first real call to
+        The URDF, pyroki robot, and collision model are built once per process
+        and shared across instances, so only the first solver pays for them —
+        and for the JAX trace + jaxls problem analysis its warm-up solve
+        triggers. Each instance resolves link and joint indices, computes fixed
+        shoulder positions, and runs a dummy solve so the first real call to
         :meth:`ik` is fast.
 
         Args:
@@ -514,13 +472,17 @@ class KinematicsSolver:
 
         enable_persistent_compilation_cache()
 
-        _logger.info("Loading Axol URDF...")
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-        self.robot = pk.Robot.from_urdf(urdf)
-        self.robot_coll, collision_margins = _build_robot_collision(
-            urdf, self.robot, config.self_collision_margin
+        # One robot model per process (see .model): reusing the same pytree —
+        # including pyroki's per-instance JointVar class, a static field —
+        # lets every solver after the first hit the in-memory jit cache
+        # instead of re-tracing and re-running jaxls analysis.
+        self.robot = shared_robot()
+        self.robot_coll = shared_robot_collision()
+        self._collision_margins = jnp.asarray(
+            collision_activation_margins(
+                self.robot, self.robot_coll, config.self_collision_margin
+            )
         )
-        self._collision_margins = jnp.asarray(collision_margins)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -560,6 +522,7 @@ class KinematicsSolver:
         self._posture_pose = jnp.zeros(
             self.robot.joints.num_actuated_joints, dtype=jnp.float32
         )
+        self._last_solve_had_nan = False
 
         # Seed of the previous ik() call: per-joint velocity estimate for the
         # limit-approach damping gate. None until the first call (gate off).
@@ -598,24 +561,35 @@ class KinematicsSolver:
 
     # -- Public interface ----------------------------------------------------
 
-    def fk(self, q: np.ndarray) -> tuple[jaxlie.SE3, jaxlie.SE3]:
+    def fk(self, q: np.ndarray) -> tuple[Pose, Pose]:
         """Compute end-effector poses from joint positions.
 
         Args:
             q: Full ``(N,)`` joint array in radians.
 
         Returns:
-            Tuple ``(left_pose, right_pose)`` as :class:`jaxlie.SE3` transforms
-            in the robot's world frame (FLU).
+            Tuple ``(left_pose, right_pose)``, each a ``(pos (3,), rot (3, 3))``
+            pair of numpy arrays in the robot's world frame (FLU) — the same
+            format :meth:`ik` takes, so a pose can be read, nudged, and solved
+            for directly::
+
+                (l_pos, l_rot), _ = solver.fk(q)
+                q = solver.ik(q, left_pose=(l_pos + delta, l_rot))
+
+        The returned pose is the gripper *mount* frame — for the point the
+        fingers close on, see :func:`almond_axol.kinematics.path.tip_poses`.
         """
         fk = self.robot.forward_kinematics(jnp.asarray(q, dtype=jnp.float32))
-        return jaxlie.SE3(fk[self.l_ee_idx]), jaxlie.SE3(fk[self.r_ee_idx])
+        return (
+            _se3_to_pose(jaxlie.SE3(fk[self.l_ee_idx])),
+            _se3_to_pose(jaxlie.SE3(fk[self.r_ee_idx])),
+        )
 
     def ik(
         self,
         q_current: np.ndarray,
-        left_pose: tuple[np.ndarray, np.ndarray] | None = None,
-        right_pose: tuple[np.ndarray, np.ndarray] | None = None,
+        left_pose: Pose | None = None,
+        right_pose: Pose | None = None,
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
     ) -> np.ndarray:
@@ -691,7 +665,7 @@ class KinematicsSolver:
         q_prev = self._q_prev if self._q_prev is not None else q_current
         self._q_prev = np.asarray(q_current, dtype=np.float32).copy()
 
-        q_result = _solve_ik(
+        q_result, cost_history = _solve_ik(
             self.robot,
             self.robot_coll,
             target_L,
@@ -728,6 +702,26 @@ class KinematicsSolver:
             cfg.lambda_factor,
         )
         q_result_np = np.asarray(q_result, dtype=np.float32)
+
+        # NaN step proposals are rejected inside the solve, so they never show
+        # up in the output — a solve where they happened can only return the
+        # seed (or whatever earlier iterations reached). Historically this
+        # froze teleop with no trace; warn on the transition into that state.
+        nan_proposals = bool(np.isnan(np.asarray(cost_history)).any())
+        if nan_proposals and not self._last_solve_had_nan:
+            made_progress = not np.array_equal(
+                q_result_np, np.asarray(q_current, dtype=np.float32)
+            )
+            _logger.warning(
+                "IK solve hit NaN step proposals (numerically degenerate problem, "
+                "e.g. a seed at a straight-limb singularity or a non-finite "
+                "target); %s.",
+                "later iterations recovered"
+                if made_progress
+                else "solver made no progress and returned the seed",
+            )
+        self._last_solve_had_nan = nan_proposals
+
         # Direction-preserving rate limit: scale the whole step so its largest
         # component hits max_joint_delta, rather than clipping per joint. Per-
         # joint clipping distorted the step direction (each joint saturated

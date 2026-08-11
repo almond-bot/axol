@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import Callable, Mapping
 
+from .config import Access, MotorParam, ParamSpec
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
 
@@ -47,8 +49,43 @@ class MotorDriver(ABC):
         ...
 
     @abstractmethod
+    async def attach(self) -> None:
+        """Prepare to command an already-enabled motor without disturbing it.
+
+        The reconnect counterpart to :meth:`enable`, for when a previous
+        process left the motor enabled and holding (e.g. it died mid-session).
+        Re-reads whatever state the driver needs for correct command scaling
+        (limit registers, firmware capabilities) and verifies the motor is
+        enabled and fault-free — but sends no reset, brake, enable, or motion
+        command, so a motor that is holding position keeps holding it
+        throughout.
+
+        Raises MotorError if the motor is unreachable, disabled, or faulted:
+        attaching is only valid while the motor is still up, and anything else
+        needs a full :meth:`enable` bring-up.
+        """
+        ...
+
+    @abstractmethod
     async def disable(self) -> None:
         """Disable the motor and engage the brake."""
+        ...
+
+    @abstractmethod
+    async def is_holding(self) -> bool:
+        """Return True if the motor is enabled and holding torque. Read-only.
+
+        The state probe behind the idempotent ``Axol.enable()``: a holding
+        motor must not be reset (it is attached to instead), while a motor
+        reporting False holds nothing and can take the full bring-up.
+
+        Damiao: feedback status is ENABLED. Note this cannot distinguish an
+        actively-holding motor from one that was enabled but never commanded
+        (which holds no torque) — such a motor conservatively reports True.
+        MyActuator: the status-1 running byte is set and no fault is latched;
+        on fleet firmware the running byte reads 1 only while the motor is
+        actively executing commands, so this matches "holding" exactly.
+        """
         ...
 
     @abstractmethod
@@ -106,6 +143,157 @@ class MotorDriver(ABC):
     async def get_error_code(self) -> MotorStatus:
         """Return the current motor status / error code."""
         ...
+
+    async def get_low_voltage_threshold(self) -> float:
+        """Return the undervoltage protection threshold in Volts.
+
+        Below this bus voltage the motor latches a level-2 undervoltage fault
+        (:attr:`MotorStatus.UNDER_VOLTAGE`). Only supported by MyActuator
+        motors; raises MotorError on Damiao.
+        """
+        raise MotorError(
+            f"get_low_voltage_threshold is not supported by {type(self).__name__}"
+        )
+
+    async def set_low_voltage_threshold(self, volts: float) -> None:
+        """Set the undervoltage protection threshold and persist it to ROM.
+
+        Only supported by MyActuator motors; raises MotorError on Damiao.
+        MyActuator applies this on every ``enable()`` — see
+        ``_MA_LOW_VOLTAGE_THRESHOLD_V`` in ``myactuator.py``.
+
+        Args:
+            volts: Threshold in Volts. A negative value can never be reached,
+                   which suppresses the undervoltage fault entirely.
+        """
+        raise MotorError(
+            f"set_low_voltage_threshold is not supported by {type(self).__name__}"
+        )
+
+    #: Canonical name of this motor family, as accepted by ``make_driver``'s
+    #: ``motor_type``. Config snapshots persist it and feed it back on restore,
+    #: so it must be a declared identity rather than anything derived from the
+    #: class name.
+    MOTOR_TYPE: str = ""
+
+    #: This driver's configuration parameter table, keyed by its own parameter
+    #: enum. Empty for drivers with no configuration surface.
+    PARAMS: Mapping[MotorParam, ParamSpec] = {}
+
+    @classmethod
+    def resolve_param(cls, name: str) -> MotorParam:
+        """Look a parameter up by name in *this* driver's table.
+
+        Names are unique across motor families, so naming a Damiao register
+        while talking to a MyActuator motor is a mistake worth reporting rather
+        than silently matching some same-valued index in the other table.
+        """
+        for param in cls.PARAMS:
+            if param.name == name:
+                return param
+        raise MotorError(f"{cls.__name__} has no configuration parameter {name!r}")
+
+    #: Bare indices a raw dump may sweep, for families whose table is still
+    #: incomplete. ``None`` where every parameter is already known, so there is
+    #: nothing a sweep could discover.
+    PARAM_SWEEP_RANGE: range | None = None
+
+    async def get_can_timeout(self) -> float:
+        """Return the CAN loss-of-comms alarm time in milliseconds.
+
+        Only supported by Damiao motors; raises MotorError on MyActuator.
+        """
+        raise MotorError(f"get_can_timeout is not supported by {type(self).__name__}")
+
+    async def set_can_timeout(self, milliseconds: float) -> None:
+        """Set the CAN loss-of-comms alarm time in ms and persist it.
+
+        The motor faults with :attr:`MotorStatus.LOST_COMM` when it goes this
+        long without a command; 0 disables the alarm. Only supported by Damiao
+        motors; raises MotorError on MyActuator.
+        """
+        raise MotorError(f"set_can_timeout is not supported by {type(self).__name__}")
+
+    async def _config_read(self, index: int) -> float:
+        """Read one parameter by raw index, in the motor's own units."""
+        raise MotorError(f"config access is not supported by {type(self).__name__}")
+
+    async def _config_write(self, index: int, value: float) -> None:
+        """Write one parameter by raw index without persisting it."""
+        raise MotorError(f"config access is not supported by {type(self).__name__}")
+
+    async def _config_commit(self) -> None:
+        """Persist every deferred config write to flash/ROM."""
+        raise MotorError(f"config access is not supported by {type(self).__name__}")
+
+    async def read_config(self, param: MotorParam) -> float:
+        """Read one configuration parameter, in the unit its spec names."""
+        raw = await self._config_read(int(param))
+        return raw * self.PARAMS[param].scale
+
+    async def write_config(self, param: MotorParam, value: float) -> None:
+        """Write one configuration parameter and persist it to flash/ROM.
+
+        Refuses read-only parameters; protected ones are allowed here because
+        naming a single parameter is already deliberate. Bulk restores gate
+        them behind ``include_protected`` instead.
+        """
+        spec = self.PARAMS[param]
+        if spec.access is Access.READ_ONLY:
+            raise MotorError(f"{param.name} is read-only")
+        await self._config_write(int(param), value / spec.scale)
+        await self._config_commit()
+
+    async def dump_config(
+        self, raw_range: range | None = None
+    ) -> dict[MotorParam | int, float]:
+        """Read every known configuration parameter.
+
+        Pass ``raw_range`` to sweep bare indices instead of the known table —
+        the way to pin down parameters a vendor GUI exposes but whose indices
+        are still unidentified. Indices the motor rejects are left out rather
+        than reported as an error, since a sweep is expected to hit gaps.
+        """
+        if not self.PARAMS:
+            raise MotorError(f"dump_config is not supported by {type(self).__name__}")
+        if raw_range is not None:
+            values: dict[MotorParam | int, float] = {}
+            for index in raw_range:
+                try:
+                    values[index] = await self._config_read(index)
+                except MotorError:
+                    continue
+            return values
+        return {param: await self.read_config(param) for param in self.PARAMS}
+
+    async def restore_config(
+        self, values: Mapping[MotorParam, float], *, include_protected: bool = False
+    ) -> list[MotorParam]:
+        """Write ``values`` back to the motor and return the ones that changed.
+
+        Parameters already holding the requested value are skipped so a restore
+        onto a matching motor costs no flash writes, and the whole batch shares
+        a single commit. Read-only parameters are always skipped, and protected
+        ones unless ``include_protected`` is set — see :class:`Access`.
+        """
+        if not self.PARAMS:
+            raise MotorError(
+                f"restore_config is not supported by {type(self).__name__}"
+            )
+        written: list[MotorParam] = []
+        for param, value in values.items():
+            spec = self.PARAMS.get(param)
+            if spec is None or spec.access is Access.READ_ONLY:
+                continue
+            if spec.access is Access.PROTECTED and not include_protected:
+                continue
+            if math.isclose(await self.read_config(param), value, rel_tol=1e-6):
+                continue
+            await self._config_write(int(param), value / spec.scale)
+            written.append(param)
+        if written:
+            await self._config_commit()
+        return written
 
     @abstractmethod
     async def set_position_velocity(self, position: float, max_speed: float) -> None:

@@ -347,13 +347,13 @@ class WebRTCManager:
 
         # With TURN/STUN configured (off-LAN operator via a tunnel), aiortc
         # gathers a relay candidate and embeds it in the offer SDP below
-        # (non-trickle). Unconfigured, this is aiortc's default — the LAN path.
+        # (non-trickle). Unconfigured (the LAN path), pass an explicitly
+        # *empty* server list: a bare RTCPeerConnection() falls back to
+        # aiortc's default Google STUN server, and on a robot that can't
+        # reach it every offer stalls ~5s in ICE gathering waiting for the
+        # STUN timeout — host candidates are all the LAN path needs.
         servers = ice_servers()
-        pc = (
-            RTCPeerConnection(RTCConfiguration(iceServers=servers))
-            if servers
-            else RTCPeerConnection()
-        )
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pcs[client_id] = pc
 
         @pc.on("connectionstatechange")

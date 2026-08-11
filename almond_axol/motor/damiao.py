@@ -13,6 +13,7 @@ from typing import Callable
 import can
 
 from .bus import CanBus
+from .config import DAMIAO_PARAMS, DamiaoParam
 from .driver import MotorDriver
 from .errors import MotorError
 from .types import ControlMode, MotorGains, MotorStatus
@@ -86,6 +87,11 @@ def _uint_to_float(x_int: int, x_min: float, x_max: float, bits: int) -> float:
 class DamiaoMotor(MotorDriver):
     """MotorDriver implementation for Damiao motors using the MIT/position-force protocol."""
 
+    MOTOR_TYPE = "damiao"
+    PARAMS = DAMIAO_PARAMS
+    # Damiao publishes the whole register table, so a sweep has nothing to find.
+    PARAM_SWEEP_RANGE = None
+
     def __init__(self, bus: CanBus, motor_id: int, feedback_id: int) -> None:
         """Construct a Damiao driver.
 
@@ -118,13 +124,31 @@ class DamiaoMotor(MotorDriver):
     # Private helpers                                                      #
     # ------------------------------------------------------------------ #
 
+    # Payload byte 2 of register-protocol traffic addressed by [id_lo, id_hi]:
+    # 0x33 read replies (handled), plus 0x55 write acks, 0xAA store acks, and
+    # 0xCC feedback-request echoes, which carry no data we consume but must
+    # never reach the feedback decoder (see _on_message).
+    _REGISTER_TRAFFIC_CMDS = frozenset({0x33, 0x55, 0xAA, 0xCC})
+
     def _on_message(self, msg: can.Message) -> None:
         if len(msg.data) != 8:
             return
         data = bytes(msg.data)
 
-        if data[1] <= 0x0F and data[2] == 0x33 and data[3] <= 81:
-            if (data[0] | (data[1] << 8)) == self._motor_id:
+        # Register-protocol traffic: [id_lo, id_hi, cmd, rid, ...]. Only the
+        # 0x33 read reply carries data we consume, but the motor also acks
+        # 0x55 writes / 0xAA stores by echoing the frame on its MST_ID —
+        # observed live when enable()'s set_control_mode (register 10 write)
+        # races the next position read: the ack [id_lo, 0x00, 0x55, rid, ...]
+        # passed the feedback checks below and decoded to ≈ -12.47 rad
+        # (position bytes 0x0055), a physically impossible -714° that
+        # poisoned the cached position. Swallow the whole ack/echo family
+        # here. (In principle a real feedback frame could match this
+        # signature, but only with the position in the bottom ~6% of the
+        # ±p_max range AND that exact low byte — unreachable on a jointed
+        # arm, and the 0x33 branch has always accepted the same trade-off.)
+        if data[1] <= 0x0F and data[2] in self._REGISTER_TRAFFIC_CMDS and data[3] <= 81:
+            if (data[0] | (data[1] << 8)) == self._motor_id and data[2] == 0x33:
                 self._handle_register_reply(data)
             return
 
@@ -244,16 +268,65 @@ class DamiaoMotor(MotorDriver):
         canid_l, canid_h = self._canid_bytes()
         await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xAA, 0x01, 0, 0, 0, 0]))
 
-    async def _request_feedback(self, timeout: float = 0.1) -> _MotorFeedback:
+    async def _config_read(self, index: int) -> float:
+        return float(await self._read_register(index))
+
+    async def _config_write(self, index: int, value: float) -> None:
+        await self._write_register(index, value)
+
+    async def _config_commit(self) -> None:
+        await self._store_parameters()
+
+    async def get_can_timeout(self) -> float:
+        """Return the loss-of-comms alarm time in milliseconds.
+
+        The motor raises :attr:`MotorStatus.LOST_COMM` when it goes this long
+        without a command. Zero disables the alarm.
+        """
+        return await self.read_config(DamiaoParam.TIMEOUT)
+
+    async def set_can_timeout(self, milliseconds: float) -> None:
+        """Set the loss-of-comms alarm time in milliseconds and persist it.
+
+        Pass 0 to disable the alarm. The register itself counts 50 µs ticks;
+        the conversion is handled by the parameter's scale.
+        """
+        if milliseconds < 0:
+            raise MotorError(f"CAN timeout must not be negative, got {milliseconds}")
+        await self.write_config(DamiaoParam.TIMEOUT, milliseconds)
+
+    async def _request_feedback(
+        self, timeout: float = 0.1, attempts: int = 5
+    ) -> _MotorFeedback:
+        """Request a feedback frame, re-sending the request if a reply is missed.
+
+        Like the parameter-read reply (see :meth:`_read_register`), the 0xCC
+        feedback reply is a single unacknowledged CAN frame that is most often
+        dropped in the enable burst — e.g. the ``get_position`` that opens
+        gripper calibration, issued right after every motor on both arms has
+        cleared errors and read its registers at once. One dropped frame must
+        not abort the whole enable, so each attempt re-sends the request.
+        """
         loop = asyncio.get_running_loop()
-        fut: asyncio.Future[_MotorFeedback] = loop.create_future()
-        self._feedback_waiters.append(fut)
         canid_l, canid_h = self._canid_bytes()
-        await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xCC, 0, 0, 0, 0, 0]))
-        try:
-            return await asyncio.wait_for(fut, timeout)
-        except asyncio.TimeoutError:
-            raise MotorError(f"Damiao motor {self._motor_id:#04x} feedback timed out")
+        last_exc: asyncio.TimeoutError | None = None
+        for _ in range(attempts):
+            fut: asyncio.Future[_MotorFeedback] = loop.create_future()
+            self._feedback_waiters.append(fut)
+            await self._bus._send(0x7FF, bytes([canid_l, canid_h, 0xCC, 0, 0, 0, 0, 0]))
+            try:
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+            finally:
+                # Drop our waiter unless a feedback frame already resolved it,
+                # so a late reply can't resolve a future from a previous attempt.
+                if fut in self._feedback_waiters:
+                    self._feedback_waiters.remove(fut)
+        raise MotorError(
+            f"Damiao motor {self._motor_id:#04x} feedback timed out "
+            f"after {attempts} attempts"
+        ) from last_exc
 
     async def _send_cmd(
         self,
@@ -297,12 +370,8 @@ class DamiaoMotor(MotorDriver):
             data = struct.pack("<fHH", target_position, v_scaled, i_scaled)
             await self._raw_send(data, arb_id=0x300 + self._motor_id)
 
-    # ------------------------------------------------------------------ #
-    # Public API (implements MotorDriver)                                  #
-    # ------------------------------------------------------------------ #
-
-    async def enable(self) -> None:
-        await self.clear_errors()
+    async def _read_limits(self) -> None:
+        """Read the position/velocity/torque ranges used to scale MIT frames."""
         pmax, vmax, tmax = await asyncio.gather(
             self._read_register(_DM_REG_PMAX),
             self._read_register(_DM_REG_VMAX),
@@ -311,7 +380,34 @@ class DamiaoMotor(MotorDriver):
         self._p_max = float(pmax)
         self._v_max = float(vmax)
         self._t_max = float(tmax)
+
+    # ------------------------------------------------------------------ #
+    # Public API (implements MotorDriver)                                  #
+    # ------------------------------------------------------------------ #
+
+    async def enable(self) -> None:
+        await self.clear_errors()
+        await self._read_limits()
         await self._raw_send(bytes([0xFF] * 7 + [0xFC]))
+
+    async def attach(self) -> None:
+        # Reads only: limit registers for command/feedback scaling, then one
+        # feedback frame to confirm the motor is still enabled and holding.
+        # No clear-errors and no 0xFC enable — a fault or a disabled state
+        # means torque was already lost, and re-enabling here would mask that.
+        await self._read_limits()
+        feedback = await self._request_feedback()
+        if feedback.status != _DamiaoStatus.ENABLED:
+            status = _DM_STATUS_MAP.get(feedback.status, MotorStatus.UNKNOWN)
+            raise MotorError(
+                f"Damiao motor {self._motor_id:#04x} is {status.value}, not "
+                f"enabled and holding — attach is not possible; use enable() "
+                f"for a full bring-up"
+            )
+
+    async def is_holding(self) -> bool:
+        feedback = await self._request_feedback()
+        return feedback.status == _DamiaoStatus.ENABLED
 
     async def disable(self) -> None:
         max_attempts = 10
@@ -319,7 +415,8 @@ class DamiaoMotor(MotorDriver):
             await self._raw_send(bytes([0xFF] * 7 + [0xFD]))
             await asyncio.sleep(0.01)
             try:
-                feedback = await self._request_feedback()
+                # attempts=1: this loop already re-sends on a missed reply.
+                feedback = await self._request_feedback(attempts=1)
                 if feedback.status == _DamiaoStatus.DISABLED:
                     return
             except MotorError:

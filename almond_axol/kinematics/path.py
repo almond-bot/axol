@@ -49,7 +49,7 @@ from numpy.typing import ArrayLike
 from scipy.interpolate import CubicSpline
 
 from ..constants import GRIPPER_TIP_OFFSET
-from .solver import KinematicsSolver
+from .solver import KinematicsSolver, Pose
 
 _logger = logging.getLogger(__name__)
 
@@ -81,9 +81,6 @@ _PEAK_SPEED_FACTOR = 1.875
 # its first-order term, which is exact to float32 precision at that scale.
 _SMALL_ANGLE = 1e-8
 
-Pose = tuple[np.ndarray, np.ndarray]
-"""A frame as ``(position (3,), rotation (3, 3))`` in the world frame."""
-
 Offset = np.ndarray | tuple[float, float, float]
 """A tool point in the gripper link frame."""
 
@@ -113,16 +110,6 @@ class PathPlanningError(RuntimeError):
     """
 
 
-def ee_poses(solver: KinematicsSolver, q: np.ndarray) -> tuple[Pose, Pose]:
-    """Return ``(left, right)`` gripper-mount poses for a full joint vector.
-
-    This is the frame :meth:`KinematicsSolver.ik` targets. For the point the
-    fingers close on, see :func:`tip_poses`.
-    """
-    left, right = solver.fk(np.asarray(q, dtype=np.float32))
-    return _to_pose(left), _to_pose(right)
-
-
 def tip_poses(
     solver: KinematicsSolver,
     q: np.ndarray,
@@ -130,10 +117,11 @@ def tip_poses(
 ) -> tuple[Pose, Pose]:
     """Return ``(left, right)`` gripper-tip poses for a full joint vector.
 
-    Same orientation as the mount, translated out to the fingertips.
+    Same orientation as the mount frame :meth:`KinematicsSolver.fk` returns,
+    translated out to the fingertips.
     """
     offset = np.asarray(tool_offset, dtype=np.float32)
-    left, right = ee_poses(solver, q)
+    left, right = solver.fk(q)
     return _apply_offset(left, offset), _apply_offset(right, offset)
 
 
@@ -146,13 +134,6 @@ def _remove_offset(pose: Pose, offset: np.ndarray) -> Pose:
     """Invert :func:`_apply_offset`: the mount pose that puts the tip here."""
     position, rotation = pose
     return (position - rotation @ offset, rotation)
-
-
-def _to_pose(se3: jaxlie.SE3) -> Pose:
-    return (
-        np.asarray(se3.translation(), dtype=np.float32),
-        np.asarray(se3.rotation().as_matrix(), dtype=np.float32),
-    )
 
 
 def _rot_log(r_from: np.ndarray, r_to: np.ndarray) -> np.ndarray:

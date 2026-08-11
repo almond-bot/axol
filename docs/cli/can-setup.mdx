@@ -3,7 +3,7 @@ title: "can.setup"
 description: "One-time CAN bus setup for the Almond Axol Hub."
 ---
 
-One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Installs the `gs_usb` kernel driver if the kernel lacks it (see [`can.driver`](/cli/can-driver) — needed on NVIDIA Jetson / ZED Box), writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, and brings up the interfaces immediately.
+One-time setup for the Almond Axol Hub (dual-channel USB CAN adapter). Installs the `gs_usb` kernel driver if the kernel lacks it (see [`can.driver`](/cli/can-driver) — needed on NVIDIA Jetson / ZED Box), writes persistent udev rules, assigns fixed interface names, registers a startup script in the root crontab, installs a hotplug bring-up service, and brings up the interfaces immediately.
 
 - Left arm → `can_alm_axol_l`
 - Right arm → `can_alm_axol_r`
@@ -20,5 +20,9 @@ If a **single-channel** CAN adapter is also attached — the [powered cart](/gui
 </Note>
 
 <Info>
-  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook). If the Axol Hub is re-plugged mid-session without a restart, bring the interfaces back up with [`can.enable`](/cli/can-enable). You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
+  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
 </Info>
+
+<Note>
+  On Raspberry Pi 5 hosts, `can.setup` additionally applies an RP1 USB quirk (`axol-rp1-usb-quirk.service`): the Pi 5's USB controllers ship with a hair-trigger babble/loss-of-activity detector that EMI from the arms can trip, kicking the hub off the bus (`disabled by hub (EMI?)` in `dmesg`). The quirk enables the controller's noise filter — the workaround recommended by Raspberry Pi engineers. If disconnects persist, add a ferrite choke to (or shield) the hub's USB cable, or put a small powered USB hub between the Pi and the Axol Hub.
+</Note>

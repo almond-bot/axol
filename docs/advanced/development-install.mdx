@@ -78,7 +78,7 @@ Before using any motor or robot commands, initialize the CAN hardware once:
 axol can.setup
 ```
 
-`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures, and [`can.enable`](/cli/can-enable) for bringing the interfaces back up after a mid-session replug.
+`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures — including the hotplug service that brings the interfaces back up on its own after a mid-session replug — and [`can.enable`](/cli/can-enable) for re-running the bring-up manually.
 
 ## Build the web UI
 

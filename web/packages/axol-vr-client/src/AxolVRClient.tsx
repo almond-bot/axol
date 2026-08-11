@@ -440,7 +440,18 @@ export function AxolVRClient({
 
     // End the XR session only now that the Y-press reset frame has been sent, so
     // the backend receives the return-to-rest before the pose stream stops.
-    if (yEdge) onExit?.()
+    if (yEdge) {
+      // This exit frame carries the return-to-rest reset and is the last one
+      // sent — no later frame can re-carry it. The preferred pose channel is
+      // deliberately unreliable (maxRetransmits: 0), so one dropped datagram
+      // would leave VR with the robot still engaged mid-air; duplicate the
+      // frame over the reliable WebSocket too (the server de-dupes by seq).
+      const ws = wsRef.current
+      if (ws && ws.readyState === WebSocket.OPEN && netSink !== ws) {
+        ws.send(payload)
+      }
+      onExit?.()
+    }
   })
 
   return null
