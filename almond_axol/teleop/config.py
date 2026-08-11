@@ -93,6 +93,12 @@ class VRTeleopConfig:
             now are.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
+        reset_on_disconnect: Return the arms to the rest pose when the
+            operator's last pose-sending connection closes while the arms are
+            away from rest — quitting the VR app (e.g. via the Quest menu)
+            can't reliably deliver the Y-exit reset frame.  Pausing without
+            quitting (system menu, doffed headset) keeps the socket open and
+            only auto-disengages; the arms hold in place.  Defaults to True.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -141,3 +147,4 @@ class VRTeleopConfig:
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
+    reset_on_disconnect: bool = True

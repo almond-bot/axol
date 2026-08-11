@@ -38,11 +38,13 @@ class ControlChannelManager:
 
     The server is the offerer: it creates the unreliable ``pose`` data channel
     and hands the SDP offer to the headset over the signaling WebSocket. Inbound
-    channel messages (the headset's pose frames) are passed to ``on_message``,
-    which feeds them into the same path as WebSocket pose frames.
+    channel messages (the headset's pose frames) are passed to ``on_message``
+    with the owning client's id, which feeds them into the same path as
+    WebSocket pose frames (the id keeps pose-sender tracking accurate when the
+    channel, not the socket, carries the poses).
     """
 
-    def __init__(self, on_message: Callable[[str], None]) -> None:
+    def __init__(self, on_message: Callable[[int, str], None]) -> None:
         self._on_message = on_message
         self._pcs: dict[int, RTCPeerConnection] = {}
 
@@ -72,7 +74,7 @@ class ControlChannelManager:
         @channel.on("message")
         def _on_message(message: object) -> None:
             if isinstance(message, str):
-                self._on_message(message)
+                self._on_message(client_id, message)
 
         @pc.on("connectionstatechange")
         async def _on_state() -> None:

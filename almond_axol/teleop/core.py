@@ -186,6 +186,22 @@ class VRTeleopCore:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
         self._reset_latched = True
 
+    def request_reset_if_away(self) -> None:
+        """Return to rest, but only if the arms are away from it. Thread-safe.
+
+        Wired to the VR server's operator-gone notification (the last
+        pose-sending client disconnected): quitting the VR app can't reliably
+        deliver the Y-exit reset frame, so the disconnect itself sends the
+        arms home. A no-op at rest or mid-reset, so an idle operator
+        disconnecting never moves the robot.
+        """
+        if self._at_rest or self.is_resetting:
+            return
+        self._logger.info(
+            "Operator disconnected with the arms away from rest: returning to rest"
+        )
+        self._reset_latched = True
+
     def clear_reset_request(self) -> None:
         """Consume a pending reset latch without acting on it.
 

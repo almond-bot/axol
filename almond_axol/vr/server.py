@@ -145,6 +145,15 @@ class VRServer:
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
+        # Clients that have delivered at least one valid pose frame (over the
+        # socket or their control data channel) — i.e. the operator's
+        # connections, as opposed to view-only ones like the control panel's
+        # camera mirror. When the last of them disconnects, the operator is
+        # gone for good (a quit/crash closes the socket; merely pausing —
+        # e.g. the Quest system menu — keeps it open) and
+        # ``_on_operator_gone`` fires.
+        self._pose_clients: set[int] = set()
+        self._on_operator_gone: Callable[[], None] | None = None
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
@@ -180,6 +189,20 @@ class VRServer:
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
+
+    def set_on_operator_gone(self, callback: Callable[[], None] | None) -> None:
+        """Called when the last pose-sending client disconnects.
+
+        Pose-sending clients are the operator's connections (headset app,
+        USB tunnel) — view-only clients such as the control panel's camera
+        mirror never send poses and don't count. The callback fires on the
+        server's event loop when the last one's socket closes: a quit or
+        crash of the VR app, as opposed to a pause (Quest system menu,
+        doffed headset) which keeps the socket open. Teleop uses it to
+        return the arms to rest, since an app quit can't reliably deliver
+        the Y-exit reset frame.
+        """
+        self._on_operator_gone = callback
 
     def set_mode(self, mode: str | None) -> None:
         """Set the operating mode announced to headsets on connect.
@@ -409,6 +432,7 @@ class VRServer:
         self._active_clients.clear()
         self._video_pending.clear()
         self._video_offering.clear()
+        self._pose_clients.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -446,15 +470,22 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
-        self._ingest_frame_obj(obj)
+        if self._ingest_frame_obj(obj):
+            self._pose_clients.add(client_id)
 
-    def _ingest_frame_obj(self, obj: Any) -> None:
-        """Validate a decoded pose object and publish it to the consumer."""
+    def _ingest_frame_obj(self, obj: Any) -> bool:
+        """Validate a decoded pose object and publish it to the consumer.
+
+        Returns True when the object was a valid pose frame — including one
+        dropped by the seq dedup below, so a transport that only ever loses
+        the arrival race (e.g. the network standby while USB wins) still
+        counts as a pose sender.
+        """
         try:
             frame = VRFrame.model_validate(obj)
         except Exception as exc:
             _logger.warning("invalid frame: %s", exc)
-            return
+            return False
 
         # The headset streams identical frames (same ``seq``) over both the
         # wired USB tunnel and the network (WebRTC data channel / WebSocket).
@@ -469,19 +500,22 @@ class VRServer:
         seq = frame.seq
         if seq is not None:
             if self._last_seq is not None and seq <= self._last_seq:
-                return
+                return True
             self._last_seq = seq
 
         self._latest_frame = frame
         self._interp.push(frame)
         if self._on_frame is not None:
             self._on_frame(frame)
+        return True
 
-    def _ingest_pose_text(self, data: str) -> None:
+    def _ingest_pose_text(self, client_id: int, data: str) -> None:
         """Ingest a pose frame from the control data channel (text message).
 
         Mirrors the WebSocket pose path; signaling never arrives here, so a
         message carrying a ``type`` field is ignored rather than validated.
+        ``client_id`` is the owning signaling client, so pose-sender tracking
+        stays accurate when the channel (not the socket) carries the poses.
         """
         try:
             obj = json.loads(data)
@@ -490,7 +524,8 @@ class VRServer:
             return
         if isinstance(obj, dict) and "type" in obj:
             return
-        self._ingest_frame_obj(obj)
+        if self._ingest_frame_obj(obj):
+            self._pose_clients.add(client_id)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -669,6 +704,19 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
+                # The last pose-sending client (the operator) is gone for
+                # good — a quit/crash closes the socket, unlike a pause
+                # (system menu, doffed headset) which keeps it open. Fired
+                # before the count-based cleanup below so consumers see the
+                # final pose state; best-effort so it can't leak the socket
+                # accounting.
+                if client_id in server._pose_clients:
+                    server._pose_clients.discard(client_id)
+                    if not server._pose_clients and server._on_operator_gone:
+                        try:
+                            server._on_operator_gone()
+                        except Exception:  # noqa: BLE001 - never break cleanup
+                            _logger.exception("operator-gone callback failed")
                 # Last operator gone: drop buffered pose state so a fresh
                 # session's capture timestamps aren't blended with this one's
                 # stale frames (which would drive IK with incoherent poses
