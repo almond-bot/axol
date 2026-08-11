@@ -44,14 +44,20 @@ Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 # _build_robot_collision.
 _CAPSULE_GRAZE_TOL = 0.003
 
-# Collision-cost activation distance (m) for graze-kept pairs (see above).
-# Their capsules already touch at poses where the physical robot has real
-# clearance, so the fit itself embeds the safety buffer — stacking the full
-# ``self_collision_margin`` on top keeps the cost active across the entire
-# close-to-body work envelope, and the constant three-way fight between task,
-# posture, and collision gradients reads as jerk. A small activation distance
-# keeps these pairs silent until the capsules are genuinely about to touch.
-_GRAZE_PAIR_MARGIN = 0.008
+# Per-pair collision-cost activation distances are derived from each pair's
+# clearance at the home pose: ``clamp(home_clearance - _MARGIN_REST_BUFFER,
+# _MARGIN_FLOOR, self_collision_margin)``. Pairs that *live* near their
+# activation shell (the wrists and grippers pass within 10-17 mm of the base
+# during ordinary close-over-table work, and the elbow capsules graze at
+# rest) would otherwise keep the cost hinge active across the entire work
+# envelope — replaying recorded deburring sessions showed base<->wrist pairs
+# inside a uniform 25 mm activation for up to 59% of all frames, and every
+# crossing of the shell pulses the (weight-150) gradient into the arm, which
+# reads as path-specific jitter. Deriving the margin from the home clearance
+# keeps such pairs silent in their normal envelope while pairs with generous
+# clearance keep the full early-warning distance.
+_MARGIN_FLOOR = 0.008
+_MARGIN_REST_BUFFER = 0.002
 
 
 def _build_robot_collision(
@@ -81,10 +87,11 @@ def _build_robot_collision(
     operator elbow hint pulling the swivel outward; with elbow tracking
     disabled it is the only thing standing between the elbow and the base.
 
-    Returns ``(collision_model, per_pair_margins)``: graze-kept pairs get the
-    reduced ``_GRAZE_PAIR_MARGIN`` activation distance (their capsule fits
-    already embed the clearance buffer), every other pair the configured
-    ``default_margin``.
+    Returns ``(collision_model, per_pair_margins)`` where each pair's
+    activation distance is derived from its home-pose clearance (see
+    ``_MARGIN_FLOOR`` / ``_MARGIN_REST_BUFFER``): pairs that normally operate
+    near their shell get a proportionally smaller activation distance, pairs
+    with generous clearance keep the configured ``default_margin``.
     """
     link_names = [link.name for link in urdf.robot.links]
 
@@ -113,15 +120,15 @@ def _build_robot_collision(
     d = np.asarray(
         rc.compute_self_collision_distance(robot, q0)
     )  # final active pair set
-    margins = np.where(
-        d <= 0.0, min(_GRAZE_PAIR_MARGIN, default_margin), default_margin
-    ).astype(np.float32)
+    floor = min(_MARGIN_FLOOR, default_margin)
+    margins = np.clip(d - _MARGIN_REST_BUFFER, floor, default_margin).astype(np.float32)
     _logger.info(
-        "RobotCollision: restricted to %d torso<->arm pairs (%d graze-kept at "
-        "%.0f mm activation).",
+        "RobotCollision: restricted to %d torso<->arm pairs (%d below the "
+        "default %.0f mm activation, floor %.0f mm).",
         len(rc.active_idx_i),
-        int((d <= 0.0).sum()),
-        1e3 * _GRAZE_PAIR_MARGIN,
+        int((margins < default_margin).sum()),
+        1e3 * default_margin,
+        1e3 * floor,
     )
     return rc, margins
 

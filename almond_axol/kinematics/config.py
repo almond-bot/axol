@@ -43,12 +43,17 @@ class KinematicsConfig:
             active during ordinary tracking, which makes the trust-region
             solver reject steps — the arm freezes while small target errors
             accumulate, then lurches once the error is large enough to punch
-            through (the teleop "stuck, then jumps" failure). 0.025 matches
-            ``VRTeleopConfig.reset_collision_margin``. Pairs whose capsules
-            already graze at the home pose (e.g. elbow<->base, kept for
-            protection despite the graze) get a reduced activation distance
-            instead — see ``_GRAZE_PAIR_MARGIN`` in the solver — so the cost
-            doesn't stay active across the whole close-to-body envelope.
+            through             (the teleop "stuck, then jumps" failure). 0.025 matches
+            ``VRTeleopConfig.reset_collision_margin``. This value is the
+            *ceiling*: each pair's actual activation distance is derived from
+            its home-pose clearance (clamped between the solver's 8 mm floor
+            and this value), so pairs that normally operate near their shell —
+            the wrists and grippers passing 10-17 mm from the base during
+            close-over-table work, the elbow capsules grazing at rest — stay
+            silent in their ordinary envelope instead of holding the cost
+            hinge active there (measured at up to 59% of frames in recorded
+            deburring sessions, which pulsed weight-150 gradients into the arm
+            as path-specific jitter).
         self_collision_weight: Weight on the self-collision penalty. 150 was
             set by replaying recorded close-to-body teleop episodes through
             the solver offline: at 75 the task cost dragged the elbow up to
