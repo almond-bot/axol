@@ -1,9 +1,9 @@
 ---
 title: "tracker.bridge / tracker.identify"
-description: "Headset-free UMI teleop and data collection with Vive trackers."
+description: "Headset-free Mantis UMI teleop and data collection with Vive trackers."
 ---
 
-Drives the UMI handheld rig from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --umi`](/cli/teleop) and [`collect-data --umi`](/cli/collect-data) run unchanged.
+Drives the Mantis UMI from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --umi`](/cli/teleop) and [`collect-data --umi`](/cli/collect-data) run unchanged.
 
 Two tracker families are supported:
 
@@ -26,7 +26,7 @@ axol teleop --umi                # or: axol collect-data --umi ...
 axol tracker.bridge
 ```
 
-No tracker→gripper calibration is needed: the absolute (UMI) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy.
+No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis UMI's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/umi/tcp_transform.json` overrides it when present. For everything else, the absolute (UMI) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
 Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands come from the rig's CAN trigger node when one is configured (`--trigger-can-left` / `--trigger-can-right`): the binary trigger switch closes the gripper while pressed and opens it at rest. A side with no trigger configured streams fully open.
 

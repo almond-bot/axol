@@ -10,7 +10,6 @@ from . import serve as serve_cmd
 from . import (
     tracker_bridge,
     tracker_identify,
-    umi_calibrate,
     umi_latency,
     umi_session,
 )
@@ -109,7 +108,6 @@ def main() -> None:
     can_enable.add_parser(subparsers)
     can_driver.add_parser(subparsers)
     umi_session.add_parser(subparsers)
-    umi_calibrate.add_parser(subparsers)
     umi_latency.add_parser(subparsers)
     tracker_bridge.add_parser(subparsers)
     tracker_identify.add_parser(subparsers)

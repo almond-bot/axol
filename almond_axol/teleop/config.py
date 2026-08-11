@@ -87,7 +87,7 @@ class VRTeleopConfig:
             controller since engage is converted to axis-angle and its angle
             is scaled by this factor; ``1.0`` is 1:1 motion, ``2.0`` rotates
             the end-effector twice as far as the wrist.  Defaults to ``1.0``.
-        absolute_mode: UMI handheld-rig mapping. Instead of re-applying
+        absolute_mode: Mantis UMI mapping. Instead of re-applying
             controller *deltas* onto the robot's engage-time FK pose (normal
             teleop), the engage rising edge solves a world-anchored robot
             **base transform** — gravity-aligned, positioned/oriented so the
@@ -110,9 +110,10 @@ class VRTeleopConfig:
             mounting height so datasets stay consistent across operators of
             different heights. ``None`` (default) lets the fit take the
             vertical position from the held grippers.
-        tcp_transform_left: Calibrated tracker→gripper SE(3) transform for the
-            left rig as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed
-            in the tracker's local frame), measured by ``axol umi.calibrate``.
+        tcp_transform_left: Tracker→gripper SE(3) transform for the left rig
+            as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed in the
+            tracker's local frame) — the rig's factory design constant, or a
+            per-unit override from ``~/.almond/umi/tcp_transform.json``.
             When set, ``absolute_mode`` maps each tracked pose through it —
             recorded TCP poses become mount-independent and wrist rotations
             stop smearing into position error — instead of absorbing the
@@ -183,7 +184,7 @@ class VRTeleopConfig:
 
 
 def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
-    """Force the UMI handheld-rig mapping/faithfulness profile in place.
+    """Force the Mantis UMI mapping/faithfulness profile in place.
 
     Shared by ``collect-data --umi`` and ``teleop --umi`` so the two flows
     behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
@@ -196,14 +197,16 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     headset's URDF overlay); a higher cutoff keeps the solution pinned to the
     hand at the price of passing through a little tremor.
 
-    Also loads any saved ``axol umi.calibrate`` tracker→gripper transforms
-    into ``tcp_transform_left`` / ``tcp_transform_right`` (explicitly set
-    values win over the file). The calibration file is keyed per tracker
-    identity; the entry matching the active tracker (``config.tracker_key``,
-    or derived — see :func:`almond_axol.umi.calibration.tracker_key_for_side`)
-    is selected per side. A missing entry for the active tracker is warned
-    about loudly: the session would otherwise silently record uncalibrated
-    (engage-snapshot) TCP poses.
+    Also resolves the tracker→gripper transform per side into
+    ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
+    explicitly set config values; the override-file entry for the active
+    tracker (``config.tracker_key``, or derived — see
+    :func:`almond_axol.umi.calibration.tracker_key_for_side`); the rig's
+    factory design transform for the tracker family
+    (:data:`~almond_axol.umi.calibration.DESIGN_TCP_TRANSFORMS` — a design
+    constant, so it applies out of the box); a legacy unkeyed override
+    entry. A tracker with none of these is warned about loudly: the session
+    would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
     """
     config.absolute_mode = True
     config.ik_alpha = 1.0
@@ -216,6 +219,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
         from ..umi.calibration import (
             LEGACY_TRACKER_KEY,
             UMI_TCP_TRANSFORM_FILE,
+            design_transform_for,
             load_tcp_transforms,
             tracker_key_for_side,
         )
@@ -227,6 +231,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                 continue
             key, reason = tracker_key_for_side(side, override=config.tracker_key)
             entries = saved.get(side, {})
+            design = design_transform_for(side, key)
             if key in entries:
                 setattr(config, attr, entries[key])
                 _logger.info(
@@ -235,25 +240,39 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                     key,
                     reason,
                 )
-            elif LEGACY_TRACKER_KEY in entries:
-                setattr(config, attr, entries[LEGACY_TRACKER_KEY])
-                _logger.warning(
-                    "UMI %s: no calibration for the active tracker %r (%s) — "
-                    "falling back to a LEGACY entry measured with an unknown "
-                    "tracker. If the tracker changed since, this transform "
-                    "is wrong; re-run `axol umi.calibrate`.",
+            elif design is not None:
+                setattr(config, attr, design)
+                _logger.info(
+                    "UMI %s: using the rig's factory tracker→gripper transform "
+                    "for tracker %r (%s) — a design constant of the standard "
+                    "mount. A per-unit entry in %s overrides it.",
                     side,
                     key,
                     reason,
+                    UMI_TCP_TRANSFORM_FILE,
+                )
+            elif LEGACY_TRACKER_KEY in entries:
+                setattr(config, attr, entries[LEGACY_TRACKER_KEY])
+                _logger.warning(
+                    "UMI %s: no transform for the active tracker %r (%s) — "
+                    "falling back to a LEGACY entry measured with an unknown "
+                    "tracker. If the tracker changed since, this transform "
+                    "is wrong; re-key or delete the entry in %s.",
+                    side,
+                    key,
+                    reason,
+                    UMI_TCP_TRANSFORM_FILE,
                 )
             else:
                 _logger.warning(
-                    "UMI %s: NO tracker→gripper calibration for the active "
-                    "tracker %r (%s) in %s — absolute mode will absorb the "
-                    "whole controller→gripper offset into the engage "
-                    "snapshot, so recorded TCP poses will be mount-dependent "
-                    "and wrist rotations will smear into position error. Run "
-                    "`axol umi.calibrate` before collecting data.",
+                    "UMI %s: NO tracker→gripper transform for the active "
+                    "tracker %r (%s) — no factory design constant covers this "
+                    "tracker family and %s has no entry for it. Absolute mode "
+                    "will absorb the whole controller→gripper offset into the "
+                    "engage snapshot, so recorded TCP poses will be "
+                    "mount-dependent and wrist rotations will smear into "
+                    "position error. Add a measured transform to the file "
+                    "before collecting data.",
                     side,
                     key,
                     reason,

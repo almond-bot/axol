@@ -234,8 +234,9 @@ class IKWorker:
         # offset ``(p_off, R_off)`` expressed in the controller's local frame.
         self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
         self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        # Calibrated tracker→gripper transforms from ``axol umi.calibrate``
-        # (per side, ``(p_off_3, R_off_3x3)`` in the tracker's local frame).
+        # Tracker→gripper transforms (the rig's factory design constants, or
+        # per-unit file overrides — see almond_axol.umi.calibration), per
+        # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
         # When present for a side, engage uses it verbatim instead of
         # absorbing the mount offset into the engage snapshot.
         self._tcp_transforms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -439,7 +440,7 @@ class IKWorker:
         return q_new
 
     def _step_absolute(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
-        """UMI handheld-rig step: absolute world-anchored targets, no deltas.
+        """Mantis UMI step: absolute world-anchored targets, no deltas.
 
         The engage rising edge solves the base transform + per-controller TCP
         offsets (:meth:`_engage_absolute`); every later frame maps each
@@ -611,8 +612,8 @@ class IKWorker:
         set, pins the vertical component to the robot's real mounting height
         instead).
 
-        A side with a calibrated tracker→gripper transform (``axol
-        umi.calibrate``) arrives here already mapped to the physical gripper
+        A side with a tracker→gripper transform (factory design constant or
+        per-unit override) arrives here already mapped to the physical gripper
         pose (see :meth:`_apply_tcp_transform`), so its engage offset is
         identity — recorded poses are mount-independent, wrist rotations
         don't smear into position error, and the operator's residual
