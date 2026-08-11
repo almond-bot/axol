@@ -22,6 +22,15 @@ CUTOFF_FREQ = 20.0
 # compliant pull on the scene stays brief.
 CONTACT_DEBOUNCE_S = 0.15
 
+# Arrival settle for guarded returns: after the trajectory completes, keep
+# holding the target at compliant gains until the tracking error decays below
+# SETTLE_TOL_RAD (or SETTLE_TIMEOUT_S elapses), and only then restore the
+# session gains. The restore multiplies whatever error remains by the gain
+# step, so restoring against the compliant-tracking lag produces a visible
+# snap at the rest pose; settling first makes it imperceptible.
+SETTLE_TOL_RAD = 0.015
+SETTLE_TIMEOUT_S = 1.0
+
 
 class ContactWatchdog:
     """Debounced measured-vs-gravity torque contact detector.

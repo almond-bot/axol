@@ -180,7 +180,11 @@ class IKResetController:
         import numpy as np
 
         from ..constants import Joint
-        from ..robot.control import ContactWatchdog
+        from ..robot.control import (
+            SETTLE_TIMEOUT_S,
+            SETTLE_TOL_RAD,
+            ContactWatchdog,
+        )
         from ..teleop.filter import ResetInterpolator
 
         assert self._conn is not None
@@ -214,6 +218,7 @@ class IKResetController:
         joints = list(Joint)
         play_hz = float(self._vr_cfg.frequency)
         period = 1.0 / play_hz
+        action: dict[str, float] | None = None
         while interp.is_active():
             if stopped is not None and stopped():
                 return "stopped"
@@ -223,7 +228,7 @@ class IKResetController:
                 break
             arm_left = np.asarray(new_q)[self._left_indices]
             arm_right = np.asarray(new_q)[self._right_indices]
-            action: dict[str, float] = {}
+            action = {}
             for j in joints:
                 if j in ARM_JOINTS:
                     ai = ARM_JOINTS.index(j)
@@ -245,6 +250,40 @@ class IKResetController:
                 )
                 return "contact"
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+
+        # Arrival settle: keep holding the final target at compliant gains
+        # until the tracking error decays, so the caller's session-gain
+        # restore multiplies ~zero error (no snap at the rest pose). The
+        # watchdog stays live — a grab at arrival trips like anywhere else.
+        if action is not None:
+            q_final = np.asarray(traj[-1])
+            final_left = q_final[self._left_indices]
+            final_right = q_final[self._right_indices]
+            cap = time.perf_counter() + SETTLE_TIMEOUT_S
+            while time.perf_counter() < cap:
+                if stopped is not None and stopped():
+                    return "stopped"
+                t0 = time.perf_counter()
+                robot.send_action(action)
+                tripped = watchdog.update(robot.torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    _logger.warning(
+                        "return-to-rest contact: %s torque residual %.1f "
+                        "exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        torque_threshold,
+                    )
+                    return "contact"
+                pos_l, pos_r = robot.positions
+                err = max(
+                    float(np.max(np.abs(np.asarray(pos_l[:7]) - final_left))),
+                    float(np.max(np.abs(np.asarray(pos_r[:7]) - final_right))),
+                )
+                if err < SETTLE_TOL_RAD:
+                    break
+                time.sleep(max(0.0, period - (time.perf_counter() - t0)))
         return "done"
 
     def _hold_limp(

@@ -37,7 +37,11 @@ from collections.abc import Awaitable, Callable
 
 import numpy as np
 
-from ..robot.control import ContactWatchdog
+from ..robot.control import (
+    SETTLE_TIMEOUT_S,
+    SETTLE_TOL_RAD,
+    ContactWatchdog,
+)
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 
@@ -466,6 +470,20 @@ class VRTeleopCore:
         """
         interval = 1.0 / self.config.frequency
 
+        def _check_contact(watchdog: ContactWatchdog) -> bool:
+            tripped = watchdog.update(torque_residuals())
+            if tripped is None:
+                return False
+            joint, residual = tripped
+            self._logger.warning(
+                "return-to-rest contact: %s torque residual %.1f "
+                "exceeds %.1f — going limp",
+                joint,
+                residual,
+                self.config.reset_torque_threshold,
+            )
+            return True
+
         async def _play() -> str:
             """One guarded play attempt: ``done`` | ``contact`` | ``stopped``."""
             watchdog = ContactWatchdog(self.config.reset_torque_threshold)
@@ -476,24 +494,75 @@ class VRTeleopCore:
                     return "stopped"
                 deadline += interval
                 await send_step()
-                tripped = watchdog.update(torque_residuals())
-                if tripped is not None:
-                    joint, residual = tripped
-                    self._logger.warning(
-                        "return-to-rest contact: %s torque residual %.1f "
-                        "exceeds %.1f — going limp",
-                        joint,
-                        residual,
-                        self.config.reset_torque_threshold,
-                    )
+                if _check_contact(watchdog):
                     return "contact"
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
             return "stopped" if stopped() else "done"
+
+        def _settle_error() -> float:
+            """Worst arm-joint tracking error vs. the held target (rad)."""
+            q = self.q
+            if q is None:
+                return 0.0
+            pos_l, pos_r = get_positions()
+            err = 0.0
+            if pos_l is not None and self.left_indices:
+                err = max(
+                    err,
+                    float(
+                        np.max(
+                            np.abs(
+                                q[self.left_indices]
+                                - np.asarray(pos_l[:7], dtype=np.float32)
+                            )
+                        )
+                    ),
+                )
+            if pos_r is not None and self.right_indices:
+                err = max(
+                    err,
+                    float(
+                        np.max(
+                            np.abs(
+                                q[self.right_indices]
+                                - np.asarray(pos_r[:7], dtype=np.float32)
+                            )
+                        )
+                    ),
+                )
+            return err
+
+        async def _settle() -> str:
+            """Hold the target at compliant gains until the arms catch up.
+
+            The session-gain restore on the way out multiplies whatever
+            tracking error remains by the gain step, so restoring straight
+            off the trajectory's compliant lag shows up as a small snap at
+            the rest pose. Keep commanding the target until the error decays
+            below tolerance (or the cap), with the watchdog still live so a
+            grab at arrival trips like anywhere else.
+            """
+            watchdog = ContactWatchdog(self.config.reset_torque_threshold)
+            cap = time.perf_counter() + SETTLE_TIMEOUT_S
+            deadline = time.perf_counter()
+            while time.perf_counter() < cap:
+                if stopped():
+                    return "stopped"
+                deadline += interval
+                await send_step()
+                if _check_contact(watchdog):
+                    return "contact"
+                if _settle_error() < SETTLE_TOL_RAD:
+                    return "done"
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+            return "done"
 
         set_compliant_gains(True)
         try:
             while not stopped():
                 outcome = await _play()
+                if outcome == "done":
+                    outcome = await _settle()
                 if outcome != "contact":
                     return
                 # Freeze the IK pipeline before the arms go limp — a reset
