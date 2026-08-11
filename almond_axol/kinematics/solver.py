@@ -29,6 +29,14 @@ from .model import shared_robot, shared_robot_collision
 _logger = logging.getLogger(__name__)
 
 
+Pose = tuple[np.ndarray, np.ndarray]
+"""A frame as ``(position (3,), rotation (3, 3))`` numpy arrays, world frame (FLU).
+
+The format :meth:`KinematicsSolver.fk` returns and :meth:`KinematicsSolver.ik`
+takes, so a pose can be read, edited, and solved for without conversion.
+"""
+
+
 # Convenience aliases for URDF link / joint names. The single source of
 # truth for these strings lives in :mod:`almond_axol.constants`; the helpers
 # below just compose ``"left_*"`` / ``"right_*"`` from a side-agnostic
@@ -258,6 +266,14 @@ def _pos3_to_se3(pos: np.ndarray) -> jaxlie.SE3:
     )
 
 
+def _se3_to_pose(se3: jaxlie.SE3) -> Pose:
+    """Convert an SE3 to the numpy ``(pos, rot_3x3)`` format :meth:`KinematicsSolver.ik` takes."""
+    return (
+        np.asarray(se3.translation(), dtype=np.float32),
+        np.asarray(se3.rotation().as_matrix(), dtype=np.float32),
+    )
+
+
 # ---------------------------------------------------------------------------
 # KinematicsSolver
 # ---------------------------------------------------------------------------
@@ -281,6 +297,11 @@ class KinematicsSolver:
         pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
         rot = np.eye(3, dtype=np.float32)
         q = solver.ik(q, left_pose=(pos, rot))
+
+        # fk returns the same (pos, rot_3x3) format ik takes, so nudging a
+        # pose is a round trip:
+        (l_pos, l_rot), _ = solver.fk(q)
+        q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
     """
 
     def __init__(self, config: KinematicsConfig = KinematicsConfig()) -> None:
@@ -375,24 +396,35 @@ class KinematicsSolver:
 
     # -- Public interface ----------------------------------------------------
 
-    def fk(self, q: np.ndarray) -> tuple[jaxlie.SE3, jaxlie.SE3]:
+    def fk(self, q: np.ndarray) -> tuple[Pose, Pose]:
         """Compute end-effector poses from joint positions.
 
         Args:
             q: Full ``(N,)`` joint array in radians.
 
         Returns:
-            Tuple ``(left_pose, right_pose)`` as :class:`jaxlie.SE3` transforms
-            in the robot's world frame (FLU).
+            Tuple ``(left_pose, right_pose)``, each a ``(pos (3,), rot (3, 3))``
+            pair of numpy arrays in the robot's world frame (FLU) — the same
+            format :meth:`ik` takes, so a pose can be read, nudged, and solved
+            for directly::
+
+                (l_pos, l_rot), _ = solver.fk(q)
+                q = solver.ik(q, left_pose=(l_pos + delta, l_rot))
+
+        The returned pose is the gripper *mount* frame — for the point the
+        fingers close on, see :func:`almond_axol.kinematics.path.tip_poses`.
         """
         fk = self.robot.forward_kinematics(jnp.asarray(q, dtype=jnp.float32))
-        return jaxlie.SE3(fk[self.l_ee_idx]), jaxlie.SE3(fk[self.r_ee_idx])
+        return (
+            _se3_to_pose(jaxlie.SE3(fk[self.l_ee_idx])),
+            _se3_to_pose(jaxlie.SE3(fk[self.r_ee_idx])),
+        )
 
     def ik(
         self,
         q_current: np.ndarray,
-        left_pose: tuple[np.ndarray, np.ndarray] | None = None,
-        right_pose: tuple[np.ndarray, np.ndarray] | None = None,
+        left_pose: Pose | None = None,
+        right_pose: Pose | None = None,
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
     ) -> np.ndarray:
