@@ -34,7 +34,7 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 For cloud development: `uv sync --extra sim` is sufficient.
 
-**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band wheels — `pyzed` and the self-built CUDA `jaxlib` / `jax_cuda12_*` from `~/.almond/wheels/` — and an exact sync silently removes them, which kills camera streaming (`No module named 'lerobot'`) and drops IK to CPU jax. Use `uv sync --extra sim --extra lerobot` and reinstall the wheels from `~/.almond/wheels/` (`uv pip install ~/.almond/wheels/*.whl`) afterwards.
+**On a real robot (Jetson/tegra host), never run a bare `uv sync --extra sim`.** The robot's venv also carries the `lerobot` extra plus out-of-band installs — `pyzed` (from `~/.almond/wheels/`) and PyGObject (`pygobject>=3.50,<3.52`, built against the system gobject-introspection) — and an exact sync silently removes them, which kills camera streaming (`No module named 'lerobot'`, no `gi` for the gst relay). Restore with `uv sync --extra sim --extra lerobot` then `uv pip install ~/.almond/wheels/pyzed-*.whl "pygobject>=3.50,<3.52"`. Do **not** install the self-built `jaxlib` / `jax_cuda12_*` wheels from `~/.almond/wheels/` — they were compiled against cuDNN 9.8 while JetPack ships 9.3, so the IK worker's first solve crashes (`RET_CHECK failure ... dnn_support != nullptr`); the lock's CPU jaxlib runs IK at full teleop rate.
 
 ### Gotchas
 
