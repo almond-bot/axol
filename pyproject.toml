@@ -42,8 +42,6 @@ gamepad = ["pygame>=2.6"]
 lerobot = ["lerobot[dataset,viz,async]>=0.6.1"]
 sim = ["viser>=1.0.24"]
 
-[tool.uv.sources]
-lerobot = { git = "https://github.com/huggingface/lerobot.git", rev = "22bd7a2f489b367d8df42de803b1e8c4ca63a3f9" }
 [project.scripts]
 axol = "almond_axol.cli:main"
 
