@@ -1,8 +1,9 @@
-"""Host-side reader for the axol_umi handheld trigger's CAN messages.
+"""Host-side reader for the Mantis UMI handheld trigger's CAN messages.
 
-The axol_umi rig's onboard MCU (RP2350 running can2040 PIO CAN) sits on
-the same per-side gripper CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``,
-SocketCAN, 1 Mbit/s) as the Damiao gripper motor and continuously
+The Mantis UMI's onboard MCU (RP2350 running can2040 PIO CAN — the
+``axol_umi`` board in the circuits-tsx repo) sits on the same per-side
+gripper CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``, SocketCAN,
+1 Mbit/s) as the Damiao gripper motor and continuously
 publishes the trigger state. SocketCAN delivers every frame to every
 open socket, so :class:`TriggerReader` opens its own filtered bus and
 coexists with the gripper driver's socket on the same interface without
@@ -164,7 +165,7 @@ class TriggerReader:
                 import can
             except ImportError as exc:  # pragma: no cover - env-dependent
                 raise RuntimeError(
-                    "python-can is required to read the axol_umi trigger "
+                    "python-can is required to read the Mantis UMI trigger "
                     "(install the project dependencies with `uv sync`)"
                 ) from exc
             bus = can.Bus(

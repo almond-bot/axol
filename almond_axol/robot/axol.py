@@ -128,7 +128,7 @@ async def calibrate_gripper_open_stop(motor: Motor) -> float:
 
     Steps the motor incrementally toward open until the torque magnitude
     reaches ``_GRIPPER_TORQUE_THRESHOLD`` (the open hard-stop), or the full
-    travel has been swept. Shared by :class:`AxolArm` and the handheld UMI rig
+    travel has been swept. Shared by :class:`AxolArm` and the Mantis UMI
     (:mod:`almond_axol.robot.umi`), whose grippers are the same Damiao unit.
 
     Must be called with the motor already enabled and in IMPEDANCE mode.

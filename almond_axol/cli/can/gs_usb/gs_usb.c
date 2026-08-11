@@ -28,7 +28,7 @@
 #define USB_CANDLELIGHT_PRODUCT_ID 0x2323
 
 /* CANable 2.0 running the stock canable2 firmware (github.com/normaldotcom/
- * canable2) — the off-the-shelf adapters used by the handheld UMI rig. */
+ * canable2) — gs_usb-compatible adapters like the Mantis UMI's CAN board. */
 #define USB_CANABLE2_VENDOR_ID     0x16d0
 #define USB_CANABLE2_PRODUCT_ID    0x117e
 

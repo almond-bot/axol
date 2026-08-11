@@ -69,7 +69,7 @@ _logger = logging.getLogger(__name__)
 
 
 def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
-    """Rewrite the parsed config for handheld UMI collection (``--umi``).
+    """Rewrite the parsed config for Mantis UMI collection (``--umi``).
 
     Robot side: swap a plain :class:`AxolRobotConfig` for
     :class:`UmiRobotConfig` (handheld grippers on ``can_alm_umi_l/r``, virtual
@@ -369,7 +369,7 @@ class CollectDataConfig:
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
 
-    ``--umi true`` records with the handheld UMI rig instead of the robot:
+    ``--umi true`` records with the Mantis UMI instead of the robot:
     grippers on ``can_alm_umi_l/r``, wrist cameras only, absolute
     (world-anchored) pose mapping, dataset rows stamped with the VR pose
     capture time, and the Cartesian EE-pose schema (state/action are absolute
@@ -686,7 +686,7 @@ def _run(
 
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
-    # The UMI rig always has grippers, so only the real robot propagates.
+    # The Mantis UMI always has grippers, so only the real robot propagates.
     if (
         not umi_mode
         and isinstance(cfg.robot_config, AxolRobotConfig)
@@ -1118,7 +1118,7 @@ def _run(
             # motion is unchanged — only the stored representation differs.
             #
             # Row timestamp: on the robot the loop tick is correct (state and
-            # image both describe the physical robot at t0). On the UMI rig the
+            # image both describe the physical robot at t0). On the Mantis UMI the
             # pose stream *is* the plant's ground truth, so the row is stamped
             # with the pose's capture time — the moment the hand was actually
             # there — keeping it on the same capture timeline as the camera

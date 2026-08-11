@@ -1,6 +1,6 @@
-"""Hardware control for the handheld UMI data-collection rig.
+"""Hardware control for the Mantis UMI handheld data-collection rig.
 
-The UMI rig is a pair of handheld devices — a Quest controller rigidly mounted
+The Mantis UMI is a pair of handheld devices — a Quest controller rigidly mounted
 to the same Damiao gripper the robot uses — held by a human demonstrator. Each
 gripper sits alone on its own CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``)
 at the production gripper CAN ID (0x08).
@@ -131,7 +131,7 @@ class UmiGripperArm:
 
 
 class Umi(RobotBase):
-    """Dual handheld UMI grippers behind the ``Axol`` control surface.
+    """The Mantis UMI's dual handheld grippers behind the ``Axol`` control surface.
 
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning
@@ -236,7 +236,7 @@ class Umi(RobotBase):
     # -- Axol-surface stubs -----------------------------------------------------
 
     async def gravity_compensate(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError("The UMI rig has no arm to gravity-compensate.")
+        raise NotImplementedError("The Mantis UMI has no arm to gravity-compensate.")
 
     def reset_command_state(self) -> None:
         """No command history to clear — the arms are virtual."""

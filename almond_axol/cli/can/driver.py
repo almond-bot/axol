@@ -52,7 +52,7 @@ def is_driver_available() -> bool:
 # USB IDs the installed driver must claim (modinfo alias fragments). A driver
 # missing any of them predates the vendored source and is rebuilt: 1d50:606f is
 # the Axol Hub / candleLight adapters, 16d0:117e is the off-the-shelf CANable
-# 2.0 used by the handheld UMI rig.
+# 2.0 used by the Mantis UMI.
 _REQUIRED_ALIASES = ("v1D50p606F", "v16D0p117E")
 
 

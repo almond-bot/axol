@@ -29,7 +29,7 @@ CAN_RIGHT = "can_alm_axol_r"
 # so this can't be the more readable "can_alm_axol_base".
 CAN_BASE = "can_alm_axol_b"
 
-# Handheld UMI data-collection rig: one dual-channel adapter, each channel
+# Mantis UMI handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
 CAN_UMI_LEFT = "can_alm_umi_l"
 CAN_UMI_RIGHT = "can_alm_umi_r"

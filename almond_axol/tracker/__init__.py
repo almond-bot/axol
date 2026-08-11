@@ -1,4 +1,4 @@
-"""Headset-free pose sources for teleop: Vive trackers on the UMI rig.
+"""Headset-free pose sources for teleop: Vive trackers on the Mantis UMI.
 
 This package feeds the existing VR teleop stack from HTC Vive trackers
 instead of a Quest headset. A :class:`TrackerSource` backend produces

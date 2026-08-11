@@ -1,4 +1,4 @@
-"""Configuration dataclass for the handheld UMI rig as a LeRobot Robot."""
+"""Configuration dataclass for the Mantis UMI as a LeRobot Robot."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .config_axol import AxolRobotConfig
 @RobotConfig.register_subclass("axol_umi")
 @dataclass
 class UmiRobotConfig(AxolRobotConfig):
-    """Configuration for the handheld UMI data-collection rig.
+    """Configuration for the Mantis UMI handheld data-collection rig.
 
     Identical to :class:`AxolRobotConfig` — same camera slots, gains, and
     observation options, so recorded datasets keep the robot schema — but the

@@ -1,7 +1,7 @@
 """
 axol umi.latency
 
-Pose↔image latency validation for the UMI rig (exUMI method).
+Pose↔image latency validation for the Mantis UMI (exUMI method).
 
 UMI training pairs each wrist-camera frame with the tracker pose captured at
 the same instant, and the recorder already does nearest-timestamp matching on

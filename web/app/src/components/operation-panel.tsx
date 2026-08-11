@@ -94,7 +94,7 @@ export function OperationPanel({
 
   const isSim = isSimRun(meta, settings)
   // Sim, or a run that never touches the arms (teleop's cart-only mode, or
-  // the handheld UMI rig on its own CAN buses): either way the
+  // the Mantis UMI on its own CAN buses): either way the
   // arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"

@@ -1,7 +1,7 @@
 """
 axol umi.session
 
-Zero-touch UMI data-collection session for a dedicated ("UMI") Jetson.
+Zero-touch Mantis UMI data-collection session for a dedicated Jetson.
 
 Runs the whole rig stack unattended: starts ``axol serve`` (control panel +
 web app) and ``axol teleop --umi`` as supervised children, then watches USB
@@ -12,8 +12,8 @@ left are putting the headset on and pulling the trigger once to enter AR
 (a browser-enforced user gesture; it cannot be scripted).
 
 ``axol umi.session --install`` writes and enables a systemd service so the
-session starts on every boot, turning the machine into a dedicated UMI
-Jetson. First-time note: the headset browser must accept the self-signed
+session starts on every boot, turning the machine into a dedicated
+Mantis UMI Jetson. First-time note: the headset browser must accept the self-signed
 certificates once (the page opens automatically; approve the interstitials);
 after that, sessions are hands-free.
 """
@@ -38,7 +38,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``umi.session`` subcommand."""
     parser = subparsers.add_parser(
         "umi.session",
-        help="Run the zero-touch UMI rig session (or --install it as a boot service).",
+        help="Run the zero-touch Mantis UMI session (or --install it as a boot service).",
     )
     parser.add_argument(
         "--install",
@@ -156,7 +156,7 @@ def _install() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     user = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
     unit = f"""[Unit]
-Description=Almond UMI rig session (serve + teleop --umi + Quest bootstrap)
+Description=Almond Mantis UMI session (serve + teleop --umi + Quest bootstrap)
 After=network-online.target
 
 [Service]
@@ -174,14 +174,14 @@ WantedBy=multi-user.target
     run_root(["tee", str(_SERVICE_PATH)], input_text=unit, check=True)
     run_root(["systemctl", "daemon-reload"], check=True)
     run_root(["systemctl", "enable", "--now", "axol-umi.service"], check=True)
-    print("Done — this machine now runs the UMI session on boot.")
+    print("Done — this machine now runs the Mantis UMI session on boot.")
     print("  status : systemctl status axol-umi")
     print("  logs   : journalctl -fu axol-umi")
     print("  remove : sudo systemctl disable --now axol-umi")
 
 
 def run(args: object = None) -> None:
-    """Run the UMI session, or install it as a boot service with --install."""
+    """Run the Mantis UMI session, or install it as a boot service with --install."""
     if getattr(args, "install", False):
         _install()
     else:

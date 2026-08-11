@@ -23,13 +23,13 @@ controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
 the disconnects at their source; the hotplug bring-up covers whatever still
 gets through.
 
-``axol can.setup --umi`` configures the handheld UMI data-collection rig
+``axol can.setup --umi`` configures the Mantis UMI handheld data-collection rig
 instead. The rig uses the **same dual-channel board** as the arm hub (one
 USB device, keyed by its serial), with one gripper bus per channel:
   channel 0 (dev_id 0x0) -> can_alm_umi_l  (left gripper: motor + trigger)
   channel 1 (dev_id 0x1) -> can_alm_umi_r  (right gripper)
 The two profiles use separate udev rule files, startup scripts, and hotplug
-units, so a machine can have both the robot and the UMI rig configured at
+units, so a machine can have both the robot and the Mantis UMI configured at
 once — serials claimed by one profile's rules are excluded when scanning
 for the other's adapter.
 """
@@ -100,7 +100,7 @@ _AXOL_PROFILE = _Profile(
 )
 
 _UMI_PROFILE = _Profile(
-    label="Almond UMI rig",
+    label="Almond Mantis UMI",
     left=CAN_UMI_LEFT,
     right=CAN_UMI_RIGHT,
     rules_file=Path("/etc/udev/rules.d/91-can-umi.rules"),
@@ -135,9 +135,10 @@ def _udev_attr(info: str, attr: str) -> str:
 def _scan_adapters() -> dict[str, dict]:
     """Every attached gs_usb CAN adapter: serial -> {vid, pid, dev_ids}.
 
-    The dual-channel Axol arm hub shows up as one serial with dev_ids {0, 1};
-    a single-channel adapter (the cart's wheel-bus CANable, a UMI rig, ...)
-    as one serial with {0}. Matched on the gs_usb driver rather than a VID/PID
+    Dual-channel boards (the Axol arm hub, the Mantis UMI) show up as one
+    serial with dev_ids {0, 1}; a single-channel adapter (the cart's
+    wheel-bus CANable) as one serial with {0}. Matched on the gs_usb driver
+    rather than a VID/PID
     so CANable firmware variants that don't use the candlelight 1d50:606f IDs
     still count; the Jetson's built-in mttcan controller has no USB serial and
     is excluded either way.
@@ -166,11 +167,13 @@ def _scan_adapters() -> dict[str, dict]:
 
 
 def _detect_serials() -> list[str]:
-    """Serials of every attached *dual-channel* Axol adapter — hub candidates.
+    """Serials of every attached *dual-channel* Axol adapter.
 
-    Single-channel devices (the cart's wheel-bus adapter, UMI rigs) share the
-    generic VID/PID but can never be the hub, so they are excluded rather
-    than left to make the scan ambiguous.
+    Candidates for the arm hub or the Mantis UMI (same board — the caller
+    disambiguates via the other profile's claimed serials). Single-channel
+    devices (the cart's wheel-bus adapter) share the generic VID/PID but can
+    never be either, so they are excluded rather than left to make the scan
+    ambiguous.
     """
     return [
         serial
@@ -232,7 +235,7 @@ def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
 def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
     """A profile's adapter serial as pinned by a *previous* setup, if any.
 
-    Preferred over live adapter detection: the arm hub and the UMI rig use
+    Preferred over live adapter detection: the arm hub and the Mantis UMI use
     the same dual-channel board (same VID/PID), so a host with both attached
     is ambiguous to a fresh scan — but not to a machine that has already
     named the profile's interfaces or written its udev rules.
@@ -251,8 +254,8 @@ def _configured_base_serial() -> str | None:
 
     Never auto-detected outside the interactive ``axol can.setup`` flow: a
     single-channel candlelight adapter is indistinguishable from unrelated
-    hardware (UMI rigs), so only a serial the operator has already confirmed
-    — a live ``can_alm_axol_b`` interface or a written udev rule — counts.
+    hardware, so only a serial the operator has already confirmed — a live
+    ``can_alm_axol_b`` interface or a written udev rule — counts.
     """
     return _serial_of_interface(_CAN_B) or _rules_serial_for(_CAN_B)
 
@@ -264,7 +267,7 @@ def _resolve_serial() -> str:
     the pinned serial in the udev rules) wins outright, so re-running setup on
     an already-configured host works no matter how many other candlelight
     adapters are attached. Only a genuinely fresh machine falls back to live
-    detection, where serials the UMI rig's rules already claim are excluded —
+    detection, where serials the Mantis UMI's rules already claim are excluded —
     the rig uses the same dual-channel board as the hub (1d50:606f), so with
     the rig plugged in it would otherwise make the robot's adapter ambiguous.
     Raises ``RuntimeError`` when zero or several candidates remain, since that
@@ -290,7 +293,7 @@ def _find_serial(profile: _Profile) -> str:
 
     unique = _detect_serials()
 
-    # The arm hub and the UMI rig use the same dual-channel board, so hide
+    # The arm hub and the Mantis UMI use the same dual-channel board, so hide
     # serials the *other* profile's rules already claim — the obvious
     # single-adapter case then stays promptless even with both attached.
     other = _UMI_PROFILE if profile is _AXOL_PROFILE else _AXOL_PROFILE
@@ -482,7 +485,7 @@ def _write_hotplug_unit(profile: _Profile) -> None:
     (see :func:`_write_udev_rules`), so every (re-)enumeration — boot or a
     mid-session USB drop — runs the startup script and the interfaces come
     back configured and up within a second, no operator action needed. The
-    UMI rig gets its own unit: the handheld is unplugged far more often
+    Mantis UMI rig gets its own unit: the handheld is unplugged far more often
     than the arm hub.
     """
     print(
@@ -583,12 +586,12 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.setup`` subcommand."""
     parser = subparsers.add_parser(
         "can.setup",
-        help="Configure CAN interfaces for the Axol arm (or the UMI rig with --umi).",
+        help="Configure CAN interfaces for the Axol arm (or the Mantis UMI with --umi).",
     )
     parser.add_argument(
         "--umi",
         action="store_true",
-        help="Configure the handheld UMI rig's dual-channel adapter "
+        help="Configure the Mantis UMI's dual-channel adapter "
         f"(channel 0 -> {CAN_UMI_LEFT}, channel 1 -> {CAN_UMI_RIGHT}).",
     )
     parser.set_defaults(func=run)
@@ -602,7 +605,7 @@ def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
     where TX still works but no received frame is ever delivered (kernel-side
     everything looks healthy — UP, ERROR-ACTIVE, correct bitrate). Probes the
     profile's ``probe_joint`` — the shoulder on the robot arm, the gripper on
-    the UMI rig (its buses carry nothing else).
+    the Mantis UMI (its buses carry nothing else).
     """
     import asyncio
 
@@ -703,7 +706,7 @@ def is_configured() -> bool:
 
     Used by the control panel to decide whether connecting needs to run the
     full :func:`ensure_setup` (first time on a machine) or can just bring the
-    already-named interfaces up. Refers to the robot-arm profile; the UMI rig
+    already-named interfaces up. Refers to the robot-arm profile; the Mantis UMI
     is configured explicitly via ``axol can.setup --umi``.
     """
     return (
@@ -749,7 +752,7 @@ def _find_base_serial(hub_serial: str) -> str | None:
 
     A previously pinned adapter is kept without prompting; otherwise any
     attached single-channel candlelight adapter is offered — except serials
-    the UMI rig's rules already claim (a belt-and-braces guard; the rig's
+    the Mantis UMI's rules already claim (a belt-and-braces guard; the rig's
     board is dual-channel, so it should never appear here). Opt-in ([y/N])
     because a single-channel adapter isn't necessarily a cart — it could be
     any other candlelight device on the host.
