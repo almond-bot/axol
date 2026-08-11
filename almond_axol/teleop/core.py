@@ -30,18 +30,26 @@ adapters.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import multiprocessing.connection
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import numpy as np
 
+from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
+
+# How long a guarded-return contact hold keeps waiting for a reset press
+# after the VR frame stream has gone dead (headset exited XR or died —
+# nobody is left to press reset). Long enough to free a hooked gripper
+# calmly; then the hold settles into a position hold where the arms are.
+_HOLD_ORPHAN_GRACE_S = 30.0
 
 
 def recv_with_timeout(
@@ -115,6 +123,22 @@ class VRTeleopCore:
         # Reset latch (set from the VR frame callback / programmatically).
         self._prev_reset: bool = False
         self._reset_latched: bool = False
+        # True from reset dispatch (latch consumed) until the planned
+        # trajectory is adopted, so ``is_resetting`` has no false window
+        # while the IK worker plans (planning can take seconds).
+        self._reset_dispatching: bool = False
+        # Set by cancel_reset() while a dispatch is in flight: the planning
+        # round trip can't be interrupted, so the dispatch drops its result
+        # instead of adopting a trajectory the caller no longer wants.
+        self._reset_cancel: bool = False
+
+        # IK pipeline pause (set while the arms are moved out-of-band, e.g.
+        # hand-guided under gravity compensation). While paused the IK loop
+        # idles: no frames are dispatched, grips can't engage tracking, and a
+        # latched reset is *held* — the owner re-syncs ``q`` to the measured
+        # positions (see :meth:`resync_to_positions`) before resuming, so the
+        # reset trajectory plans from where the arms actually are.
+        self._ik_paused: bool = False
 
         # Arrival time of the most recent raw VR frame (written on the VR
         # server thread in note_frame_reset, read on the IK thread). Drives
@@ -165,6 +189,35 @@ class VRTeleopCore:
         if trajectory:
             self.reset_interp.set_trajectory(trajectory, self.l_grip, self.r_grip)
 
+    def resync_to_positions(
+        self, cur_left: np.ndarray | None, cur_right: np.ndarray | None
+    ) -> None:
+        """Re-adopt the measured arm positions after an out-of-band move.
+
+        Call while the IK loop is paused (:meth:`pause_ik`), after the arms
+        were moved outside teleop (e.g. hand-guided under gravity comp):
+        writes the measured joints into the raw IK solution ``q`` — so the
+        next reset plans from where the arms actually are — and re-seeds the
+        grips and smoothing filters so the first command back out produces no
+        transient. ``cur_left`` / ``cur_right`` are ``(>=8,)`` position
+        vectors (7 arm joints + gripper, gripper normalized [0, 1]); ``None``
+        skips that arm.
+        """
+        if self.q is not None:
+            q = self.q.copy()
+            if cur_left is not None and self.left_indices:
+                q[self.left_indices] = np.asarray(cur_left[:7], dtype=np.float32)
+            if cur_right is not None and self.right_indices:
+                q[self.right_indices] = np.asarray(cur_right[:7], dtype=np.float32)
+            self.q = q
+        self.set_initial_grips(
+            float(cur_left[7]) if cur_left is not None and len(cur_left) > 7 else None,
+            float(cur_right[7])
+            if cur_right is not None and len(cur_right) > 7
+            else None,
+        )
+        self.seed_filters(cur_left, cur_right)
+
     # ------------------------------------------------------------------
     # Reset control
     # ------------------------------------------------------------------
@@ -210,10 +263,61 @@ class VRTeleopCore:
         """
         self._reset_latched = False
 
+    def cancel_reset(self) -> None:
+        """Abandon a pending, planning, or playing reset move.
+
+        Clears the latch, cancels any trajectory playback, and marks an
+        in-flight planning dispatch so its result is dropped when it returns
+        (the blocking round trip itself can't be interrupted). Used by
+        guarded moves that bail out on contact: call :meth:`pause_ik` first
+        so no new dispatch can start, then this. Safe from any thread.
+        """
+        self._reset_latched = False
+        self._reset_cancel = True
+        self.reset_interp.clear()
+
+    @property
+    def reset_pending(self) -> bool:
+        """True while a reset press is latched but not yet dispatched.
+
+        Distinct from :attr:`is_resetting`, which also covers planning and
+        playback: a paused IK loop holds the latch (see :meth:`pause_ik`),
+        so this is the "operator asked to go home" signal a hold loop waits
+        on.
+        """
+        return self._reset_latched
+
     @property
     def is_resetting(self) -> bool:
-        """True while a reset is pending or a reset trajectory is playing back."""
-        return self._reset_latched or self.reset_interp.is_active()
+        """True while a reset is pending, being planned, or playing back."""
+        return (
+            self._reset_latched
+            or self._reset_dispatching
+            or self.reset_interp.is_active()
+        )
+
+    # ------------------------------------------------------------------
+    # IK pipeline pause (out-of-band moves)
+    # ------------------------------------------------------------------
+
+    def pause_ik(self) -> None:
+        """Idle the IK loop while the arms are moved out-of-band.
+
+        While paused, VR frames are not dispatched (grips can't engage
+        tracking) and a latched reset press is held instead of dispatched, so
+        it can't plan from a solution that no longer matches the hand-guided
+        arms. Re-sync with :meth:`resync_to_positions`, then
+        :meth:`resume_ik`. Safe to call from any thread.
+        """
+        self._ik_paused = True
+
+    def resume_ik(self) -> None:
+        """Resume the IK loop after :meth:`pause_ik`.
+
+        A reset latched during the pause dispatches on the next IK loop
+        iteration, planning from the (re-synced) current ``q``.
+        """
+        self._ik_paused = False
 
     # ------------------------------------------------------------------
     # Engage toggle + IK target (IK thread)
@@ -326,6 +430,147 @@ class VRTeleopCore:
         return out
 
     # ------------------------------------------------------------------
+    # Guarded return-to-rest (hardware flows)
+    # ------------------------------------------------------------------
+
+    async def guarded_return(
+        self,
+        *,
+        send_step: Callable[[], Awaitable[object]],
+        gravity_step: Callable[[], Awaitable[object]],
+        torque_residuals: Callable[[], tuple[object, object]],
+        reset_command_state: Callable[[], None],
+        get_positions: Callable[[], tuple[np.ndarray, np.ndarray]],
+        stopped: Callable[[], bool],
+        announce: Callable[[str], None],
+        on_contact: Callable[[], None] | None = None,
+        hold_tick: Callable[[], None] | None = None,
+        vr_alive: Callable[[], bool] | None = None,
+        move_timeout_s: float = 30.0,
+    ) -> None:
+        """Play the pending return-to-rest guarded by the contact watchdog.
+
+        The single engine behind every VR-flow rest move (native ``axol
+        teleop`` and ``collect-data``), so the sequencing cannot drift
+        between them. Await with a reset already pending or playing
+        (``is_resetting``); returns once the arms are home or the flow
+        stopped. The move plays at the normal session gains — accurate
+        tracking of the collision-checked path — and a torque residual
+        sustained above ``config.reset_torque_threshold`` (see
+        :class:`~almond_axol.robot.control.ContactWatchdog`) cancels it
+        where it is and drops the arms into a limp gravity-comp hold. The
+        operator hand-guides them clear and presses reset, which replans
+        from wherever they were left.
+
+        Args:
+            send_step: Advance the flow's control pipeline by one step —
+                compute the smoothed output (which plays the trajectory) and
+                command the robot. Must call :meth:`compute_output` exactly
+                once.
+            gravity_step: Apply one gravity-compensation cycle (the hold).
+            torque_residuals: ``(left, right)`` per-joint measured-minus-
+                gravity torques, ``None`` for an absent arm.
+            reset_command_state: Clear the robot's command history after the
+                arms moved out-of-band (max-step safety check).
+            get_positions: Measured ``(left, right)`` arm positions used to
+                re-sync the pipeline after hand-guiding.
+            stopped: Flow shutdown flag; checked every cycle.
+            announce: Operator-facing status line (e.g. ``log_say``).
+            on_contact: Extra flow hook run once per trip, before the hold
+                (e.g. unblock the headset's reset button).
+            hold_tick: Flow hook run every hold cycle (e.g. consume teleop
+                events so a stray record press is answered).
+            vr_alive: Whether VR frames are still arriving. When given, a
+                contact hold whose frame stream has been dead for a grace
+                period is *orphaned* — the reset press that ends it can
+                never come (a Y-exit return, a headset that died) — so the
+                hold settles into a position hold where the arms are and
+                the guarded return ends; reconnecting and pressing reset
+                resumes the normal path. ``None`` waits indefinitely.
+            move_timeout_s: Cap on each individual play attempt.
+        """
+        interval = 1.0 / self.config.frequency
+
+        async def _play() -> str:
+            """One guarded play attempt: ``done`` | ``contact`` | ``stopped``."""
+            watchdog = ContactWatchdog(self.config.reset_torque_threshold)
+            cap = time.perf_counter() + move_timeout_s
+            deadline = time.perf_counter()
+            while self.is_resetting and time.perf_counter() < cap:
+                if stopped():
+                    return "stopped"
+                deadline += interval
+                await send_step()
+                tripped = watchdog.update(torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    self._logger.warning(
+                        "return-to-rest contact: %s torque residual %.1f "
+                        "exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        self.config.reset_torque_threshold,
+                    )
+                    return "contact"
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+            return "stopped" if stopped() else "done"
+
+        while not stopped():
+            outcome = await _play()
+            if outcome != "contact":
+                return
+            # Freeze the IK pipeline before the arms go limp — a reset
+            # latched during the hold must not dispatch from a solution
+            # the hand-guided arms no longer match — then drop the
+            # interrupted plan.
+            self.pause_ik()
+            self.cancel_reset()
+            if on_contact is not None:
+                on_contact()
+            announce("Contact. Arms are free — press reset to continue.")
+            deadline = time.perf_counter()
+            orphan_since: float | None = None
+            orphaned = False
+            while not stopped() and not self.reset_pending:
+                deadline += interval
+                await gravity_step()
+                if hold_tick is not None:
+                    hold_tick()
+                # Orphaned hold: the VR frame stream is dead (Y-exit
+                # return, headset died), so the reset press that ends
+                # this hold can never arrive. After the grace period,
+                # stop waiting and settle where the arms are.
+                if vr_alive is not None:
+                    now = time.perf_counter()
+                    if vr_alive():
+                        orphan_since = None
+                    elif orphan_since is None:
+                        orphan_since = now
+                    elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
+                        orphaned = True
+                        break
+                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+            if stopped():
+                return
+            # Hand position control back from wherever the operator left
+            # the arms: clear the stale command history (max-step safety
+            # check) and re-seed the pipeline from the measured
+            # positions, so the first commands hold the true pose with
+            # no transient — and, on a reset press, the replan starts
+            # from it.
+            reset_command_state()
+            pos_l, pos_r = get_positions()
+            self.resync_to_positions(pos_l, pos_r)
+            self.resume_ik()
+            if orphaned:
+                announce(
+                    "No headset connected — holding position here. "
+                    "Reconnect and press reset to return to rest."
+                )
+                return
+            announce("Returning to rest pose.")
+
+    # ------------------------------------------------------------------
     # IK dispatch loop (IK thread)
     # ------------------------------------------------------------------
 
@@ -359,6 +604,12 @@ class VRTeleopCore:
         last_dead_warn = 0.0
 
         while not stop_event.is_set():
+            # Paused (arms moved out-of-band, e.g. gravity comp): idle without
+            # dispatching frames or a latched reset — see :meth:`pause_ik`.
+            if self._ik_paused:
+                time.sleep(0.02)
+                continue
+
             t0 = time.perf_counter()
 
             # Reset (return-to-rest) takes priority over normal tracking. Leave
@@ -370,10 +621,20 @@ class VRTeleopCore:
                 and not self.reset_interp.is_active()
             ):
                 self._reset_latched = False
+                self._reset_cancel = False
+                # Keep is_resetting true across the (possibly seconds-long)
+                # planning round trip so callers waiting on it don't observe a
+                # false gap between the latch and the trajectory playback.
+                self._reset_dispatching = True
                 try:
                     conn.send(("reset", self.q.copy()))
                     result = conn.recv()
-                    if isinstance(result, tuple) and result[0] == "reset_traj":
+                    if self._reset_cancel:
+                        # cancel_reset() fired mid-planning: drop the plan —
+                        # the owner took the arms out-of-band and re-syncs q
+                        # before any next dispatch.
+                        pass
+                    elif isinstance(result, tuple) and result[0] == "reset_traj":
                         _, q_default, trajectory = result
                         if trajectory:
                             self.reset_interp.set_trajectory(
@@ -388,6 +649,9 @@ class VRTeleopCore:
                         self.q = np.asarray(q_default, dtype=np.float32)
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
                     self._logger.error("Reset error: %s", e)
+                finally:
+                    self._reset_dispatching = False
+                    self._reset_cancel = False
                 self._pace(t0, ik_interval)
                 continue
 

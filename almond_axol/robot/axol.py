@@ -1154,6 +1154,25 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n)
         self._meas_vel_diff = Differentiator(n=n)
 
+    def torque_residuals(self) -> np.ndarray:
+        """Measured minus model-gravity torque per arm joint, shape (7,).
+
+        Both terms are evaluated at the cached measured positions, so during
+        slow, quasi-static moves the residual background is just friction
+        plus tracking effort; unexpected contact (a gripper still hooked on
+        the scene, an operator grabbing the arm) shows up as a residual well
+        above that background. Units are the motor's reported torque units
+        (Nm on Damiao). Entries are in :data:`ARM_JOINTS` order; the gripper
+        is excluded (position-force mode — its torque tracks grasp effort,
+        not contact). Requires fresh feedback (telemetry or streaming
+        commands, whose replies refresh the position/torque cache).
+        """
+        positions = self.positions
+        arm_q = positions[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        tau = self.torques[: len(ARM_JOINTS)].astype(np.float32)
+        return tau - gravity
+
 
 class Axol(RobotBase):
     """Dual-arm Axol robot interface.
@@ -1699,3 +1718,15 @@ class Axol(RobotBase):
             self.left.reset_command_state()
         if self.right is not None:
             self.right.reset_command_state()
+
+    def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm measured-minus-gravity torques, ``(left, right)``.
+
+        Each present arm contributes a shape ``(7,)`` array in
+        :data:`ARM_JOINTS` order (``None`` for an absent arm). See
+        :meth:`AxolArm.torque_residuals` for semantics; reads only the
+        telemetry cache, so it costs no CAN traffic.
+        """
+        left = self.left.torque_residuals() if self.left is not None else None
+        right = self.right.torque_residuals() if self.right is not None else None
+        return left, right

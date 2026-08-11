@@ -1,4 +1,4 @@
-"""Motor control utilities: friction model and velocity differentiator.
+"""Motor control utilities: friction model, differentiator, contact watchdog.
 
 Gravity compensation is handled separately — see
 :class:`almond_axol.robot.gravity.GravityCompensator` — because the simple
@@ -11,8 +11,82 @@ from __future__ import annotations
 import math
 import time
 
+from ..constants import ARM_JOINTS
+
 # Cutoff frequency for the velocity differentiator low-pass filter (Hz)
 CUTOFF_FREQ = 20.0
+
+# How long a torque residual must stay above the watchdog threshold before a
+# guarded move is judged to have hit something. Long enough to ride out
+# feedforward transients and single noisy samples, short enough that the
+# pull on the scene stays brief.
+CONTACT_DEBOUNCE_S = 0.15
+
+
+class ContactWatchdog:
+    """Debounced measured-vs-gravity torque contact detector.
+
+    Feed one per-arm torque-residual sample per control step (see
+    :meth:`almond_axol.robot.axol.AxolArm.torque_residuals`); once any
+    joint's residual magnitude stays above ``threshold`` for
+    ``debounce_s``, :meth:`update` reports the offending joint. Used by the
+    guarded return-to-rest moves to tell "the move is pushing/pulling on
+    something that isn't in the plan" — a gripper still hooked on the
+    scene, or an operator grabbing an arm — apart from the friction /
+    model-error background.
+
+    Args:
+        threshold: Residual magnitude (motor torque units — Nm on Damiao)
+            above which a joint counts as in contact. ``<= 0`` disables the
+            watchdog (:meth:`update` never trips).
+        debounce_s: How long the residual must stay above ``threshold``
+            before tripping.
+    """
+
+    def __init__(self, threshold: float, debounce_s: float = CONTACT_DEBOUNCE_S):
+        self.threshold = threshold
+        self.debounce_s = debounce_s
+        self._since: float | None = None
+
+    def update(self, residuals, now: float | None = None) -> tuple[str, float] | None:
+        """Feed one sample; return the tripped joint, or ``None``.
+
+        Args:
+            residuals: ``(left, right)`` arrays of per-arm-joint torque
+                residuals in :data:`ARM_JOINTS` order (``None`` for an
+                absent arm), as returned by ``torque_residuals()``.
+            now: Sample time (``time.perf_counter()``); defaults to now.
+
+        Returns:
+            ``("left ELBOW", residual)`` for the worst joint once contact
+            has been sustained for ``debounce_s``, else ``None``. The
+            debounce state resets whenever every joint drops back under the
+            threshold.
+        """
+        if self.threshold <= 0:
+            return None
+        if now is None:
+            now = time.perf_counter()
+        worst = 0.0
+        worst_joint = ""
+        for side, res in zip(("left", "right"), residuals):
+            if res is None:
+                continue
+            for i, value in enumerate(res):
+                mag = abs(float(value))
+                if mag > worst:
+                    worst = mag
+                    worst_joint = f"{side} {ARM_JOINTS[i].name}"
+        if worst <= self.threshold:
+            self._since = None
+            return None
+        if self._since is None:
+            self._since = now
+            return None
+        if now - self._since >= self.debounce_s:
+            self._since = None
+            return worst_joint, worst
+        return None
 
 
 def compute_friction(
