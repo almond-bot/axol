@@ -26,8 +26,12 @@ this package is a thin shim that registers them with LeRobot at CLI startup.
 
 ## Install
 
-One command — the plugin pulls in `almond-axol` (and its pinned dependencies)
-automatically; both are distributed from GitHub, not PyPI:
+```bash
+pip install lerobot_robot_axol
+```
+
+This pulls in `almond-axol[lerobot]` automatically. To install from source
+instead:
 
 ```bash
 pip install "lerobot_robot_axol @ git+https://github.com/almond-bot/axol#subdirectory=plugins/lerobot_robot_axol"
@@ -38,7 +42,7 @@ If you already installed the `axol` CLI via the
 that environment instead:
 
 ```bash
-uv tool install --with "lerobot_robot_axol @ git+https://github.com/almond-bot/axol#subdirectory=plugins/lerobot_robot_axol" almond-axol
+uv tool install --with lerobot_robot_axol almond-axol
 ```
 
 ## Usage

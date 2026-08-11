@@ -1,14 +1,19 @@
-# Publish almond-axol to PyPI on every published GitHub release, via PyPI
-# trusted publishing (OIDC) — no tokens or secrets required.
+# Publish almond-axol and lerobot_robot_axol to PyPI on every published
+# GitHub release, via PyPI trusted publishing (OIDC) — no tokens or secrets
+# required.
 #
 # One-time PyPI setup (org owner): on the organization's Publishing page
 # (https://pypi.org/manage/organization/<org>/publishing/), add a pending
-# publisher with project name `almond-axol`, owner `almond-bot`, repository
-# `axol`, workflow `publish.yml`, environment blank. The first release after
-# that creates the PyPI project owned by the organization.
+# publisher for EACH project — names `almond-axol` and `lerobot_robot_axol` —
+# both with owner `almond-bot`, repository `axol`, workflow `publish.yml`,
+# environment blank. One OIDC token covers every project that trusts these
+# claims, so a single upload step publishes both. The first release after
+# that creates the PyPI projects owned by the organization.
 #
-# The published version is whatever `version` in pyproject.toml says at the
-# release tag — the release flow already bumps it per release.
+# The published almond-axol version is whatever `version` in pyproject.toml
+# says at the release tag — the release flow already bumps it per release.
+# The plugin's version lives in plugins/lerobot_robot_axol/pyproject.toml and
+# only needs bumping when the plugin itself changes.
 name: Publish to PyPI
 
 on:
@@ -26,4 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv build
+      - run: uv build --project plugins/lerobot_robot_axol -o dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A re-run after a partial publish (e.g. the plugin version was not
+          # bumped) should not fail on the files that already made it up.
+          skip-existing: true
