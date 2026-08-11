@@ -57,12 +57,11 @@ class ControlChannelManager:
         """
         await self.close(client_id)
 
+        # Explicitly empty when unconfigured (LAN): a bare RTCPeerConnection()
+        # falls back to aiortc's default Google STUN server, stalling gathering
+        # ~5s per offer on hosts that can't reach it (see WebRTCManager).
         servers = ice_servers()
-        pc = (
-            RTCPeerConnection(RTCConfiguration(iceServers=servers))
-            if servers
-            else RTCPeerConnection()
-        )
+        pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
         self._pcs[client_id] = pc
 
         # Unreliable + unordered: drop a late/lost pose rather than stall the

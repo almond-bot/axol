@@ -140,6 +140,12 @@ class VRServer:
         # ``webrtc-unavailable``. Guarded per client in _send_webrtc_offer
         # (single event loop, so a plain set suffices).
         self._video_offering: set[int] = set()
+        # Same guard for the control (pose) channel offers.
+        self._control_offering: set[int] = set()
+        # Offer-creation tasks in flight (offers are built off the WebSocket
+        # receive loop — see _handle_signaling); referenced here so the event
+        # loop can't garbage-collect a running task.
+        self._signaling_tasks: set[asyncio.Task[None]] = set()
         # Event loop this server runs on (captured in enable()) so video
         # registration from another thread can schedule the pending flush.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -449,6 +455,8 @@ class VRServer:
         self._active_clients.clear()
         self._video_pending.clear()
         self._video_offering.clear()
+        self._control_offering.clear()
+        self._signaling_tasks.clear()
         self._pose_last.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
@@ -553,17 +561,17 @@ class VRServer:
         # Control data channel (pose transport): negotiated independently of the
         # cameras, so it's handled before the video-availability check below and
         # works even when no video sources are registered.
+        #
+        # Offer creation is offloaded to a task: this handler runs on the
+        # socket's sequential receive loop, and an inline await (ICE
+        # gathering, the relay pipe round-trip) would queue every following
+        # message behind it — pose frames stall into bursts, and a queued
+        # webrtc/control *answer* applies only after a queued retry has
+        # already replaced its peer connection, so negotiation never
+        # completes.
         if msg_type == "control-request":
-            sdp = await self._control.create_offer(client_id)
-            await websocket.send_text(
-                json.dumps(
-                    {
-                        "type": "control-offer",
-                        "sdp": sdp,
-                        "iceServers": client_ice_servers(),
-                    }
-                )
-            )
+            if client_id not in self._control_offering:
+                self._spawn(self._send_control_offer(websocket, client_id))
             return
         if msg_type == "control-answer":
             sdp = obj.get("sdp")
@@ -599,7 +607,15 @@ class VRServer:
         if msg_type == "webrtc-request":
             # A direct answer supersedes any parked copy of this request.
             self._video_pending.pop(client_id, None)
-            await self._send_webrtc_offer(websocket, client_id)
+            if client_id in self._video_offering:
+                # An offer for this client is already being built (its retry
+                # landed mid-flight): that offer answers this request too.
+                # Tell the client to keep waiting rather than starting a
+                # competing negotiation.
+                await websocket.send_text(json.dumps({"type": "webrtc-pending"}))
+                return
+            # Built off the receive loop — see the control-request comment.
+            self._spawn(self._send_webrtc_offer(websocket, client_id))
         elif msg_type == "webrtc-answer":
             sdp = obj.get("sdp")
             if isinstance(sdp, str):
@@ -610,11 +626,47 @@ class VRServer:
         else:
             _logger.debug("ignoring unknown signaling type: %s", msg_type)
 
+    def _spawn(self, coro: Any) -> None:
+        """Run a signaling coroutine as its own task on the server loop.
+
+        The task set holds a strong reference so a running task can't be
+        garbage-collected mid-flight.
+        """
+        task = asyncio.create_task(coro)
+        self._signaling_tasks.add(task)
+        task.add_done_callback(self._signaling_tasks.discard)
+
+    async def _send_control_offer(self, websocket: WebSocket, client_id: int) -> None:
+        """Create and send the control-channel offer. Runs as its own task.
+
+        Guarded per client like the video offers; never raises (a send to a
+        just-disconnected socket is normal churn).
+        """
+        if client_id in self._control_offering:
+            return
+        self._control_offering.add(client_id)
+        try:
+            sdp = await self._control.create_offer(client_id)
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "control-offer",
+                        "sdp": sdp,
+                        "iceServers": client_ice_servers(),
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - task context; log and move on
+            _logger.warning("control offer for client %d failed: %s", client_id, exc)
+        finally:
+            self._control_offering.discard(client_id)
+
     async def _send_webrtc_offer(self, websocket: WebSocket, client_id: int) -> None:
         """Create a fresh per-client offer and send it (unavailable on failure).
 
-        No-op while an offer for the same client is already being created —
-        the pending flush and a concurrent request retry would otherwise race,
+        Runs as its own task (or from the pending flush); never raises. No-op
+        while an offer for the same client is already being created — the
+        pending flush and a concurrent request retry would otherwise race,
         with the later ``create_offer`` tearing down the earlier one's peer
         connection mid-negotiation. The in-flight offer (sent to this same
         socket) answers the skipped request.
@@ -625,17 +677,11 @@ class VRServer:
         try:
             webrtc = self._webrtc
             if webrtc is None:
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
-                return
-            try:
-                sdp, tracks = await webrtc.create_offer(client_id)
-            except Exception as exc:  # noqa: BLE001 - degrade to no video
-                _logger.error("failed to create webrtc offer: %s", exc)
-                await websocket.send_text(json.dumps({"type": "webrtc-unavailable"}))
-                return
-            await websocket.send_text(
-                json.dumps(
-                    {
+                payload: dict[str, Any] = {"type": "webrtc-unavailable"}
+            else:
+                try:
+                    sdp, tracks = await webrtc.create_offer(client_id)
+                    payload = {
                         "type": "webrtc-offer",
                         "sdp": sdp,
                         "tracks": tracks,
@@ -644,8 +690,13 @@ class VRServer:
                         # a LAN (no env config) — harmless to the headset.
                         "iceServers": client_ice_servers(),
                     }
-                )
-            )
+                except Exception as exc:  # noqa: BLE001 - degrade to no video
+                    _logger.error("failed to create webrtc offer: %s", exc)
+                    payload = {"type": "webrtc-unavailable"}
+            try:
+                await websocket.send_text(json.dumps(payload))
+            except Exception as exc:  # noqa: BLE001 - client left mid-offer
+                _logger.warning("failed to send webrtc reply: %s", exc)
         finally:
             self._video_offering.discard(client_id)
 
