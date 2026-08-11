@@ -514,6 +514,13 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         obs_keys = list(robot.get_joint_observation().keys())
         action_keys = list(robot.action_features.keys())
 
+        # The VR server accepts headsets during the IK worker's JAX compile
+        # inside connect(), before the video registration below runs. Declare
+        # video as expected so an early headset request waits for the offer
+        # instead of being told there is no video.
+        if use_relay or robot.cameras:
+            teleop.set_video_expected(True)
+
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
 

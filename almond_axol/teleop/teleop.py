@@ -111,6 +111,13 @@ class VRTeleop:
         # cannot drift apart.
         self._core = VRTeleopCore(config, _logger, self._broadcast_tracking)
 
+        # Quitting the VR app closes the operator's socket without reliably
+        # delivering the Y-exit reset frame; send the arms home on that
+        # disconnect (a pause — system menu, doffed headset — keeps the
+        # socket open and only auto-disengages).
+        if config.reset_on_disconnect:
+            self._vr_server.set_on_operator_gone(self._core.request_reset_if_away)
+
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
         self._ik_thread: threading.Thread | None = None
@@ -279,6 +286,20 @@ class VRTeleop:
 
     async def __aexit__(self, *_: object) -> None:
         await self.disable()
+
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare that camera video will be registered once it finishes starting.
+
+        Call before ``async with`` / :meth:`enable` when cameras are
+        configured: the VR server starts accepting headsets long before the
+        video relay finishes opening the cameras, and an early video request
+        would otherwise be answered "unavailable" — hiding the camera screens
+        for the whole session. With this set, early requests wait
+        (``webrtc-pending``) and receive their offer the moment
+        :meth:`set_video_manager` / :meth:`set_video_sources` lands. See
+        :meth:`almond_axol.vr.server.VRServer.set_video_expected`.
+        """
+        self._vr_server.set_video_expected(expected)
 
     def set_video_sources(self, sources: dict[str, object] | None) -> None:
         """Stream camera frames to the headset via WebRTC.
