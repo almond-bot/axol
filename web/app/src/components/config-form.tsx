@@ -33,7 +33,12 @@ const vectorDefault = (field: SchemaField): number[] =>
 /** Parse one component's text: number when it is one, raw text while mid-edit. */
 const parseComponent = (text: string): number | string => {
   const t = text.trim()
-  return t !== "" && Number.isFinite(Number(t)) ? Number(t) : text
+  const n = Number(t)
+  // Only commit to a number when it round-trips exactly: Number("0.") is 0,
+  // so converting eagerly would rewrite "0." to "0" under the cursor and make
+  // it impossible to type a decimal point. Non-canonical text ("0.", "-0",
+  // ".5") stays a string and is coerced server-side.
+  return t !== "" && Number.isFinite(n) && String(n) === t ? n : text
 }
 
 /** Current component values: the override if set, else the defaults. */
