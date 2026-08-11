@@ -1,0 +1,29 @@
+# Publish almond-axol to PyPI on every published GitHub release, via PyPI
+# trusted publishing (OIDC) — no tokens or secrets required.
+#
+# One-time PyPI setup (org owner): on the organization's Publishing page
+# (https://pypi.org/manage/organization/<org>/publishing/), add a pending
+# publisher with project name `almond-axol`, owner `almond-bot`, repository
+# `axol`, workflow `publish.yml`, environment blank. The first release after
+# that creates the PyPI project owned by the organization.
+#
+# The published version is whatever `version` in pyproject.toml says at the
+# release tag — the release flow already bumps it per release.
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for PyPI trusted publishing (OIDC).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@release/v1

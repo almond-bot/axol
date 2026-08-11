@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "LeRobot plugin for the Almond Axol dual-arm robot: robot `axol`, VR teleoperator `axol_vr`, camera `zed`."
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 # Direct git reference: almond-axol has no PyPI release, so carrying the URL in
 # the metadata makes `pip install "lerobot_robot_axol @ git+...#subdirectory=..."`
 # a one-command install. Swap to a plain versioned dependency if/when

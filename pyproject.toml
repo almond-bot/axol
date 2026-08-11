@@ -8,7 +8,10 @@ version = "0.1.23"
 description = "Almond Axol SDK"
 license = { text = "MIT" }
 readme = "README.md"
-requires-python = ">=3.13"
+# 3.12 floor so `pip install lerobot[almond_axol]` works everywhere LeRobot
+# does (LeRobot supports 3.12); our own installs and dev stay on 3.13 via
+# .python-version and the install script.
+requires-python = ">=3.12"
 dependencies = [
     "aiortc>=1.9", # WebRTC transport for headset camera video (pulls av)
     "draccus>=0.11.6,<0.12",
