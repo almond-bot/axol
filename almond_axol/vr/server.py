@@ -55,15 +55,6 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# How recently (seconds) a client must have delivered a pose frame to still
-# count as one of the operator's live connections when deciding whether the
-# operator is gone (see ``set_on_operator_gone``). Long enough that the
-# paired transports of one headset (USB tunnel + network standby) shield
-# each other through a quit's near-simultaneous socket closes; short enough
-# that a stale connection which streamed poses minutes ago can't mask a
-# real quit.
-_OPERATOR_RECENCY_S = 10.0
-
 
 class VRServer:
     """Secure WebSocket server that receives VRFrame data from a VR headset.
@@ -164,16 +155,12 @@ class VRServer:
         # Monotonic time of the last valid pose frame per client (socket or
         # its control data channel) — i.e. the operator's connections, as
         # opposed to view-only ones like the control panel's camera mirror.
-        # When a pose-sending client disconnects and no *other* client has
-        # sent a pose recently (see _OPERATOR_RECENCY_S), the operator is
-        # gone for good (a quit/crash closes the socket; merely pausing —
-        # e.g. the Quest system menu — keeps it open) and
-        # ``_on_operator_gone`` fires. Recency matters: membership must not
-        # be sticky, or a lingering connection that streamed poses once
-        # (say, a desktop tab that briefly ran the emulated XR session)
-        # would block the quit handling for the whole session.
+        # When the last pose-sending client disconnects, the buffered pose
+        # state (latest frame, seq high-water mark, interpolator) is dropped
+        # so a relaunched headset — whose seq counter restarts at 1 — isn't
+        # gated against the old session's high-water mark while a view-only
+        # client keeps the connection count above zero.
         self._pose_last: dict[int, float] = {}
-        self._on_operator_gone: Callable[[], None] | None = None
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
@@ -209,23 +196,6 @@ class VRServer:
     def set_on_frame(self, callback: Callable[[VRFrame], None] | None) -> None:
         """Replace the on_frame callback. Safe to call after construction."""
         self._on_frame = callback
-
-    def set_on_operator_gone(self, callback: Callable[[], None] | None) -> None:
-        """Called when the operator's pose-sending connections are gone.
-
-        Pose-sending clients are the operator's connections (headset app,
-        USB tunnel) — view-only clients such as the control panel's camera
-        mirror never send poses and don't count. The callback fires on the
-        server's event loop when a pose-sending client's socket closes and
-        no other client has delivered a pose within ``_OPERATOR_RECENCY_S``:
-        a quit or crash of the VR app, as opposed to a pause (Quest system
-        menu, doffed headset) which keeps the socket open. The recency test
-        keeps a stale connection that streamed poses once (e.g. an abandoned
-        browser tab) from masking a real quit. Teleop uses this to return
-        the arms to rest, since an app quit can't reliably deliver the
-        Y-exit reset frame.
-        """
-        self._on_operator_gone = callback
 
     def set_mode(self, mode: str | None) -> None:
         """Set the operating mode announced to headsets on connect.
@@ -414,9 +384,10 @@ class VRServer:
             # Tighter pings were tried for faster dead-peer detection, but
             # with the camera RTP saturating the operator's WiFi a pong can
             # take >5s on a perfectly healthy link, and killing the pose
-            # socket then tears down video and teleop with it. Exits with a
-            # lost FIN are covered by the pose-silence backstop instead
-            # (VRTeleopConfig.exit_reset_timeout).
+            # socket then tears down video and teleop with it. Prompt
+            # dead-peer detection isn't needed for safety: pose silence
+            # force-disengages teleop within VRTeleopConfig.disengage_timeout
+            # and the arms hold position until the operator acts.
         )
         self._uvicorn_server = uvicorn.Server(config)
         self._server_task = asyncio.create_task(
@@ -779,38 +750,21 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
-                # A pose-sending client (the operator) disconnected — a
-                # quit/crash closes the socket, unlike a pause (system menu,
-                # doffed headset) which keeps it open. The operator is gone
-                # when no *other* client has sent a pose recently: a sibling
-                # transport of the same headset (USB tunnel + network
-                # standby) is fresh through a quit's near-simultaneous
-                # closes, while a stale connection that streamed poses
-                # minutes ago (an abandoned tab) doesn't mask the quit.
-                # Best-effort so it can't leak the socket accounting.
-                if server._pose_last.pop(client_id, None) is not None:
-                    if not server._pose_last:
-                        # Last pose sender gone: drop the buffered pose state
-                        # *now* rather than when every client disconnects — a
-                        # view-only client (the control panel's camera mirror)
-                        # can stay connected across the operator's app
-                        # relaunches, and a relaunched headset restarts its
-                        # seq counter at 1, so a kept high-water mark would
-                        # silently drop every frame it sends (no poses, no
-                        # engage) until the panel also left.
-                        server._latest_frame = None
-                        server._last_seq = None
-                        server._interp.reset()
-                    now = time.monotonic()
-                    others_recent = any(
-                        now - t <= _OPERATOR_RECENCY_S
-                        for t in server._pose_last.values()
-                    )
-                    if not others_recent and server._on_operator_gone:
-                        try:
-                            server._on_operator_gone()
-                        except Exception:  # noqa: BLE001 - never break cleanup
-                            _logger.exception("operator-gone callback failed")
+                # A pose-sending client (the operator) disconnected. When the
+                # last one goes, drop the buffered pose state *now* rather
+                # than when every client disconnects — a view-only client
+                # (the control panel's camera mirror) can stay connected
+                # across the operator's app relaunches, and a relaunched
+                # headset restarts its seq counter at 1, so a kept high-water
+                # mark would silently drop every frame it sends (no poses, no
+                # engage) until the panel also left.
+                if (
+                    server._pose_last.pop(client_id, None) is not None
+                    and not server._pose_last
+                ):
+                    server._latest_frame = None
+                    server._last_seq = None
+                    server._interp.reset()
                 # Last operator gone: drop buffered pose state so a fresh
                 # session's capture timestamps aren't blended with this one's
                 # stale frames (which would drive IK with incoherent poses
