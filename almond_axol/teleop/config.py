@@ -50,14 +50,17 @@ class VRTeleopConfig:
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
-        engage_max_vel: Maximum joint velocity (rad/s) used by the
-            trapezoidal filter when teleop is first engaged after a
-            rest-pose trajectory (startup or reset).  Slows the transition from
-            rest pose to the first IK target.  Restored to ``teleop_max_vel``
-            after ``engage_duration`` seconds.  Defaults to
-            ``reset_speed`` for a consistent feel.
-        engage_duration: Seconds to hold ``engage_max_vel`` after the
-            post-rest engage rising edge before restoring ``teleop_max_vel``.
+        engage_max_vel: Starting joint-velocity cap (rad/s) for the
+            trapezoidal filter when teleop is first engaged after a rest-pose
+            trajectory (startup or reset). Softens the transition from rest
+            pose to the first IK target: the cap smoothsteps from this value
+            up to ``teleop_max_vel`` over ``engage_duration`` seconds, so the
+            arm starts gentle and opens up progressively (a hard restore used
+            to release the error accumulated during the slow phase all at
+            once). Defaults to ``reset_speed`` for a consistent feel.
+        engage_duration: Seconds over which the velocity cap ramps from
+            ``engage_max_vel`` to ``teleop_max_vel`` after the post-rest
+            engage rising edge.
         teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
             trapezoidal filter during normal teleoperation.  Limits how fast
             any single joint can move toward a new IK target.  Defaults to
@@ -70,20 +73,23 @@ class VRTeleopConfig:
             the IK output before the trapezoidal filter.  Range ``(0, 1]``
             where ``1.0`` disables smoothing.  Lower values kill more
             high-frequency jitter at the cost of a small fixed lag
-            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.5`` (~8 ms lag
-            at 120 Hz), which removes most IK noise without a perceptible
-            feel difference.
+            (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
+            at 120 Hz), favouring smoothness over minimum latency.
         pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
             applied to raw VR controller positions, quaternions, and elbow
             positions **before** they enter the IK solver.  This is the
             primary tremor / tracking-noise kill knob.  Lower values give
             heavier smoothing at rest (more tremor rejection) at the cost of
             slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
-            to ``1.5`` Hz.
+            to ``0.8`` Hz, favouring smoothness over minimum latency (the
+            fixed-lag smoother in the VR server's pose interpolator does the
+            heavy lifting upstream).
         pose_beta: Speed coefficient for the One Euro Filter.  Raises the
             filter cutoff proportionally to the signal's instantaneous speed,
             keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``5.0``.
+            Increase if fast moves feel sticky.  Defaults to ``2.0`` so the
+            filter stays partially engaged during motion instead of opening
+            fully and passing noise through.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -154,9 +160,9 @@ class VRTeleopConfig:
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
     teleop_max_accel: float = 3.5 * 2 * math.pi
-    ik_alpha: float = 0.5
-    pose_min_cutoff: float = 1.5
-    pose_beta: float = 5.0
+    ik_alpha: float = 0.3
+    pose_min_cutoff: float = 0.8
+    pose_beta: float = 2.0
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5

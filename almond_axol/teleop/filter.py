@@ -17,7 +17,11 @@ class TrapezoidalFilter:
 
     The deceleration distance is computed from kinematics:
     ``v_stop = sqrt(2 * max_accel * distance)``
-    so the filter always arrives at the target without overshoot.
+    so the filter always arrives at the target without overshoot.  When a step
+    reaches the target, the internal velocity keeps the value realized by that
+    step (rather than resetting to zero) so continuously tracking a moving
+    target produces a smooth velocity profile instead of a snap / re-accelerate
+    limit cycle.
 
     Args:
         max_vel:   Maximum joint velocity in rad/s.
@@ -38,6 +42,15 @@ class TrapezoidalFilter:
         self.dt = dt
         self._pos: np.ndarray | None = None
         self._vel: np.ndarray | None = None
+
+    @property
+    def position(self) -> np.ndarray | None:
+        """The filter's current output position (the last commanded value).
+
+        ``None`` until the first :meth:`update`. Safe to read cross-thread:
+        updates replace the array reference atomically.
+        """
+        return self._pos
 
     def update(self, target: np.ndarray | None) -> np.ndarray | None:
         """Advance one step toward ``target``.
@@ -72,10 +85,15 @@ class TrapezoidalFilter:
         self._vel = self._vel + dv
 
         # Advance position; snap to target if we would overshoot this step.
+        # On snap, keep the velocity actually realized by the snap (|err|/dt,
+        # always a slowdown since |err| < |step|) instead of zeroing it:
+        # zeroing made every arrival a velocity discontinuity, so closely
+        # tracking a *moving* target limit-cycled through snap / re-accelerate
+        # every few steps and manufactured jerk from a perfectly smooth input.
         step = self._vel * self.dt
         overshoot = np.abs(step) > dist
         self._pos = np.where(overshoot, target, self._pos + step)
-        self._vel = np.where(overshoot, 0.0, self._vel)
+        self._vel = np.where(overshoot, err / self.dt, self._vel)
 
         return self._pos.copy()
 
@@ -179,6 +197,7 @@ class OneEuroFilter:
         self._d_cutoff = d_cutoff
         self._x_prev: np.ndarray | None = None
         self._dx_prev: np.ndarray | None = None
+        self._t_prev: float | None = None
 
     @staticmethod
     def _alpha(cutoff: float | np.ndarray, freq: float) -> float | np.ndarray:
@@ -187,20 +206,39 @@ class OneEuroFilter:
         te = 1.0 / freq
         return 1.0 / (1.0 + tau / te)
 
-    def update(self, x: np.ndarray) -> np.ndarray:
-        """Apply one filter step. Returns ``x`` unchanged on the first call."""
+    def update(self, x: np.ndarray, t: float | None = None) -> np.ndarray:
+        """Apply one filter step. Returns ``x`` unchanged on the first call.
+
+        Args:
+            x: Sample value.
+            t: Sample timestamp in seconds (any steady clock). When provided,
+                the filter uses the true inter-sample spacing instead of the
+                fixed construction-time ``freq`` — the samples this filter
+                sees arrive at the irregular IK solve cadence, and a fixed-
+                frequency assumption converts that timing jitter into value
+                jitter (a late sample's larger motion reads as one fast step,
+                a bunched sample as a stall). ``None`` keeps the fixed rate.
+        """
         x = np.asarray(x, dtype=np.float32)
         if self._x_prev is None:
             self._x_prev = x.copy()
             self._dx_prev = np.zeros_like(x)
+            self._t_prev = t
             return x.copy()
 
-        dx = (x - self._x_prev) * self._freq
-        a_d = self._alpha(self._d_cutoff, self._freq)
+        freq = self._freq
+        if t is not None and self._t_prev is not None:
+            # Clamp so a stream gap or duplicate stamp can't blow up the
+            # derivative estimate (2 ms .. 100 ms spacing).
+            freq = 1.0 / min(max(t - self._t_prev, 0.002), 0.1)
+        self._t_prev = t
+
+        dx = (x - self._x_prev) * freq
+        a_d = self._alpha(self._d_cutoff, freq)
         dx_hat = a_d * dx + (1.0 - a_d) * self._dx_prev
 
         cutoff = self._min_cutoff + self._beta * np.abs(dx_hat)
-        a = self._alpha(cutoff, self._freq)
+        a = self._alpha(cutoff, freq)
 
         x_hat = a * x + (1.0 - a) * self._x_prev
         self._x_prev = x_hat.copy()
@@ -215,6 +253,7 @@ class OneEuroFilter:
         else:
             self._x_prev = None
             self._dx_prev = None
+        self._t_prev = None
 
 
 class ResetInterpolator:
