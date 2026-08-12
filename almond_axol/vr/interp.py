@@ -390,7 +390,12 @@ class PoseInterpolator:
                         _HOLD_WARN_AFTER_S,
                     )
         else:
-            rendered, pos = _interpolate(a, b, alpha, latest)
+            # Playout stamps are only meaningful for client-stamped streams;
+            # unstamped frames keep their original (absent) stamp so the
+            # worker's filters fall back to their fixed rate.
+            rendered, pos = _interpolate(
+                a, b, alpha, latest, play if self._t_is_client else None
+            )
 
         # Identity-stable: reuse the previous object when nothing moved and the
         # control state matches, so the consumer's `is` check skips the solve.
@@ -660,12 +665,13 @@ def _smooth_window(
         l_grip,
         r_grip,
         latest,
+        play,
     )
     return frame, pos, l_out, l_live, r_out, r_live
 
 
 def _interpolate(
-    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame
+    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame, play: float | None
 ) -> tuple[VRFrame, np.ndarray]:
     """Interpolate motion between ``a`` and ``b``; take control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
@@ -679,7 +685,7 @@ def _interpolate(
     l_grip = float(a.l_grip + alpha * (b.l_grip - a.l_grip))
     r_grip = float(a.r_grip + alpha * (b.r_grip - a.r_grip))
     return _build_frame(
-        l_ee_p, l_ee_q, r_ee_p, r_ee_q, l_el, r_el, l_grip, r_grip, latest
+        l_ee_p, l_ee_q, r_ee_p, r_ee_q, l_el, r_el, l_grip, r_grip, latest, play
     )
 
 
@@ -693,10 +699,17 @@ def _build_frame(
     l_grip: float,
     r_grip: float,
     latest: VRFrame,
+    play: float | None,
 ) -> tuple[VRFrame, np.ndarray]:
     """Assemble a rendered frame; motion from the args, control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
     concatenated EE+elbow positions used for the change/identity check.
+
+    ``play`` is the playout time this pose was rendered at (client-clock
+    seconds); it becomes the frame's ``t`` so downstream consumers timestamp
+    the *motion* correctly — the IK worker's One Euro filters use consecutive
+    ``t`` values as true sample spacing. ``None`` (unstamped stream) falls
+    back to the latest arrival stamp.
 
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields
@@ -738,7 +751,7 @@ def _build_frame(
         r_lock=latest.r_lock,
         reset=latest.reset,
         state=latest.state,
-        t=latest.t,
+        t=(play * 1000.0) if play is not None else latest.t,
         seq=latest.seq,
     )
     pos = np.concatenate([l_ee_p, r_ee_p, l_el, r_el])

@@ -113,6 +113,32 @@ class VRTeleopCore:
         self.l_grip: float = 0.0
         self.r_grip: float = 0.0
 
+        # Target playback segment: IK solutions arrive at the (irregular)
+        # solve cadence, and tracking the newest one latest-wins makes the
+        # control loop chase a staircase — each new solution lands as a step
+        # of hand-speed x solve-interval, which the EMA/trapezoid bound but
+        # don't hide (acceleration can flip in one tick). Instead, each new
+        # solution starts a short linear segment from the currently *rendered*
+        # target to the new solution, played over roughly one solve interval,
+        # so the control loop tracks a continuous, C0 target. Costs about one
+        # solve interval (~10 ms) of extra latency. The tuple is replaced
+        # atomically (single reference write) for the control thread.
+        self._segment: tuple[np.ndarray, np.ndarray, float, float] | None = None
+        self._seg_last_arrival: float | None = None
+
+        # Output guard: the hard contract that no two consecutive arm
+        # commands differ by more than teleop_max_vel / frequency per joint
+        # (~52 mrad at defaults — double any human-driven joint speed, so a
+        # larger step is by definition an upstream bug or bypass). The
+        # trapezoid already enforces this on the tracking path; the guard
+        # extends it to *every* path (reset/startup playback included),
+        # spreading an oversized step across ticks and warning when it had to
+        # — violations become impossible and visible. Cleared at the points
+        # where the command is legitimately re-adopted to match the measured
+        # arm (connect seeding, resync after hand-guiding).
+        self._last_cmd: np.ndarray | None = None
+        self._guard_warn_time: float = 0.0
+
         # Engage toggle state (mutated on the IK thread).
         self.teleop_enabled: bool = False
         self._prev_both: bool = False
@@ -162,7 +188,7 @@ class VRTeleopCore:
         self, q_init: np.ndarray, left_indices: list[int], right_indices: list[int]
     ) -> None:
         """Adopt the IK worker's initial solution + per-arm joint index maps."""
-        self.q = np.asarray(q_init, dtype=np.float32)
+        self._hold_target(np.asarray(q_init, dtype=np.float32))
         self.left_indices = left_indices
         self.right_indices = right_indices
 
@@ -183,6 +209,10 @@ class VRTeleopCore:
             seed_r = np.append(cur_right[:7], self.r_grip)
             self.ema_right.reset(seed=seed_r)
             self.smooth_right.reset(seed=seed_r[:7])
+        # The command is being re-adopted to the measured arm: the output
+        # guard must not rate-limit across the adoption (the arm is already
+        # there; clamping would command it back toward the stale position).
+        self._last_cmd = None
 
     def set_startup_trajectory(self, trajectory: object) -> None:
         """Queue the IK worker's startup trajectory for playback in compute_output."""
@@ -209,7 +239,7 @@ class VRTeleopCore:
                 q[self.left_indices] = np.asarray(cur_left[:7], dtype=np.float32)
             if cur_right is not None and self.right_indices:
                 q[self.right_indices] = np.asarray(cur_right[:7], dtype=np.float32)
-            self.q = q
+            self._hold_target(q)
         self.set_initial_grips(
             float(cur_left[7]) if cur_left is not None and len(cur_left) > 7 else None,
             float(cur_right[7])
@@ -342,8 +372,49 @@ class VRTeleopCore:
             self.r_grip = frame.r_grip
 
     def set_target(self, q_raw: object) -> None:
-        """Publish a fresh raw IK solution (consumed by compute_output)."""
-        self.q = np.asarray(q_raw, dtype=np.float32)
+        """Publish a fresh raw IK solution (consumed by compute_output).
+
+        Starts a playback segment from the currently rendered target to the
+        new solution (see ``_segment`` in ``__init__``) so the control loop
+        never sees a step. Late solutions (a dispatch stall) play back over a
+        capped window instead of landing at once.
+        """
+        now = time.perf_counter()
+        q_new = np.asarray(q_raw, dtype=np.float32)
+        start = self._eval_target(now)
+        if start is None:
+            start = q_new
+        gap = (
+            now - self._seg_last_arrival
+            if self._seg_last_arrival is not None
+            else 1.0 / self.config.frequency
+        )
+        self._seg_last_arrival = now
+        # Play over the observed solve gap (floor: a couple control ticks) so
+        # normal cadence adds ~one solve interval of lag; cap the window so a
+        # stalled solve's accumulated motion is spread, not slow-motion.
+        dur = min(max(gap, 2.0 / self.config.frequency), 0.04)
+        self.q = q_new
+        self._segment = (start, q_new, now, dur)
+
+    def _eval_target(self, now: float) -> np.ndarray | None:
+        """Render the interpolated raw target at time ``now`` (any thread)."""
+        seg = self._segment
+        if seg is None:
+            return None
+        start, end, t0, dur = seg
+        u = (now - t0) / dur
+        if u >= 1.0:
+            return end
+        if u <= 0.0:
+            return start.copy()
+        return (start + u * (end - start)).astype(np.float32)
+
+    def _hold_target(self, q: np.ndarray) -> None:
+        """Adopt ``q`` as a stationary target (reset/startup adoption paths)."""
+        self.q = np.asarray(q, dtype=np.float32)
+        self._segment = None
+        self._seg_last_arrival = None
 
     # ------------------------------------------------------------------
     # Smoothing (control-loop thread)
@@ -379,7 +450,12 @@ class VRTeleopCore:
             self.smooth_left.max_vel = v
             self.smooth_right.max_vel = v
 
-        q = self.q
+        # Track the interpolated target segment (see set_target), not the
+        # latest-wins staircase; fall back to the raw solution before the
+        # first segment exists.
+        q = self._eval_target(time.perf_counter())
+        if q is None:
+            q = self.q
         if q is None:
             return None
 
@@ -389,7 +465,7 @@ class VRTeleopCore:
                 return None
             q = np.asarray(new_q, dtype=np.float32)
             if done:
-                self.q = q.copy()
+                self._hold_target(q.copy())
                 self.l_grip = l_grip
                 self.r_grip = r_grip
                 self._at_rest = True
@@ -404,7 +480,7 @@ class VRTeleopCore:
             out[7] = l_grip
             out[8:15] = q[self.right_indices]
             out[15] = r_grip
-            return out
+            return self._guard_output(out)
 
         l_grip = self.l_grip
         r_grip = self.r_grip
@@ -422,6 +498,42 @@ class VRTeleopCore:
         out[7] = ema_l[7]
         out[8:15] = smoothed_r_arm
         out[15] = ema_r[7]
+        return self._guard_output(out)
+
+    def _guard_output(self, out: np.ndarray) -> np.ndarray:
+        """Enforce the per-tick command-step contract on the arm joints.
+
+        Clamps each arm's step from the previous command to
+        ``teleop_max_vel / frequency`` per joint (whole-vector scaling, so a
+        clamped step keeps its direction and is simply spread over the next
+        ticks). Grippers (normalized units, EMA-bounded) pass through. Warns
+        (rate-limited) whenever it engages: the guard exists to make an
+        upstream discontinuity harmless *and* loud, not to silently absorb it.
+        """
+        last = self._last_cmd
+        if last is None:
+            self._last_cmd = out
+            return out
+        bound = self.config.teleop_max_vel / self.config.frequency
+        worst = 0.0
+        for sl in (slice(0, 7), slice(8, 15)):
+            delta = out[sl] - last[sl]
+            m = float(np.max(np.abs(delta)))
+            if m > bound:
+                out[sl] = last[sl] + delta * (bound / m)
+                worst = max(worst, m)
+        self._last_cmd = out
+        if worst > 0.0:
+            now = time.perf_counter()
+            if now - self._guard_warn_time >= 2.0:
+                self._guard_warn_time = now
+                self._logger.warning(
+                    "Output guard clamped a %.1f mrad command step to the "
+                    "%.1f mrad/tick contract — an upstream stage produced a "
+                    "discontinuity (spread over the following ticks)",
+                    1e3 * worst,
+                    1e3 * bound,
+                )
         return out
 
     # ------------------------------------------------------------------
@@ -622,7 +734,23 @@ class VRTeleopCore:
                 # false gap between the latch and the trajectory playback.
                 self._reset_dispatching = True
                 try:
-                    conn.send(("reset", self.q.copy()))
+                    # Plan from the last *commanded* joints, not the raw IK
+                    # solution: the smoothed command lags raw q by the EMA +
+                    # trapezoid lag (tens of mrad mid-motion), and a trajectory
+                    # planned from raw q would join the command stream with a
+                    # step the playback path never filters. Holding the target
+                    # there also freezes the output for the (possibly
+                    # seconds-long) planning window, so playback starts exactly
+                    # where the arm stopped.
+                    q_plan = self.q.copy()
+                    pos_l = self.smooth_left.position
+                    pos_r = self.smooth_right.position
+                    if pos_l is not None and self.left_indices:
+                        q_plan[self.left_indices] = pos_l
+                    if pos_r is not None and self.right_indices:
+                        q_plan[self.right_indices] = pos_r
+                    self._hold_target(q_plan)
+                    conn.send(("reset", q_plan.copy()))
                     result = conn.recv()
                     if self._reset_cancel:
                         # cancel_reset() fired mid-planning: drop the plan —
@@ -641,7 +769,7 @@ class VRTeleopCore:
                             self._prev_either = False
                             self._engage_time = None
                             self._at_rest = True
-                        self.q = np.asarray(q_default, dtype=np.float32)
+                        self._hold_target(np.asarray(q_default, dtype=np.float32))
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
                     self._logger.error("Reset error: %s", e)
                 finally:

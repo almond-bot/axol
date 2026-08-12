@@ -250,10 +250,16 @@ class IKWorker:
         # after engaging felt heavily over-smoothed. Continuous filtering
         # keeps the state fresh (no stale sweep) and the derivative already
         # tracking hand velocity at the engage snap (no cold start).
+        #
+        # ``t`` is the frame's playout/capture stamp: frames reach this worker
+        # at the irregular solve cadence, and timestamped updates keep that
+        # timing jitter from being read as velocity jitter.
+        t_s = (frame.t / 1000.0) if frame.t is not None else None
         lp = self._f_l_pos.update(
             np.array(
                 [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
-            )
+            ),
+            t=t_s,
         )
         lq = self._f_l_quat.update(
             np.array(
@@ -263,14 +269,16 @@ class IKWorker:
                     frame.l_ee.quaternion.z,
                     frame.l_ee.quaternion.w,
                 ]
-            )
+            ),
+            t=t_s,
         )
         lq = lq / np.linalg.norm(lq)
 
         rp = self._f_r_pos.update(
             np.array(
                 [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
-            )
+            ),
+            t=t_s,
         )
         rq = self._f_r_quat.update(
             np.array(
@@ -280,7 +288,8 @@ class IKWorker:
                     frame.r_ee.quaternion.z,
                     frame.r_ee.quaternion.w,
                 ]
-            )
+            ),
+            t=t_s,
         )
         rq = rq / np.linalg.norm(rq)
 
@@ -291,10 +300,10 @@ class IKWorker:
         right_e: np.ndarray | None = None
         if self._use_elbow:
             le = self._f_l_elbow.update(
-                np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
+                np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z]), t=t_s
             )
             re = self._f_r_elbow.update(
-                np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z])
+                np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z]), t=t_s
             )
             left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
             right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
