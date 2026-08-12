@@ -103,23 +103,13 @@ class VRTeleopConfig:
             link dropped.  Without it the engage toggle survives the gap, so
             the next frames after re-entering VR are tracked against the old
             engage snapshot and the arms jerk toward wherever the controllers
-            now are.  The headset streams poses at 72+ Hz while presenting,
+            now are.  After the disengage the arms hold position wherever
+            they are — a lost link never moves the robot on its own — until
+            the operator deliberately re-engages (a fresh engage snapshot, so
+            motion resumes relative to the controllers' new pose) or presses
+            reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
-        reset_on_disconnect: Return the arms to the rest pose when the
-            operator's last pose-sending connection closes while the arms are
-            away from rest — quitting the VR app (e.g. via the Quest menu)
-            can't reliably deliver the Y-exit reset frame.  Pausing without
-            quitting (system menu, doffed headset) keeps the socket open and
-            only auto-disengages; the arms hold in place.  Defaults to True.
-        exit_reset_timeout: Also return the arms to rest when no VR pose
-            frame has arrived for this many seconds while the arms are away
-            from rest.  This is the backstop for exits whose socket close is
-            delayed or lost — a killed headset app whose TCP FIN never went
-            out (WiFi power-save after quitting, a crash, a link drop) —
-            and it means stepping away mid-session parks the arms safely.
-            Long enough that a normal Quest-menu visit doesn't trigger it.
-            ``0`` disables.  Defaults to ``10`` s.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -170,5 +160,3 @@ class VRTeleopConfig:
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
-    reset_on_disconnect: bool = True
-    exit_reset_timeout: float = 10.0
