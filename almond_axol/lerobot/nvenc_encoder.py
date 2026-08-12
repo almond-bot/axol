@@ -487,7 +487,16 @@ class NvencStreamingEncoder:
         self._episode_active = False
         self._closed = False
 
-    def start_episode(self, video_keys: list[str], temp_dir: Path) -> None:
+    def start_episode(
+        self,
+        video_keys: list[str],
+        temp_dir: Path,
+        depth_video_keys: list[str] | None = None,
+    ) -> None:
+        # depth_video_keys is part of LeRobot's StreamingVideoEncoder interface;
+        # Axol declares no depth features, so it is always empty here.
+        if depth_video_keys:
+            raise ValueError("NvencStreamingEncoder does not support depth features")
         if self._episode_active:
             self.cancel_episode()
         temp_dir = Path(temp_dir)

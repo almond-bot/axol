@@ -34,8 +34,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.robots.robot import Robot
-from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint

@@ -20,7 +20,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from GitHub, with every extra), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with every extra), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
@@ -30,7 +30,7 @@ Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine.
 
 ### Development install
 
-Install the package from a clone using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and are resolved automatically:
+Install the package from a clone using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
 
 ```bash
 uv sync
@@ -46,7 +46,7 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash

@@ -11,6 +11,35 @@ from almond_axol.lerobot.teleop import AxolVRTeleop, AxolVRTeleopConfig
 from almond_axol.lerobot.camera import ZedCamera, ZedCameraConfig
 ```
 
+## Use with the stock LeRobot CLIs
+
+`almond-axol` is published to PyPI, and the companion **`lerobot_robot_axol`** plugin registers these wrappers through LeRobot's plugin auto-discovery — so the **stock** LeRobot CLIs (`lerobot-teleoperate`, `lerobot-record`, `lerobot-replay`, …) drive the Axol with no changes to LeRobot itself. Installing the plugin pulls in `almond-axol[lerobot]`; then select the devices by `type`:
+
+```bash
+pip install lerobot_robot_axol
+
+lerobot-teleoperate --robot.type=axol --teleop.type=axol_vr
+
+lerobot-record \
+    --robot.type=axol \
+    --robot.cameras "{overhead: {type: zed, serial: 41234567, stereo: true}}" \
+    --teleop.type=axol_vr \
+    --dataset.repo_id=${HF_USER}/my-dataset \
+    --dataset.num_episodes=5
+```
+
+| Kind | `type` | Class |
+|---|---|---|
+| Robot | `axol` | [`AxolRobot`](#axolrobot) |
+| Teleoperator | `axol_vr` | [`AxolVRTeleop`](#axolvrteleop) |
+| Camera | `zed` | [`ZedCamera`](#zedcamera) |
+
+Teleoperation still uses the VR headset — open the [VR app](/operations/teleop) and connect to the robot machine. For the highest-rate data collection (out-of-process ZED capture, on-Jetson NVENC dataset encoding, headset video streaming), prefer the SDK's own [`collect-data`](/cli/collect-data) / [`run-policy`](/cli/run-policy), which are built on these same classes.
+
+<Note>
+  Requires LeRobot ≥ 0.6.1, Linux, and Python 3.13 on the robot machine; the `zed` camera additionally needs `pyzed` ([`zed.install`](/cli/zed-install)). See the [plugin README](https://github.com/almond-bot/axol/tree/main/plugins/lerobot_robot_axol) for adding it to an existing one-command-install `axol` environment.
+</Note>
+
 ## `AxolRobot`
 
 LeRobot `Robot` wrapping the async `Axol` hardware driver. A background thread runs a dedicated asyncio event loop so motor telemetry keeps streaming while the synchronous `get_observation()` and `send_action()` calls block on the calling thread.

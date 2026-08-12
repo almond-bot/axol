@@ -111,13 +111,6 @@ class VRTeleop:
         # cannot drift apart.
         self._core = VRTeleopCore(config, _logger, self._broadcast_tracking)
 
-        # Quitting the VR app closes the operator's socket without reliably
-        # delivering the Y-exit reset frame; send the arms home on that
-        # disconnect (a pause — system menu, doffed headset — keeps the
-        # socket open and only auto-disengages).
-        if config.reset_on_disconnect:
-            self._vr_server.set_on_operator_gone(self._core.request_reset_if_away)
-
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
         self._ik_thread: threading.Thread | None = None

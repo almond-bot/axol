@@ -929,6 +929,9 @@ def _run(
             log_say(f"Removing empty dataset directory at {dataset_root}.")
             shutil.rmtree(dataset_root)
 
+        from lerobot.configs.video import RGBEncoderConfig
+
+        rgb_encoder = RGBEncoderConfig(vcodec=vcodec)
         if is_complete:
             check_resume_consistency(dataset_root)
             log_say(f"Resuming existing dataset at {dataset_root}.")
@@ -938,7 +941,7 @@ def _run(
                 image_writer_threads=4,
                 streaming_encoding=True,
                 encoder_threads=4,
-                vcodec=vcodec,
+                rgb_encoder=rgb_encoder,
             )
             resumed_dataset = True
         else:
@@ -970,7 +973,7 @@ def _run(
                 image_writer_threads=4,
                 streaming_encoding=True,
                 encoder_threads=4,
-                vcodec=vcodec,
+                rgb_encoder=rgb_encoder,
             )
 
     if rerun_ip:

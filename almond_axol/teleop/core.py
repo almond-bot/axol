@@ -239,22 +239,6 @@ class VRTeleopCore:
         """Programmatically trigger a return-to-rest move. Safe from any thread."""
         self._reset_latched = True
 
-    def request_reset_if_away(self) -> None:
-        """Return to rest, but only if the arms are away from it. Thread-safe.
-
-        Wired to the VR server's operator-gone notification (the last
-        pose-sending client disconnected): quitting the VR app can't reliably
-        deliver the Y-exit reset frame, so the disconnect itself sends the
-        arms home. A no-op at rest or mid-reset, so an idle operator
-        disconnecting never moves the robot.
-        """
-        if self._at_rest or self.is_resetting:
-            return
-        self._logger.info(
-            "Operator disconnected with the arms away from rest: returning to rest"
-        )
-        self._reset_latched = True
-
     def clear_reset_request(self) -> None:
         """Consume a pending reset latch without acting on it.
 
@@ -737,26 +721,25 @@ class VRTeleopCore:
         last_frame: object,
         process_alive: Callable[[], bool],
     ) -> None:
-        """Safety handling for a stopped pose stream, in two stages.
+        """Force-disengage when the pose stream stops (``disengage_timeout``).
 
         The pose stream only flows while the headset is presenting, so a gap
         means the operator left VR (or the link died) — through *any* exit
         path, including ones that never deliver the Y-press reset frame
         (system menu, headset doffed, app crash, WiFi drop).
 
-        Stage 1 (``disengage_timeout``): force-disengage. Staying engaged
-        across the gap is what makes the arms jerk on the next VR entry: the
-        resumed frames are measured against the old engage snapshot, so the
-        target jumps by however far the controllers moved in the meantime.
-        Disengaging freezes the arms in place and makes re-entry inert until
-        the operator deliberately re-engages (fresh engage snapshot — no
-        jump).
+        Staying engaged across the gap is what makes the arms jerk on the
+        next VR entry: the resumed frames are measured against the old engage
+        snapshot, so the target jumps by however far the controllers moved in
+        the meantime. Disengaging freezes the arms in place and makes
+        re-entry inert until the operator deliberately re-engages (fresh
+        engage snapshot — no jump).
 
-        Stage 2 (``exit_reset_timeout``): return to rest. The prompt path for
-        a quit is the operator-gone disconnect notification
-        (:meth:`request_reset_if_away`), but a killed app's socket close can
-        be delayed or lost entirely (WiFi power-save right after quitting, a
-        crash); sustained silence sends the arms home regardless.
+        That freeze is deliberately where it ends: the arms *hold position*
+        until an operator acts. A lost link, a quit app, or a crashed headset
+        must never move the robot on its own — the operator reconnects and
+        either re-engages (tracking resumes from where the arms are) or
+        presses reset (X) to send them home.
 
         Runs on the IK thread. Frame arrivals are timestamped at ingest
         (:meth:`note_frame_reset`) rather than via ``get_frame`` identity,
@@ -774,7 +757,8 @@ class VRTeleopCore:
             self.teleop_enabled = False
             self._logger.info(
                 "Teleop disabled: no VR poses for %.2fs (operator left VR or "
-                "the link dropped); re-engage with both grips",
+                "the link dropped); holding position — re-engage with both "
+                "grips, or press reset (X) to return to rest",
                 gap,
             )
             self._broadcast(False)
@@ -799,20 +783,6 @@ class VRTeleopCore:
                         )
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
                     self._logger.error("IK disengage dispatch error: %s", e)
-
-        # Backstop for exits whose socket close is delayed or never arrives
-        # (a killed app whose TCP FIN was lost to WiFi power-save, a crash, a
-        # link drop): after a longer silence, send the arms home like the
-        # disconnect path would have. A no-op at rest, so an operator who
-        # never engaged can idle in the menu indefinitely.
-        reset_after = self.config.exit_reset_timeout
-        if 0 < reset_after <= gap and not self._at_rest and not self.is_resetting:
-            self._logger.info(
-                "Returning to rest: no VR poses for %.1fs and the arms are "
-                "away from rest",
-                gap,
-            )
-            self._reset_latched = True
 
     @staticmethod
     def _pace(t0: float, interval: float) -> None:

@@ -46,9 +46,9 @@ import time
 from typing import Any
 
 import numpy as np
+from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
@@ -243,12 +243,6 @@ class AxolVRTeleop(Teleoperator):
     ) -> None:
         self._vr_server = VRServer(self.config.vr_server_config)
         self._vr_server.set_on_frame(self._on_vr_frame)
-        # Quitting the VR app closes the operator's socket without reliably
-        # delivering the Y-exit reset frame; send the arms home on that
-        # disconnect (a pause — system menu, doffed headset — keeps the
-        # socket open and only auto-disengages).
-        if self.config.vr_teleop_config.reset_on_disconnect:
-            self._vr_server.set_on_operator_gone(self._core.request_reset_if_away)
         # Lock the headset HUD to data collection: the operator can record
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
