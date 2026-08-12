@@ -110,6 +110,30 @@ If VR tracking feels jittery or arrives in bursts, configure the following on yo
 
 These prevent the AP from batching packets between beacon intervals, which causes intermittent latency spikes that are especially noticeable in VR.
 
+## Latency tuning
+
+Teleop deliberately trades a little latency for smoothness: the pose stream is buffered and filtered before it reaches IK so that controller tracking glitches and network jitter don't turn into arm jitter. The defaults add roughly **80–90 ms** between your hand and the commanded arm on a clean link — the table below shows where it goes and which knob controls each stage. All of them are CLI flags (or [config-file](/cli/configuration) fields); none require code changes.
+
+| Knob | Default | What it buys | Latency cost |
+|---|---|---|---|
+| `--vr_server.interp_smooth_window_s` | `0.12` | Zero-phase pose smoothing + tracking-glitch rejection (glitches up to ~half the window are erased outright) | **+60 ms**, fixed — half the window. The largest single contributor |
+| `--vr_server.interp_max_delay_s` | `0.15` | Cap on the adaptive jitter buffer that replays bursty network delivery smoothly | 0 ms on a clean link (USB, quiet Wi-Fi); grows only while the network is actually jittery, up to the cap, and decays within seconds |
+| `--teleop.pose_min_cutoff` | `0.8` | Tremor rejection while the hand is (near) still — One Euro filter's minimum cutoff (Hz) | Up to ~200 ms during *slow, precise* moves; negligible during fast ones |
+| `--teleop.pose_beta` | `2.0` | How eagerly the One Euro filter opens up as hand speed rises | Higher = less lag during medium/fast motion, at the cost of passing more tracking noise through |
+| `--teleop.ik_alpha` | `0.3` | Smoothing of the IK output before the velocity filter | ~19 ms at the default; ~8 ms at `0.5` |
+
+If teleop feels too laggy, adjust in this order — one knob at a time, on the real robot, since the same smoothing is what makes contact-heavy work (deburring, insertion) feel good:
+
+1. **`--vr_server.interp_smooth_window_s 0.08`** — buys back 20 ms; glitch rejection stays effective for the common short tracking glitches.
+2. **`--teleop.pose_beta 4`** — snappier during motion, unchanged at rest.
+3. **`--teleop.ik_alpha 0.4`** — a few ms, minor smoothness cost.
+4. **`--teleop.pose_min_cutoff 1.2`** — only if slow precise work still feels sticky; this re-admits some at-rest tremor.
+5. **`--vr_server.interp_smooth_window_s 0`** — disables the fixed-lag smoother entirely (pure jitter-buffer playout). Only worth it on a wired [USB connection](/guides/quest-over-usb) with a well-tracked controller.
+
+<Note>
+  The jitter buffer (`interp_max_delay_s`) self-regulates — it only adds delay while packet delivery is actually bursty, so lowering its cap mostly changes how much of a bad Wi-Fi episode gets smoothed versus played as a catch-up. If you're chasing network-induced lag, the [USB connection](/guides/quest-over-usb) and the [router settings above](#network-tip) are worth more than any knob here.
+</Note>
+
 ## Next steps
 
 <CardGroup cols={2}>
