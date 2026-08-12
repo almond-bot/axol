@@ -327,9 +327,9 @@ class VRTeleopCore:
         """Advance the engage toggle and grip tracking for one VR frame.
 
         Toggle logic (rising-edge): both grips together → enable; either grip
-        alone → disable. On the first engage out of rest, ramp at the reduced
-        ``engage_max_vel`` for ``engage_duration`` (restored in
-        :meth:`compute_output`).
+        alone → disable. On the first engage out of rest, the velocity cap
+        starts at ``engage_max_vel`` and smoothsteps up to ``teleop_max_vel``
+        across ``engage_duration`` (advanced in :meth:`compute_output`).
         """
         both = frame.l_lock and frame.r_lock
         either = frame.l_lock or frame.r_lock
@@ -375,14 +375,25 @@ class VRTeleopCore:
         rate the setpoint stair-cases and the velocity feedforward turns each
         jump into a torque spike (jerk).
         """
-        # Restore full velocity once the post-engage ramp window expires.
-        if (
-            self._engage_time is not None
-            and time.perf_counter() - self._engage_time >= self.config.engage_duration
-        ):
-            self.smooth_left.max_vel = self.config.teleop_max_vel
-            self.smooth_right.max_vel = self.config.teleop_max_vel
-            self._engage_time = None
+        # Post-engage velocity ramp: smoothstep the cap from engage_max_vel to
+        # teleop_max_vel across engage_duration. The old behaviour held the
+        # low cap for the whole window and then stepped to full speed — error
+        # accumulated during the slow phase was released all at once, so
+        # moving immediately after engage felt dead and then lurched.
+        if self._engage_time is not None:
+            u = (time.perf_counter() - self._engage_time) / max(
+                self.config.engage_duration, 1e-6
+            )
+            if u >= 1.0:
+                v = self.config.teleop_max_vel
+                self._engage_time = None
+            else:
+                s = u * u * (3.0 - 2.0 * u)
+                v = self.config.engage_max_vel + s * (
+                    self.config.teleop_max_vel - self.config.engage_max_vel
+                )
+            self.smooth_left.max_vel = v
+            self.smooth_right.max_vel = v
 
         q = self.q
         if q is None:

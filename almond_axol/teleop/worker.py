@@ -240,24 +240,16 @@ class IKWorker:
     def step(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
         """Process one VRFrame. Returns updated full (N,) q in radians."""
         enabled = frame.l_lock and frame.r_lock
-        if not enabled:
-            self._active = False
-            self._clear_freeze()
-            return q_current
 
-        if not self._active:
-            # OneEuroFilter ``_x_prev`` froze at the controller pose held when
-            # the toggle was last disabled; reset so the engage-snap uses the
-            # actual current pose instead of biasing toward stale state and
-            # sweeping the IK target as the filter catches up.
-            self._reset_pose_filters()
-            # Pin posture to ``q_current`` so the held pose is itself the IK
-            # fixed point. The default rest-pose attractor would otherwise pull
-            # q in the EE null space at every frame, growing with distance from
-            # rest; reset() restores the rest-pose attractor.
-            self._solver.set_posture_pose(q_current)
-
-        # Filter raw VR poses before IK to remove tracking noise / tremor.
+        # Filter raw VR poses on *every* frame — engaged or not — so the
+        # filters are always warm. They used to run only while engaged and be
+        # reset on the engage rising edge, which fixed stale-state sweeps but
+        # made every engage a cold start: a fresh OneEuroFilter's derivative
+        # estimate is zero, pinning the cutoff at its minimum for the first
+        # few hundred ms regardless of hand speed, so moving immediately
+        # after engaging felt heavily over-smoothed. Continuous filtering
+        # keeps the state fresh (no stale sweep) and the derivative already
+        # tracking hand velocity at the engage snap (no cold start).
         lp = self._f_l_pos.update(
             np.array(
                 [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
@@ -307,9 +299,19 @@ class IKWorker:
             left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
             right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
+        if not enabled:
+            self._active = False
+            self._clear_freeze()
+            return q_current
+
         if not self._active:
             self._active = True
             self._clear_freeze()
+            # Pin posture to ``q_current`` so the held pose is itself the IK
+            # fixed point. The default rest-pose attractor would otherwise pull
+            # q in the EE null space at every frame, growing with distance from
+            # rest; reset() restores the rest-pose attractor.
+            self._solver.set_posture_pose(q_current)
             self._engage_snap(
                 left_pos, left_rot, right_pos, right_rot, left_e, right_e, q_current
             )

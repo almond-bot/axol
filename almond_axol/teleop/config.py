@@ -50,14 +50,17 @@ class VRTeleopConfig:
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
-        engage_max_vel: Maximum joint velocity (rad/s) used by the
-            trapezoidal filter when teleop is first engaged after a
-            rest-pose trajectory (startup or reset).  Slows the transition from
-            rest pose to the first IK target.  Restored to ``teleop_max_vel``
-            after ``engage_duration`` seconds.  Defaults to
-            ``reset_speed`` for a consistent feel.
-        engage_duration: Seconds to hold ``engage_max_vel`` after the
-            post-rest engage rising edge before restoring ``teleop_max_vel``.
+        engage_max_vel: Starting joint-velocity cap (rad/s) for the
+            trapezoidal filter when teleop is first engaged after a rest-pose
+            trajectory (startup or reset). Softens the transition from rest
+            pose to the first IK target: the cap smoothsteps from this value
+            up to ``teleop_max_vel`` over ``engage_duration`` seconds, so the
+            arm starts gentle and opens up progressively (a hard restore used
+            to release the error accumulated during the slow phase all at
+            once). Defaults to ``reset_speed`` for a consistent feel.
+        engage_duration: Seconds over which the velocity cap ramps from
+            ``engage_max_vel`` to ``teleop_max_vel`` after the post-rest
+            engage rising edge.
         teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
             trapezoidal filter during normal teleoperation.  Limits how fast
             any single joint can move toward a new IK target.  Defaults to
