@@ -21,6 +21,19 @@ return-to-rest from wherever the arms were left.
 
 Recording continues until Ctrl+C.
 
+When run from the web control panel (``axol serve``), an injected
+``_QueueCollectControl`` merges dashboard commands with the VR events each
+control tick, so a session can be driven with the headset off: Start opens a
+3 s countdown to recording (mirroring the in-headset one), and the Save /
+Discard buttons end the episode with the same outcomes as the VR record and
+reset+record presses. The control's ``snapshot()`` mirrors the headset HUD to
+the panel — phase, episode number, saved count, a status line, and the buttons
+valid right now — and the panel additionally shows the relay's camera streams
+(it joins the VR WebSocket server as one more WebRTC client). A contact hold is
+one of those phases: without it the panel sat on "Saving…" (no buttons) for as
+long as the arms stayed limp, which reads as a stuck save, and a headset-off
+session had no way out of the hold but Stop.
+
 The teleop loop runs at ``--teleop_hz`` and publishes the latest
 ``(joint_obs, action)`` snapshot every tick. The dataset itself — frame
 capture, row assembly, encoding, ``save_episode`` — is owned by a separate
@@ -33,7 +46,9 @@ timestamp.
 
 import asyncio
 import logging
+import math
 import os
+import queue
 import socket
 import threading
 import time
@@ -325,6 +340,183 @@ class CollectDataConfig:
     log_level: LogLevel = "INFO"
 
 
+# ----------------------------------------------------------------------
+# Episode control: lets the web control panel drive a session with the
+# headset off.
+#
+# The VR flow stays authoritative when a headset is worn — the record button
+# starts and ends episodes exactly as before. The panel is a parallel input:
+# its commands arrive through a queue (pushed from /api/op/episode by the
+# serve layer) and are merged with the VR events each control tick. The panel
+# also mirrors everything the headset HUD would show — phase, episode number,
+# saved count, a status line, and the buttons valid right now — through
+# ``snapshot()``, which the serve layer polls.
+# ----------------------------------------------------------------------
+
+# Delay between the panel's "Start recording" click and recording actually
+# starting, mirroring the in-headset record countdown so the operator has time
+# to pick the controllers back up. A second click cancels.
+_PANEL_START_COUNTDOWN_S = 3.0
+
+# Buttons the panel renders per phase (see EpisodeControls in the web app):
+# ``confirm`` asks for a second, confirming click — the panel's stand-in for
+# the headset's double-press save/discard confirmation. ``contact`` is the
+# guarded return's limp hold, whose button stands in for the VR reset press
+# that ends it (same label as the equivalent gate in run-policy, which reaches
+# the same state through its continue gate).
+_COLLECT_PHASE_CONTROLS: dict[str, tuple[dict[str, Any], ...]] = {
+    "ready": ({"command": "start", "label": "Start recording"},),
+    "countdown": ({"command": "start", "label": "Cancel countdown"},),
+    "recording": (
+        {"command": "s", "label": "Save episode", "confirm": True},
+        {"command": "r", "label": "Discard episode", "confirm": True},
+    ),
+    "contact": ({"command": "continue", "label": "Return to rest"},),
+}
+
+
+class _NullCollectControl:
+    """No-op episode control for the plain CLI (VR-only sessions)."""
+
+    def poll_command(self) -> str | None:
+        return None
+
+    def note_ready(self, episode: int) -> None:
+        pass
+
+    def note_countdown(self, deadline: float) -> None:
+        pass
+
+    def note_recording(self) -> None:
+        pass
+
+    def note_saving(self) -> None:
+        pass
+
+    def note_saved(self) -> None:
+        pass
+
+    def note_contact(self) -> None:
+        pass
+
+    def note_returning(self) -> None:
+        pass
+
+
+class _QueueCollectControl:
+    """Web episode control for ``collect-data``: panel-driven recording.
+
+    Mirrors the VR controller flow with dashboard buttons so a session can be
+    driven with the headset off: ``start`` opens a short countdown to
+    recording (``start`` again cancels), and ``s`` / ``r`` end the episode
+    saving / discarding it — the same outcomes as the VR record and
+    reset+record presses.
+
+    Constructed by the serve runner as ``cls(stop_event)``; ``push`` and
+    ``snapshot`` are the API surface it uses (see the ``episode_control``
+    argument of :class:`~almond_axol.serve.commands.CommandDef`). The
+    loop-side surface (``poll_command`` plus the ``note_*`` phase updates) is
+    what :func:`_run` drives.
+    """
+
+    def __init__(self, stop_event: threading.Event) -> None:
+        self._q: queue.Queue[str] = queue.Queue()
+        self._stop = stop_event
+        self._lock = threading.Lock()
+        self._phase = "preparing"
+        self._message = "Preparing…"
+        self._episode: int | None = None
+        self._episodes_recorded = 0
+        # perf_counter deadline of a pending panel-started countdown.
+        self._countdown_deadline: float | None = None
+
+    # -- serve API surface --------------------------------------------------
+
+    def push(self, command: str) -> None:
+        self._q.put(command)
+
+    def snapshot(self) -> dict[str, Any]:
+        """Thread-safe phase/count/message/buttons for ``/api/op/status``."""
+        with self._lock:
+            phase = self._phase
+            message = self._message
+            if phase == "countdown" and self._countdown_deadline is not None:
+                remaining = max(0.0, self._countdown_deadline - time.perf_counter())
+                message = f"Recording starts in {math.ceil(remaining)} s…"
+            snap: dict[str, Any] = {
+                "phase": phase,
+                "episodesRecorded": self._episodes_recorded,
+                "message": message,
+                "controls": [dict(c) for c in _COLLECT_PHASE_CONTROLS.get(phase, ())],
+            }
+            if self._episode is not None:
+                snap["episode"] = self._episode
+            return snap
+
+    # -- loop-side surface --------------------------------------------------
+
+    def poll_command(self) -> str | None:
+        """Next panel command (``start``/``s``/``r``/``continue``), or ``None``.
+
+        ``continue`` is only meaningful during a contact hold (it stands in
+        for the VR reset press); the episode loop ignores it, so a stale one
+        can't affect a recording.
+        """
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            if cmd in ("start", "s", "r", "continue"):
+                return cmd
+            # Anything else (stray run-policy commands, typos) is ignored.
+
+    def _set(self, phase: str, message: str) -> None:
+        with self._lock:
+            self._phase = phase
+            self._message = message
+            if phase != "countdown":
+                self._countdown_deadline = None
+
+    def note_ready(self, episode: int) -> None:
+        with self._lock:
+            self._episode = episode
+        self._set(
+            "ready",
+            f"Episode {episode}: press record on the VR controller, or start "
+            "recording here.",
+        )
+
+    def note_countdown(self, deadline: float) -> None:
+        with self._lock:
+            self._phase = "countdown"
+            self._countdown_deadline = deadline
+
+    def note_recording(self) -> None:
+        self._set("recording", "Recording — save or discard the episode to end it.")
+
+    def note_saving(self) -> None:
+        self._set("saving", "Saving episode…")
+
+    def note_saved(self) -> None:
+        with self._lock:
+            self._episodes_recorded += 1
+
+    def note_contact(self) -> None:
+        self._set(
+            "contact",
+            "Contact during return to rest — the arms are limp and free to "
+            "move. Clear them, then press reset on the controller (or return "
+            "to rest here) to replan from where they are.",
+        )
+
+    def note_returning(self) -> None:
+        self._set("resetting", "Returning to rest…")
+
+
+Control = _NullCollectControl | _QueueCollectControl
+
+
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a data-collection session."""
     cfg = parse(CollectDataConfig, argv)
@@ -340,7 +532,11 @@ def main(argv: list[str]) -> None:
     _run(cfg)
 
 
-def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) -> None:
+def _run(
+    cfg: CollectDataConfig,
+    stop_event: "threading.Event | None" = None,
+    control: "Control | None" = None,
+) -> None:
     from lerobot.processor import make_default_processors
     from lerobot.teleoperators.utils import TeleopEvents
     from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
@@ -353,6 +549,13 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     from ..lerobot.robot.robot_axol import AxolRobot
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
     from ..vr.models import VRState
+
+    # Default keeps the CLI path unchanged: episode decisions come from the VR
+    # controller only. The web panel injects a _QueueCollectControl so the
+    # session can also be driven (and followed) from the dashboard with the
+    # headset off.
+    if control is None:
+        control = _NullCollectControl()
 
     repo_id = cfg.repo_id
     task = cfg.task
@@ -730,6 +933,8 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     async def _episode_loop() -> tuple[bool, bool]:
         recording = False
         rerecord = False
+        # perf_counter deadline of a panel-started record countdown, or None.
+        pending_start: float | None = None
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -747,6 +952,11 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             # reset mid-take is deliberately left as-is.)
             if not recording and teleop.is_resetting:
                 await _guarded_return()
+                # A contact hold during that move left the panel on the
+                # "contact" phase, and nothing else re-announces this phase
+                # until the next episode — the outer loop only runs
+                # note_ready before the episode starts.
+                control.note_ready(episode_idx + 1)
                 deadline = time.perf_counter()
                 prev_t0["v"] = 0.0
                 continue
@@ -778,16 +988,52 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             recorder.publish(joint_obs, robot.action_to_dataset(act_processed), t0)
 
             events = teleop.get_teleop_events()
+            panel_cmd = control.poll_command()
 
-            if events.get("start_recording") and not recording:
+            # Panel-driven start (headset off): a Start click opens a short
+            # countdown — mirroring the in-headset one, so the operator can
+            # pick the controllers back up — and a second click cancels it.
+            # The VR record button stays immediate (the headset app already
+            # ran its own countdown before flipping to RECORDING).
+            if not recording and panel_cmd == "start":
+                if pending_start is None:
+                    pending_start = time.perf_counter() + _PANEL_START_COUNTDOWN_S
+                    control.note_countdown(pending_start)
+                    log_say(
+                        f"Recording starts in {_PANEL_START_COUNTDOWN_S:.0f} seconds."
+                    )
+                else:
+                    pending_start = None
+                    control.note_ready(episode_idx + 1)
+                    log_say("Recording start cancelled.")
+            start_requested = events.get("start_recording") or (
+                pending_start is not None and time.perf_counter() >= pending_start
+            )
+
+            if start_requested and not recording:
+                pending_start = None
                 recording = True
                 # Open the relay's raw branch so the recorder has frames, then
                 # tell the recorder to start an episode.
                 if relay is not None:
                     relay.set_raw_enabled(True)
                 recorder.start_episode(task)
+                control.note_recording()
                 log_say("Recording started.")
 
+            # The episode outcome comes from the VR record button (terminate →
+            # save, reset+record → discard) or the panel's Save / Discard
+            # buttons — whichever arrives first. A panel press has to move the
+            # headset itself, since its own state machine never saw the press:
+            # SAVING blocks its controls until the write completes, while a
+            # discard writes nothing and goes straight back to DATA_COLLECTION
+            # — the states the equivalent A→A / X→X presses leave it in.
+            if recording and panel_cmd in ("s", "r"):
+                rerecord = panel_cmd == "r"
+                teleop.send_feedback_state(
+                    VRState.DATA_COLLECTION if rerecord else VRState.SAVING
+                )
+                break
             if events[TeleopEvents.TERMINATE_EPISODE]:
                 teleop.send_feedback_state(VRState.SAVING)
                 break
@@ -816,13 +1062,33 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
     async def _guard_gravity_step() -> None:
         await robot.gravity_compensate_async(kd=vrt_cfg.reset_gravity_comp_kd)
 
+    def _guard_on_contact() -> None:
+        # The headset may still be in SAVING (which blocks the reset button)
+        # when contact trips, so unblock it. The panel needs telling too: it
+        # would otherwise keep showing the phase the move started from
+        # ("Saving…", which has no buttons) for as long as the hold lasts.
+        teleop.send_feedback_state(VRState.DATA_COLLECTION)
+        control.note_contact()
+
     def _guard_hold_tick() -> None:
         # Recording can't start while the arms are limp: answer a start press
-        # by snapping the headset back to DATA_COLLECTION.
+        # (VR record button or the panel's Start) by snapping the headset back
+        # to DATA_COLLECTION. Draining the panel queue here also keeps a click
+        # from leaking into the next episode's countdown.
         events = teleop.get_teleop_events()
-        if events.get("start_recording"):
+        panel_cmd = control.poll_command()
+        if panel_cmd == "continue":
+            # The hold only ends on a latched reset, so a headset-off session
+            # (or one whose operator has the headset off their face) would
+            # otherwise have no way out of it but Stop.
+            teleop.request_reset()
+        elif events.get("start_recording") or panel_cmd == "start":
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
             log_say("Press reset to return to rest before recording.")
+        if teleop.reset_pending:
+            # Latched, from either input — the hold exits on the next cycle
+            # and replans, so stop offering the panel a button for it.
+            control.note_returning()
 
     async def _guarded_return() -> None:
         """Play the pending reset guarded; await on the robot's event loop."""
@@ -834,9 +1100,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             get_positions=lambda: robot.positions,
             stopped=_stopped,
             announce=log_say,
-            # The headset may still be in SAVING (which blocks the reset
-            # button) when contact trips, so unblock it.
-            on_contact=lambda: teleop.send_feedback_state(VRState.DATA_COLLECTION),
+            on_contact=_guard_on_contact,
             hold_tick=_guard_hold_tick,
             vr_alive=teleop.vr_alive,
         )
@@ -875,6 +1139,7 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
             log_say("Saving episode…")
             recorder.save_episode()
             episodes_recorded += 1
+            control.note_saved()
             log_say(
                 f"Saved episode {recorder.episode_count()} "
                 f"({episodes_recorded} this session)."
@@ -886,8 +1151,11 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
         while not _stopped():
             episode_idx = recorder.episode_count()
             # Surface the (1-based) episode number in the headset HUD so the
-            # operator can see which episode they're about to record.
+            # operator can see which episode they're about to record. The panel
+            # gets the same readout (plus the Start button) through the
+            # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
+            control.note_ready(episode_idx + 1)
             log_say(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
@@ -904,6 +1172,14 @@ def _run(cfg: CollectDataConfig, stop_event: "threading.Event | None" = None) ->
                 if recording:
                     recorder.cancel_episode()
                 break
+
+            if recording and not rerecord:
+                # Mirror the headset's SAVING state in the panel for the whole
+                # rest-pose + save stretch (recording controls are blocked).
+                control.note_saving()
+            else:
+                # Nothing to write, so the return to rest is all that's left.
+                control.note_returning()
 
             # Return home right away, but *guarded*: the move bails into a
             # limp gravity-comp hold on contact (see _return_home_loop), so

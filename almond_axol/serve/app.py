@@ -105,7 +105,8 @@ class SettingsUpdateRequest(BaseModel):
 class EpisodeRequest(BaseModel):
     """A control command for the running op, as named in its own snapshot.
 
-    ``run-policy`` takes ``start`` | ``s`` | ``r`` | ``q``; ``waypoints`` takes
+    ``run-policy`` takes ``start`` | ``s`` | ``r`` | ``q``; ``collect-data``
+    takes ``start`` | ``s`` | ``r`` | ``continue``; ``waypoints`` takes
     ``record`` | ``undo`` | ``clear`` | ``grip-left`` | ``grip-right`` |
     ``play`` | ``stop`` | ``quit``. The panel sends back whatever the op
     published in ``controls``.
