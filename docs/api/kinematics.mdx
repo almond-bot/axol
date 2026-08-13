@@ -84,16 +84,21 @@ for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=2
 |---|---|---|
 | `pos_weight` | `50.0` | End-effector position tracking weight |
 | `ori_weight` | `10.0` | End-effector orientation tracking weight |
-| `elbow_weight` | `5.0` | Elbow hint tracking weight |
+| `elbow_weight` | `0.0` | Elbow hint tracking weight. `0` (the default) disables elbow tracking — the headset's inferred elbow proved unreliable on hardware, so the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`) |
 | `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
 | `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
-| `self_collision_weight` | `75.0` | Self-collision penalty weight |
+| `self_collision_weight` | `150.0` | Self-collision penalty weight |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
 | `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
 | `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |
 | `lambda_factor` | `10.0` | LM damping multiplier after each rejected step, so damping spans its useful range within the iteration budget |
-| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call |
-| `max_reach` | `0.8` m | EE target clamped to this distance from shoulder |
+| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call — an over-limit step is scaled as a whole vector (not clipped per joint), so the commanded configuration keeps its direction |
+| `max_reach` | `0.82` m | Asymptotic cap on the shoulder-to-EE target distance. A soft runaway-target guard, **not** the true reach boundary (which is direction-dependent, ~0.69–0.78 m); targets are soft-clamped so they approach but never reach it. Extension smoothness is handled by the manipulability damping instead |
+| `reach_soft_start` | `0.78` m | Distance from the shoulder where the reach soft-clamp begins to engage (C1-smooth, so it only ever acts on targets beyond any reachable pose) |
+| `manip_damping_threshold` | `0.015` | Translational manipulability below which per-arm adaptive damping ramps in — off in normal use (~0.027 at rest), on only approaching a singular boundary |
+| `manip_damping_boost` | `60.0` | Extra rest-cost weight added to an arm at zero manipulability, ramped in quadratically from `manip_damping_threshold` to slow the solver smoothly near singularities. `0` disables |
+| `limit_damping_margin` | `0.12` rad | Distance from a joint limit within which that joint's damping ramps in — gated on approach, so a joint parked against a limit by task pressure stays free |
+| `elbow_fade_band` | `0.15` m | Height band above the shoulder over which the elbow hint's weight fades to zero (the inferred elbow becomes unreliable at/above shoulder height) |

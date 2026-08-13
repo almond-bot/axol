@@ -94,6 +94,8 @@ Each frame sends a JSON message over the WebSocket:
   r_lock:  boolean   // right grip button state (True = pressed); see l_lock
   l_grip:  number    // left grip (0 = fully gripped, 1 = open)
   r_grip:  number    // right grip
+  l_tracked: boolean // false when the left controller is only inertially tracked (WebXR emulatedPosition — occluded/out of view); the server holds the last clean pose. Omit to default true
+  r_tracked: boolean // right controller optical-tracking state; see l_tracked
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — powered-cart strafe (ignored without a cart)
