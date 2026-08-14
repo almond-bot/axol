@@ -113,7 +113,7 @@ Pick an operation from the selector. Each panel asks only for its **per-run inpu
 | **Teleoperation** | Axol, sim, or cart-only | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If the robot has the [powered cart](/guides/vr-interface#powered-cart), the **Powered cart** setting (Robot tab) also lets the thumbsticks drive it; tick **Cart only** to drive *just* the cart with the arms untouched — no Axol connection or motor check needed. If camera slots are assigned, the feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views) — and mirrored in the panel's [operator view](#operator-view). |
 | **Gravity compensation** | Axol | Hold the arms weightless for hand-guiding. |
 | **Waypoints** | Axol or sim | Teach-and-repeat: hand-guide the arms and press **Record waypoint** for each pose, then **Play** to replay the path as straight-line moves. **Undo**, **Clear**, and a gripper toggle are there while teaching; **Stop playback** interrupts a run. Toggle **sim** to preview a saved path in the browser visualizer. See [`waypoints`](/cli/waypoints). |
-| **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. |
+| **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. The feeds are mirrored in the panel's [operator view](#operator-view) and the [episode controls](#episode-controls) can start and end takes, so a session can be driven with the headset off. |
 | **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
 | **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
 
@@ -129,25 +129,35 @@ Starting an operation streams its logs into the console at the bottom of the pag
 
 ## Operator view
 
-While **teleoperation** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
+While **teleoperation** or **collect data** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
 
 The **fullscreen** toggle on the camera-feeds header expands the feeds to a full-screen operator display that fits without scrolling; **Esc** or **Exit fullscreen** leaves. If the feeds never connect, the panel offers a one-tap button to **authorize** the stream server's self-signed certificate — the same one-time step the [VR app](/guides/vr-interface) uses.
 
-## Run Policy episode controls
+## Episode controls
 
-While **Run policy** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the saved-episode count, and these buttons:
+While **Run policy** or **Collect data** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the episode number and saved count. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header.
+
+For **Run policy**:
 
 | Button | Effect |
 |---|---|
 | **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
 | **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
 | **Discard** | Drop the current episode and return to the reset gate to redo it. |
+| **Return to rest** | Only during a **Contact** hold: the guarded return between episodes met resistance and the arms are limp. Clear them by hand, then press this to replan the return from where they are. |
 
-These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header.
+These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
 
-<Note>
-  **Collect data has no on-screen episode buttons** — recording is driven from the VR controller (press **A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle. See the [Data Collection guide](/operations/data-collection#controller-layout) for the controller layout.
-</Note>
+For **Collect data**, the buttons do exactly what the VR controller does, so a session can run with the headset off — pair them with the mirrored [camera feeds](#operator-view) above:
+
+| Button | Effect |
+|---|---|
+| **Start recording** | Begin the next take after a 3-second countdown, mirroring the in-headset one so you can pick the controllers back up. Clicking again cancels. |
+| **Save episode** | End the take and save it, like confirming **A** in the headset. Click twice to confirm — the panel's stand-in for the controller's double-press. |
+| **Discard episode** | End the take and drop it to re-record, like confirming **X**. Also click-to-confirm. |
+| **Return to rest** | Only during a **Contact** hold: the guarded return met resistance and the arms are limp. Clear them by hand, then press this (or **X** on the controller) to replan the return from where they are. |
+
+The VR controller stays live throughout — the panel is a parallel input, not a replacement, and whichever arrives first ends the take. Anything the operator arms on the controller (the **Save episode?** / **Discard episode?** confirmation and the record countdown) is mirrored into the panel as a popup, so a headset worn off the face is still followable.
 
 ## Next steps
 

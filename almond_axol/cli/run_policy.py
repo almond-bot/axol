@@ -38,6 +38,7 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
+from ..recording import restore_dataset_ownership
 from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
 
@@ -149,8 +150,45 @@ class RunPolicyConfig:
 #
 # The CLI reads them from stdin (``s`` / ``r`` / ``q`` + Enter prompts); the
 # web control panel pushes them through a queue from the API. ``_run`` is
-# agnostic — it only calls the small surface below.
+# agnostic — it only calls the small surface below, and phrases its operator
+# prompts without naming a key or a button, since each control renders the
+# affordance its own surface has (the terminal appends "[Enter]", the panel
+# draws a button).
 # ----------------------------------------------------------------------
+
+# Buttons the panel renders per phase (see EpisodeControls in the web app).
+# The gates aren't here: each has a single button whose label depends on what
+# continuing does — start the next episode, or end a limp contact hold — so
+# they're carried as gate state instead.
+_POLICY_PHASE_CONTROLS: dict[str, tuple[dict[str, Any], ...]] = {
+    "recording": (
+        {"command": "s", "label": "Save"},
+        {"command": "r", "label": "Discard"},
+    ),
+    # The time cap already stopped the rollout, but the operator still owes a
+    # save/discard decision — so the same buttons stay live.
+    "deciding": (
+        {"command": "s", "label": "Save"},
+        {"command": "r", "label": "Discard"},
+    ),
+}
+
+# Panel status line per phase. The gate phases ("ready" / "contact") instead
+# show their live gate message, which carries the operator instruction.
+_POLICY_PHASE_MESSAGES: dict[str, str] = {
+    "preparing": "Preparing…",
+    "recording": "Episode running — Save to keep it, Discard to re-record.",
+    "deciding": "Time cap reached — Save to keep it, Discard to re-record.",
+    "resetting": "Returning to rest…",
+}
+
+# The guarded return-to-rest hit something and dropped the arms into a limp
+# gravity-comp hold. Shared by both controls so the terminal prompt and the
+# panel's status line say the same thing.
+_CONTACT_PROMPT = (
+    "Contact during return to rest — the arms are limp and free to move. "
+    "Clear them, then continue to replan the return from where they are."
+)
 
 
 class _StdinPolicyControl:
@@ -163,10 +201,13 @@ class _StdinPolicyControl:
 
     def await_continue(self, message: str) -> bool:
         try:
-            input(message)
+            input(f"{message} [Enter] ")
             return True
         except (EOFError, KeyboardInterrupt):
             return False
+
+    def await_contact_clear(self) -> bool:
+        return self.await_continue(_CONTACT_PROMPT)
 
     def begin_episode(self) -> None:
         from ..lerobot.rollout import stdin_watcher
@@ -211,7 +252,13 @@ class _QueuePolicyControl:
     """Web episode control: decisions arrive as API-pushed queue commands.
 
     Accepts ``s`` / ``r`` / ``q`` for the running episode and ``continue``
-    (alias ``start``) to advance through the between-episode "ready" gate.
+    (alias ``start``) to advance through a gate — the between-episode "reset
+    the scene" one, or the limp hold a contact during the return-to-rest
+    drops the arms into.
+
+    :meth:`snapshot` is what the control panel renders — the phase, a status
+    line, and the buttons that make sense right now — so the panel follows the
+    run without hardcoding this flow.
     """
 
     def __init__(self, stop_event: "threading.Event") -> None:
@@ -225,6 +272,9 @@ class _QueuePolicyControl:
         self._state_lock = threading.Lock()
         self._phase = "preparing"
         self._episodes_recorded = 0
+        # Instruction + button label of the gate currently open, if any.
+        self._gate_message = ""
+        self._gate_label = "Start episode"
 
     def push(self, command: str) -> None:
         self._q.put(command)
@@ -238,11 +288,23 @@ class _QueuePolicyControl:
             self._episodes_recorded += 1
 
     def snapshot(self) -> dict[str, Any]:
-        """Thread-safe episode phase/count for the /api/op/status API."""
+        """Thread-safe phase/count/message/buttons for the /api/op/status API."""
         with self._state_lock:
+            phase = self._phase
+            if phase in ("ready", "contact"):
+                message = self._gate_message
+                controls = [{"command": "start", "label": self._gate_label}]
+            else:
+                message = _POLICY_PHASE_MESSAGES.get(phase, "")
+                controls = [dict(c) for c in _POLICY_PHASE_CONTROLS.get(phase, ())]
             return {
-                "phase": self._phase,
+                "phase": phase,
+                # Saves are what number an episode, so a discarded rollout is
+                # re-recorded under the same number — as the log line says.
+                "episode": self._episodes_recorded + 1,
                 "episodesRecorded": self._episodes_recorded,
+                "message": message,
+                "controls": controls,
             }
 
     def _drain(self) -> None:
@@ -254,13 +316,17 @@ class _QueuePolicyControl:
         except queue.Empty:
             pass
 
-    def await_continue(self, message: str) -> bool:
+    def _await_gate(self, phase: str, message: str, label: str) -> bool:
+        """Open a gate for the panel and block until the operator resolves it."""
         import queue
 
         from lerobot.utils.utils import log_say
 
         log_say(message)
-        self._set_phase("ready")
+        with self._state_lock:
+            self._phase = phase
+            self._gate_message = message
+            self._gate_label = label
         while not self._stop.is_set():
             try:
                 cmd = self._q.get(timeout=0.25)
@@ -271,6 +337,17 @@ class _QueuePolicyControl:
             if cmd == "q":
                 return False
         return False
+
+    def await_continue(self, message: str) -> bool:
+        return self._await_gate("ready", message, "Start episode")
+
+    def await_contact_clear(self) -> bool:
+        cleared = self._await_gate("contact", _CONTACT_PROMPT, "Return to rest")
+        if cleared:
+            # The return replans and plays from here, so drop the contact
+            # buttons rather than leave them up over a moving arm.
+            self._set_phase("resetting")
+        return cleared
 
     def begin_episode(self) -> None:
         self._choice = None
@@ -1021,18 +1098,16 @@ def _run(
         """Guarded return to rest; ``False`` when the operator aborted.
 
         Plays with the torque watchdog live; on contact the arms drop into
-        a limp gravity-comp hold, and the normal continue gate (Enter on
-        the terminal, Start on the control panel) retries from wherever
-        they were hand-guided to.
+        a limp gravity-comp hold, and the contact gate (Enter on the
+        terminal, "Return to rest" on the control panel) retries from
+        wherever they were hand-guided to.
         """
         return reset_controller.return_to_rest(
             robot,
             torque_threshold=cfg.reset_torque_threshold,
             gravity_comp_kd=cfg.reset_gravity_comp_kd,
             stopped=stop_event.is_set,
-            wait_retry=lambda: control.await_continue(
-                "Contact during return to rest. Free the arms, then continue to retry."
-            ),
+            wait_retry=control.await_contact_clear,
         )
 
     client = None
@@ -1092,9 +1167,7 @@ def _run(
         log_say("Returning to rest pose.")
         if not _return_to_rest_guarded():
             return
-        if not control.await_continue(
-            "Reset the scene, then press Enter to start the first episode."
-        ):
+        if not control.await_continue("Reset the scene, then start the first episode."):
             return
 
         while True:
@@ -1215,7 +1288,7 @@ def _run(
                 if not _return_to_rest_guarded():
                     break
                 if not control.await_continue(
-                    "Reset the scene, then press Enter to start."
+                    "Reset the scene, then start the episode again."
                 ):
                     break
                 continue
@@ -1223,6 +1296,10 @@ def _run(
             # choice == "s"
             if dataset is not None:
                 dataset.save_episode()
+                # The serve unit records as root into the operator's home; hand
+                # the tree back after every save so a crash never leaves a
+                # root-owned dataset behind (no-op off the root service).
+                restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
             log_say(f"Saved episode {episodes_recorded}.")
@@ -1230,7 +1307,7 @@ def _run(
             if not _return_to_rest_guarded():
                 break
             if not control.await_continue(
-                "Reset the scene, then press Enter to start the next episode."
+                "Reset the scene, then start the next episode."
             ):
                 break
 
@@ -1296,6 +1373,11 @@ def _run(
                 _logger.warning(
                     "Failed to remove empty dataset at %s: %s", dataset_root, exc
                 )
+        elif dataset_root is not None:
+            # Finalize wrote the last meta/stats files as root; adopt them too.
+            # After the wipe above, so a discarded dataset isn't chowned on its
+            # way to being deleted.
+            restore_dataset_ownership(dataset_root)
 
         # Restore the default handler so Ctrl+C can still kill any leaked
         # non-daemon thread keeping the interpreter alive.

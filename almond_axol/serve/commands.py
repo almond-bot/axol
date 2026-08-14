@@ -246,6 +246,12 @@ def _collect_data_run() -> Callable[..., Any]:
     return _run
 
 
+def _collect_data_control() -> Callable[..., Any]:
+    from ..cli.collect_data import _QueueCollectControl
+
+    return _QueueCollectControl
+
+
 def _replay_dataset_run() -> Callable[..., Any]:
     from ..cli.replay_dataset import _run
 
@@ -345,6 +351,13 @@ COMMANDS: dict[str, CommandDef] = {
         requires_cameras=True,
         camera_mode="argv",
         streams_video=True,
+        # Recording is teleoperated, so the panel tells the operator to point
+        # the headset at this machine — and shows the relay's camera feeds.
+        uses_headset=True,
+        # Panel-driven episodes (headset-off collection): the dashboard can
+        # start recording and save or discard an episode, and mirrors the
+        # headset HUD (phase, episode number, saved count).
+        episode_control=_collect_data_control,
         per_run_fields=("repo_id", "task"),
     ),
     "replay-dataset": CommandDef(

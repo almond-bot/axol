@@ -29,7 +29,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ...constants import CAN_BASE, CAN_LEFT, CAN_RIGHT
+from ...constants import CAN_BASE, CAN_BRINGUP_SCRIPT, CAN_LEFT, CAN_RIGHT
 from ...utils.sudo import run_root
 from . import driver
 
@@ -42,8 +42,8 @@ _BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
 _UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
-_CAN_DIR = Path.home() / ".almond" / "can"
-_CRON_SCRIPT = _CAN_DIR / "startup.sh"
+_CAN_DIR = CAN_BRINGUP_SCRIPT.parent
+_CRON_SCRIPT = CAN_BRINGUP_SCRIPT
 
 # Hotplug bring-up: pulled in via the udev rules (SYSTEMD_WANTS) whenever an
 # adapter (re-)enumerates, so interfaces recreated by a mid-session USB drop

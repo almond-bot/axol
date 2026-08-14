@@ -29,6 +29,13 @@ CAN_RIGHT = "can_alm_axol_r"
 # so this can't be the more readable "can_alm_axol_base".
 CAN_BASE = "can_alm_axol_b"
 
+# CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter
+# hotplug, and is also the sanctioned way to reset the interfaces at runtime:
+# it flaps both arm-hub channels *together* (flapping one at a time can wedge
+# the adapter's RX path). The CAN bus layer reuses it to purge stale TX frames
+# after an e-stop (see almond_axol/motor/bus.py).
+CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
+
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 
 
