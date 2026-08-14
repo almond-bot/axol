@@ -66,6 +66,7 @@ from ..recording import (
     DatasetRecorderProcess,
     InProcessRecorder,
     default_vcodec,
+    restore_dataset_ownership,
 )
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
@@ -1138,6 +1139,10 @@ def _run(
         elif recording:
             log_say("Saving episode…")
             recorder.save_episode()
+            # The serve unit records as root into the operator's home; hand the
+            # tree back after every save so a crash never leaves a root-owned
+            # dataset behind (no-op off the root service).
+            restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
             log_say(
@@ -1225,6 +1230,8 @@ def _run(
         # Recorder owns the dataset: finalize, optional push, and empty-dataset
         # cleanup all happen in recorder.close().
         recorder.close()
+        # Finalize wrote the last meta/stats files as root; adopt them too.
+        restore_dataset_ownership(dataset_root)
         if relay is not None:
             relay.shutdown()
 

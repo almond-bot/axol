@@ -144,8 +144,9 @@ For **Run policy**:
 | **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
 | **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
 | **Discard** | Drop the current episode and return to the reset gate to redo it. |
+| **Return to rest** | Only during a **Contact** hold: the guarded return between episodes met resistance and the arms are limp. Clear them by hand, then press this to replan the return from where they are. |
 
-These mirror the `s` / `r` keystrokes the [`run-policy`](/cli/run-policy) CLI reads from stdin.
+These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
 
 For **Collect data**, the buttons do exactly what the VR controller does, so a session can run with the headset off — pair them with the mirrored [camera feeds](#operator-view) above:
 
