@@ -354,8 +354,8 @@ export type OperationId = string
 
 /** Episode lifecycle phase, surfaced so the control panel on any
  *  computer shows the right episode controls (not just the tab that started it).
- *  Open-ended: a downstream package's episode control can define its own
- *  phases (e.g. collect-data's "countdown" / "saving") — the panel renders the
+ *  Open-ended: an episode control can define its own phases (collect-data's
+ *  "countdown" / "contact", or a downstream package's) — the panel renders the
  *  server-driven `message`/`controls` then and never needs to know them. */
 export type PolicyPhase = string
 
@@ -386,7 +386,8 @@ export interface PolicyState {
 export interface OpStatus {
   running: boolean
   session: SessionInfo | null
-  /** Present only while run-policy is the running op; null otherwise. */
+  /** Present only while an op declaring an episode control is running
+   *  (collect-data / run-policy / waypoints); null otherwise. */
   policy: PolicyState | null
 }
 
@@ -762,8 +763,12 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    // Panel-driven episodes are newer than the registry, so a host old enough
+    // to need this table can't serve them — the controls would sit on
+    // "Preparing" forever. Its collect-data does run the VR server with the
+    // camera tracks, so the feeds are safe to offer.
     episodeControl: false,
-    usesHeadset: false,
+    usesHeadset: true,
   },
   {
     id: "replay-dataset",
