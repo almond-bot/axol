@@ -91,8 +91,8 @@ The Cameras tab **detects the cameras** plugged into the host and shows one card
 
 The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
 
-- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop, collect-data, and run-policy preview).
-- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream).
+- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop and collect-data). Run policy relays no video, so it ignores this branch entirely.
+- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream). Because **run policy** streams no headset video, it also captures its policy observations at this resolution — the size the dataset was recorded at and the policy was trained on, rather than grabbing a larger headset frame it would only throw away.
 
 Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
 
