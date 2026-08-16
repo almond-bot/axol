@@ -130,43 +130,28 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
 
 
 def check_resume_consistency(dataset_root: "Path") -> None:
-    """Refuse to resume a dataset whose last session lost episodes.
+    """Make sure a resumed dataset didn't lose episodes to a killed recorder.
 
     A recorder subprocess killed before flushing (its "recorder subprocess
     exited … before shutdown" error is in that session's log) loses the
     episodes still buffered in its parquet writer, while ``info.json``'s
     ``total_episodes`` — already bumped per save — survives. Resuming such a
-    dataset numbers the next episode past the lost ones, leaving a permanent
-    index gap. That gap is poison downstream: LeRobot's episode metadata
-    lookups are positional (``meta.episodes[i]`` is a row position, not a
-    key), so on a gapped dataset every episode after the gap silently
-    resolves to a *different* episode's video span. Refuse here, at the next
-    session's start, instead.
+    dataset as-is would number the next episode past the lost ones, leaving a
+    permanent index gap. That gap is poison downstream: LeRobot's episode
+    metadata lookups are positional (``meta.episodes[i]`` is a row position,
+    not a key), so on a gapped dataset every episode after the gap silently
+    resolves to a *different* episode's video span.
+
+    Since the lost episodes' frames are unrecoverable anyway, the torn tail
+    is repaired in place: the dataset is truncated back to the longest
+    verified contiguous prefix of episodes and its totals rewritten to match
+    (see :mod:`almond_axol.recording.repair`), so the session resumes cleanly
+    right after the last intact episode. Raises only when not a single
+    complete episode survives.
     """
-    import json
+    from ..recording.repair import ensure_resume_consistency
 
-    import pyarrow.parquet as pq
-
-    total = int(
-        json.loads((dataset_root / "meta" / "info.json").read_text())["total_episodes"]
-    )
-    indices: list[int] = []
-    for f in sorted((dataset_root / "meta" / "episodes").glob("*/*.parquet")):
-        indices.extend(
-            pq.read_table(f, columns=["episode_index"])["episode_index"].to_pylist()
-        )
-    if sorted(indices) == list(range(total)):
-        return
-    missing = sorted(set(range(total)) - set(indices))
-    raise RuntimeError(
-        f"Dataset {dataset_root} is crash-inconsistent: info.json counts "
-        f"{total} episode(s) but meta/episodes holds {len(indices)}"
-        f"{f' (missing indices {missing})' if missing else ''}. A previous "
-        "session's recorder was killed before it flushed, so those episodes' "
-        "frames are gone. Recording more would number new episodes past the "
-        "gap. Renumber the surviving episodes to a contiguous 0..N-1 (data + "
-        "meta/episodes parquets, info.json totals) or start a fresh dataset."
-    )
+    ensure_resume_consistency(dataset_root)
 
 
 def _existing_dataset_resolution(dataset_root: "Path") -> str | None:

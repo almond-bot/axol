@@ -1206,48 +1206,166 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
     )
 
 
-def _verify_videos_decodable(
-    dataset_root: "Path | str", since: float | None = None
-) -> list[tuple[str, int, int]]:
-    """Safety net: assert every recorded video frame is actually decodable.
+def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
+    """Flush the just-saved episode to disk so a kill can no longer lose it.
 
-    The exact-``k/fps`` timestamp grid means LeRobot's save-time validation only
-    checks *packet* timestamps — so if an upstream stall drops a keyframe, the
-    orphaned frames are muxed (packet present, correct PTS) yet fail to *decode*,
-    producing a dataset that validates on save but raises ``FrameTimestampError``
-    at train time. This re-decodes video files end to end and, for any file
-    whose decoded-frame count is short of its packet count, logs a loud error
-    naming the file (so the operator re-records the affected episode). Best-effort:
-    a probe failure never breaks finalize. Returns the list of bad files.
+    LeRobot keeps two parquet writers open across the whole session — the data
+    rows, and ``meta/episodes`` (which buffers ten episodes per row group) —
+    and only ``finalize()`` writes their footers, without which a parquet file
+    cannot be read at all. Every episode saved so far therefore used to ride
+    on a clean shutdown: a recorder killed mid-session (or an operator killing
+    a shutdown that looked hung) lost them all, leaving the dataset
+    crash-inconsistent. Closing both writers right after each ``save_episode``
+    puts the footers on disk immediately, and re-arming the writers' rotation
+    state — the same state a fresh ``resume`` starts from — makes the *next*
+    episode open new data/meta/video files instead of appending. At every
+    point between saves the dataset on disk is complete, readable, and
+    resumable, so shutdown has nothing left to flush and a crash costs at most
+    the episode currently being written.
 
-    ``since`` (wall-clock epoch) limits the scan to files modified after it —
-    i.e. the files this session actually wrote (an append rewrites the whole
-    chunk file, so its mtime is fresh). Without the filter the verify decodes
-    the *entire* dataset on every shutdown, which grows with total dataset
-    size and makes Ctrl+C appear hung on a large resumed dataset (earlier
-    sessions' files were already verified when they were written).
+    The rotation gives each episode its own parquet/mp4 files (LeRobot's
+    format addresses them per episode by chunk/file index, so per-episode
+    files are just the smallest legal packing). That also retires the old
+    append path's video concat — which rewrote the whole accumulating chunk
+    file on *every* save — so saves get cheaper as the session grows, not
+    more expensive.
+
+    Returns the just-saved episode's metadata row (scalar values), which names
+    its data/video files.
     """
-    import concurrent.futures
+    meta = dataset.meta
+    # latest_episode is the row _save_episode_metadata just buffered, with
+    # every value wrapped in a single-element list; unwrap to the scalar form
+    # meta.episodes rows use.
+    last = {
+        k: (v[0] if isinstance(v, list) else v) for k, v in meta.latest_episode.items()
+    }
+    dataset.writer.close_writer()  # data parquet footer
+    try:
+        meta._close_writer()  # flush the metadata buffer + its footer
+    except Exception:
+        # Don't leave the metadata writer half-open: its file would stay
+        # footerless (unreadable). Closing writes the footer over the row
+        # groups that did land; a row still in the metadata buffer stays there
+        # and flushes with a later save or finalize (each row targets its own
+        # rotated file, so a late flush can't truncate earlier episodes), and
+        # if the process dies first the missing row is exactly the torn tail
+        # the resume repair truncates.
+        if getattr(meta, "_pq_writer", None) is not None:
+            with contextlib.suppress(Exception):
+                meta._pq_writer.close()
+            meta._pq_writer = None
+        raise
+    finally:
+        # The data writer is closed at this point no matter what happened
+        # above, so rotation MUST be re-armed even on failure — otherwise the
+        # next save_episode would see stale rotation state and reopen (i.e.
+        # truncate) the just-finished data parquet. The writers'
+        # rotate-on-resume branches read the previous episode from
+        # meta.episodes[-1]; hand them the row we already hold instead of
+        # re-loading every metadata parquet from disk on each save.
+        meta.episodes = [last]
+        meta.latest_episode = None
+        dataset.writer._latest_episode = None
+    return last
 
-    import av
 
-    root = Path(dataset_root)
-    videos_root = root / "videos"
-    if not videos_root.exists():
-        return []
-    mp4s = sorted(videos_root.glob("observation.images.*/chunk-*/file-*.mp4"))
-    if since is not None:
-        mp4s = [p for p in mp4s if p.stat().st_mtime >= since]
-    if not mp4s:
-        return []
-    _logger.info(
-        "video integrity: verifying %d file(s)%s (%.0f MB)",
-        len(mp4s),
-        " written this session" if since is not None else "",
-        sum(p.stat().st_size for p in mp4s) / 1e6,
-    )
+def _episode_video_paths(dataset_root: "Path", episode_row: dict[str, Any]) -> list:
+    """The mp4 files an episode's metadata row references, one per camera."""
+    paths = []
+    for key in episode_row:
+        if not (key.startswith("videos/") and key.endswith("/chunk_index")):
+            continue
+        video_key = key[len("videos/") : -len("/chunk_index")]
+        paths.append(
+            Path(dataset_root)
+            / "videos"
+            / video_key
+            / f"chunk-{int(episode_row[key]):03d}"
+            / f"file-{int(episode_row[f'videos/{video_key}/file_index']):03d}.mp4"
+        )
+    return paths
 
-    def _probe(mp4: "Path") -> tuple[int, int] | None:
+
+class _EpisodeVideoVerifier:
+    """Decode-verifies each saved episode's videos on a background thread.
+
+    The exact-``k/fps`` timestamp grid means LeRobot's save-time validation
+    only checks *packet* timestamps — so if an upstream stall drops a
+    keyframe, the orphaned frames are muxed (packet present, correct PTS) yet
+    fail to *decode*, producing a dataset that validates on save but raises
+    ``FrameTimestampError`` at train time. This re-decodes each episode's
+    video files end to end right after the episode saves and logs a loud
+    error naming any bad file, so the operator can re-record that episode on
+    the spot. It used to run over the whole session's files at shutdown
+    instead, which grew with session length and made Ctrl+C appear hung — the
+    very thing that tempts an operator into the kill that corrupts the
+    dataset. Off the save path (background thread) so the SAVING window stays
+    short; per-episode files are written-once, so each is verified exactly
+    once, and by shutdown the backlog is at most the last episode.
+    """
+
+    def __init__(self, dataset_root: "Path | str") -> None:
+        import queue
+
+        self._root = Path(dataset_root)
+        self._queue: "queue.Queue[list | None]" = queue.Queue()
+        self._thread = threading.Thread(
+            target=self._run, name="axol-video-verify", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, episode_row: dict[str, Any]) -> None:
+        paths = _episode_video_paths(self._root, episode_row)
+        if paths:
+            self._queue.put(paths)
+
+    def close(self, timeout: float = 60.0) -> None:
+        """Finish the pending verifies (bounded — the backlog is ~1 episode)."""
+        self._queue.put(None)
+        self._thread.join(timeout)
+        if self._thread.is_alive():
+            _logger.warning(
+                "video integrity: verifier still running after %.0fs; leaving "
+                "the last episode's videos unverified",
+                timeout,
+            )
+
+    def _run(self) -> None:
+        while True:
+            paths = self._queue.get()
+            if paths is None:
+                return
+            for mp4 in paths:
+                try:
+                    packets, decoded = self._probe(mp4)
+                except Exception as exc:  # noqa: BLE001 - verify is best-effort
+                    _logger.warning(
+                        "video integrity: could not verify %s: %s", mp4, exc
+                    )
+                    continue
+                if decoded != packets:
+                    _logger.error(
+                        "video integrity: %s has %d frames but only %d decode "
+                        "(%d undecodable) — an upstream drop cost a keyframe; "
+                        "those dataset rows will fail to load, re-record the "
+                        "affected episode",
+                        mp4.relative_to(self._root),
+                        packets,
+                        decoded,
+                        packets - decoded,
+                    )
+                else:
+                    _logger.info(
+                        "video integrity: %s fully decodable (%d frames)",
+                        mp4.relative_to(self._root),
+                        decoded,
+                    )
+
+    @staticmethod
+    def _probe(mp4: "Path") -> tuple[int, int]:
+        import av
+
         with av.open(str(mp4)) as container:
             packets = sum(1 for p in container.demux(video=0) if p.pts is not None)
         with av.open(str(mp4)) as container:
@@ -1256,48 +1374,21 @@ def _verify_videos_decodable(
             decoded = sum(1 for _ in container.decode(stream))
         return packets, decoded
 
-    bad: list[tuple[str, int, int]] = []
-    # Decode files in parallel (PyAV releases the GIL), so shutdown waits for
-    # the slowest file rather than the sum of all cameras.
-    workers = min(len(mp4s), os.cpu_count() or 4)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_probe, mp4): mp4 for mp4 in mp4s}
-        for fut, mp4 in futures.items():
-            try:
-                packets, decoded = fut.result()
-            except Exception as exc:  # noqa: BLE001 - probe must never break finalize
-                _logger.warning("video integrity: could not verify %s: %s", mp4, exc)
-                continue
-            if decoded != packets:
-                rel = str(mp4.relative_to(root))
-                bad.append((rel, packets, decoded))
-                _logger.error(
-                    "video integrity: %s has %d frames but only %d decode (%d "
-                    "undecodable) — an upstream drop cost a keyframe; those dataset "
-                    "rows will fail to load, re-record the affected episode(s)",
-                    rel,
-                    packets,
-                    decoded,
-                    packets - decoded,
-                )
-    if not bad:
-        _logger.info("video integrity: all recorded frames decodable")
-    return bad
-
 
 def _close_dataset_writers(dataset: "LeRobotDataset") -> None:
     """Run ``dataset.finalize()``, guaranteeing the parquet footers get written.
 
     A parquet file is only readable once its writer is closed — that is what
-    appends the row-group index and the trailing ``PAR1`` magic. LeRobot keeps
-    two writers open for a whole session (the data rows, and ``meta/episodes``,
-    which buffers ten episodes per row group) and closes both in
-    ``DatasetWriter.finalize()`` — but only as steps 3 and 4, behind the image
-    writer drain (step 1) and the video encoder flush (step 2). Anything raising
-    in those first two steps leaves both files footerless, which loses *every*
-    episode the session recorded: pyarrow can't locate a single row group
-    without the footer, so ``load_episodes`` fails and the dataset can no longer
-    be read, resumed, or shipped.
+    appends the row-group index and the trailing ``PAR1`` magic. With
+    :func:`make_episode_durable` closing both parquet writers after every save,
+    finalize normally has nothing left to flush and returns immediately — but
+    if a durability flush failed mid-session the writers fall back to staying
+    open, and ``DatasetWriter.finalize()`` closes them only as steps 3 and 4,
+    behind the image writer drain (step 1) and the video encoder flush
+    (step 2). Anything raising in those first two steps leaves the files
+    footerless, which loses every episode still buffered in them: pyarrow
+    can't locate a single row group without the footer, so ``load_episodes``
+    fails and the dataset can no longer be read, resumed, or shipped.
 
     Video and image teardown failures are real but recoverable (at worst one
     episode's video is bad); losing the metadata is not. So close the writers
@@ -1348,8 +1439,17 @@ def _finalize_dataset(
     dataset: "LeRobotDataset",
     config: dict,
     episodes_recorded: int,
-    session_start: float | None = None,
 ) -> None:
+    """Close out the dataset at session end.
+
+    With :func:`make_episode_durable` flushing after every save (and the
+    per-episode video verify running as episodes save), this is normally
+    instant: close already-closed writers, read back the episode metadata as
+    a cheap sanity check, optionally push, wipe an empty fresh dataset. A
+    slow shutdown is exactly what tempted operators into killing the process
+    mid-finalize — the main way datasets got corrupted — so nothing
+    session-length-proportional is allowed here.
+    """
     from lerobot.utils.utils import log_say
 
     try:
@@ -1360,9 +1460,6 @@ def _finalize_dataset(
         # either way, so this is where we find out whether the salvage worked.
         if episodes_recorded > 0:
             _verify_episodes_readable(config["dataset_root"])
-    if episodes_recorded > 0:
-        with contextlib.suppress(Exception):
-            _verify_videos_decodable(config["dataset_root"], since=session_start)
     if config["push_to_hub"] and episodes_recorded > 0:
         dataset.push_to_hub()
     dataset_root = Path(config["dataset_root"])
@@ -1394,6 +1491,7 @@ class InProcessRecorder:
         self._robot = robot
         self._robot_obs_proc = robot_obs_proc
         self._dataset = _open_dataset(config)
+        self._verifier = _EpisodeVideoVerifier(config["dataset_root"])
         self._publisher = _SnapshotPublisher()
         self._thread: threading.Thread | None = None
         self._stop: threading.Event | None = None
@@ -1402,7 +1500,6 @@ class InProcessRecorder:
         self._record = threading.Event()
         self._frames: dict[str, int] = {"n": 0}
         self._episodes_recorded = 0
-        self._session_start = time.time()
 
     def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
         self._publisher.write(joint_obs, action, ts)
@@ -1473,6 +1570,17 @@ class InProcessRecorder:
                 "with its rows; episode discarded."
             )
         self._dataset.save_episode()
+        # Flush the episode to disk so a kill from here on can't lose it (see
+        # make_episode_durable). Best-effort: on failure the episode is still
+        # saved and its remaining rows reach disk at the next save or finalize
+        # (make_episode_durable leaves the writers consistent either way).
+        try:
+            self._verifier.submit(make_episode_durable(self._dataset))
+        except Exception:  # noqa: BLE001 - durability is best-effort
+            _logger.exception(
+                "could not fully flush the saved episode to disk; it completes "
+                "at the next save or finalize — do not kill this process"
+            )
         self._episodes_recorded += 1
 
     def cancel_episode(self) -> None:
@@ -1481,12 +1589,8 @@ class InProcessRecorder:
 
     def close(self) -> None:
         self._stop_capture()
-        _finalize_dataset(
-            self._dataset,
-            self._config,
-            self._episodes_recorded,
-            session_start=self._session_start,
-        )
+        _finalize_dataset(self._dataset, self._config, self._episodes_recorded)
+        self._verifier.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1501,9 +1605,6 @@ def _recorder_main(
 ) -> None:
     """Recorder subprocess entry: own the dataset, capture from shared memory."""
     logging.basicConfig(level=config["log_level"])
-    # Finalize's decode-verify scans only files written after this (a resumed
-    # dataset's earlier files were verified by the sessions that wrote them).
-    session_start = time.time()
 
     # Keep the recorder (+ its NVENC gst children, which inherit this) off the
     # control loop's cores; fall back to a positive nice where affinity isn't
@@ -1589,6 +1690,7 @@ def _recorder_main(
         )
 
     dataset = _open_dataset(config)
+    verifier = _EpisodeVideoVerifier(config["dataset_root"])
     conn.send(("ready", dataset.num_episodes))
 
     thread: threading.Thread | None = None
@@ -1706,9 +1808,27 @@ def _recorder_main(
                     try:
                         t_save = time.perf_counter()
                         dataset.save_episode()
+                        # Flush the episode to disk *before* acknowledging the
+                        # save, so "saved" means "survives a kill". Best-effort:
+                        # if the flush itself fails the episode is still saved
+                        # in memory and its remaining rows reach disk at the
+                        # next save or finalize (make_episode_durable leaves
+                        # the writers in a consistent state either way), so
+                        # don't fail the session over it — but say so loudly.
+                        try:
+                            episode_row = make_episode_durable(dataset)
+                        except Exception:  # noqa: BLE001 - durability is best-effort
+                            episode_row = None
+                            _logger.exception(
+                                "could not fully flush the saved episode to "
+                                "disk; it completes at the next save or "
+                                "finalize — do not kill this process"
+                            )
                         _logger.info(
                             "save_episode took %.1fs", time.perf_counter() - t_save
                         )
+                        if episode_row is not None:
+                            verifier.submit(episode_row)
                         episodes_recorded += 1
                         conn.send(("saved", dataset.num_episodes))
                     except Exception as exc:  # noqa: BLE001 - report to control proc
@@ -1721,15 +1841,17 @@ def _recorder_main(
     finally:
         stop_capture()
         try:
-            _finalize_dataset(
-                dataset, config, episodes_recorded, session_start=session_start
-            )
+            _finalize_dataset(dataset, config, episodes_recorded)
         except Exception:
             # Never let this take the subprocess down before the cameras are
             # released, but do not swallow it either: a failed finalize is how
             # a session's episode metadata ends up unreadable, and suppressing
             # it left the operator with only the downstream parquet error.
             _logger.exception("recorder failed to finalize the dataset")
+        # After finalize (the dataset is already consistent on disk either
+        # way), give the verifier a bounded window to finish its ~1-episode
+        # backlog so a bad last take is still reported before exit.
+        verifier.close()
         for cam in cameras.values():
             with contextlib.suppress(Exception):
                 cam.close()

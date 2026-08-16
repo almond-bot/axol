@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from lerobot.robots.config import RobotConfig
 
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
@@ -39,9 +40,7 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
-import numpy as np
-
-from ..recording import restore_dataset_ownership
+from ..recording import make_episode_durable, restore_dataset_ownership
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from .collect_data import check_resume_consistency
@@ -1635,9 +1634,24 @@ def _run(
             # choice == "s"
             if dataset is not None:
                 dataset.save_episode()
+                # Flush the episode to disk so a kill can't lose it (mirrors
+                # collect-data — see make_episode_durable). Best-effort: on
+                # failure the episode is still saved and its remaining rows
+                # reach disk at the next save or finalize (make_episode_durable
+                # leaves the writers consistent either way).
+                try:
+                    make_episode_durable(dataset)
+                except Exception:  # noqa: BLE001 - durability is best-effort
+                    _logger.exception(
+                        "could not fully flush the saved episode to disk; it "
+                        "completes at the next save or finalize — do not kill "
+                        "this process"
+                    )
                 # The serve unit records as root into the operator's home; hand
                 # the tree back after every save so a crash never leaves a
-                # root-owned dataset behind (no-op off the root service).
+                # root-owned dataset behind (no-op off the root service). After
+                # the durable flush so the episode's freshly rotated files are
+                # all on disk and covered by the chown.
                 restore_dataset_ownership(dataset_root)
             episodes_recorded += 1
             control.note_saved()
