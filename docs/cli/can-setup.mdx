@@ -25,6 +25,8 @@ If a **single-channel** CAN adapter is also attached — the [powered cart](/gui
 
 <Note>
   The same bring-up script also recovers the bus after an **emergency stop**. Cutting motor power mid-motion leaves the in-flight CAN commands unacknowledged, so without intervention they would all replay the instant the arm is powered back on — snapping it to its pre-e-stop position. The CAN layer detects the stalled bus, flaps the interfaces to drop the stale frames, and holds every send until a probe frame is acknowledged on the wire again, so the arm stays put until the bus is genuinely back online.
+
+  A **momentary** TX-queue overflow is handled more gently. Both arm channels share one dual-channel USB adapter, so a brief stall of its USB pipe — e.g. camera traffic during data collection — can back the queue up while the bus itself is healthy and draining. Told apart from a dead bus by how long it persists, a brief overflow just drops the frame (a rate-limited warning) and the next command proceeds, so heavy USB traffic no longer crashes teleop or data collection mid-session; only an overflow that keeps persisting (nothing draining) escalates to the interface flap and probe-gated hold above.
 </Note>
 
 <Note>
