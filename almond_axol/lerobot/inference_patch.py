@@ -45,3 +45,35 @@ def disable_observation_similarity_filter() -> None:
 
     ps.observations_similar = lambda *args, **kwargs: False
     _logger.debug("Disabled PolicyServer observation-similarity filter.")
+
+
+def import_robot_client_preserving_logging() -> None:
+    """Import lerobot's ``RobotClient`` without letting it hijack root logging.
+
+    Importing ``lerobot.async_inference.robot_client`` runs ``get_logger`` at
+    class scope, which calls ``init_logging``: the root logger is reset to
+    ``NOTSET``, every installed handler is cleared, and lerobot's own console
+    handler plus a ``logs/`` file handler at DEBUG level are installed. With
+    the root effectively at DEBUG, python-can then emits two records per
+    transmitted CAN frame — thousands of synchronous disk writes per second
+    through the shared logging lock, sitting directly on the impedance-command
+    path. Measured on the robot host, that throttled run-policy's 60 Hz
+    control loop to an irregular 35-45 Hz per arm (visible arm jitter) and
+    grew a multi-hundred-MB log file per session.
+
+    Snapshot the root logger's level and handlers, trigger the import, then
+    restore both, so the process keeps exactly the logging its entry point
+    (CLI ``main`` or the serve runner's capture) configured. The ``can``
+    logger is additionally pinned to INFO so even a deliberate DEBUG session
+    can't re-enable per-frame TX logging on the control path.
+    """
+    root = logging.getLogger()
+    prior_level = root.level
+    prior_handlers = root.handlers[:]
+
+    import lerobot.async_inference.robot_client  # noqa: F401
+
+    root.setLevel(prior_level)
+    root.handlers[:] = prior_handlers
+    logging.getLogger("can").setLevel(logging.INFO)
+    _logger.debug("Restored root logging after lerobot robot_client import.")
