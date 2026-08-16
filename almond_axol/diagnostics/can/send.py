@@ -79,8 +79,9 @@ async def _enable(arm: AxolArm, present: set[Joint]) -> None:
     await asyncio.gather(
         *[arm.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in present]
     )
-    # This subset path bypasses AxolArm.enable, so detect which end stop the
-    # present either-stop joints were zeroed at before any _joint_offsets use.
+    # This subset path bypasses AxolArm.enable, so resolve/verify the present
+    # joints' encoder zeros before any _joint_offsets use (either-stop side
+    # detection + unset-zero rejection).
     await arm.resolve_joint_offsets(present)
     if Joint.GRIPPER in present:
         await arm._calibrate_gripper()

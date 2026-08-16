@@ -165,9 +165,9 @@ class HardwareController:
         await asyncio.gather(
             *[m.set_control_mode(ControlMode.IMPEDANCE) for m in motors]
         )
-        # This subset path bypasses AxolArm.enable, so detect which end stop
-        # the present either-stop joints were zeroed at before any
-        # _joint_offsets use.
+        # This subset path bypasses AxolArm.enable, so resolve/verify the
+        # present joints' encoder zeros before any _joint_offsets use
+        # (either-stop side detection + unset-zero rejection).
         await arm.resolve_joint_offsets(self._present)
         if Joint.GRIPPER in self._present:
             await arm._calibrate_gripper()
