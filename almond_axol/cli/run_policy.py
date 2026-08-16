@@ -30,6 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 from lerobot.robots.config import RobotConfig
 
 from ..lerobot.camera.configuration_zed import ZedCameraConfig
@@ -39,8 +40,6 @@ from ..lerobot.rollout import (
     IKResetController,
     RolloutCaptureThread,
 )
-import numpy as np
-
 from ..recording import make_episode_durable, restore_dataset_ownership
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
@@ -1637,13 +1636,16 @@ def _run(
                 dataset.save_episode()
                 # Flush the episode to disk so a kill can't lose it (mirrors
                 # collect-data — see make_episode_durable). Best-effort: on
-                # failure the episode stays buffered until finalize, as before.
+                # failure the episode is still saved and its remaining rows
+                # reach disk at the next save or finalize (make_episode_durable
+                # leaves the writers consistent either way).
                 try:
                     make_episode_durable(dataset)
                 except Exception:  # noqa: BLE001 - durability is best-effort
                     _logger.exception(
-                        "could not flush the saved episode to disk; it is "
-                        "buffered until finalize — do not kill this process"
+                        "could not fully flush the saved episode to disk; it "
+                        "completes at the next save or finalize — do not kill "
+                        "this process"
                     )
                 # The serve unit records as root into the operator's home; hand
                 # the tree back after every save so a crash never leaves a

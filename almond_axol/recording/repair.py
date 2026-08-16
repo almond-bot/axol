@@ -241,12 +241,16 @@ def _repair(
     _recompute_stats(root, surviving)
 
     # 5. info.json last (see the docstring): totals now match what's on disk.
+    # Written via tmp + rename — this write is the repair's commit point, and
+    # an in-place truncate interrupted mid-write would leave info.json
+    # unparseable, turning a still-intact dataset unresumable instead of just
+    # re-running the repair.
     info_path = root / "meta" / "info.json"
     info = json.loads(info_path.read_text())
     info["total_episodes"] = keep
     info["total_frames"] = int(surviving[-1]["dataset_to_index"])
     info["splits"] = {"train": f"0:{keep}"}
-    info_path.write_text(json.dumps(info, indent=4) + "\n")
+    _write_json_atomic(info, info_path)
 
     _logger.warning(
         "repaired crash-inconsistent dataset at %s: a previous session's "
@@ -266,6 +270,13 @@ def _repair(
     )
 
 
+def _write_json_atomic(data: dict[str, Any], path: "Path") -> None:
+    """Write JSON via tmp + rename so a kill mid-write can't corrupt the file."""
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=4, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
 def _recompute_stats(root: "Path", surviving: list[dict[str, Any]]) -> None:
     """Rewrite ``meta/stats.json`` from the surviving episodes' stats columns.
 
@@ -277,7 +288,7 @@ def _recompute_stats(root: "Path", surviving: list[dict[str, Any]]) -> None:
     try:
         import numpy as np
         from lerobot.datasets.compute_stats import aggregate_stats
-        from lerobot.datasets.io_utils import write_stats
+        from lerobot.datasets.utils import serialize_dict
 
         per_episode: list[dict[str, dict[str, Any]]] = []
         for row in surviving:
@@ -290,7 +301,11 @@ def _recompute_stats(root: "Path", surviving: list[dict[str, Any]]) -> None:
             if nested:
                 per_episode.append(nested)
         if per_episode:
-            write_stats(aggregate_stats(per_episode), root)
+            # Atomic for the same reason as info.json: a kill mid-write must
+            # not leave an unparseable stats.json (LeRobot's write_stats
+            # truncates in place).
+            stats = serialize_dict(aggregate_stats(per_episode))
+            _write_json_atomic(stats, root / "meta" / "stats.json")
     except Exception as exc:  # noqa: BLE001 - stats are a best-effort refresh
         _logger.warning(
             "could not re-aggregate stats.json from the surviving episodes "

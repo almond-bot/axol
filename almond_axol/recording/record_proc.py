@@ -1241,13 +1241,32 @@ def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:
         k: (v[0] if isinstance(v, list) else v) for k, v in meta.latest_episode.items()
     }
     dataset.writer.close_writer()  # data parquet footer
-    meta._close_writer()  # flush the metadata buffer + its footer
-    # The writers' rotate-on-resume branches read the previous episode from
-    # meta.episodes[-1]; hand them the row we already hold instead of
-    # re-loading every metadata parquet from disk on each save.
-    meta.episodes = [last]
-    meta.latest_episode = None
-    dataset.writer._latest_episode = None
+    try:
+        meta._close_writer()  # flush the metadata buffer + its footer
+    except Exception:
+        # Don't leave the metadata writer half-open: its file would stay
+        # footerless (unreadable). Closing writes the footer over the row
+        # groups that did land; a row still in the metadata buffer stays there
+        # and flushes with a later save or finalize (each row targets its own
+        # rotated file, so a late flush can't truncate earlier episodes), and
+        # if the process dies first the missing row is exactly the torn tail
+        # the resume repair truncates.
+        if getattr(meta, "_pq_writer", None) is not None:
+            with contextlib.suppress(Exception):
+                meta._pq_writer.close()
+            meta._pq_writer = None
+        raise
+    finally:
+        # The data writer is closed at this point no matter what happened
+        # above, so rotation MUST be re-armed even on failure — otherwise the
+        # next save_episode would see stale rotation state and reopen (i.e.
+        # truncate) the just-finished data parquet. The writers'
+        # rotate-on-resume branches read the previous episode from
+        # meta.episodes[-1]; hand them the row we already hold instead of
+        # re-loading every metadata parquet from disk on each save.
+        meta.episodes = [last]
+        meta.latest_episode = None
+        dataset.writer._latest_episode = None
     return last
 
 
@@ -1553,13 +1572,14 @@ class InProcessRecorder:
         self._dataset.save_episode()
         # Flush the episode to disk so a kill from here on can't lose it (see
         # make_episode_durable). Best-effort: on failure the episode is still
-        # saved, just buffered until finalize as before.
+        # saved and its remaining rows reach disk at the next save or finalize
+        # (make_episode_durable leaves the writers consistent either way).
         try:
             self._verifier.submit(make_episode_durable(self._dataset))
         except Exception:  # noqa: BLE001 - durability is best-effort
             _logger.exception(
-                "could not flush the saved episode to disk; it is buffered "
-                "until finalize — do not kill this process"
+                "could not fully flush the saved episode to disk; it completes "
+                "at the next save or finalize — do not kill this process"
             )
         self._episodes_recorded += 1
 
@@ -1791,17 +1811,18 @@ def _recorder_main(
                         # Flush the episode to disk *before* acknowledging the
                         # save, so "saved" means "survives a kill". Best-effort:
                         # if the flush itself fails the episode is still saved
-                        # (writers fall back to staying open until finalize, the
-                        # pre-durability behavior), so don't fail the session
-                        # over it — but say so loudly.
+                        # in memory and its remaining rows reach disk at the
+                        # next save or finalize (make_episode_durable leaves
+                        # the writers in a consistent state either way), so
+                        # don't fail the session over it — but say so loudly.
                         try:
                             episode_row = make_episode_durable(dataset)
                         except Exception:  # noqa: BLE001 - durability is best-effort
                             episode_row = None
                             _logger.exception(
-                                "could not flush the saved episode to disk; it "
-                                "is buffered until finalize — do not kill this "
-                                "process"
+                                "could not fully flush the saved episode to "
+                                "disk; it completes at the next save or "
+                                "finalize — do not kill this process"
                             )
                         _logger.info(
                             "save_episode took %.1fs", time.perf_counter() - t_save
