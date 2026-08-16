@@ -39,12 +39,17 @@ policy always starts from the rest pose.
 
 Inference runs in-process, one policy call per control tick (the same
 pre/post-processor + ``select_action`` pipeline as LeRobot's sync rollout
-engine). Every intervention span is tracked in *dataset* time (recorded
+engine). Interventions are annotated the way LeRobot's own DAgger rollout
+strategy annotates them: the dataset declares a per-frame bool
+``intervention`` feature and every row recorded while the operator was
+driving is tagged ``True`` (rows from the policy are ``False``). On top of
+that, every intervention span is tracked in *dataset* time (recorded
 frames / fps — the episode's own timeline, so spans stay inside the episode
 boundaries despite the unrecorded frozen gaps); a package building on this
-command can persist them (see :class:`_DaggerControlLoop`). The policy
-backend itself is pluggable (:class:`DaggerPolicy`), so a downstream package
-can drive the same session loop with a remotely-hosted policy.
+command can persist them in other formats (see :class:`_DaggerControlLoop`).
+The policy backend itself is pluggable (:class:`DaggerPolicy`), so a
+downstream package can drive the same session loop with a remotely-hosted
+policy.
 
 Camera and recording plumbing follows ``collect-data``'s proven
 out-of-process split, with one twist this flow needs: the video relay owns
@@ -101,6 +106,13 @@ _logger = logging.getLogger(__name__)
 _STATE_POLICY = "policy"
 _STATE_FROZEN = "frozen"
 _STATE_TELEOP = "teleop"
+
+# LeRobot's native DAgger annotation: a per-frame bool feature tagging rows
+# recorded while the operator was driving (the same feature lerobot's own
+# DAgger rollout strategy declares). Added to every dataset this command
+# creates; the recorder tags each row from the control loop's published
+# intervention flag.
+INTERVENTION_FEATURE: dict[str, Any] = {"dtype": "bool", "shape": (1,), "names": None}
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -406,8 +418,11 @@ class _DaggerControlLoop(threading.Thread):
 
     Every tick publishes the ``(joint_obs, action)`` snapshot to the recorder
     subprocess (a small shared-memory write), which pairs it with the relay's
-    camera frames on its own 60 fps clock. The frozen gap is gated in the
-    recorder (``pause_episode``/``resume_episode``), and the intervention
+    camera frames on its own 60 fps clock. The TELEOP state publishes with
+    ``intervention=True``, which is how the recorder tags the dataset's
+    per-frame ``intervention`` feature (LeRobot's native DAgger annotation).
+    The frozen gap is gated in the recorder
+    (``pause_episode``/``resume_episode``), and the intervention
     span times come from its row counts — dataset time = rows / fps, the
     episode's own timeline. The FROZEN state still publishes the held action
     so the recorder's snapshot always matches the live command when capture
@@ -566,10 +581,14 @@ class _DaggerControlLoop(threading.Thread):
                     joint_obs = self.robot.get_joint_observation()
                     action = self.teleop.get_action()
                     performed = self.robot.send_action(action)
+                    # intervention=True: the recorder tags the rows this
+                    # snapshot pairs with as human-driven (the dataset's
+                    # per-frame ``intervention`` feature).
                     self.recorder.publish(
                         joint_obs,
                         performed if performed is not None else action,
                         t0,
+                        intervention=True,
                     )
                     last_action = action
                 else:  # FROZEN — hold pose, keep the command cadence alive.
@@ -903,6 +922,24 @@ def _run(
         # this process. Mirrors collect-data.
         if is_complete:
             log_say(f"Resuming existing dataset at {dataset_root}.")
+            # An existing dataset's feature set is fixed; one created before
+            # the per-frame intervention flag existed can't gain it on resume
+            # (the recorder only tags rows when the dataset declares the
+            # feature) — interventions in new episodes would go untagged.
+            import json
+
+            try:
+                existing_features = json.loads((meta / "info.json").read_text()).get(
+                    "features", {}
+                )
+            except (OSError, ValueError):
+                existing_features = {}
+            if "intervention" not in existing_features:
+                _logger.warning(
+                    "resuming a dataset without the per-frame 'intervention' "
+                    "feature; new episodes won't carry LeRobot DAgger "
+                    "intervention tags (start a fresh dataset to record them)."
+                )
         action_features = hw_to_dataset_features(robot.action_features, ACTION)
         obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
         recorder = DatasetRecorderProcess(
@@ -915,7 +952,11 @@ def _run(
                 "root": root,
                 "dataset_root": str(dataset_root),
                 "is_complete": is_complete,
-                "features": {**action_features, **obs_features},
+                "features": {
+                    **action_features,
+                    **obs_features,
+                    "intervention": dict(INTERVENTION_FEATURE),
+                },
                 "robot_type": robot.name,
                 "fps": fps,
                 "vcodec": vcodec,

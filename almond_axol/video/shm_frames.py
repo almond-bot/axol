@@ -645,11 +645,12 @@ class SnapshotWriter:
     """Control-process side: publish the latest joint/action snapshot.
 
     A lock-free single-slot seqlock over one shared-memory block of float64s
-    (``[ts, *joint_obs_vals, *action_vals]`` in fixed ``obs_keys`` / ``action_keys``
-    order). The control loop calls :meth:`write` every tick; the cost is a handful
-    of dict lookups + an aligned float store — no pickle, no lock, no blocking, so
-    it stays off the hot path. The recorder subprocess reads it via
-    :class:`SnapshotReader`. Single-writer / single-reader.
+    (``[ts, *joint_obs_vals, *action_vals, intervention]`` in fixed ``obs_keys``
+    / ``action_keys`` order; ``intervention`` is 0.0/1.0). The control loop calls
+    :meth:`write` every tick; the cost is a handful of dict lookups + an aligned
+    float store — no pickle, no lock, no blocking, so it stays off the hot path.
+    The recorder subprocess reads it via :class:`SnapshotReader`.
+    Single-writer / single-reader.
     """
 
     def __init__(self, obs_keys: list[str], action_keys: list[str]) -> None:
@@ -657,16 +658,18 @@ class SnapshotWriter:
         self._action_keys = list(action_keys)
         n = len(self._obs_keys) + len(self._action_keys)
         self._shm = shared_memory.SharedMemory(
-            create=True, size=_SNAP_HEADER_BYTES + 8 * (1 + n)
+            create=True, size=_SNAP_HEADER_BYTES + 8 * (2 + n)
         )
         self.name = self._shm.name
         self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
         self._data = np.ndarray(
-            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+            (2 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
         )
         self._meta["seq"][0] = 0
 
-    def write(self, joint_obs: dict, action: dict, ts: float) -> None:
+    def write(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
         """Pack one snapshot into the slot (seq odd while writing, even when done)."""
         self._meta["seq"][0] += 1  # odd: write in progress
         d = self._data
@@ -678,6 +681,7 @@ class SnapshotWriter:
         for k in self._action_keys:
             d[i] = action[k]
             i += 1
+        d[i] = 1.0 if intervention else 0.0
         self._meta["seq"][0] += 1  # even: committed
 
     def close(self) -> None:
@@ -694,9 +698,10 @@ class SnapshotReader:
     """Recorder-subprocess side: read the latest joint/action snapshot.
 
     Attaches to a :class:`SnapshotWriter`'s block by name and reconstructs the
-    ``(joint_obs, action, ts)`` dicts using the same key order. Returns ``None``
-    before the first write (mirroring the in-process ``_SnapshotPublisher.latest``
-    contract), so the caller can skip a tick just as it did before.
+    ``(joint_obs, action, ts, intervention)`` tuple using the same key order.
+    Returns ``None`` before the first write (mirroring the in-process
+    ``_SnapshotPublisher.latest`` contract), so the caller can skip a tick just
+    as it did before.
     """
 
     def __init__(self, name: str, obs_keys: list[str], action_keys: list[str]) -> None:
@@ -706,10 +711,10 @@ class SnapshotReader:
         self._shm = shared_memory.SharedMemory(name=name)
         self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
         self._data = np.ndarray(
-            (1 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
+            (2 + n,), dtype="<f8", buffer=self._shm.buf, offset=_SNAP_HEADER_BYTES
         )
 
-    def read_latest(self) -> tuple[dict, dict, float] | None:
+    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         # SPSC seqlock: retry while the writer is mid-write (odd seq) or laps us
         # (seq changed across the copy). Writes are sub-microsecond so this
         # converges on the first try in practice; bail to None on the rare miss.
@@ -727,7 +732,8 @@ class SnapshotReader:
             no = len(self._obs_keys)
             joint_obs = {k: float(vals[i]) for i, k in enumerate(self._obs_keys)}
             action = {k: float(vals[no + i]) for i, k in enumerate(self._action_keys)}
-            return joint_obs, action, ts
+            intervention = bool(snap[-1] >= 0.5)
+            return joint_obs, action, ts, intervention
         return None
 
     def close(self) -> None:
