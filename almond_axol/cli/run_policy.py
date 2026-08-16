@@ -1223,6 +1223,18 @@ def _run(
             # choice == "s"
             if dataset is not None:
                 dataset.save_episode()
+                # Flush the episode to disk so a kill can't lose it (mirrors
+                # collect-data — see make_episode_durable). Best-effort: on
+                # failure the episode stays buffered until finalize, as before.
+                from ..recording import make_episode_durable
+
+                try:
+                    make_episode_durable(dataset)
+                except Exception:  # noqa: BLE001 - durability is best-effort
+                    _logger.exception(
+                        "could not flush the saved episode to disk; it is "
+                        "buffered until finalize — do not kill this process"
+                    )
             episodes_recorded += 1
             control.note_saved()
             log_say(f"Saved episode {episodes_recorded}.")
