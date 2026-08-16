@@ -35,7 +35,13 @@ plain teleop (engage with both, release with one — nothing is recorded) so
 the operator can reset the scene with the arms, mirroring ``collect-data``'s
 pre-record phase; the VR reset button homes the arms on demand, and they
 re-home when record is pressed if teleop left them away from rest, so the
-policy always starts from the rest pose.
+policy always starts from the rest pose. Every one of those rest moves is
+*guarded*: a torque-residual contact watchdog (the shared teleop-config knobs
+``--teleop_config.vr_teleop_config.reset_torque_threshold`` /
+``.reset_gravity_comp_kd``) stops the move on unexpected contact and drops
+the arms into a limp gravity-comp hold; the VR reset button (idle-phase
+homes) or the continue gate (terminal Enter / panel button) retries from
+wherever the arms were hand-guided to.
 
 Inference runs in-process, one policy call per control tick (the same
 pre/post-processor + ``select_action`` pipeline as LeRobot's sync rollout
@@ -71,6 +77,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -93,7 +100,7 @@ from .collect_data import (
     check_resume_consistency,
 )
 from .config import DatasetResolution, LogLevel, PolicyType, parse
-from .run_policy import _QueuePolicyControl, _StdinPolicyControl
+from .run_policy import _GATE_CONTACT, _QueuePolicyControl, _StdinPolicyControl
 
 if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -640,7 +647,7 @@ class _DaggerControlLoop(threading.Thread):
 def _idle_teleop_until_record(
     teleop: "DaggerVRTeleop",
     robot: "AxolRobot",
-    reset_controller: IKResetController,
+    return_to_rest: Callable[[], bool],
     teleop_hz: int,
     control: "_StdinPolicyControl | _QueuePolicyControl",
     stop_event: threading.Event,
@@ -650,8 +657,10 @@ def _idle_teleop_until_record(
     Mirrors collect-data's pre-record phase: the grips engage/disengage
     teleop (same both-grips / one-grip toggle as an intervention, including
     the robot-pose sync; grippers adopt the triggers) so the operator can
-    reset the scene with the arms, and the VR reset button homes the arms (via
-    the ``IKResetController``, which plans from the robot's measured pose).
+    reset the scene with the arms, and the VR reset button homes the arms
+    (``return_to_rest`` — the supervisor's guarded ``IKResetController``
+    closure, which plans from the robot's measured pose and bails into a
+    limp gravity-comp hold on contact; another reset press retries).
     Nothing is recorded — no episode exists yet. While engaged, this loop
     runs the teleop tick at ``teleop_hz`` (matching the smoothing filters);
     while idle it just polls the VR events and ``control``'s gate, so the web
@@ -681,14 +690,16 @@ def _idle_teleop_until_record(
         if teleop.consume_idle_reset():
             # VR reset button: home the arms. Disarm the grips for the move
             # so an engage can't fight the reset trajectory, and drop any
-            # events fired while it played.
+            # events fired while it played. An aborted move (stop, or a
+            # contact hold the operator never resolved) leaves teleop_used
+            # as-is, so the pre-episode re-home still covers the arms.
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
             log_say("Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            if return_to_rest():
+                teleop_used = False  # the arms are at rest again
             teleop.set_intervention_allowed(True)
             teleop.get_teleop_events()
-            teleop_used = False  # the arms are at rest again
             continue
         if teleop.teleop_engaged:
             teleop_used = True
@@ -742,6 +753,11 @@ def _run(
     rerun_ip = cfg.rerun_ip
     rerun_port = cfg.rerun_port
 
+    # Guarded return-to-rest knobs, read from the shared teleop config (the
+    # same fields collect-data / `axol teleop` use — see VRTeleopConfig).
+    reset_torque_threshold = 4.0
+    reset_gravity_comp_kd = 0.25
+
     # The teleop smoothing filters advance once per get_action() call with a
     # step of max_vel/frequency, and get_action() only runs in the TELEOP
     # state, which ticks at teleop_hz — so the configured frequency must
@@ -756,6 +772,8 @@ def _run(
                 vr_cfg.frequency,
             )
             vr_cfg.frequency = float(teleop_hz)
+        reset_torque_threshold = vr_cfg.reset_torque_threshold
+        reset_gravity_comp_kd = vr_cfg.reset_gravity_comp_kd
 
     # Finalize the camera set before the relay/robot open the cameras: prune
     # unassigned slots and flag physically-stereo ZED X units. Assign the
@@ -895,6 +913,72 @@ def _run(
     episode_idx = 0
     recorder: DatasetRecorderProcess | None = None
     control_thread: _DaggerControlLoop | None = None
+
+    def _return_to_rest_guarded(wait_retry: Callable[[], bool]) -> bool:
+        """Guarded ``IKResetController`` home; ``False`` when aborted.
+
+        Plays with the torque watchdog live; on contact the arms drop into a
+        limp gravity-comp hold until ``wait_retry`` answers (``True`` =
+        replan from wherever they were hand-guided to) or the run stops.
+        """
+        return reset_controller.return_to_rest(
+            robot,
+            torque_threshold=reset_torque_threshold,
+            gravity_comp_kd=reset_gravity_comp_kd,
+            stopped=stop_event.is_set,
+            wait_retry=wait_retry,
+        )
+
+    def _gate_retry() -> bool:
+        """Contact-hold retry via the continue gate (terminal Enter / panel)."""
+        return control.await_continue(
+            "Contact during return to rest. Free the arms, then continue to retry.",
+            label="Return to rest",
+            phase=_GATE_CONTACT,
+        )
+
+    def _idle_gate_message() -> str:
+        """The idle phase's gate instruction, for opening and restoring it."""
+        return (
+            f"Episode {episode_idx + 1}: reset the scene (grips teleop the "
+            "arms, reset button homes them), then press record in VR to "
+            "start (Ctrl+C quits)."
+        )
+
+    def _idle_reset_retry() -> bool:
+        """Contact-hold retry via the VR reset button (idle-phase homes).
+
+        The idle reset stays armed through the move, so the operator who
+        requested the home ends its contact hold the same way — pressing
+        reset again. The panel's gate works too; the terminal control's
+        ``poll_gate`` is inert by design.
+
+        The hold borrows the idle gate rather than opening its own, so the
+        panel names the contact instead of still reading "reset the scene /
+        Start episode" while the arms hang limp.
+        """
+        log_say(
+            "Contact during return to rest. Free the arms, then press the "
+            "VR reset button (or continue in the panel) to retry."
+        )
+        control.note_gate(
+            "Contact during return to rest — the arms are limp and free to "
+            "move. Clear them, then press the VR reset button, or return to "
+            "rest here.",
+            "Return to rest",
+            phase=_GATE_CONTACT,
+        )
+        try:
+            while not stop_event.is_set():
+                if teleop.consume_idle_reset():
+                    return True
+                if (decision := control.poll_gate()) is not None:
+                    return decision == "go"
+                time.sleep(0.1)
+            return False
+        finally:
+            control.note_gate(_idle_gate_message())
+
     try:
         log_say("Connecting robot...")
         robot.connect()
@@ -969,7 +1053,8 @@ def _run(
         episode_idx = recorder.episode_count()
 
         log_say("Returning to rest pose.")
-        reset_controller.return_to_rest(robot)
+        if not _return_to_rest_guarded(_gate_retry):
+            return
 
         # Keep the relay's raw branch closed outside episodes: the per-frame
         # copy work is the bulk of the relay's raw-branch CPU and nothing
@@ -981,13 +1066,11 @@ def _run(
             teleop.send_feedback_state(VRState.DATA_COLLECTION)
             # Surface the (1-based) dataset episode number in the headset
             # HUD, matching `collect-data` — the operator is in VR, so
-            # this is their episode counter.
+            # this is their episode counter. The panel reads the same
+            # number off the control (its gate message names it too).
             teleop.send_feedback_episode(episode_idx + 1)
-            control.begin_gate(
-                f"Episode {episode_idx + 1}: reset the scene (grips "
-                "teleop the arms, reset button homes them), then press "
-                "record in VR to start (Ctrl+C quits)."
-            )
+            control.note_episode(episode_idx + 1)
+            control.begin_gate(_idle_gate_message())
             # Drop events latched during the reset/save phase so a stale
             # record press can't auto-start the episode, then arm the
             # grips + reset button for between-episode scene-reset teleop.
@@ -995,7 +1078,12 @@ def _run(
             teleop.set_intervention_allowed(True)
             teleop.set_idle_reset_armed(True)
             idle_teleop_used, started = _idle_teleop_until_record(
-                teleop, robot, reset_controller, teleop_hz, control, stop_event
+                teleop,
+                robot,
+                lambda: _return_to_rest_guarded(_idle_reset_retry),
+                teleop_hz,
+                control,
+                stop_event,
             )
             teleop.set_idle_reset_armed(False)
             teleop.set_intervention_allowed(False)
@@ -1006,7 +1094,8 @@ def _run(
                 # The operator moved the arms during the scene reset; the
                 # policy expects to start from the rest pose.
                 log_say("Returning to rest pose before the policy starts.")
-                reset_controller.return_to_rest(robot)
+                if not _return_to_rest_guarded(_gate_retry):
+                    break
 
             # Fresh episode: drop the policy's episode-scoped state (obs
             # history / hidden state from the previous episode).
@@ -1127,7 +1216,11 @@ def _run(
 
             teleop.send_feedback_state(VRState.SAVING)
             log_say("Returning to rest pose.")
-            reset_controller.return_to_rest(robot)
+            # An aborted home (stop / declined retry) must not discard a
+            # fully-recorded episode: fall through to the save/discard
+            # decision either way; the session loop then winds down on the
+            # stop flag.
+            _return_to_rest_guarded(_gate_retry)
 
             if choice == "r":
                 log_say("Re-recording episode.")
