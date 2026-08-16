@@ -80,7 +80,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
   </Tab>
 </Tabs>
 
-`--episode_time_s` is a safety cap (default 120 s) that falls back to the same save / discard / quit prompt if no key is pressed. If a dataset repo is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory.
+`--episode_time_s` is a safety cap (default 120 s) that falls back to the same save / discard / quit prompt if no key is pressed. If a dataset repo is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory — **guarded**: if a joint's torque strays from the gravity model for a sustained window (something still grasped, or a person grabbing an arm) the move stops where it is and the arms drop into a limp gravity-compensation hold. Free them by hand, then continue (Enter on the terminal, **Return to rest** on the control panel) to replan from wherever they were left. Tune with `--reset_torque_threshold` (default 4.0 Nm; `0` disables the watchdog) or the control panel's **Reset contact threshold**.
 
 ## Offload inference to a remote server (optional)
 

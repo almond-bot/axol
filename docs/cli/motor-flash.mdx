@@ -1,0 +1,24 @@
+---
+title: "motor.flash"
+description: "Flash a firmware image to a MyActuator motor over CAN."
+---
+
+Flashes a firmware image to a single MyActuator motor over CAN. The motor reboots into its bootloader and the image is streamed to it as a YMODEM-1K transfer — the same transfer the vendor setup software performs — so no Windows tooling is needed to update a motor in the field. Nothing else may talk to the motor while this runs, so power the arm but leave it idle.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
+| `firmware` | Path to the firmware image (`.bin`, positional, required) |
+| `--id ID` | CAN ID of the motor to flash, hex or decimal (required) |
+| `--frame-delay SECONDS` | Pause between CAN frames; raise if the adapter's TX queue overruns (default: `0`, matching the vendor tool) |
+| `--yes` | Skip the confirmation prompt |
+
+```bash
+axol motor.flash --l --id 0x01 ./RMD-X6-V4.4.bin
+axol motor.flash --r --id 0x03 ./firmware.bin --yes
+```
+
+<Warning>
+  This overwrites the motor's firmware. Interrupting a flash leaves the motor sitting in its bootloader with a partially written image — it will not answer normal commands, but re-running this command recovers it. Do **not** power-cycle and assume the motor is lost.
+</Warning>

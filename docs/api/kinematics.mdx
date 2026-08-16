@@ -3,10 +3,17 @@ title: "almond_axol.kinematics"
 description: "Bimanual inverse kinematics solver using pyroki and JAX/jaxls."
 ---
 
-Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first call takes a few seconds; subsequent calls are fast.
+Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, builds a collision model, and JIT-compiles the solver during `__init__` — the first solver in a process takes a few seconds; subsequent calls (and subsequent solver instances) are fast.
 
 <Note>
-  The XLA compile is cached to disk (`~/.almond/jax-cache`), so that cost is paid **once per machine**, not on every process start — a fresh `axol teleop` / `serve` boots straight into the fast path instead of recompiling. The cache key covers the solver graph plus the `jax`/`jaxlib` versions and backend, so upgrading JAX or changing the solver simply recompiles and refreshes the cache (stale entries are never reused). Only the XLA backend compile is skipped; Python-side tracing/lowering still runs each session. Set `JAX_COMPILATION_CACHE_DIR` to override the location.
+  Solver startup is cached at two levels, both automatic:
+
+  - **Per machine** — the XLA compile (the expensive part, minutes cold on a Jetson) is cached to disk (`~/.almond/jax-cache`), so it's paid **once per machine**, not on every process start. The cache key covers the solver graph plus the `jax`/`jaxlib` versions and backend, so upgrading JAX or changing the solver simply recompiles and refreshes the cache (stale entries are never reused). Set `JAX_COMPILATION_CACHE_DIR` to override the location.
+  - **Per process** — the URDF, pyroki robot, and collision model are built once per process and shared by every `KinematicsSolver` / `AxolForwardKinematics` instance, so creating additional instances doesn't repeat the JAX trace or jaxls problem analysis.
+
+  What remains on every fresh process start is the Python side: imports, URDF parsing, and the jaxls analysis/tracing pass (the `Building optimization problem` / `Vectorizing group` log lines) — several seconds that no disk cache can skip. Within a process it's paid once, up front: additional solver instances reuse the shared model and the already-traced solve. (`axol teleop` / `serve` absorb it in the IK worker's startup handshake, which is why it isn't felt there.)
+
+  The disk cache only covers compiles that happen after it's enabled, which `KinematicsSolver` / `AxolForwardKinematics` do in `__init__`. A script that runs its own JAX/jaxls work **before** creating a solver can call `almond_axol.kinematics.enable_persistent_compilation_cache()` first so those compiles are disk-cached too.
 </Note>
 
 ```python
@@ -20,13 +27,16 @@ from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
 solver = KinematicsSolver(KinematicsConfig(pos_weight=100.0))
 q = np.zeros(solver.num_joints, dtype=np.float32)
 
-# Forward kinematics → (left_SE3, right_SE3) as jaxlie.SE3
-left_se3, right_se3 = solver.fk(q)
-
 # Inverse kinematics → new joint array
 pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
 rot = np.eye(3, dtype=np.float32)
 q = solver.ik(q, left_pose=(pos, rot))
+
+# Forward kinematics → (left, right), each a (pos (3,), rot (3, 3)) numpy
+# pair — the same format ik takes. Reading a pose, nudging it, and solving
+# for the joints is a round trip:
+(l_pos, l_rot), (r_pos, r_rot) = solver.fk(q)
+q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 ```
 
 ## `KinematicsSolver` interface
@@ -36,9 +46,37 @@ q = solver.ik(q, left_pose=(pos, rot))
 | `num_joints` | Total actuated joints across both arms |
 | `joint_names` | Joint name strings (left arm then right) |
 | `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
-| `fk(q)` | Forward kinematics → `(left_SE3, right_SE3)` |
+| `fk(q)` | Forward kinematics → `((pos_3, rot_3x3), (pos_3, rot_3x3))` — the same format `ik` takes |
 | `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
-| `set_posture_pose(q)` | Set the null-space attractor (home pose for joint drift prevention) |
+| `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
+
+## Straight-line paths
+
+`almond_axol.kinematics.path.plan_linear_segment(solver, q_from, q_to, ...)` returns the joint vectors that walk both **gripper tips** along a straight world-frame line between the poses of two joint configurations — position lerped, orientation slerped, every sample resolved with `ik()` and the posture attractor swept between the endpoints so the redundant elbow keeps the configuration you started from.
+
+`fk()` and `ik()` work in the gripper *mount* frame, which the URDF chain ends at; the fingers close `GRIPPER_TIP_OFFSET` (145 mm along the link's -Z) beyond it. The planner holds the line at the tip and converts back to a mount target per solve, since a mount held straight swings the tip through an arc as the wrist reorients. `tip_poses(solver, q)` returns the tip frames directly.
+
+The whole segment is solved up front, at one vector per control tick, so the result can be streamed to `motion_control` verbatim. Timing follows the minimum-jerk curve `ease()` — zero velocity *and* zero acceleration at both ends, so a leg neither jolts as it departs nor as it arrives, at the cost of peaking at 1.875x the average speed rather than smoothstep's 1.5x.
+
+IK does not run at every tick. It runs a couple of dozen times a second — `plan_rate` sets a floor, `MAX_STEP_M` and `MAX_STEP_RAD` a ceiling on how far the tip may travel between solves — and a clamped cubic spline fills in the rest. Solving more finely is not just wasted work but actively worse: each solve lands a fraction of a milliradian off its neighbours' trend (the cost's flat direction, not early stopping — more iterations do not change it), and commanding those samples directly turns that wobble into acceleration noise. Interpolating between sparse solves leaves it behind. Measured peak tip acceleration on a 35 cm leg was 1.7 m/s² solving every tick against 0.11 solving 20 a second, where the profile's own optimum is 0.105.
+
+Because the ceiling is a distance and the floor is rarely the binding one, a leg is sampled the same way however fast it is run, and accuracy does not degrade with speed: the same 35 cm leg holds its line to 0.74 mm and lands 0.02 mm from its target at 0.08 m/s and at 1.0 m/s alike, planning in 0.15 s either way. Speed buys itself in acceleration instead, which rises with its square.
+
+Two separate thresholds govern accuracy. `settle_fraction` is how close a sample is driven before the planner moves on, by re-solving against the same target; `pos_tolerance` and `ori_tolerance` are where a sample is declared unreachable and `PathPlanningError` is raised, before anything has moved. Conflating them leaves every sample a different distance behind its target, which is itself a source of acceleration noise. The delivered trajectory is then checked *between* solved samples too, where a chord deviates most from the line.
+
+An arm whose tip travels less than `min_travel` (and turns less than `min_rotation`) is pinned at `q_from` for the whole segment rather than tracked. Below that scale the difference between two taught configurations is drift rather than intent, and a redundant arm chasing it wanders through its null space — degrees of elbow for a millimetre of tip.
+
+The first vector returned is the configuration IK settles into at the start of the line, which reaches the same gripper pose as `q_from` but generally holds the elbow slightly differently. Commanding it directly puts that difference into a single tick, so plan each segment from the previous one's final vector and blend the remainder in over a few tenths of a second (`axol waypoints` does both).
+
+Planning calls `ik()` without elbow hints, which is a different JAX trace from the one `KinematicsSolver` warms up; call `path.warmup(solver)` once (off the hot path) to absorb that compile. This is what [`axol waypoints`](/cli/waypoints) replays — for a shortest-path move in joint space instead (returning to rest, for example), see `almond_axol.teleop.trajectory.plan_collision_aware_trajectory`.
+
+```python
+from almond_axol.kinematics import KinematicsSolver, plan_linear_segment
+
+solver = KinematicsSolver()
+for q in plan_linear_segment(solver, q_a, q_b, speed=0.25, ang_speed=1.2, rate=250.0):
+    await robot.motion_control(left=..., right=...)
+```
 
 ## `KinematicsConfig` fields
 
@@ -46,16 +84,21 @@ q = solver.ik(q, left_pose=(pos, rot))
 |---|---|---|
 | `pos_weight` | `50.0` | End-effector position tracking weight |
 | `ori_weight` | `10.0` | End-effector orientation tracking weight |
-| `elbow_weight` | `5.0` | Elbow hint tracking weight |
+| `elbow_weight` | `0.0` | Elbow hint tracking weight. `0` (the default) disables elbow tracking — the headset's inferred elbow proved unreliable on hardware, so the arm's swivel is left to the posture attractor. When enabled, the hint is projected onto the robot's reachable elbow sphere and fades out above shoulder height (see `elbow_fade_band`) |
 | `rest_weight` | `7.5` | Per-step damping; penalises deviation from `q_current` |
 | `posture_weight` | `5.0` | Persistent attractor to home pose (prevents null-space drift) |
 | `manipulability_weight` | `0.05` | Reward for configurations with high manipulability |
 | `limit_weight` | `75.0` | Joint limit penalty weight |
 | `self_collision_margin` | `0.025` m | Minimum clearance between collision bodies. Kept below the arm–torso clearance of normal teleop poses so the collision cost isn't active during ordinary tracking |
-| `self_collision_weight` | `75.0` | Self-collision penalty weight |
+| `self_collision_weight` | `150.0` | Self-collision penalty weight |
 | `max_iterations` | `8` | Solver iterations per `ik()` call |
 | `cost_tolerance` | `1e-4` | Convergence tolerance; small enough that only genuine convergence ends a solve (not a rejected step) |
 | `lambda_initial` | `1e-2` | Initial Levenberg–Marquardt damping for the per-tick solve |
 | `lambda_factor` | `10.0` | LM damping multiplier after each rejected step, so damping spans its useful range within the iteration budget |
-| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call |
-| `max_reach` | `0.8` m | EE target clamped to this distance from shoulder |
+| `max_joint_delta` | `~0.035` rad | Maximum joint change per `ik()` call — an over-limit step is scaled as a whole vector (not clipped per joint), so the commanded configuration keeps its direction |
+| `max_reach` | `0.82` m | Asymptotic cap on the shoulder-to-EE target distance. A soft runaway-target guard, **not** the true reach boundary (which is direction-dependent, ~0.69–0.78 m); targets are soft-clamped so they approach but never reach it. Extension smoothness is handled by the manipulability damping instead |
+| `reach_soft_start` | `0.78` m | Distance from the shoulder where the reach soft-clamp begins to engage (C1-smooth, so it only ever acts on targets beyond any reachable pose) |
+| `manip_damping_threshold` | `0.015` | Translational manipulability below which per-arm adaptive damping ramps in — off in normal use (~0.027 at rest), on only approaching a singular boundary |
+| `manip_damping_boost` | `60.0` | Extra rest-cost weight added to an arm at zero manipulability, ramped in quadratically from `manip_damping_threshold` to slow the solver smoothly near singularities. `0` disables |
+| `limit_damping_margin` | `0.12` rad | Distance from a joint limit within which that joint's damping ramps in — gated on approach, so a joint parked against a limit by task pressure stays free |
+| `elbow_fade_band` | `0.15` m | Height band above the shoulder over which the elbow hint's weight fades to zero (the inferred elbow becomes unreliable at/above shoulder height) |

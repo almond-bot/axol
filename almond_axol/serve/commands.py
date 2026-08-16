@@ -15,6 +15,10 @@ one-off checks (``motor.info`` / ``motor.health``, whose read set the
 dashboard's motor tiles show live), the remote ``inference-server``, and
 ``serve`` itself — stays CLI-only.
 
+``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
+browser form can only name a path on the serve host, so the dashboard offers
+the read half (``motor.dump-config``) and single-parameter writes instead.
+
 :data:`COMMANDS` is a registry rather than a fixed table: a package that builds
 on ``almond-axol`` can :func:`register` its own commands before calling
 :func:`~almond_axol.serve.create_app`, and they flow through the API and the
@@ -71,6 +75,7 @@ class CommandDef:
         execution: str = "thread",
         requires_cameras: bool = False,
         camera_mode: str = "none",
+        streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
         uses_headset: bool = False,
@@ -110,6 +115,12 @@ class CommandDef:
         # inputs), "teleop" attaches them to a built config's camera dict
         # (unreachable via flat argv), "none" ignores it.
         self.camera_mode = camera_mode
+        # Whether the op relays camera video to the headset. Only such ops
+        # honor the stream branch of the camera spec (capture at the streaming
+        # resolution, per-camera stream opt-outs); for the rest the merge
+        # captures at the recording resolution, which is what the dataset (and
+        # a policy trained on it) actually consumes.
+        self.streams_video = streams_video
         # Arg name that means "no hardware" for this op, so a sim run skips the
         # robot link and the motor-fault gate. None means it always needs the
         # robot.
@@ -178,6 +189,12 @@ def _gravity_comp() -> type:
     return GravityCompCmdConfig
 
 
+def _waypoints() -> type:
+    from ..cli.waypoints import WaypointsCmdConfig
+
+    return WaypointsCmdConfig
+
+
 def _collect_data() -> type:
     from ..cli.collect_data import CollectDataConfig
 
@@ -217,10 +234,28 @@ def _gravity_comp_run() -> Callable[..., Any]:
     return _run
 
 
+def _waypoints_run() -> Callable[..., Any]:
+    from ..cli.waypoints import _run
+
+    return _run
+
+
+def _waypoints_control() -> Callable[..., Any]:
+    from ..cli.waypoints import _QueueWaypointControl
+
+    return _QueueWaypointControl
+
+
 def _collect_data_run() -> Callable[..., Any]:
     from ..cli.collect_data import _run
 
     return _run
+
+
+def _collect_data_control() -> Callable[..., Any]:
+    from ..cli.collect_data import _QueueCollectControl
+
+    return _QueueCollectControl
 
 
 def _collect_dagger_run() -> Callable[..., Any]:
@@ -277,6 +312,7 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_teleop_run,
         execution="async",
         camera_mode="teleop",
+        streams_video=True,
         sim_flag="sim",
         robot_free_flags=("cart_only",),
         uses_headset=True,
@@ -295,6 +331,25 @@ COMMANDS: dict[str, CommandDef] = {
         execution="async",
         per_run_fields=("free_joints",),
     ),
+    "waypoints": CommandDef(
+        "waypoints",
+        "waypoints",
+        "Waypoints",
+        "Hand-guide the arms in gravity comp to record waypoints, then replay "
+        "them as straight-line moves solved with inverse kinematics. Enable "
+        "simulation to preview a saved path in the browser.",
+        "Operate",
+        "draccus",
+        _waypoints,
+        sim_capable=True,
+        entrypoint=_waypoints_run,
+        episode_control=_waypoints_control,
+        sim_flag="sim",
+        # The gravity-comp side of a session takes the same config shape
+        # (axol.*, channels, kd, rates), so the settings table is inherited.
+        settings_like="gravity-comp",
+        per_run_fields=("file", "loops", "play_only", "sim"),
+    ),
     "collect-data": CommandDef(
         "collect-data",
         "collect-data",
@@ -307,6 +362,14 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_collect_data_run,
         requires_cameras=True,
         camera_mode="argv",
+        streams_video=True,
+        # Recording is teleoperated, so the panel tells the operator to point
+        # the headset at this machine — and shows the relay's camera feeds.
+        uses_headset=True,
+        # Panel-driven episodes (headset-off collection): the dashboard can
+        # start recording and save or discard an episode, and mirrors the
+        # headset HUD (phase, episode number, saved count).
+        episode_control=_collect_data_control,
         per_run_fields=("repo_id", "task"),
     ),
     "collect-dagger": CommandDef(
@@ -412,6 +475,42 @@ COMMANDS: dict[str, CommandDef] = {
         "Calibrate",
         "argparse",
         _argparse_loader("..cli.motor.set_can_id"),
+        requires_hardware=True,
+    ),
+    "motor.dump-config": CommandDef(
+        "motor.dump-config",
+        "motor.dump-config",
+        "Dump config",
+        "Read every configuration parameter from one or all motors, MyActuator "
+        "or Damiao. Read-only — the run log is the snapshot to attach to a "
+        "support thread.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.dump_config"),
+        requires_hardware=True,
+    ),
+    "motor.set-config": CommandDef(
+        "motor.set-config",
+        "motor.set-config",
+        "Set config parameter",
+        "Read or write a single configuration parameter on either motor family "
+        "— protection thresholds, position limits, motion planning caps, and "
+        "Damiao's CAN timeout.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.set_config"),
+        requires_hardware=True,
+    ),
+    "motor.flash": CommandDef(
+        "motor.flash",
+        "motor.flash",
+        "Flash firmware",
+        "Overwrite a MyActuator motor's firmware from a .bin on the robot host. "
+        "Nothing else may use the bus while it runs, and an interrupted flash "
+        "leaves the motor in its bootloader until the flash is re-run.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.motor.flash"),
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------

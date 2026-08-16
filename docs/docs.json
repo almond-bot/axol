@@ -68,6 +68,10 @@
               "cli/diag-zed-cable",
               "cli/motor-set-can-id",
               "cli/motor-set-zero-pos",
+              "cli/motor-dump-config",
+              "cli/motor-set-config",
+              "cli/motor-restore-config",
+              "cli/motor-flash",
               "cli/teleop",
               "cli/collect-data",
               "cli/replay-dataset",
@@ -82,7 +86,8 @@
               "cli/tune-pid",
               "cli/tune-friction",
               "cli/tune-repeatability",
-              "cli/gravity-comp"
+              "cli/gravity-comp",
+              "cli/waypoints"
             ]
           },
           {

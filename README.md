@@ -20,7 +20,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from GitHub, with every extra), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with every extra), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
@@ -30,7 +30,7 @@ Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine.
 
 ### Development install
 
-Install the package from a clone using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and are resolved automatically:
+Install the package from a clone using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
 
 ```bash
 uv sync
@@ -46,7 +46,7 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
@@ -118,7 +118,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -130,6 +130,10 @@ Each operation can be driven from the web control panel or the CLI:
 - [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable)
 - [`motor.set-can-id`](https://docs.almond.bot/cli/motor-set-can-id)
 - [`motor.set-zero-pos`](https://docs.almond.bot/cli/motor-set-zero-pos)
+- [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config)
+- [`motor.set-config`](https://docs.almond.bot/cli/motor-set-config)
+- [`motor.restore-config`](https://docs.almond.bot/cli/motor-restore-config)
+- [`motor.flash`](https://docs.almond.bot/cli/motor-flash)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
@@ -146,6 +150,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`tune.friction`](https://docs.almond.bot/cli/tune-friction)
 - [`tune.repeatability`](https://docs.almond.bot/cli/tune-repeatability)
 - [`gravity-comp`](https://docs.almond.bot/cli/gravity-comp)
+- [`waypoints`](https://docs.almond.bot/cli/waypoints)
 
 ### Python API
 

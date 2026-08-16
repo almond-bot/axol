@@ -103,7 +103,14 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class EpisodeRequest(BaseModel):
-    """run-policy episode control command: ``start`` | ``s`` | ``r`` | ``q``."""
+    """A control command for the running op, as named in its own snapshot.
+
+    ``run-policy`` takes ``start`` | ``s`` | ``r`` | ``q``; ``collect-data``
+    takes ``start`` | ``s`` | ``r`` | ``continue``; ``waypoints`` takes
+    ``record`` | ``undo`` | ``clear`` | ``grip-left`` | ``grip-right`` |
+    ``play`` | ``stop`` | ``quit``. The panel sends back whatever the op
+    published in ``controls``.
+    """
 
     command: str
 
@@ -680,9 +687,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def op_episode(req: EpisodeRequest) -> JSONResponse:
         ok = runner.episode_command(req.command)
         if not ok:
-            return JSONResponse(
-                {"error": "no run-policy episode control active"}, status_code=409
-            )
+            return JSONResponse({"error": "no episode control active"}, status_code=409)
         return JSONResponse({"ok": True})
 
     @app.get("/api/commands")

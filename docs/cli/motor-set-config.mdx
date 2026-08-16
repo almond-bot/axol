@@ -1,0 +1,29 @@
+---
+title: "motor.set-config"
+description: "Read or write a single motor configuration parameter."
+---
+
+Reads or writes a single configuration parameter on either motor family — MyActuator's `0xC0` parameters or Damiao's `0x7FF` registers. The type is inferred from the CAN ID, and parameter names are unique across families. With `--value` the parameter is written and persisted to flash; without it the current value is read back. Use [`motor.dump-config`](https://docs.almond.bot/cli/motor-dump-config) to list every parameter name at once.
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
+| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
+| `--id ID` | CAN ID of the motor, hex or decimal (required) |
+| `--param NAME` | Parameter to read or write (required) |
+| `--value V` | New value; omit to read the current value without writing |
+| `--type {myactuator,damiao}` | Motor type (inferred from the ID if omitted) |
+| `--force-protected` | Allow writing a protected parameter (factory calibration, CAN ID, baud rate) |
+| `--yes` | Skip the confirmation prompt |
+
+Read-only parameters (firmware versions, measured winding constants) are always refused. Protected ones — factory calibration, CAN IDs, baud rate — need `--force-protected`, since getting one wrong can leave a motor unable to commutate or unreachable on the bus. Damiao's CAN loss-of-comms timeout is handled in milliseconds here; the underlying register counts 50 µs ticks and the conversion is applied for you.
+
+```bash
+axol motor.set-config --l --id 0x01 --param LOW_VOLTAGE               # read the threshold
+axol motor.set-config --l --id 0x01 --param LOW_VOLTAGE --value -2.0  # write and persist it
+axol motor.set-config --r --id 0x07 --param TIMEOUT --value 1000      # Damiao CAN timeout, ms
+```
+
+<Warning>
+  Writing a protected parameter can brick a motor on the bus. `--force-protected` exists for deliberate recovery (e.g. reassigning a baud rate), not routine tuning.
+</Warning>

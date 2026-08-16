@@ -13,9 +13,13 @@ from .can import setup as can_setup
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .jetson import setup as jetson_setup
+from .motor import dump_config as motor_dump_config
+from .motor import flash as motor_flash
 from .motor import health as motor_health
 from .motor import info as motor_info
+from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
+from .motor import set_config as motor_set_config
 from .tune import friction, pid, repeatability
 from .zed import driver as zed_driver
 from .zed import install as zed_install
@@ -49,6 +53,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "teleop": ("teleop", "Run a VR teleoperation session."),
     "gravity-comp": ("gravity_comp", "Hold the Axol in gravity-compensation mode."),
+    "waypoints": (
+        "waypoints",
+        "Teach waypoints by hand, then replay them as straight-line moves.",
+    ),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
     "collect-dagger": (
         "collect_dagger",
@@ -97,6 +105,10 @@ def main() -> None:
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)
     motor_health.add_parser(subparsers)
+    motor_flash.add_parser(subparsers)
+    motor_dump_config.add_parser(subparsers)
+    motor_set_config.add_parser(subparsers)
+    motor_restore_config.add_parser(subparsers)
     zed_install.add_parser(subparsers)
     zed_driver.add_parser(subparsers)
     gst_install.add_parser(subparsers)

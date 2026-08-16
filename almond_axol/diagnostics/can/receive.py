@@ -98,11 +98,17 @@ def _read_positions(
     Monitored motors that have reported use their transformed cached position;
     every other entry falls back to ``fallback`` (so unmonitored joints and
     motors still awaiting their first frame do not blow up the whole read).
+    Joints whose zeroed-end-stop side could not be detected (NaN offset —
+    this passive monitor tolerates an unreadable robot) also fall back.
     """
     vals: list[float] = []
     for i, j in enumerate(Joint):
         m = arm.motors[j]
-        if j in monitored and m.has_position:
+        if (
+            j in monitored
+            and m.has_position
+            and not math.isnan(float(arm._joint_offsets[i]))
+        ):
             vals.append(_joint_frame(arm, i, j, m.position))
         else:
             vals.append(float(fallback[i]))
@@ -288,6 +294,20 @@ async def _run(
                 _stats_monitor(channel, arm, log, monitored_set),
                 name="can_stats_monitor",
             )
+
+            # Detect which end stop the monitored either-stop joints were
+            # zeroed at while direct reads are still allowed (telemetry
+            # rejects them once running). This monitor must keep working on
+            # an unpowered robot, so a failed detection only warns — the
+            # affected joints then display the fallback value.
+            try:
+                await arm.resolve_joint_offsets(monitored_set)
+            except Exception as exc:
+                log.warning(
+                    "Could not detect zeroed end stops (%s) — wrist_2/wrist_3 "
+                    "rows will show fallback values until readable.",
+                    exc,
+                )
 
             try:
                 await asyncio.gather(

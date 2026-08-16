@@ -75,8 +75,8 @@ export function CameraFeeds({
 
   // Own the WebSocket to the VR server, reconnecting while mounted: the
   // server only comes up partway through the operation's startup (after the
-  // teleop stack connects), and its video manager is registered later still —
-  // reconnecting also re-triggers useAxolVideo's one-shot webrtc-request.
+  // teleop stack connects). Video negotiation itself needs no reconnects —
+  // useAxolVideo keeps requesting on this socket until an offer lands.
   useEffect(() => {
     let closed = false
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -144,24 +144,21 @@ export function CameraFeeds({
 
   const { streams, available } = useAxolVideo(wsRef, true)
 
-  // `available === false` means this socket's webrtc-request landed before the
-  // op registered its video manager (or video is off). Recycle the socket on a
-  // timer so the next request can succeed once video comes up, and count the
-  // consecutive unavailable replies: the first few are the expected startup
-  // race, so only a persistent run means streaming is actually off.
-  const [unavailableRuns, setUnavailableRuns] = useState(0)
+  // `available === false` means the server currently reports no video. A new
+  // server answers "pending" while its cameras are still starting (available
+  // stays null), so a persistent false means streaming is actually off — but
+  // debounce it, since an older server can't distinguish the startup race
+  // from video-off (useAxolVideo keeps retrying and recovers either way).
+  const [videoOff, setVideoOff] = useState(false)
   useEffect(() => {
-    if (available === true) {
+    if (available !== false) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setUnavailableRuns(0)
+      setVideoOff(false)
       return
     }
-    if (available !== false) return
-    setUnavailableRuns((n) => n + 1)
-    const t = setTimeout(() => wsRef.current?.close(), 5000)
+    const t = setTimeout(() => setVideoOff(true), 10000)
     return () => clearTimeout(t)
   }, [available])
-  const videoOff = available === false && unavailableRuns >= 3
 
   const feeds = useMemo(() => selectFeeds(streams), [streams])
   // A repeatedly-failing connection is either the unaccepted self-signed cert

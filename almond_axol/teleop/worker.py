@@ -168,6 +168,10 @@ class IKWorker:
         """
         self._config = config
         self._solver = KinematicsSolver(kinematics_config)
+        # Elbow hints are optional (kinematics.elbow_weight == 0 disables, the
+        # default): skip the whole elbow pipeline — filters, engage snapshots,
+        # target math — so the solve graph never carries the cost.
+        self._use_elbow = kinematics_config.elbow_weight > 0.0
 
         self._rest_pose_left = np.asarray(config.rest_pose_left, dtype=np.float32)
         self._rest_pose_right = np.asarray(config.rest_pose_right, dtype=np.float32)
@@ -236,28 +240,26 @@ class IKWorker:
     def step(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
         """Process one VRFrame. Returns updated full (N,) q in radians."""
         enabled = frame.l_lock and frame.r_lock
-        if not enabled:
-            self._active = False
-            self._clear_freeze()
-            return q_current
 
-        if not self._active:
-            # OneEuroFilter ``_x_prev`` froze at the controller pose held when
-            # the toggle was last disabled; reset so the engage-snap uses the
-            # actual current pose instead of biasing toward stale state and
-            # sweeping the IK target as the filter catches up.
-            self._reset_pose_filters()
-            # Pin posture to ``q_current`` so the held pose is itself the IK
-            # fixed point. The default rest-pose attractor would otherwise pull
-            # q in the EE null space at every frame, growing with distance from
-            # rest; reset() restores the rest-pose attractor.
-            self._solver.set_posture_pose(q_current)
-
-        # Filter raw VR poses before IK to remove tracking noise / tremor.
+        # Filter raw VR poses on *every* frame — engaged or not — so the
+        # filters are always warm. They used to run only while engaged and be
+        # reset on the engage rising edge, which fixed stale-state sweeps but
+        # made every engage a cold start: a fresh OneEuroFilter's derivative
+        # estimate is zero, pinning the cutoff at its minimum for the first
+        # few hundred ms regardless of hand speed, so moving immediately
+        # after engaging felt heavily over-smoothed. Continuous filtering
+        # keeps the state fresh (no stale sweep) and the derivative already
+        # tracking hand velocity at the engage snap (no cold start).
+        #
+        # ``t`` is the frame's playout/capture stamp: frames reach this worker
+        # at the irregular solve cadence, and timestamped updates keep that
+        # timing jitter from being read as velocity jitter.
+        t_s = (frame.t / 1000.0) if frame.t is not None else None
         lp = self._f_l_pos.update(
             np.array(
                 [frame.l_ee.position.x, frame.l_ee.position.y, frame.l_ee.position.z]
-            )
+            ),
+            t=t_s,
         )
         lq = self._f_l_quat.update(
             np.array(
@@ -267,14 +269,16 @@ class IKWorker:
                     frame.l_ee.quaternion.z,
                     frame.l_ee.quaternion.w,
                 ]
-            )
+            ),
+            t=t_s,
         )
         lq = lq / np.linalg.norm(lq)
 
         rp = self._f_r_pos.update(
             np.array(
                 [frame.r_ee.position.x, frame.r_ee.position.y, frame.r_ee.position.z]
-            )
+            ),
+            t=t_s,
         )
         rq = self._f_r_quat.update(
             np.array(
@@ -284,25 +288,39 @@ class IKWorker:
                     frame.r_ee.quaternion.z,
                     frame.r_ee.quaternion.w,
                 ]
-            )
+            ),
+            t=t_s,
         )
         rq = rq / np.linalg.norm(rq)
 
         left_pos, left_rot = _vr_to_flu_np(*lp, *lq)
         right_pos, right_rot = _vr_to_flu_np(*rp, *rq)
 
-        le = self._f_l_elbow.update(
-            np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z])
-        )
-        re = self._f_r_elbow.update(
-            np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z])
-        )
-        left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
-        right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
+        left_e: np.ndarray | None = None
+        right_e: np.ndarray | None = None
+        if self._use_elbow:
+            le = self._f_l_elbow.update(
+                np.array([frame.l_elbow.x, frame.l_elbow.y, frame.l_elbow.z]), t=t_s
+            )
+            re = self._f_r_elbow.update(
+                np.array([frame.r_elbow.x, frame.r_elbow.y, frame.r_elbow.z]), t=t_s
+            )
+            left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
+            right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
+
+        if not enabled:
+            self._active = False
+            self._clear_freeze()
+            return q_current
 
         if not self._active:
             self._active = True
             self._clear_freeze()
+            # Pin posture to ``q_current`` so the held pose is itself the IK
+            # fixed point. The default rest-pose attractor would otherwise pull
+            # q in the EE null space at every frame, growing with distance from
+            # rest; reset() restores the rest-pose attractor.
+            self._solver.set_posture_pose(q_current)
             self._engage_snap(
                 left_pos, left_rot, right_pos, right_rot, left_e, right_e, q_current
             )
@@ -327,12 +345,15 @@ class IKWorker:
             rotation_multiplier=rot_mult,
         )
 
-        elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
-            left_e - self._snap_elbow_ctrl["left"]
-        )
-        elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
-            right_e - self._snap_elbow_ctrl["right"]
-        )
+        elbow_l: np.ndarray | None = None
+        elbow_r: np.ndarray | None = None
+        if self._use_elbow:
+            elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
+                left_e - self._snap_elbow_ctrl["left"]
+            )
+            elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
+                right_e - self._snap_elbow_ctrl["right"]
+            )
 
         q_new = self._solver.ik(
             q_current,
@@ -341,9 +362,12 @@ class IKWorker:
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
+        targets = [tl_pos, tr_pos]
+        if elbow_l is not None and elbow_r is not None:
+            targets += [elbow_l, elbow_r]
         self._note_solve(
             bool(np.array_equal(q_new, q_current)),
-            np.concatenate([tl_pos, tr_pos, elbow_l, elbow_r]),
+            np.concatenate(targets),
         )
         return q_new
 
@@ -474,8 +498,8 @@ class IKWorker:
                 q,
                 left_pose=l_pose,
                 right_pose=r_pose,
-                left_elbow_pos=l_elbow,
-                right_elbow_pos=r_elbow,
+                left_elbow_pos=l_elbow if self._use_elbow else None,
+                right_elbow_pos=r_elbow if self._use_elbow else None,
             )
             if float(np.max(np.abs(q_new - q))) < tol:
                 return q_new
@@ -488,14 +512,16 @@ class IKWorker:
         left_rot: np.ndarray,
         right_pos: np.ndarray,
         right_rot: np.ndarray,
-        left_e: np.ndarray,
-        right_e: np.ndarray,
+        left_e: np.ndarray | None,
+        right_e: np.ndarray | None,
         q_current: np.ndarray,
     ) -> None:
         """Snapshot controller and FK poses at toggle engage.
 
         These snapshots become the origin against which subsequent controller
-        motion is measured to build relative EE and elbow targets in :meth:`step`.
+        motion is measured to build relative EE and elbow targets in
+        :meth:`step`. Elbow snapshots are ``None`` when elbow tracking is
+        disabled (``kinematics.elbow_weight == 0``) and are never read.
         """
         fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
 
@@ -638,5 +664,9 @@ def run_ik_worker(
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError):
+            # OSError covers ConnectionResetError/BrokenPipeError when the
+            # parent end closes abruptly (parent crash, or a shutdown that
+            # left an in-flight response unread — the close then RSTs this
+            # end). Exit cleanly instead of dying with a traceback.
             break

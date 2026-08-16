@@ -81,11 +81,11 @@ draccus.decode.register(
 )
 
 
-# draccus 0.10.0's attribute-docstring extraction (used only to populate
+# draccus's attribute-docstring extraction (used only to populate
 # --help text) raises IndexError on some source layouts (e.g. a config
-# whose last field is the final line of its module). The help text is
-# cosmetic, so wrap the extractor to degrade gracefully to "no docstring"
-# instead of crashing the whole parse.
+# whose last field is the final line of its module; still present in
+# 0.11.6). The help text is cosmetic, so wrap the extractor to degrade
+# gracefully to "no docstring" instead of crashing the whole parse.
 from draccus.wrappers import docstring as _draccus_docstring  # noqa: E402
 
 _orig_get_attribute_docstring = _draccus_docstring.get_attribute_docstring
@@ -104,10 +104,11 @@ _draccus_docstring.get_attribute_docstring = _safe_get_attribute_docstring
 # ----------------------------------------------------------------------
 # Literal choice decoders.
 #
-# draccus 0.10.0 has no built-in decoder for ``typing.Literal`` and its
-# registry only accepts concrete type objects (not the bare
-# ``typing.Literal`` origin), so we register one decoder per concrete
-# alias. Each rejects out-of-set values, mirroring argparse ``choices=``.
+# draccus (still as of 0.11.6) has no built-in decoder for
+# ``typing.Literal`` and its registry only accepts concrete type objects
+# (not the bare ``typing.Literal`` origin), so we register one decoder per
+# concrete alias. Each rejects out-of-set values, mirroring argparse
+# ``choices=``.
 #
 # Every ``Literal`` field that draccus parses must be registered this way,
 # including ones defined elsewhere: the ``lerobot`` config modules call
@@ -218,7 +219,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
     the explicit CLI flags), so a single deep override like
     ``--axol.left.elbow.kp 200`` keeps the elbow's other per-joint
     defaults instead of demanding the whole ``JointConfig``. Kept faithful
-    to draccus 0.10.0's own ``_postprocessing`` (pinned in pyproject).
+    to draccus 0.11.6's own ``_postprocessing`` (pinned in pyproject).
     """
 
     def __init__(self, *args: Any, overlay: dict[str, Any], **kwargs: Any) -> None:
@@ -235,7 +236,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
         for key in parsed_arg_values:
             parsed_value = cfgparsing.parse_string(parsed_arg_values[key])
             if isinstance(parsed_value, str) and parsed_value.startswith("include"):
-                with open(parsed_value[len("include ") :]) as f:
+                with open(parsed_value[len("include ") :], encoding="utf-8") as f:
                     parsed_arg_values[key] = cfgparsing.load_config(f)
             else:
                 parsed_arg_values[key] = parsed_value
@@ -254,7 +255,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
             del parsed_arg_values[utils.CONFIG_ARG]
 
         if config_path is not None:
-            with open(config_path) as f:
+            with open(config_path, encoding="utf-8") as f:
                 file_args = cfgparsing.load_config(f, file=config_path)
         else:
             file_args = {}
@@ -439,6 +440,34 @@ def parse(config_class: type[T], argv: list[str]) -> T:
         # mismatch) as a clean usage error instead of a traceback.
         # draccus wraps the underlying argparse parser as ``parser.parser``.
         parser.parser.error(str(exc))
+
+
+def normalize_bool_flags(argv: list[str], *names: str) -> list[str]:
+    """Let the named bool fields be passed as bare flags.
+
+    draccus parses bool fields as value-taking arguments (``--sim true``), so
+    rewrite a standalone ``--sim`` (one followed by another flag or nothing)
+    into ``--sim true``. An explicit ``--sim true`` / ``--sim false`` /
+    ``--sim=...`` is left untouched.
+
+    Args:
+        argv: Raw argument list.
+        names: Field names to accept bare, without the leading dashes.
+    """
+    flags = {f"--{name}" for name in names}
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in flags:
+            nxt = argv[i + 1] if i + 1 < len(argv) else None
+            if nxt is None or nxt.startswith("-"):
+                out.extend((tok, "true"))
+                i += 1
+                continue
+        out.append(tok)
+        i += 1
+    return out
 
 
 # ----------------------------------------------------------------------

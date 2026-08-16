@@ -38,7 +38,7 @@ from ..constants import ARM_JOINTS
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.types import RobotAction
+    from lerobot.lerobot_types import RobotAction
 
     from .robot.robot_axol import AxolRobot
 
@@ -110,14 +110,115 @@ class IKResetController:
         self._right_indices = [int(i) for i in right_indices]
         self._ready = True
 
-    def return_to_rest(self, robot: "AxolRobot") -> None:
-        """Plan and play a collision-aware trajectory to the rest pose."""
+    def return_to_rest(
+        self,
+        robot: "AxolRobot",
+        *,
+        torque_threshold: float = 4.0,
+        gravity_comp_kd: float = 0.25,
+        wait_retry: Callable[[], bool] | None = None,
+        stopped: Callable[[], bool] | None = None,
+        on_contact: Callable[[], None] | None = None,
+    ) -> bool:
+        """Plan and play a guarded collision-aware trajectory to the rest pose.
+
+        The move plays at the normal session gains — accurate tracking of
+        the collision-checked path — while a torque residual sustained above
+        ``torque_threshold`` (see
+        :class:`~almond_axol.robot.control.ContactWatchdog`) means it hit
+        something — a gripper still hooked on the scene, an operator
+        grabbing an arm — so the move stops where it is and the arms drop
+        into a limp gravity-comp hold instead of pulling through. What ends
+        the hold depends on the caller:
+
+        - ``wait_retry`` set (run-policy): it runs in a helper thread while
+          the hold streams; return ``True`` to replan from wherever the
+          arms were left and try again, ``False`` to abort.
+        - ``wait_retry`` unset (replay): the hold streams until ``stopped``
+          fires (or Ctrl+C), then aborts — there is no interactive channel
+          to retry from.
+
+        Args:
+            robot: Connected robot to drive.
+            torque_threshold: Contact watchdog threshold (Nm); ``0``
+                disables it (the move always plays through).
+            gravity_comp_kd: Velocity damping for the hold's free joints.
+            wait_retry: Blocking operator gate; ``True`` = retry.
+            stopped: Flow shutdown flag, polled during play and hold.
+            on_contact: Announce hook, run once per trip before the hold.
+
+        Returns:
+            ``True`` once the arms reached rest; ``False`` if aborted
+            (stopped, or the operator declined the retry).
+        """
+        self.wait_ready()
+        while True:
+            outcome = self._play_to_rest(robot, torque_threshold, stopped)
+            if outcome != "contact":
+                return outcome == "done"
+            if on_contact is not None:
+                on_contact()
+            if not self._hold_limp(robot, gravity_comp_kd, wait_retry, stopped):
+                return False
+            # The arms were hand-guided during the hold: clear the stale
+            # command history so the max-step safety check doesn't reject
+            # the first command of the replanned move.
+            robot.reset_command_state()
+
+    def hold_limp(
+        self,
+        robot: "AxolRobot",
+        *,
+        gravity_comp_kd: float = 0.25,
+        wait: Callable[[], bool] | None = None,
+        stopped: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Hold the arms limp (gravity comp) until the operator resolves ``wait``.
+
+        Used by run-policy's discard flow: after a failed episode the operator
+        usually needs to untangle the grippers from the scene or reposition
+        the arms by hand before any planned move is safe, so the arms drop
+        into a free gravity-supported hold instead of pulling straight back
+        to rest. ``wait`` blocks in a helper thread while the hold streams
+        (same mechanics as the contact hold inside :meth:`return_to_rest`).
+
+        Needs no IK worker — only gravity-comp cycles — so it never blocks on
+        :meth:`wait_ready`.
+
+        Args:
+            robot: Connected robot to hold.
+            gravity_comp_kd: Velocity damping for the free joints (Nm·s/rad).
+            wait: Blocking operator gate; ``True`` = proceed.
+            stopped: Flow shutdown flag, polled while the hold streams.
+
+        Returns:
+            ``True`` when the operator asked to proceed — with the command
+            history cleared so the next planned move isn't rejected by the
+            max-step safety check; ``False`` when aborted.
+        """
+        if not self._hold_limp(robot, gravity_comp_kd, wait, stopped):
+            return False
+        robot.reset_command_state()
+        return True
+
+    def _play_to_rest(
+        self,
+        robot: "AxolRobot",
+        torque_threshold: float,
+        stopped: Callable[[], bool] | None,
+    ) -> str:
+        """One play attempt from the current measured positions.
+
+        Plans from the robot's cached positions, then streams the waypoints
+        watching the torque residuals. Returns ``"done"``, ``"contact"``, or
+        ``"stopped"``.
+        """
         import numpy as np
 
         from ..constants import Joint
+        from ..robot.control import ContactWatchdog
         from ..teleop.filter import ResetInterpolator
 
-        self.wait_ready()
         assert self._conn is not None
         assert self._q_init is not None
         assert self._left_indices is not None
@@ -140,15 +241,18 @@ class IKResetController:
         _, _q_rest, traj = result
         if not traj:
             _logger.warning("IK worker returned an empty reset trajectory; skipping.")
-            return
+            return "done"
 
         interp = ResetInterpolator()
         interp.set_trajectory(traj, float(pos_l[7]), float(pos_r[7]))
+        watchdog = ContactWatchdog(torque_threshold)
 
         joints = list(Joint)
         play_hz = float(self._vr_cfg.frequency)
         period = 1.0 / play_hz
         while interp.is_active():
+            if stopped is not None and stopped():
+                return "stopped"
             t0 = time.perf_counter()
             new_q, l_grip, r_grip, _done = interp.step()
             if new_q is None:
@@ -165,6 +269,61 @@ class IKResetController:
                     action[f"left_{j.value}.pos"] = float(l_grip)
                     action[f"right_{j.value}.pos"] = float(r_grip)
             robot.send_action(action)
+            tripped = watchdog.update(robot.torque_residuals())
+            if tripped is not None:
+                joint, residual = tripped
+                _logger.warning(
+                    "return-to-rest contact: %s torque residual %.1f exceeds "
+                    "%.1f — going limp",
+                    joint,
+                    residual,
+                    torque_threshold,
+                )
+                return "contact"
+            time.sleep(max(0.0, period - (time.perf_counter() - t0)))
+        return "done"
+
+    def _hold_limp(
+        self,
+        robot: "AxolRobot",
+        gravity_comp_kd: float,
+        wait_retry: Callable[[], bool] | None,
+        stopped: Callable[[], bool] | None,
+    ) -> bool:
+        """Hold the arms in gravity comp; ``True`` when the operator retries.
+
+        ``wait_retry`` (when given) blocks in a helper thread while this
+        thread streams gravity-comp cycles, so the arms stay limp and
+        gravity-supported for as long as the operator prompt is open.
+        Without it, the hold runs until ``stopped`` fires (or Ctrl+C
+        propagates), then aborts.
+        """
+        if wait_retry is None and stopped is None:
+            # No channel could ever end the hold (e.g. the final teardown
+            # return after a stop): don't hold at all — leave the arms where
+            # the move stopped and let the caller wind down.
+            _logger.warning(
+                "return-to-rest aborted on contact (no retry channel); "
+                "the arms hold where the move stopped."
+            )
+            return False
+        result: dict[str, bool] = {}
+        waiter: threading.Thread | None = None
+        if wait_retry is not None:
+            waiter = threading.Thread(
+                target=lambda: result.update(retry=bool(wait_retry())),
+                name="axol-reset-retry-wait",
+                daemon=True,
+            )
+            waiter.start()
+        period = 1.0 / 100.0
+        while True:
+            if stopped is not None and stopped():
+                return False
+            if waiter is not None and not waiter.is_alive():
+                return bool(result.get("retry"))
+            t0 = time.perf_counter()
+            robot.gravity_compensate(kd=gravity_comp_kd)
             time.sleep(max(0.0, period - (time.perf_counter() - t0)))
 
     def stop(self) -> None:

@@ -7,7 +7,7 @@ The [one-command install](/installation) is the right path for running Axol on t
 
 ## Install from a clone
 
-Install the package from a checkout using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and resolved automatically:
+Install the package from a checkout using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
 
 ```bash
 uv sync
@@ -29,7 +29,7 @@ Install optional dependency groups as needed (the install script includes `lerob
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
@@ -78,7 +78,7 @@ Before using any motor or robot commands, initialize the CAN hardware once:
 axol can.setup
 ```
 
-`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures, and [`can.enable`](/cli/can-enable) for bringing the interfaces back up after a mid-session replug.
+`sudo` is invoked automatically where required. See [`can.setup`](/cli/can-setup) for what it configures — including the hotplug service that brings the interfaces back up on its own after a mid-session replug — and [`can.enable`](/cli/can-enable) for re-running the bring-up manually.
 
 ## Build the web UI
 

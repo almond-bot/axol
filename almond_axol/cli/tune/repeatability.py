@@ -83,6 +83,11 @@ def _build_pose(
     calibration end stop). The control stack works in joint frame (0 = rest),
     where ``joint = motor + closer_end_stop(j, is_left)[0]``. The right arm is
     held at its rest configuration so only the left arm differs from rest.
+
+    Note: this static conversion assumes wrist_2/wrist_3 were zeroed at their
+    historical (closer) end stop. If the arm is re-zeroed at the other stop
+    (the guided flow now accepts either side), the pasted poses are stale —
+    re-pose the arm and paste fresh numbers, as the module docstring says.
     """
     q = q_rest.copy()
     for i, j in enumerate(ARM_JOINTS):
@@ -294,8 +299,7 @@ async def _run(args: argparse.Namespace) -> None:
     # Report the FK gripper position at each waypoint so the operator can
     # eyeball the geometry before any motors move.
     for name, q_wp in (("rest", q_rest), ("A", q_a), ("B", q_b)):
-        se3, _ = solver.fk(q_wp)
-        p = np.asarray(se3.translation())
+        (p, _), _ = solver.fk(q_wp)
         print(f"  left gripper @ {name:4} → ({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:+.3f}) m")
 
     # The arm moves rest → A once, then bounces A → B → A → B … for every

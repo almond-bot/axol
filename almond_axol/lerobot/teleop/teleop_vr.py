@@ -46,9 +46,9 @@ import time
 from typing import Any
 
 import numpy as np
+from lerobot.lerobot_types import RobotAction
 from lerobot.teleoperators.teleoperator import Teleoperator
 from lerobot.teleoperators.utils import TeleopEvents
-from lerobot.types import RobotAction
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
@@ -96,6 +96,9 @@ class AxolVRTeleop(Teleoperator):
 
         # VR + IK
         self._vr_server: VRServer | None = None
+        # Whether camera video will be registered after connect (stashed here
+        # since the VR server doesn't exist yet; applied in _connect_async).
+        self._video_expected = False
         self._parent_conn: multiprocessing.connection.Connection | None = None
         self._ik_process: multiprocessing.context.SpawnProcess | None = None
         # IK dispatch runs in a dedicated daemon thread (not an asyncio task on
@@ -165,6 +168,18 @@ class AxolVRTeleop(Teleoperator):
         with self._rate_lock:
             return self._window_hz(self._vr_frame_times)
 
+    def vr_alive(self, within_s: float = 2.0) -> bool:
+        """True while VR frames have arrived within the last ``within_s``.
+
+        The guarded-return contact hold uses this to detect an *orphaned*
+        hold — the headset exited XR or died, so the reset press that would
+        end it can never arrive — and settle instead of waiting forever.
+        Thread-safe.
+        """
+        with self._rate_lock:
+            last = self._vr_frame_times[-1] if self._vr_frame_times else None
+        return last is not None and (time.perf_counter() - last) < within_s
+
     @property
     def is_connected(self) -> bool:
         return self._vr_server is not None
@@ -231,6 +246,9 @@ class AxolVRTeleop(Teleoperator):
         # Lock the headset HUD to data collection: the operator can record
         # episodes but can't switch back to plain teleop.
         self._vr_server.set_mode("data_collection")
+        # Park early headset video requests until set_video_manager /
+        # set_video_sources lands (they run after the caller's camera setup).
+        self._vr_server.set_video_expected(self._video_expected)
         await self._vr_server.enable()
 
         if self._cart is not None:
@@ -315,6 +333,13 @@ class AxolVRTeleop(Teleoperator):
 
         if self._parent_conn is not None:
             try:
+                # Drain in-flight worker responses before closing: the dispatch
+                # thread can stop mid solve, and closing a connection with
+                # unread data RSTs the peer — the worker's blocking recv then
+                # dies with ConnectionResetError instead of reading the None
+                # shutdown sentinel.
+                while self._parent_conn.poll(0):
+                    self._parent_conn.recv()
                 self._parent_conn.send(None)
             except Exception:
                 pass
@@ -362,8 +387,78 @@ class AxolVRTeleop(Teleoperator):
 
     @property
     def is_resetting(self) -> bool:
-        """True while a reset is pending or a reset trajectory is playing back."""
+        """True while a reset is pending, being planned, or playing back."""
         return self._core.is_resetting
+
+    @property
+    def reset_pending(self) -> bool:
+        """True while a reset press is latched but not yet dispatched.
+
+        The "operator asked to go home" signal: a paused IK pipeline holds
+        the latch (see :meth:`pause_ik`), so a gravity-comp hold loop waits
+        on this rather than :attr:`is_resetting` (which also covers an
+        in-flight planning round trip being cancelled underneath it).
+        """
+        return self._core.reset_pending
+
+    def cancel_reset(self) -> None:
+        """Abandon a pending, planning, or playing reset move.
+
+        Used by the contact-guarded return-to-rest: on contact the move must
+        stop where it is instead of finishing the plan. Call
+        :meth:`pause_ik` first so no new dispatch can start. Safe from any
+        thread.
+        """
+        self._core.cancel_reset()
+
+    def pause_ik(self) -> None:
+        """Idle the IK/engage pipeline while the arms are moved out-of-band.
+
+        Used by ``collect-data``'s contact-fallback gravity-comp hold: while
+        paused, VR frames are not dispatched to the solver (grips can't
+        engage tracking) and a reset press is latched but *held*, so it can't
+        plan from a solution the hand-guided arms no longer match. Call
+        :meth:`resync_to_positions` with the measured positions, then
+        :meth:`resume_ik`, to hand control back. Safe from any thread.
+        """
+        self._core.pause_ik()
+
+    def resume_ik(self) -> None:
+        """Resume the IK/engage pipeline after :meth:`pause_ik`.
+
+        A reset latched during the pause dispatches on the next IK loop
+        iteration, planning from the (re-synced) current solution.
+        """
+        self._core.resume_ik()
+
+    def resync_to_positions(
+        self, pos_left: np.ndarray | None, pos_right: np.ndarray | None
+    ) -> None:
+        """Re-adopt measured arm positions after an out-of-band move.
+
+        Call while paused (:meth:`pause_ik`): re-seeds the IK solution, grip
+        targets, and smoothing filters from the measured ``(>=8,)`` per-arm
+        position vectors (as returned by ``AxolRobot.positions``), so a
+        pending reset plans from the arms' true pose and the first command
+        after resuming produces no transient.
+        """
+        with self._q_lock:
+            self._core.resync_to_positions(pos_left, pos_right)
+            out = self._core.compute_output()
+            if out is not None:
+                self._q_out = out
+
+    async def guarded_return(self, **kwargs: Any) -> None:
+        """Play the pending return-to-rest guarded; see the shared engine.
+
+        Thin passthrough to :meth:`VRTeleopCore.guarded_return`, which owns
+        the contact-watchdog / gravity-comp-fallback sequencing shared with
+        native ``axol teleop``. The caller supplies
+        the flow-specific hooks (robot commands, gravity cycle, residuals,
+        announcements); await from a coroutine on the robot's event loop
+        with a reset already pending or playing.
+        """
+        await self._core.guarded_return(**kwargs)
 
     # ------------------------------------------------------------------
     # Teleoperator interface
@@ -373,6 +468,22 @@ class AxolVRTeleop(Teleoperator):
     def send_feedback(self, feedback: dict[str, Any]) -> None:
         """Accept robot observation. Currently a no-op — IK worker maintains its own state."""
         pass
+
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare that camera video will be registered after :meth:`connect`.
+
+        Call before :meth:`connect` when cameras are configured: the VR server
+        starts accepting headsets during the IK worker's JAX compile, well
+        before :meth:`set_video_manager` / :meth:`set_video_sources` runs, and
+        an early video request would otherwise be answered "unavailable" —
+        hiding the camera screens for the whole session. With this set, early
+        requests wait (``webrtc-pending``) and receive their offer once video
+        registration lands. See
+        :meth:`almond_axol.vr.server.VRServer.set_video_expected`.
+        """
+        self._video_expected = expected
+        if self._vr_server is not None:
+            self._vr_server.set_video_expected(expected)
 
     def set_video_sources(self, sources: dict[str, Any] | None) -> None:
         """Stream wrist-camera frames to the headset via WebRTC.

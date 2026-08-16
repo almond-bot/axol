@@ -101,6 +101,10 @@ The headset only shows the feeds for cameras that are actually being streamed (s
   The session's **mode is fixed by the command that launched it** — there's no in-headset toggle between the two. [`axol teleop`](/cli/teleop) runs plain teleop (recording is unavailable, so **A** does nothing and the HUD stays on `Teleop`), while [`axol collect-data`](/cli/collect-data) runs data collection (recording enabled, HUD starts on `Data Collection`).
 </Note>
 
+<Note>
+  **A dropped link never moves the robot.** If the pose stream stops while tracking is engaged — you doff the headset, open the system menu, quit the app, or the link drops — the arms **auto-disengage** after about half a second and **hold position** wherever they are. When you return, re-engaging (both grips) takes a fresh snapshot, so the arms never jerk toward the controllers on the next entry; press **X** to send them back to the rest pose when you're ready.
+</Note>
+
 ## Powered cart
 
 Robots equipped with the **powered Axol Cart** (an x-drive omni-wheel base plus a telescoping lift) are driven from the headset **thumbsticks**, so an operator can reposition the whole robot without leaving VR:

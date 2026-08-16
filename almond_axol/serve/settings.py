@@ -280,6 +280,26 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="robot.reset_torque_threshold",
+                label="Reset contact threshold (Nm)",
+                type="number",
+                help=(
+                    "Contact watchdog for every return-to-rest move: a "
+                    "joint torque this far (Nm) from the gravity model, "
+                    "sustained, stops the move and drops the arms into a "
+                    "limp gravity-comp hold — free them by hand, then press "
+                    "reset (VR) or continue (panel/terminal) to replan from "
+                    "where they are. Raise if normal returns false-trip; 0 "
+                    "disables the watchdog."
+                ),
+                targets={
+                    "teleop": ("teleop.reset_torque_threshold",),
+                    "collect-data": (f"{_VRT}.reset_torque_threshold",),
+                    "run-policy": ("reset_torque_threshold",),
+                    "replay-dataset": ("reset_torque_threshold",),
+                },
+            ),
+            SettingDef(
                 key="robot.gravity_kd",
                 label="Gravity comp damping (kd)",
                 type="number",
@@ -423,7 +443,9 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 type="number",
                 help=(
                     "Weight on the elbow position hint — how strongly the arm "
-                    "follows the operator's elbow (position only)."
+                    "follows the operator's elbow (position only). 0 disables "
+                    "elbow tracking; the arm's swivel then follows the posture "
+                    "attractor instead of the headset's inferred elbow."
                 ),
                 targets={
                     "teleop": ("kinematics.elbow_weight",),
