@@ -36,12 +36,28 @@ _RECONNECT_POLL_S = 0.2
 # is missing — remind operators at this cadence rather than spamming.
 _RECONNECT_REMIND_S = 30.0
 
-# A send failing with ENOBUFS means the interface TX queue is full because no
-# node on the bus is ACKing frames — on the Axol that's the e-stop cutting
-# motor power mid-stream. Everything queued behind the dead bus is a stale
-# motion command that would replay all at once when power returns (the arm
-# suddenly snapping back to its pre-e-stop position), so the queue must be
-# purged and sends held off until the bus is proven alive again.
+# A send failing with ENOBUFS means the interface TX queue is full. Two very
+# different situations produce it:
+#
+#  - Transient host-side congestion: both channels share one dual-channel
+#    gs_usb adapter, so a brief stall of its USB pipe (e.g. camera traffic
+#    during data collection) backs the queue up while the bus itself is
+#    healthy and draining. The frame is simply dropped, like a send during
+#    a lost interface.
+#  - A dead bus: no node is ACKing frames — on the Axol that's the e-stop
+#    cutting motor power mid-stream. Everything queued behind the dead bus is
+#    a stale motion command that would replay all at once when power returns
+#    (the arm suddenly snapping back to its pre-e-stop position), so the
+#    queue must be purged and sends held off until the bus is proven alive.
+#
+# The two are told apart by duration: at 1 Mbit/s a healthy full queue
+# (txqueuelen 512) drains in ~65 ms, so ENOBUFS persisting across sends for
+# longer than this means nothing is draining — the bus is dead.
+_STALL_DETECT_S = 1.0
+
+# Transient overflows come in bursts at telemetry rates; warn at most this
+# often so congestion doesn't flood the log with one line per dropped frame.
+_TX_FULL_WARN_INTERVAL_S = 5.0
 
 # Arbitration ID of the aliveness probe frame. Unused by both motor protocols
 # (Damiao: motor IDs 0x01-0x08 plus 0x100/0x200/0x300 offsets, feedback
@@ -58,20 +74,26 @@ _flush_lock = asyncio.Lock()
 _last_flush_monotonic = 0.0
 
 
+def _error_code(exc: BaseException) -> int | None:
+    """Extract the errno from a python-can or OS-level exception."""
+    code = getattr(exc, "error_code", None)  # python-can CanOperationError
+    if code is None:
+        code = getattr(exc, "errno", None)
+    return code
+
+
 def _iface_lost(exc: BaseException) -> bool:
     """True when *exc* is a socket failure meaning the interface went away."""
-    code = getattr(exc, "error_code", None)  # python-can CanOperationError
-    if code is None:
-        code = getattr(exc, "errno", None)
-    return code in _IFACE_LOST_ERRNOS
+    return _error_code(exc) in _IFACE_LOST_ERRNOS
 
 
-def _tx_stalled(exc: BaseException) -> bool:
-    """True when *exc* means the TX queue is full (no node is ACKing frames)."""
-    code = getattr(exc, "error_code", None)  # python-can CanOperationError
-    if code is None:
-        code = getattr(exc, "errno", None)
-    return code == errno.ENOBUFS
+def _tx_queue_full(exc: BaseException) -> bool:
+    """True when *exc* means the interface's TX queue is full (``ENOBUFS``).
+
+    Whether that's transient host-side congestion or a dead bus is decided
+    by how long it persists — see :data:`_STALL_DETECT_S`.
+    """
+    return _error_code(exc) == errno.ENOBUFS
 
 
 def _iface_is_up(channel: str) -> bool:
@@ -95,10 +117,14 @@ class CanBus:
     interface is back up, keeping every registered listener attached. Sends
     during the gap are dropped, so request/response commands fall into their
     usual timeout path (``MotorError``) and resume after the reconnect.
+    A momentarily full TX queue (``ENOBUFS`` under host-side USB congestion)
+    is handled the same way, minus the reconnect: the frame is dropped and
+    the next command cycle proceeds normally.
 
     A stalled bus — the e-stop cutting motor power so nothing ACKs frames and
-    the kernel TX queue fills (``ENOBUFS``) — is handled the same way, with
-    two extra steps: the queued (now stale) motion commands are purged by
+    the kernel TX queue fills (``ENOBUFS`` persisting past
+    :data:`_STALL_DETECT_S`, past any transient congestion) — is handled the
+    same way, with two extra steps: the queued (now stale) motion commands are purged by
     flapping the interface, and sends stay dropped until a probe frame is
     actually ACKed on the wire again. Without the purge, up to ``txqueuelen``
     stale position commands replay the instant the arm is powered back on,
@@ -133,6 +159,12 @@ class CanBus:
         # Poked by socket readability or a failed send, so the idle reader
         # wakes both for frames and for lost-interface handling.
         self._wake = asyncio.Event()
+        # Monotonic deadline for the next TX-queue-full warning (rate limit).
+        self._next_tx_full_warn = 0.0
+        # Loop time of the first ENOBUFS in the current burst (None outside
+        # one); a successful send resets it. Overflow persisting longer than
+        # _STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
+        self._enobufs_since: float | None = None
 
     async def start(self) -> None:
         """Start the background frame-dispatch loop. Idempotent.
@@ -185,12 +217,39 @@ class CanBus:
         try:
             self._bus.send(msg)
         except (can.CanError, OSError) as exc:
-            if _tx_stalled(exc):
-                self._mark_stalled(exc)
+            if _tx_queue_full(exc):
+                self._on_tx_queue_full(exc)
             elif _iface_lost(exc):
                 self._mark_lost(exc)
             else:
                 raise
+        else:
+            self._enobufs_since = None
+
+    def _on_tx_queue_full(self, exc: BaseException) -> None:
+        """Classify an ``ENOBUFS`` send: transient congestion or a dead bus.
+
+        The frame is dropped either way — commands time out upstream
+        (``MotorError``) and resume. Transient host-side congestion drains
+        within milliseconds, so overflow persisting across sends for
+        :data:`_STALL_DETECT_S` means no node is ACKing (e-stop) and stall
+        recovery (purge + probe) takes over.
+        """
+        now = asyncio.get_running_loop().time()
+        if self._enobufs_since is None:
+            self._enobufs_since = now
+        elif now - self._enobufs_since >= _STALL_DETECT_S:
+            self._enobufs_since = None
+            self._mark_stalled(exc)
+            return
+        if now >= self._next_tx_full_warn:
+            self._next_tx_full_warn = now + _TX_FULL_WARN_INTERVAL_S
+            _logger.warning(
+                "CAN %s: TX queue full (%s) — dropping frame(s); "
+                "consider raising txqueuelen if this persists",
+                self._channel,
+                exc,
+            )
 
     def _mark_lost(self, cause: BaseException) -> None:
         """Flag the interface as gone and wake the reader to start reconnecting."""
@@ -401,7 +460,7 @@ class CanBus:
                     if _iface_lost(exc):
                         self._mark_lost(exc)
                         return
-                    if not _tx_stalled(exc):
+                    if not _tx_queue_full(exc):
                         raise
                     # Queue still full (the purge failed, e.g. no root) — the
                     # probe doesn't fit yet; keep trying so recovery is still
