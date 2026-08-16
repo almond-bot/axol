@@ -32,13 +32,35 @@ _RECONNECT_POLL_S = 0.2
 # is missing — remind operators at this cadence rather than spamming.
 _RECONNECT_REMIND_S = 30.0
 
+# TX-queue overflows come in bursts at telemetry rates; warn at most this
+# often so a stall doesn't flood the log with one line per dropped frame.
+_TX_FULL_WARN_INTERVAL_S = 5.0
 
-def _iface_lost(exc: BaseException) -> bool:
-    """True when *exc* is a socket failure meaning the interface went away."""
+
+def _error_code(exc: BaseException) -> int | None:
+    """Extract the errno from a python-can or OS-level exception."""
     code = getattr(exc, "error_code", None)  # python-can CanOperationError
     if code is None:
         code = getattr(exc, "errno", None)
-    return code in _IFACE_LOST_ERRNOS
+    return code
+
+
+def _iface_lost(exc: BaseException) -> bool:
+    """True when *exc* is a socket failure meaning the interface went away."""
+    return _error_code(exc) in _IFACE_LOST_ERRNOS
+
+
+def _tx_queue_full(exc: BaseException) -> bool:
+    """True when *exc* means the interface's TX queue is momentarily full.
+
+    Happens under host-side congestion only (``sendto`` returns ``ENOBUFS``):
+    on the Axol hub both CAN channels share a single dual-channel gs_usb
+    adapter, so a brief stall of its USB pipe — e.g. USB contention from the
+    cameras during data collection — backs the txqueue up. The bus itself is
+    healthy, so this is transient and the frame can be dropped like a send
+    during a lost interface.
+    """
+    return _error_code(exc) == errno.ENOBUFS
 
 
 def _iface_is_up(channel: str) -> bool:
@@ -62,6 +84,9 @@ class CanBus:
     interface is back up, keeping every registered listener attached. Sends
     during the gap are dropped, so request/response commands fall into their
     usual timeout path (``MotorError``) and resume after the reconnect.
+    A momentarily full TX queue (``ENOBUFS`` under host-side USB congestion)
+    is handled the same way, minus the reconnect: the frame is dropped and
+    the next command cycle proceeds normally.
 
     Use as an async context manager:
 
@@ -89,6 +114,8 @@ class CanBus:
         # Poked by socket readability or a failed send, so the idle reader
         # wakes both for frames and for lost-interface handling.
         self._wake = asyncio.Event()
+        # Monotonic deadline for the next TX-queue-full warning (rate limit).
+        self._next_tx_full_warn = 0.0
 
     async def start(self) -> None:
         """Start the background frame-dispatch loop. Idempotent.
@@ -140,6 +167,21 @@ class CanBus:
         try:
             self._bus.send(msg)
         except (can.CanError, OSError) as exc:
+            if _tx_queue_full(exc):
+                # Transient host-side overflow — drop the frame just like a
+                # send during a lost interface: commands time out upstream
+                # (MotorError) and the next cycle resumes. No reconnect
+                # needed; the queue drains on its own within milliseconds.
+                now = asyncio.get_running_loop().time()
+                if now >= self._next_tx_full_warn:
+                    self._next_tx_full_warn = now + _TX_FULL_WARN_INTERVAL_S
+                    _logger.warning(
+                        "CAN %s: TX queue full (%s) — dropping frame(s); "
+                        "consider raising txqueuelen if this persists",
+                        self._channel,
+                        exc,
+                    )
+                return
             if not _iface_lost(exc):
                 raise
             self._mark_lost(exc)
