@@ -159,6 +159,42 @@ class IKResetController:
             # the first command of the replanned move.
             robot.reset_command_state()
 
+    def hold_limp(
+        self,
+        robot: "AxolRobot",
+        *,
+        gravity_comp_kd: float = 0.25,
+        wait: Callable[[], bool] | None = None,
+        stopped: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Hold the arms limp (gravity comp) until the operator resolves ``wait``.
+
+        Used by run-policy's discard flow: after a failed episode the operator
+        usually needs to untangle the grippers from the scene or reposition
+        the arms by hand before any planned move is safe, so the arms drop
+        into a free gravity-supported hold instead of pulling straight back
+        to rest. ``wait`` blocks in a helper thread while the hold streams
+        (same mechanics as the contact hold inside :meth:`return_to_rest`).
+
+        Needs no IK worker — only gravity-comp cycles — so it never blocks on
+        :meth:`wait_ready`.
+
+        Args:
+            robot: Connected robot to hold.
+            gravity_comp_kd: Velocity damping for the free joints (Nm·s/rad).
+            wait: Blocking operator gate; ``True`` = proceed.
+            stopped: Flow shutdown flag, polled while the hold streams.
+
+        Returns:
+            ``True`` when the operator asked to proceed — with the command
+            history cleared so the next planned move isn't rejected by the
+            max-step safety check; ``False`` when aborted.
+        """
+        if not self._hold_limp(robot, gravity_comp_kd, wait, stopped):
+            return False
+        robot.reset_command_state()
+        return True
+
     def _play_to_rest(
         self,
         robot: "AxolRobot",

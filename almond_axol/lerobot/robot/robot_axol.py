@@ -40,6 +40,8 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.axol import Axol
+from ...teleop.config import VRTeleopConfig
+from ...teleop.filter import TrapezoidalFilter
 from .config_axol import AxolRobotConfig
 
 if TYPE_CHECKING:
@@ -107,6 +109,17 @@ class AxolRobot(Robot):
         # (run-policy). Collect-data commands joint targets, so it never builds
         # this; only the cheap forward-kinematics helper above runs there.
         self._ik: KinematicsSolver | None = None
+        # Post-IK command shapers for Cartesian actions (one per arm), built
+        # lazily alongside their first use. Cartesian clients stream EE poses
+        # whose IK solutions can step arbitrarily (discontinuous policy
+        # chunks, IK branch changes, a slow inference platform), so the joint
+        # targets are run through the same velocity/acceleration-limited
+        # tracker teleop uses — the exact command profile all training data
+        # went through. Joint-action clients (teleop, collect-data, joint
+        # policies) are untouched: their pipelines already shape commands
+        # upstream, and double-filtering a tuned path buys nothing.
+        self._cart_shapers: tuple[TrapezoidalFilter, TrapezoidalFilter] | None = None
+        self._cart_last_send: float = 0.0
 
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
@@ -595,7 +608,11 @@ class AxolRobot(Robot):
 
         Each arm's 6-axis end-effector pose is solved to joint angles, seeded
         with the arm's current cached position so the solve tracks from where
-        the arm actually is. The gripper passes straight through. Returns
+        the arm actually is. The IK output is then shaped by the per-arm
+        :class:`TrapezoidalFilter` (teleop's velocity/acceleration limits) so
+        Cartesian clients can never command a joint-space discontinuity — the
+        smoothness guarantee holds regardless of how jumpy the pose stream or
+        the IK solution is. The gripper passes straight through. Returns
         ``(left, right)`` 8-vectors (7 arm joints + gripper) in Joint order.
         """
         from ...kinematics.fk import pose6_to_pos_rot
@@ -623,6 +640,42 @@ class AxolRobot(Robot):
             left[i] = q_out[gi]
         for i, gi in enumerate(solver.right_indices):
             right[i] = q_out[gi]
+
+        # Cartesian senders have no fixed rate contract, so the shapers run on
+        # measured inter-send spacing — but the dt fed to the filter is capped
+        # at one nominal 60 Hz tick, so a single command can never advance the
+        # target by more than ``max_vel / 60`` no matter how long the sender
+        # paused (an uncapped dt would let one post-starvation command carry a
+        # whole gap's worth of motion in one step — exactly the snap this
+        # shaper exists to prevent; a slow sender is instead rate-limited,
+        # which is the correct graceful degradation). After a longer gap the
+        # arm may also have been moved by another path (return-to-rest,
+        # gravity comp) and the filter's velocity state is stale, so re-seed
+        # from the actual measured positions — which also zeroes the velocity
+        # — rather than ramping from a stale command at a stale speed.
+        now = time.monotonic()
+        gap = now - self._cart_last_send
+        self._cart_last_send = now
+        if self._cart_shapers is None:
+            self._cart_shapers = (
+                TrapezoidalFilter(
+                    VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
+                ),
+                TrapezoidalFilter(
+                    VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
+                ),
+            )
+            gap = float("inf")
+        shaper_l, shaper_r = self._cart_shapers
+        if gap > 0.25:
+            shaper_l.reset(seed=np.asarray(left_cur, dtype=np.float32)[:7])
+            shaper_r.reset(seed=np.asarray(right_cur, dtype=np.float32)[:7])
+        dt = min(max(gap, 1.0 / 240.0), 1.0 / 60.0)
+        shaper_l.dt = dt
+        shaper_r.dt = dt
+        left[:7] = shaper_l.update(left[:7])
+        right[:7] = shaper_r.update(right[:7])
+
         # The gripperless SKU has no gripper keys; Axol ignores the padded slot.
         left[-1] = action[_LEFT_GRIPPER_KEY] if self._has_gripper else 0.0
         right[-1] = action[_RIGHT_GRIPPER_KEY] if self._has_gripper else 0.0

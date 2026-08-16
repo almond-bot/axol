@@ -24,5 +24,9 @@ If a **single-channel** CAN adapter is also attached — the [powered cart](/gui
 </Info>
 
 <Note>
+  The same bring-up script also recovers the bus after an **emergency stop**. Cutting motor power mid-motion leaves the in-flight CAN commands unacknowledged, so without intervention they would all replay the instant the arm is powered back on — snapping it to its pre-e-stop position. The CAN layer detects the stalled bus, flaps the interfaces to drop the stale frames, and holds every send until a probe frame is acknowledged on the wire again, so the arm stays put until the bus is genuinely back online.
+</Note>
+
+<Note>
   On Raspberry Pi 5 hosts, `can.setup` additionally applies an RP1 USB quirk (`axol-rp1-usb-quirk.service`): the Pi 5's USB controllers ship with a hair-trigger babble/loss-of-activity detector that EMI from the arms can trip, kicking the hub off the bus (`disabled by hub (EMI?)` in `dmesg`). The quirk enables the controller's noise filter — the workaround recommended by Raspberry Pi engineers. If disconnects persist, add a ferrite choke to (or shield) the hub's USB cable, or put a small powered USB hub between the Pi and the Axol Hub.
 </Note>

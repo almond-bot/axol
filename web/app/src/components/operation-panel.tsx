@@ -313,6 +313,21 @@ const PHASE_STYLES: Record<string, { label: string; cls: string; kind: "dot" | "
       cls: "border-amber-400/50 bg-amber-400/10 text-amber-200",
       kind: "pulse",
     },
+    // The guarded return's limp gravity-comp hold: the arms hit something and
+    // are waiting to be cleared by hand, so this needs the operator, not a
+    // spinner.
+    contact: {
+      label: "Contact",
+      cls: "border-orange-400/60 bg-orange-400/15 text-orange-200",
+      kind: "pulse",
+    },
+    // run-policy's discard cleanup: the arms are limp for hand-repositioning
+    // until the operator sends them back to rest.
+    limp: {
+      label: "Limp",
+      cls: "border-orange-400/60 bg-orange-400/15 text-orange-200",
+      kind: "pulse",
+    },
     saving: {
       label: "Saving",
       cls: "border-emerald-400/50 bg-emerald-400/10 text-emerald-200",
