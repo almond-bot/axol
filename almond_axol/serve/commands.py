@@ -75,6 +75,7 @@ class CommandDef:
         execution: str = "thread",
         requires_cameras: bool = False,
         camera_mode: str = "none",
+        streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
         uses_headset: bool = False,
@@ -114,6 +115,12 @@ class CommandDef:
         # inputs), "teleop" attaches them to a built config's camera dict
         # (unreachable via flat argv), "none" ignores it.
         self.camera_mode = camera_mode
+        # Whether the op relays camera video to the headset. Only such ops
+        # honor the stream branch of the camera spec (capture at the streaming
+        # resolution, per-camera stream opt-outs); for the rest the merge
+        # captures at the recording resolution, which is what the dataset (and
+        # a policy trained on it) actually consumes.
+        self.streams_video = streams_video
         # Arg name that means "no hardware" for this op, so a sim run skips the
         # robot link and the motor-fault gate. None means it always needs the
         # robot.
@@ -239,6 +246,12 @@ def _collect_data_run() -> Callable[..., Any]:
     return _run
 
 
+def _collect_data_control() -> Callable[..., Any]:
+    from ..cli.collect_data import _QueueCollectControl
+
+    return _QueueCollectControl
+
+
 def _replay_dataset_run() -> Callable[..., Any]:
     from ..cli.replay_dataset import _run
 
@@ -287,6 +300,7 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_teleop_run,
         execution="async",
         camera_mode="teleop",
+        streams_video=True,
         sim_flag="sim",
         robot_free_flags=("cart_only",),
         uses_headset=True,
@@ -336,6 +350,14 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_collect_data_run,
         requires_cameras=True,
         camera_mode="argv",
+        streams_video=True,
+        # Recording is teleoperated, so the panel tells the operator to point
+        # the headset at this machine — and shows the relay's camera feeds.
+        uses_headset=True,
+        # Panel-driven episodes (headset-off collection): the dashboard can
+        # start recording and save or discard an episode, and mirrors the
+        # headset HUD (phase, episode number, saved count).
+        episode_control=_collect_data_control,
         per_run_fields=("repo_id", "task"),
     ),
     "replay-dataset": CommandDef(

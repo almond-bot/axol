@@ -37,12 +37,12 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
       </Step>
 
       <Step title="Start and record from the headset">
-        Press **Start**, connect the headset, and drive the arms. Recording is controlled entirely from the VR controllers — see [Recording an episode](#recording-an-episode) below.
+        Press **Start**, connect the headset, and drive the arms. Recording is normally controlled from the VR controllers — see [Recording an episode](#recording-an-episode) below — and the panel mirrors the camera feeds and episode state while you go, with on-screen buttons for the same decisions ([Driving from the panel](#driving-from-the-panel)).
       </Step>
     </Steps>
 
     <Note>
-      **Collect Data has no on-screen episode buttons** — takes are driven from the VR controller (**A** to record/save, **X** to discard). The session is locked to data collection; there's no mode toggle.
+      The session is locked to data collection; there's no mode toggle.
     </Note>
   </Tab>
 
@@ -68,7 +68,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
 
 ## Controller layout
 
-Episodes are driven entirely from the Quest controllers. The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** (record) button. The session is locked to data collection mode, so there's no mode toggle to worry about.
+Episodes are driven from the Quest controllers (the control panel can take the same decisions — see [Driving from the panel](#driving-from-the-panel)). The movement controls are the same as in [teleoperation](/operations/teleop); data collection adds the **A** (record) button. The session is locked to data collection mode, so there's no mode toggle to worry about.
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 
@@ -126,6 +126,14 @@ The HUD shows an **Episode N** readout (top-right) with the 1-based number of th
 | `Saving` | Episode being written to disk; controls blocked |
 
 Collection resumes from an existing dataset at `--root`; an aborted session that saved no episodes is cleaned up on shutdown.
+
+## Driving from the panel
+
+Everything above assumes the headset is on your face. When you launched the session from the [control panel](/guides/control-panel), it doubles as an operator display and can take the same decisions, so you can collect with the headset off — resting on the table, still holding the controllers.
+
+The panel mirrors the **camera feeds** the headset receives (with a fullscreen toggle for a proper operator display) and an **Episode control** box carrying the phase, the episode number, the saved count, and the buttons that make sense right now: **Start recording** (a 3-second countdown mirroring the in-headset one, so you can pick the controllers back up; click again to cancel), **Save episode**, and **Discard episode** — the last two click-to-confirm, standing in for the controller's double-press. During a contact hold a **Return to rest** button appears, which does what **X** does: replan the return from wherever you left the arms.
+
+The controller stays live the whole time — the panel is a parallel input, and whichever arrives first ends the take. Anything you arm on the controller (the confirmation popup, the record countdown) is mirrored into the panel too, so the dashboard follows a controller-driven session as well as a panel-driven one. See [Episode controls](/guides/control-panel#episode-controls).
 
 <Note>
   **Crash-safe resume.** Collection refuses to resume a dataset whose saved episodes don't form a contiguous `0…N-1` range — the tell-tale of a recorder killed mid-save, where buffered episodes were lost while the episode counter had already advanced. Recording past such a gap would silently misalign every later episode with a different episode's video, so it stops with guidance (renumber the survivors to be contiguous, or start a fresh dataset) instead. Keeping the host on a current release matters here too: the service now gives a recording session up to ~200 s to finalize when it's stopped, so a shutdown mid-save doesn't drop the take in the first place — [re-run the installer or press **Update**](/installation#staying-up-to-date) to pick this up on an older station.
