@@ -546,11 +546,12 @@ class AxolArm:
         raise MotorError(f"{side} arm: {last_exc}") from last_exc
 
     def _require_offsets_resolved(self) -> None:
-        """Raise if any either-stop joint's offset is still undetected."""
-        if self._unresolved_offsets:
-            names = ", ".join(j.name for j in Joint if j in self._unresolved_offsets)
+        """Raise if any arm joint's zero is still undetected or unverified."""
+        pending = self._unresolved_offsets | self._unverified_zeros
+        if pending:
+            names = ", ".join(j.name for j in Joint if j in pending)
             raise MotorError(
-                f"Which end stop {names} was zeroed at has not been detected "
+                f"The encoder zero of {names} has not been detected/verified "
                 f"yet — enable(), start_telemetry(), or get_positions() first "
                 f"(each resolves it automatically)"
             )
