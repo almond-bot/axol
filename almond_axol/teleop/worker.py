@@ -657,9 +657,21 @@ def run_ik_worker(
                     q[gi] = pos_l[i]
                 for i, gi in enumerate(worker.right_indices):
                     q[gi] = pos_r[i]
-                # Clear snap poses / pose filters / engage state so the next
-                # engage performs a fresh engage-snap from the synced q.
-                worker.reset()
+                # Deactivate the engage state and drop the stale snap poses so
+                # the next engage performs a fresh engage-snap from the synced
+                # q. Deliberately NOT worker.reset(): that would also clear
+                # the One Euro pose filters, which step() keeps warm on every
+                # frame precisely so an engage isn't a smoothing cold start —
+                # and a DAgger takeover is exactly such an engage. The engage
+                # rising edge in step() re-pins the posture pose and re-snaps
+                # from the warm filtered poses, so nothing else from reset()
+                # is needed here.
+                worker._active = False
+                worker._clear_freeze()
+                worker._snap_ctrl = {}
+                worker._snap_fk = {}
+                worker._snap_elbow_ctrl = {}
+                worker._snap_elbow_fk = {}
                 conn.send(("synced", q.copy()))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)

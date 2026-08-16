@@ -68,7 +68,12 @@ class DaggerTeleopCore(VRTeleopCore):
     replay a trajectory through :meth:`compute_output` while the CLI's control
     loop is in a policy state and not consuming it (or worse, while the
     policy is simultaneously commanding). Between-episode homing is the CLI's
-    ``IKResetController``'s job.
+    ``IKResetController``'s job, so :meth:`note_frame_reset` never latches the
+    core's own reset. The stale-pose-stream **auto-disengage**
+    (``disengage_timeout``) is kept, though: :meth:`note_frame_reset` stamps
+    the pose heartbeat, so a dead headset link mid-intervention hands control
+    back to the policy instead of leaving the arms latched to a stale engage
+    snapshot (which would jump on VR re-entry).
     """
 
     def __init__(
@@ -152,7 +157,14 @@ class DaggerTeleopCore(VRTeleopCore):
         latches a request its idle loop consumes to home the arms via the
         ``IKResetController`` — which plans from the robot's measured pose,
         unlike the core's path (whose ``q`` is stale outside teleop).
+
+        The pose heartbeat stamp is kept from the base method: it drives the
+        stale-stream auto-disengage (``disengage_timeout``), which in DAgger
+        hands a dead-link intervention back to the policy instead of leaving
+        teleop latched to a stale engage snapshot (which would jump on VR
+        re-entry).
         """
+        self._last_frame_time = time.perf_counter()
         if reset and not self._prev_reset and self.idle_reset_armed.is_set():
             with self._freeze_lock:
                 self._idle_reset_latch = True
@@ -193,8 +205,9 @@ class DaggerTeleopCore(VRTeleopCore):
                     self._logger.info("Teleop engaged (DAgger intervention).")
                     self._broadcast(True)
                     # Ramp in gently on every takeover (not just out of
-                    # rest): full velocity is restored by compute_output
-                    # after engage_duration.
+                    # rest): compute_output smoothsteps the velocity cap
+                    # from engage_max_vel up to teleop_max_vel across
+                    # engage_duration once _engage_time is set.
                     self.smooth_left.max_vel = self.config.engage_max_vel
                     self.smooth_right.max_vel = self.config.engage_max_vel
                     self._engage_time = time.perf_counter()
@@ -235,7 +248,14 @@ class DaggerTeleopCore(VRTeleopCore):
         result = recv_with_timeout(self._conn, _SYNC_RECV_TIMEOUT)
         if not (isinstance(result, tuple) and result[0] == "synced"):
             raise RuntimeError(f"unexpected sync reply from IK worker: {result!r}")
-        self.q = np.asarray(result[1], dtype=np.float32)
+        # _hold_target, not a bare ``self.q =``: run_ik_loop's set_target()
+        # keeps starting playback segments toward the worker's echoed q even
+        # while disengaged, and compute_output prefers the segment over
+        # ``q`` — a leftover segment still points at the worker's pre-sync
+        # (stale) solution, so the first takeover ticks would command toward
+        # it. Adopting via _hold_target clears the segment so the synced
+        # pose is what the filters track from the first engaged tick.
+        self._hold_target(np.asarray(result[1], dtype=np.float32))
 
         # Seed the grips at the robot's current gripper positions so the
         # EMA blends from them to the controller triggers over a few ticks
