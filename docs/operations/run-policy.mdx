@@ -48,7 +48,8 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
         |---|---|
         | **Start episode** | Begin the next rollout. |
         | **Save** | Save the current episode and return to the reset gate. |
-        | **Discard** | Drop the current episode and redo it. |
+        | **Discard** | Drop the current episode. Because a failed rollout usually leaves the arms somewhere they shouldn't be, they go **limp** for hand-repositioning instead of driving home from that pose — clear them of the scene, then **Return to rest**. |
+        | **Return to rest** | Send the limp arms home, replanning the collision-aware return from wherever they were left. Appears after a **Discard** (limp cleanup) or when the guarded between-episode return meets resistance (a **Contact** hold). |
 
         To end the run, press **Stop** in the card header.
       </Step>
@@ -73,7 +74,7 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
     | Key | Action |
     |---|---|
     | `s` | Save the rollout and end the episode |
-    | `r` | Discard and re-record |
+    | `r` | Discard the episode — the arms drop **limp** for hand-repositioning; clear them, then press **Enter** to return to rest and re-record |
     | `q` | Discard and quit |
 
     See [`run-policy`](/cli/run-policy) for aggregation, chunking, and dataset-saving fields.
@@ -81,6 +82,12 @@ You can launch a rollout from the **web control panel** or the **CLI** (`axol ru
 </Tabs>
 
 `--episode_time_s` is a safety cap (default 120 s) that falls back to the same save / discard / quit prompt if no key is pressed. If a dataset repo is supplied, each saved episode is appended to a LeRobot-format dataset. Between episodes the arms return to the rest pose via a collision-aware IK trajectory — **guarded**: if a joint's torque strays from the gravity model for a sustained window (something still grasped, or a person grabbing an arm) the move stops where it is and the arms drop into a limp gravity-compensation hold. Free them by hand, then continue (Enter on the terminal, **Return to rest** on the control panel) to replan from wherever they were left. Tune with `--reset_torque_threshold` (default 4.0 Nm; `0` disables the watchdog) or the control panel's **Reset contact threshold**.
+
+**Discarding** an episode uses that same limp hold up front: because a bad rollout usually leaves the arms somewhere they shouldn't be, they go slack for hand-repositioning first, so you untangle them by hand rather than dragging them home from a failed pose — then return to rest replans from where you left them.
+
+<Info>
+  Rollout execution stays smooth on any inference hardware. Every command the policy produces is shaped by the same velocity/acceleration profile teleop and all training data go through, so a slow or bursty inference platform decelerates the arms to a brief hold and ramps back out instead of jerking at chunk boundaries. The shaping knobs (`--exec_max_vel`, `--ensemble_blend_s`, `--align_fade_s`) are in the [`run-policy`](/cli/run-policy) reference.
+</Info>
 
 ## Offload inference to a remote server (optional)
 

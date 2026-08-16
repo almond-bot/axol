@@ -143,8 +143,8 @@ For **Run policy**:
 |---|---|
 | **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
 | **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
-| **Discard** | Drop the current episode and return to the reset gate to redo it. |
-| **Return to rest** | Only during a **Contact** hold: the guarded return between episodes met resistance and the arms are limp. Clear them by hand, then press this to replan the return from where they are. |
+| **Discard** | Drop the current episode. The arms go **limp** for hand-repositioning — a failed rollout usually leaves them somewhere they shouldn't be, so they don't drive home from that pose — then **Return to rest** before the next take. |
+| **Return to rest** | Send the limp arms home, replanning the collision-aware return from where they are. Appears whenever the arms are left limp: after a **Discard** (phase **Limp**), or when the guarded between-episode return meets resistance (phase **Contact**). Clear the arms by hand first. |
 
 These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
 
