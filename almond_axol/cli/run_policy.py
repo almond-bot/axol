@@ -1528,62 +1528,66 @@ def _run(
             # snaps. Sweep now, while the arm is still stationary, then hold
             # automatic collection for the episode: refcounting still frees
             # the (acyclic) tensors and frames immediately, and the deferred
-            # cyclic garbage is collected at teardown below.
+            # cyclic garbage is collected in the ``finally`` below. The
+            # re-enable lives in a ``finally`` because run-policy also runs
+            # in-process under ``axol serve``: an exception escaping the
+            # episode must not leave automatic collection off for the rest
+            # of the serve process's lifetime.
             gc.collect()
             gc.disable()
-
-            receiver_thread.start()
-            control_thread.start()
-            obs_thread.start()
-            if capture is not None:
-                capture.start()
-
-            deadline = time.perf_counter() + episode_time_s
             timed_out = False
             interrupted = False
             try:
-                while True:
-                    if stop_event.is_set():
-                        break
-                    if control.poll_choice() is not None:
-                        break
-                    if time.perf_counter() >= deadline:
-                        timed_out = True
-                        break
-                    if client.fatal_error is not None:
-                        # Hardware fault from the control loop — drop the
-                        # episode and exit the run.
-                        log_say(
-                            f"Fatal error in control loop: "
-                            f"{client.fatal_error!r}. Aborting run without "
-                            "saving the current episode."
-                        )
-                        break
-                    time.sleep(0.1)
-            except KeyboardInterrupt:
-                interrupted = True
+                receiver_thread.start()
+                control_thread.start()
+                obs_thread.start()
+                if capture is not None:
+                    capture.start()
 
-            # Tear down per-episode threads (server + client stay alive).
-            control.end_episode()
-            client.shutdown_event.set()
-            if capture is not None:
-                capture.stop_event.set()
-                capture.join(timeout=5.0)
-            control_thread.join(timeout=5.0)
-            receiver_thread.join(timeout=5.0)
-            obs_thread.join(timeout=5.0)
+                deadline = time.perf_counter() + episode_time_s
+                try:
+                    while True:
+                        if stop_event.is_set():
+                            break
+                        if control.poll_choice() is not None:
+                            break
+                        if time.perf_counter() >= deadline:
+                            timed_out = True
+                            break
+                        if client.fatal_error is not None:
+                            # Hardware fault from the control loop — drop the
+                            # episode and exit the run.
+                            log_say(
+                                f"Fatal error in control loop: "
+                                f"{client.fatal_error!r}. Aborting run without "
+                                "saving the current episode."
+                            )
+                            break
+                        time.sleep(0.1)
+                except KeyboardInterrupt:
+                    interrupted = True
 
-            # Sweep the cyclic garbage deferred during the episode. The
-            # duration doubles as confirmation of the mid-episode GC stall
-            # diagnosis: a multi-hundred-ms sweep here is the pause that
-            # previously landed inside the control loop.
-            gc.enable()
-            gc_t0 = time.perf_counter()
-            gc.collect()
-            _logger.info(
-                "End-of-episode gc.collect: %.0f ms",
-                (time.perf_counter() - gc_t0) * 1000.0,
-            )
+                # Tear down per-episode threads (server + client stay alive).
+                control.end_episode()
+                client.shutdown_event.set()
+                if capture is not None:
+                    capture.stop_event.set()
+                    capture.join(timeout=5.0)
+                control_thread.join(timeout=5.0)
+                receiver_thread.join(timeout=5.0)
+                obs_thread.join(timeout=5.0)
+            finally:
+                # Sweep the cyclic garbage deferred during the episode. The
+                # duration doubles as confirmation of the mid-episode GC stall
+                # diagnosis: a multi-hundred-ms sweep here is the pause that
+                # previously landed inside the control loop.
+                gc.enable()
+                gc_t0 = time.perf_counter()
+                gc.collect()
+                _logger.info(
+                    "End-of-episode gc.collect: %.0f ms",
+                    (time.perf_counter() - gc_t0) * 1000.0,
+                )
 
             if interrupted or stop_event.is_set():
                 if dataset is not None:

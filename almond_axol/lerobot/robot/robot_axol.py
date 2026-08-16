@@ -642,10 +642,17 @@ class AxolRobot(Robot):
             right[i] = q_out[gi]
 
         # Cartesian senders have no fixed rate contract, so the shapers run on
-        # measured inter-send spacing (clamped so a hiccup can't blow up the
-        # step size). After a gap the arm may have been moved by another path
-        # (return-to-rest, gravity comp), so re-seed from the actual measured
-        # positions rather than ramping from a stale command.
+        # measured inter-send spacing — but the dt fed to the filter is capped
+        # at one nominal 60 Hz tick, so a single command can never advance the
+        # target by more than ``max_vel / 60`` no matter how long the sender
+        # paused (an uncapped dt would let one post-starvation command carry a
+        # whole gap's worth of motion in one step — exactly the snap this
+        # shaper exists to prevent; a slow sender is instead rate-limited,
+        # which is the correct graceful degradation). After a longer gap the
+        # arm may also have been moved by another path (return-to-rest,
+        # gravity comp) and the filter's velocity state is stale, so re-seed
+        # from the actual measured positions — which also zeroes the velocity
+        # — rather than ramping from a stale command at a stale speed.
         now = time.monotonic()
         gap = now - self._cart_last_send
         self._cart_last_send = now
@@ -660,10 +667,10 @@ class AxolRobot(Robot):
             )
             gap = float("inf")
         shaper_l, shaper_r = self._cart_shapers
-        if gap > 0.5:
+        if gap > 0.25:
             shaper_l.reset(seed=np.asarray(left_cur, dtype=np.float32)[:7])
             shaper_r.reset(seed=np.asarray(right_cur, dtype=np.float32)[:7])
-        dt = min(max(gap, 1.0 / 240.0), 0.1)
+        dt = min(max(gap, 1.0 / 240.0), 1.0 / 60.0)
         shaper_l.dt = dt
         shaper_r.dt = dt
         left[:7] = shaper_l.update(left[:7])
