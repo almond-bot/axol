@@ -424,6 +424,35 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_can_bus=False,
     ),
+    # The lift commands run on the chest CAN bus, not the arm hub, but they
+    # still take the single bus-owner slot (uses_can_bus default) so physical
+    # motion is never launched concurrently with teleop or another
+    # diagnostic. drives_motors stays False: the arm-motor fault gate is
+    # irrelevant to the lift, and homing must stay available regardless.
+    "lift.home": CommandDef(
+        "lift.home",
+        "lift.home",
+        "Home the lift",
+        "Calibrate the telescoping lift: drive both legs to their end stops "
+        "and save the height scale to the lift board's flash (~1-2 min). "
+        "One-time — the calibration persists across power cycles. Stop "
+        "aborts safely (rolls back).",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.lift.home"),
+        requires_hardware=True,
+    ),
+    "lift.goto": CommandDef(
+        "lift.goto",
+        "lift.goto",
+        "Raise lift (install height)",
+        "Move the lift to a target height in percent of travel. The default "
+        "75% is the robot install height. Requires a homed lift.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.lift.goto"),
+        requires_hardware=True,
+    ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
         "motor.set-zero-pos",

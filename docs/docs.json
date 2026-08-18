@@ -61,6 +61,8 @@
               "cli/can-setup",
               "cli/can-enable",
               "cli/can-driver",
+              "cli/lift-home",
+              "cli/lift-goto",
               "cli/motor-info",
               "cli/motor-health",
               "cli/diag-rom-enable",

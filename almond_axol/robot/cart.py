@@ -1,9 +1,9 @@
-"""Powered Axol Cart: x-drive omni wheel base + Jiecang telescoping lift.
+"""Powered Axol Cart: x-drive omni wheel base + telescoping lift.
 
 The powered cart has four omni wheels mounted at 45° on the corners (an
 x-drive), each driven by a Damiao motor in VELOCITY mode on a dedicated
-CAN bus, plus a telescoping lift whose driver is currently a no-op stub
-awaiting our own lift PCB (see :mod:`almond_axol.robot.lift`). CAN IDs are
+CAN bus, plus a telescoping lift driven by the jelly_legs board on its own
+chest CAN bus (see :mod:`almond_axol.robot.lift`). Wheel CAN IDs are
 fixed by convention:
 
     id 1  front-left      id 2  front-right
@@ -48,11 +48,11 @@ import math
 import time
 from dataclasses import dataclass
 
-from ..constants import CAN_BASE
+from ..constants import CAN_BASE, CAN_CHEST
 from ..motor import CanBus, ControlMode, make_driver
 from ..motor.damiao import _DM_REG_PMAX
 from ..motor.driver import MotorDriver
-from .lift import DOWN, STOP, UP, Lift
+from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
 
 _logger = logging.getLogger(__name__)
 
@@ -184,9 +184,16 @@ class CartConfig:
         command_timeout: Seconds without a fresh :meth:`Cart.set_command`
                          before the target is forced to zero (and the lift
                          stopped). Protects against a dead command source.
-        lift:            Whether the telescoping lift is present. Its driver
-                         is a no-op until the lift PCB lands, so this only
-                         decides whether lift commands are routed at all.
+        lift:            Whether the telescoping lift is present (the
+                         jelly_legs board on the chest CAN bus, see
+                         :mod:`almond_axol.robot.lift`). The chest bus being
+                         down at enable time only disables the lift with a
+                         warning — the buses are independent, so a cart can
+                         still drive without it.
+        lift_channel:    SocketCAN interface of the chest bus carrying the
+                         jelly_legs lift controller.
+        lift_speed:      Lift jog speed in encoder counts/s (the firmware's
+                         full speed is ~650).
     """
 
     enabled: bool = False
@@ -205,6 +212,8 @@ class CartConfig:
     frequency: float = 50.0
     command_timeout: float = 0.3
     lift: bool = True
+    lift_channel: str = CAN_CHEST
+    lift_speed: int = JOG_SPEED
 
 
 class _YawLog:
@@ -360,6 +369,16 @@ class Cart:
         """True when a wheel CAN channel is configured."""
         return self._config.channel is not None
 
+    @property
+    def has_lift(self) -> bool:
+        """True when the lift driver is up (chest bus opened at enable time)."""
+        return self._lift is not None
+
+    @property
+    def lift_status(self) -> LiftStatus | None:
+        """Latest jelly_legs status frame, or None (no lift / board silent)."""
+        return self._lift.status if self._lift is not None else None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -369,8 +388,20 @@ class Cart:
         the command task."""
         cfg = self._config
         if cfg.lift:
-            self._lift = Lift()
-            _logger.info("cart lift: no-op driver — the lift will not move")
+            # The chest bus is optional and independent of the wheels: a
+            # missing/unpowered lift only costs the lift, never the drive.
+            lift = Lift(cfg.lift_channel, cfg.lift_speed)
+            try:
+                await lift.start()
+                self._lift = lift
+            except Exception as exc:  # noqa: BLE001 - lift is best-effort
+                await lift.close()
+                _logger.warning(
+                    "cart lift: could not open the chest bus %s (%s) — "
+                    "the lift is disabled for this session",
+                    cfg.lift_channel,
+                    exc,
+                )
 
         if cfg.channel is not None:
             # Seamless enable: bring the wheel interface up if it isn't yet
@@ -450,7 +481,7 @@ class Cart:
             self._bus = None
 
         if self._lift is not None:
-            self._lift.close()
+            await self._lift.close()
             self._lift = None
         _logger.info("cart disabled")
 
