@@ -491,13 +491,17 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
-def rx_alive() -> bool:
-    """True when at least one motor answers on either arm.
+def rx_alive_per_arm() -> tuple[bool, bool]:
+    """(left, right) — True where a motor answers on that arm's bus.
 
     Verifies the adapter's receive path, not just the interface state: the
     dual-channel gs_usb adapter can come out of a down/up cycle in a state
     where TX still works but no received frame is ever delivered (kernel-side
     everything looks healthy — UP, ERROR-ACTIVE, correct bitrate).
+
+    Per-arm results matter because one healthy arm must not mask the other:
+    a bus with no responding motors (arm powered off, harness fault, dead
+    transceiver channel) looks identical to the adapter wedge on that side.
     """
     import asyncio
 
@@ -514,22 +518,30 @@ def rx_alive() -> bool:
         except Exception:  # noqa: BLE001 - silence means "no RX", whatever the cause
             return False
 
-    async def probe_all() -> bool:
+    async def probe_all() -> tuple[bool, bool]:
         await asyncio.sleep(0.5)  # let the freshly-upped interfaces settle
-        results = await asyncio.gather(probe(_CAN_L), probe(_CAN_R))
-        return any(results)
+        left, right = await asyncio.gather(probe(_CAN_L), probe(_CAN_R))
+        return left, right
 
     return asyncio.run(probe_all())
+
+
+def rx_alive() -> bool:
+    """True when at least one motor answers on either arm."""
+    return any(rx_alive_per_arm())
 
 
 def bring_up_can() -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
-    that lands in the wedge is recovered by exactly one more cycle. A robot
-    with its motors powered off is indistinguishable from the wedge, hence the
-    bounded retries and the warning instead of an error.
+    state and the TX-only wedge described in :func:`rx_alive_per_arm`, so a
+    bring-up that lands in the wedge is recovered by exactly one more cycle.
+    A robot with its motors powered off is indistinguishable from the wedge,
+    hence the bounded retries and the warning instead of an error. Results are
+    reported per arm: one answering arm proves the adapter is healthy (no
+    retry), while the other side staying silent is called out instead of being
+    masked by it.
     """
     print("Bringing up CAN interfaces (requires sudo)...")
     hub_present = (Path("/sys/class/net") / _CAN_L).exists() and (
@@ -543,8 +555,20 @@ def bring_up_can() -> None:
         return
     for attempt in range(3):
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
-        if rx_alive():
-            print("  Done — motors responding.")
+        left, right = rx_alive_per_arm()
+        if left and right:
+            print("  Done — motors responding on both arms.")
+            return
+        if left or right:
+            # One arm answering proves the adapter's RX path is healthy, so
+            # more cycling can't help the silent side — that's an arm-level
+            # problem (power, harness, or the hub's transceiver channel).
+            alive, silent = ("left", "right") if left else ("right", "left")
+            print(f"  Done — motors responding on the {alive} arm.")
+            print(
+                f"  WARNING: no motor answered on the {silent} arm. Check that "
+                f"it is powered and its CAN connection is intact."
+            )
             return
         if attempt < 2:
             print("  No motor responses (adapter RX may be wedged) — cycling again...")
