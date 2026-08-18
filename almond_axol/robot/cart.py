@@ -43,6 +43,7 @@ if a wheel runs backwards on your cart, flip its entry in
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import time
@@ -403,42 +404,63 @@ class Cart:
                     exc,
                 )
 
-        if cfg.channel is not None:
-            # Seamless enable: bring the wheel interface up if it isn't yet
-            # (boot normally handles this via can.setup's @reboot script, but
-            # a freshly plugged adapter or a manual teardown shouldn't need a
-            # separate can.enable). A missing interface raises with its name.
-            from ..cli.can.setup import bring_up_interfaces, iface_up
+        try:
+            if cfg.channel is not None:
+                # Seamless enable: bring the wheel interface up if it isn't yet
+                # (boot normally handles this via can.setup's @reboot script,
+                # but a freshly plugged adapter or a manual teardown shouldn't
+                # need a separate can.enable). A missing interface raises with
+                # its name.
+                from ..cli.can.setup import bring_up_interfaces, iface_up
 
-            if not iface_up(cfg.channel):
-                bring_up_interfaces([cfg.channel])
-            self._bus = CanBus(cfg.channel)
-            await self._bus.start()
-            # Wheel IDs 1-4 collide with the arm-bus MyActuator IDs in the
-            # driver-inference table, so the Damiao protocol is forced.
-            self._motors = [
-                make_driver(self._bus, w.motor_id, motor_type="damiao") for w in WHEELS
-            ]
-            # Widen the position-mapping range (RAM only) before enable()
-            # reads it back, so multi-turn wheel positions stay valid for the
-            # MIT park hold.
-            await asyncio.gather(
-                *[m._write_register(_DM_REG_PMAX, _SESSION_PMAX) for m in self._motors]
-            )
-            await asyncio.gather(*[m.enable() for m in self._motors])
-            for w, m in zip(WHEELS, self._motors):
-                if abs(m._p_max - _SESSION_PMAX) > 1.0:
-                    _logger.warning(
-                        "cart wheel %s PMAX readback %.0f != %.0f — parking "
-                        "may misbehave",
-                        w.name,
-                        m._p_max,
-                        _SESSION_PMAX,
-                    )
-            await asyncio.gather(
-                *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
-            )
-            _logger.info("cart wheels enabled on %s", cfg.channel)
+                if not iface_up(cfg.channel):
+                    bring_up_interfaces([cfg.channel])
+                self._bus = CanBus(cfg.channel)
+                await self._bus.start()
+                # Wheel IDs 1-4 collide with the arm-bus MyActuator IDs in the
+                # driver-inference table, so the Damiao protocol is forced.
+                self._motors = [
+                    make_driver(self._bus, w.motor_id, motor_type="damiao")
+                    for w in WHEELS
+                ]
+                # Widen the position-mapping range (RAM only) before enable()
+                # reads it back, so multi-turn wheel positions stay valid for
+                # the MIT park hold.
+                await asyncio.gather(
+                    *[
+                        m._write_register(_DM_REG_PMAX, _SESSION_PMAX)
+                        for m in self._motors
+                    ]
+                )
+                await asyncio.gather(*[m.enable() for m in self._motors])
+                for w, m in zip(WHEELS, self._motors):
+                    if abs(m._p_max - _SESSION_PMAX) > 1.0:
+                        _logger.warning(
+                            "cart wheel %s PMAX readback %.0f != %.0f — parking "
+                            "may misbehave",
+                            w.name,
+                            m._p_max,
+                            _SESSION_PMAX,
+                        )
+                await asyncio.gather(
+                    *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
+                )
+                _logger.info("cart wheels enabled on %s", cfg.channel)
+        except BaseException:
+            # A failed enable() propagates to the caller, who never calls
+            # disable() — so everything opened above must be torn down here,
+            # or the lift's CAN reader and jog task would keep running (and a
+            # half-started wheel bus would stay open).
+            self._motors = []
+            if self._bus is not None:
+                with contextlib.suppress(Exception):
+                    await self._bus.close()
+                self._bus = None
+            if self._lift is not None:
+                with contextlib.suppress(Exception):
+                    await self._lift.close()
+                self._lift = None
+            raise
 
         if cfg.yaw_hold_gain != 0.0:
             _logger.info(

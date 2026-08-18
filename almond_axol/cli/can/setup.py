@@ -265,6 +265,12 @@ def _find_serial() -> str | None:
 _JELLY_CMD_ID = 0x420
 _JELLY_STATUS_ID = 0x421
 _JELLY_GET_STATUS = bytes([0x04])
+# SET_RATE 0 (opcode 0x05, uint16 period 0): turns the 50 ms status
+# broadcast off. The board starts broadcasting as soon as it has received
+# *any* frame, and that stream starves the CANable's gs_usb TX path (see
+# the firmware README bench note) — so every probe sequence must silence
+# the board before expecting its own transmissions to get through.
+_JELLY_SET_RATE_OFF = bytes([0x05, 0x00, 0x00])
 # Damiao register read: 0x7FF [id_lo, id_hi, 0x33, rid, ...]; the motor
 # echoes a 0x33 reply on its feedback ID. Register 60 (VBUS) is read-only.
 _DAMIAO_CFG_ID = 0x7FF
@@ -310,11 +316,34 @@ def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa:
     return False
 
 
+def _send_once(iface: str, can_id: int, data: bytes) -> None:
+    """Fire one frame on ``iface`` and return; no reply expected."""
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+    except OSError:
+        return
+    try:
+        s.send(struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0")))
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
 def _probe_chest(iface: str) -> bool:
-    """True when a jelly_legs board answers a GET_STATUS on ``iface``."""
+    """True when a jelly_legs board answers a GET_STATUS on ``iface``.
+
+    Each attempt sends SET_RATE 0 before the GET_STATUS so the board's
+    status broadcast stays off — both for the probe's own reply and for
+    whatever runs on this bus next.
+    """
     return _probe(
         iface,
-        [(_JELLY_CMD_ID, _JELLY_GET_STATUS)],
+        [
+            (_JELLY_CMD_ID, _JELLY_SET_RATE_OFF),
+            (_JELLY_CMD_ID, _JELLY_GET_STATUS),
+        ],
         lambda can_id, _data: can_id == _JELLY_STATUS_ID,
     )
 
@@ -364,8 +393,16 @@ def _identify_adapter(serial: str) -> str | None:
         bring_up_interfaces([iface])
     except RuntimeError:
         return None
-    chest = _probe_chest(iface)
+    # Silence any jelly_legs board before the wheel probe: the board starts
+    # its 50 ms broadcast after the first frame it sees (the wheel probe's
+    # own Damiao reads would wake it), and that stream starves the CANable's
+    # TX path — on a combined bus the wheel probe would then go deaf and the
+    # bus would be misclassified as chest-only. Harmless where no board is
+    # listening; a frame queued on a dead bus is dropped by the bring-up flap.
+    _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
+    time.sleep(0.05)
     wheels = _probe_wheels(iface)
+    chest = _probe_chest(iface)
     if chest and wheels:
         # The pre-split combined cart bus (jelly_legs next to the wheels).
         print(
