@@ -25,9 +25,14 @@ class Joint(Enum):
 CAN_LEFT = "can_alm_axol_l"
 CAN_RIGHT = "can_alm_axol_r"
 # The powered cart's wheel bus (its own single-channel adapter, separate from
-# the arm hub). NB: kernel interface names are capped at 15 chars (IFNAMSIZ),
-# so this can't be the more readable "can_alm_axol_base".
+# the arm hub), carrying the four Damiao wheel motors at IDs 0x01-0x04.
+# NB: kernel interface names are capped at 15 chars (IFNAMSIZ), so this can't
+# be the more readable "can_alm_axol_base".
 CAN_BASE = "can_alm_axol_b"
+# The chest bus (another single-channel adapter): the jelly_legs lift
+# controller — our own PCB replacing the Jiecang control box, driving the
+# telescoping lift legs (see almond_axol/robot/lift.py for the protocol).
+CAN_CHEST = "can_alm_axol_c"
 
 # CAN bring-up script written by `axol can.setup`. Runs at boot and on adapter
 # hotplug, and is also the sanctioned way to reset the interfaces at runtime:
