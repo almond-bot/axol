@@ -123,6 +123,8 @@ Each operation can be driven from the web control panel or the CLI:
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
 - [`can.driver`](https://docs.almond.bot/cli/can-driver)
+- [`lift.home`](https://docs.almond.bot/cli/lift-home)
+- [`lift.goto`](https://docs.almond.bot/cli/lift-goto)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)
