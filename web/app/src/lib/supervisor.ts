@@ -207,6 +207,14 @@ export async function startUpdate(): Promise<{ started: boolean }> {
   return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
 }
 
+/**
+ * Power off the serve host (`shutdown -h now`). Refused (409) while an
+ * operation or session is running.
+ */
+export async function shutdownHost(): Promise<{ ok: boolean }> {
+  return json(await fetch(apiUrl("/api/host/shutdown"), { method: "POST" }))
+}
+
 // ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
