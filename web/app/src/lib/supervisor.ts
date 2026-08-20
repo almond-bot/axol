@@ -474,8 +474,28 @@ export interface CameraSpec {
   resolution?: string
 }
 
+/**
+ * How long the connect probe waits before declaring the host unreachable.
+ * Without this, a fetch to an absent host sits in TCP retries for a minute or
+ * more with the UI stuck on "Connecting…". Kept just high enough for a live
+ * LAN host's worst case (mDNS .local resolution + TCP + TLS handshake over
+ * Wi-Fi); much lower and slow-but-alive hosts get misreported as offline.
+ */
+const CONNECT_TIMEOUT_MS = 2_000
+
 export async function fetchCommands(): Promise<CommandSpec[]> {
-  return json(await fetch(apiUrl("/api/commands")))
+  let res: Response
+  try {
+    res = await fetch(apiUrl("/api/commands"), {
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    })
+  } catch (e) {
+    if (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
+    }
+    throw e
+  }
+  return json(res)
 }
 
 export async function fetchSessions(): Promise<SessionInfo[]> {
