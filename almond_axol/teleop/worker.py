@@ -562,7 +562,22 @@ def run_ik_worker(
     q_current_left: np.ndarray | None = None,
     q_current_right: np.ndarray | None = None,
 ) -> None:
-    """IK subprocess entry point."""
+    """IK subprocess entry point.
+
+    Message protocol (after the ``("ready", …)`` handshake):
+
+    - ``VRFrame``                      → ``q`` (one solve step)
+    - ``("reset", q_current)``         → ``("reset_traj", q_rest, traj)``
+    - ``("sync", pos_left, pos_right)`` → ``("synced", q)`` — seat the worker's
+      joint vector at the robot's measured arm positions (7 arm joints per
+      side; any gripper element past index 6 is ignored) and clear the engage
+      state via :meth:`IKWorker.reset`, so the *next* engage snapshots FK at
+      the robot's actual pose instead of wherever the worker last solved.
+      Used by the DAgger takeover (see :mod:`almond_axol.teleop.dagger`):
+      after a policy has moved the arms, the worker's own last solution is
+      stale, and engaging against it would drag the robot back toward it.
+    - ``None``                         → exit
+    """
     # Confine the JAX solve to a single core's worth of compute. The per-arm IK
     # is tiny, but XLA's CPU backend fans its Eigen thread pool across *every*
     # core for each solve; combined with this process's nice(-10) boost, that
@@ -635,6 +650,29 @@ def run_ik_worker(
                 worker.reset()
                 q = traj[-1].copy() if traj else q_rest.copy()
                 conn.send(("reset_traj", q_rest.copy(), traj))
+            elif isinstance(msg, tuple) and msg[0] == "sync":
+                pos_l = np.asarray(msg[1], dtype=np.float32)
+                pos_r = np.asarray(msg[2], dtype=np.float32)
+                for i, gi in enumerate(worker.left_indices):
+                    q[gi] = pos_l[i]
+                for i, gi in enumerate(worker.right_indices):
+                    q[gi] = pos_r[i]
+                # Deactivate the engage state and drop the stale snap poses so
+                # the next engage performs a fresh engage-snap from the synced
+                # q. Deliberately NOT worker.reset(): that would also clear
+                # the One Euro pose filters, which step() keeps warm on every
+                # frame precisely so an engage isn't a smoothing cold start —
+                # and a DAgger takeover is exactly such an engage. The engage
+                # rising edge in step() re-pins the posture pose and re-snaps
+                # from the warm filtered poses, so nothing else from reset()
+                # is needed here.
+                worker._active = False
+                worker._clear_freeze()
+                worker._snap_ctrl = {}
+                worker._snap_fk = {}
+                worker._snap_elbow_ctrl = {}
+                worker._snap_elbow_fk = {}
+                conn.send(("synced", q.copy()))
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 conn.send(q.copy())

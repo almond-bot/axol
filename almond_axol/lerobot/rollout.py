@@ -11,6 +11,12 @@ the same episode plumbing without duplicating it:
 - :class:`RolloutCaptureThread` — fixed-rate thread that pairs a
   timestamp-aligned observation with the latest published action and
   appends it to a ``LeRobotDataset``.
+- :class:`PolicyActionLimiter` — per-joint velocity/acceleration envelope
+  over policy actions, for control loops that command a policy's raw
+  output directly (``collect-dagger``).
+- :func:`latest_observation` — joint state + each camera's newest frame
+  without the capture-instant alignment wait, for inference ticks that
+  want the freshest frame rather than a timestamp-aligned one.
 - :func:`stdin_watcher` — ``s`` / ``r`` / ``q`` keystroke watcher with
   no-block ``select`` polling.
 
@@ -458,14 +464,128 @@ class RolloutCaptureThread(threading.Thread):
             tick += 1
 
 
+class PolicyActionLimiter:
+    """Per-joint velocity/acceleration envelope over policy actions.
+
+    A control loop that commands a policy's raw action directly has no
+    smoothing of its own, so a discontinuous action — a chunk re-planned
+    from a stale observation after a slow inference round-trip, or an
+    outlier from the policy itself — jerks the arm. The teleop stack
+    already solves this with a trapezoidal velocity profile; this wraps the
+    same :class:`~almond_axol.teleop.filter.TrapezoidalFilter` around the
+    policy's *arm* joints (the grippers snap by design and pass through
+    untouched).
+
+    With the default limits at the teleop envelope (~1 rev/s, ~3.5 rev/s²)
+    the filter is transparent for normal trained motion and only engages on
+    discontinuities, turning a jump into a bounded, acceleration-limited
+    move. It is a smoothness guarantee, not a safety stop: a policy heading
+    somewhere bad still gets there (smoothly) — the freeze grip / e-stop
+    remain the real safeguards. Each engagement beyond a small deviation is
+    logged (rate-limited), so jump frequency is visible in the session log —
+    useful for telling network hiccups from a jumpy policy.
+
+    Call :meth:`seed` at the robot's measured pose whenever the policy
+    (re)takes control, and :meth:`apply` once per tick at ``fps`` (the
+    filter's step size is ``max_vel / fps``, so the tick rate must hold).
+    """
+
+    # Log an engagement only when the raw target deviates from the filtered
+    # command by more than this (rad) on some joint, at most once a second.
+    _CLAMP_LOG_THRESHOLD = 0.05
+
+    def __init__(self, max_vel: float, max_accel: float, fps: int) -> None:
+        import numpy as np
+
+        from ..teleop.filter import TrapezoidalFilter
+
+        self._np = np
+        # Arm-only key lists (grippers excluded): the grippers snap by design
+        # and are safe; the arms get the velocity envelope.
+        self._left_keys = [f"left_{j.value}.pos" for j in ARM_JOINTS]
+        self._right_keys = [f"right_{j.value}.pos" for j in ARM_JOINTS]
+        dt = 1.0 / float(fps)
+        self._left = TrapezoidalFilter(max_vel, max_accel, dt)
+        self._right = TrapezoidalFilter(max_vel, max_accel, dt)
+        self._last_clamp_log = 0.0
+
+    def seed(self, pos_l: Any, pos_r: Any) -> None:
+        """Reset the envelope to the robot's measured arm positions."""
+        np = self._np
+        self._left.reset(seed=np.asarray(pos_l[:7], dtype=np.float32))
+        self._right.reset(seed=np.asarray(pos_r[:7], dtype=np.float32))
+
+    def apply(self, action: dict[str, float]) -> dict[str, float]:
+        """Return ``action`` with the arm joints velocity/accel limited."""
+        np = self._np
+        raw_l = np.array([action[k] for k in self._left_keys], dtype=np.float32)
+        raw_r = np.array([action[k] for k in self._right_keys], dtype=np.float32)
+        lim_l = self._left.update(raw_l)
+        lim_r = self._right.update(raw_r)
+
+        deviation = max(
+            float(np.abs(raw_l - lim_l).max()), float(np.abs(raw_r - lim_r).max())
+        )
+        now = time.perf_counter()
+        if deviation > self._CLAMP_LOG_THRESHOLD and now - self._last_clamp_log > 1.0:
+            self._last_clamp_log = now
+            _logger.warning(
+                "policy action clamped by the velocity envelope (max deviation "
+                "%.3f rad) — a discontinuous chunk (late/stale inference) or a "
+                "policy jump was smoothed.",
+                deviation,
+            )
+
+        out = dict(action)
+        for key, value in zip(self._left_keys, lim_l):
+            out[key] = float(value)
+        for key, value in zip(self._right_keys, lim_r):
+            out[key] = float(value)
+        return out
+
+
+def latest_observation(robot: "AxolRobot") -> dict[str, Any]:
+    """Joint state + each camera's newest frame, without waiting for one.
+
+    Used by inference ticks (``collect-dagger`` and downstream policy CLIs):
+    ``AxolRobot.get_observation`` aligns cameras with ``read_at_or_after(now)``,
+    which *waits* for a frame captured after now, serialized across all the
+    cameras (~up to a frame period each) — a hard ceiling far below fps on the
+    loop calling it. Inference wants the freshest frame it can get;
+    capture-instant alignment only matters for the dataset, which the recorder
+    subprocess handles on its own clock. When the cameras are a video relay's
+    shared-memory readers (pyshm), a read is just a block copy.
+
+    Raises RuntimeError listing the cameras that had no readable frame.
+    """
+    obs = robot.get_joint_observation()
+    missing: list[str] = []
+    for cam_name, cam in robot.cameras.items():
+        try:
+            obs[cam_name] = cam.read_latest()
+        except Exception as exc:  # noqa: BLE001
+            _logger.debug("Camera %s read_latest failed (%s).", cam_name, exc)
+            missing.append(cam_name)
+    if missing:
+        raise RuntimeError(f"no readable frame from cameras {missing}")
+    return obs
+
+
 def stdin_watcher(
     stop_event: threading.Event,
     result: dict[str, str | None],
+    on_subtask: Callable[[int], None] | None = None,
+    num_subtasks: int = 0,
 ) -> None:
     """Watch stdin for ``s`` / ``r`` / ``q`` on its own line.
 
     Uses ``select.select`` so it never blocks past the stop event. Sets
     ``result["choice"]`` to the first valid keystroke received.
+
+    When ``num_subtasks`` is set, a bare integer ``1``..``num_subtasks``
+    instead switches the running policy's instruction to that subtask via
+    ``on_subtask(index)`` and keeps watching — it does NOT end the episode.
+    Anything else is ignored.
     """
     import select
     import sys
@@ -481,3 +601,12 @@ def stdin_watcher(
         if ch in ("s", "r", "q"):
             result["choice"] = ch
             return
+        if num_subtasks and on_subtask is not None and ch.isdigit():
+            idx = int(ch)
+            if 1 <= idx <= num_subtasks:
+                on_subtask(idx)
+            else:
+                print(
+                    f"  Ignoring subtask {idx}: valid range is 1-{num_subtasks}.",
+                    flush=True,
+                )
