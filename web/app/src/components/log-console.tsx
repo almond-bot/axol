@@ -35,7 +35,11 @@ export function LogConsole({ lines }: { lines: string[] }) {
     if (!el) return
     stickToBottom.current = true
     setShowJumpToBottom(false)
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" })
+    // Instant jump: a smooth scroll's intermediate frames fire scroll events
+    // that handleScroll would read as the user scrolling away, clearing
+    // stick-to-bottom before the animation lands (and streaming logs would
+    // make the animated target stale anyway).
+    el.scrollTop = el.scrollHeight
   }
 
   function downloadLogs() {
