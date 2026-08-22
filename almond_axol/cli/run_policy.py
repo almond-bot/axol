@@ -180,7 +180,7 @@ class RunPolicyConfig:
     # rest and start the next attempt. The policy pushes on the scene on
     # purpose, so the default sits above the reset threshold; raise it if
     # legitimate task contact keeps tripping it. 0 disables the watchdog.
-    policy_torque_threshold: float = 8.0
+    policy_torque_threshold: float = 16.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
@@ -557,7 +557,7 @@ def _build_axol_robot_client(
     align_fade_s: float = 1.0,
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
-    policy_torque_threshold: float = 8.0,
+    policy_torque_threshold: float = 16.0,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 

@@ -101,7 +101,7 @@ class ReplayDatasetConfig:
     # the run is stopped. Replayed episodes touch the scene on purpose, so
     # the default sits above the reset threshold; raise it if legitimate
     # task contact keeps tripping it. 0 disables.
-    play_torque_threshold: float = 8.0
+    play_torque_threshold: float = 16.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
