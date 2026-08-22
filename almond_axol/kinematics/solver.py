@@ -2,7 +2,15 @@
 Standalone bimanual IK solver for the Axol robot.
 
 Uses pyroki + jaxls to solve for joint positions given absolute Cartesian
-end-effector poses in the robot's world frame (FLU).
+end-effector poses in the robot's world frame (FLU: +x forward, +y left,
++z up).
+
+All public joint vectors are laid out as the robot itself orders them: the
+left arm's 7 joints in :data:`~almond_axol.constants.ARM_JOINTS` order
+(shoulder_1 … wrist_3) followed by the right arm's — so ``q[:7]`` /
+``q[7:]`` are exactly the arrays ``motion_control`` takes. pyroki orders
+the actuated joints its own way internally; the permutation is applied at
+every public boundary and callers never see it.
 """
 
 from __future__ import annotations
@@ -35,7 +43,8 @@ _logger = logging.getLogger(__name__)
 
 
 Pose = tuple[np.ndarray, np.ndarray]
-"""A frame as ``(position (3,), rotation (3, 3))`` numpy arrays, world frame (FLU).
+"""A frame as ``(position (3,), rotation (3, 3))`` numpy arrays, world frame
+(FLU: +x forward, +y left, +z up).
 
 The format :meth:`KinematicsSolver.fk` returns and :meth:`KinematicsSolver.ik`
 takes, so a pose can be read, edited, and solved for without conversion.
@@ -434,9 +443,14 @@ class KinematicsSolver:
     """Bimanual IK solver for the Axol robot.
 
     Loads the bundled URDF, builds a pyroki + jaxls solver, and resolves
-    absolute Cartesian end-effector poses (world frame, FLU) to joint angles.
-    JIT compilation is triggered during ``__init__`` so the first call to
-    :meth:`ik` is fast.
+    absolute Cartesian end-effector poses (world frame, FLU: +x forward,
+    +y left, +z up) to joint angles. JIT compilation is triggered during
+    ``__init__`` so the first call to :meth:`ik` is fast.
+
+    Every joint vector this class takes or returns is laid out left arm
+    then right arm, each in :data:`~almond_axol.constants.ARM_JOINTS` order
+    (shoulder_1 … wrist_3) — the same order ``motion_control`` and
+    ``rest_pose`` use, so ``q[:7]`` is the left arm and ``q[7:]`` the right.
 
     Args:
         config: Solver cost weights and parameters.
@@ -448,6 +462,7 @@ class KinematicsSolver:
         pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
         rot = np.eye(3, dtype=np.float32)
         q = solver.ik(q, left_pose=(pos, rot))
+        left_arm, right_arm = q[:7], q[7:]  # ARM_JOINTS order
 
         # fk returns the same (pos, rot_3x3) format ik takes, so nudging a
         # pose is a round trip:
@@ -510,14 +525,31 @@ class KinematicsSolver:
         self._left_shoulder_jax = jnp.asarray(self._left_shoulder_pos)
         self._right_shoulder_jax = jnp.asarray(self._right_shoulder_pos)
 
-        # Determine left/right joint indices in ARM_JOINTS order so that
-        # q[left_indices] / q[right_indices] align with rest_pose and motion_control.
+        # Public joint vectors are left-then-right in ARM_JOINTS order (the
+        # robot's own ordering); pyroki reorders the actuated joints
+        # internally (topologically — alphabetical for this URDF). The
+        # permutation between the two is applied at every public boundary,
+        # so callers never deal with pyroki's ordering.
+        canonical = _LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES
         actuated = list(self.robot.joints.actuated_names)
+        self._pyroki_index = np.array(
+            [actuated.index(n) for n in canonical], dtype=np.intp
+        )
+
+        # Per-arm joint indices in pyroki's order, for the internal costs.
         name_to_idx = {n: i for i, n in enumerate(actuated)}
-        self.left_indices = [name_to_idx[n] for n in _LEFT_JOINT_NAMES]
-        self.right_indices = [name_to_idx[n] for n in _RIGHT_JOINT_NAMES]
-        self._left_idx_jax = jnp.asarray(self.left_indices, dtype=jnp.int32)
-        self._right_idx_jax = jnp.asarray(self.right_indices, dtype=jnp.int32)
+        self._left_idx_jax = jnp.asarray(
+            [name_to_idx[n] for n in _LEFT_JOINT_NAMES], dtype=jnp.int32
+        )
+        self._right_idx_jax = jnp.asarray(
+            [name_to_idx[n] for n in _RIGHT_JOINT_NAMES], dtype=jnp.int32
+        )
+
+        # The public layout makes these trivial; kept because splitting a
+        # full vector into per-arm arrays reads better through them.
+        n_arm = len(_LEFT_JOINT_NAMES)
+        self.left_indices = list(range(n_arm))
+        self.right_indices = list(range(n_arm, 2 * n_arm))
 
         self._posture_pose = jnp.zeros(
             self.robot.joints.num_actuated_joints, dtype=jnp.float32
@@ -536,7 +568,7 @@ class KinematicsSolver:
         Args:
             q: Full ``(N,)`` joint array in radians (same ordering as :meth:`ik`).
         """
-        self._posture_pose = jnp.asarray(q, dtype=jnp.float32)
+        self._posture_pose = jnp.asarray(self.to_pyroki_order(q), dtype=jnp.float32)
 
     @property
     def posture_pose(self) -> np.ndarray:
@@ -545,19 +577,38 @@ class KinematicsSolver:
         Lets a caller that sweeps the attractor (e.g. Cartesian path planning
         in :mod:`almond_axol.kinematics.path`) restore what it found.
         """
-        return np.asarray(self._posture_pose, dtype=np.float32)
+        return self.from_pyroki_order(np.asarray(self._posture_pose, dtype=np.float32))
 
     # -- Properties ----------------------------------------------------------
 
     @property
     def joint_names(self) -> list[str]:
-        """Ordered list of all actuated joint names (left arm then right arm)."""
-        return list(self.robot.joints.actuated_names)
+        """All actuated joint names — left arm then right arm, ARM_JOINTS order."""
+        return list(_LEFT_JOINT_NAMES + _RIGHT_JOINT_NAMES)
 
     @property
     def num_joints(self) -> int:
         """Total number of actuated joints across both arms."""
         return self.robot.joints.num_actuated_joints
+
+    # -- Joint-order conversion ----------------------------------------------
+
+    def to_pyroki_order(self, q: np.ndarray) -> np.ndarray:
+        """Reorder a public joint vector into the order ``self.robot`` uses.
+
+        Only needed when driving the pyroki ``self.robot`` /
+        ``self.robot_coll`` objects directly (their joint limits, forward
+        kinematics, and collision pairs are indexed in pyroki's own actuated
+        order); every method on this class converts internally.
+        """
+        q = np.asarray(q, dtype=np.float32)
+        out = np.empty_like(q)
+        out[self._pyroki_index] = q
+        return out
+
+    def from_pyroki_order(self, q: np.ndarray) -> np.ndarray:
+        """Inverse of :meth:`to_pyroki_order`."""
+        return np.asarray(q, dtype=np.float32)[self._pyroki_index]
 
     # -- Public interface ----------------------------------------------------
 
@@ -569,9 +620,9 @@ class KinematicsSolver:
 
         Returns:
             Tuple ``(left_pose, right_pose)``, each a ``(pos (3,), rot (3, 3))``
-            pair of numpy arrays in the robot's world frame (FLU) — the same
-            format :meth:`ik` takes, so a pose can be read, nudged, and solved
-            for directly::
+            pair of numpy arrays in the robot's world frame (FLU: +x forward,
+            +y left, +z up) — the same format :meth:`ik` takes, so a pose can
+            be read, nudged, and solved for directly::
 
                 (l_pos, l_rot), _ = solver.fk(q)
                 q = solver.ik(q, left_pose=(l_pos + delta, l_rot))
@@ -579,10 +630,26 @@ class KinematicsSolver:
         The returned pose is the gripper *mount* frame — for the point the
         fingers close on, see :func:`almond_axol.kinematics.path.tip_poses`.
         """
-        fk = self.robot.forward_kinematics(jnp.asarray(q, dtype=jnp.float32))
+        fk = self.robot.forward_kinematics(jnp.asarray(self.to_pyroki_order(q)))
         return (
             _se3_to_pose(jaxlie.SE3(fk[self.l_ee_idx])),
             _se3_to_pose(jaxlie.SE3(fk[self.r_ee_idx])),
+        )
+
+    def elbow_positions(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """World-frame elbow positions from joint positions.
+
+        Args:
+            q: Full ``(N,)`` joint array in radians.
+
+        Returns:
+            Tuple ``(left, right)`` of ``(3,)`` numpy arrays — the elbow link
+            origins in the robot's world frame.
+        """
+        fk = self.robot.forward_kinematics(jnp.asarray(self.to_pyroki_order(q)))
+        return (
+            np.asarray(jaxlie.SE3(fk[self.l_elbow_idx]).translation(), np.float32),
+            np.asarray(jaxlie.SE3(fk[self.r_elbow_idx]).translation(), np.float32),
         )
 
     def ik(
@@ -596,7 +663,8 @@ class KinematicsSolver:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
         All positions and orientations must be expressed in the robot's world
-        frame (FLU). End-effector targets are soft-clamped between
+        frame (FLU: +x forward, +y left, +z up). End-effector targets are
+        soft-clamped between
         ``config.reach_soft_start`` and ``config.max_reach`` from each shoulder
         before solving; elbow hints are projected onto the robot's reachable
         elbow sphere and faded out for overhead targets; joint steps are
@@ -617,6 +685,10 @@ class KinematicsSolver:
         """
         if left_pose is None and right_pose is None:
             return q_current
+
+        # Everything below runs in pyroki's joint order; converted back at
+        # the return.
+        q_current = self.to_pyroki_order(q_current)
 
         cfg = self.config
 
@@ -732,7 +804,7 @@ class KinematicsSolver:
         if max_abs > cfg.max_joint_delta:
             delta = delta * (cfg.max_joint_delta / max_abs)
         q_out = (q_current + delta).astype(np.float32)
-        return q_out
+        return self.from_pyroki_order(q_out)
 
     def _elbow_fade(
         self, ee_target: np.ndarray | None, shoulder_pos: np.ndarray
