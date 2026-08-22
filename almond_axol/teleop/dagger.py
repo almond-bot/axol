@@ -94,6 +94,12 @@ class DaggerTeleopCore(VRTeleopCore):
         self._freeze_lock = threading.Lock()
         self._freeze_latch = False
         self._idle_reset_latch = False
+        # Either-grip edge state for the DAgger toggle. The base core tracks
+        # per-grip edges (_prev_l_lock / _prev_r_lock) for its per-arm
+        # toggles; the DAgger flow is all-or-nothing (freeze / take over /
+        # hand back move BOTH arms between the policy and the operator), so
+        # it keeps its own combined edge.
+        self._prev_either = False
         # Worker pipe + robot-position source, attached at connect time.
         self._conn: multiprocessing.connection.Connection | None = None
         self._get_positions: Callable[[], tuple[np.ndarray, np.ndarray]] | None = None
@@ -128,10 +134,20 @@ class DaggerTeleopCore(VRTeleopCore):
             self._idle_reset_latch = False
             return latched
 
+    def _set_engaged(self, engaged: bool) -> None:
+        """Engage/disengage BOTH arms as a unit.
+
+        The base core's ``teleop_enabled`` is a read-only property over the
+        per-arm flags; DAgger interventions always move both arms between
+        the policy and the operator, so both flags flip together.
+        """
+        self.left_enabled = engaged
+        self.right_enabled = engaged
+
     def force_disengage(self) -> None:
         """Disable teleop (e.g. when an episode ends mid-intervention)."""
         if self.teleop_enabled:
-            self.teleop_enabled = False
+            self._set_engaged(False)
             self._logger.info("Teleop force-disengaged.")
             self._broadcast(False)
 
@@ -201,7 +217,7 @@ class DaggerTeleopCore(VRTeleopCore):
                         "Release and squeeze both grips to retry."
                     )
                 else:
-                    self.teleop_enabled = True
+                    self._set_engaged(True)
                     self._logger.info("Teleop engaged (DAgger intervention).")
                     self._broadcast(True)
                     # Ramp in gently on every takeover (not just out of
@@ -214,7 +230,7 @@ class DaggerTeleopCore(VRTeleopCore):
                     self._at_rest = False
         else:
             if either and not self._prev_either:
-                self.teleop_enabled = False
+                self._set_engaged(False)
                 self._logger.info("Teleop disengaged — policy resumes.")
                 self._broadcast(False)
         self._prev_both = both

@@ -372,19 +372,10 @@ export default function ControlPanel() {
     // usbConnectClick is stable (only uses state setters / fetch).
   }, [conn.state, usb, usbBusy])
 
-  async function hostDisconnectClick() {
-    // Kill any running task and wait for it to exit before dropping the host,
-    // so disconnecting never leaves an orphaned op running server-side. Only
-    // then tear down the (client-side) host connection.
-    setBusy(true)
-    try {
-      await stopRunningOp()
-    } catch (e) {
-      toast.error(String(e))
-      setBusy(false)
-      return
-    }
-    setBusy(false)
+  function hostDisconnectClick() {
+    // Purely client-side: drop this browser's view of the host without
+    // touching server state. Other control panels on the network may be
+    // driving the same host, so never stop a running op from here.
     setConn({ state: "idle" })
     setCommands([])
     setRobot(null)

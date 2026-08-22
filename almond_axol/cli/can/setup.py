@@ -3,20 +3,32 @@ axol can.setup
 
 Sets persistent CAN interface names for the Almond Axol CAN bus adapters,
 registers a root crontab @reboot entry to bring up the interfaces, and
-installs a udev-triggered systemd unit that re-runs the bring-up whenever the
+installs a udev-triggered systemd unit that re-runs the bring-up whenever an
 adapter (re-)enumerates — so a mid-session USB drop of the hub (EMI from the
 arms can kick it off the bus, most visibly on Raspberry Pi 5 hosts) heals
 itself without operator action.
 
-The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two CAN
-channels on a single USB device:
-  channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
-  channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+Up to four Axol buses, every one of them optional and independent:
 
-Robots on the powered cart additionally carry a single-channel candlelight
-adapter (same generic VID/PID) for the wheel bus, named can_alm_axol_b. The
-channel count tells the two apart: the hub always enumerates both channels
-under one serial, the cart adapter exactly one.
+  - The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two
+    CAN channels on a single USB device:
+      channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
+      channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+  - The powered cart's wheel bus: a single-channel candlelight adapter
+    (same generic VID/PID) carrying the four Damiao wheel motors at CAN
+    IDs 0x01-0x04, named can_alm_axol_b.
+  - The chest bus: another single-channel adapter, carrying the jelly_legs
+    lift controller (listens on 0x420, answers on 0x421 — see
+    ``almond_axol.robot.lift``), named can_alm_axol_c.
+
+The hub is told apart from the single-channel adapters by channel count: it
+always enumerates both channels under one serial, the others exactly one.
+The two single-channel adapters are physically identical, so they are told
+apart by *probing*: a bus whose jelly_legs board answers a GET_STATUS is the
+chest, one whose Damiao motors answer a register read is the wheels; a bus
+where nothing answers (devices unpowered) falls back to asking the operator.
+A Jetson host's built-in system CAN controller (mttcan) has no USB serial
+and is never touched.
 
 On Raspberry Pi 5 hosts the setup additionally raises the RP1 USB
 controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
@@ -25,11 +37,14 @@ gets through.
 """
 
 import re
+import socket
+import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
-from ...constants import CAN_BASE, CAN_BRINGUP_SCRIPT, CAN_LEFT, CAN_RIGHT
+from ...constants import CAN_BASE, CAN_BRINGUP_SCRIPT, CAN_CHEST, CAN_LEFT, CAN_RIGHT
 from ...utils.sudo import run_root
 from . import driver
 
@@ -38,6 +53,7 @@ _PID = "606f"
 _CAN_L = CAN_LEFT
 _CAN_R = CAN_RIGHT
 _CAN_B = CAN_BASE
+_CAN_C = CAN_CHEST
 _BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
@@ -120,12 +136,12 @@ def _detect_serials() -> list[str]:
     ]
 
 
-def _detect_base_serials(exclude: str) -> list[str]:
-    """Serials of attached single-channel adapters — cart wheel-bus candidates."""
+def _detect_single_serials(exclude: set[str]) -> list[str]:
+    """Serials of attached single-channel adapters — wheel/chest bus candidates."""
     return [
         serial
         for serial, a in _scan_adapters().items()
-        if len(a["dev_ids"]) == 1 and serial != exclude
+        if len(a["dev_ids"]) == 1 and serial not in exclude
     ]
 
 
@@ -172,26 +188,28 @@ def _configured_serial() -> str | None:
     return _rules_serial_for(_CAN_L) or _rules_serial_for(_CAN_R)
 
 
-def _configured_base_serial() -> str | None:
-    """The cart wheel-bus adapter's serial as pinned by a previous setup.
+def _configured_named_serial(name: str) -> str | None:
+    """A single-channel adapter's serial as pinned by a previous setup.
 
     Never auto-detected outside the interactive ``axol can.setup`` flow: a
     single-channel candlelight adapter is indistinguishable from unrelated
-    hardware (UMI rigs), so only a serial the operator has already confirmed
-    — a live ``can_alm_axol_b`` interface or a written udev rule — counts.
+    hardware (UMI rigs) without probing, so only a serial the operator has
+    already confirmed — a live named interface or a written udev rule —
+    counts here.
     """
-    return _serial_of_interface(_CAN_B) or _rules_serial_for(_CAN_B)
+    return _serial_of_interface(name) or _rules_serial_for(name)
 
 
-def _resolve_serial() -> str:
-    """Pick the adapter serial without prompting (for headless ``ensure_setup``).
+def _resolve_hub_serial() -> str | None:
+    """Pick the hub serial without prompting (for headless ``ensure_setup``).
 
     A previously configured serial (named ``can_alm_axol_*`` interfaces, or
     the pinned serial in the udev rules) wins outright, so re-running setup on
     an already-configured host works no matter how many other candlelight
     adapters are attached. Only a genuinely fresh machine falls back to live
-    detection — and raises when zero or several adapters are present, since
-    that needs the interactive ``axol can.setup`` flow to disambiguate.
+    detection — returning None when no hub is attached (the hub is optional),
+    and raising when several dual-channel candidates are present, since that
+    needs the interactive ``axol can.setup`` flow to disambiguate.
     """
     configured = _configured_serial()
     if configured:
@@ -200,14 +218,15 @@ def _resolve_serial() -> str:
     if len(unique) == 1:
         return unique[0]
     if not unique:
-        raise RuntimeError("Robot not detected")
+        return None
     raise RuntimeError(
         "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
     )
 
 
-def _find_serial() -> str:
-    print(f"Scanning for Almond Axol CAN adapter ({_VID}:{_PID})...")
+def _find_serial() -> str | None:
+    """Interactively pick the arm hub adapter, or None when there is no hub."""
+    print(f"Scanning for the Almond Axol arm hub adapter ({_VID}:{_PID})...")
 
     unique = _detect_serials()
 
@@ -220,12 +239,10 @@ def _find_serial() -> str:
             print(f"  No hub attached — keeping configured serial {configured}.")
             return configured
         print(
-            "\n  No adapter found. Enter the serial number manually (blank to abort):"
+            "\n  No arm hub found. Enter its serial manually, or leave blank "
+            "for a robot without one (cart/chest only):"
         )
-        serial = input("  Serial: ").strip()
-        if not serial:
-            _die("No serial provided. Connect the device and re-run.")
-        return serial
+        return input("  Serial: ").strip() or None
 
     if len(unique) == 1:
         print(f"  Found adapter — serial: {unique[0]}")
@@ -238,30 +255,206 @@ def _find_serial() -> str:
     return unique[int(idx)]
 
 
-def _write_udev_rules(serial: str, base_serial: str | None = None) -> None:
-    print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
-    content = (
-        f"# Almond Axol dual-channel CAN adapter\n"
-        f"# Adapter serial: {serial}\n"
-        f"# Channel 0 -> left arm\n"
-        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x0", NAME="{_CAN_L}"\n'
-        f"# Channel 1 -> right arm\n"
-        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
-        f"# Every (re-)enumeration — boot or a mid-session USB drop — pulls in\n"
-        f"# the bring-up service so the channels come back configured and up.\n"
-        f"# Tagged on the USB device rather than the net interfaces: the NAME=\n"
-        f"# rules above put every real hotplug add mid-rename, and systemd\n"
-        f'# skips SYSTEMD_WANTS on renaming devices ("device is renaming").\n'
-        f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
+# --------------------------------------------------------------------------
+# Single-channel adapter identification (wheels vs chest)
+# --------------------------------------------------------------------------
+
+# The jelly_legs lift controller listens on 0x420 and answers on 0x421
+# (see almond_axol.robot.lift); a GET_STATUS (opcode 0x04) provokes exactly
+# one status frame. Both IDs are clear of every Damiao/MyActuator range.
+_JELLY_CMD_ID = 0x420
+_JELLY_STATUS_ID = 0x421
+_JELLY_GET_STATUS = bytes([0x04])
+# SET_RATE 0 (opcode 0x05, uint16 period 0): turns the 50 ms status
+# broadcast off. The board starts broadcasting as soon as it has received
+# *any* frame, and that stream starves the CANable's gs_usb TX path (see
+# the firmware README bench note) — so every probe sequence must silence
+# the board before expecting its own transmissions to get through.
+_JELLY_SET_RATE_OFF = bytes([0x05, 0x00, 0x00])
+# Damiao register read: 0x7FF [id_lo, id_hi, 0x33, rid, ...]; the motor
+# echoes a 0x33 reply on its feedback ID. Register 60 (VBUS) is read-only.
+_DAMIAO_CFG_ID = 0x7FF
+_DAMIAO_WHEEL_IDS = (0x01, 0x02, 0x03, 0x04)
+_PROBE_ATTEMPTS = 3
+_PROBE_WINDOW_S = 0.4
+
+
+def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
+    """Send probe frames on ``iface`` and wait briefly for a matching reply.
+
+    Raw SocketCAN (no python-can machinery needed for a one-shot probe).
+    Unanswered probes are harmless: the IDs used command nothing, and a
+    frame left queued behind an unpowered bus is dropped by the bring-up
+    script's interface flap.
+    """
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+    except OSError:
+        return False
+    try:
+        for _ in range(_PROBE_ATTEMPTS):
+            for can_id, data in frames:
+                try:
+                    s.send(
+                        struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0"))
+                    )
+                except OSError:
+                    return False  # interface down / TX queue wedged
+            deadline = time.monotonic() + _PROBE_WINDOW_S
+            while (remaining := deadline - time.monotonic()) > 0:
+                s.settimeout(remaining)
+                try:
+                    frame = s.recv(16)
+                except (TimeoutError, OSError):
+                    break
+                can_id, dlc = struct.unpack("<IB3x", frame[:8])
+                if match(can_id & 0x7FF, frame[8 : 8 + dlc]):
+                    return True
+    finally:
+        s.close()
+    return False
+
+
+def _send_once(iface: str, can_id: int, data: bytes) -> None:
+    """Fire one frame on ``iface`` and return; no reply expected."""
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+    except OSError:
+        return
+    try:
+        s.send(struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0")))
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def _probe_chest(iface: str) -> bool:
+    """True when a jelly_legs board answers a GET_STATUS on ``iface``.
+
+    Each attempt sends SET_RATE 0 before the GET_STATUS so the board's
+    status broadcast stays off — both for the probe's own reply and for
+    whatever runs on this bus next.
+    """
+    return _probe(
+        iface,
+        [
+            (_JELLY_CMD_ID, _JELLY_SET_RATE_OFF),
+            (_JELLY_CMD_ID, _JELLY_GET_STATUS),
+        ],
+        lambda can_id, _data: can_id == _JELLY_STATUS_ID,
     )
-    if base_serial:
-        # Matched by serial alone: CANable firmware variants ship various
-        # VID/PIDs, and the serial already identifies the exact adapter.
+
+
+def _probe_wheels(iface: str) -> bool:
+    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``."""
+    frames = [
+        (_DAMIAO_CFG_ID, bytes([mid, 0x00, 0x33, 60, 0, 0, 0, 0]))
+        for mid in _DAMIAO_WHEEL_IDS
+    ]
+
+    def is_reply(_can_id: int, data: bytes) -> bool:
+        return (
+            len(data) == 8
+            and data[2] == 0x33
+            and data[1] == 0x00
+            and data[0] in _DAMIAO_WHEEL_IDS
+        )
+
+    return _probe(iface, frames, is_reply)
+
+
+def _iface_for_serial(serial: str) -> str | None:
+    """The current interface name of a single-channel adapter, or None."""
+    for iface_path in Path("/sys/class/net").glob("can*"):
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        if _udev_attr(info, "ATTRS{serial}") == serial:
+            return iface_path.name
+    return None
+
+
+def _identify_adapter(serial: str) -> str | None:
+    """Probe a single-channel adapter's bus: ``"wheels"``, ``"chest"``, or None.
+
+    Brings the interface up first (root); a bus where nothing answers —
+    devices unpowered, or unrelated hardware like a UMI rig — stays None and
+    is left to the operator.
+    """
+    iface = _iface_for_serial(serial)
+    if iface is None:
+        return None
+    try:
+        bring_up_interfaces([iface])
+    except RuntimeError:
+        return None
+    # Silence any jelly_legs board before the wheel probe: the board starts
+    # its 50 ms broadcast after the first frame it sees (the wheel probe's
+    # own Damiao reads would wake it), and that stream starves the CANable's
+    # TX path — on a combined bus the wheel probe would then go deaf and the
+    # bus would be misclassified as chest-only. Harmless where no board is
+    # listening; a frame queued on a dead bus is dropped by the bring-up flap.
+    _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
+    time.sleep(0.05)
+    wheels = _probe_wheels(iface)
+    chest = _probe_chest(iface)
+    if chest and wheels:
+        # The pre-split combined cart bus (jelly_legs next to the wheels).
+        print(
+            f"  WARNING: both the wheel motors and the jelly_legs board "
+            f"answer on {iface} — treating it as the wheel bus. Point the "
+            f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
+            f"the lift onto its own chest bus."
+        )
+        return "wheels"
+    if chest:
+        return "chest"
+    if wheels:
+        return "wheels"
+    return None
+
+
+def _write_udev_rules(
+    hub_serial: str | None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+) -> None:
+    print(f"Writing udev rules to {_UDEV_RULES_FILE} (requires sudo)...")
+    content = ""
+    if hub_serial:
         content += (
-            f"# Powered-cart wheel bus (single-channel adapter)\n"
-            f"# Adapter serial: {base_serial}\n"
-            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{base_serial}", NAME="{_CAN_B}"\n'
-            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{base_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
+            f"# Almond Axol dual-channel CAN adapter\n"
+            f"# Adapter serial: {hub_serial}\n"
+            f"# Channel 0 -> left arm\n"
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{hub_serial}", ATTR{{dev_id}}=="0x0", NAME="{_CAN_L}"\n'
+            f"# Channel 1 -> right arm\n"
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{_VID}", ATTRS{{idProduct}}=="{_PID}", ATTRS{{serial}}=="{hub_serial}", ATTR{{dev_id}}=="0x1", NAME="{_CAN_R}"\n'
+            f"# Every (re-)enumeration — boot or a mid-session USB drop — pulls in\n"
+            f"# the bring-up service so the channels come back configured and up.\n"
+            f"# Tagged on the USB device rather than the net interfaces: the NAME=\n"
+            f"# rules above put every real hotplug add mid-rename, and systemd\n"
+            f'# skips SYSTEMD_WANTS on renaming devices ("device is renaming").\n'
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{hub_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
+        )
+    # Single-channel adapters, matched by serial alone: CANable firmware
+    # variants ship various VID/PIDs, and the serial already identifies the
+    # exact adapter.
+    for label, name, serial in (
+        ("Powered-cart wheel bus", _CAN_B, wheels_serial),
+        ("Chest bus (jelly_legs lift controller)", _CAN_C, chest_serial),
+    ):
+        if not serial:
+            continue
+        content += (
+            f"# {label} (single-channel adapter)\n"
+            f"# Adapter serial: {serial}\n"
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{serial}", NAME="{name}"\n'
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{_HOTPLUG_UNIT}"\n'
         )
     run_root(["tee", str(_UDEV_RULES_FILE)], input_text=content, check=True)
     print("  Done.")
@@ -274,14 +467,23 @@ def _reload_udev() -> None:
     print("  Done.")
 
 
-def _rename_interfaces(serial: str, base_serial: str | None = None) -> None:
+def _rename_interfaces(
+    hub_serial: str | None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+) -> None:
     """Rename existing canX interfaces to their target names without replug."""
     print("Renaming CAN interfaces (requires sudo)...")
-    # (adapter serial, channel dev_id) -> persistent name. The cart adapter is
-    # single-channel, so its only interface is dev_id 0.
-    target = {(serial, 0): _CAN_L, (serial, 1): _CAN_R}
-    if base_serial:
-        target[(base_serial, 0)] = _CAN_B
+    # (adapter serial, channel dev_id) -> persistent name. The wheel/chest
+    # adapters are single-channel, so their only interface is dev_id 0.
+    target: dict[tuple[str, int], str] = {}
+    if hub_serial:
+        target[(hub_serial, 0)] = _CAN_L
+        target[(hub_serial, 1)] = _CAN_R
+    if wheels_serial:
+        target[(wheels_serial, 0)] = _CAN_B
+    if chest_serial:
+        target[(chest_serial, 0)] = _CAN_C
 
     for iface_path in Path("/sys/class/net").glob("can*"):
         iface = iface_path.name
@@ -308,7 +510,13 @@ def _rename_interfaces(serial: str, base_serial: str | None = None) -> None:
     print("  Done.")
 
 
-def _write_cron_script(*, with_base: bool = False) -> None:
+def _write_cron_script() -> None:
+    """Write the bring-up script covering all four interfaces.
+
+    Every interface is optional and checked for presence at runtime, so one
+    script serves every hardware combination — arm-only, cart-only, chest-
+    only, or all of them — and an unplugged adapter never blocks the rest.
+    """
     print(f"Writing CAN startup script to {_CRON_SCRIPT}...")
     _CAN_DIR.mkdir(parents=True, exist_ok=True)
     script = (
@@ -316,15 +524,15 @@ def _write_cron_script(*, with_base: bool = False) -> None:
         f"# Bring up Almond Axol CAN interfaces\n"
         f"#\n"
         f"# Runs at boot (@reboot root crontab) and on every (re-)enumeration\n"
-        f"# of the adapter (udev -> {_HOTPLUG_UNIT}), so a mid-session USB\n"
+        f"# of an adapter (udev -> {_HOTPLUG_UNIT}), so a mid-session USB\n"
         f"# drop of the hub comes back configured without operator action.\n"
         f"#\n"
         f"# The arm interfaces are channels of one dual-channel gs_usb adapter.\n"
         f"# Bring them down together, configure, then up together — flapping\n"
         f"# the channels one at a time (down/up L, then down/up R) toggles the\n"
         f"# adapter into a state where TX works but no RX frame is delivered.\n"
-        f"# Skipped entirely when the hub is unplugged (a cart-only session\n"
-        f"# must still bring up the wheel bus below).\n"
+        f"# Skipped entirely when the hub is unplugged (a hub-less session\n"
+        f"# must still bring up the wheel/chest buses below).\n"
         f"set -euo pipefail\n\n"
         f"# Boot and hotplug triggers can race (the hub's two channels fire one\n"
         f"# udev add event each) — serialize whole runs.\n"
@@ -354,19 +562,18 @@ def _write_cron_script(*, with_base: bool = False) -> None:
         f"else\n"
         f'    echo "arm hub interfaces not present — skipping arm bring-up"\n'
         f"fi\n"
+        f"\n# Wheel and chest buses: their own single-channel adapters, so no\n"
+        f"# flap-together dance — and each skipped when absent, so an\n"
+        f"# unplugged adapter never blocks the others' bring-up.\n"
+        f"for IFACE in {_CAN_B} {_CAN_C}; do\n"
+        f'    if ip link show "${{IFACE}}" >/dev/null 2>&1; then\n'
+        f'        ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+        f'        ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
+        f'        ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+        f'        ip link set "${{IFACE}}" up\n'
+        f"    fi\n"
+        f"done\n"
     )
-    if with_base:
-        script += (
-            f"\n# Powered-cart wheel bus: its own single-channel adapter, so no\n"
-            f"# flap-together dance — and skipped when absent, so an unplugged\n"
-            f"# cart never blocks the arm bring-up.\n"
-            f"if ip link show {_CAN_B} >/dev/null 2>&1; then\n"
-            f'    ip link set "{_CAN_B}" down 2>/dev/null || true\n'
-            f'    ip link set "{_CAN_B}" type can bitrate {_BITRATE}\n'
-            f'    ip link set "{_CAN_B}" txqueuelen {_TXQUEUELEN}\n'
-            f'    ip link set "{_CAN_B}" up\n'
-            f"fi\n"
-        )
     _CRON_SCRIPT.write_text(script)
     _CRON_SCRIPT.chmod(0o755)
     print("  Done.")
@@ -487,17 +694,21 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.setup`` subcommand."""
     subparsers.add_parser(
         "can.setup",
-        help="Configure CAN interfaces for the Axol arm.",
+        help="Configure CAN interfaces (arm hub, wheel bus, chest bus).",
     ).set_defaults(func=run)
 
 
-def rx_alive() -> bool:
-    """True when at least one motor answers on either arm.
+def rx_alive_per_arm() -> tuple[bool, bool]:
+    """(left, right) — True where a motor answers on that arm's bus.
 
     Verifies the adapter's receive path, not just the interface state: the
     dual-channel gs_usb adapter can come out of a down/up cycle in a state
     where TX still works but no received frame is ever delivered (kernel-side
     everything looks healthy — UP, ERROR-ACTIVE, correct bitrate).
+
+    Per-arm results matter because one healthy arm must not mask the other:
+    a bus with no responding motors (arm powered off, harness fault, dead
+    transceiver channel) looks identical to the adapter wedge on that side.
     """
     import asyncio
 
@@ -514,37 +725,58 @@ def rx_alive() -> bool:
         except Exception:  # noqa: BLE001 - silence means "no RX", whatever the cause
             return False
 
-    async def probe_all() -> bool:
+    async def probe_all() -> tuple[bool, bool]:
         await asyncio.sleep(0.5)  # let the freshly-upped interfaces settle
-        results = await asyncio.gather(probe(_CAN_L), probe(_CAN_R))
-        return any(results)
+        left, right = await asyncio.gather(probe(_CAN_L), probe(_CAN_R))
+        return left, right
 
     return asyncio.run(probe_all())
+
+
+def rx_alive() -> bool:
+    """True when at least one motor answers on either arm."""
+    return any(rx_alive_per_arm())
 
 
 def bring_up_can() -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
-    that lands in the wedge is recovered by exactly one more cycle. A robot
-    with its motors powered off is indistinguishable from the wedge, hence the
-    bounded retries and the warning instead of an error.
+    state and the TX-only wedge described in :func:`rx_alive_per_arm`, so a
+    bring-up that lands in the wedge is recovered by exactly one more cycle.
+    A robot with its motors powered off is indistinguishable from the wedge,
+    hence the bounded retries and the warning instead of an error. Results are
+    reported per arm: one answering arm proves the adapter is healthy (no
+    retry), while the other side staying silent is called out instead of being
+    masked by it.
     """
     print("Bringing up CAN interfaces (requires sudo)...")
     hub_present = (Path("/sys/class/net") / _CAN_L).exists() and (
         Path("/sys/class/net") / _CAN_R
     ).exists()
     if not hub_present:
-        # Cart-only host state: the script still brings up the wheel bus; the
-        # RX-wedge probe/re-flap is hub-specific, so there's nothing to verify.
+        # Hub-less host state: the script still brings up the wheel/chest
+        # buses; the RX-wedge probe/re-flap is hub-specific, so there's
+        # nothing to verify.
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
         print("  Done — arm hub not attached, arm interfaces skipped.")
         return
     for attempt in range(3):
         run_root(["bash", str(_CRON_SCRIPT)], check=True)
-        if rx_alive():
-            print("  Done — motors responding.")
+        left, right = rx_alive_per_arm()
+        if left and right:
+            print("  Done — motors responding on both arms.")
+            return
+        if left or right:
+            # One arm answering proves the adapter's RX path is healthy, so
+            # more cycling can't help the silent side — that's an arm-level
+            # problem (power, harness, or the hub's transceiver channel).
+            alive, silent = ("left", "right") if left else ("right", "left")
+            print(f"  Done — motors responding on the {alive} arm.")
+            print(
+                f"  WARNING: no motor answered on the {silent} arm. Check that "
+                f"it is powered and its CAN connection is intact."
+            )
             return
         if attempt < 2:
             print("  No motor responses (adapter RX may be wedged) — cycling again...")
@@ -608,23 +840,21 @@ def is_configured() -> bool:
     )
 
 
-def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -> None:
-    """Run the full CAN configuration non-interactively (for the control panel).
+def _apply_setup(
+    hub_serial: str | None,
+    wheels_serial: str | None,
+    chest_serial: str | None,
+) -> None:
+    """Write the persistent config for the given adapters and bring them up.
 
-    Mirrors :func:`run` but resolves the adapter serials without prompting.
-    Each step is idempotent, so this is safe to call on a partially-configured
-    machine. The cart wheel-bus adapter is only ever *re*-pinned here (from a
-    previous setup's rules or a live interface); confirming a new one needs
-    the interactive flow — see :func:`_configured_base_serial`.
+    Each step is idempotent, so this is safe to re-run on a
+    partially-configured machine.
     """
-    driver.ensure_driver()
-    serial = serial or _resolve_serial()
-    base_serial = base_serial or _configured_base_serial()
-    _write_udev_rules(serial, base_serial)
-    _write_cron_script(with_base=base_serial is not None)
+    _write_udev_rules(hub_serial, wheels_serial, chest_serial)
+    _write_cron_script()
     _write_hotplug_unit()
     _reload_udev()
-    _rename_interfaces(serial, base_serial)
+    _rename_interfaces(hub_serial, wheels_serial, chest_serial)
     _register_cron()
     try:
         _setup_rp1_usb_quirk()
@@ -633,53 +863,116 @@ def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -
     bring_up_can()
 
 
-def _find_base_serial(hub_serial: str) -> str | None:
-    """Interactively pick the cart wheel-bus adapter, or None for no cart.
+def ensure_setup(
+    *,
+    hub_serial: str | None = None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+) -> None:
+    """Run the full CAN configuration non-interactively (for the control panel).
 
-    A previously pinned adapter is kept without prompting; otherwise any
-    attached single-channel candlelight adapter is offered. Opt-in ([y/N])
-    because a single-channel adapter isn't necessarily a cart — it could be
-    any other candlelight device on the host.
+    Mirrors :func:`run` but resolves the adapter serials without prompting.
+    The wheel-bus and chest adapters are only ever *re*-pinned here (from a
+    previous setup's rules or a live interface); identifying a new one needs
+    the interactive flow's probing — see :func:`_identify_adapter`.
     """
-    configured = _configured_base_serial()
-    if configured:
-        print(f"Cart wheel bus: keeping configured adapter (serial {configured}).")
-        return configured
-    candidates = _detect_base_serials(exclude=hub_serial)
+    driver.ensure_driver()
+    hub_serial = hub_serial or _resolve_hub_serial()
+    wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
+    chest_serial = chest_serial or _configured_named_serial(_CAN_C)
+    if not (hub_serial or wheels_serial or chest_serial):
+        raise RuntimeError("Robot not detected")
+    _apply_setup(hub_serial, wheels_serial, chest_serial)
+
+
+def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
+    """Interactively assign single-channel adapters to the wheel/chest buses.
+
+    Previously pinned adapters are kept without prompting. Every other
+    attached single-channel adapter is identified by probing its bus (see
+    :func:`_identify_adapter`); one where nothing answers — devices
+    unpowered, or unrelated hardware like a UMI rig — is offered to the
+    operator instead of guessed at.
+
+    Returns ``(wheels_serial, chest_serial)``, either of which may be None.
+    """
+    wheels = _configured_named_serial(_CAN_B)
+    chest = _configured_named_serial(_CAN_C)
+    if wheels:
+        print(f"Cart wheel bus: keeping configured adapter (serial {wheels}).")
+    if chest:
+        print(f"Chest bus: keeping configured adapter (serial {chest}).")
+
+    exclude = {s for s in (hub_serial, wheels, chest) if s}
+    candidates = _detect_single_serials(exclude)
     if not candidates:
-        return None
-    if len(candidates) == 1:
-        prompt = (
-            f"Found a single-channel CAN adapter (serial {candidates[0]}). "
-            f"Use it as the powered cart's wheel bus ({_CAN_B})? [y/N]: "
+        return wheels, chest
+
+    print(
+        f"Identifying {len(candidates)} single-channel CAN adapter(s) by "
+        f"probing (wheel motors / jelly_legs board must be powered)..."
+    )
+    unidentified: list[str] = []
+    for serial in candidates:
+        role = _identify_adapter(serial)
+        if role == "wheels" and wheels is None:
+            wheels = serial
+            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}")
+        elif role == "chest" and chest is None:
+            chest = serial
+            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}")
+        elif role is not None:
+            print(
+                f"  {serial}: identified as the {role} bus, but that bus is "
+                f"already pinned to another adapter — skipping."
+            )
+        else:
+            unidentified.append(serial)
+
+    for serial in unidentified:
+        print(f"  {serial}: nothing answered on this adapter's bus.")
+        choice = (
+            input(
+                f"    Assign it to the [w]heel bus ({_CAN_B}), the [c]hest "
+                f"bus ({_CAN_C}), or leave blank to skip: "
+            )
+            .strip()
+            .lower()
         )
-        return candidates[0] if input(prompt).strip().lower() == "y" else None
-    print("  Multiple single-channel CAN adapters found:")
-    for i, s in enumerate(candidates):
-        print(f"    [{i}] {s}")
-    choice = input(
-        f"  Index of the powered cart's wheel-bus adapter ({_CAN_B}), blank for none: "
-    ).strip()
-    return candidates[int(choice)] if choice else None
+        if choice == "w" and wheels is None:
+            wheels = serial
+        elif choice == "c" and chest is None:
+            chest = serial
+        elif choice in ("w", "c"):
+            print("    That bus is already assigned — skipping.")
+    return wheels, chest
 
 
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     driver.ensure_driver()
-    serial = _find_serial()
-    base_serial = _find_base_serial(serial)
-    ensure_setup(serial=serial, base_serial=base_serial)
+    hub_serial = _find_serial()
+    wheels_serial, chest_serial = _find_single_serials(hub_serial)
+    if not (hub_serial or wheels_serial or chest_serial):
+        _die(
+            "No CAN adapters found or configured. Connect the arm hub, "
+            "wheel-bus, or chest adapter and re-run."
+        )
+    _apply_setup(hub_serial, wheels_serial, chest_serial)
 
     print()
     print("Setup complete.")
-    print(f"  Left arm : {_CAN_L}")
-    print(f"  Right arm: {_CAN_R}")
-    if base_serial:
-        print(f"  Cart     : {_CAN_B}")
+    if hub_serial:
+        print(f"  Left arm : {_CAN_L}")
+        print(f"  Right arm: {_CAN_R}")
+    if wheels_serial:
+        print(f"  Wheels   : {_CAN_B}")
+    if chest_serial:
+        print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
     print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
     print(
         f"  Hotplug  : {_HOTPLUG_UNIT} (re-runs the startup script whenever "
-        f"the adapter re-enumerates, e.g. after a mid-session USB drop)"
+        f"an adapter re-enumerates, e.g. after a mid-session USB drop)"
     )
     if _is_raspberry_pi_5():
         print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")

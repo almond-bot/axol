@@ -20,17 +20,26 @@ Bimanual inverse kinematics using pyroki and JAX/jaxls. Loads the bundled URDF, 
 from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
 ```
 
+All poses live in the robot's world frame — **+x forward, +y left, +z up**
+(FLU), origin at the base of the torso axis.
+
+Every joint vector the solver takes or returns is ordered the way the robot
+itself is: the left arm's 7 joints in `ARM_JOINTS` order (`shoulder_1` …
+`wrist_3`) followed by the right arm's. `q[:7]` and `q[7:]` are exactly the
+per-arm arrays `motion_control` takes (minus the gripper slot).
+
 ```python
 import numpy as np
 from almond_axol.kinematics import KinematicsSolver, KinematicsConfig
 
 solver = KinematicsSolver(KinematicsConfig(pos_weight=100.0))
-q = np.zeros(solver.num_joints, dtype=np.float32)
+q = np.zeros(solver.num_joints, dtype=np.float32)  # [left s1…w3, right s1…w3]
 
 # Inverse kinematics → new joint array
-pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)
+pos = np.array([0.3, 0.2, 0.4], dtype=np.float32)  # 30 cm forward, 20 cm left
 rot = np.eye(3, dtype=np.float32)
 q = solver.ik(q, left_pose=(pos, rot))
+left_arm, right_arm = q[:7], q[7:]  # ARM_JOINTS order, ready for motion_control
 
 # Forward kinematics → (left, right), each a (pos (3,), rot (3, 3)) numpy
 # pair — the same format ik takes. Reading a pose, nudging it, and solving
@@ -44,11 +53,13 @@ q = solver.ik(q, left_pose=(l_pos + np.array([0.0, 0.0, 0.05]), l_rot))
 | Member | Description |
 |---|---|
 | `num_joints` | Total actuated joints across both arms |
-| `joint_names` | Joint name strings (left arm then right) |
-| `left_indices` / `right_indices` | Indices into the full `q` array for each arm |
+| `joint_names` | Joint name strings (left arm then right, `ARM_JOINTS` order) |
+| `left_indices` / `right_indices` | Indices into the full `q` array for each arm — `[0…6]` and `[7…13]`, kept as a readable way to split a full vector |
 | `fk(q)` | Forward kinematics → `((pos_3, rot_3x3), (pos_3, rot_3x3))` — the same format `ik` takes |
+| `elbow_positions(q)` | World-frame elbow positions → `(left_3, right_3)` |
 | `ik(q, left_pose, right_pose, left_elbow_pos, right_elbow_pos)` | IK; `pose` is `(pos_3, rot_3x3)`; elbow hints are optional `(3,)` arrays |
 | `set_posture_pose(q)` / `posture_pose` | Set / read the null-space attractor (home pose for joint drift prevention) |
+| `to_pyroki_order(q)` / `from_pyroki_order(q)` | Convert to/from the internal pyroki joint ordering — only needed when driving `solver.robot` / `solver.robot_coll` directly |
 
 ## Straight-line paths
 

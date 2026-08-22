@@ -460,6 +460,18 @@ class AxolVRTeleop(Teleoperator):
         """
         await self._core.guarded_return(**kwargs)
 
+    async def contact_hold(self, **kwargs: Any) -> None:
+        """Limp gravity-comp hold after a tracking-time contact trip.
+
+        Thin passthrough to :meth:`VRTeleopCore.contact_hold`: tracking is
+        disengaged, the arms drop into the gravity-comp hold, and a reset
+        press re-syncs the pipeline and leaves the reset latched for the
+        caller's normal guarded return. The caller supplies the same
+        flow-specific hooks as :meth:`guarded_return` (minus the tracking
+        ones); await from a coroutine on the robot's event loop.
+        """
+        await self._core.contact_hold(**kwargs)
+
     # ------------------------------------------------------------------
     # Teleoperator interface
     # ------------------------------------------------------------------

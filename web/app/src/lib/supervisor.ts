@@ -207,6 +207,14 @@ export async function startUpdate(): Promise<{ started: boolean }> {
   return json(await fetch(apiUrl("/api/update/start"), { method: "POST" }))
 }
 
+/**
+ * Power off the serve host (`shutdown -h now`). Refused (409) while an
+ * operation or session is running.
+ */
+export async function shutdownHost(): Promise<{ ok: boolean }> {
+  return json(await fetch(apiUrl("/api/host/shutdown"), { method: "POST" }))
+}
+
 // ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
@@ -424,6 +432,26 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
+// ---------------------------------------------------------------------------
+// Datasets on disk (the replay / collect-data panels' dataset picker)
+// ---------------------------------------------------------------------------
+
+/** One LeRobot dataset found on the serve host (see /api/datasets). */
+export interface DatasetInfo {
+  /** Repo id relative to the datasets root — what replay/collect take. */
+  repoId: string
+  /** Absolute dataset directory on the serve host. */
+  root: string
+  episodes: number | null
+  fps: number | null
+}
+
+/** Datasets on the serve host, newest first. Empty on older hosts (404). */
+export async function fetchDatasets(): Promise<DatasetInfo[]> {
+  const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
+  return res.datasets ?? []
+}
+
 /** Which eye(s) of a stereo ZED X to use, per branch. */
 export type StereoEyes = "both" | "left" | "right"
 
@@ -466,7 +494,34 @@ export interface CameraSpec {
   resolution?: string
 }
 
+/**
+ * How long the reachability probe waits before declaring the host absent.
+ * Without this, a fetch to an absent host sits in TCP retries for a minute or
+ * more with the UI stuck on "Connecting…". Kept just high enough for a live
+ * LAN host's worst case (mDNS .local resolution + TCP + TLS handshake over
+ * Wi-Fi); much lower and slow-but-alive hosts get misreported as offline.
+ */
+const CONNECT_TIMEOUT_MS = 2_000
+
 export async function fetchCommands(): Promise<CommandSpec[]> {
+  // Fail fast on an absent host by racing the timer against a probe that
+  // answers from memory (/api/op/status — any HTTP response, even a 404 from
+  // an older host, proves it's alive). The timer must not cover /api/commands
+  // itself: its first call after a serve start imports every command's config
+  // module to build the schemas and can take well past the timeout, so racing
+  // it misreported a slow-but-alive host as offline — the first connect after
+  // a cert authorization always failed and only the retry (against the
+  // then-warm schema cache) got through.
+  try {
+    await fetch(apiUrl("/api/op/status"), {
+      signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
+    })
+  } catch (e) {
+    if (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      throw new Error(`no response from the host after ${CONNECT_TIMEOUT_MS / 1000}s`)
+    }
+    throw e
+  }
   return json(await fetch(apiUrl("/api/commands")))
 }
 
@@ -509,12 +564,15 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
 
 export type SettingValue = string | number | boolean | number[]
 
-/** Optional widget hints for a settings field (slider ranges, pose editor). */
+/** Optional widget hints for a settings field (slider ranges, pose editor,
+ * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose"
+  widget?: "slider" | "pose" | "toggle-number"
   min?: number
   max?: number
   step?: number
+  /** toggle-number: value filled in when the switch turns on. */
+  onValue?: number
 }
 
 export interface SettingsField {

@@ -65,9 +65,11 @@ class VRFrame(BaseModel):
         r_elbow: Right elbow position.
         l_grip:  Left gripper command — 0.0 = fully closed, 1.0 = fully open.
         r_grip:  Right gripper command — 0.0 = fully closed, 1.0 = fully open.
-        l_lock:  Left grip button state (True = pressed). VRTeleop uses rising
-            edges of both buttons together to enable tracking, and a rising edge
-            of either button alone to disable it.
+        l_lock:  Left grip button state (True = pressed). VRTeleop engages
+            tracking on both buttons together (a rising edge, or a hold with
+            ``hold_to_engage``); once engaged each button acts per-arm —
+            toggling (or, in hold mode, holding) that arm between tracking
+            and frozen. See :meth:`VRTeleopCore.update_engage`.
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).

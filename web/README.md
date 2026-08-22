@@ -90,7 +90,7 @@ Each frame sends a JSON message over the WebSocket:
   r_ee:    { position: { x, y, z }, quaternion: { x, y, z, w } }  // right controller
   l_elbow: { x, y, z }
   r_elbow: { x, y, z }
-  l_lock:  boolean   // left grip button state (True = pressed); rising edge of both together enables tracking, either alone disables it
+  l_lock:  boolean   // left grip button state (True = pressed); rising edge of both together enables tracking from rest, then each grip toggles (or, with hold_to_engage, holds) its own arm
   r_lock:  boolean   // right grip button state (True = pressed); see l_lock
   l_grip:  number    // left grip (0 = fully gripped, 1 = open)
   r_grip:  number    // right grip
@@ -115,7 +115,7 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
+| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking from rest; once engaged each grip **toggles its own arm** — click to freeze that arm in place (e.g. while it holds something), click again to resume it. With the `hold_to_engage` setting the grips are dead-man switches instead: hold both to start, release one to freeze that arm, hold to keep it going |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
 | 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |

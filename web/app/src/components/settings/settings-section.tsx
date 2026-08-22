@@ -517,6 +517,55 @@ function SettingRow({
     )
   }
 
+  if (field.ui.widget === "toggle-number") {
+    // One combined control: the switch arms the feature and its numeric
+    // value (e.g. a contact-stop torque threshold) edits inline next to
+    // it; off stores the default (0 = disabled). Mid-edit text is kept as
+    // a string (same round-trip rule as the plain number field below), so
+    // typing "0." or clearing doesn't collapse the row; blur cleans up
+    // anything that isn't a positive number by switching off.
+    const raw = set ? value : field.default
+    const enabled = typeof raw === "string" || (typeof raw === "number" && raw > 0)
+    const onValue = field.ui.onValue ?? 16
+    const text = set ? String(value) : enabled ? String(raw) : ""
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between gap-4">
+          {labelNode}
+          <div className="flex shrink-0 items-center gap-3">
+            {enabled && (
+              <Input
+                id={id}
+                inputMode="decimal"
+                className="h-7 w-20 text-right"
+                value={text}
+                placeholder={String(onValue)}
+                onBlur={() => {
+                  const n = Number(text)
+                  if (text.trim() === "" || !Number.isFinite(n) || n <= 0) {
+                    onChange(field.key, null)
+                  }
+                }}
+                onChange={(e) => {
+                  const s = e.target.value
+                  const n = Number(s)
+                  const clean = Number.isFinite(n) && String(n) === s.trim() && n > 0
+                  onChange(field.key, clean ? n : s)
+                }}
+              />
+            )}
+            <Switch
+              checked={enabled}
+              onChange={(v) => onChange(field.key, v ? onValue : null)}
+              aria-label={field.label}
+            />
+          </div>
+        </div>
+        <p className="max-w-prose text-xs text-white/35">{field.help}</p>
+      </div>
+    )
+  }
+
   if (field.ui.widget === "slider") {
     const current = set ? Number(value) : Number(field.default ?? field.ui.min ?? 0)
     return (

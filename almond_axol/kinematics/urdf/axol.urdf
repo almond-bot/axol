@@ -403,8 +403,10 @@
         <parent link="base" />
         <child link="s1" />
     </joint>
+    <!-- The CAD export faces -y; this +90-degree yaw turns the model so the
+         world frame is FLU: +x forward, +y left, +z up. -->
     <joint name="fixed_node_to_root_joint_0" type="fixed">
-        <origin xyz="-2.77556e-17 -6.93889e-18 0.86" rpy="0 -0 0" />
+        <origin xyz="-2.77556e-17 -6.93889e-18 0.86" rpy="0 0 1.5707963267948966" />
         <axis xyz="0 0 1" />
         <parent link="root" />
         <child link="base" />
