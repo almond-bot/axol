@@ -94,12 +94,15 @@ export function OperationPanel({
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
 
-  // Replay's dataset picker: datasets found on the serve host, offered as a
-  // datalist under the repo id field — typing a bare id or a path stays
-  // possible. Refetched whenever the panel is editable (a collect-data run
-  // that just ended may have added one). Older hosts without /api/datasets
-  // simply leave the field a plain input.
-  const wantsDatasets = meta.id === "replay-dataset" && runFields.some((f) => f.key === "repo_id")
+  // Dataset picker: datasets found on the serve host, offered as a datalist
+  // under the repo id field — typing a fresh id or a path stays possible.
+  // On replay it picks what to play; on collect-data it makes resuming an
+  // existing dataset a click instead of retyping its id. Refetched whenever
+  // the panel is editable (a run that just ended may have added one). Older
+  // hosts without /api/datasets simply leave the field a plain input.
+  const wantsDatasets =
+    (meta.id === "replay-dataset" || meta.id === "collect-data") &&
+    runFields.some((f) => f.key === "repo_id")
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   useEffect(() => {
     if (!wantsDatasets || live) return

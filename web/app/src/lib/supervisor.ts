@@ -433,12 +433,12 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
 }
 
 // ---------------------------------------------------------------------------
-// Datasets on disk (the replay panel's dataset picker)
+// Datasets on disk (the replay / collect-data panels' dataset picker)
 // ---------------------------------------------------------------------------
 
 /** One LeRobot dataset found on the serve host (see /api/datasets). */
 export interface DatasetInfo {
-  /** Repo id relative to the datasets root — what replay-dataset takes. */
+  /** Repo id relative to the datasets root — what replay/collect take. */
   repoId: string
   /** Absolute dataset directory on the serve host. */
   root: string
