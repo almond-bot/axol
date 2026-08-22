@@ -21,6 +21,13 @@ interface CommonProps {
   onReset: (key: string) => void
 }
 
+/** One datalist entry offered under a text field (typing stays free-form). */
+export interface FieldSuggestion {
+  value: string
+  /** Secondary text the browser shows next to the value (e.g. "12 episodes"). */
+  label?: string
+}
+
 // -- vector fields (numeric arrays rendered one input per component) ---------
 
 const XYZ = ["x", "y", "z"]
@@ -67,14 +74,22 @@ function setVectorComponent(
  * Renders a curated, flat list of fields (a hand-picked subset of an op's
  * full schema) — used by the operation panels and the diagnostics actions.
  */
-export function CuratedForm({ fields, ...common }: CommonProps & { fields: SchemaField[] }) {
+export function CuratedForm({
+  fields,
+  suggestions,
+  ...common
+}: CommonProps & {
+  fields: SchemaField[]
+  /** Optional datalist entries per field key (e.g. datasets on disk under repo_id). */
+  suggestions?: Record<string, FieldSuggestion[]>
+}) {
   if (fields.length === 0) {
     return <p className="text-sm text-white/40">No settings — just press Start.</p>
   }
   return (
     <div className="flex flex-col gap-4">
       {fields.map((f) => (
-        <FieldRow key={f.key} field={f} {...common} />
+        <FieldRow key={f.key} field={f} suggestions={suggestions?.[f.key]} {...common} />
       ))}
     </div>
   )
@@ -303,11 +318,17 @@ export function FlatSchemaForm({
 export function FieldRow({
   field,
   showPath,
+  suggestions,
   overrides,
   disabled,
   onChange,
   onReset,
-}: CommonProps & { field: SchemaField; showPath?: boolean }) {
+}: CommonProps & {
+  field: SchemaField
+  showPath?: boolean
+  /** Datalist entries offered under a text/number input (typing stays free). */
+  suggestions?: FieldSuggestion[]
+}) {
   const has = field.key in overrides
   const value = has ? overrides[field.key] : undefined
   const modified = isModified(field, value)
@@ -403,14 +424,24 @@ export function FieldRow({
           ))}
         </select>
       ) : (
-        <Input
-          id={fieldId}
-          inputMode={field.type === "number" ? "decimal" : undefined}
-          value={text}
-          placeholder={field.required ? "required" : defaultString(field)}
-          disabled={disabled}
-          onChange={(e) => onChange(field.key, e.target.value)}
-        />
+        <>
+          <Input
+            id={fieldId}
+            inputMode={field.type === "number" ? "decimal" : undefined}
+            value={text}
+            placeholder={field.required ? "required" : defaultString(field)}
+            disabled={disabled}
+            list={suggestions?.length ? `${fieldId}-suggestions` : undefined}
+            onChange={(e) => onChange(field.key, e.target.value)}
+          />
+          {suggestions && suggestions.length > 0 && (
+            <datalist id={`${fieldId}-suggestions`}>
+              {suggestions.map((s) => (
+                <option key={s.value} value={s.value} label={s.label} />
+              ))}
+            </datalist>
+          )}
+        </>
       )}
     </div>
   )

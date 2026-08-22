@@ -300,6 +300,42 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="robot.teleop_torque_threshold",
+                label="Teleop contact threshold (Nm)",
+                type="number",
+                help=(
+                    "Contact watchdog while the operator drives the arms "
+                    "(teleop and data collection): a sustained torque this "
+                    "far (Nm) from the gravity model disengages tracking and "
+                    "drops the arms into the limp gravity-comp hold — free "
+                    "them by hand, then press reset to return to rest. "
+                    "Teleop pushes on the scene on purpose, so raise this "
+                    "before the reset threshold if deliberate contact keeps "
+                    "tripping it; 0 disables the watchdog."
+                ),
+                targets={
+                    "teleop": ("teleop.teleop_torque_threshold",),
+                    "collect-data": (f"{_VRT}.teleop_torque_threshold",),
+                },
+            ),
+            SettingDef(
+                key="robot.policy_torque_threshold",
+                label="Policy contact threshold (Nm)",
+                type="number",
+                help=(
+                    "Contact watchdog while a policy (or a replayed episode) "
+                    "drives the arms: a sustained torque this far (Nm) from "
+                    "the gravity model aborts the episode / playback and "
+                    "drops the arms into the limp gravity-comp hold. Raise "
+                    "this if legitimate task contact keeps tripping it; 0 "
+                    "disables the watchdog."
+                ),
+                targets={
+                    "run-policy": ("policy_torque_threshold",),
+                    "replay-dataset": ("play_torque_threshold",),
+                },
+            ),
+            SettingDef(
                 key="robot.gravity_kd",
                 label="Gravity comp damping (kd)",
                 type="number",
@@ -363,6 +399,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={
                     "teleop": ("teleop.rotation_multiplier",),
                     "collect-data": (f"{_VRT}.rotation_multiplier",),
+                },
+            ),
+            SettingDef(
+                key="teleop.hold_to_engage",
+                label="Hold grips to engage",
+                type="boolean",
+                help=(
+                    "Dead-man grip scheme: hold both grips to start driving, "
+                    "and each arm tracks only while its grip stays held — "
+                    "release one and that arm freezes where it is. Off "
+                    "(default) is the toggle scheme: click both grips to "
+                    "engage from rest, then a click on either grip toggles "
+                    "that arm between tracking and frozen."
+                ),
+                targets={
+                    "teleop": ("teleop.hold_to_engage",),
+                    "collect-data": (f"{_VRT}.hold_to_engage",),
                 },
             ),
             SettingDef(

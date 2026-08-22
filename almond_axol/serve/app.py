@@ -643,6 +643,35 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(snapshot)
 
+    # -- datasets on disk (the replay panel's dataset picker) -----------------
+
+    @app.get("/api/datasets")
+    async def get_datasets() -> dict[str, Any]:
+        """LeRobot datasets on this host, newest first.
+
+        Scans the shared ``recording.root`` setting when set (the directory
+        collect-data writes to), otherwise the LeRobot cache dir — the same
+        place replay-dataset resolves a bare repo id against.
+        """
+        from pathlib import Path
+
+        from ..recording.datasets import list_datasets
+
+        stored_root = settings.snapshot()["values"].get("recording.root")
+        base = Path(str(stored_root)).expanduser() if stored_root else None
+        found = await asyncio.to_thread(list_datasets, base)
+        return {
+            "datasets": [
+                {
+                    "repoId": d.repo_id,
+                    "root": d.root,
+                    "episodes": d.episodes,
+                    "fps": d.fps,
+                }
+                for d in found
+            ]
+        }
+
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 
     @app.get("/api/urdf/{asset_path:path}", response_model=None)
