@@ -329,11 +329,6 @@ class IKWorker:
         was_any = self._active["left"] or self._active["right"]
         if not was_any:
             self._clear_freeze()
-            # Pin posture to ``q_current`` so the held pose is itself the IK
-            # fixed point. The default rest-pose attractor would otherwise pull
-            # q in the EE null space at every frame, growing with distance from
-            # rest; reset() restores the rest-pose attractor.
-            self._solver.set_posture_pose(q_current)
 
         # Per-arm activation. FK of q_current is needed to snapshot a rising
         # arm's EE pose and to capture a freezing/frozen arm's hold pose;
@@ -383,6 +378,16 @@ class IKWorker:
                         self._hold_elbow_fk[side] = _elbow(side)
 
         if snapped:
+            # Pin posture to ``q_current`` so the held pose is itself the IK
+            # fixed point (the rest-pose attractor would otherwise pull q in
+            # the EE null space at every frame, growing with distance from
+            # rest; reset() restores it). Re-pinned on *every* engage snap,
+            # not just the first out of a full disengage: a single arm
+            # re-engaging mid-session is no longer pinned to its seed, so a
+            # posture pose left at the previous engage would drag it through
+            # the null space — a visible settle over the first frames even
+            # with a still controller.
+            self._solver.set_posture_pose(q_current)
             # An engage snap re-anchors that arm to q_current: return the
             # seed unchanged so the snap frame itself produces no motion
             # (matching the previous whole-session engage behaviour).

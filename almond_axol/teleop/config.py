@@ -54,9 +54,9 @@ class VRTeleopConfig:
             trip, tracking disengages and the arms drop into the limp
             gravity-comp hold; hand-guide them clear and press reset to
             return to rest and continue. Tracking pushes against payloads
-            and the scene on purpose, so raise this before raising the
-            reset threshold if deliberate contact keeps tripping it.
-            ``0`` disables the watchdog. Defaults to ``4.0``.
+            and the scene on purpose, so the default sits well above the
+            reset threshold; raise it further if deliberate contact keeps
+            tripping it. ``0`` disables the watchdog. Defaults to ``8.0``.
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
@@ -175,7 +175,7 @@ class VRTeleopConfig:
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
     reset_torque_threshold: float = 4.0
-    teleop_torque_threshold: float = 4.0
+    teleop_torque_threshold: float = 8.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
     engage_max_vel: float = 0.1 * 2 * math.pi

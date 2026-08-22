@@ -99,8 +99,9 @@ class ReplayDatasetConfig:
     # sustained-torque-residual trip, checked on every command. On a trip
     # playback stops and the arms drop into the limp gravity-comp hold until
     # the run is stopped. Replayed episodes touch the scene on purpose, so
-    # raise this if legitimate task contact keeps tripping it. 0 disables.
-    play_torque_threshold: float = 4.0
+    # the default sits above the reset threshold; raise it if legitimate
+    # task contact keeps tripping it. 0 disables.
+    play_torque_threshold: float = 8.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
