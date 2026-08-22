@@ -139,10 +139,21 @@ class VRTeleopCore:
         self._last_cmd: np.ndarray | None = None
         self._guard_warn_time: float = 0.0
 
-        # Engage toggle state (mutated on the IK thread).
-        self.teleop_enabled: bool = False
+        # Engage state (mutated on the IK thread). Per-arm: a disengaged arm
+        # freezes where it is (pose + gripper) while the other keeps
+        # tracking. From rest both arms always engage together (both grips);
+        # once engaged, grips act per-arm — as rising-edge toggles by
+        # default, or as dead-man holds with ``config.hold_to_engage``.
+        self.left_enabled: bool = False
+        self.right_enabled: bool = False
         self._prev_both: bool = False
-        self._prev_either: bool = False
+        self._prev_l_lock: bool = False
+        self._prev_r_lock: bool = False
+        # Both-grips gate for the next engage. Set at startup, at rest, and by
+        # every forced disengage (reset, stale stream, contact) so resuming is
+        # always deliberate; cleared once engaged, so an operator who froze
+        # both arms mid-task can resume either with a single click.
+        self._require_both_engage: bool = True
         self._at_rest: bool = True
         self._engage_time: float | None = None
 
@@ -337,38 +348,113 @@ class VRTeleopCore:
     # Engage toggle + IK target (IK thread)
     # ------------------------------------------------------------------
 
-    def update_engage(self, frame: object) -> None:
-        """Advance the engage toggle and grip tracking for one VR frame.
+    @property
+    def teleop_enabled(self) -> bool:
+        """True while at least one arm is engaged (tracking)."""
+        return self.left_enabled or self.right_enabled
 
-        Toggle logic (rising-edge): both grips together → enable; either grip
-        alone → disable. On the first engage out of rest, the velocity cap
-        starts at ``engage_max_vel`` and smoothsteps up to ``teleop_max_vel``
-        across ``engage_duration`` (advanced in :meth:`compute_output`).
+    def _disengage_all(self, log_message: str | None = None) -> None:
+        """Disengage both arms and clear the edge/ramp state (IK thread).
+
+        Used by every non-toggle disengage path — reset adoption, the
+        stale-stream watchdog, a tracking contact trip — so re-engaging
+        afterwards always requires a deliberate both-grips engage.
         """
-        both = frame.l_lock and frame.r_lock
-        either = frame.l_lock or frame.r_lock
-        if not self.teleop_enabled:
-            if both and not self._prev_both:
-                self.teleop_enabled = True
-                self._logger.info("Teleop enabled")
-                self._broadcast(True)
-                if self._at_rest:
-                    self.smooth_left.max_vel = self.config.engage_max_vel
-                    self.smooth_right.max_vel = self.config.engage_max_vel
-                    self._engage_time = time.perf_counter()
-                    self._at_rest = False
-        else:
-            if either and not self._prev_either:
-                self.teleop_enabled = False
-                self._logger.info("Teleop disabled")
-                self._broadcast(False)
-        self._prev_both = both
-        self._prev_either = either
+        was_enabled = self.teleop_enabled
+        self.left_enabled = False
+        self.right_enabled = False
+        self._prev_both = False
+        self._prev_l_lock = False
+        self._prev_r_lock = False
+        self._require_both_engage = True
+        self._engage_time = None
+        if log_message is not None and was_enabled:
+            self._logger.info(log_message)
+        self._broadcast(False)
 
-        # Only track gripper position while engaged so it can't be actuated
-        # independently of the toggle.
-        if self.teleop_enabled:
+    def update_engage(self, frame: object) -> None:
+        """Advance the per-arm engage state and grip tracking for one VR frame.
+
+        From rest — and after any forced disengage (reset, stale stream,
+        contact) — both grips together are required to engage, and both arms
+        start tracking. Once engaged, grips act per-arm:
+
+          - Toggle scheme (default): a rising edge on a grip toggles *that*
+            arm between tracking and frozen. A frozen arm holds its pose and
+            gripper while the other keeps tracking; a click re-engages it.
+          - Dead-man scheme (``config.hold_to_engage``): each arm tracks only
+            while its grip is held; releasing a grip freezes that arm, and
+            releasing both disengages the session (both grips must be held
+            again to resume).
+
+        On the first engage out of rest, the velocity cap starts at
+        ``engage_max_vel`` and smoothsteps up to ``teleop_max_vel`` across
+        ``engage_duration`` (advanced in :meth:`compute_output`).
+        """
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        both = l_lock and r_lock
+        was_left = self.left_enabled
+        was_right = self.right_enabled
+        was_enabled = was_left or was_right
+
+        if not was_enabled and (
+            self._require_both_engage or self.config.hold_to_engage
+        ):
+            # Engage gate: both grips together. Rising-edge in toggle mode so
+            # a held-over press can't re-engage; level-triggered in hold mode
+            # (the operator is *holding*, there is no release to edge on).
+            engage = (
+                both if self.config.hold_to_engage else (both and not self._prev_both)
+            )
+            if engage:
+                self.left_enabled = True
+                self.right_enabled = True
+                self._require_both_engage = False
+        elif self.config.hold_to_engage:
+            # Dead-man: each arm tracks exactly while its grip is held.
+            self.left_enabled = l_lock
+            self.right_enabled = r_lock
+        else:
+            # Toggle: a rising edge on a grip flips that arm. Also reached
+            # fully-disengaged when the operator froze both arms themselves
+            # (no forced disengage in between): a single click resumes.
+            if l_lock and not self._prev_l_lock:
+                self.left_enabled = not self.left_enabled
+            if r_lock and not self._prev_r_lock:
+                self.right_enabled = not self.right_enabled
+
+        now_enabled = self.left_enabled or self.right_enabled
+        if now_enabled and not was_enabled:
+            self._logger.info("Teleop enabled")
+            self._broadcast(True)
+            if self._at_rest:
+                self.smooth_left.max_vel = self.config.engage_max_vel
+                self.smooth_right.max_vel = self.config.engage_max_vel
+                self._engage_time = time.perf_counter()
+                self._at_rest = False
+        elif was_enabled and not now_enabled:
+            self._logger.info("Teleop disabled")
+            self._broadcast(False)
+        elif was_enabled:
+            if self.left_enabled != was_left:
+                self._logger.info(
+                    "Left arm %s", "engaged" if self.left_enabled else "frozen"
+                )
+            if self.right_enabled != was_right:
+                self._logger.info(
+                    "Right arm %s", "engaged" if self.right_enabled else "frozen"
+                )
+
+        self._prev_both = both
+        self._prev_l_lock = l_lock
+        self._prev_r_lock = r_lock
+
+        # Only track a gripper while its arm is engaged, so a frozen arm's
+        # grasp (and a disengaged session) can't be actuated by the trigger.
+        if self.left_enabled:
             self.l_grip = frame.l_grip
+        if self.right_enabled:
             self.r_grip = frame.r_grip
 
     def set_target(self, q_raw: object) -> None:
@@ -626,56 +712,131 @@ class VRTeleopCore:
             outcome = await _play()
             if outcome != "contact":
                 return
-            # Freeze the IK pipeline before the arms go limp — a reset
-            # latched during the hold must not dispatch from a solution
-            # the hand-guided arms no longer match — then drop the
-            # interrupted plan.
-            self.pause_ik()
-            self.cancel_reset()
-            if on_contact is not None:
-                on_contact()
-            announce("Contact. Arms are free — press reset to continue.")
-            deadline = time.perf_counter()
-            orphan_since: float | None = None
-            orphaned = False
-            while not stopped() and not self.reset_pending:
-                deadline += interval
-                await gravity_step()
-                if hold_tick is not None:
-                    hold_tick()
-                # Orphaned hold: the VR frame stream is dead (Y-exit
-                # return, headset died), so the reset press that ends
-                # this hold can never arrive. After the grace period,
-                # stop waiting and settle where the arms are.
-                if vr_alive is not None:
-                    now = time.perf_counter()
-                    if vr_alive():
-                        orphan_since = None
-                    elif orphan_since is None:
-                        orphan_since = now
-                    elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
-                        orphaned = True
-                        break
-                await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
-            if stopped():
-                return
-            # Hand position control back from wherever the operator left
-            # the arms: clear the stale command history (max-step safety
-            # check) and re-seed the pipeline from the measured
-            # positions, so the first commands hold the true pose with
-            # no transient — and, on a reset press, the replan starts
-            # from it.
-            reset_command_state()
-            pos_l, pos_r = get_positions()
-            self.resync_to_positions(pos_l, pos_r)
-            self.resume_ik()
-            if orphaned:
-                announce(
-                    "No headset connected — holding position here. "
-                    "Reconnect and press reset to return to rest."
-                )
+            hold = await self._contact_hold_until_reset(
+                gravity_step=gravity_step,
+                reset_command_state=reset_command_state,
+                get_positions=get_positions,
+                stopped=stopped,
+                announce=announce,
+                on_contact=on_contact,
+                hold_tick=hold_tick,
+                vr_alive=vr_alive,
+            )
+            if hold != "reset":
                 return
             announce("Returning to rest pose.")
+
+    async def contact_hold(
+        self,
+        *,
+        gravity_step: Callable[[], Awaitable[object]],
+        reset_command_state: Callable[[], None],
+        get_positions: Callable[[], tuple[np.ndarray, np.ndarray]],
+        stopped: Callable[[], bool],
+        announce: Callable[[str], None],
+        on_contact: Callable[[], None] | None = None,
+        hold_tick: Callable[[], None] | None = None,
+        vr_alive: Callable[[], bool] | None = None,
+    ) -> None:
+        """Limp gravity-comp hold after a *tracking-time* contact trip.
+
+        The tracking-phase counterpart of :meth:`guarded_return`'s contact
+        fallback: the flow's control loop tripped its
+        ``config.teleop_torque_threshold`` watchdog while the operator was
+        driving the arms. Disengages tracking (re-engaging afterwards needs a
+        deliberate both-grips engage), drops the arms into the limp hold, and
+        waits for a reset press. On reset, the pipeline is re-synced to the
+        hand-guided positions and the latched reset is left pending, so the
+        caller's normal reset path plans the return-to-rest from wherever the
+        arms were left. Arguments as in :meth:`guarded_return`.
+        """
+        self.pause_ik()
+        self.cancel_reset()
+        self._disengage_all("Teleop disabled (contact)")
+        hold = await self._contact_hold_until_reset(
+            gravity_step=gravity_step,
+            reset_command_state=reset_command_state,
+            get_positions=get_positions,
+            stopped=stopped,
+            announce=announce,
+            on_contact=on_contact,
+            hold_tick=hold_tick,
+            vr_alive=vr_alive,
+        )
+        if hold == "reset":
+            # The reset press that ended the hold is still latched
+            # (dispatch was paused): the caller's reset path picks it up.
+            announce("Returning to rest pose.")
+
+    async def _contact_hold_until_reset(
+        self,
+        *,
+        gravity_step: Callable[[], Awaitable[object]],
+        reset_command_state: Callable[[], None],
+        get_positions: Callable[[], tuple[np.ndarray, np.ndarray]],
+        stopped: Callable[[], bool],
+        announce: Callable[[str], None],
+        on_contact: Callable[[], None] | None,
+        hold_tick: Callable[[], None] | None,
+        vr_alive: Callable[[], bool] | None,
+    ) -> str:
+        """Shared limp-hold engine: ``reset`` | ``orphaned`` | ``stopped``.
+
+        Freezes the IK pipeline, holds the arms limp until a reset press
+        (or the flow stops / the hold is orphaned), then hands position
+        control back re-synced to wherever the operator left the arms.
+        """
+        interval = 1.0 / self.config.frequency
+        # Freeze the IK pipeline before the arms go limp — a reset
+        # latched during the hold must not dispatch from a solution
+        # the hand-guided arms no longer match — then drop the
+        # interrupted plan.
+        self.pause_ik()
+        self.cancel_reset()
+        if on_contact is not None:
+            on_contact()
+        announce("Contact. Arms are free — press reset to continue.")
+        deadline = time.perf_counter()
+        orphan_since: float | None = None
+        orphaned = False
+        while not stopped() and not self.reset_pending:
+            deadline += interval
+            await gravity_step()
+            if hold_tick is not None:
+                hold_tick()
+            # Orphaned hold: the VR frame stream is dead (Y-exit
+            # return, headset died), so the reset press that ends
+            # this hold can never arrive. After the grace period,
+            # stop waiting and settle where the arms are.
+            if vr_alive is not None:
+                now = time.perf_counter()
+                if vr_alive():
+                    orphan_since = None
+                elif orphan_since is None:
+                    orphan_since = now
+                elif now - orphan_since >= _HOLD_ORPHAN_GRACE_S:
+                    orphaned = True
+                    break
+            await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+        if stopped():
+            return "stopped"
+        # Hand position control back from wherever the operator left
+        # the arms: clear the stale command history (max-step safety
+        # check) and re-seed the pipeline from the measured
+        # positions, so the first commands hold the true pose with
+        # no transient — and, on a reset press, the replan starts
+        # from it.
+        reset_command_state()
+        pos_l, pos_r = get_positions()
+        self.resync_to_positions(pos_l, pos_r)
+        self.resume_ik()
+        if orphaned:
+            announce(
+                "No headset connected — holding position here. "
+                "Reconnect and press reset to return to rest."
+            )
+            return "orphaned"
+        return "reset"
 
     # ------------------------------------------------------------------
     # IK dispatch loop (IK thread)
@@ -763,11 +924,7 @@ class VRTeleopCore:
                             self.reset_interp.set_trajectory(
                                 trajectory, self.l_grip, self.r_grip
                             )
-                            self.teleop_enabled = False
-                            self._broadcast(False)
-                            self._prev_both = False
-                            self._prev_either = False
-                            self._engage_time = None
+                            self._disengage_all()
                             self._at_rest = True
                         self._hold_target(np.asarray(q_default, dtype=np.float32))
                 except Exception as e:  # noqa: BLE001 - keep the loop alive
@@ -818,12 +975,12 @@ class VRTeleopCore:
                 continue
 
             try:
-                # Synthesize lock state so the IK worker tracks our toggle
-                # rather than the raw button state.
+                # Synthesize lock state so the IK worker tracks our per-arm
+                # engage state rather than the raw button state.
                 frame_to_send = frame.model_copy(
                     update={
-                        "l_lock": self.teleop_enabled,
-                        "r_lock": self.teleop_enabled,
+                        "l_lock": self.left_enabled,
+                        "r_lock": self.right_enabled,
                     }
                 )
                 conn.send(frame_to_send)
@@ -882,14 +1039,13 @@ class VRTeleopCore:
 
         timeout = self.config.disengage_timeout
         if self.teleop_enabled and 0 < timeout <= gap:
-            self.teleop_enabled = False
             self._logger.info(
                 "Teleop disabled: no VR poses for %.2fs (operator left VR or "
                 "the link dropped); holding position — re-engage with both "
                 "grips, or press reset (X) to return to rest",
                 gap,
             )
-            self._broadcast(False)
+            self._disengage_all()
             # Also deactivate the IK worker so its next engaged frame performs
             # a fresh engage-snap. Without this, a client that resumes already
             # holding both grips (or a reconnecting SDK client streaming

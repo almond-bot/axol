@@ -68,6 +68,7 @@ from ..recording import (
     default_vcodec,
     restore_dataset_ownership,
 )
+from ..robot.control import ContactWatchdog
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -313,12 +314,14 @@ class CollectDataConfig:
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
     vcodec: str = field(default_factory=default_vcodec)
-    # Every return-to-rest is guarded: a torque watchdog drops the arms into
-    # a limp gravity-comp hold on unexpected contact (reset replans from
-    # wherever they were left). The knobs live on the shared teleop config —
-    # ``--teleop_config.vr_teleop_config.reset_torque_threshold`` (0 disables
-    # the watchdog) and ``.reset_gravity_comp_kd`` — the same fields `axol
-    # teleop` uses, so the two flows behave identically.
+    # Every return-to-rest is guarded, and so is the tracking phase itself: a
+    # torque watchdog drops the arms into a limp gravity-comp hold on
+    # unexpected contact (reset replans from wherever they were left; a
+    # recording episode is discarded). The knobs live on the shared teleop
+    # config — ``--teleop_config.vr_teleop_config.reset_torque_threshold`` /
+    # ``.teleop_torque_threshold`` (0 disables the respective watchdog) and
+    # ``.reset_gravity_comp_kd`` — the same fields `axol teleop` uses, so the
+    # two flows behave identically.
     root: str | None = None
     push_to_hub: bool = False
     rerun_ip: str | None = None
@@ -491,9 +494,9 @@ class _QueueCollectControl:
     def note_contact(self) -> None:
         self._set(
             "contact",
-            "Contact during return to rest — the arms are limp and free to "
-            "move. Clear them, then press reset on the controller (or return "
-            "to rest here) to replan from where they are.",
+            "Contact — torque exceeded the threshold, so the arms are limp "
+            "and free to move. Clear them, then press reset on the controller "
+            "(or return to rest here) to replan from where they are.",
         )
 
     def note_returning(self) -> None:
@@ -916,11 +919,16 @@ def _run(
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
     # The main thread drives the episode lifecycle (dataset writes, rest-pose
     # moves) and blocks on each coroutine until the episode (or reset) finishes.
-    async def _episode_loop() -> tuple[bool, bool]:
+    async def _episode_loop() -> tuple[bool, bool, bool]:
         recording = False
         rerecord = False
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
+        # Tracking-phase contact watchdog: the same sustained-torque trip the
+        # guarded return uses, active while the operator drives the arms. A
+        # trip ends the loop (third element of the return tuple True); the
+        # caller discards any recording and runs the limp contact hold.
+        watchdog = ContactWatchdog(vrt_cfg.teleop_torque_threshold)
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -966,6 +974,17 @@ def _run(
             sect["act"] += t_act - t_obs
             sect["proc"] += t_proc - t_act
             sect["send"] += t_send - t_proc
+
+            tripped = watchdog.update(robot.torque_residuals())
+            if tripped is not None:
+                joint, residual = tripped
+                _logger.warning(
+                    "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
+                    joint,
+                    residual,
+                    vrt_cfg.teleop_torque_threshold,
+                )
+                return recording, rerecord, True
 
             # Record the action in the configured action space: identity for
             # joint datasets, FK-to-Cartesian when observe_cartesian is set. The
@@ -1032,7 +1051,7 @@ def _run(
             if slip > max_slip["v"]:
                 max_slip["v"] = slip
 
-        return recording, rerecord
+        return recording, rerecord, False
 
     # Guarded return-to-rest: the sequencing (torque watchdog, gravity-comp
     # fallback, reset-press retry) lives in the shared engine
@@ -1097,6 +1116,27 @@ def _run(
         teleop.request_reset()
         await _guarded_return()
 
+    async def _contact_hold_loop() -> None:
+        """Tracking contact: hold limp until reset, then return to rest guarded.
+
+        The hold leaves the operator's reset press latched, so the guarded
+        return that follows plans from wherever the arms were hand-guided; on
+        an orphaned/stopped hold nothing is latched and the return is skipped
+        (the arms hold position where they are).
+        """
+        await teleop.contact_hold(
+            gravity_step=_guard_gravity_step,
+            reset_command_state=robot.reset_command_state,
+            get_positions=lambda: robot.positions,
+            stopped=_stopped,
+            announce=log_say,
+            on_contact=_guard_on_contact,
+            hold_tick=_guard_hold_tick,
+            vr_alive=teleop.vr_alive,
+        )
+        if teleop.is_resetting:
+            await _guarded_return()
+
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
 
@@ -1150,7 +1190,7 @@ def _run(
                 f"Episode {episode_idx + 1}: robot is at rest pose. Press record on the VR controller when ready."
             )
 
-            recording, rerecord = _run_on_robot_loop(_episode_loop())
+            recording, rerecord, contact = _run_on_robot_loop(_episode_loop())
 
             # Recording done — close the raw branch so the rest-pose/reset and
             # next pre-record phase stay light. (The recorder stops its own
@@ -1162,6 +1202,20 @@ def _run(
                 if recording:
                     recorder.cancel_episode()
                 break
+
+            if contact:
+                # The tracking contact watchdog tripped: an in-flight episode
+                # is unusable (the arms went limp mid-take), so discard it,
+                # then run the limp hold + guarded return on the robot loop.
+                if recording:
+                    recorder.cancel_episode()
+                    log_say("Episode discarded (contact).")
+                _run_on_robot_loop(_contact_hold_loop())
+                # Drain VR events fired during the hold/return, then unblock
+                # the headset for the next take.
+                teleop.get_teleop_events()
+                teleop.send_feedback_state(VRState.DATA_COLLECTION)
+                continue
 
             if recording and not rerecord:
                 # Mirror the headset's SAVING state in the panel for the whole

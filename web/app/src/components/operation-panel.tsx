@@ -10,12 +10,14 @@ import {
 } from "lucide-react"
 import {
   cameraCount,
+  fetchDatasets,
   isRobotFreeRun,
   isSimRun,
   motorFaultLabel,
   perRunFields,
   type CameraSpec,
   type CommandSpec,
+  type DatasetInfo,
   type EpisodeControlSpec,
   type FormValue,
   type OperationMeta,
@@ -23,7 +25,7 @@ import {
   type RobotStatus,
   type SessionInfo,
 } from "@/lib/supervisor"
-import { CuratedForm } from "@/components/config-form"
+import { CuratedForm, type FieldSuggestion } from "@/components/config-form"
 import { ArmJointPicker } from "@/components/arm-joint-picker"
 import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { Card, CardContent } from "@/components/ui/card"
@@ -91,6 +93,36 @@ export function OperationPanel({
   // Gravity-comp's joint subset gets a proper picker instead of a text field.
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
+
+  // Replay's dataset picker: datasets found on the serve host, offered as a
+  // datalist under the repo id field — typing a bare id or a path stays
+  // possible. Refetched whenever the panel is editable (a collect-data run
+  // that just ended may have added one). Older hosts without /api/datasets
+  // simply leave the field a plain input.
+  const wantsDatasets = meta.id === "replay-dataset" && runFields.some((f) => f.key === "repo_id")
+  const [datasets, setDatasets] = useState<DatasetInfo[]>([])
+  useEffect(() => {
+    if (!wantsDatasets || live) return
+    let cancelled = false
+    fetchDatasets()
+      .then((found) => {
+        if (!cancelled) setDatasets(found)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [wantsDatasets, live])
+  const suggestions = useMemo<Record<string, FieldSuggestion[]> | undefined>(() => {
+    if (!wantsDatasets || datasets.length === 0) return undefined
+    return {
+      repo_id: datasets.map((d) => ({
+        value: d.repoId,
+        label:
+          d.episodes != null ? `${d.episodes} episode${d.episodes === 1 ? "" : "s"}` : undefined,
+      })),
+    }
+  }, [wantsDatasets, datasets])
 
   const isSim = isSimRun(meta, settings)
   // Sim, or a run that never touches the arms (teleop's cart-only mode):
@@ -180,6 +212,7 @@ export function OperationPanel({
                   {textFields.length > 0 && (
                     <CuratedForm
                       fields={textFields}
+                      suggestions={suggestions}
                       overrides={settings}
                       disabled={live}
                       onChange={onChange}

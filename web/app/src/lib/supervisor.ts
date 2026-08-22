@@ -432,6 +432,26 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
+// ---------------------------------------------------------------------------
+// Datasets on disk (the replay panel's dataset picker)
+// ---------------------------------------------------------------------------
+
+/** One LeRobot dataset found on the serve host (see /api/datasets). */
+export interface DatasetInfo {
+  /** Repo id relative to the datasets root — what replay-dataset takes. */
+  repoId: string
+  /** Absolute dataset directory on the serve host. */
+  root: string
+  episodes: number | null
+  fps: number | null
+}
+
+/** Datasets on the serve host, newest first. Empty on older hosts (404). */
+export async function fetchDatasets(): Promise<DatasetInfo[]> {
+  const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
+  return res.datasets ?? []
+}
+
 /** Which eye(s) of a stereo ZED X to use, per branch. */
 export type StereoEyes = "both" | "left" | "right"
 
