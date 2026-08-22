@@ -42,6 +42,7 @@ import numpy as np
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.cart import Cart
+from ..robot.control import ContactWatchdog
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
@@ -399,6 +400,17 @@ class VRTeleop:
                 last = self._vr_frame_times[-1] if self._vr_frame_times else None
             return last is not None and (time.perf_counter() - last) < 2.0
 
+        # Tracking-phase contact watchdog (hardware only, opt-in — the
+        # threshold defaults to 0 = off): the same sustained-torque trip the
+        # guarded return uses, but active while the operator drives (or
+        # holds) the arms. On a trip tracking disengages and the arms go
+        # limp until reset — see VRTeleopCore.contact_hold.
+        track_watchdog = (
+            ContactWatchdog(self._config.teleop_torque_threshold)
+            if guard and self._config.teleop_torque_threshold > 0
+            else None
+        )
+
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
@@ -431,6 +443,34 @@ class VRTeleop:
                 left, right = self.step()
                 t_step = time.perf_counter()
                 await self._robot.motion_control(left=left, right=right)
+
+                if track_watchdog is not None and left is not None:
+                    tripped = track_watchdog.update(
+                        self._robot.torque_residuals()  # type: ignore[attr-defined]
+                    )
+                    if tripped is not None:
+                        joint, residual = tripped
+                        _logger.warning(
+                            "teleop contact: %s torque residual %.1f exceeds "
+                            "%.1f — going limp",
+                            joint,
+                            residual,
+                            self._config.teleop_torque_threshold,
+                        )
+                        await self._core.contact_hold(
+                            gravity_step=_guard_gravity_step,
+                            reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                            get_positions=_guard_positions,
+                            stopped=lambda: False,  # unwound by task cancellation
+                            announce=_logger.info,
+                            vr_alive=_guard_vr_alive,
+                        )
+                        track_watchdog = ContactWatchdog(
+                            self._config.teleop_torque_threshold
+                        )
+                        deadline = time.perf_counter()
+                        prev_iter = 0.0
+                        continue
 
                 now = time.perf_counter()
                 sect["step"] += t_step - t_start

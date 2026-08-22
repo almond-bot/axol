@@ -19,10 +19,10 @@ Controls (Logitech F310/F710 in XInput mode):
     B             quit (wheels stopped, motors disabled)
 
 The D-pad commands the lift only while the deadman is held; releasing
-either stops it. Nothing physically moves until the lift PCB lands — the
-driver behind it is a no-op stub (see :mod:`almond_axol.robot.lift`), and
-the status line's height stays blank for the same reason. ``--no-lift``
-skips the lift entirely.
+either stops it. The lift is the jelly_legs board on the chest CAN bus
+(see :mod:`almond_axol.robot.lift`); the status line shows its height as
+percent of homed travel, blank until the board answers (and ``---`` until
+the legs have been homed once). ``--no-lift`` skips the lift entirely.
 
 Run directly (pygame ships in the ``gamepad`` extra):
     uv run --extra gamepad -m almond_axol.diagnostics.base.drive
@@ -39,7 +39,7 @@ import logging
 import os
 
 from ...robot.cart import DEFAULT_CHANNEL, WHEELS, Cart, CartConfig, deadzone
-from ...robot.lift import DOWN, STOP, UP, HeightReader
+from ...robot.lift import DOWN, STOP, UP
 
 # Logitech F310/F710 (XInput mode) under SDL/pygame.
 _AXIS_LX = 0  # left stick x: left = -1
@@ -79,7 +79,7 @@ def _init_gamepad(index: int):  # noqa: ANN202 — pygame typed lazily
     return pad
 
 
-def _status_line(cart: Cart, engaged: bool, lift_height_mm: int | None) -> str:
+def _status_line(cart: Cart, engaged: bool) -> str:
     if engaged:
         state = "DRIVE"
     elif cart.parked:
@@ -92,7 +92,12 @@ def _status_line(cart: Cart, engaged: bool, lift_height_mm: int | None) -> str:
         for w, s in zip(WHEELS, cart.wheel_speeds)
     )
     lift = {UP: "up", DOWN: "down", STOP: "--"}[cart.lift_dir]
-    height = f" {lift_height_mm}mm" if lift_height_mm is not None else ""
+    height = ""
+    if (status := cart.lift_status) is not None:
+        pct = status.height_percent
+        height = f" {pct:.1f}%" if pct is not None else " ---"
+        if status.stall_fault:
+            height += " STALL"
     warn = "  [CMD ERR]" if cart.send_failed else ""
     return (
         f"\r  {state:<22}  vx={cmd[0]:+.2f} vy={cmd[1]:+.2f} wz={cmd[2]:+.2f}"
@@ -103,7 +108,6 @@ def _status_line(cart: Cart, engaged: bool, lift_height_mm: int | None) -> str:
 async def _input_loop(
     pad,  # noqa: ANN001 — pygame typed lazily
     cart: Cart,
-    height: HeightReader | None,
     dz: float,
 ) -> None:
     """Poll the gamepad into ``cart.set_command`` until B is pressed."""
@@ -129,8 +133,7 @@ async def _input_loop(
                 lift_dir = UP if hat_y > 0 else DOWN if hat_y < 0 else STOP
         cart.set_command(vx, vy, wz, lift_dir)
 
-        lift_height = height.poll() if height is not None else None
-        print(_status_line(cart, engaged, lift_height), end="", flush=True)
+        print(_status_line(cart, engaged), end="", flush=True)
         await asyncio.sleep(interval)
 
 
@@ -146,15 +149,12 @@ async def _run(args: argparse.Namespace) -> None:
         hold_kp=args.hold_kp,
         hold_kd=args.hold_kd,
         lift=not args.no_lift,
+        lift_channel=args.lift_channel,
         imu=args.imu,
         yaw_log=args.yaw_log,
     )
     if args.no_can:
         print("--no-can: wheel motors disabled (gamepad + lift only).")
-
-    height: HeightReader | None = None
-    if not args.no_lift:
-        height = HeightReader()
 
     cart = Cart(config)
     await cart.enable()
@@ -174,13 +174,11 @@ async def _run(args: argparse.Namespace) -> None:
 
     print("Cart enabled. Hold LB/RB to drive, D-pad for the lift, B to quit.")
     try:
-        await _input_loop(pad, cart, height, args.deadzone)
+        await _input_loop(pad, cart, args.deadzone)
     finally:
         if imu_src is not None:
             imu_src.close()
         await cart.disable()
-        if height is not None:
-            height.close()
         print("Cart disabled.")
 
 
@@ -248,6 +246,12 @@ def main(argv: list[str] | None = None) -> None:
         "--no-lift",
         action="store_true",
         help="Skip the lift entirely (the D-pad is ignored).",
+    )
+    parser.add_argument(
+        "--lift-channel",
+        default=CartConfig.lift_channel,
+        help="SocketCAN interface of the chest bus carrying the jelly_legs "
+        f"lift controller (default: {CartConfig.lift_channel})",
     )
     parser.add_argument(
         "--imu",

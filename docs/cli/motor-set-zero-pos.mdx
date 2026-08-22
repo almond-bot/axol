@@ -31,3 +31,7 @@ axol motor.set-zero-pos --l --guided --joints wrist_2,wrist_3  # just the wrist 
 <Note>
   After `--guided` calibration each motor's encoder zero coincides with its calibration end stop. `AxolArm` carries a per-joint offset internally so the public API (`positions`, `motion_control`, etc.) stays in joint frame (`0` = rest position); for `wrist_2`/`wrist_3` the offset's sign is detected from the encoder at connect time. Damiao motors (`WRIST_2`, `WRIST_3`) need a power cycle for the new zero to take effect.
 </Note>
+
+<Warning>
+  **Bring-up refuses a robot whose zeros were never set.** An unset (or stale) encoder zero makes every joint-frame reading garbage, so enabling the arms — from [`teleop`](/cli/teleop), [`collect-data`](/cli/collect-data), [`run-policy`](/cli/run-policy), [`gravity-comp`](/cli/gravity-comp), the [control panel](/guides/control-panel), or the [diagnostics dashboard](/guides/diagnostics-dashboard) — first verifies each fixed-stop joint's reading is plausible for a zero at its calibration end stop, **before any motor is torqued**. If one isn't, it stops with an error naming the joint; run `axol motor.set-zero-pos --guided` to (re)zero, then try again. (`wrist_2` / `wrist_3` get the equivalent check from their end-stop side detection.)
+</Warning>

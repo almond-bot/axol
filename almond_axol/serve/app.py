@@ -8,7 +8,9 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from pydantic import BaseModel
 from ..constants import URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
+from ..utils.sudo import prime_sudo
 from .commands import COMMANDS, command_specs, operation_ids
 from .manager import Session, SessionManager
 from .robot_link import RobotLink, scoped_motor_faults
@@ -320,6 +323,40 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": reason}, status_code=409)
         return JSONResponse({"started": True})
 
+    # -- host power ----------------------------------------------------------
+
+    @app.post("/api/host/shutdown")
+    async def host_shutdown() -> JSONResponse:
+        """Power off the serve host (``shutdown -h now``).
+
+        Refused while an operation or session is running — cutting power mid-
+        run would drop the arms. The hosted install runs as root; a dev serve
+        escalates via ``sudo -n`` so a headless context fails fast instead of
+        blocking on a password prompt.
+        """
+        if not _is_idle():
+            return JSONResponse(
+                {"error": "an operation or session is running — stop it first"},
+                status_code=409,
+            )
+
+        def _halt() -> tuple[bool, str]:
+            cmd = ["shutdown", "-h", "now"]
+            if os.geteuid() != 0:
+                if not prime_sudo():
+                    return False, "root required (no passwordless sudo)"
+                cmd = ["sudo", "-n", *cmd]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
+
+        ok, detail = await asyncio.to_thread(_halt)
+        if not ok:
+            return JSONResponse(
+                {"error": f"shutdown failed: {detail or 'unknown error'}"},
+                status_code=500,
+            )
+        return JSONResponse({"ok": True})
+
     # -- robot connection (detached CAN + 1 Hz motor ping) ------------------
 
     @app.get("/api/robot/status")
@@ -605,6 +642,35 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(snapshot)
+
+    # -- datasets on disk (the replay / collect-data dataset picker) ----------
+
+    @app.get("/api/datasets")
+    async def get_datasets() -> dict[str, Any]:
+        """LeRobot datasets on this host, newest first.
+
+        Scans the shared ``recording.root`` setting when set (the directory
+        collect-data writes to), otherwise the LeRobot cache dir — the same
+        place replay-dataset resolves a bare repo id against.
+        """
+        from pathlib import Path
+
+        from ..recording.datasets import list_datasets
+
+        stored_root = settings.snapshot()["values"].get("recording.root")
+        base = Path(str(stored_root)).expanduser() if stored_root else None
+        found = await asyncio.to_thread(list_datasets, base)
+        return {
+            "datasets": [
+                {
+                    "repoId": d.repo_id,
+                    "root": d.root,
+                    "episodes": d.episodes,
+                    "fps": d.fps,
+                }
+                for d in found
+            ]
+        }
 
     # -- robot model (URDF + meshes for the pose editor) ---------------------
 

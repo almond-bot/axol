@@ -116,8 +116,7 @@ def _plan_joint_trajectory(
     the arc. Returns one full ``(N,)`` joint vector per control tick.
     """
     return plan_collision_aware_trajectory(
-        solver.robot,
-        solver.robot_coll,
+        solver,
         q_from,
         q_to,
         speed=speed_rad_s,

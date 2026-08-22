@@ -117,6 +117,8 @@ The sticks are their own **deadman**: the base only moves while a stick is defle
 
 Enable the cart per-robot from the control panel's **Powered cart** toggle (Robot settings) or with [`axol teleop --cart.enabled true`](/cli/teleop); the tunables live under **Advanced → Cart** (or the `--cart.*` flags). To drive **only** the cart with the arms left untouched — no Axol hub needed — use the control panel's **Cart only** checkbox or [`axol teleop --cart_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring the cart's own CAN adapter.
 
+The telescoping lift needs a one-time [`axol lift.home`](/cli/lift-home) calibration before it will move, and [`axol lift.goto`](/cli/lift-goto) raises it to the robot-install height; both are also on the panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics**.
+
 ## State machine
 
 In **teleop** mode the headset stays in `Teleop` with the recording controls inert. In **data collection** mode it starts in `Data Collection` and drives episodes with **A** / **X**:

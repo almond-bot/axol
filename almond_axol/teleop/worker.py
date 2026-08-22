@@ -15,8 +15,6 @@ import multiprocessing.connection
 import os
 import time
 
-import jax.numpy as jnp
-import jaxlie
 import numpy as np
 
 from ..kinematics.config import KinematicsConfig
@@ -178,7 +176,13 @@ class IKWorker:
 
         self._solver.set_posture_pose(self.get_rest_q())
 
-        self._active: bool = False
+        # Per-arm engage state: an arm is *active* while its (core-synthesized)
+        # lock is held and tracks the controller; an inactive arm in an
+        # otherwise-engaged session is *frozen* — held at the pose it had when
+        # its lock dropped (see ``_hold_fk`` / ``_hold_elbow_fk``).
+        self._active: dict[str, bool] = {"left": False, "right": False}
+        self._hold_fk: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._hold_elbow_fk: dict[str, np.ndarray] = {}
         # Freeze detection state: when the last solve returned its seed
         # unchanged, `_freeze_since` holds the wall time the freeze started and
         # `_freeze_targets` the EE/elbow target positions at that moment, so a
@@ -238,8 +242,15 @@ class IKWorker:
     # -- Core ---------------------------------------------------------------
 
     def step(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
-        """Process one VRFrame. Returns updated full (N,) q in radians."""
-        enabled = frame.l_lock and frame.r_lock
+        """Process one VRFrame. Returns updated full (N,) q in radians.
+
+        ``frame.l_lock`` / ``frame.r_lock`` carry the core's per-arm engage
+        state: a locked arm tracks its controller, an unlocked arm in an
+        otherwise-engaged frame is frozen at the pose it had when its lock
+        dropped. A frame with neither lock leaves ``q_current`` untouched.
+        """
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
 
         # Filter raw VR poses on *every* frame — engaged or not — so the
         # filters are always warm. They used to run only while engaged and be
@@ -308,51 +319,115 @@ class IKWorker:
             left_e = np.array((le[2], le[1], -le[0]), dtype=np.float32)
             right_e = np.array((re[2], re[1], -re[0]), dtype=np.float32)
 
-        if not enabled:
-            self._active = False
+        if not (l_lock or r_lock):
+            self._active = {"left": False, "right": False}
+            self._hold_fk = {}
+            self._hold_elbow_fk = {}
             self._clear_freeze()
             return q_current
 
-        if not self._active:
-            self._active = True
+        was_any = self._active["left"] or self._active["right"]
+        if not was_any:
             self._clear_freeze()
+
+        # Per-arm activation. FK of q_current is needed to snapshot a rising
+        # arm's EE pose and to capture a freezing/frozen arm's hold pose;
+        # compute each (lazily) at most once per step.
+        ee_fk: (
+            tuple[tuple[np.ndarray, np.ndarray], tuple[np.ndarray, np.ndarray]] | None
+        ) = None
+        elbow_fk: tuple[np.ndarray, np.ndarray] | None = None
+
+        def _ee(side: str) -> tuple[np.ndarray, np.ndarray]:
+            nonlocal ee_fk
+            if ee_fk is None:
+                ee_fk = self._solver.fk(q_current)
+            return ee_fk[0] if side == "left" else ee_fk[1]
+
+        def _elbow(side: str) -> np.ndarray:
+            nonlocal elbow_fk
+            if elbow_fk is None:
+                elbow_fk = self._solver.elbow_positions(q_current)
+            return elbow_fk[0] if side == "left" else elbow_fk[1]
+
+        snapped = False
+        for side, lock, ctrl_pos, ctrl_rot, ctrl_e in (
+            ("left", l_lock, left_pos, left_rot, left_e),
+            ("right", r_lock, right_pos, right_rot, right_e),
+        ):
+            if lock:
+                if not self._active[side]:
+                    self._active[side] = True
+                    self._hold_fk.pop(side, None)
+                    self._hold_elbow_fk.pop(side, None)
+                    self._snap_arm(
+                        side,
+                        ctrl_pos,
+                        ctrl_rot,
+                        ctrl_e,
+                        _ee(side),
+                        _elbow(side) if self._use_elbow else None,
+                    )
+                    snapped = True
+            else:
+                if self._active[side]:
+                    self._active[side] = False
+                if side not in self._hold_fk:
+                    self._hold_fk[side] = _ee(side)
+                    if self._use_elbow:
+                        self._hold_elbow_fk[side] = _elbow(side)
+
+        if snapped:
             # Pin posture to ``q_current`` so the held pose is itself the IK
-            # fixed point. The default rest-pose attractor would otherwise pull
-            # q in the EE null space at every frame, growing with distance from
-            # rest; reset() restores the rest-pose attractor.
+            # fixed point (the rest-pose attractor would otherwise pull q in
+            # the EE null space at every frame, growing with distance from
+            # rest; reset() restores it). Re-pinned on *every* engage snap,
+            # not just the first out of a full disengage: a single arm
+            # re-engaging mid-session is no longer pinned to its seed, so a
+            # posture pose left at the previous engage would drag it through
+            # the null space — a visible settle over the first frames even
+            # with a still controller.
             self._solver.set_posture_pose(q_current)
-            self._engage_snap(
-                left_pos, left_rot, right_pos, right_rot, left_e, right_e, q_current
-            )
+            # An engage snap re-anchors that arm to q_current: return the
+            # seed unchanged so the snap frame itself produces no motion
+            # (matching the previous whole-session engage behaviour).
+            self._clear_freeze()
             return q_current
 
         pos_mult = self._config.position_multiplier
         rot_mult = self._config.rotation_multiplier
-        tl_pos, tl_rot = _relative_target_np(
-            left_pos,
-            left_rot,
-            *self._snap_ctrl["left"],
-            *self._snap_fk["left"],
-            position_multiplier=pos_mult,
-            rotation_multiplier=rot_mult,
-        )
-        tr_pos, tr_rot = _relative_target_np(
-            right_pos,
-            right_rot,
-            *self._snap_ctrl["right"],
-            *self._snap_fk["right"],
-            position_multiplier=pos_mult,
-            rotation_multiplier=rot_mult,
-        )
+
+        def _target(
+            side: str, ctrl_pos: np.ndarray, ctrl_rot: np.ndarray
+        ) -> tuple[np.ndarray, np.ndarray]:
+            if self._active[side]:
+                return _relative_target_np(
+                    ctrl_pos,
+                    ctrl_rot,
+                    *self._snap_ctrl[side],
+                    *self._snap_fk[side],
+                    position_multiplier=pos_mult,
+                    rotation_multiplier=rot_mult,
+                )
+            return self._hold_fk[side]
+
+        tl_pos, tl_rot = _target("left", left_pos, left_rot)
+        tr_pos, tr_rot = _target("right", right_pos, right_rot)
 
         elbow_l: np.ndarray | None = None
         elbow_r: np.ndarray | None = None
         if self._use_elbow:
-            elbow_l = self._snap_elbow_fk["left"] + pos_mult * (
-                left_e - self._snap_elbow_ctrl["left"]
+            elbow_l = (
+                self._snap_elbow_fk["left"]
+                + pos_mult * (left_e - self._snap_elbow_ctrl["left"])
+                if self._active["left"]
+                else self._hold_elbow_fk["left"]
             )
-            elbow_r = self._snap_elbow_fk["right"] + pos_mult * (
-                right_e - self._snap_elbow_ctrl["right"]
+            elbow_r = (
+                self._snap_elbow_fk["right"]
+                + pos_mult * (right_e - self._snap_elbow_ctrl["right"])
+                if self._active["right"]
+                else self._hold_elbow_fk["right"]
             )
 
         q_new = self._solver.ik(
@@ -362,6 +437,14 @@ class IKWorker:
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
         )
+        # A frozen arm must not move at all: the hold-pose target keeps the
+        # solve consistent (collision terms see the true pose), but the
+        # joints themselves are pinned to the seed.
+        q_new = np.asarray(q_new, dtype=np.float32).copy()
+        if not self._active["left"]:
+            q_new[self._solver.left_indices] = q_current[self._solver.left_indices]
+        if not self._active["right"]:
+            q_new[self._solver.right_indices] = q_current[self._solver.right_indices]
         targets = [tl_pos, tr_pos]
         if elbow_l is not None and elbow_r is not None:
             targets += [elbow_l, elbow_r]
@@ -377,8 +460,7 @@ class IKWorker:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
         return plan_collision_aware_trajectory(
-            self._solver.robot,
-            self._solver.robot_coll,
+            self._solver,
             q_current,
             q_target,
             speed=cfg.reset_speed,
@@ -397,7 +479,9 @@ class IKWorker:
         Call this before replaying a reset trajectory so the next engage
         performs a fresh engage-snap from the current IK pose.
         """
-        self._active = False
+        self._active = {"left": False, "right": False}
+        self._hold_fk = {}
+        self._hold_elbow_fk = {}
         self._clear_freeze()
         self._snap_ctrl = {}
         self._snap_fk = {}
@@ -475,22 +559,8 @@ class IKWorker:
         at engage time.
         """
         q = self.get_rest_q()
-        fk = self._solver.robot.forward_kinematics(jnp.asarray(q))
-
-        def _pose(idx: int) -> tuple[np.ndarray, np.ndarray]:
-            T = jaxlie.SE3(fk[idx])
-            return (
-                np.asarray(T.translation(), dtype=np.float32),
-                np.asarray(T.rotation().as_matrix(), dtype=np.float32),
-            )
-
-        def _elbow(idx: int) -> np.ndarray:
-            return np.asarray(jaxlie.SE3(fk[idx]).translation(), dtype=np.float32)
-
-        l_pose = _pose(self._solver.l_ee_idx)
-        r_pose = _pose(self._solver.r_ee_idx)
-        l_elbow = _elbow(self._solver.l_elbow_idx)
-        r_elbow = _elbow(self._solver.r_elbow_idx)
+        l_pose, r_pose = self._solver.fk(q)
+        l_elbow, r_elbow = self._solver.elbow_positions(q)
 
         for _ in range(max_iterations):
             self._solver.set_posture_pose(q)
@@ -506,48 +576,27 @@ class IKWorker:
             q = q_new
         return q
 
-    def _engage_snap(
+    def _snap_arm(
         self,
-        left_pos: np.ndarray,
-        left_rot: np.ndarray,
-        right_pos: np.ndarray,
-        right_rot: np.ndarray,
-        left_e: np.ndarray | None,
-        right_e: np.ndarray | None,
-        q_current: np.ndarray,
+        side: str,
+        ctrl_pos: np.ndarray,
+        ctrl_rot: np.ndarray,
+        ctrl_e: np.ndarray | None,
+        ee_pose: tuple[np.ndarray, np.ndarray],
+        elbow_pos: np.ndarray | None,
     ) -> None:
-        """Snapshot controller and FK poses at toggle engage.
+        """Snapshot one arm's controller and FK poses at its engage edge.
 
-        These snapshots become the origin against which subsequent controller
-        motion is measured to build relative EE and elbow targets in
-        :meth:`step`. Elbow snapshots are ``None`` when elbow tracking is
-        disabled (``kinematics.elbow_weight == 0``) and are never read.
+        These snapshots become the origin against which that controller's
+        subsequent motion is measured to build relative EE and elbow targets
+        in :meth:`step`. The elbow snapshots are ``None`` when elbow tracking
+        is disabled (``kinematics.elbow_weight == 0``) and are never read.
         """
-        fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
-
-        def _fk_pos_rot(idx: int) -> tuple[np.ndarray, np.ndarray]:
-            T = jaxlie.SE3(fk[idx])
-            pos = np.asarray(T.translation(), dtype=np.float32)
-            rot = np.asarray(T.rotation().as_matrix(), dtype=np.float32)
-            return pos, rot
-
-        self._snap_ctrl = {
-            "left": (left_pos, left_rot),
-            "right": (right_pos, right_rot),
-        }
-        self._snap_fk = {
-            "left": _fk_pos_rot(self._solver.l_ee_idx),
-            "right": _fk_pos_rot(self._solver.r_ee_idx),
-        }
-        self._snap_elbow_ctrl = {"left": left_e, "right": right_e}
-        self._snap_elbow_fk = {
-            "left": np.asarray(
-                jaxlie.SE3(fk[self._solver.l_elbow_idx]).translation(), dtype=np.float32
-            ),
-            "right": np.asarray(
-                jaxlie.SE3(fk[self._solver.r_elbow_idx]).translation(), dtype=np.float32
-            ),
-        }
+        self._snap_ctrl[side] = (ctrl_pos, ctrl_rot)
+        self._snap_fk[side] = ee_pose
+        self._snap_elbow_ctrl[side] = ctrl_e
+        if elbow_pos is not None:
+            self._snap_elbow_fk[side] = elbow_pos
 
 
 # ---------------------------------------------------------------------------

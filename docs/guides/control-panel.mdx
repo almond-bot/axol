@@ -41,7 +41,7 @@ The top of the panel is a pair of tiles — **Axol Host** and **Axol** — each 
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed). When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot; press the power button to disconnect. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed); if the host can't be reached the attempt gives up after a couple of seconds with a *can't reach the host* message instead of leaving the tile stuck on *Connecting…*. When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot. Pressing the power button disconnects **this browser only** — a client-side drop that leaves the server, the robot link, and any running operation untouched, so another operator driving the same host isn't affected. Teleop and gravity comp need only this connection.
 
 #### Updates
 
@@ -61,7 +61,7 @@ The panel connects the robot **automatically** once the host comes online (one a
 The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
 <Warning>
-  Closing the browser tab does **not** stop anything — the robot link and any running operation live in the `serve` process and keep running. Use **Stop** / **Disconnect** (or stop `axol serve`) to tear them down.
+  Closing the browser tab — or disconnecting the **host** — does **not** stop anything: the robot link and any running operation live in the `serve` process and keep running. Use **Stop**, **Robot Disconnect**, or stop `axol serve` to tear them down.
 </Warning>
 
 ## Settings
@@ -125,7 +125,7 @@ Per-run values (repo ids, task names, …) are remembered by your browser so the
 
 ### Running, logs, and stopping
 
-Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. The console captures not just the operation's Python output but also **native-library and subprocess output** — the ZED SDK, GStreamer, and CUDA, plus the spawned video-relay and recorder processes — so a camera or ZED failure surfaces its actual reason in the UI instead of a bare "exited". The console **auto-follows** new output only while you're scrolled to the bottom; scroll up to read earlier lines and it stops yanking you back down until you return to the bottom. The **download** button in the Logs header saves everything currently in the console to a timestamped `.log` file (disabled when there's no output) — handy for attaching to a bug report. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Host** / **Robot Disconnect** likewise wait for the running op to finish tearing down before proceeding.
+Starting an operation streams its logs into the console at the bottom of the page and shows a status badge. The console captures not just the operation's Python output but also **native-library and subprocess output** — the ZED SDK, GStreamer, and CUDA, plus the spawned video-relay and recorder processes — so a camera or ZED failure surfaces its actual reason in the UI instead of a bare "exited". The console **auto-follows** new output only while you're scrolled to the bottom; scroll up to read earlier lines and it stops yanking you back down. While you're scrolled up, a **floating arrow button** in the lower-right of the log area jumps you back to the latest line and re-engages auto-follow. The **download** button in the Logs header saves everything currently in the console to a timestamped `.log` file (disabled when there's no output) — handy for attaching to a bug report. Press **Stop** to end it — the request returns immediately and the badge and button flip to **Stopping…** while a background watchdog tears the op down (force-killing its child subprocesses after a short grace if a save or startup is still blocking). The panel polls until the op is truly gone, then the robot link returns to idle 1 Hz polling. **Robot Disconnect** likewise stops the running op and waits for it to finish tearing down before releasing the robot link; the host **Disconnect**, by contrast, is a client-side drop that leaves any running op in place server-side.
 
 ## Operator view
 
@@ -143,8 +143,8 @@ For **Run policy**:
 |---|---|
 | **Start episode** | Begin the next rollout (advances the between-episode "reset the scene" gate). |
 | **Save** | Save the current episode and return to the reset gate — press **Start episode** for the next one. |
-| **Discard** | Drop the current episode and return to the reset gate to redo it. |
-| **Return to rest** | Only during a **Contact** hold: the guarded return between episodes met resistance and the arms are limp. Clear them by hand, then press this to replan the return from where they are. |
+| **Discard** | Drop the current episode. The arms go **limp** for hand-repositioning — a failed rollout usually leaves them somewhere they shouldn't be, so they don't drive home from that pose — then **Return to rest** before the next take. |
+| **Return to rest** | Send the limp arms home, replanning the collision-aware return from where they are. Appears whenever the arms are left limp: after a **Discard** (phase **Limp**), or when the guarded between-episode return meets resistance (phase **Contact**). Clear the arms by hand first. |
 
 These mirror the `s` / `r` keystrokes and the Enter prompts the [`run-policy`](/cli/run-policy) CLI reads from stdin.
 

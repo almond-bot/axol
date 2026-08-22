@@ -47,9 +47,30 @@ class VRTeleopConfig:
             replans from wherever the arms were left. Raise if normal
             returns false-trip on the friction / model-error background;
             ``0`` disables the watchdog. Defaults to ``4.0``.
+        teleop_torque_threshold: Contact watchdog for the *tracking* phase
+            (hardware only) — the same sustained-torque-residual trip as
+            ``reset_torque_threshold``, but active while the operator is
+            driving the arms (``axol teleop`` and ``collect-data``; replay
+            playback shares this field). On a trip, tracking disengages and
+            the arms drop into the limp gravity-comp hold; hand-guide them
+            clear and press reset to return to rest and continue. ``0``
+            (the default) disables it — tracking pushes against payloads
+            and the scene on purpose, so only the return-to-rest guard is
+            always on. Set a threshold (``16.0`` is the control panel's
+            suggested value) to enable.
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
+        hold_to_engage: Grip behaviour. ``False`` (default) is the toggle
+            scheme: from rest, click both grips together to engage both
+            arms; while engaged, a click on either grip toggles *that* arm
+            between tracking and frozen (a frozen arm holds its pose and
+            gripper — e.g. it keeps a grasp steady while the other arm
+            works). ``True`` is the dead-man scheme: hold both grips to
+            engage from rest, and each arm tracks only while its grip
+            stays held — release a grip and that arm freezes where it is,
+            hold on and it keeps going; re-engaging from a full release
+            requires holding both again.
         engage_max_vel: Starting joint-velocity cap (rad/s) for the
             trapezoidal filter when teleop is first engaged after a rest-pose
             trajectory (startup or reset). Softens the transition from rest
@@ -155,7 +176,9 @@ class VRTeleopConfig:
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
     reset_torque_threshold: float = 4.0
+    teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
+    hold_to_engage: bool = False
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
     teleop_max_vel: float = 1.0 * 2 * math.pi
