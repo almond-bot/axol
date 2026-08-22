@@ -564,12 +564,15 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
 
 export type SettingValue = string | number | boolean | number[]
 
-/** Optional widget hints for a settings field (slider ranges, pose editor). */
+/** Optional widget hints for a settings field (slider ranges, pose editor,
+ * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose"
+  widget?: "slider" | "pose" | "toggle-number"
   min?: number
   max?: number
   step?: number
+  /** toggle-number: value filled in when the switch turns on. */
+  onValue?: number
 }
 
 export interface SettingsField {

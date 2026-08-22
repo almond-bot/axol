@@ -47,20 +47,17 @@ class VRTeleopConfig:
             replans from wherever the arms were left. Raise if normal
             returns false-trip on the friction / model-error background;
             ``0`` disables the watchdog. Defaults to ``4.0``.
-        teleop_contact_stop: Enable the contact watchdog for the *tracking*
-            phase (hardware only) — the same sustained-torque-residual trip
-            as ``reset_torque_threshold``, but active while the operator is
+        teleop_torque_threshold: Contact watchdog for the *tracking* phase
+            (hardware only) — the same sustained-torque-residual trip as
+            ``reset_torque_threshold``, but active while the operator is
             driving the arms (``axol teleop`` and ``collect-data``; replay
-            playback shares these two fields). On a trip, tracking
-            disengages and the arms drop into the limp gravity-comp hold;
-            hand-guide them clear and press reset to return to rest and
-            continue. Off by default: tracking pushes against payloads and
-            the scene on purpose, so only the return-to-rest guard is
-            always on. Defaults to ``False``.
-        teleop_torque_threshold: Trip threshold (Nm) for that tracking
-            watchdog; only read when ``teleop_contact_stop`` is enabled.
-            Raise it if deliberate task contact keeps tripping it.
-            Defaults to ``16.0``.
+            playback shares this field). On a trip, tracking disengages and
+            the arms drop into the limp gravity-comp hold; hand-guide them
+            clear and press reset to return to rest and continue. ``0``
+            (the default) disables it — tracking pushes against payloads
+            and the scene on purpose, so only the return-to-rest guard is
+            always on. Set a threshold (``16.0`` is the control panel's
+            suggested value) to enable.
         reset_gravity_comp_kd: Velocity damping (Nm·s/rad) for the arm
             joints during the contact-fallback gravity-comp hold; same
             semantics as ``axol gravity-comp --kd``. Defaults to ``0.25``.
@@ -179,8 +176,7 @@ class VRTeleopConfig:
     reset_collision_weight: float = 100.0
     reset_max_iterations: int = 10
     reset_torque_threshold: float = 4.0
-    teleop_contact_stop: bool = False
-    teleop_torque_threshold: float = 16.0
+    teleop_torque_threshold: float = 0.0
     reset_gravity_comp_kd: float = 0.25
     hold_to_engage: bool = False
     engage_max_vel: float = 0.1 * 2 * math.pi

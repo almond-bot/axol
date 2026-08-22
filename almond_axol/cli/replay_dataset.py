@@ -95,17 +95,15 @@ class ReplayDatasetConfig:
     # has no interactive retry channel, so the hold lasts until the run is
     # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
-    # Contact watchdog while the episode itself plays back (opt-in): the
-    # same sustained-torque-residual trip, checked on every command. On a
-    # trip playback stops and the arms drop into the limp gravity-comp hold
-    # until the run is stopped. Off by default — replayed episodes touch the
-    # scene on purpose, so only the return-to-rest guard is always on. The
-    # fields mirror the teleop config's (`axol teleop` and collect-data
-    # share the same knob in the control panel).
-    teleop_contact_stop: bool = False
-    # Trip threshold (Nm) for that playback watchdog; only read when
-    # teleop_contact_stop is enabled.
-    teleop_torque_threshold: float = 16.0
+    # Contact watchdog while the episode itself plays back: the same
+    # sustained-torque-residual trip, checked on every command. On a trip
+    # playback stops and the arms drop into the limp gravity-comp hold until
+    # the run is stopped. 0 (the default) disables it — replayed episodes
+    # touch the scene on purpose, so only the return-to-rest guard is always
+    # on; set a threshold (16 is the control panel's suggested value) to
+    # enable. Mirrors the teleop config's field of the same name (`axol
+    # teleop` and collect-data share the same knob in the control panel).
+    teleop_torque_threshold: float = 0.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
@@ -296,17 +294,17 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         differentiating commanded positions against wall time, so interval
         jitter comes out of the arm as torque jitter.
 
-        With ``teleop_contact_stop`` enabled, a torque residual sustained
-        above ``teleop_torque_threshold`` (the scene changed since the
-        recording — something is in the way, or a gripper caught) stops
-        playback and returns the tripped ``(joint, residual)``; ``None`` on
-        a clean finish or stop.
+        With ``teleop_torque_threshold`` set (> 0), a torque residual
+        sustained above it (the scene changed since the recording —
+        something is in the way, or a gripper caught) stops playback and
+        returns the tripped ``(joint, residual)``; ``None`` on a clean
+        finish or stop.
         """
         from ..robot.control import ContactWatchdog
 
         watchdog = (
             ContactWatchdog(cfg.teleop_torque_threshold)
-            if cfg.teleop_contact_stop
+            if cfg.teleop_torque_threshold > 0
             else None
         )
         send_period = 1.0 / (fps * substeps)

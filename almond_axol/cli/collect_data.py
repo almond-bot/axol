@@ -319,8 +319,8 @@ class CollectDataConfig:
     # unexpected contact (reset replans from wherever they were left; a
     # recording episode is discarded). The knobs live on the shared teleop
     # config — ``--teleop_config.vr_teleop_config.reset_torque_threshold``
-    # (0 disables), ``.teleop_contact_stop`` / ``.teleop_torque_threshold``
-    # (the tracking watchdog, off by default) and ``.reset_gravity_comp_kd``
+    # and ``.teleop_torque_threshold`` (the tracking watchdog; 0 disables
+    # either, the tracking one defaults off) and ``.reset_gravity_comp_kd``
     # — the same fields `axol teleop` uses, so the two flows behave
     # identically.
     root: str | None = None
@@ -925,14 +925,14 @@ def _run(
         rerecord = False
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
-        # Tracking-phase contact watchdog (opt-in via teleop_contact_stop):
-        # the same sustained-torque trip the guarded return uses, active
-        # while the operator drives the arms. A trip ends the loop (third
-        # element of the return tuple True); the caller discards any
-        # recording and runs the limp contact hold.
+        # Tracking-phase contact watchdog (opt-in — the threshold defaults
+        # to 0 = off): the same sustained-torque trip the guarded return
+        # uses, active while the operator drives the arms. A trip ends the
+        # loop (third element of the return tuple True); the caller discards
+        # any recording and runs the limp contact hold.
         watchdog = (
             ContactWatchdog(vrt_cfg.teleop_torque_threshold)
-            if vrt_cfg.teleop_contact_stop
+            if vrt_cfg.teleop_torque_threshold > 0
             else None
         )
 

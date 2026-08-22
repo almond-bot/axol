@@ -300,35 +300,25 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.teleop_contact_stop",
-                label="Teleop contact stop",
-                type="boolean",
+                key="robot.teleop_torque_threshold",
+                label="Teleop contact stop (Nm)",
+                type="number",
                 help=(
                     "Contact watchdog while the operator drives the arms "
                     "(teleop and data collection) or a recorded episode "
-                    "plays back (replay): a sustained torque above the "
-                    "teleop contact threshold disengages tracking / stops "
+                    "plays back (replay): a torque this far (Nm) from the "
+                    "gravity model, sustained, disengages tracking / stops "
                     "playback and drops the arms into the limp gravity-comp "
                     "hold — free them by hand, then press reset to return "
                     "to rest. Off by default (only the return-to-rest guard "
-                    "is always on): tracking pushes on the scene on purpose."
+                    "is always on): tracking pushes on the scene on "
+                    "purpose. Raise the threshold if deliberate task "
+                    "contact keeps tripping it."
                 ),
-                targets={
-                    "teleop": ("teleop.teleop_contact_stop",),
-                    "collect-data": (f"{_VRT}.teleop_contact_stop",),
-                    "replay-dataset": ("teleop_contact_stop",),
-                },
-            ),
-            SettingDef(
-                key="robot.teleop_torque_threshold",
-                label="Teleop contact threshold (Nm)",
-                type="number",
-                help=(
-                    "Trip threshold for the teleop contact stop (only used "
-                    "while that toggle is on): a torque this far (Nm) from "
-                    "the gravity model, sustained, counts as contact. Raise "
-                    "it if deliberate task contact keeps tripping the stop."
-                ),
+                # One combined control: a switch that arms the watchdog
+                # (filling in the suggested threshold) with the value
+                # editable next to it; off stores 0 = disabled.
+                ui={"widget": "toggle-number", "onValue": 16},
                 targets={
                     "teleop": ("teleop.teleop_torque_threshold",),
                     "collect-data": (f"{_VRT}.teleop_torque_threshold",),
@@ -336,31 +326,20 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.policy_contact_stop",
-                label="Policy contact stop",
-                type="boolean",
-                help=(
-                    "Contact watchdog while a policy drives the arms: a "
-                    "sustained torque above the policy contact threshold "
-                    "aborts the episode (nothing is saved) and drops the "
-                    "arms into the limp gravity-comp hold. Off by default "
-                    "(only the return-to-rest guard is always on): the "
-                    "policy pushes on the scene on purpose."
-                ),
-                targets={
-                    "run-policy": ("policy_contact_stop",),
-                },
-            ),
-            SettingDef(
                 key="robot.policy_torque_threshold",
-                label="Policy contact threshold (Nm)",
+                label="Policy contact stop (Nm)",
                 type="number",
                 help=(
-                    "Trip threshold for the policy contact stop (only used "
-                    "while that toggle is on): a torque this far (Nm) from "
-                    "the gravity model, sustained, counts as contact. Raise "
-                    "it if legitimate task contact keeps tripping the stop."
+                    "Contact watchdog while a policy drives the arms: a "
+                    "torque this far (Nm) from the gravity model, "
+                    "sustained, aborts the episode (nothing is saved) and "
+                    "drops the arms into the limp gravity-comp hold. Off "
+                    "by default (only the return-to-rest guard is always "
+                    "on): the policy pushes on the scene on purpose. Raise "
+                    "the threshold if legitimate task contact keeps "
+                    "tripping it."
                 ),
+                ui={"widget": "toggle-number", "onValue": 16},
                 targets={
                     "run-policy": ("policy_torque_threshold",),
                 },
