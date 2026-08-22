@@ -432,6 +432,26 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
   )
 }
 
+// ---------------------------------------------------------------------------
+// Datasets on disk (the replay / collect-data panels' dataset picker)
+// ---------------------------------------------------------------------------
+
+/** One LeRobot dataset found on the serve host (see /api/datasets). */
+export interface DatasetInfo {
+  /** Repo id relative to the datasets root — what replay/collect take. */
+  repoId: string
+  /** Absolute dataset directory on the serve host. */
+  root: string
+  episodes: number | null
+  fps: number | null
+}
+
+/** Datasets on the serve host, newest first. Empty on older hosts (404). */
+export async function fetchDatasets(): Promise<DatasetInfo[]> {
+  const res: { datasets?: DatasetInfo[] } = await json(await fetch(apiUrl("/api/datasets")))
+  return res.datasets ?? []
+}
+
 /** Which eye(s) of a stereo ZED X to use, per branch. */
 export type StereoEyes = "both" | "left" | "right"
 
@@ -544,12 +564,15 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
 
 export type SettingValue = string | number | boolean | number[]
 
-/** Optional widget hints for a settings field (slider ranges, pose editor). */
+/** Optional widget hints for a settings field (slider ranges, pose editor,
+ * toggle-number = a switch arming a numeric value where 0 means off). */
 export interface SettingsFieldUI {
-  widget?: "slider" | "pose"
+  widget?: "slider" | "pose" | "toggle-number"
   min?: number
   max?: number
   step?: number
+  /** toggle-number: value filled in when the switch turns on. */
+  onValue?: number
 }
 
 export interface SettingsField {

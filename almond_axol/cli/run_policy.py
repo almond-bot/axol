@@ -41,6 +41,7 @@ from ..lerobot.rollout import (
     RolloutCaptureThread,
 )
 from ..recording import make_episode_durable, restore_dataset_ownership
+from ..robot.control import ContactWatchdog
 from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from .collect_data import check_resume_consistency
@@ -172,6 +173,15 @@ class RunPolicyConfig:
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
+    # Contact watchdog while the *policy* drives the arms: the same
+    # sustained-torque-residual trip, checked on every executed action. On a
+    # trip the episode aborts (nothing is saved) and the arms drop into the
+    # limp gravity-comp hold; clear them by hand, then continue to return to
+    # rest and start the next attempt. 0 (the default) disables it — the
+    # policy pushes on the scene on purpose, so only the return-to-rest
+    # guard is always on; set a threshold (16 is the control panel's
+    # suggested value) to enable.
+    policy_torque_threshold: float = 0.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
@@ -232,6 +242,14 @@ _DISCARD_LIMP_PROMPT = (
     "Reposition them and reset the scene, then return to rest."
 )
 
+# The tracking contact watchdog tripped mid-episode (the policy pushed or
+# pulled on something sustained above the threshold), so the rollout was
+# aborted and the arms dropped into the limp hold.
+_EPISODE_CONTACT_PROMPT = (
+    "Contact — torque exceeded the threshold, so the episode stopped and "
+    "the arms are limp and free to move. Clear them, then return to rest."
+)
+
 
 class _StdinPolicyControl:
     """Terminal episode control: stdin keystrokes + Enter-to-continue prompts."""
@@ -250,6 +268,9 @@ class _StdinPolicyControl:
 
     def await_contact_clear(self) -> bool:
         return self.await_continue(_CONTACT_PROMPT)
+
+    def await_episode_contact_clear(self) -> bool:
+        return self.await_continue(_EPISODE_CONTACT_PROMPT)
 
     def await_manual_reset(self) -> bool:
         return self.await_continue(_DISCARD_LIMP_PROMPT)
@@ -394,6 +415,13 @@ class _QueuePolicyControl:
             self._set_phase("resetting")
         return cleared
 
+    def await_episode_contact_clear(self) -> bool:
+        """Gate for the mid-episode contact hold; resolves to a return-to-rest."""
+        cleared = self._await_gate("contact", _EPISODE_CONTACT_PROMPT, "Return to rest")
+        if cleared:
+            self._set_phase("resetting")
+        return cleared
+
     def await_manual_reset(self) -> bool:
         """Gate for the discard-cleanup limp hold; resolves to a return-to-rest."""
         cleared = self._await_gate("limp", _DISCARD_LIMP_PROMPT, "Return to rest")
@@ -530,6 +558,7 @@ def _build_axol_robot_client(
     align_fade_s: float = 1.0,
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
+    policy_torque_threshold: float = 0.0,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -549,6 +578,11 @@ def _build_axol_robot_client(
             disables the filter (see ``RunPolicyConfig.exec_max_vel``).
         exec_max_accel: Execution filter joint-acceleration limit (rad/s²);
             0 disables the filter (see ``RunPolicyConfig.exec_max_accel``).
+        policy_torque_threshold: Tracking contact watchdog threshold (Nm)
+            checked on every executed action; a trip sets
+            ``contact_tripped`` and shuts the episode down. ``<= 0``
+            disables (the default; see
+            ``RunPolicyConfig.policy_torque_threshold``).
     """
     import threading as _threading
     from queue import Queue
@@ -620,6 +654,7 @@ def _build_axol_robot_client(
             align_fade_s,
             exec_max_vel,
             exec_max_accel,
+            policy_torque_threshold,
         ):
             # We override the private RobotClient._aggregate_action_queues to
             # inject temporal_ensemble (no public hook can express it — see the
@@ -693,6 +728,12 @@ def _build_axol_robot_client(
             # Surfaces unhandled control-loop exceptions (typically CAN
             # faults) to the episode supervisor for an immediate teardown.
             self.fatal_error: BaseException | None = None
+            # Tracking contact watchdog: checked after every executed action.
+            # A trip records the offending joint here and signals shutdown so
+            # the episode supervisor aborts the rollout and holds limp.
+            self._contact_threshold = float(policy_torque_threshold)
+            self._contact_watchdog = ContactWatchdog(self._contact_threshold)
+            self.contact_tripped: "tuple[str, float] | None" = None
 
             lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -749,6 +790,8 @@ def _build_axol_robot_client(
             self.start_barrier = _threading.Barrier(3)
             self._race_fix_warned = False
             self.fatal_error = None
+            self._contact_watchdog = ContactWatchdog(self._contact_threshold)
+            self.contact_tripped = None
             if self._publisher is not None:
                 self._publisher.reset()
 
@@ -1036,6 +1079,23 @@ def _build_axol_robot_client(
             performed = self.robot.send_action(action)
             if self._publisher is not None and performed is not None:
                 self._publisher.publish(performed)
+            # Tracking contact watchdog: a torque residual sustained above
+            # the threshold means the policy is pushing/pulling on something
+            # beyond legitimate task contact — abort the episode so the
+            # supervisor can hold the arms limp instead of grinding on.
+            if self.contact_tripped is None:
+                tripped = self._contact_watchdog.update(self.robot.torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    _logger.warning(
+                        "policy contact: %s torque residual %.1f exceeds "
+                        "%.1f — stopping the episode",
+                        joint,
+                        residual,
+                        self._contact_threshold,
+                    )
+                    self.contact_tripped = tripped
+                    self.shutdown_event.set()
             return performed
 
         def control_loop_action(self, verbose: bool = False):  # type: ignore[no-untyped-def]
@@ -1192,6 +1252,7 @@ def _build_axol_robot_client(
         align_fade_s,
         exec_max_vel,
         exec_max_accel,
+        policy_torque_threshold,
     )
 
 
@@ -1445,6 +1506,7 @@ def _run(
             align_fade_s=cfg.align_fade_s,
             exec_max_vel=cfg.exec_max_vel,
             exec_max_accel=cfg.exec_max_accel,
+            policy_torque_threshold=cfg.policy_torque_threshold,
         )
 
         log_say("Loading policy on server (one-time)...")
@@ -1562,6 +1624,10 @@ def _run(
                                 "saving the current episode."
                             )
                             break
+                        if client.contact_tripped is not None:
+                            # Tracking contact — the client already signalled
+                            # shutdown; the limp hold runs after teardown.
+                            break
                         time.sleep(0.1)
                 except KeyboardInterrupt:
                     interrupted = True
@@ -1596,6 +1662,32 @@ def _run(
                 if dataset is not None:
                     dataset.clear_episode_buffer()
                 break
+
+            if client.contact_tripped is not None:
+                # The tracking contact watchdog aborted the rollout: nothing
+                # is saved, and the arms drop into the limp gravity-comp hold
+                # so the operator can clear them by hand. The gate ("Return
+                # to rest" on the panel, Enter on the terminal) then plans
+                # the return from wherever the arms were left.
+                joint, _residual = client.contact_tripped
+                log_say(f"Contact on {joint} — episode aborted; arms are limp.")
+                if dataset is not None:
+                    dataset.clear_episode_buffer()
+                if not reset_controller.hold_limp(
+                    robot,
+                    gravity_comp_kd=cfg.reset_gravity_comp_kd,
+                    wait=control.await_episode_contact_clear,
+                    stopped=stop_event.is_set,
+                ):
+                    break
+                log_say("Returning to rest pose.")
+                if not _return_to_rest_guarded():
+                    break
+                if not control.await_continue(
+                    "Reset the scene, then start the next episode."
+                ):
+                    break
+                continue
 
             choice = control.poll_choice()
             if timed_out:

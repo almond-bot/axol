@@ -300,6 +300,51 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
+                key="robot.teleop_torque_threshold",
+                label="Teleop contact stop (Nm)",
+                type="number",
+                help=(
+                    "Contact watchdog while the operator drives the arms "
+                    "(teleop and data collection) or a recorded episode "
+                    "plays back (replay): a torque this far (Nm) from the "
+                    "gravity model, sustained, disengages tracking / stops "
+                    "playback and drops the arms into the limp gravity-comp "
+                    "hold — free them by hand, then press reset to return "
+                    "to rest. Off by default (only the return-to-rest guard "
+                    "is always on): tracking pushes on the scene on "
+                    "purpose. Raise the threshold if deliberate task "
+                    "contact keeps tripping it."
+                ),
+                # One combined control: a switch that arms the watchdog
+                # (filling in the suggested threshold) with the value
+                # editable next to it; off stores 0 = disabled.
+                ui={"widget": "toggle-number", "onValue": 16},
+                targets={
+                    "teleop": ("teleop.teleop_torque_threshold",),
+                    "collect-data": (f"{_VRT}.teleop_torque_threshold",),
+                    "replay-dataset": ("teleop_torque_threshold",),
+                },
+            ),
+            SettingDef(
+                key="robot.policy_torque_threshold",
+                label="Policy contact stop (Nm)",
+                type="number",
+                help=(
+                    "Contact watchdog while a policy drives the arms: a "
+                    "torque this far (Nm) from the gravity model, "
+                    "sustained, aborts the episode (nothing is saved) and "
+                    "drops the arms into the limp gravity-comp hold. Off "
+                    "by default (only the return-to-rest guard is always "
+                    "on): the policy pushes on the scene on purpose. Raise "
+                    "the threshold if legitimate task contact keeps "
+                    "tripping it."
+                ),
+                ui={"widget": "toggle-number", "onValue": 16},
+                targets={
+                    "run-policy": ("policy_torque_threshold",),
+                },
+            ),
+            SettingDef(
                 key="robot.gravity_kd",
                 label="Gravity comp damping (kd)",
                 type="number",
@@ -363,6 +408,23 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 targets={
                     "teleop": ("teleop.rotation_multiplier",),
                     "collect-data": (f"{_VRT}.rotation_multiplier",),
+                },
+            ),
+            SettingDef(
+                key="teleop.hold_to_engage",
+                label="Hold grips to engage",
+                type="boolean",
+                help=(
+                    "Dead-man grip scheme: hold both grips to start driving, "
+                    "and each arm tracks only while its grip stays held — "
+                    "release one and that arm freezes where it is. Off "
+                    "(default) is the toggle scheme: click both grips to "
+                    "engage from rest, then a click on either grip toggles "
+                    "that arm between tracking and frozen."
+                ),
+                targets={
+                    "teleop": ("teleop.hold_to_engage",),
+                    "collect-data": (f"{_VRT}.hold_to_engage",),
                 },
             ),
             SettingDef(
