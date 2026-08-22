@@ -173,13 +173,16 @@ class RunPolicyConfig:
     # through — free them by hand, then continue (Enter / the panel's Start)
     # to replan from wherever they were left. 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
-    # Contact watchdog while the *policy* drives the arms: the same
+    # Contact watchdog while the *policy* drives the arms (opt-in): the same
     # sustained-torque-residual trip, checked on every executed action. On a
     # trip the episode aborts (nothing is saved) and the arms drop into the
     # limp gravity-comp hold; clear them by hand, then continue to return to
-    # rest and start the next attempt. The policy pushes on the scene on
-    # purpose, so the default sits above the reset threshold; raise it if
-    # legitimate task contact keeps tripping it. 0 disables the watchdog.
+    # rest and start the next attempt. Off by default — the policy pushes on
+    # the scene on purpose, so only the return-to-rest guard is always on.
+    policy_contact_stop: bool = False
+    # Trip threshold (Nm) for that policy watchdog; only read when
+    # policy_contact_stop is enabled. Raise it if legitimate task contact
+    # keeps tripping it.
     policy_torque_threshold: float = 16.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
@@ -557,7 +560,7 @@ def _build_axol_robot_client(
     align_fade_s: float = 1.0,
     exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
-    policy_torque_threshold: float = 16.0,
+    policy_torque_threshold: float = 0.0,
 ) -> Any:
     """Construct an ``AxolRobotClient`` against an already-connected robot.
 
@@ -579,8 +582,9 @@ def _build_axol_robot_client(
             0 disables the filter (see ``RunPolicyConfig.exec_max_accel``).
         policy_torque_threshold: Tracking contact watchdog threshold (Nm)
             checked on every executed action; a trip sets
-            ``contact_tripped`` and shuts the episode down (see
-            ``RunPolicyConfig.policy_torque_threshold``). 0 disables.
+            ``contact_tripped`` and shuts the episode down. ``<= 0``
+            disables (the default — callers pass the configured threshold
+            only when ``RunPolicyConfig.policy_contact_stop`` is enabled).
     """
     import threading as _threading
     from queue import Queue
@@ -1504,7 +1508,9 @@ def _run(
             align_fade_s=cfg.align_fade_s,
             exec_max_vel=cfg.exec_max_vel,
             exec_max_accel=cfg.exec_max_accel,
-            policy_torque_threshold=cfg.policy_torque_threshold,
+            policy_torque_threshold=(
+                cfg.policy_torque_threshold if cfg.policy_contact_stop else 0.0
+            ),
         )
 
         log_say("Loading policy on server (one-time)...")

@@ -95,13 +95,17 @@ class ReplayDatasetConfig:
     # has no interactive retry channel, so the hold lasts until the run is
     # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
     reset_torque_threshold: float = 4.0
-    # Contact watchdog while the episode itself plays back: the same
-    # sustained-torque-residual trip, checked on every command. On a trip
-    # playback stops and the arms drop into the limp gravity-comp hold until
-    # the run is stopped. Replayed episodes touch the scene on purpose, so
-    # the default sits above the reset threshold; raise it if legitimate
-    # task contact keeps tripping it. 0 disables.
-    play_torque_threshold: float = 16.0
+    # Contact watchdog while the episode itself plays back (opt-in): the
+    # same sustained-torque-residual trip, checked on every command. On a
+    # trip playback stops and the arms drop into the limp gravity-comp hold
+    # until the run is stopped. Off by default — replayed episodes touch the
+    # scene on purpose, so only the return-to-rest guard is always on. The
+    # fields mirror the teleop config's (`axol teleop` and collect-data
+    # share the same knob in the control panel).
+    teleop_contact_stop: bool = False
+    # Trip threshold (Nm) for that playback watchdog; only read when
+    # teleop_contact_stop is enabled.
+    teleop_torque_threshold: float = 16.0
     # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
     # semantics as `axol gravity-comp --kd`.
     reset_gravity_comp_kd: float = 0.25
@@ -292,14 +296,19 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         differentiating commanded positions against wall time, so interval
         jitter comes out of the arm as torque jitter.
 
-        A torque residual sustained above ``play_torque_threshold`` (the
-        scene changed since the recording — something is in the way, or a
-        gripper caught) stops playback and returns the tripped
-        ``(joint, residual)``; ``None`` on a clean finish or stop.
+        With ``teleop_contact_stop`` enabled, a torque residual sustained
+        above ``teleop_torque_threshold`` (the scene changed since the
+        recording — something is in the way, or a gripper caught) stops
+        playback and returns the tripped ``(joint, residual)``; ``None`` on
+        a clean finish or stop.
         """
         from ..robot.control import ContactWatchdog
 
-        watchdog = ContactWatchdog(cfg.play_torque_threshold)
+        watchdog = (
+            ContactWatchdog(cfg.teleop_torque_threshold)
+            if cfg.teleop_contact_stop
+            else None
+        )
         send_period = 1.0 / (fps * substeps)
         deadline = time.perf_counter()
         for idx in range(num_frames):
@@ -314,17 +323,18 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                 values = base if sub == 0 else base + (nxt - base) * (sub / substeps)
                 action = {name: float(values[i]) for i, name in enumerate(action_names)}
                 await robot.send_action_async(action)
-                tripped = watchdog.update(robot.torque_residuals())
-                if tripped is not None:
-                    joint, residual = tripped
-                    _logger.warning(
-                        "replay contact: %s torque residual %.1f exceeds "
-                        "%.1f — stopping playback",
-                        joint,
-                        residual,
-                        cfg.play_torque_threshold,
-                    )
-                    return tripped
+                if watchdog is not None:
+                    tripped = watchdog.update(robot.torque_residuals())
+                    if tripped is not None:
+                        joint, residual = tripped
+                        _logger.warning(
+                            "replay contact: %s torque residual %.1f exceeds "
+                            "%.1f — stopping playback",
+                            joint,
+                            residual,
+                            cfg.teleop_torque_threshold,
+                        )
+                        return tripped
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         return None
 

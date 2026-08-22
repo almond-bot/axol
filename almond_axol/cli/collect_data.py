@@ -314,14 +314,15 @@ class CollectDataConfig:
     # record_proc.default_vcodec). Override with any of LeRobot's
     # VALID_VIDEO_CODECS (e.g. auto, h264, libsvtav1).
     vcodec: str = field(default_factory=default_vcodec)
-    # Every return-to-rest is guarded, and so is the tracking phase itself: a
-    # torque watchdog drops the arms into a limp gravity-comp hold on
+    # Every return-to-rest is guarded — and, opted in, the tracking phase
+    # too: a torque watchdog drops the arms into a limp gravity-comp hold on
     # unexpected contact (reset replans from wherever they were left; a
     # recording episode is discarded). The knobs live on the shared teleop
-    # config — ``--teleop_config.vr_teleop_config.reset_torque_threshold`` /
-    # ``.teleop_torque_threshold`` (0 disables the respective watchdog) and
-    # ``.reset_gravity_comp_kd`` — the same fields `axol teleop` uses, so the
-    # two flows behave identically.
+    # config — ``--teleop_config.vr_teleop_config.reset_torque_threshold``
+    # (0 disables), ``.teleop_contact_stop`` / ``.teleop_torque_threshold``
+    # (the tracking watchdog, off by default) and ``.reset_gravity_comp_kd``
+    # — the same fields `axol teleop` uses, so the two flows behave
+    # identically.
     root: str | None = None
     push_to_hub: bool = False
     rerun_ip: str | None = None
@@ -924,11 +925,16 @@ def _run(
         rerecord = False
         # perf_counter deadline of a panel-started record countdown, or None.
         pending_start: float | None = None
-        # Tracking-phase contact watchdog: the same sustained-torque trip the
-        # guarded return uses, active while the operator drives the arms. A
-        # trip ends the loop (third element of the return tuple True); the
-        # caller discards any recording and runs the limp contact hold.
-        watchdog = ContactWatchdog(vrt_cfg.teleop_torque_threshold)
+        # Tracking-phase contact watchdog (opt-in via teleop_contact_stop):
+        # the same sustained-torque trip the guarded return uses, active
+        # while the operator drives the arms. A trip ends the loop (third
+        # element of the return tuple True); the caller discards any
+        # recording and runs the limp contact hold.
+        watchdog = (
+            ContactWatchdog(vrt_cfg.teleop_torque_threshold)
+            if vrt_cfg.teleop_contact_stop
+            else None
+        )
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -975,16 +981,17 @@ def _run(
             sect["proc"] += t_proc - t_act
             sect["send"] += t_send - t_proc
 
-            tripped = watchdog.update(robot.torque_residuals())
-            if tripped is not None:
-                joint, residual = tripped
-                _logger.warning(
-                    "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
-                    joint,
-                    residual,
-                    vrt_cfg.teleop_torque_threshold,
-                )
-                return recording, rerecord, True
+            if watchdog is not None:
+                tripped = watchdog.update(robot.torque_residuals())
+                if tripped is not None:
+                    joint, residual = tripped
+                    _logger.warning(
+                        "teleop contact: %s torque residual %.1f exceeds %.1f — going limp",
+                        joint,
+                        residual,
+                        vrt_cfg.teleop_torque_threshold,
+                    )
+                    return recording, rerecord, True
 
             # Record the action in the configured action space: identity for
             # joint datasets, FK-to-Cartesian when observe_cartesian is set. The

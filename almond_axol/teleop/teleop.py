@@ -400,12 +400,15 @@ class VRTeleop:
                 last = self._vr_frame_times[-1] if self._vr_frame_times else None
             return last is not None and (time.perf_counter() - last) < 2.0
 
-        # Tracking-phase contact watchdog (hardware only): the same
-        # sustained-torque trip the guarded return uses, but active while the
-        # operator drives (or holds) the arms. On a trip tracking disengages
-        # and the arms go limp until reset — see VRTeleopCore.contact_hold.
+        # Tracking-phase contact watchdog (hardware only, opt-in via
+        # teleop_contact_stop): the same sustained-torque trip the guarded
+        # return uses, but active while the operator drives (or holds) the
+        # arms. On a trip tracking disengages and the arms go limp until
+        # reset — see VRTeleopCore.contact_hold.
         track_watchdog = (
-            ContactWatchdog(self._config.teleop_torque_threshold) if guard else None
+            ContactWatchdog(self._config.teleop_torque_threshold)
+            if guard and self._config.teleop_contact_stop
+            else None
         )
 
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
