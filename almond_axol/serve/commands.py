@@ -8,12 +8,13 @@ whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
 Only commands some UI surface actually launches belong here: the control
-panel's five operations, and the diagnostics dashboard's tests, CAN bring-up
-buttons, and motor calibration tools. Everything else — install-time commands
-(``gst.*``, ``jetson.setup``, ``can.driver``), the tuning suite (``tune.*``),
-one-off checks (``motor.info`` / ``motor.health``, whose read set the
-dashboard's motor tiles show live), the remote ``inference-server``, and
-``serve`` itself — stays CLI-only.
+panel's five operations, and the diagnostics dashboard's tests, tuning tools
+(``tune.pid`` / ``tune.friction``, whose ``--save`` writes this robot's
+calibration file), CAN bring-up buttons, and motor calibration tools.
+Everything else — install-time commands (``gst.*``, ``jetson.setup``,
+``can.driver``), ``tune.repeatability``, one-off checks (``motor.info`` /
+``motor.health``, whose read set the dashboard's motor tiles show live), the
+remote ``inference-server``, and ``serve`` itself — stays CLI-only.
 
 ``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
 browser form can only name a path on the serve host, so the dashboard offers
@@ -423,6 +424,32 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.zed.cable"),
         requires_hardware=True,
         uses_can_bus=False,
+    ),
+    "tune.pid": CommandDef(
+        "tune.pid",
+        "tune.pid",
+        "PID tuning",
+        "Test impedance Kp/Kd candidates on one joint (sine or step tracking) "
+        "with production-matched feedforward, rank them, and optionally save "
+        "the best pair to this robot's calibration.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.pid"),
+        requires_hardware=True,
+        drives_motors=True,
+    ),
+    "tune.friction": CommandDef(
+        "tune.friction",
+        "tune.friction",
+        "Friction identification",
+        "Identify one joint's friction model (Fc, k, Fv, Fo) with a "
+        "bidirectional velocity sweep, and optionally save it to this "
+        "robot's calibration. Run per joint, per arm, on every new robot.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.friction"),
+        requires_hardware=True,
+        drives_motors=True,
     ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(

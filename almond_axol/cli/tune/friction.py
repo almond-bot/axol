@@ -20,9 +20,15 @@ becomes ``Fo`` and the shape residual is reported as a sanity check on the
 At runtime:
     tff(q, v) = gravity_model(q) + Fc·tanh(0.1·k·v) + Fv·v + Fo
 
+Pass ``--save`` to persist the fitted parameters to this robot's calibration
+file (``~/.almond/calibration.json``); ``AxolConfig`` loads that file on
+construction, so the values take effect for every operation on this machine
+without touching ``config.py``. Friction is motor-specific — run this per
+joint, per arm, on every robot you build.
+
 Examples:
     axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
-    axol tune.friction --r --joint elbow --kp 20 --kd 0.6
+    axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
     axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
 """
 
@@ -36,11 +42,13 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import curve_fit
 
-from ...constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ...constants import ARM_JOINTS
 from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
+from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
+from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
@@ -396,9 +404,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    side = p.add_mutually_exclusive_group(required=True)
-    side.add_argument("--l", action="store_true")
-    side.add_argument("--r", action="store_true")
+    add_side_and_channel_arguments(p)
     p.add_argument(
         "--joint",
         required=True,
@@ -449,6 +455,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "logs/friction_<side>_<joint>_<timestamp>.csv, or pass an explicit "
         "path.",
     )
+    p.add_argument(
+        "--save",
+        action="store_true",
+        help="Save the fitted friction parameters to this robot's calibration "
+        f"file ({CALIBRATION_PATH}); they then override the shared defaults "
+        "on this machine",
+    )
     p.set_defaults(func=run)
 
 
@@ -483,7 +496,7 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"  Velocity sweep: {[round(v, 3) for v in args.velocities]} rad/s")
     print(f"  Kp={kp}  Kd={kd}")
 
-    channel = CAN_LEFT if is_left else CAN_RIGHT
+    channel = resolve_channel(args)
 
     async with CanBus(channel) as bus:
         motors = {j: Motor(bus, j) for j in ARM_JOINTS}
@@ -559,11 +572,31 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
 
             if friction_result is not None or Fo_result is not None:
-                print(f"\n  Add to config.py JointConfig.{joint.value}.friction:")
-                print(
-                    f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
-                    f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
-                )
+                if args.save:
+                    path = update_joint_calibration(
+                        side_str,
+                        joint.value,
+                        friction={
+                            "fc": round(Fc_out, 4),
+                            "k": round(k_out, 2),
+                            "fv": round(Fv_out, 4),
+                            "fo": round(Fo_out, 4),
+                        },
+                    )
+                    print(f"\n  Saved to {path}")
+                    print(
+                        "  (loaded automatically by AxolConfig — every "
+                        "operation on this machine now uses these values)"
+                    )
+                else:
+                    print(
+                        f"\n  Fitted for {side_str} {joint.value} "
+                        "(re-run with --save to persist to this robot's calibration):"
+                    )
+                    print(
+                        f"    FrictionParams(fc={Fc_out:.4f}, k={k_out:.2f}, "
+                        f"fv={Fv_out:.4f}, fo={Fo_out:.4f}),"
+                    )
 
             print(f"{'─' * 50}")
 

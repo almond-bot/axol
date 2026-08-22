@@ -27,8 +27,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 from ..constants import ARM_JOINTS
+from .calibration import load_calibration
 
 
 @dataclass
@@ -252,11 +254,13 @@ class _ArmFriction:
     wrist_3: FrictionParams
 
 
-# Per-joint friction values measured with ``axol tune.friction``. Each
-# instance is the source of truth for one physical arm — the two arms share
-# gains, masses, and (after mirroring) CoMs, but motor-by-motor friction
-# differs enough to be worth identifying per side. Re-run the tuner on a
-# fresh Axol to refresh these.
+# Per-joint friction values measured with ``axol tune.friction`` on the
+# reference robot. The two arms share gains, masses, and (after mirroring)
+# CoMs, but motor-by-motor friction differs enough to be worth identifying
+# per side — and per robot: these are only the *fallback* for machines that
+# have not been calibrated. Run ``axol tune.friction --save`` on each new
+# Axol to write its own values to ``~/.almond/calibration.json``, which
+# overrides these defaults (see :mod:`almond_axol.robot.calibration`).
 _LEFT_FRICTION = _ArmFriction(
     shoulder_1=FrictionParams(fc=1.0191, k=723.53, fv=3.3848, fo=0.2853),
     shoulder_2=FrictionParams(fc=1.6873, k=115.41, fv=2.7202, fo=-0.1701),
@@ -278,9 +282,28 @@ _RIGHT_FRICTION = _ArmFriction(
 )
 
 
+def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
+    """Overlay one joint's calibration-file entry onto its config."""
+    overrides: dict[str, Any] = {
+        f: entry[f] for f in ("kp", "kd", "kd_soft", "j_eff") if f in entry
+    }
+    friction = entry.get("friction")
+    if friction is not None:
+        overrides["friction"] = FrictionParams(**friction)
+    return replace(jc, **overrides) if overrides else jc
+
+
 def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     """Build an :class:`ArmConfig` for one side: shared gains + masses, with
     per-side CoMs (mirrored on the right) and per-motor friction injected.
+
+    Values saved by ``axol tune.friction --save`` / ``axol tune.pid --save``
+    to this machine's calibration file (see
+    :mod:`almond_axol.robot.calibration`) are then overlaid per joint, so a
+    calibrated robot uses its own measured friction and gains as the
+    defaults. Explicit overrides at construction (draccus dotted flags, the
+    panel's Advanced settings) apply on top of the built defaults and
+    therefore still win.
 
     Each :class:`FrictionParams` is copied (``replace()`` with no field
     overrides) so that mutating one config's friction — e.g.
@@ -289,7 +312,7 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
-    return replace(
+    arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),
         shoulder_2=replace(arm.shoulder_2, friction=replace(friction.shoulder_2)),
@@ -298,6 +321,19 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         wrist_1=replace(arm.wrist_1, friction=replace(friction.wrist_1)),
         wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
         wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
+    )
+    calibrated = load_calibration()["left" if is_left else "right"]
+    if not calibrated:
+        return arm
+    return replace(
+        arm,
+        **{
+            joint.value: _calibrated_joint(
+                getattr(arm, joint.value), calibrated[joint.value]
+            )
+            for joint in ARM_JOINTS
+            if joint.value in calibrated
+        },
     )
 
 

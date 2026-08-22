@@ -1,25 +1,36 @@
 ---
 title: "tune.pid"
-description: "Tune Kp/Kd gains for a single joint via sinusoidal or step-response tracking."
+description: "Sweep and rank Kp/Kd gains for a single joint via sinusoidal or step-response tracking."
 ---
 
-Tunes `Kp`/`Kd` gains for a single joint at ~100 Hz using sinusoidal tracking or step-response, and prints error statistics.
+Tests one or more `Kp`/`Kd` candidates for a single joint at ~100 Hz — pass several values to either flag to sweep the whole grid in one session — measures tracking error (RMS, max, overshoot, settling), ranks the candidates, and can save the winner to this robot's calibration file. Also available from the diagnostics dashboard (`axol serve`).
+
+The feedforward path defaults to exactly what the production control loop applies — gravity + friction + inertia (`j_eff`) + software damping (`kd_soft`) — so gains found here transfer 1:1 to teleop. Use `--ff` to tune against a reduced feedforward instead (e.g. `--ff none` for bare PD, or `--ff friction` to see how the joint behaves without gravity compensation).
 
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |
+| `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
 | `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
-| `--kp FLOAT` | Proportional gain (required) |
-| `--kd FLOAT` | Derivative gain (required) |
-| `--tff` | Apply full feedforward (gravity + friction) |
+| `--kp KP [KP ...]` | Proportional gain candidate(s) (default: the joint's configured kp) |
+| `--kd KD [KD ...]` | Derivative gain candidate(s) (default: the joint's configured kd) |
+| `--ff {full,gravity,friction,none}` | Feedforward during the test (default: `full` — matches production) |
 | `--mode {sine,step}` | `sine` = sinusoidal tracking (default); `step` = step response |
 | `--amp FLOAT` | Motion amplitude in rad (default: auto safe value) |
 | `--freq FLOAT` | [sine] Frequency in Hz (default: 1.0) |
 | `--duration FLOAT` | [sine] Duration in seconds (default: 5.0) |
 | `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) |
 | `--rate FLOAT` | Command rate in Hz (default: 100.0) |
+| `--save` | Save the best candidate's Kp/Kd to `~/.almond/calibration.json` |
+| `--dump-csv [PATH]` | Write per-sample `(kp, kd, t, target, actual, error)` rows to a CSV for offline plotting. Pass without a value to auto-name as `logs/pid_<side>_<joint>_<timestamp>.csv` |
 
 ```bash
-axol tune.pid --l --joint elbow --kp 25 --kd 0.6
-axol tune.pid --r --joint shoulder_1 --kp 35 --kd 1.2 --mode step
+axol tune.pid --l --joint elbow                              # config gains, production FF
+axol tune.pid --l --joint elbow --kp 20 30 45 --kd 0.5 1.0   # 6-way sweep, ranked
+axol tune.pid --r --joint shoulder_1 --mode step --ff none   # bare-PD step response
+axol tune.pid --l --joint wrist_1 --kp 12 --kd 0.4 --save    # persist to calibration
 ```
+
+## Per-robot calibration
+
+`--save` writes the winning gains to `~/.almond/calibration.json`, which `AxolConfig` loads on construction — every operation on the machine (teleop, data collection, policies) then uses the saved values instead of the shared defaults, while explicit overrides (`--axol.left.elbow.kp 60`, the panel's Advanced settings) still win over both. Saved `kp`/`kd` are the compliant (`s=0`) endpoint of the stiffness blend, like the defaults they replace. Friction values saved by [`tune.friction --save`](/cli/tune-friction) live in the same file.

@@ -42,6 +42,10 @@ axol run-policy --config_path rollout.yaml --device cpu   # file, then override
 
 Precedence is **defaults → `--config_path` file → CLI flags** (later wins), so flags always override file values, which override the built-in defaults.
 
+<Note>
+  On a calibrated robot the "defaults" already include that machine's own measurements: per-joint gains and friction parameters saved by [`tune.pid --save`](/cli/tune-pid) / [`tune.friction --save`](/cli/tune-friction) to `~/.almond/calibration.json` are loaded into `AxolConfig` at construction, replacing the shared constants. Config files and CLI flags still override them like any other default.
+</Note>
+
 ## Field-name conventions
 
 | Convention | Form | Example |
