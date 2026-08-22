@@ -157,10 +157,11 @@ class ArmConfig:
     values because Onshape often over-assigns aluminum-class densities to
     parts that are hollow / 3D-printed.
 
-    These ``kp`` / ``kd`` are the fully-compliant (``s=0``) endpoint of the
-    :attr:`AxolConfig.left_stiffness` / :attr:`AxolConfig.right_stiffness`
-    blend; the production default (``s=0.5``) interpolates them toward the
-    stiffer :data:`_STIFF_GAINS`.
+    These ``kp`` / ``kd`` are the tuned **midpoint** (``s=0.5``, the
+    production default) of the :attr:`AxolConfig.left_stiffness` /
+    :attr:`AxolConfig.right_stiffness` blend — the slider softens them
+    toward :data:`_SOFT_GAINS` below 0.5 and stiffens them toward
+    :data:`_STIFF_GAINS` above.
     """
 
     # Gains below were identified on the reference robot (both arms, which
@@ -422,25 +423,59 @@ _STIFF_GAINS = _ArmGains(
     wrist_3=(250.0, 2.8),
 )
 
+# Soft "hand-guidable" gains used as the ``s=0.0`` endpoint of the blend.
+# ``kp`` values are the pre-retune compliant defaults (the soft feel users
+# know from earlier releases); ``kd`` is damping-ratio-consistent with the
+# tuned midpoint (``kd_soft = kd · sqrt(kp_soft / kp)``, tuned values), same
+# rule as :data:`_STIFF_GAINS` above.
+_SOFT_GAINS = _ArmGains(
+    shoulder_1=(40.0, 14.0),
+    shoulder_2=(50.0, 15.7),
+    shoulder_3=(45.0, 10.0),
+    elbow=(40.0, 22.2),
+    wrist_1=(30.0, 8.2),
+    wrist_2=(25.0, 1.5),
+    wrist_3=(25.0, 0.9),
+)
+
 
 def _blend_joint(
-    jc: JointConfig, kp_stiff: float, kd_stiff: float, s: float
+    jc: JointConfig,
+    kp_soft: float,
+    kd_soft: float,
+    kp_stiff: float,
+    kd_stiff: float,
+    s: float,
 ) -> JointConfig:
-    """Blend one joint's gains toward the stiff endpoint by factor ``s``.
+    """Blend one joint's gains along the soft ↔ tuned ↔ stiff slider.
+
+    The joint's own ``kp`` / ``kd`` (the hardware-tuned optimum) anchor the
+    **midpoint** ``s=0.5`` — the production default. The lower half blends
+    toward the soft hand-guidable endpoint (:data:`_SOFT_GAINS`), the upper
+    half toward the industrial stiff endpoint (:data:`_STIFF_GAINS`).
 
     ``kp`` and ``kd`` interpolate geometrically (log-space — matches how
-    stiffness is perceived); ``j_eff`` scales linearly to 0 since it only
-    compensates for the low-``kp`` regime. ``kd_host`` scales with
-    ``√(kp(s)/kp)`` — critical damping grows with the square root of
-    stiffness, so this keeps the host-damping ratio constant along the
-    slider without needing its own stiff endpoint.
+    stiffness is perceived); with damping-ratio-consistent endpoints the
+    blend then holds the damping ratio at every ``s``. ``kd_host`` scales
+    with ``√(kp(s)/kp)`` — critical damping grows with the square root of
+    stiffness — for the same reason. ``j_eff`` stays constant on the soft
+    half (it compensates real inertia, which matters most at low ``kp``)
+    and scales linearly to 0 at ``s=1``.
     """
-    kp_factor = (kp_stiff / jc.kp) ** s
+    if s <= 0.5:
+        u = 1.0 - 2.0 * s  # 1 at the soft endpoint, 0 at the tuned midpoint
+        kp_end, kd_end = kp_soft, kd_soft
+        j_eff = jc.j_eff
+    else:
+        u = 2.0 * s - 1.0  # 0 at the tuned midpoint, 1 at the stiff endpoint
+        kp_end, kd_end = kp_stiff, kd_stiff
+        j_eff = jc.j_eff * (1.0 - u)
+    kp_factor = (kp_end / jc.kp) ** u
     return replace(
         jc,
         kp=jc.kp * kp_factor,
-        kd=jc.kd * (kd_stiff / jc.kd) ** s,
-        j_eff=jc.j_eff * (1.0 - s),
+        kd=jc.kd * (kd_end / jc.kd) ** u,
+        j_eff=j_eff,
         kd_host=jc.kd_host * math.sqrt(kp_factor),
     )
 
@@ -470,24 +505,28 @@ def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
 
 
 def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
-    """Blend each of ``arm``'s 7 joints toward :data:`_STIFF_GAINS` by ``s``.
+    """Blend each of ``arm``'s 7 joints along the soft ↔ tuned ↔ stiff slider.
 
     ``s`` is either a scalar or a 7-tuple in
     :data:`almond_axol.constants.ARM_JOINTS` order (see
-    :func:`_normalize_stiffness`). An all-zero blend returns ``arm`` unchanged.
+    :func:`_normalize_stiffness`). ``0.5`` is the tuned midpoint and returns
+    ``arm`` unchanged; lower values blend toward :data:`_SOFT_GAINS`, higher
+    toward :data:`_STIFF_GAINS` (see :func:`_blend_joint`).
     """
     factors = _normalize_stiffness(s)
-    if all(f == 0.0 for f in factors):
+    if all(f == 0.5 for f in factors):
         return arm
     return replace(
         arm,
-        shoulder_1=_blend_joint(arm.shoulder_1, *_STIFF_GAINS.shoulder_1, factors[0]),
-        shoulder_2=_blend_joint(arm.shoulder_2, *_STIFF_GAINS.shoulder_2, factors[1]),
-        shoulder_3=_blend_joint(arm.shoulder_3, *_STIFF_GAINS.shoulder_3, factors[2]),
-        elbow=_blend_joint(arm.elbow, *_STIFF_GAINS.elbow, factors[3]),
-        wrist_1=_blend_joint(arm.wrist_1, *_STIFF_GAINS.wrist_1, factors[4]),
-        wrist_2=_blend_joint(arm.wrist_2, *_STIFF_GAINS.wrist_2, factors[5]),
-        wrist_3=_blend_joint(arm.wrist_3, *_STIFF_GAINS.wrist_3, factors[6]),
+        **{
+            j.value: _blend_joint(
+                getattr(arm, j.value),
+                *getattr(_SOFT_GAINS, j.value),
+                *getattr(_STIFF_GAINS, j.value),
+                factors[i],
+            )
+            for i, j in enumerate(ARM_JOINTS)
+        },
     )
 
 
@@ -519,20 +558,20 @@ class AxolConfig:
                          in ``[0, 1]``. Either a scalar (applied to every
                          joint) or 7 values in
                          :data:`almond_axol.constants.ARM_JOINTS` order
-                         (gripper excluded). ``0`` keeps the per-joint
-                         compliant gains; ``1`` restores the pre-tuning
-                         industrial gains in :data:`_STIFF_GAINS`;
-                         ``0.5`` (default) is the geometric mean of the
-                         two. ``kp`` / ``kd`` interpolate geometrically
-                         (log-space); ``j_eff`` scales linearly to 0 at
-                         ``s=1``. The blend is baked into
-                         the ``left`` / ``right`` gains by :meth:`resolved`,
-                         which is called once at the robot-construction
-                         boundary (``Axol.__init__``). The stiffness fields
-                         are left untouched on the config itself, so a
-                         serialized :class:`AxolConfig` round-trips cleanly
-                         (loading a dumped config and resolving it again is
-                         idempotent).
+                         (gripper excluded). ``0.5`` (default) runs the
+                         hardware-tuned per-joint gains; ``0`` softens to
+                         the hand-guidable :data:`_SOFT_GAINS`; ``1``
+                         stiffens to the industrial :data:`_STIFF_GAINS`.
+                         ``kp`` / ``kd`` interpolate geometrically
+                         (log-space) in each half; ``j_eff`` holds on the
+                         soft half and scales linearly to 0 at ``s=1``. The
+                         blend is baked into the ``left`` / ``right`` gains
+                         by :meth:`resolved`, which is called once at the
+                         robot-construction boundary (``Axol.__init__``).
+                         The stiffness fields are left untouched on the
+                         config itself, so a serialized :class:`AxolConfig`
+                         round-trips cleanly (loading a dumped config and
+                         resolving it again is idempotent).
         right_stiffness: Same, for the **right** arm.
     """
 
@@ -550,18 +589,19 @@ class AxolConfig:
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.
 
-        Blends each arm toward :data:`_STIFF_GAINS` by its stiffness factor
-        (see :func:`_apply_stiffness`) and resets ``left_stiffness`` /
-        ``right_stiffness`` to ``0.0`` so the result is **idempotent** —
-        calling :meth:`resolved` again is a no-op. This is applied once at
-        the single robot-construction boundary (``Axol.__init__``) so every
-        consumer sees consistent gains while the unresolved config stays
-        safe to serialize and reload.
+        Blends each arm along the soft ↔ tuned ↔ stiff slider by its
+        stiffness factor (see :func:`_apply_stiffness`) and resets
+        ``left_stiffness`` / ``right_stiffness`` to ``0.5`` — the tuned
+        midpoint, where the blend is the identity — so the result is
+        **idempotent**: calling :meth:`resolved` again is a no-op. This is
+        applied once at the single robot-construction boundary
+        (``Axol.__init__``) so every consumer sees consistent gains while
+        the unresolved config stays safe to serialize and reload.
         """
         return replace(
             self,
             left=_apply_stiffness(self.left, self.left_stiffness),
             right=_apply_stiffness(self.right, self.right_stiffness),
-            left_stiffness=0.0,
-            right_stiffness=0.0,
+            left_stiffness=0.5,
+            right_stiffness=0.5,
         )

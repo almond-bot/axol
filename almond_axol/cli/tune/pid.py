@@ -663,15 +663,15 @@ async def _run(args: argparse.Namespace) -> None:
         f"\nAxol PID tuner — {side_str} {joint.value}  limits=[{lo:.4f}, {hi:.4f}] rad"
     )
     print(f"  mode={args.mode}  ff={args.ff}  candidates={len(candidates)}")
-    # The configured kp/kd are the compliant (s=0) endpoint; production blends
-    # them toward the stiff endpoint by the robot's stiffness setting. Print
+    # The configured kp/kd are the tuned midpoint (s=0.5, the production
+    # default); the stiffness slider softens/stiffens around them. Print
     # both so the operator knows what the tested values relate to.
     resolved_jc: JointConfig = getattr(
         AxolConfig().resolved().left if is_left else AxolConfig().resolved().right,
         joint.value,
     )
     print(
-        f"  config kp={jc.kp:.1f} kd={jc.kd:.2f} (compliant endpoint)  |  "
+        f"  config kp={jc.kp:.1f} kd={jc.kd:.2f} (tuned midpoint)  |  "
         f"production at default stiffness: kp={resolved_jc.kp:.1f} kd={resolved_jc.kd:.2f}"
     )
     if use_friction:
@@ -805,7 +805,7 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"\n  Saved {saved} to {path}")
                 print(
                     "  (loaded automatically by AxolConfig on this machine; "
-                    "these are the compliant s=0 endpoint of the stiffness "
+                    "these are the tuned s=0.5 midpoint of the stiffness "
                     "blend, like the shared defaults they replace)"
                 )
 

@@ -26,8 +26,9 @@ File shape (every level optional)::
       "right": { ... }
     }
 
-``kp`` / ``kd`` are the fully-compliant (``s=0``) endpoint of the stiffness
-blend, exactly like the :class:`JointConfig` defaults they replace.
+``kp`` / ``kd`` are the tuned midpoint (``s=0.5``, the production default)
+of the stiffness blend, exactly like the :class:`JointConfig` defaults they
+replace.
 
 This module is deliberately I/O-only (no imports from ``config``) so
 ``config.py`` can consume it without an import cycle.
