@@ -370,6 +370,11 @@ class MyActuatorMotor(MotorDriver):
     # Public API (implements MotorDriver)                                  #
     # ------------------------------------------------------------------ #
 
+    @property
+    def kd_max(self) -> float:
+        # 5 until _detect_capabilities() has run; 50 on V4.4+ firmware.
+        return self._kd_max
+
     async def enable(self) -> None:
         # Detect firmware version + model so the MIT command and feedback decode
         # use the ranges this motor's firmware actually implements. If the motor

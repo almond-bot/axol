@@ -49,10 +49,12 @@ from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
+from .joint_frame import JointFrameMotor, joint_frame_motors
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
 _SWEEP_MARGIN = 0.05  # rad — don't sweep all the way to hard limits
+_SWEEP_DECEL = 3.0  # rad/s² — braking rate for the target at the end of a pass
 _WARMUP_FRACTION = 0.15  # skip first 15% of each pass for motor settling
 _RATE_HZ = 100.0
 _N_BINS = 40  # position bins for matching fwd/bwd samples
@@ -62,7 +64,7 @@ DEFAULT_VELOCITIES = [v * _TAU for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
 
 
 async def _ramp_to(
-    motor: Motor,
+    motor: JointFrameMotor,
     kp: float,
     kd: float,
     target: float,
@@ -83,11 +85,11 @@ async def _ramp_to(
 
 
 async def _ramp_others(
-    motors: dict[Joint, Motor],
+    motors: dict[Joint, JointFrameMotor],
     exclude: Joint,
     targets: dict[Joint, float] | None = None,
 ) -> None:
-    """Move all joints except `exclude` to their target positions (default 0)."""
+    """Move all joints except `exclude` to their joint-frame targets (default 0 = rest)."""
     joints = [j for j in ARM_JOINTS if j != exclude]
     t = targets or {}
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
@@ -107,28 +109,44 @@ async def _ramp_others(
 
 
 async def _run_sweep_raw(
-    motor: Motor,
+    motor: JointFrameMotor,
     kp: float,
     kd: float,
     start_pos: float,
     velocity_rad_s: float,
     end_pos: float,
 ) -> list[tuple[float, float]]:
-    """Sweep from start_pos to end_pos at constant velocity.
+    """Sweep from start_pos to end_pos at constant velocity, then brake.
 
-    Returns list of ``(q_actual, tau_measured)``. The first
-    ``WARMUP_FRACTION`` of travel is discarded for motor settling.
-    ``tau_measured`` is read from the motor's feedback frame (motor-side
-    torque estimate), **not** computed from host-side ``kp·pos_err +
-    kd·vel_err`` — host-side numerical differentiation of position is
-    too noisy at the velocities we sweep, and the motor's own estimate is
-    already what we want.
+    The commanded target cruises at constant velocity and decelerates
+    smoothly (at ``_SWEEP_DECEL``) to rest exactly at ``end_pos``. Halting
+    the target abruptly instead lets the arm's momentum carry it past the
+    sweep limit at the higher velocities — into the robot base on capped
+    joints like shoulder_2 — because only the soft tuning-hold gains are
+    there to catch it.
+
+    Returns list of ``(q_actual, tau_measured)`` collected during the
+    constant-velocity cruise only (the braking phase is not at the sweep
+    velocity, so its samples would pollute the friction fit; the first
+    ``_WARMUP_FRACTION`` of the cruise is likewise discarded for motor
+    settling). ``tau_measured`` is read from the motor's feedback frame
+    (motor-side torque estimate), **not** computed from host-side
+    ``kp·pos_err + kd·vel_err`` — host-side numerical differentiation of
+    position is too noisy at the velocities we sweep, and the motor's own
+    estimate is already what we want.
     """
     travel = abs(end_pos - start_pos)
     if travel < 0.02:
         return []
-    total_time = travel / abs(velocity_rad_s)
-    warmup_time = total_time * _WARMUP_FRACTION
+    v = abs(velocity_rad_s)
+    sign = 1.0 if velocity_rad_s > 0 else -1.0
+    # Cap the braking distance to half the pass so short passes still cruise.
+    d_decel = min(0.5 * v * v / _SWEEP_DECEL, 0.5 * travel)
+    t_decel = 2.0 * d_decel / v
+    decel = v / t_decel if t_decel > 0 else 0.0
+    d_cruise = travel - d_decel
+    t_cruise = d_cruise / v
+    warmup_time = t_cruise * _WARMUP_FRACTION
     dt = 1.0 / _RATE_HZ
 
     samples: list[tuple[float, float]] = []
@@ -137,16 +155,23 @@ async def _run_sweep_raw(
     while True:
         now = time.monotonic()
         t = now - t0
-        if t >= total_time:
+        if t >= t_cruise + t_decel:
             break
         loop_start = now
 
-        target = start_pos + velocity_rad_s * t
+        if t <= t_cruise:
+            target = start_pos + sign * v * t
+            v_des = sign * v
+        else:
+            tau = t - t_cruise
+            v_brake = max(v - decel * tau, 0.0)
+            target = start_pos + sign * (d_cruise + v * tau - 0.5 * decel * tau * tau)
+            v_des = sign * v_brake
         # set_impedance returns a feedback frame, which updates
         # motor.position / motor.torque via the driver _on_feedback hook.
-        await motor.set_impedance(target, velocity_rad_s, kp, kd, 0.0)
+        await motor.set_impedance(target, v_des, kp, kd, 0.0)
 
-        if t >= warmup_time:
+        if warmup_time <= t <= t_cruise:
             samples.append((motor.position, motor.torque))
 
         spent = time.monotonic() - loop_start
@@ -281,7 +306,7 @@ def _fit_friction_halfdiff(
 
 
 async def _identify_joint(
-    motor: Motor,
+    motor: JointFrameMotor,
     joint: Joint,
     kp: float,
     kd: float,
@@ -499,8 +524,12 @@ async def _run(args: argparse.Namespace) -> None:
     channel = resolve_channel(args)
 
     async with CanBus(channel) as bus:
-        motors = {j: Motor(bus, j) for j in ARM_JOINTS}
-        await asyncio.gather(*[m.enable() for m in motors.values()])
+        raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
+        await asyncio.gather(*[m.enable() for m in raw_motors.values()])
+        # Motor encoders are zeroed at end stops; the sweep ranges, gravity
+        # poses, and park targets below are joint frame (0 = rest), so wrap
+        # the motors in the frame conversion before any position I/O.
+        motors = await joint_frame_motors(raw_motors, is_left)
         await asyncio.gather(
             *[
                 motors[j].set_control_mode(
@@ -603,7 +632,7 @@ async def _run(args: argparse.Namespace) -> None:
         except KeyboardInterrupt:
             print("\n  Interrupted.")
         finally:
-            print("  Returning to 0 and disabling ...")
+            print("  Returning to rest and disabling ...")
             try:
                 await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
             except Exception:

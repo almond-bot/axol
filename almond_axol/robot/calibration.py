@@ -18,7 +18,6 @@ File shape (every level optional)::
         "elbow": {
           "kp": 40.0,
           "kd": 3.0,
-          "kd_soft": 0.0,
           "j_eff": 0.0,
           "friction": {"fc": 0.68, "k": 801.3, "fv": 0.87, "fo": -0.25},
           "updated_at": "2026-08-16T01:00:00Z"
@@ -48,7 +47,8 @@ _logger = logging.getLogger(__name__)
 CALIBRATION_PATH = Path.home() / ".almond" / "calibration.json"
 
 _SIDES = ("left", "right")
-_SCALAR_FIELDS = ("kp", "kd", "kd_soft", "j_eff")
+# ``kd_soft`` entries written by older versions are silently dropped on load.
+_SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host")
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
 
 # A corrupt file must never take the robot down, but silently ignoring it
@@ -106,10 +106,7 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
                     clean[field] = value
             friction = entry.get("friction")
             if isinstance(friction, dict):
-                fclean = {
-                    f: _coerce_float(friction.get(f))
-                    for f in _FRICTION_FIELDS
-                }
+                fclean = {f: _coerce_float(friction.get(f)) for f in _FRICTION_FIELDS}
                 if all(v is not None for v in fclean.values()):
                     clean["friction"] = fclean
                 elif any(v is not None for v in fclean.values()):
@@ -130,8 +127,8 @@ def update_joint_calibration(
     *,
     kp: float | None = None,
     kd: float | None = None,
-    kd_soft: float | None = None,
     j_eff: float | None = None,
+    kd_host: float | None = None,
     friction: dict[str, float] | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
@@ -168,12 +165,14 @@ def update_joint_calibration(
     if not isinstance(entry, dict):
         entry = {}
         side_map[joint] = entry
+    # Scrub the retired software-damping field left behind by older versions.
+    entry.pop("kd_soft", None)
 
     for field, value in (
         ("kp", kp),
         ("kd", kd),
-        ("kd_soft", kd_soft),
         ("j_eff", j_eff),
+        ("kd_host", kd_host),
     ):
         if value is not None:
             entry[field] = float(value)

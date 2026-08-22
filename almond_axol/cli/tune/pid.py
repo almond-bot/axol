@@ -10,10 +10,9 @@ candidates, and can persist the winner to this robot's calibration file
 (``~/.almond/calibration.json``, loaded automatically by ``AxolConfig``).
 
 The feedforward path mirrors the production ``motion_control`` loop —
-``gravity + friction + j_eff·a_des + kd_soft·(v_des − v_meas)`` — so gains
-found here transfer 1:1 to teleop. Use ``--ff`` to tune against a reduced
-feedforward instead (e.g. ``--ff none`` for bare PD, ``--ff gravity`` for
-gravity-only).
+``gravity + friction + j_eff·a_des`` — so gains found here transfer 1:1 to
+teleop. Use ``--ff`` to tune against a reduced feedforward instead (e.g.
+``--ff none`` for bare PD, ``--ff gravity`` for gravity-only).
 
 Examples:
     axol tune.pid --l --joint elbow                       # config gains, production FF
@@ -39,6 +38,7 @@ from ...robot.config import ArmConfig, AxolConfig, JointConfig
 from ...robot.control import Differentiator, compute_friction
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
+from .joint_frame import JointFrameMotor, joint_frame_motors
 
 # Default sine amplitude / step size (rad). 0.175 rad ≈ 10° — well above
 # the encoder noise floor and the ``5%`` settling threshold (≈0.5°), well
@@ -63,17 +63,18 @@ def _safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
     if joint == Joint.SHOULDER_2:
         return -1 if is_left else 1
     if joint == Joint.WRIST_2:
-        # symmetric across arms; +π/2 side is always away from the base.
-        return 1
+        # mirrored across arms: the outboard (base-free) half is +π/2 on the
+        # left arm and −π/2 on the right.
+        return 1 if is_left else -1
     return None
 
 
 def _sine_center(joint: Joint, is_left: bool) -> float:
     lo, hi = arm_limits(joint, is_left)
     if joint == Joint.WRIST_2:
-        # wrist_2 midpoint is 0; going negative hits the robot base, so center
-        # at the midpoint of the positive half instead.
-        return hi / 2.0
+        # wrist_2 midpoint is 0; the inboard half hits the robot base, so
+        # center at the midpoint of the outboard half (side-dependent).
+        return hi / 2.0 if is_left else lo / 2.0
     return (lo + hi) / 2.0
 
 
@@ -108,13 +109,20 @@ class FeedForward:
 
     ``compute(q_target, q_meas)`` returns ``(v_des, t_ff)`` where::
 
-        t_ff = gravity(q_target) + friction(v_des)
-             + j_eff · a_des + kd_soft · (v_des − v_meas)
+        t_ff = gravity(q_target) + friction(v_des) + j_eff · a_des
+               + host_kd · (v_des − v_meas)
 
     ``gravity_fn`` evaluates the full-chain URDF model with the *other*
     joints at their real (measured) positions, not an assumed zero pose —
     shoulder_2 / wrist_2 are deliberately never parked at 0 (base
     collision), so assuming zeros there skews the model torque.
+
+    ``host_kd`` adds host-side velocity damping computed from the
+    differentiated measured position (the ``kd_soft`` scheme). It exists to
+    diagnose joints where the motor's firmware kd underdelivers — on the
+    high-inertia shoulders the firmware velocity estimate appears too
+    filtered to damp the ~2 Hz closed-loop resonance, while a host-side
+    estimate at the command rate still can.
 
     Construct one instance per candidate run: the differentiators are
     stateful low-pass filters and must not leak between runs. For step
@@ -132,36 +140,39 @@ class FeedForward:
         fv: float,
         fo: float,
         j_eff: float,
-        kd_soft: float,
         differentiate_target: bool = True,
+        host_kd: float = 0.0,
     ) -> None:
         self.gravity_fn = gravity_fn
         self._fric = (fc, k, fv, fo)
         self._j_eff = j_eff
-        self._kd_soft = kd_soft
         self._differentiate_target = differentiate_target
+        self._host_kd = host_kd
         self._v_des_diff = Differentiator(1)
         self._a_des_diff = Differentiator(1)
         self._v_meas_diff = Differentiator(1)
 
-    def compute(self, q_target: float, q_meas: float) -> tuple[float, float]:
+    def compute(
+        self, q_target: float, q_meas: float | None = None
+    ) -> tuple[float, float]:
         if self._differentiate_target:
             v_des = self._v_des_diff.differentiate([q_target])[0]
             a_des = self._a_des_diff.differentiate([v_des])[0]
         else:
             v_des = a_des = 0.0
-        v_meas = self._v_meas_diff.differentiate([q_meas])[0]
         t_ff = (
             self.gravity_fn(q_target)
             + compute_friction(v_des, *self._fric)
             + self._j_eff * a_des
-            + self._kd_soft * (v_des - v_meas)
         )
+        if self._host_kd and q_meas is not None:
+            v_meas = self._v_meas_diff.differentiate([q_meas])[0]
+            t_ff += self._host_kd * (v_des - v_meas)
         return v_des, t_ff
 
 
 async def _ramp_impedance(
-    motor: Motor,
+    motor: JointFrameMotor,
     kp: float,
     kd: float,
     target: float,
@@ -169,7 +180,7 @@ async def _ramp_impedance(
     rate_hz: float = 100.0,
     speed: float = _RAMP_SPEED,
 ) -> None:
-    """Ramp one impedance-mode joint to ``target`` at ``speed``, with gravity FF."""
+    """Ramp one impedance-mode joint to ``target`` (joint frame) at ``speed``, with gravity FF."""
     start = await motor.get_position()
     duration = max(abs(target - start) / speed, 0.5)
     dt = 1.0 / rate_hz
@@ -185,10 +196,10 @@ async def _ramp_impedance(
 
 
 async def _ramp_others_to_zero(
-    motors: dict[Joint, Motor],
+    motors: dict[Joint, JointFrameMotor],
     exclude: Joint,
 ) -> None:
-    """Send non-test joints to 0 via set_position_velocity and poll until arrival.
+    """Send non-test joints to rest (joint-frame 0) and poll until arrival.
 
     Joints listed in ``_BASE_COLLISION_JOINTS`` are also skipped: 0 physically
     collides with the robot base (the URDF limits don't capture this), and the
@@ -213,7 +224,7 @@ async def _ramp_others_to_zero(
 
 
 async def run_sine(
-    motors: dict[Joint, Motor],
+    motors: dict[Joint, JointFrameMotor],
     joint: Joint,
     kp: float,
     kd: float,
@@ -245,8 +256,8 @@ async def run_sine(
     print(f"  running {duration:.1f} s at {rate_hz:.0f} Hz ...")
     dt = 1.0 / rate_hz
     log: list[dict] = []
+    q_meas = await test_motor.get_position()
     start = time.monotonic()
-    actual = await test_motor.get_position()
 
     while True:
         t = time.monotonic() - start
@@ -255,9 +266,10 @@ async def run_sine(
         loop_start = time.monotonic()
 
         target = center + amp * math.sin(2 * math.pi * freq * t)
-        v_des, t_ff = ff.compute(target, actual)
+        v_des, t_ff = ff.compute(target, q_meas)
         await test_motor.set_impedance(target, v_des, kp, kd, t_ff)
         actual = await test_motor.get_position()
+        q_meas = actual
         t_read = time.monotonic() - start
         target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
         log.append(
@@ -277,7 +289,7 @@ async def run_sine(
 
 
 async def run_step(
-    motors: dict[Joint, Motor],
+    motors: dict[Joint, JointFrameMotor],
     joint: Joint,
     kp: float,
     kd: float,
@@ -350,17 +362,18 @@ async def run_step(
 
     dt = 1.0 / rate_hz
     log: list[dict] = []
+    q_meas = await test_motor.get_position()
     start = time.monotonic()
-    actual = await test_motor.get_position()
 
     for phase_target in [step_target, center]:
         phase_start = time.monotonic()
         while time.monotonic() - phase_start < hold:
             loop_start = time.monotonic()
             t = time.monotonic() - start
-            _, t_ff = ff.compute(phase_target, actual)
+            _, t_ff = ff.compute(phase_target, q_meas)
             await test_motor.set_impedance(phase_target, 0.0, kp, kd, t_ff)
             actual = await test_motor.get_position()
+            q_meas = actual
             log.append(
                 {
                     "t": round(t, 5),
@@ -541,14 +554,23 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         choices=list(_FF_MODES),
         default="full",
         help="Feedforward during the test: full (gravity + friction + inertia "
-        "+ software damping — matches production; default), gravity, "
-        "friction, or none (bare PD)",
+        "— matches production; default), gravity, friction, or none (bare PD)",
     )
     p.add_argument(
         "--mode",
         choices=["sine", "step"],
         default="sine",
         help="sine (default): continuous tracking; step: step response",
+    )
+    p.add_argument(
+        "--host-kd",
+        type=float,
+        default=None,
+        metavar="KD",
+        help="Host-side damping (Nm·s/rad) applied through t_ff from the "
+        "differentiated measured position — matches the production kd_host "
+        "term, needed on the high-inertia shoulders where firmware kd "
+        "underdelivers (default: this joint's configured kd_host)",
     )
     p.add_argument(
         "--amp",
@@ -616,7 +638,7 @@ async def _run(args: argparse.Namespace) -> None:
     f = jc.friction
     fric = (f.fc, f.k, f.fv, f.fo) if use_friction else (0.0, 0.0, 0.0, 0.0)
     j_eff = jc.j_eff if args.ff == "full" else 0.0
-    kd_soft = jc.kd_soft if args.ff == "full" else 0.0
+    host_kd = args.host_kd if args.host_kd is not None else jc.kd_host
 
     gravity_comp = GravityCompensator() if use_gravity else None
     test_idx = ARM_JOINTS.index(joint)
@@ -655,7 +677,9 @@ async def _run(args: argparse.Namespace) -> None:
     if use_friction:
         print(f"  friction  Fc={f.fc}  k={f.k}  Fv={f.fv}  Fo={f.fo}")
     if args.ff == "full":
-        print(f"  inertia/damping  j_eff={j_eff}  kd_soft={kd_soft}")
+        print(f"  inertia  j_eff={j_eff}")
+    if host_kd:
+        print(f"  host-kd  {host_kd} (host-side damping via t_ff, kd_host)")
 
     channel = resolve_channel(args)
 
@@ -671,8 +695,12 @@ async def _run(args: argparse.Namespace) -> None:
     ref_kp, ref_kd = candidates[0]
 
     async with CanBus(channel) as bus:
-        motors = {j: Motor(bus, j) for j in ARM_JOINTS}
-        await asyncio.gather(*[m.enable() for m in motors.values()])
+        raw_motors = {j: Motor(bus, j) for j in ARM_JOINTS}
+        await asyncio.gather(*[m.enable() for m in raw_motors.values()])
+        # Motor encoders are zeroed at end stops; everything below (limits,
+        # centers, gravity poses) is joint frame (0 = rest), so wrap the
+        # motors in the frame conversion before any position I/O.
+        motors = await joint_frame_motors(raw_motors, is_left)
         await asyncio.gather(
             *[
                 motors[j].set_control_mode(
@@ -685,7 +713,7 @@ async def _run(args: argparse.Namespace) -> None:
         )
 
         try:
-            print("  ramping other joints to 0 ...")
+            print("  ramping other joints to rest (joint-frame 0) ...")
             await _ramp_others_to_zero(motors, joint)
 
             # Fill the gravity pose with the *measured* positions of the
@@ -706,8 +734,8 @@ async def _run(args: argparse.Namespace) -> None:
                     gravity_fn,
                     *fric,
                     j_eff=j_eff,
-                    kd_soft=kd_soft,
                     differentiate_target=(args.mode == "sine"),
+                    host_kd=host_kd,
                 )
                 if args.mode == "sine":
                     log, amp = await run_sine(
@@ -761,10 +789,20 @@ async def _run(args: argparse.Namespace) -> None:
 
             if args.save and results:
                 best = min(results, key=lambda r: r["metrics"]["score"])
+                # Persist kd_host only when the operator set it explicitly:
+                # the gains were validated with that damping active, so the
+                # two must be saved (and later loaded) together.
                 path = update_joint_calibration(
-                    side_str, joint.value, kp=best["kp"], kd=best["kd"]
+                    side_str,
+                    joint.value,
+                    kp=best["kp"],
+                    kd=best["kd"],
+                    kd_host=args.host_kd,
                 )
-                print(f"\n  Saved Kp={best['kp']}  Kd={best['kd']} to {path}")
+                saved = f"Kp={best['kp']}  Kd={best['kd']}"
+                if args.host_kd is not None:
+                    saved += f"  kd_host={args.host_kd}"
+                print(f"\n  Saved {saved} to {path}")
                 print(
                     "  (loaded automatically by AxolConfig on this machine; "
                     "these are the compliant s=0 endpoint of the stiffness "
@@ -776,10 +814,10 @@ async def _run(args: argparse.Namespace) -> None:
         finally:
             if csv_file is not None:
                 csv_file.close()
-            # Slow controlled ramp to 0 — for shoulder_2 this is the *safe*
+            # Slow controlled ramp to rest — for shoulder_2 this is the *safe*
             # way to reach the base side: the danger was a fast mid-step
             # return-to-center, not the gentle approach at _RAMP_SPEED.
-            print("  returning to 0 ...")
+            print("  returning to rest ...")
             try:
                 await _ramp_impedance(
                     motors[joint], ref_kp, ref_kd, 0.0, gravity_fn, args.rate

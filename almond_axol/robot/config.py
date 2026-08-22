@@ -25,6 +25,7 @@ via :func:`dataclasses.replace`::
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -69,8 +70,7 @@ class JointConfig:
         kd:       Velocity damping for impedance control. The motor clamps
                   this to its firmware's range — 5 on Damiao and legacy
                   MyActuator, up to 50 on newer (V4.4+) MyActuator firmware
-                  (auto-detected on ``enable()``). Use ``kd_soft`` to add
-                  damping beyond a motor's cap.
+                  (auto-detected on ``enable()``).
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
@@ -80,10 +80,33 @@ class JointConfig:
         j_eff:    Effective scalar inertia (kg·m²) for acceleration
                   feedforward: ``τ = j_eff · q̈_des`` is added to ``t_ff``
                   so inertia is not driven through tracking error.
-        kd_soft:  Extra software velocity damping (Nm·s/rad) applied as
-                  ``τ = kd_soft · (v_des − v_meas)``; mathematically
-                  equivalent to raising ``kd`` past the motor's firmware cap
-                  (e.g. past 5 on Damiao or legacy MyActuator firmware).
+        kd_host:  Host-side velocity damping (Nm·s/rad):
+                  ``τ = kd_host · (v_des − v_meas)`` is added to ``t_ff``,
+                  with ``v_meas`` differentiated from measured positions at
+                  the command rate. Needed on the high-inertia shoulders,
+                  where the motor firmware's internal velocity estimate is
+                  too filtered to damp the ~2 Hz closed-loop resonance —
+                  measured on left shoulder_2 at kp=250: firmware kd=35
+                  alone left a 62%-overshoot ring; kd_host=30 on top damped
+                  it critically. The elbow needs a small dose for the same
+                  reason (4 halves its step overshoot). Leave at 0 for
+                  joints whose firmware kd works (wrists, shoulder_3).
+        kd_host_max: Hard ceiling on *total* host-side damping, including
+                  the firmware-kd spillover added when ``kd`` exceeds the
+                  motor's firmware range (see ``_mit_cmd`` in
+                  :mod:`almond_axol.robot.axol`). Host damping runs at the
+                  ~100 Hz command rate on a one-cycle-stale velocity, so it
+                  only works on modes far below that rate: the shoulders'
+                  ~2.3 Hz resonance (40 samples/cycle) damps cleanly up to
+                  the hardware-verified 40–45, but the elbow rings at
+                  ~11 Hz (8 samples/cycle, ~45° phase lag) where host
+                  damping *feeds* the oscillation — host-kd 39 there
+                  diverged violently and even 10 sustained a limit cycle on
+                  a full-size step. Only the motor's internal kHz loop can
+                  damp such fast modes, so joints like the elbow must not
+                  spill (``kd_host_max == kd_host``). Set only to values
+                  verified stable on hardware; ``0`` (default) allows no
+                  spillover beyond ``kd_host`` itself.
     """
 
     kp: float
@@ -92,7 +115,8 @@ class JointConfig:
     mass: float
     com: tuple[float, float, float]
     j_eff: float = 0.0
-    kd_soft: float = 0.0
+    kd_host: float = 0.0
+    kd_host_max: float = 0.0
 
 
 @dataclass
@@ -139,50 +163,63 @@ class ArmConfig:
     stiffer :data:`_STIFF_GAINS`.
     """
 
+    # Gains below were identified on the reference robot (both arms, which
+    # converged on the same values) with ``axol tune.pid``: kp from the knee
+    # of the sine-tracking error curve, kd (+ kd_host where firmware kd
+    # can't deliver, see the :class:`JointConfig` docstring) from step
+    # response (<2% overshoot, minimal settling), j_eff from minimizing
+    # sine RMS at fixed gains. ``axol tune.pid --save`` / ``axol
+    # tune.friction --save`` store per-robot values that override these.
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=40.0,
-            kd=5.0,
+            kp=250.0,
+            kd=35.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_soft=5.0,
+            kd_host=40.0,
+            kd_host_max=45.0,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=50.0,
-            kd=5.0,
+            kp=250.0,
+            kd=35.0,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
-            j_eff=0.91,
-            kd_soft=5.0,
+            j_eff=1.1,
+            kd_host=35.0,
+            kd_host_max=40.0,
         )
     )
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=45.0,
-            kd=1.0,
+            kp=180.0,
+            kd=20.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
+            j_eff=0.25,
         )
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=40.0,
-            kd=3.0,
+            kp=130.0,
+            kd=40.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
+            j_eff=0.6,
+            kd_host=4.0,
+            kd_host_max=4.0,
         )
     )
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=30.0,
-            kd=1.0,
+            kp=180.0,
+            kd=20.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
@@ -190,8 +227,8 @@ class ArmConfig:
     )
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=25.0,
-            kd=1.0,
+            kp=130.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
@@ -199,8 +236,8 @@ class ArmConfig:
     )
     wrist_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=25.0,
-            kd=0.5,
+            kp=130.0,
+            kd=2.0,
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
@@ -261,31 +298,38 @@ class _ArmFriction:
 # have not been calibrated. Run ``axol tune.friction --save`` on each new
 # Axol to write its own values to ``~/.almond/calibration.json``, which
 # overrides these defaults (see :mod:`almond_axol.robot.calibration`).
+#
+# Shoulders were swept at 0.13–0.38 rad/s only: above ~0.5 rad/s the
+# MyActuator torque telemetry on the heavy joints degrades (apparent
+# friction *decreases* with speed, scatter grows to ±10 Nm), which is what
+# produced the large phantom viscous terms in earlier fits — every joint is
+# in fact Coulomb-dominated (fv ≈ 0) except a small real viscous drag on
+# wrist_1 and right shoulder_3.
 _LEFT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=1.0191, k=723.53, fv=3.3848, fo=0.2853),
-    shoulder_2=FrictionParams(fc=1.6873, k=115.41, fv=2.7202, fo=-0.1701),
-    shoulder_3=FrictionParams(fc=0.5979, k=106.56, fv=2.1515, fo=0.0242),
-    elbow=FrictionParams(fc=0.6806, k=801.34, fv=0.8665, fo=-0.2496),
-    wrist_1=FrictionParams(fc=0.5601, k=66.02, fv=1.2435, fo=0.0504),
-    wrist_2=FrictionParams(fc=0.2658, k=180.00, fv=0.9962, fo=0.0691),
-    wrist_3=FrictionParams(fc=0.1048, k=829.09, fv=0.5857, fo=0.0638),
+    shoulder_1=FrictionParams(fc=0.9091, k=799.59, fv=0.0, fo=0.37),
+    shoulder_2=FrictionParams(fc=1.1378, k=756.76, fv=0.0, fo=-0.3969),
+    shoulder_3=FrictionParams(fc=0.3599, k=835.51, fv=0.0, fo=-0.0133),
+    elbow=FrictionParams(fc=0.6023, k=855.95, fv=0.0, fo=-0.072),
+    wrist_1=FrictionParams(fc=0.3765, k=88.91, fv=0.0298, fo=-0.0115),
+    wrist_2=FrictionParams(fc=0.1521, k=780.31, fv=0.0, fo=-0.0152),
+    wrist_3=FrictionParams(fc=0.0714, k=927.26, fv=0.0, fo=0.0042),
 )
 
 _RIGHT_FRICTION = _ArmFriction(
-    shoulder_1=FrictionParams(fc=1.0390, k=781.53, fv=3.5425, fo=0.2861),
-    shoulder_2=FrictionParams(fc=1.6873, k=115.41, fv=2.7202, fo=0.1701),
-    shoulder_3=FrictionParams(fc=0.4773, k=91.37, fv=1.8673, fo=0.0631),
-    elbow=FrictionParams(fc=0.5255, k=159.25, fv=0.8480, fo=0.3607),
-    wrist_1=FrictionParams(fc=0.4415, k=80.96, fv=1.3184, fo=0.0497),
-    wrist_2=FrictionParams(fc=0.1880, k=813.44, fv=1.1331, fo=0.0252),
-    wrist_3=FrictionParams(fc=0.1137, k=852.61, fv=0.5843, fo=0.0345),
+    shoulder_1=FrictionParams(fc=1.2972, k=742.11, fv=0.0, fo=-0.1557),
+    shoulder_2=FrictionParams(fc=1.3950, k=768.06, fv=0.0, fo=0.2082),
+    shoulder_3=FrictionParams(fc=0.4377, k=107.94, fv=0.0853, fo=-0.0147),
+    elbow=FrictionParams(fc=0.6066, k=784.78, fv=0.0, fo=0.049),
+    wrist_1=FrictionParams(fc=0.5245, k=98.58, fv=0.3062, fo=-0.0097),
+    wrist_2=FrictionParams(fc=0.1092, k=899.67, fv=0.0, fo=0.0021),
+    wrist_3=FrictionParams(fc=0.1172, k=204.46, fv=0.0, fo=0.0042),
 )
 
 
 def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
-        f: entry[f] for f in ("kp", "kd", "kd_soft", "j_eff") if f in entry
+        f: entry[f] for f in ("kp", "kd", "j_eff", "kd_host") if f in entry
     }
     friction = entry.get("friction")
     if friction is not None:
@@ -352,17 +396,30 @@ class _ArmGains:
     wrist_3: tuple[float, float]
 
 
-# Pre-compliance-tuning gains — the high-``kp`` "industrial robot" defaults
-# used as the ``s=1.0`` endpoint of :attr:`AxolConfig.left_stiffness` and
-# :attr:`AxolConfig.right_stiffness`.
+# High-``kp`` "industrial robot" gains used as the ``s=1.0`` endpoint of
+# :attr:`AxolConfig.left_stiffness` and :attr:`AxolConfig.right_stiffness`.
+#
+# ``kd`` here stays damping-ratio-consistent with the tuned compliant
+# endpoint — ``kd_stiff = kd * sqrt(kp_stiff / kp)``, both taken at the
+# compliant (``s=0``) values — and the
+# geometric blend in :func:`_blend_joint` then holds the damping ratio at
+# every ``s``, so intermediate slider positions stay as well damped as the
+# tuned endpoint (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10°
+# step, the consistent 100/1.6 overshot 0.5%). ``kp_stiff`` is capped where
+# the required ``kd`` would exceed the firmware range: Damiao clamps kd at 5
+# (wrist_2: 250 → kd 4.9), MyActuator V4.4 at 50 (elbow: 200 → kd 50,
+# shoulders: 500 → kd 49.5). Legacy MyActuator firmware clamps kd at 5;
+# part of the excess is delivered host-side instead, up to each joint's
+# ``kd_host_max`` stability ceiling (see ``kd_host`` spillover in
+# :mod:`almond_axol.robot.axol`).
 _STIFF_GAINS = _ArmGains(
-    shoulder_1=(500.0, 5.0),
-    shoulder_2=(500.0, 5.0),
-    shoulder_3=(250.0, 2.0),
-    elbow=(100.0, 2.0),
-    wrist_1=(150.0, 1.0),
-    wrist_2=(150.0, 2.5),
-    wrist_3=(100.0, 0.8),
+    shoulder_1=(500.0, 49.5),
+    shoulder_2=(500.0, 49.5),
+    shoulder_3=(250.0, 23.6),
+    elbow=(200.0, 50.0),
+    wrist_1=(300.0, 26.0),
+    wrist_2=(250.0, 4.9),
+    wrist_3=(250.0, 2.8),
 )
 
 
@@ -372,15 +429,19 @@ def _blend_joint(
     """Blend one joint's gains toward the stiff endpoint by factor ``s``.
 
     ``kp`` and ``kd`` interpolate geometrically (log-space — matches how
-    stiffness is perceived); ``j_eff`` and ``kd_soft`` scale linearly to 0
-    since they only compensate for the low-``kp`` regime.
+    stiffness is perceived); ``j_eff`` scales linearly to 0 since it only
+    compensates for the low-``kp`` regime. ``kd_host`` scales with
+    ``√(kp(s)/kp)`` — critical damping grows with the square root of
+    stiffness, so this keeps the host-damping ratio constant along the
+    slider without needing its own stiff endpoint.
     """
+    kp_factor = (kp_stiff / jc.kp) ** s
     return replace(
         jc,
-        kp=jc.kp * (kp_stiff / jc.kp) ** s,
+        kp=jc.kp * kp_factor,
         kd=jc.kd * (kd_stiff / jc.kd) ** s,
         j_eff=jc.j_eff * (1.0 - s),
-        kd_soft=jc.kd_soft * (1.0 - s),
+        kd_host=jc.kd_host * math.sqrt(kp_factor),
     )
 
 
@@ -463,8 +524,8 @@ class AxolConfig:
                          industrial gains in :data:`_STIFF_GAINS`;
                          ``0.5`` (default) is the geometric mean of the
                          two. ``kp`` / ``kd`` interpolate geometrically
-                         (log-space); ``j_eff`` / ``kd_soft`` scale
-                         linearly to 0 at ``s=1``. The blend is baked into
+                         (log-space); ``j_eff`` scales linearly to 0 at
+                         ``s=1``. The blend is baked into
                          the ``left`` / ``right`` gains by :meth:`resolved`,
                          which is called once at the robot-construction
                          boundary (``Axol.__init__``). The stiffness fields

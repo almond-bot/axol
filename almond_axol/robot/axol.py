@@ -295,8 +295,9 @@ class AxolArm:
         }
         # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
         # the impedance-control velocity FF and the friction model; a_des
-        # feeds inertia FF (``j_eff``); v_meas feeds software damping
-        # (``kd_soft``) — all in :class:`JointConfig`.
+        # feeds inertia FF (``j_eff``); v_meas feeds host-side damping
+        # (``kd_host``, needed on the shoulders where firmware kd can't damp
+        # the low-frequency resonance) — all in :class:`JointConfig`.
         self._vel_diff = Differentiator(n=len(list(Joint)))
         self._accel_diff = Differentiator(n=len(list(Joint)))
         self._meas_vel_diff = Differentiator(n=len(list(Joint)))
@@ -968,9 +969,9 @@ class AxolArm:
         # so we differentiate the joint-frame ``clipped`` array directly.
         velocities = self._vel_diff.differentiate(list(clipped))
         accelerations = self._accel_diff.differentiate(velocities)
-        # v_meas drives software velocity damping. The position cache is
-        # empty until the first set_impedance reply lands; fall back to v_des
-        # so the ``kd_soft`` term collapses to 0 for those first cycles.
+        # v_meas drives host-side velocity damping (``kd_host``). The position
+        # cache is empty until the first set_impedance reply lands; fall back
+        # to v_des so the term collapses to 0 for those first cycles.
         try:
             v_meas = self._meas_vel_diff.differentiate(list(self.positions))
         except MotorError:
@@ -989,13 +990,28 @@ class AxolArm:
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
+            motor = self.motors[j]
+            # The firmware silently clamps kd to its supported range (5 on
+            # Damiao and legacy MyActuator, 50 on MyActuator V4.4+). Deliver
+            # part of the clamped-off excess host-side so robots on legacy
+            # firmware keep some of the tuned damping instead of ringing —
+            # but never beyond ``kd_host_max``: host damping runs at ~100 Hz
+            # on a one-cycle-stale velocity, so on modes anywhere near that
+            # rate the delayed torque arrives out of phase and *excites* the
+            # oscillation instead of damping it (the elbow's ~11 Hz mode
+            # diverged violently under spilled host damping; only the
+            # shoulders' ~2.3 Hz resonance is slow enough to damp host-side).
+            kd_spill = max(gains.kd - motor.kd_max, 0.0)
+            kd_host_total = min(
+                gains.kd_host + kd_spill, max(gains.kd_host_max, gains.kd_host)
+            )
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
                 + gains.j_eff * accelerations[i]
-                + gains.kd_soft * (velocities[i] - v_meas[i])
+                + kd_host_total * (velocities[i] - v_meas[i])
             )
-            return self.motors[j].set_impedance(
+            return motor.set_impedance(
                 float(motor_targets[i]),
                 velocities[i],
                 gains.kp,

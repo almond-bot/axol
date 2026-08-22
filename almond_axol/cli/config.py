@@ -267,7 +267,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
 
 
 # Per-joint arm fields (``kp`` / ``kd`` / ``friction.*`` / ``mass`` / ``com``
-# / ``j_eff`` / ``kd_soft`` for the seven arm joints). For a config that
+# / ``j_eff`` / ``kd_host`` for the seven arm joints). For a config that
 # embeds ``AxolConfig`` these are ~140 of the ~165 generated options and
 # flood ``--help`` into illegibility. Matched anywhere in a dotted option
 # string so it works for both ``--axol.left.elbow.kp`` (teleop) and

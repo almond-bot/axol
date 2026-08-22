@@ -292,6 +292,16 @@ class Motor:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     @property
+    def kd_max(self) -> float:
+        """Upper bound of the firmware's impedance ``kd`` range (Nm·s/rad).
+
+        ``set_impedance`` clamps ``kd`` to this silently: 5 on Damiao and
+        legacy MyActuator, 50 on MyActuator V4.4+ (detected on ``enable()`` /
+        ``attach()``).
+        """
+        return self._driver.kd_max
+
+    @property
     def telemetry_active(self) -> bool:
         """True while the background telemetry polling loop is running."""
         return self._telemetry_task is not None

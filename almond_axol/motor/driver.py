@@ -43,6 +43,19 @@ class MotorDriver(ABC):
         """
         self._on_feedback = callback
 
+    @property
+    def kd_max(self) -> float:
+        """Upper bound of the firmware's impedance ``kd`` range (Nm·s/rad).
+
+        :meth:`set_impedance` encodings clamp ``kd`` to this silently, so a
+        request above it is *lost*, not an error. 5 on Damiao and legacy
+        MyActuator; MyActuator V4.4+ raises it to 50 (detected on
+        :meth:`enable` / :meth:`attach` and overridden by that driver).
+        Consumers can deliver the clamped-off excess host-side instead — see
+        the ``kd_host`` spillover in ``AxolArm.motion_control``.
+        """
+        return 5.0
+
     @abstractmethod
     async def enable(self) -> None:
         """Enable the motor and release the brake."""
