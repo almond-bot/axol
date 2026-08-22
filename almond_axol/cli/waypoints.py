@@ -720,8 +720,7 @@ class _Session:
         legs: list[Leg] = [
             (
                 plan_collision_aware_trajectory(
-                    solver.robot,
-                    solver.robot_coll,
+                    solver,
                     self._q_start,
                     q_waypoints[0],
                     speed=rest_cfg.reset_speed,
@@ -847,8 +846,7 @@ class _Session:
         self._publish("returning", "Returning to the rest pose…")
         trajectory = await asyncio.to_thread(
             plan_collision_aware_trajectory,
-            solver.robot,
-            solver.robot_coll,
+            solver,
             q_now,
             q_rest,
             speed=rest_cfg.reset_speed,

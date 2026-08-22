@@ -15,8 +15,6 @@ import multiprocessing.connection
 import os
 import time
 
-import jax.numpy as jnp
-import jaxlie
 import numpy as np
 
 from ..kinematics.config import KinematicsConfig
@@ -377,8 +375,7 @@ class IKWorker:
         """Collision-aware trajectory. Each item is a full (N,) array in radians."""
         cfg = self._config
         return plan_collision_aware_trajectory(
-            self._solver.robot,
-            self._solver.robot_coll,
+            self._solver,
             q_current,
             q_target,
             speed=cfg.reset_speed,
@@ -475,22 +472,8 @@ class IKWorker:
         at engage time.
         """
         q = self.get_rest_q()
-        fk = self._solver.robot.forward_kinematics(jnp.asarray(q))
-
-        def _pose(idx: int) -> tuple[np.ndarray, np.ndarray]:
-            T = jaxlie.SE3(fk[idx])
-            return (
-                np.asarray(T.translation(), dtype=np.float32),
-                np.asarray(T.rotation().as_matrix(), dtype=np.float32),
-            )
-
-        def _elbow(idx: int) -> np.ndarray:
-            return np.asarray(jaxlie.SE3(fk[idx]).translation(), dtype=np.float32)
-
-        l_pose = _pose(self._solver.l_ee_idx)
-        r_pose = _pose(self._solver.r_ee_idx)
-        l_elbow = _elbow(self._solver.l_elbow_idx)
-        r_elbow = _elbow(self._solver.r_elbow_idx)
+        l_pose, r_pose = self._solver.fk(q)
+        l_elbow, r_elbow = self._solver.elbow_positions(q)
 
         for _ in range(max_iterations):
             self._solver.set_posture_pose(q)
@@ -523,31 +506,16 @@ class IKWorker:
         :meth:`step`. Elbow snapshots are ``None`` when elbow tracking is
         disabled (``kinematics.elbow_weight == 0``) and are never read.
         """
-        fk = self._solver.robot.forward_kinematics(jnp.asarray(q_current))
-
-        def _fk_pos_rot(idx: int) -> tuple[np.ndarray, np.ndarray]:
-            T = jaxlie.SE3(fk[idx])
-            pos = np.asarray(T.translation(), dtype=np.float32)
-            rot = np.asarray(T.rotation().as_matrix(), dtype=np.float32)
-            return pos, rot
+        l_fk, r_fk = self._solver.fk(q_current)
+        l_elbow, r_elbow = self._solver.elbow_positions(q_current)
 
         self._snap_ctrl = {
             "left": (left_pos, left_rot),
             "right": (right_pos, right_rot),
         }
-        self._snap_fk = {
-            "left": _fk_pos_rot(self._solver.l_ee_idx),
-            "right": _fk_pos_rot(self._solver.r_ee_idx),
-        }
+        self._snap_fk = {"left": l_fk, "right": r_fk}
         self._snap_elbow_ctrl = {"left": left_e, "right": right_e}
-        self._snap_elbow_fk = {
-            "left": np.asarray(
-                jaxlie.SE3(fk[self._solver.l_elbow_idx]).translation(), dtype=np.float32
-            ),
-            "right": np.asarray(
-                jaxlie.SE3(fk[self._solver.r_elbow_idx]).translation(), dtype=np.float32
-            ),
-        }
+        self._snap_elbow_fk = {"left": l_elbow, "right": r_elbow}
 
 
 # ---------------------------------------------------------------------------

@@ -31,8 +31,9 @@ _logger = logging.getLogger(__name__)
 
 
 # 6-axis end-effector pose layout: Cartesian position (metres) followed by an
-# axis-angle rotation vector (radians), both in the robot's world frame (FLU).
-# The order matches the per-arm vector returned by :meth:`AxolForwardKinematics.ee_poses`.
+# axis-angle rotation vector (radians), both in the robot's world frame
+# (FLU: +x forward, +y left, +z up). The order matches the per-arm vector
+# returned by :meth:`AxolForwardKinematics.ee_poses`.
 EE_AXES: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
 
 
@@ -108,7 +109,8 @@ class AxolForwardKinematics:
         Returns:
             ``(left_pose, right_pose)``, each a ``(6,)`` array of
             ``[x, y, z, rx, ry, rz]`` (position + axis-angle rotation vector) in
-            the robot's world frame (FLU). See :data:`EE_AXES`.
+            the robot's world frame (FLU: +x forward, +y left, +z up). See
+            :data:`EE_AXES`.
         """
         n = len(self._left_indices)
         q = np.zeros(self._num_joints, dtype=np.float32)

@@ -22,6 +22,8 @@ import jaxls
 import numpy as np
 import pyroki as pk
 
+from ..kinematics.solver import KinematicsSolver
+
 
 @functools.partial(jax.jit, static_argnames=("max_iterations",))
 def solve_path_step(
@@ -72,8 +74,7 @@ def solve_path_step(
 
 
 def plan_collision_aware_trajectory(
-    robot: pk.Robot,
-    robot_coll: pk.collision.RobotCollision,
+    solver: KinematicsSolver,
     q_from: np.ndarray,
     q_to: np.ndarray,
     *,
@@ -96,8 +97,9 @@ def plan_collision_aware_trajectory(
     handful of frames.
 
     Args:
-        robot:            pyroki ``Robot`` instance.
-        robot_coll:       pyroki collision model matched to ``robot``.
+        solver:           :class:`KinematicsSolver` providing the shared robot
+                          and collision models. Joint vectors use its public
+                          ordering (left then right arm, ARM_JOINTS order).
         q_from:           Starting joint configuration, shape ``(N,)``.
         q_to:             Target joint configuration, shape ``(N,)``.
         speed:            Average joint velocity (rad/s) for the worst-case
@@ -116,8 +118,11 @@ def plan_collision_aware_trajectory(
         A list of full ``(N,)`` joint vectors, one per control tick at
         ``rate`` Hz. Always at least two waypoints long.
     """
-    q_from = np.asarray(q_from, dtype=np.float32)
-    q_to = np.asarray(q_to, dtype=np.float32)
+    # The projection costs (joint limits, self-collision) index joints the
+    # way the pyroki robot does, so the solve runs in that order and the
+    # returned waypoints are converted back.
+    q_from = solver.to_pyroki_order(q_from)
+    q_to = solver.to_pyroki_order(q_to)
     max_dist = float(np.max(np.abs(q_from - q_to)))
     duration = max(max_dist / speed, min_duration)
     n_steps = max(2, round(duration * rate))
@@ -129,8 +134,8 @@ def plan_collision_aware_trajectory(
         alpha = t * t * (3.0 - 2.0 * t)
         q_interp = (q_from * (1.0 - alpha) + q_to * alpha).astype(np.float32)
         result = solve_path_step(
-            robot,
-            robot_coll,
+            solver.robot,
+            solver.robot_coll,
             jnp.asarray(q_interp),
             jnp.asarray(q),
             rest_weight,
@@ -140,5 +145,5 @@ def plan_collision_aware_trajectory(
             max_iterations,
         )
         q = np.asarray(result, dtype=np.float32)
-        trajectory.append(q.copy())
+        trajectory.append(solver.from_pyroki_order(q))
     return trajectory
