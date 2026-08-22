@@ -50,6 +50,7 @@ from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .joint_frame import JointFrameMotor, joint_frame_motors
+from .pid import _BASE_COLLISION_JOINTS
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
@@ -89,9 +90,20 @@ async def _ramp_others(
     exclude: Joint,
     targets: dict[Joint, float] | None = None,
 ) -> None:
-    """Move all joints except `exclude` to their joint-frame targets (default 0 = rest)."""
-    joints = [j for j in ARM_JOINTS if j != exclude]
+    """Move all joints except `exclude` to their joint-frame targets (default 0 = rest).
+
+    Joints in ``_BASE_COLLISION_JOINTS`` (shoulder_2, wrist_2 — their 0
+    collides with the robot base) are left in place unless an explicit
+    target is given, same as the PID tuner's ``_ramp_others_to_zero``. The
+    operator is responsible for initially posing them outside the danger
+    zone.
+    """
     t = targets or {}
+    joints = [
+        j
+        for j in ARM_JOINTS
+        if j != exclude and (j not in _BASE_COLLISION_JOINTS or j in t)
+    ]
     pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
     max_dist = max(
         (abs(pos - t.get(j, 0.0)) for j, pos in zip(joints, pos_vals)), default=0.0
@@ -554,6 +566,11 @@ async def _run(args: argparse.Namespace) -> None:
             print("  Ramping other joints to start position ...")
             await _ramp_others(motors, joint, other_targets)
             await asyncio.sleep(1.0)
+            # Base-collision joints were left wherever the operator posed
+            # them (not commanded to 0) — feed their measured positions to
+            # the gravity model so the Fo fit uses the real pose.
+            for j in _BASE_COLLISION_JOINTS - {joint} - set(other_targets):
+                other_targets[j] = await motors[j].get_position()
 
             # shoulder_2 swings into the robot base on the inboard side; cap
             # the sweep at 0 so it stays on the safe half of its range.
@@ -601,7 +618,16 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"    Fv = {Fv_out:.4f} Nm·s/rad  (viscous)")
 
             if friction_result is not None or Fo_result is not None:
-                if args.save:
+                if args.save and friction_result is None:
+                    # Saving here would write Fc=k=Fv=0 into the calibration
+                    # file and override this robot's real friction values on
+                    # every later AxolConfig load.
+                    print(
+                        "\n  ! Friction fit failed — not saving (only Fo was "
+                        "estimated; zeros for Fc/k/Fv would override real "
+                        "calibration values)."
+                    )
+                elif args.save:
                     path = update_joint_calibration(
                         side_str,
                         joint.value,

@@ -106,7 +106,10 @@ class JointConfig:
                   damp such fast modes, so joints like the elbow must not
                   spill (``kd_host_max == kd_host``). Set only to values
                   verified stable on hardware; ``0`` (default) allows no
-                  spillover beyond ``kd_host`` itself.
+                  spillover beyond ``kd_host`` itself. The stiffness blend
+                  scales this ceiling with the same ``√kp`` factor as
+                  ``kd_host``, keeping the spill allowance damping-ratio-
+                  consistent at every slider position.
     """
 
     kp: float
@@ -471,12 +474,17 @@ def _blend_joint(
         kp_end, kd_end = kp_stiff, kd_stiff
         j_eff = jc.j_eff * (1.0 - u)
     kp_factor = (kp_end / jc.kp) ** u
+    host_factor = math.sqrt(kp_factor)
     return replace(
         jc,
         kp=jc.kp * kp_factor,
         kd=jc.kd * (kd_end / jc.kd) ** u,
         j_eff=j_eff,
-        kd_host=jc.kd_host * math.sqrt(kp_factor),
+        kd_host=jc.kd_host * host_factor,
+        # The spillover ceiling must track the same √kp scaling, or blended
+        # kd_host would sail past a fixed cap (making it meaningless) while
+        # legacy-firmware spillover stayed clamped to the midpoint's value.
+        kd_host_max=jc.kd_host_max * host_factor,
     )
 
 
