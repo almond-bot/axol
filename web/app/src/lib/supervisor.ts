@@ -495,7 +495,7 @@ export interface CameraSpec {
 }
 
 /**
- * How long the connect probe waits before declaring the host unreachable.
+ * How long the reachability probe waits before declaring the host absent.
  * Without this, a fetch to an absent host sits in TCP retries for a minute or
  * more with the UI stuck on "Connecting…". Kept just high enough for a live
  * LAN host's worst case (mDNS .local resolution + TCP + TLS handshake over
@@ -504,9 +504,16 @@ export interface CameraSpec {
 const CONNECT_TIMEOUT_MS = 2_000
 
 export async function fetchCommands(): Promise<CommandSpec[]> {
-  let res: Response
+  // Fail fast on an absent host by racing the timer against a probe that
+  // answers from memory (/api/op/status — any HTTP response, even a 404 from
+  // an older host, proves it's alive). The timer must not cover /api/commands
+  // itself: its first call after a serve start imports every command's config
+  // module to build the schemas and can take well past the timeout, so racing
+  // it misreported a slow-but-alive host as offline — the first connect after
+  // a cert authorization always failed and only the retry (against the
+  // then-warm schema cache) got through.
   try {
-    res = await fetch(apiUrl("/api/commands"), {
+    await fetch(apiUrl("/api/op/status"), {
       signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
     })
   } catch (e) {
@@ -515,7 +522,7 @@ export async function fetchCommands(): Promise<CommandSpec[]> {
     }
     throw e
   }
-  return json(res)
+  return json(await fetch(apiUrl("/api/commands")))
 }
 
 export async function fetchSessions(): Promise<SessionInfo[]> {
