@@ -33,7 +33,7 @@ You drive the arms over VR exactly as in [teleoperation](/operations/teleop); th
       </Step>
 
       <Step title="Select Collect Data and fill the fields">
-        Pick **Collect Data**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`) and the **task** description — the only per-run inputs. Everything reusable (fps, teleop rate, stiffness, push-to-hub) lives in the [Settings](/guides/control-panel#settings) tabs.
+        Pick **Collect Data**. Set the dataset **repo&nbsp;id** — type a new one (e.g. `myorg/pick-place`) or pick an existing dataset from the dropdown (each shown with its episode count) to **resume** it — and the **task** description; those are the only per-run inputs. Everything reusable (fps, teleop rate, stiffness, push-to-hub) lives in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
 
       <Step title="Start and record from the headset">
@@ -74,7 +74,7 @@ Episodes are driven from the Quest controllers (the control panel can take the s
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** (toggle, not hold) |
+| 1 | Left grip | Press both grips (1 + 2) together to **engage** tracking from rest; once engaged, each grip **toggles its own arm** between tracking and frozen (a frozen arm holds its pose and grasp) |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it (both triggers on one screen **resize** it) |
@@ -114,6 +114,8 @@ Episodes are driven from the Quest controllers (the control panel can take the s
     If the move meets **unexpected resistance** — a gripper still hooked on a handle, or you grabbing an arm — it stops where it is and the arms drop into a limp **gravity-compensation hold**, free to be hand-guided. Ease them clear of the scene (the episode keeps saving in the background), then press **X** to send them home again — the return replans **from wherever you left the arms**. Recording is blocked while limp; pressing **A** just gets you a reminder to reset first.
 
     The same guard covers **every** rest move — an **X** reset between takes and the startup move too, not just the post-episode return. Its sensitivity is the **Reset contact threshold** in the control panel's Robot settings (`--teleop_config.vr_teleop_config.reset_torque_threshold` on the CLI) — raise it if normal returns trip it falsely, or set `0` to disable it and always complete the return.
+
+    You can also arm a watchdog for the **tracking** phase — while you're actively driving the arms during a take. It's **off by default** (recording pushes on the scene on purpose): set the **Teleop contact stop** in the control panel's Robot settings (`--teleop_config.vr_teleop_config.teleop_torque_threshold`; the panel suggests `16` Nm). A trip mid-take **disengages tracking, discards the in-flight episode**, and drops the arms limp — clear them by hand, then press **X** to return to rest and re-record. Shared with [`teleop`](/operations/teleop), so both flows behave identically.
   </Step>
 </Steps>
 
