@@ -56,6 +56,11 @@ class JointFrameMotor:
         """Latest cached torque estimate (Nm) — frame-invariant."""
         return self.motor.torque
 
+    @property
+    def feedback_ts(self) -> float:
+        """CAN receive timestamp (s) of the last cached feedback frame."""
+        return self.motor.feedback_ts
+
     async def get_position(self) -> float:
         """Current position (rad, joint frame)."""
         return await self.motor.get_position() + self.offset

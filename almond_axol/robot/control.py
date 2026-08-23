@@ -89,11 +89,31 @@ class ContactWatchdog:
         return None
 
 
+# Steepness ceiling for the friction *feedforward* (identification keeps the
+# raw fit). Fitted k values are often very steep (k≈800 saturates the Coulomb
+# term within |v| < 0.025 rad/s) — physically right for stiction, but as
+# feedforward it makes the ±Fc torque snap on/off within a couple of control
+# cycles at every trajectory arrival and reversal. On the shoulders that
+# ~1 Nm near-step rings the arm's 2–3 Hz structural mode: at ROM's
+# gravity-loaded −90° waypoint the arrival ring measured 0.37 Nm RMS /
+# 10 mdeg with raw k, and 0.10–0.13 Nm / ~0 mdeg with the cap (k=50 and
+# k=100 performed equally; 100 keeps more low-speed friction comp). Sweep
+# and teleop speeds (≳0.3 rad/s) stay in the saturated region either way,
+# so steady tracking feedforward is unchanged.
+FRICTION_FF_K_MAX = 100.0
+
+
 def compute_friction(
     velocity: float, Fc: float, k: float, Fv: float, Fo: float
 ) -> float:
-    """Tanh friction model: τ = Fc * tanh(0.1 * k * v) + Fv * v + Fo"""
-    return Fc * math.tanh(0.1 * k * velocity) + Fv * velocity + Fo
+    """Tanh friction model: τ = Fc * tanh(0.1 * k * v) + Fv * v + Fo
+
+    ``k`` is capped at :data:`FRICTION_FF_K_MAX` (see above) so the Coulomb
+    term ramps smoothly through zero crossings instead of stepping.
+    """
+    return (
+        Fc * math.tanh(0.1 * min(k, FRICTION_FF_K_MAX) * velocity) + Fv * velocity + Fo
+    )
 
 
 class Differentiator:
@@ -118,17 +138,36 @@ class Differentiator:
         self._vel_prev = [0.0] * n
         self._pos_prev: list[float | None] = [None] * n
         self._last_time: float | None = None
+        self._ts_prev: list[float] | None = None
 
-    def differentiate(self, positions: list[float]) -> list[float]:
+    def differentiate(
+        self, positions: list[float], timestamps: list[float] | None = None
+    ) -> list[float]:
         """Compute low-pass-filtered velocities from a new position sample.
 
         Returns a list of length ``n`` in rad/s.  Returns all zeros on the
         first call.  If called with no elapsed time (``Ts <= 0``), returns
         the previous velocity estimate unchanged.
 
+        With ``timestamps`` (one per channel, seconds — e.g. CAN frame
+        receive times), each channel is differentiated against its *own*
+        sample interval instead of the shared wall clock at call time. Use
+        this when positions come from cached feedback frames: the variable
+        delay between a frame's arrival and this call otherwise shows up as
+        velocity noise proportional to speed (scheduling jitter × velocity),
+        which host-side damping then amplifies into torque chatter. A
+        channel whose timestamp has not advanced keeps its previous
+        velocity. Do not mix timestamped and wall-clock calls on one
+        instance.
+
         Args:
-            positions: Current joint positions in radians, length ``n``.
+            positions:  Current joint positions in radians, length ``n``.
+            timestamps: Per-channel sample times in seconds (any common
+                        epoch), length ``n``, or ``None`` for wall-clock.
         """
+        if timestamps is not None:
+            return self._differentiate_timestamped(positions, timestamps)
+
         now = time.perf_counter()
 
         if self._last_time is None or any(p is None for p in self._pos_prev):
@@ -150,6 +189,30 @@ class Differentiator:
             vel = self._vel_prev[i] * a + b * (positions[i] - self._pos_prev[i])  # type: ignore[operator]
             self._vel_prev[i] = vel
             self._pos_prev[i] = positions[i]
+            velocities.append(vel)
+
+        return velocities
+
+    def _differentiate_timestamped(
+        self, positions: list[float], timestamps: list[float]
+    ) -> list[float]:
+        if self._ts_prev is None:
+            self._ts_prev = list(timestamps)
+            self._pos_prev = list(positions)
+            return [0.0] * self._n
+
+        velocities: list[float] = []
+        for i in range(self._n):
+            Ts = timestamps[i] - self._ts_prev[i]
+            if Ts <= 0:
+                velocities.append(self._vel_prev[i])
+                continue
+            a = 1.0 / (1.0 + Ts * CUTOFF_FREQ)
+            b = a * CUTOFF_FREQ
+            vel = self._vel_prev[i] * a + b * (positions[i] - self._pos_prev[i])  # type: ignore[operator]
+            self._vel_prev[i] = vel
+            self._pos_prev[i] = positions[i]
+            self._ts_prev[i] = timestamps[i]
             velocities.append(vel)
 
         return velocities

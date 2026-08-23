@@ -23,23 +23,31 @@ class MotorDriver(ABC):
     # Push-based feedback callback, installed via ``set_feedback_callback``.
     # Subclasses initialize this to ``None`` in ``__init__`` and invoke it
     # from their CAN message handler when a feedback frame arrives.
-    _on_feedback: Callable[[float, float], None] | None = None
+    _on_feedback: Callable[[float, float, float, float], None] | None = None
 
     def set_feedback_callback(
-        self, callback: Callable[[float, float], None] | None
+        self, callback: Callable[[float, float, float, float], None] | None
     ) -> None:
-        """Register a callback fired with ``(position, torque)`` on each feedback frame.
+        """Register a callback fired with ``(position, velocity, torque, timestamp)`` per feedback frame.
 
         This is the push-based counterpart to :meth:`get_telemetry`'s
         pull-based ``on_position`` / ``on_torque`` callbacks: drivers invoke
         it whenever an unsolicited or command-response feedback frame arrives
         (for example the response to :meth:`set_impedance`), letting callers
-        cache the latest position/torque without an explicit telemetry
-        round-trip. Pass ``None`` to clear the callback.
+        cache the latest position/velocity/torque without an explicit
+        telemetry round-trip.
+
+        ``timestamp`` is the CAN frame's kernel receive time (seconds,
+        epoch): differentiating cached positions against it — rather than
+        the wall clock at read time — removes the scheduling jitter between
+        frame arrival and consumption. ``velocity`` is the motor firmware's
+        own estimate; note it is heavily filtered on MyActuator (too laggy
+        to damp a ~2 Hz resonance host-side). Pass ``None`` to clear the
+        callback.
 
         Args:
-            callback: Receives ``(position_rad, torque_nm)``, or ``None`` to
-                disable feedback callbacks.
+            callback: Receives ``(position_rad, velocity_rad_s, torque_nm,
+                timestamp_s)``, or ``None`` to disable feedback callbacks.
         """
         self._on_feedback = callback
 

@@ -68,7 +68,14 @@ CONTROL_RATE_HZ = 100.0  # Hz
 # dashboard watches the log for this and turns it into a Continue button.
 PROMPT_MARKER = "[prompt]"
 
-AXOL_SPEED = 1.0  # rad/s
+# Sweep speed. 1.0 rad/s excites the shoulders' ~3 Hz structural mode: the
+# smoothstep acceleration of a 90° sweep at that speed has significant energy
+# at the resonance, producing a visible ~1.3 Nm RMS wobble during motion and
+# an arrival ring at every waypoint. Hardware A/B (mirrored shoulder_1 sweep,
+# s=1.0) measured 0.6 rad/s cutting the in-motion residual ~35% and halving
+# the arrival ring; host damping is already at its stability ceiling, so a
+# gentler trajectory is the only remaining lever.
+AXOL_SPEED = 0.6  # rad/s
 AXOL_PRE_POSE_SPEED = 0.3  # rad/s
 # Return-to-home speed, matching teleop's VRTeleopConfig.reset_speed so the
 # end-of-soak homing feels identical to a teleop return-to-rest.
@@ -264,6 +271,41 @@ class HardwareController:
         await asyncio.gather(*tasks)
 
 
+async def hold_pose(
+    robot: Axol | HardwareController,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+    seconds: float,
+) -> None:
+    """Hold a pose for ``seconds`` while keeping the 100 Hz command stream alive.
+
+    A bare ``asyncio.sleep`` would leave the motors holding on firmware
+    impedance alone, without the host-side damping term (``kd_host``) that
+    ``motion_control`` streams in ``t_ff``. The shoulders' ~2.3 Hz resonance is
+    essentially undamped by firmware kd, so at ROM's stiff gains any
+    perturbation during an unstreamed pause (an operator touching the arm, the
+    arrival transient at a waypoint) rings visibly for seconds. Streaming the
+    hold keeps the tuned damping active the whole time.
+    """
+    dt = 1.0 / CONTROL_RATE_HZ
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        await robot.motion_control(left=left_q, right=right_q)
+        await asyncio.sleep(dt)
+
+
+async def _stream_hold_forever(
+    robot: Axol | HardwareController,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+) -> None:
+    """Stream a static hold until cancelled (see :func:`hold_pose` for why)."""
+    dt = 1.0 / CONTROL_RATE_HZ
+    while True:
+        await robot.motion_control(left=left_q, right=right_q)
+        await asyncio.sleep(dt)
+
+
 async def move_grippers(
     robot: Axol | HardwareController,
     left_q: np.ndarray,  # rad
@@ -329,7 +371,9 @@ async def sweep_to_target(
         if progress >= 1.0:
             break
         await asyncio.sleep(dt)
-    await asyncio.sleep(pause)
+    # Keep streaming through the waypoint pause — an unstreamed pause drops
+    # the host-side damping and lets the shoulders ring (see hold_pose).
+    await hold_pose(robot, left_target, right_target, pause)
     return left_target.copy(), right_target.copy()
 
 
@@ -602,19 +646,37 @@ async def close_buses(robot: Axol) -> None:
     await asyncio.gather(*(bus.close() for bus in buses))
 
 
-async def _confirm(instruction: str, web_prompts: bool) -> None:
-    """Block until the operator confirms a hands-on step.
+async def _confirm(
+    instruction: str,
+    web_prompts: bool,
+    robot: Axol | HardwareController,
+    left_q: np.ndarray,  # rad
+    right_q: np.ndarray,  # rad
+) -> None:
+    """Block until the operator confirms a hands-on step, streaming the hold.
+
+    The operator is touching the robot during these steps (placing the item in
+    a gripper), so this is exactly when the arms must stay well-damped: the
+    current pose keeps streaming at 100 Hz while we wait (see hold_pose).
 
     ``--web-prompts``: emit a ``[prompt]`` marker the dashboard turns into a
     Continue button, then block until it writes a line to our stdin. Otherwise
     fall back to an ordinary tty ``input()`` prompt. A closed stdin (EOF, e.g.
     the run is being stopped) unblocks and returns so teardown can proceed.
     """
-    if web_prompts:
-        print(f"{PROMPT_MARKER} {instruction}", flush=True)
-        await asyncio.to_thread(sys.stdin.readline)
-        return
-    await asyncio.to_thread(input, f"{instruction} Press Enter to continue ...")
+    hold = asyncio.ensure_future(_stream_hold_forever(robot, left_q, right_q))
+    try:
+        if web_prompts:
+            print(f"{PROMPT_MARKER} {instruction}", flush=True)
+            await asyncio.to_thread(sys.stdin.readline)
+        else:
+            await asyncio.to_thread(input, f"{instruction} Press Enter to continue ...")
+    finally:
+        hold.cancel()
+        try:
+            await hold
+        except asyncio.CancelledError:
+            pass
 
 
 async def run_axol(
@@ -663,11 +725,16 @@ async def run_axol(
     robot = HardwareController(axol, present)
     await robot.enable()
     print("Motors enabled.")
-    await asyncio.sleep(2.0)
 
     logger = TelemetryCsvLogger(axol, "rom") if capture else None
     if logger is not None:
         logger.start()
+
+    # Settle for 2 s while streaming the current pose — a bare sleep would
+    # leave the motors on firmware-only hold without host damping (see
+    # hold_pose) right after the enable transient.
+    settle_left, settle_right = await robot.get_positions()
+    await hold_pose(robot, settle_left, settle_right, 2.0)
 
     closed_left_q: np.ndarray | None = None
     closed_right_q: np.ndarray | None = None
@@ -683,7 +750,6 @@ async def run_axol(
     keep_enabled = False
 
     try:
-        home = home_pose()
         gripper_i = JOINT_INDEX[Joint.GRIPPER]
 
         # Ease the arms from wherever they actually are to home before anything
@@ -691,6 +757,7 @@ async def run_axol(
         # otherwise command home as a single stiff (s=1) impedance setpoint and
         # snap the arms there; sweep_unchecked ramps them in with a smoothstep
         # trajectory instead.
+        home = home_pose()
         cur_left, cur_right = await robot.get_positions()
         ready_left = home.copy()
         ready_right = home.copy()
@@ -713,6 +780,9 @@ async def run_axol(
                 await _confirm(
                     "Position the item in the RIGHT gripper, then close it.",
                     web_prompts,
+                    robot,
+                    left_q,
+                    right_q,
                 )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, left_q[gripper_i], 0.0, GRIPPER_SPEED
@@ -721,6 +791,9 @@ async def run_axol(
                 await _confirm(
                     "Position the item in the LEFT gripper, then close it.",
                     web_prompts,
+                    robot,
+                    left_q,
+                    right_q,
                 )
                 left_q, right_q = await move_grippers(
                     robot, left_q, right_q, 0.0, right_q[gripper_i], GRIPPER_SPEED
@@ -731,7 +804,7 @@ async def run_axol(
         closed_right_q = right_q.copy()
 
         print("Starting ROM test in 5 s ...")
-        await asyncio.sleep(5.0)
+        await hold_pose(robot, left_q, right_q, 5.0)
 
         deadline = time.monotonic() + SOAK_DURATION
         cycle = 0
@@ -760,7 +833,7 @@ async def run_axol(
             print(f"\nCycle {cycle} complete.")
             if time.monotonic() < deadline:
                 print(f"Waiting {CYCLE_PAUSE}s ...")
-                await asyncio.sleep(CYCLE_PAUSE)
+                await hold_pose(robot, left_q, right_q, CYCLE_PAUSE)
 
         print(f"\n2-hour soak complete — {cycle} cycle(s) finished.")
 

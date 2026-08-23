@@ -43,10 +43,25 @@ _MA_POS_CONTROL = 0xA4  # absolute position closed-loop control
 _MA_VELOCITY_CONTROL = 0xA2  # speed closed-loop control
 _MA_FUNCTION_CONTROL = 0x20  # function control; byte 1 = index, bytes 4-7 = value
 _MA_FC_SET_CANID = 0x05  # function control index: set CAN ID
-_MA_READ_GAINS = 0x30  # read all PID gains (uint8, bulk)
-_MA_WRITE_GAINS_ROM = (
-    0x32  # write all PID gains to ROM (uint8, bulk); persistent by command
-)
+# Loop-gain (PID parameter) access. Protocol V4.2 (2024-05) changed these from
+# a bulk read/write of six uint8 values to an indexed float32 per parameter:
+# request [cmd, index, 0, 0, 0, 0, 0, 0], reply echoes the index in byte 1 with
+# the little-endian float in bytes 4-7. Pre-V4.2 firmware instead replies with
+# the six uint8 gains in bytes 2-7 (byte 1 zero) — the index echo is how the
+# driver tells the two formats apart at runtime.
+_MA_READ_GAINS = 0x30
+_MA_WRITE_GAINS_ROM = 0x32  # persistent by command; 0x31 (RAM) is not used
+
+# Indexed float32 parameter indices for 0x30/0x31/0x32 (V4.2+).
+_MA_PID_IDX = {
+    "current_kp": 0x01,
+    "current_ki": 0x02,
+    "speed_kp": 0x04,
+    "speed_ki": 0x05,
+    "position_kp": 0x07,
+    "position_ki": 0x08,
+    "position_kd": 0x09,
+}
 _MA_SET_ACCELERATION = 0x43  # write acceleration to RAM and ROM; persistent by command
 
 # Configuration-parameter access. These two commands are absent from MyActuator's
@@ -200,7 +215,7 @@ class MyActuatorMotor(MotorDriver):
         self._motor_id = motor_id
         self._kt = kt
         self._pending: dict[tuple[int, int], asyncio.Future[bytes]] = {}
-        self._on_feedback: Callable[[float, float], None] | None = None
+        self._on_feedback: Callable[[float, float, float, float], None] | None = None
 
         # Firmware-dependent MIT-command ranges. Default to the conservative
         # legacy ranges until enable() reads the firmware version and model.
@@ -223,10 +238,12 @@ class MyActuatorMotor(MotorDriver):
             if self._on_feedback is not None:
                 data = bytes(msg.data)
                 pos_int = (data[1] << 8) | data[2]
+                vel_int = (data[3] << 4) | (data[4] >> 4)
                 torq_int = ((data[4] & 0x0F) << 8) | data[5]
                 position = _uint_to_float(pos_int, -self._p_max, self._p_max, 16)
+                velocity = _uint_to_float(vel_int, -_MA_V_MAX, _MA_V_MAX, 12)
                 torque = _uint_to_float(torq_int, -self._t_max, self._t_max, 12)
-                self._on_feedback(position, torque)
+                self._on_feedback(position, velocity, torque, msg.timestamp)
             return
         key = (msg.arbitration_id, msg.data[0])
         fut = self._pending.pop(key, None)
@@ -543,27 +560,68 @@ class MyActuatorMotor(MotorDriver):
         await _send(_MA_ACC_VEL_PLAN, acceleration)
         await _send(_MA_DEC_VEL_PLAN, dec)
 
+    async def _read_gain_indexed(self, index: int) -> float | None:
+        """Read one loop gain via the V4.2+ indexed float32 format.
+
+        Returns None if the motor answered in the pre-V4.2 bulk format (no
+        index echo), so the caller can fall back to the legacy parse. All
+        gain reads share one response CAN ID — keep them sequential.
+        """
+        resp = await self._request(bytes([_MA_READ_GAINS, index, 0, 0, 0, 0, 0, 0]))
+        if resp[1] != index:
+            return None
+        return float(struct.unpack_from("<f", resp, 4)[0])
+
     async def get_gains(self) -> MotorGains:
-        resp = await self._request(self._cmd(_MA_READ_GAINS))
-        # Response bytes 2-7: current_kp, current_ki, speed_kp, speed_ki, pos_kp, pos_ki (uint8)
-        return MotorGains(
-            speed_kp=float(resp[4]),
-            speed_ki=float(resp[5]),
-            position_kp=float(resp[6]),
-            position_ki=float(resp[7]),
-            current_kp=float(resp[2]),
-            current_ki=float(resp[3]),
-        )
+        values: dict[str, float] = {}
+        for name, index in _MA_PID_IDX.items():
+            value = await self._read_gain_indexed(index)
+            if value is None:
+                # Pre-V4.2 firmware: one bulk frame carries all six gains.
+                resp = await self._request(self._cmd(_MA_READ_GAINS))
+                return MotorGains(
+                    speed_kp=float(resp[4]),
+                    speed_ki=float(resp[5]),
+                    position_kp=float(resp[6]),
+                    position_ki=float(resp[7]),
+                    current_kp=float(resp[2]),
+                    current_ki=float(resp[3]),
+                )
+            values[name] = value
+        return MotorGains(**values)
 
     async def set_gains(self, gains: MotorGains) -> None:
         # Command 0x32 writes directly to ROM — no separate store step needed.
+        # Probe the read format first so a V4.2+ motor never receives the
+        # legacy bulk frame (and vice versa), which would store garbage gains.
+        probe = await self._read_gain_indexed(_MA_PID_IDX["current_kp"])
+        if probe is not None:
+            writes = {
+                "speed_kp": gains.speed_kp,
+                "speed_ki": gains.speed_ki,
+                "position_kp": gains.position_kp,
+                "position_ki": gains.position_ki,
+            }
+            if gains.position_kd is not None:
+                writes["position_kd"] = gains.position_kd
+            if gains.current_kp is not None:
+                writes["current_kp"] = gains.current_kp
+            if gains.current_ki is not None:
+                writes["current_ki"] = gains.current_ki
+            for name, value in writes.items():
+                data = bytes(
+                    [_MA_WRITE_GAINS_ROM, _MA_PID_IDX[name], 0, 0]
+                ) + struct.pack("<f", float(value))
+                await self._request(data)
+            return
+
         current_kp = int(max(0, min(255, gains.current_kp or 0)))
         current_ki = int(max(0, min(255, gains.current_ki or 0)))
         speed_kp = int(max(0, min(255, gains.speed_kp)))
         speed_ki = int(max(0, min(255, gains.speed_ki)))
         pos_kp = int(max(0, min(255, gains.position_kp)))
         pos_ki = int(max(0, min(255, gains.position_ki)))
-        # SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
+        # Legacy SDK byte layout: [cmd, 0, cur_kp, cur_ki, spd_kp, spd_ki, pos_kp, pos_ki]
         data = bytes(
             [
                 _MA_WRITE_GAINS_ROM,

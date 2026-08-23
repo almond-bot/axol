@@ -91,6 +91,14 @@ class JointConfig:
                   it critically. The elbow needs a small dose for the same
                   reason (4 halves its step overshoot). Leave at 0 for
                   joints whose firmware kd works (wrists, shoulder_3).
+                  This value is the *rest-pose* (q = 0) anchor: at runtime
+                  the controller scales it by J(q)/J_rest from the URDF
+                  mass matrix, tapering it toward 0 in poses where the
+                  joint's reflected inertia collapses (e.g. shoulder_1 with
+                  the arm raised to the side) — there the mode is fast, the
+                  stale host torque arrives out of phase, and un-scheduled
+                  kd_host measurably sustains jitter (see
+                  ``AxolArm.motion_control``).
         kd_host_max: Hard ceiling on *total* host-side damping, including
                   the firmware-kd spillover added when ``kd`` exceeds the
                   motor's firmware range (see ``_mit_cmd`` in
@@ -411,18 +419,41 @@ class _ArmGains:
 # tuned endpoint (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10°
 # step, the consistent 100/1.6 overshot 0.5%). ``kp_stiff`` is capped where
 # the required ``kd`` would exceed the firmware range: Damiao clamps kd at 5
-# (wrist_2: 250 → kd 4.9), MyActuator V4.4 at 50 (elbow: 200 → kd 50,
-# shoulders: 500 → kd 49.5). Legacy MyActuator firmware clamps kd at 5;
-# part of the excess is delivered host-side instead, up to each joint's
-# ``kd_host_max`` stability ceiling (see ``kd_host`` spillover in
-# :mod:`almond_axol.robot.axol`).
+# (wrist_2: 250 → kd 4.9), MyActuator V4.4 at 50 (elbow: 200 → kd 50).
+# Legacy MyActuator firmware clamps kd at 5; part of the excess is
+# delivered host-side instead, up to each joint's ``kd_host_max`` stability
+# ceiling (see ``kd_host`` spillover in :mod:`almond_axol.robot.axol`).
+#
+# The shoulders are capped at 350 by measured torque chatter, not firmware:
+# at kp=500 each shoulder injected ~1.5 Nm RMS of cycle-to-cycle torque
+# noise (vs 0.96 at the kp=250 midpoint) — with both arms driven that
+# excited a structural torso vibration in the full-robot ROM test — while
+# settling only marginally faster than kp=350 (466 vs 544 ms on a 3° step,
+# both 0% overshoot). kp=350 holds chatter near the midpoint level (1.08).
+#
+# wrist_2 is capped at 160 by a measured stability margin, not the damping
+# ratio: with Damiao kd hardware-clamped at 5, kp=250 sat at the edge of a
+# bistable ~35 Hz limit cycle (±0.55°, ±1.4 Nm sustained, triggered by load
+# shifts and latching even at rest — observed on one unit whose wrist_2 had
+# less mechanical margin, while its twin stayed quiet). Host-side damping
+# can't reach a 35 Hz mode, so the stiff endpoint keeps the loop bandwidth
+# (∝ √kp) safely below the phase-lagged region instead.
+#
+# wrist_1 is capped at 200 by an in-motion structural buzz: sweeping the
+# wrist with the elbow at 90° (the loaded ROM pose) excites a ~27 Hz forearm
+# mode whose amplitude scales with kp, not kd (kp=300: 0.24–0.27 Nm RMS on
+# both arms; lowering kd made it worse, so firmware damping was already
+# helping). kp=200/kd=18 cuts the buzz ~35% with identical gravity-hold
+# accuracy (0.165° vs 0.159° mean error at the ±135° waypoint), so the
+# extra kp bought no stiffness in practice — a gripped payload would lower
+# the mode's frequency and amplify it further.
 _STIFF_GAINS = _ArmGains(
-    shoulder_1=(500.0, 49.5),
-    shoulder_2=(500.0, 49.5),
+    shoulder_1=(350.0, 41.4),
+    shoulder_2=(350.0, 41.4),
     shoulder_3=(250.0, 23.6),
     elbow=(200.0, 50.0),
-    wrist_1=(300.0, 26.0),
-    wrist_2=(250.0, 4.9),
+    wrist_1=(200.0, 18.0),
+    wrist_2=(160.0, 3.9),
     wrist_3=(250.0, 2.8),
 )
 
@@ -459,31 +490,38 @@ def _blend_joint(
 
     ``kp`` and ``kd`` interpolate geometrically (log-space — matches how
     stiffness is perceived); with damping-ratio-consistent endpoints the
-    blend then holds the damping ratio at every ``s``. ``kd_host`` scales
-    with ``√(kp(s)/kp)`` — critical damping grows with the square root of
-    stiffness — for the same reason. ``j_eff`` stays constant on the soft
-    half (it compensates real inertia, which matters most at low ``kp``)
-    and scales linearly to 0 at ``s=1``.
+    blend then holds the damping ratio at every ``s``. On the **soft half**
+    ``kd_host`` scales down with ``√(kp(s)/kp)`` — critical damping grows
+    with the square root of stiffness. On the **stiff half** it stays at
+    the midpoint value: hardware step tests at the stiff endpoint showed
+    host-kd 40 and the √kp-scaled 56.6 damp identically (5.4% vs 1.6%
+    overshoot, equal torque chatter), and the midpoint values are the
+    hardware-verified stability ceilings — scaling past them buys nothing
+    and risks the out-of-phase host-damping instability on faster modes.
+    ``j_eff`` stays constant on the soft half (it compensates real inertia,
+    which matters most at low ``kp``) and scales linearly to 0 at ``s=1``.
     """
     if s <= 0.5:
         u = 1.0 - 2.0 * s  # 1 at the soft endpoint, 0 at the tuned midpoint
         kp_end, kd_end = kp_soft, kd_soft
         j_eff = jc.j_eff
+        stiff_half = False
     else:
         u = 2.0 * s - 1.0  # 0 at the tuned midpoint, 1 at the stiff endpoint
         kp_end, kd_end = kp_stiff, kd_stiff
         j_eff = jc.j_eff * (1.0 - u)
+        stiff_half = True
     kp_factor = (kp_end / jc.kp) ** u
-    host_factor = math.sqrt(kp_factor)
+    host_factor = 1.0 if stiff_half else math.sqrt(kp_factor)
     return replace(
         jc,
         kp=jc.kp * kp_factor,
         kd=jc.kd * (kd_end / jc.kd) ** u,
         j_eff=j_eff,
         kd_host=jc.kd_host * host_factor,
-        # The spillover ceiling must track the same √kp scaling, or blended
-        # kd_host would sail past a fixed cap (making it meaningless) while
-        # legacy-firmware spillover stayed clamped to the midpoint's value.
+        # The spillover ceiling tracks the same scaling as kd_host, so the
+        # soft half keeps its damping-ratio-consistent cap and the stiff
+        # half keeps the hardware-verified midpoint ceiling.
         kd_host_max=jc.kd_host_max * host_factor,
     )
 

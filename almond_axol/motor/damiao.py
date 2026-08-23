@@ -116,7 +116,7 @@ class DamiaoMotor(MotorDriver):
         self._v_max = 45.0
         self._t_max = 18.0
 
-        self._on_feedback: Callable[[float, float], None] | None = None
+        self._on_feedback: Callable[[float, float, float, float], None] | None = None
 
         bus._add_listener(self._on_message)
 
@@ -167,7 +167,7 @@ class DamiaoMotor(MotorDriver):
         if msg.arbitration_id != self._feedback_id:
             return
         if (data[0] & 0x0F) == (self._motor_id & 0x0F):
-            self._handle_feedback(data)
+            self._handle_feedback(data, msg.timestamp)
 
     def _handle_register_reply(self, data: bytes) -> None:
         rid = data[3]
@@ -182,7 +182,7 @@ class DamiaoMotor(MotorDriver):
         if fut is not None and not fut.done():
             fut.set_result(value)
 
-    def _handle_feedback(self, data: bytes) -> None:
+    def _handle_feedback(self, data: bytes, timestamp: float) -> None:
         status_code = data[0] >> 4
         pos_int = (data[1] << 8) | data[2]
         vel_int = (data[3] << 4) | (data[4] >> 4)
@@ -208,7 +208,12 @@ class DamiaoMotor(MotorDriver):
         self._feedback_waiters.clear()
 
         if self._on_feedback is not None:
-            self._on_feedback(self._feedback.position, self._feedback.torque)
+            self._on_feedback(
+                self._feedback.position,
+                self._feedback.velocity,
+                self._feedback.torque,
+                timestamp,
+            )
 
     def _canid_bytes(self) -> tuple[int, int]:
         return self._motor_id & 0xFF, (self._motor_id >> 8) & 0xFF

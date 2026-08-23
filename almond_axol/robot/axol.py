@@ -342,12 +342,31 @@ class AxolArm:
         # feeds inertia FF (``j_eff``); v_meas feeds host-side damping
         # (``kd_host``, needed on the shoulders where firmware kd can't damp
         # the low-frequency resonance) — all in :class:`JointConfig`.
+        #
+        # v_meas differentiates the positions cached from impedance feedback
+        # frames against the frames' own CAN receive timestamps (see
+        # ``Differentiator.differentiate``): wall-clock differentiation turns
+        # scheduling jitter into velocity noise proportional to joint speed,
+        # which kd_host amplifies into torque chatter (measured ±1.3 Nm at
+        # 1 rad/s with kd_host=40). The motor-*reported* velocity is not
+        # used: MyActuator's firmware estimate lags too much to damp the
+        # shoulders' ~2.3 Hz resonance — feeding it to kd_host measured
+        # violently unstable (the same lag is why firmware kd underdelivers).
         self._vel_diff = Differentiator(n=len(list(Joint)))
         self._accel_diff = Differentiator(n=len(list(Joint)))
         self._meas_vel_diff = Differentiator(n=len(list(Joint)))
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
+
+        # Reference reflected inertia at the joint-frame rest pose (q = 0),
+        # normalizing the per-cycle kd_host schedule in motion_control().
+        # kd_host values are tuned at rest, where each joint's reflected
+        # inertia is at (or near) its maximum; the schedule only ever scales
+        # them *down* as the pose moves mass toward a joint's axis.
+        self._inertia_rest = gravity_comp.gravity_and_inertia_arm(
+            np.zeros(len(ARM_JOINTS), dtype=np.float32), is_left=is_left
+        )[1].astype(np.float64)
 
         # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
         # matching the URDF and ``arm_limits``); gripper entries are in raw
@@ -1077,11 +1096,23 @@ class AxolArm:
         # so we differentiate the joint-frame ``clipped`` array directly.
         velocities = self._vel_diff.differentiate(list(clipped))
         accelerations = self._accel_diff.differentiate(velocities)
-        # v_meas drives host-side velocity damping (``kd_host``). The position
-        # cache is empty until the first set_impedance reply lands; fall back
-        # to v_des so the term collapses to 0 for those first cycles.
+        # v_meas drives host-side velocity damping (``kd_host``): cached
+        # feedback positions differentiated against their frames' CAN receive
+        # timestamps (jitter-free — see __init__). Falls back to v_des —
+        # collapsing the damping term to 0 — until every cache is filled by
+        # the first set_impedance replies.
         try:
-            v_meas = self._meas_vel_diff.differentiate(list(self.positions))
+            pos_list: list[float] = []
+            ts_list: list[float] = []
+            for j in Joint:
+                motor = self.motors.get(j)
+                if motor is not None:
+                    pos_list.append(motor.position)
+                    ts_list.append(motor.feedback_ts)
+                else:
+                    pos_list.append(0.0)
+                    ts_list.append(0.0)
+            v_meas = self._meas_vel_diff.differentiate(pos_list, ts_list)
         except MotorError:
             v_meas = list(velocities)
 
@@ -1089,7 +1120,27 @@ class AxolArm:
         # full URDF chain so child links contribute to each parent joint's load.
         # ``arm_q`` is in joint frame, which matches the URDF convention.
         arm_q = clipped[: len(ARM_JOINTS)].astype(np.float32)
-        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        gravity, inertia = self._gravity_comp.gravity_and_inertia_arm(
+            arm_q, is_left=self._is_left
+        )
+
+        # kd_host schedule: host-side damping is only stable — and only
+        # needed — where the joint's reflected inertia is high. High inertia
+        # means a slow natural mode (ωn = √(kp/J), ~2.3 Hz for a hanging
+        # shoulder) that the motor's lagged internal velocity estimate can't
+        # damp but a ~100 Hz host loop can. As the pose moves mass onto a
+        # joint's axis, J collapses, ωn rises toward the host loop rate, and
+        # the one-cycle-stale host torque arrives out of phase — measured as
+        # sustained jitter on shoulder_1 with the arm raised to the side
+        # (kd_host=15 rang at 0.57° RMS; kd_host=0 was clean, firmware kd
+        # alone handles the fast mode fine). Scale each joint's kd_host by
+        # J(q)/J_rest, capped at 1 so the rest-tuned values are never
+        # exceeded. Constant damping *ratio* would only need √(J/J_rest),
+        # but the binding constraint at low J is phase-lag stability, not
+        # ζ — the linear taper reaches ~0 at the measured-unstable raised
+        # pose (J ratio 0.02) where √ would still deliver 14% — and the two
+        # rules differ by <25% at the moderate poses where damping matters.
+        host_scale = np.clip(inertia.astype(np.float64) / self._inertia_rest, 0.0, 1.0)
 
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
@@ -1110,7 +1161,10 @@ class AxolArm:
             # diverged violently under spilled host damping; only the
             # shoulders' ~2.3 Hz resonance is slow enough to damp host-side).
             kd_spill = max(gains.kd - motor.kd_max, 0.0)
-            kd_host_total = min(
+            # The pose-dependent host_scale (see above) applies to the spill
+            # too: on legacy firmware the spilled damping has the same
+            # phase-lag stability limit as the tuned kd_host.
+            kd_host_total = float(host_scale[i]) * min(
                 gains.kd_host + kd_spill, max(gains.kd_host_max, gains.kd_host)
             )
             t_ff = (
