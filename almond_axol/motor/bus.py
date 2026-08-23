@@ -90,10 +90,20 @@ def _iface_lost(exc: BaseException) -> bool:
 def _tx_queue_full(exc: BaseException) -> bool:
     """True when *exc* means the interface's TX queue is full (``ENOBUFS``).
 
-    Whether that's transient host-side congestion or a dead bus is decided
-    by how long it persists — see :data:`_STALL_DETECT_S`.
+    python-can surfaces this two ways: ``sendto`` failing with ``ENOBUFS``
+    (errno attached), or ``select`` never reporting the socket writable, in
+    which case it raises a bare ``CanOperationError("Transmit buffer full")``
+    with no error code. Whether that's transient host-side congestion or a
+    dead bus is decided by how long it persists — see :data:`_STALL_DETECT_S`.
     """
-    return _error_code(exc) == errno.ENOBUFS
+    code = _error_code(exc)
+    if code == errno.ENOBUFS:
+        return True
+    return (
+        code is None
+        and isinstance(exc, can.CanOperationError)
+        and "buffer full" in str(exc).lower()
+    )
 
 
 def _iface_is_up(channel: str) -> bool:

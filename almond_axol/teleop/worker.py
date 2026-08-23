@@ -231,7 +231,9 @@ class IKWorker:
         self._raw_vel: dict[str, np.ndarray] = {}
         self._suspect: dict | None = None
 
-        freq = config.frequency
+        # OneEuro nominal rate: these filters see samples at the VR-frame /
+        # IK dispatch cadence, not the (faster) CAN control rate.
+        freq = config.ik_frequency
         mc = config.pose_min_cutoff
         beta = config.pose_beta
         self._f_l_pos = OneEuroFilter(freq, mc, beta)
@@ -635,7 +637,7 @@ class IKWorker:
         if t_s is not None:
             t_eff = t_s
         elif self._prev_raw_t is not None:
-            t_eff = self._prev_raw_t + 1.0 / self._config.frequency
+            t_eff = self._prev_raw_t + 1.0 / self._config.ik_frequency
         else:
             t_eff = 0.0
 

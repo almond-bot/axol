@@ -97,8 +97,12 @@ class VRTeleopCore:
         self._broadcast = broadcast_tracking
 
         dt = 1.0 / config.frequency
-        self.ema_left = AlphaSmoothFilter(config.ik_alpha)
-        self.ema_right = AlphaSmoothFilter(config.ik_alpha)
+        # ik_alpha is specified as a per-tick blend at the historical 120 Hz
+        # control rate; convert it to this rate's per-tick alpha so the EMA's
+        # *time constant* — the thing that was tuned — is rate-invariant.
+        alpha = 1.0 - (1.0 - config.ik_alpha) ** (120.0 * dt)
+        self.ema_left = AlphaSmoothFilter(alpha)
+        self.ema_right = AlphaSmoothFilter(alpha)
         self.smooth_left = TrapezoidalFilter(
             config.teleop_max_vel, config.teleop_max_accel, dt
         )
@@ -880,7 +884,7 @@ class VRTeleopCore:
             on_ik_sample: Called with ``time.perf_counter()`` after each solve,
                 for the adapter's IK-rate readout.
         """
-        ik_interval = 1.0 / self.config.frequency
+        ik_interval = 1.0 / self.config.ik_frequency
         last_frame = None
         recv_timeout_count = 0
         last_dead_warn = 0.0

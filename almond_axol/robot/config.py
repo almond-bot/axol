@@ -90,7 +90,7 @@ class JointConfig:
                   alone left a 62%-overshoot ring; kd_host=30 on top damped
                   it critically. The elbow needs a small dose for the same
                   reason (4 halves its step overshoot). Leave at 0 for
-                  joints whose firmware kd works (wrists).
+                  joints whose firmware kd works (wrists, shoulder_3).
                   This value is the *max-inertia-pose* anchor: at runtime
                   the controller scales it by J(q)/J_ref, where J_ref is
                   the per-joint maximum reflected inertia over arm shapes
@@ -215,14 +215,10 @@ class ArmConfig:
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
             j_eff=0.25,
-            # Applies only with the arm extended: shoulder_3's reflected
-            # inertia at rest is ~3% of its max (forearm along the axis),
-            # so the J(q)/J_ref schedule keeps host damping near zero at
-            # rest — where its mode is fast and firmware kd suffices — and
-            # ramps it in as the elbow bend slows the mode into the band
-            # the host loop can damp.
-            kd_host=15.0,
-            kd_host_max=15.0,
+            # If extension jitter returns (arm forward, elbow bent), a small
+            # kd_host (~10-15) is the fix: the J(q)/J_ref schedule keeps it
+            # near zero at rest (J_rest ≈ 3% of max, fast mode) and ramps
+            # it in only where the mode slows into the host loop's band.
         )
     )
     elbow: JointConfig = field(

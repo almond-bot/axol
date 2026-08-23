@@ -381,9 +381,10 @@ class AxolArm:
         # inverted — at rest the forearm lies along its axis (J ≈ 3% of
         # max, fast mode, host damping unstable) and the arm extended with
         # the elbow bent is its max — so its schedule must anchor there.
-        self._inertia_ref = gravity_comp.gravity_and_inertia_arm(
+        j_link_rest = gravity_comp.gravity_and_inertia_arm(
             np.zeros(len(ARM_JOINTS), dtype=np.float32), is_left=is_left
         )[1].astype(np.float64)
+        self._inertia_ref = j_link_rest.copy()
         for s1 in (0.0, 1.57, -1.57):
             for s2 in (0.0, -1.57):
                 for s3 in (0.0, 1.57, -1.57):
@@ -393,6 +394,31 @@ class AxolArm:
                             1
                         ].astype(np.float64)
                         np.maximum(self._inertia_ref, ine, out=self._inertia_ref)
+
+        # Inertia-FF pose schedule. The tuned ``j_eff`` (fit at the rest
+        # pose) is the sum of two physically different terms: the reflected
+        # rotor inertia (motor rotor × gear², pose-independent — dominant on
+        # shoulder_3 and the elbow, whose tuned values exceed their link
+        # inertia severalfold) and the link-chain inertia J_link(q), which
+        # varies strongly with arm shape (shoulder_1: 1.06 kg·m² at rest →
+        # 0.81 elbow bent → ~0.02 raised to the side). Feeding a constant
+        # j_eff over-torques every acceleration transient away from the rest
+        # pose — measured as whole-arm jitter when shoulder_1 launches or
+        # stops with the arm reaching in front — so motion_control() scales
+        # the FF by (J_rotor + J_link(q)) / (J_rotor + J_link(0)): exactly
+        # the tuned value at the rest pose, tracking the true inertia
+        # elsewhere. The rotor term is anchored to the construction-time
+        # (calibrated, pre-blend) j_eff; runtime stiffness blending still
+        # applies multiplicatively through ``gains.j_eff``.
+        j_eff_cfg = np.array(
+            [getattr(self._arm_config, j.value).j_eff for j in ARM_JOINTS],
+            dtype=np.float64,
+        )
+        self._j_rotor = np.maximum(j_eff_cfg - j_link_rest, 0.0)
+        denom = self._j_rotor + j_link_rest
+        # Joints with no tuned j_eff and negligible link inertia (wrists):
+        # the scale multiplies j_eff = 0 anyway, so just avoid dividing by ~0.
+        self._j_ff_denom = np.where(denom > 1e-9, denom, 1.0)
 
         # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
         # matching the URDF and ``arm_limits``); gripper entries are in raw
@@ -1173,6 +1199,13 @@ class AxolArm:
         # by <25% at the moderate poses where damping matters.
         host_scale = np.clip(inertia.astype(np.float64) / self._inertia_ref, 0.0, 1.0)
 
+        # Inertia-FF schedule (see __init__): rotor term constant, link term
+        # tracking J(q), normalized to 1 at the rest pose where j_eff was
+        # tuned. Unclipped above 1 on purpose — shoulder_3's link inertia
+        # peaks with the arm extended (up to ~1.6× its rest anchor), exactly
+        # where its acceleration FF is needed most.
+        j_scale = (self._j_rotor + inertia.astype(np.float64)) / self._j_ff_denom
+
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
         motor_targets = clipped - self._joint_offsets
@@ -1201,7 +1234,7 @@ class AxolArm:
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
-                + gains.j_eff * accelerations[i]
+                + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + kd_host_total * v_damp[i]
             )
             return motor.set_impedance(
