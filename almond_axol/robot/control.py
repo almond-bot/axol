@@ -13,8 +13,43 @@ import time
 
 from ..constants import ARM_JOINTS
 
-# Cutoff frequency for the velocity differentiator low-pass filter (Hz)
+# Filter poles for the control loop's differentiators, in rad/s (the update
+# is a = 1/(1 + Ts·ω), a first-order pole at ω rad/s — NOT Hz).
+#
+# CUTOFF_FREQ (20 rad/s ≈ 3.2 Hz) filters the motor-facing paths: v_des
+# (impedance velocity target, friction FF) and the a_des chain (j_eff
+# inertia FF). These only need the intentional-motion band (<2 Hz), and a
+# low pole keeps command-stream noise out of the Nm-scale feedforwards.
+#
+# VEL_CUTOFF_FREQ (80 rad/s ≈ 12.7 Hz) filters the two differentiators
+# inside the *host damping* path only (see BandPass below): there the pole
+# must sit well above the ~3 Hz shoulder resonance so the damping arrives
+# in phase, and the band-pass that follows provides the high-frequency
+# rolloff a low pole would otherwise supply.
 CUTOFF_FREQ = 20.0
+VEL_CUTOFF_FREQ = 80.0
+
+# Host damping band-pass (see BandPass): centre and quality factor.
+#
+# Why a band-pass: kd_host exists to damp the shoulders' ~3 Hz structural
+# resonance, which the motors' lagged internal velocity estimates can't
+# touch. The damping torque is computed host-side at ~100 Hz with a
+# one-cycle transport delay, so its phase degrades with frequency: at
+# 25-35 Hz the delayed torque is fully anti-phase and *excites* whatever
+# structural mode lives there. Any single low-pass pole must therefore
+# trade resonance-band phase against high-frequency gain — the historical
+# 20 rad/s velocity pole sat exactly ON the 3.2 Hz resonance and delivered
+# only ~35% of kd_host in phase (a closed-loop sine probe measured a
+# resonant gain of 2.1 with ~70 Nm·s/rad commanded), while an 80 rad/s pole
+# delivered the damping but passed enough 25-35 Hz gain to shake the arm
+# violently during the reset ramp. A unity-peak band-pass at the resonance
+# escapes the trade: at 3.2 Hz the full chain (fast differentiator +
+# band-pass + delay) delivers ~0.8 of kd_host in phase (2.3× the old
+# design), while at 30 Hz its gain is ~7× *lower* than the old design's.
+# Q = 0.8 keeps the passband wide enough (~2-5 Hz) to cover the
+# resonance's pose dependence (ωn = √(kp/J)).
+DAMP_BP_W0 = 20.0  # rad/s (≈3.2 Hz)
+DAMP_BP_Q = 0.8
 
 # How long a torque residual must stay above the watchdog threshold before a
 # guarded move is judged to have hit something. Long enough to ride out
@@ -116,25 +151,75 @@ def compute_friction(
     )
 
 
+class BandPass:
+    """N-channel state-variable band-pass (Chamberlin SVF), unity centre gain.
+
+    Confines the host damping torque to the structural-resonance band: at
+    :data:`DAMP_BP_W0` the output tracks the input with ~zero phase and unity
+    gain; gain rolls off 6 dB/oct on both sides, so the delayed host loop
+    can't excite fast structural modes and doesn't drag slow intentional
+    motion. Sample spacing is taken from the wall clock, matching the control
+    loop cadence its input velocities arrive at.
+
+    Args:
+        n:  Number of independent channels.
+        w0: Centre frequency in rad/s.
+        q:  Quality factor (bandwidth = w0/q).
+    """
+
+    def __init__(self, n: int, w0: float = DAMP_BP_W0, q: float = DAMP_BP_Q) -> None:
+        self._n = n
+        self._w0 = w0
+        self._q = q
+        self._lp = [0.0] * n
+        self._bp = [0.0] * n
+        self._last_time: float | None = None
+
+    def update(self, x: list[float]) -> list[float]:
+        """Advance one step; returns the band-passed values (zeros on first call)."""
+        now = time.perf_counter()
+        if self._last_time is None:
+            self._last_time = now
+            return [0.0] * self._n
+        ts = now - self._last_time
+        self._last_time = now
+        if ts <= 0:
+            return [b / self._q for b in self._bp]
+        # Chamberlin SVF coefficient; the sin() form keeps the centre accurate
+        # at low fs, and clamping keeps the filter stable across loop stalls.
+        f = 2.0 * math.sin(min(0.5 * self._w0 * ts, 0.7))
+        out: list[float] = []
+        for i in range(self._n):
+            self._lp[i] += f * self._bp[i]
+            hp = x[i] - self._lp[i] - self._bp[i] / self._q
+            self._bp[i] += f * hp
+            out.append(self._bp[i] / self._q)
+        return out
+
+
 class Differentiator:
     """First-order low-pass differentiator, matching C++ Differentiator::Differentiate.
 
     For each channel:
-        a = 1 / (1 + Ts * CUTOFF_FREQ)
-        b = a * CUTOFF_FREQ
+        a = 1 / (1 + Ts * cutoff)
+        b = a * cutoff
         vel[i] = vel_prev[i] * a + b * (pos[i] - pos_prev[i])
 
     Args:
         n: Number of channels to differentiate.
+        cutoff: Low-pass pole in rad/s (see the module constants for how to
+            choose; defaults to :data:`CUTOFF_FREQ`).
     """
 
-    def __init__(self, n: int) -> None:
+    def __init__(self, n: int, cutoff: float = CUTOFF_FREQ) -> None:
         """Initialize the differentiator.
 
         Args:
             n: Number of independent channels to differentiate simultaneously.
+            cutoff: Low-pass pole in rad/s.
         """
         self._n = n
+        self._cutoff = cutoff
         self._vel_prev = [0.0] * n
         self._pos_prev: list[float | None] = [None] * n
         self._last_time: float | None = None
@@ -181,8 +266,8 @@ class Differentiator:
         if Ts <= 0:
             return list(self._vel_prev)
 
-        a = 1.0 / (1.0 + Ts * CUTOFF_FREQ)
-        b = a * CUTOFF_FREQ
+        a = 1.0 / (1.0 + Ts * self._cutoff)
+        b = a * self._cutoff
 
         velocities: list[float] = []
         for i in range(self._n):
@@ -207,8 +292,8 @@ class Differentiator:
             if Ts <= 0:
                 velocities.append(self._vel_prev[i])
                 continue
-            a = 1.0 / (1.0 + Ts * CUTOFF_FREQ)
-            b = a * CUTOFF_FREQ
+            a = 1.0 / (1.0 + Ts * self._cutoff)
+            b = a * self._cutoff
             vel = self._vel_prev[i] * a + b * (positions[i] - self._pos_prev[i])  # type: ignore[operator]
             self._vel_prev[i] = vel
             self._pos_prev[i] = positions[i]

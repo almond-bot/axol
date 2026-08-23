@@ -47,10 +47,10 @@ Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 _CAPSULE_GRAZE_TOL = 0.003
 
 # Per-pair collision-cost activation distances are derived from each pair's
-# clearance at the home pose: ``clamp(home_clearance - _MARGIN_REST_BUFFER,
-# _MARGIN_FLOOR, default_margin)``. Pairs that *live* near their activation
-# shell (the wrists and grippers pass within 10-17 mm of the base during
-# ordinary close-over-table work, and the elbow capsules graze at rest) would
+# clearance at the home pose: ``min(home_clearance - _MARGIN_REST_BUFFER,
+# default_margin)``. Pairs that *live* near their activation shell (the
+# wrists and grippers pass within 10-17 mm of the base during ordinary
+# close-over-table work, and the elbow capsules graze at rest) would
 # otherwise keep the cost hinge active across the entire work envelope —
 # replaying recorded deburring sessions showed base<->wrist pairs inside a
 # uniform 25 mm activation for up to 59% of all frames, and every crossing of
@@ -58,7 +58,19 @@ _CAPSULE_GRAZE_TOL = 0.003
 # path-specific jitter. Deriving the margin from the home clearance keeps
 # such pairs silent in their normal envelope while pairs with generous
 # clearance keep the full early-warning distance.
-_MARGIN_FLOOR = 0.008
+#
+# The activation may be *negative*: ``base <-> e2`` (the elbow) reads
+# -1.4 mm at home because pyroki's conservative capsule fits already
+# interpenetrate there while the physical parts hang in free air. pyroki's
+# stock cost cannot activate below zero (its smoothing ramp spans [0,
+# margin]), so this pair used to be clamped to a +8 mm activation — leaving
+# its gradient permanently active at rest and across the whole
+# gripper-in-front-of-torso envelope, where it measurably tripled the
+# solver's per-tick output acceleration and kicked the elbow at every shell
+# crossing. The custom residual in .solver decouples the activation start
+# from the ramp width, so such pairs activate only when the pose actually
+# gets closer than home, while keeping the full linear pushback deeper in.
+_RAMP_WIDTH_MIN = 0.008
 _MARGIN_REST_BUFFER = 0.002
 
 _lock = threading.RLock()
@@ -151,27 +163,34 @@ def _build_robot_collision(
     return rc
 
 
-def collision_activation_margins(
+def collision_cost_params(
     robot: pk.Robot, rc: pk.collision.RobotCollision, default_margin: float
-) -> np.ndarray:
-    """Per-pair collision-cost activation distances derived from home-pose clearance.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pair ``(activation_start, ramp_width)`` for the smoothed collision cost.
 
-    ``clamp(home_clearance - _MARGIN_REST_BUFFER, _MARGIN_FLOOR,
-    default_margin)`` for each active pair — see the constants above for the
-    rationale. Cheap (one collision-distance evaluation), so callers compute
-    it per solver instance rather than caching it here: the result depends on
-    the configured ``default_margin``.
+    ``activation_start = min(home_clearance - _MARGIN_REST_BUFFER,
+    default_margin)`` for each active pair — possibly negative for pairs
+    whose conservative capsules already interpenetrate at home (see the
+    constants above). ``ramp_width`` is the distance over which the residual
+    ramps quadratically from zero to its full linear slope: equal to the
+    activation start where that start is generous (matching pyroki's stock
+    cost shape exactly), floored at ``_RAMP_WIDTH_MIN`` so near-shell pairs
+    keep a steep, protective gradient onset.
+
+    Cheap (one collision-distance evaluation), so callers compute it per
+    solver instance rather than caching it here: the result depends on the
+    configured ``default_margin``.
     """
     q0 = jnp.zeros(robot.joints.num_actuated_joints)
     d = np.asarray(rc.compute_self_collision_distance(robot, q0))
-    floor = min(_MARGIN_FLOOR, default_margin)
-    margins = np.clip(d - _MARGIN_REST_BUFFER, floor, default_margin).astype(np.float32)
+    starts = np.minimum(d - _MARGIN_REST_BUFFER, default_margin).astype(np.float32)
+    widths = np.maximum(starts, _RAMP_WIDTH_MIN).astype(np.float32)
     _logger.info(
-        "Collision activation margins: %d of %d pairs below the default "
-        "%.0f mm (floor %.0f mm).",
-        int((margins < default_margin).sum()),
-        len(margins),
+        "Collision activation: %d of %d pairs below the default %.0f mm "
+        "(%d activate only inside their home-pose clearance).",
+        int((starts < default_margin).sum()),
+        len(starts),
         1e3 * default_margin,
-        1e3 * floor,
+        int((starts <= 0.0).sum()),
     )
-    return margins
+    return starts, widths

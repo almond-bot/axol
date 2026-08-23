@@ -43,7 +43,12 @@ from ...motor import CanBus, ControlMode, Joint, Motor, MotorError
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig, JointConfig
-from ...robot.control import Differentiator, compute_friction
+from ...robot.control import (
+    VEL_CUTOFF_FREQ,
+    BandPass,
+    Differentiator,
+    compute_friction,
+)
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .joint_frame import JointFrameMotor, joint_frame_motors
@@ -156,9 +161,15 @@ class FeedForward:
         self._j_eff = j_eff
         self._differentiate_target = differentiate_target
         self._host_kd = host_kd
+        # Mirrors production motion_control: motor-facing v_des/a_des keep the
+        # slow pole; the host damping term uses fast differentiators feeding a
+        # band-pass centred on the shoulder resonance (see BandPass in
+        # robot.control for the design).
         self._v_des_diff = Differentiator(1)
         self._a_des_diff = Differentiator(1)
-        self._v_meas_diff = Differentiator(1)
+        self._v_des_fast_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
+        self._v_meas_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
+        self._damp_bp = BandPass(1)
 
     def compute(
         self, q_target: float, meas: tuple[float, float] | None = None
@@ -173,8 +184,9 @@ class FeedForward:
         if self._differentiate_target:
             v_des = self._v_des_diff.differentiate([q_target])[0]
             a_des = self._a_des_diff.differentiate([v_des])[0]
+            v_des_fast = self._v_des_fast_diff.differentiate([q_target])[0]
         else:
-            v_des = a_des = 0.0
+            v_des = a_des = v_des_fast = 0.0
         t_ff = (
             self.gravity_fn(q_target)
             + compute_friction(v_des, *self._fric)
@@ -183,7 +195,7 @@ class FeedForward:
         if self._host_kd and meas is not None:
             q_meas, ts = meas
             v_meas = self._v_meas_diff.differentiate([q_meas], [ts])[0]
-            t_ff += self._host_kd * (v_des - v_meas)
+            t_ff += self._host_kd * self._damp_bp.update([v_des_fast - v_meas])[0]
         return v_des, t_ff
 
 
@@ -1027,7 +1039,11 @@ async def _run(args: argparse.Namespace) -> None:
             j: getattr(arm_cfg, j.value) for j in ARM_JOINTS
         }
         q_now: dict[Joint, float] = {}
-        hand_diff = Differentiator(len(ARM_JOINTS))
+        # Holder damping mirrors production: fast measured-velocity estimate
+        # band-passed around the shoulder resonance (targets are frozen, so
+        # v_des ≡ 0 and the damper input is just -v_meas).
+        hand_diff = Differentiator(len(ARM_JOINTS), cutoff=VEL_CUTOFF_FREQ)
+        hand_bp = BandPass(len(ARM_JOINTS))
         hand_q_buf = np.zeros(len(ARM_JOINTS), dtype=np.float32)
         hand_landed = False
 
@@ -1060,13 +1076,14 @@ async def _run(args: argparse.Namespace) -> None:
                 hand_q_buf[i] = q_now[j]
             grav = gravity_comp.gravity_arm(hand_q_buf, is_left=is_left)
             vels = hand_diff.differentiate(qs, tss)
+            v_damp = hand_bp.update([-v for v in vels])
             cmds = []
             for i, j in enumerate(ARM_JOINTS):
                 if j in skip:
                     continue
                 if j in hold:
                     jc_j = jc_all[j]
-                    t_ff = float(grav[i]) - scale * _hold_kd_host(j) * vels[i]
+                    t_ff = float(grav[i]) + scale * _hold_kd_host(j) * v_damp[i]
                     cmds.append(
                         motors[j].set_impedance(
                             hold[j], 0.0, scale * jc_j.kp, scale * jc_j.kd, t_ff

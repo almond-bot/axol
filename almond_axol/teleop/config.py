@@ -108,9 +108,11 @@ class VRTeleopConfig:
         pose_beta: Speed coefficient for the One Euro Filter.  Raises the
             filter cutoff proportionally to the signal's instantaneous speed,
             keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``2.0`` so the
-            filter stays partially engaged during motion instead of opening
-            fully and passing noise through.
+            Increase if fast moves feel sticky.  Defaults to ``0.5``: a
+            flight-recorder replay of a real session measured ``2.0`` passing
+            101% of the 3-15 Hz hand-tremor band during motion (the opened
+            cutoff tracks the hand exactly when it trembles), while ``0.5``
+            cut it to 71% for ~33 ms of extra in-motion lag.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -185,7 +187,7 @@ class VRTeleopConfig:
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
     pose_min_cutoff: float = 0.8
-    pose_beta: float = 2.0
+    pose_beta: float = 0.5
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5

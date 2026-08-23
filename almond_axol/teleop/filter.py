@@ -245,6 +245,17 @@ class OneEuroFilter:
         self._dx_prev = dx_hat.copy()
         return x_hat
 
+    def nudge(self, delta: np.ndarray) -> None:
+        """Shift the value state by ``delta``, keeping the derivative estimate.
+
+        For compensating an upstream reference-frame jump (e.g. a VR headset
+        re-localization): the signal's frame moved, the signal's motion didn't.
+        A ``reset`` would zero the derivative and cold-start the adaptive
+        cutoff; a nudge keeps the filter fully warm.
+        """
+        if self._x_prev is not None:
+            self._x_prev = self._x_prev + np.asarray(delta, dtype=np.float32)
+
     def reset(self, seed: np.ndarray | None = None) -> None:
         """Reset filter state, optionally seeding with a known starting value."""
         if seed is not None:

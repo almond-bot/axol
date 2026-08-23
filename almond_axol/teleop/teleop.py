@@ -49,6 +49,7 @@ from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
+from .recorder import from_env as _recorder_from_env
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -130,6 +131,12 @@ class VRTeleop:
         # Event loop of the VR server thread, captured so the IK thread can
         # broadcast tracking-state changes to the headset.
         self._vr_loop: asyncio.AbstractEventLoop | None = None
+
+        # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps
+        # the measured side per control tick — cached joint positions and
+        # torques (8 left + 8 right), refreshed by the impedance feedback
+        # frames so reading them costs no CAN traffic.
+        self._rec = _recorder_from_env("meas", {"qm": 16, "tq": 16})
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -444,6 +451,9 @@ class VRTeleop:
                 t_step = time.perf_counter()
                 await self._robot.motion_control(left=left, right=right)
 
+                if self._rec is not None:
+                    self._record_measured()
+
                 if track_watchdog is not None and left is not None:
                     tripped = track_watchdog.update(
                         self._robot.torque_residuals()  # type: ignore[attr-defined]
@@ -568,6 +578,29 @@ class VRTeleop:
         if out is None:
             return None, None
         return out[:8], out[8:]
+
+    def _record_measured(self) -> None:
+        """Append one measured-side row to the jitter recorder (hardware only).
+
+        Reads the cached positions/torques the impedance feedback frames
+        refresh every cycle — no CAN traffic. Arms that don't expose the
+        cache (Sim, an absent arm, offsets not yet resolved) record NaN.
+        """
+        qm = np.full(16, np.nan, dtype=np.float32)
+        tq = np.full(16, np.nan, dtype=np.float32)
+        for sl, arm in (
+            (slice(0, 8), getattr(self._robot, "left", None)),
+            (slice(8, 16), getattr(self._robot, "right", None)),
+        ):
+            if arm is None:
+                continue
+            try:
+                qm[sl] = arm.positions
+                tq[sl] = arm.torques
+            except Exception:  # noqa: BLE001 - recording must never break the loop
+                pass
+        assert self._rec is not None
+        self._rec.record(qm=qm, tq=tq)
 
     # ------------------------------------------------------------------
     # VR frame callback (runs on every incoming frame)

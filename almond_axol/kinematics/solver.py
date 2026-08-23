@@ -34,7 +34,7 @@ from ..constants import (
 from .config import KinematicsConfig
 from .jax_cache import enable_persistent_compilation_cache
 from .model import (
-    collision_activation_margins,
+    collision_cost_params,
     shared_robot,
     shared_robot_collision,
 )
@@ -113,6 +113,46 @@ _bounded_manipulability_cost = jaxls.Cost.factory(_bounded_manipulability_residu
 
 
 # ---------------------------------------------------------------------------
+# Self-collision cost with per-pair (possibly negative) activation starts
+# ---------------------------------------------------------------------------
+
+
+def _self_collision_residual(
+    vals: jaxls.VarValues,
+    robot: pk.Robot,
+    robot_coll: pk.collision.RobotCollision,
+    joint_var: jaxls.Var[jax.Array],
+    activation_start: jax.Array,
+    ramp_width: jax.Array,
+    weight: jax.Array | float,
+) -> jax.Array:
+    """pyroki's self-collision residual with decoupled activation and ramp.
+
+    Per pair: zero for clearance above ``activation_start``, a quadratic ramp
+    over the ``ramp_width`` below it (C1 at both ends), then the full linear
+    slope. With ``ramp_width == activation_start > 0`` this is exactly
+    pyroki's ``colldist_from_sdf`` shape; the decoupling exists so that pairs
+    whose conservative capsules already interpenetrate at the home pose can
+    use a *negative* activation start (activate only when the pose gets
+    closer than home) — pyroki's stock cost bottoms out at zero, which kept
+    the ``base <-> e2`` gradient permanently active during ordinary
+    front-of-torso work (see .model.collision_cost_params).
+    """
+    cfg = vals[joint_var]
+    d = robot_coll.compute_self_collision_distance(robot, cfg)
+    s = activation_start - d  # violation depth beyond the activation shell
+    r = jnp.where(
+        s < ramp_width,
+        jnp.square(jnp.maximum(s, 0.0)) / (2.0 * ramp_width),
+        s - 0.5 * ramp_width,
+    )
+    return (r * weight).flatten()
+
+
+_self_collision_cost = jaxls.Cost.factory(_self_collision_residual)
+
+
+# ---------------------------------------------------------------------------
 # JIT-compiled core solve
 # ---------------------------------------------------------------------------
 
@@ -168,7 +208,8 @@ def _solve_ik(
     posture_weight: float,
     manipulability_weight: float,
     limit_weight: float,
-    self_collision_margin: jax.Array,
+    self_collision_start: jax.Array,
+    self_collision_ramp: jax.Array,
     self_collision_weight: float,
     elbow_weight_L: float,
     elbow_weight_R: float,
@@ -292,11 +333,12 @@ def _solve_ik(
 
     costs.append(pk.costs.limit_cost(robot, JointVar(0), weight=limit_weight))
     costs.append(
-        pk.costs.self_collision_cost(
+        _self_collision_cost(
             robot,
             robot_coll,
             JointVar(0),
-            margin=self_collision_margin,
+            activation_start=self_collision_start,
+            ramp_width=self_collision_ramp,
             weight=self_collision_weight,
         )
     )
@@ -493,11 +535,11 @@ class KinematicsSolver:
         # instead of re-tracing and re-running jaxls analysis.
         self.robot = shared_robot()
         self.robot_coll = shared_robot_collision()
-        self._collision_margins = jnp.asarray(
-            collision_activation_margins(
-                self.robot, self.robot_coll, config.self_collision_margin
-            )
+        starts, widths = collision_cost_params(
+            self.robot, self.robot_coll, config.self_collision_margin
         )
+        self._collision_starts = jnp.asarray(starts)
+        self._collision_ramps = jnp.asarray(widths)
 
         names = self.robot.links.names
         self.l_ee_idx = names.index(_LEFT_EE)
@@ -761,7 +803,8 @@ class KinematicsSolver:
             cfg.posture_weight,
             cfg.manipulability_weight,
             cfg.limit_weight,
-            self._collision_margins,
+            self._collision_starts,
+            self._collision_ramps,
             cfg.self_collision_weight,
             elbow_w_l,
             elbow_w_r,

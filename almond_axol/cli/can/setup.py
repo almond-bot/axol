@@ -204,24 +204,37 @@ def _resolve_hub_serial() -> str | None:
     """Pick the hub serial without prompting (for headless ``ensure_setup``).
 
     A previously configured serial (named ``can_alm_axol_*`` interfaces, or
-    the pinned serial in the udev rules) wins outright, so re-running setup on
-    an already-configured host works no matter how many other candlelight
-    adapters are attached. Only a genuinely fresh machine falls back to live
-    detection — returning None when no hub is attached (the hub is optional),
-    and raising when several dual-channel candidates are present, since that
-    needs the interactive ``axol can.setup`` flow to disambiguate.
+    the pinned serial in the udev rules) wins while that adapter is attached,
+    so re-running setup on an already-configured host works no matter how many
+    other candlelight adapters are present — and it is kept when no hub is
+    attached at all, so an unplugged hub's rules stay valid. A configured but
+    *absent* serial with exactly one live hub candidate means the adapter was
+    replaced (or a different Axol was plugged into this host): the live hub
+    wins and gets re-pinned. Several live candidates with no attached
+    configured serial still need the interactive ``axol can.setup`` flow to
+    disambiguate; None means no hub anywhere (the hub is optional).
     """
     configured = _configured_serial()
-    if configured:
+    attached = _detect_serials()
+    if configured and (configured in attached or not attached):
         return configured
-    unique = _detect_serials()
-    if len(unique) == 1:
-        return unique[0]
-    if not unique:
+    if len(attached) == 1:
+        return attached[0]
+    if not attached:
         return None
     raise RuntimeError(
         "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
     )
+
+
+def _stdin_is_tty() -> bool:
+    """True when an operator can answer ``input()`` prompts.
+
+    The web dashboard launches ``can.setup`` as a subprocess with a piped
+    stdin (no tty), where a prompt would block invisibly — the prompt text
+    has no trailing newline, so it never even reaches the streamed log.
+    """
+    return sys.stdin is not None and sys.stdin.isatty()
 
 
 def _find_serial() -> str | None:
@@ -229,15 +242,18 @@ def _find_serial() -> str | None:
     print(f"Scanning for the Almond Axol arm hub adapter ({_VID}:{_PID})...")
 
     unique = _detect_serials()
+    configured = _configured_serial()
 
     if not unique:
         # An unplugged hub on an already-configured host (e.g. re-running
         # setup on a cart-only session) keeps its pinned serial — the udev
         # rule and startup script stay valid for whenever it's reattached.
-        configured = _configured_serial()
         if configured:
             print(f"  No hub attached — keeping configured serial {configured}.")
             return configured
+        if not _stdin_is_tty():
+            print("  No arm hub found — continuing without one (cart/chest only).")
+            return None
         print(
             "\n  No arm hub found. Enter its serial manually, or leave blank "
             "for a robot without one (cart/chest only):"
@@ -245,9 +261,28 @@ def _find_serial() -> str | None:
         return input("  Serial: ").strip() or None
 
     if len(unique) == 1:
-        print(f"  Found adapter — serial: {unique[0]}")
-        return unique[0]
+        serial = unique[0]
+        if configured and configured != serial:
+            print(
+                f"  Found adapter — serial: {serial} (replacing previously "
+                f"configured {configured}, which is not attached)."
+            )
+        else:
+            print(f"  Found adapter — serial: {serial}")
+        return serial
 
+    if not _stdin_is_tty():
+        # Same rules as the headless flow: an attached configured hub wins;
+        # several fresh candidates are genuinely ambiguous.
+        if configured in unique:
+            print(
+                f"  Multiple adapters found — keeping configured serial {configured}."
+            )
+            return configured
+        _die(
+            "Multiple arm hub adapters found and none matches the configured "
+            "serial. Run `axol can.setup` from a terminal to choose one."
+        )
     print("  Multiple adapters found:")
     for i, s in enumerate(unique):
         print(f"    [{i}] {s}")
@@ -871,39 +906,69 @@ def ensure_setup(
 ) -> None:
     """Run the full CAN configuration non-interactively (for the control panel).
 
-    Mirrors :func:`run` but resolves the adapter serials without prompting.
-    The wheel-bus and chest adapters are only ever *re*-pinned here (from a
-    previous setup's rules or a live interface); identifying a new one needs
-    the interactive flow's probing — see :func:`_identify_adapter`.
+    Mirrors :func:`run` but never prompts: the hub is resolved by
+    attachment-aware detection (:func:`_resolve_hub_serial`) and the
+    single-channel wheel/chest adapters by probing their buses
+    (:func:`_find_single_serials`), so a replacement adapter — a new hub, a
+    new cart/chest CANable, or a different Axol plugged into this host — is
+    re-pinned on the next connect without the interactive flow. Only an
+    adapter whose bus doesn't answer (devices unpowered, unrelated hardware)
+    is left to the interactive ``axol can.setup``.
     """
     driver.ensure_driver()
     hub_serial = hub_serial or _resolve_hub_serial()
-    wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
-    chest_serial = chest_serial or _configured_named_serial(_CAN_C)
+    if wheels_serial is None and chest_serial is None:
+        wheels_serial, chest_serial = _find_single_serials(
+            hub_serial, interactive=False
+        )
+    else:
+        wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
+        chest_serial = chest_serial or _configured_named_serial(_CAN_C)
     if not (hub_serial or wheels_serial or chest_serial):
         raise RuntimeError("Robot not detected")
     _apply_setup(hub_serial, wheels_serial, chest_serial)
 
 
-def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
-    """Interactively assign single-channel adapters to the wheel/chest buses.
+def _find_single_serials(
+    hub_serial: str | None, *, interactive: bool = True
+) -> tuple[str | None, str | None]:
+    """Assign single-channel adapters to the wheel/chest buses.
 
-    Previously pinned adapters are kept without prompting. Every other
-    attached single-channel adapter is identified by probing its bus (see
-    :func:`_identify_adapter`); one where nothing answers — devices
-    unpowered, or unrelated hardware like a UMI rig — is offered to the
-    operator instead of guessed at.
+    A previously pinned adapter keeps its bus while it is *attached*. A pinned
+    but absent adapter is only a fallback: an attached adapter whose bus
+    probes as wheels/chest takes over the pin (the adapter was replaced, or a
+    different Axol was plugged into this host), while nothing claiming the bus
+    keeps the old pin so a temporarily unplugged cart/chest stays configured.
+
+    Every unpinned attached single-channel adapter is identified by probing
+    its bus (see :func:`_identify_adapter`); one where nothing answers —
+    devices unpowered, or unrelated hardware like a UMI rig — is offered to
+    the operator instead of guessed at, but only on an interactive tty run
+    (``interactive=False``, and non-tty runs like the web dashboard's, skip
+    the prompt).
 
     Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
+    attached = set(_scan_adapters())
     wheels = _configured_named_serial(_CAN_B)
     chest = _configured_named_serial(_CAN_C)
-    if wheels:
-        print(f"Cart wheel bus: keeping configured adapter (serial {wheels}).")
-    if chest:
-        print(f"Chest bus: keeping configured adapter (serial {chest}).")
+    # The serial that *owns* a bus (blocks reassignment): only a pin whose
+    # adapter is actually attached.
+    wheels_owner = wheels if wheels in attached else None
+    chest_owner = chest if chest in attached else None
+    for label, serial, owner in (
+        ("Cart wheel bus", wheels, wheels_owner),
+        ("Chest bus", chest, chest_owner),
+    ):
+        if owner:
+            print(f"{label}: keeping configured adapter (serial {serial}).")
+        elif serial:
+            print(
+                f"{label}: configured adapter (serial {serial}) is not "
+                f"attached — an adapter probing as this bus will replace it."
+            )
 
-    exclude = {s for s in (hub_serial, wheels, chest) if s}
+    exclude = {s for s in (hub_serial, wheels_owner, chest_owner) if s}
     candidates = _detect_single_serials(exclude)
     if not candidates:
         return wheels, chest
@@ -915,22 +980,32 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
     unidentified: list[str] = []
     for serial in candidates:
         role = _identify_adapter(serial)
-        if role == "wheels" and wheels is None:
-            wheels = serial
-            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}")
-        elif role == "chest" and chest is None:
-            chest = serial
-            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}")
+        if role == "wheels" and wheels_owner is None:
+            replaced = f" (replacing {wheels})" if wheels else ""
+            wheels = wheels_owner = serial
+            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}{replaced}")
+        elif role == "chest" and chest_owner is None:
+            replaced = f" (replacing {chest})" if chest else ""
+            chest = chest_owner = serial
+            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}{replaced}")
         elif role is not None:
             print(
-                f"  {serial}: identified as the {role} bus, but that bus is "
-                f"already pinned to another adapter — skipping."
+                f"  {serial}: identified as the {role} bus, but an attached "
+                f"adapter already owns that bus — skipping."
             )
         else:
             unidentified.append(serial)
 
+    interactive = interactive and _stdin_is_tty()
     for serial in unidentified:
         print(f"  {serial}: nothing answered on this adapter's bus.")
+        if not interactive:
+            print(
+                "    Skipping — power the wheel motors / chest board and "
+                "reconnect, or run `axol can.setup` from a terminal to "
+                "assign it manually."
+            )
+            continue
         choice = (
             input(
                 f"    Assign it to the [w]heel bus ({_CAN_B}), the [c]hest "
@@ -939,10 +1014,10 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
             .strip()
             .lower()
         )
-        if choice == "w" and wheels is None:
-            wheels = serial
-        elif choice == "c" and chest is None:
-            chest = serial
+        if choice == "w" and wheels_owner is None:
+            wheels = wheels_owner = serial
+        elif choice == "c" and chest_owner is None:
+            chest = chest_owner = serial
         elif choice in ("w", "c"):
             print("    That bus is already assigned — skipping.")
     return wheels, chest

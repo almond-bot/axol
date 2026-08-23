@@ -27,7 +27,7 @@ from ..motor import (
 )
 from .base import RobotBase
 from .config import AxolConfig
-from .control import Differentiator, compute_friction
+from .control import VEL_CUTOFF_FREQ, BandPass, Differentiator, compute_friction
 from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
@@ -352,21 +352,47 @@ class AxolArm:
         # used: MyActuator's firmware estimate lags too much to damp the
         # shoulders' ~2.3 Hz resonance — feeding it to kd_host measured
         # violently unstable (the same lag is why firmware kd underdelivers).
-        self._vel_diff = Differentiator(n=len(list(Joint)))
-        self._accel_diff = Differentiator(n=len(list(Joint)))
-        self._meas_vel_diff = Differentiator(n=len(list(Joint)))
+        #
+        # Motor-facing paths (v_des impedance target, friction FF, a_des →
+        # j_eff FF) keep the slow pole. The host damping term instead gets
+        # its own chain — fast differentiators on both commanded and measured
+        # positions feeding a band-pass centred on the shoulder resonance —
+        # so kd_host arrives in phase at ~3 Hz without passing the delayed,
+        # anti-phase gain that excites 25-35 Hz structural modes (see the
+        # BandPass docstring in .control for the measured trade).
+        n_j = len(list(Joint))
+        self._vel_diff = Differentiator(n=n_j)
+        self._accel_diff = Differentiator(n=n_j)
+        self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        self._damp_bp = BandPass(n=n_j)
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
 
-        # Reference reflected inertia at the joint-frame rest pose (q = 0),
-        # normalizing the per-cycle kd_host schedule in motion_control().
-        # kd_host values are tuned at rest, where each joint's reflected
-        # inertia is at (or near) its maximum; the schedule only ever scales
-        # them *down* as the pose moves mass toward a joint's axis.
-        self._inertia_rest = gravity_comp.gravity_and_inertia_arm(
+        # Reference reflected inertia normalizing the per-cycle kd_host
+        # schedule in motion_control(): per joint, the *maximum* over a
+        # coarse grid of arm shapes (shoulder/elbow combinations). Host
+        # damping is fully applied only near a joint's max-inertia pose,
+        # where its mode is slowest and the ~100 Hz host loop is safest,
+        # and tapers as J(q) drops and the mode speeds up. For every joint
+        # except shoulder_3 the max is at (or equal to) the rest pose, so
+        # this matches the previous rest-pose anchor exactly; shoulder_3 is
+        # inverted — at rest the forearm lies along its axis (J ≈ 3% of
+        # max, fast mode, host damping unstable) and the arm extended with
+        # the elbow bent is its max — so its schedule must anchor there.
+        self._inertia_ref = gravity_comp.gravity_and_inertia_arm(
             np.zeros(len(ARM_JOINTS), dtype=np.float32), is_left=is_left
         )[1].astype(np.float64)
+        for s1 in (0.0, 1.57, -1.57):
+            for s2 in (0.0, -1.57):
+                for s3 in (0.0, 1.57, -1.57):
+                    for el in (0.0, 1.2, -1.2):
+                        q = np.array([s1, s2, s3, el, 0.0, 0.0, 0.0], dtype=np.float32)
+                        ine = gravity_comp.gravity_and_inertia_arm(q, is_left=is_left)[
+                            1
+                        ].astype(np.float64)
+                        np.maximum(self._inertia_ref, ine, out=self._inertia_ref)
 
         # Clipping arrays.  Arm joints are in joint frame (0 = rest position,
         # matching the URDF and ``arm_limits``); gripper entries are in raw
@@ -1096,11 +1122,14 @@ class AxolArm:
         # so we differentiate the joint-frame ``clipped`` array directly.
         velocities = self._vel_diff.differentiate(list(clipped))
         accelerations = self._accel_diff.differentiate(velocities)
-        # v_meas drives host-side velocity damping (``kd_host``): cached
-        # feedback positions differentiated against their frames' CAN receive
-        # timestamps (jitter-free — see __init__). Falls back to v_des —
-        # collapsing the damping term to 0 — until every cache is filled by
+        # Host damping input: fast-differentiated commanded and measured
+        # velocities, band-passed around the shoulder resonance (see
+        # __init__). The measured side differentiates the positions cached
+        # from impedance feedback frames against the frames' own CAN receive
+        # timestamps (jitter-free — see ``Differentiator.differentiate``).
+        # Falls back to a zero damping input until every cache is filled by
         # the first set_impedance replies.
+        v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
         try:
             pos_list: list[float] = []
             ts_list: list[float] = []
@@ -1112,9 +1141,10 @@ class AxolArm:
                 else:
                     pos_list.append(0.0)
                     ts_list.append(0.0)
-            v_meas = self._meas_vel_diff.differentiate(pos_list, ts_list)
+            v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
         except MotorError:
-            v_meas = list(velocities)
+            v_meas_fast = list(v_des_fast)
+        v_damp = self._damp_bp.update([d - m for d, m in zip(v_des_fast, v_meas_fast)])
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
@@ -1134,13 +1164,14 @@ class AxolArm:
         # sustained jitter on shoulder_1 with the arm raised to the side
         # (kd_host=15 rang at 0.57° RMS; kd_host=0 was clean, firmware kd
         # alone handles the fast mode fine). Scale each joint's kd_host by
-        # J(q)/J_rest, capped at 1 so the rest-tuned values are never
-        # exceeded. Constant damping *ratio* would only need √(J/J_rest),
-        # but the binding constraint at low J is phase-lag stability, not
-        # ζ — the linear taper reaches ~0 at the measured-unstable raised
-        # pose (J ratio 0.02) where √ would still deliver 14% — and the two
-        # rules differ by <25% at the moderate poses where damping matters.
-        host_scale = np.clip(inertia.astype(np.float64) / self._inertia_rest, 0.0, 1.0)
+        # J(q)/J_ref (J_ref = per-joint max over arm shapes, see __init__),
+        # capped at 1 so the configured values are never exceeded. Constant
+        # damping *ratio* would only need √(J/J_ref), but the binding
+        # constraint at low J is phase-lag stability, not ζ — the linear
+        # taper reaches ~0 at the measured-unstable raised pose (J ratio
+        # 0.02) where √ would still deliver 14% — and the two rules differ
+        # by <25% at the moderate poses where damping matters.
+        host_scale = np.clip(inertia.astype(np.float64) / self._inertia_ref, 0.0, 1.0)
 
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
@@ -1171,7 +1202,7 @@ class AxolArm:
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
                 + gains.j_eff * accelerations[i]
-                + kd_host_total * (velocities[i] - v_meas[i])
+                + kd_host_total * v_damp[i]
             )
             return motor.set_impedance(
                 float(motor_targets[i]),
@@ -1330,7 +1361,9 @@ class AxolArm:
         n = len(list(Joint))
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)
-        self._meas_vel_diff = Differentiator(n=n)
+        self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
+        self._damp_bp = BandPass(n=n)
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).

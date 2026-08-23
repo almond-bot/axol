@@ -53,14 +53,19 @@ class KinematicsConfig:
             through             (the teleop "stuck, then jumps" failure). 0.025 matches
             ``VRTeleopConfig.reset_collision_margin``. This value is the
             *ceiling*: each pair's actual activation distance is derived from
-            its home-pose clearance (clamped between the solver's 8 mm floor
-            and this value), so pairs that normally operate near their shell —
-            the wrists and grippers passing 10-17 mm from the base during
-            close-over-table work, the elbow capsules grazing at rest — stay
-            silent in their ordinary envelope instead of holding the cost
-            hinge active there (measured at up to 59% of frames in recorded
-            deburring sessions, which pulsed weight-150 gradients into the arm
-            as path-specific jitter).
+            its home-pose clearance (``min(home_clearance - 2 mm, this
+            value)``, possibly *negative* — see
+            :func:`almond_axol.kinematics.model.collision_cost_params`), so
+            pairs that normally operate near their shell — the wrists and
+            grippers passing 10-17 mm from the base during close-over-table
+            work, the elbow capsules whose conservative fits interpenetrate
+            by 1.4 mm at rest — stay silent in their ordinary envelope
+            instead of holding the cost hinge active there (measured at up
+            to 59% of frames in recorded deburring sessions, which pulsed
+            weight-150 gradients into the arm as path-specific jitter; the
+            formerly floor-clamped elbow pair tripled per-tick solver output
+            acceleration during front-of-torso reaches and kicked the elbow
+            at every shell crossing).
         self_collision_weight: Weight on the self-collision penalty. 150 was
             set by replaying recorded close-to-body teleop episodes through
             the solver offline: at 75 the task cost dragged the elbow up to

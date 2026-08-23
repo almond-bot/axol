@@ -42,6 +42,7 @@ import numpy as np
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
+from .recorder import from_env as _recorder_from_env
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
@@ -183,6 +184,12 @@ class VRTeleopCore:
         # "no new frame from get_frame()" indistinguishable from an operator
         # holding perfectly still, so staleness must be measured at ingest.
         self._last_frame_time: float | None = None
+
+        # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps
+        # the smoothing stages this class owns per control tick — the
+        # segment-rendered raw target, the EMA output, and the final guarded
+        # command (7 left + 7 right arm joints each).
+        self._rec = _recorder_from_env("cmd", {"tgt": 14, "ema": 14, "out": 14})
 
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)
@@ -584,7 +591,14 @@ class VRTeleopCore:
         out[7] = ema_l[7]
         out[8:15] = smoothed_r_arm
         out[15] = ema_r[7]
-        return self._guard_output(out)
+        out = self._guard_output(out)
+        if self._rec is not None:
+            self._rec.record(
+                tgt=np.concatenate([q[self.left_indices], q[self.right_indices]]),
+                ema=np.concatenate([ema_l[:7], ema_r[:7]]),
+                out=np.concatenate([out[:7], out[8:15]]),
+            )
+        return out
 
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.
