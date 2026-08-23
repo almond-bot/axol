@@ -60,6 +60,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Teach waypoints by hand, then replay them as straight-line moves.",
     ),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
+    "teach-poses": (
+        "teach_poses",
+        "Record named key poses during teleop, guided by in-headset prompts.",
+    ),
     "replay-dataset": (
         "replay_dataset",
         "Replay a recorded dataset episode on the robot.",

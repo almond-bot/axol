@@ -39,6 +39,7 @@ export function AxolVRClient({
   onPendingConfirm,
   onMode,
   onEpisode,
+  onBanner,
   onExit,
 }: {
   wsRef: RefObject<WebSocket | null>
@@ -61,6 +62,9 @@ export function AxolVRClient({
   // Called with the current 1-based episode number while collecting data (and
   // null if the server ever clears it). Drives the in-headset episode readout.
   onEpisode?: (episode: number | null) => void
+  // Called with the server-driven guidance banner text (guided teach mode);
+  // null clears it. Drives the in-headset banner readout.
+  onBanner?: (text: string | null) => void
   onExit?: () => void
 }) {
   const { gl } = useThree()
@@ -87,6 +91,9 @@ export function AxolVRClient({
   // the "unset" sentinel (distinct from a real episode value or an explicit
   // null the server could send); replaced with the parsed value on each push.
   const serverEpisodeRef = useRef<number | null | -1>(-1)
+  // Server-pushed banner, applied at the start of the next frame. The string
+  // sentinel "\u0000unset" is distinct from null (an explicit clear).
+  const serverBannerRef = useRef<string | null>("\u0000unset")
   // Track which WebSocket we have attached onmessage to avoid re-attaching.
   const wsWithHandlerRef = useRef<WebSocket | null>(null)
   // Change key of the last HUD state published to the server (see below).
@@ -122,6 +129,8 @@ export function AxolVRClient({
               serverModeRef.current = msg.value as AxolMode
             } else if (msg.type === "episode") {
               serverEpisodeRef.current = typeof msg.value === "number" ? msg.value : null
+            } else if (msg.type === "banner") {
+              serverBannerRef.current = typeof msg.value === "string" ? msg.value : null
             }
           } catch {
             // ignore malformed messages
@@ -188,6 +197,10 @@ export function AxolVRClient({
     if (serverEpisodeRef.current !== -1) {
       onEpisode?.(serverEpisodeRef.current)
       serverEpisodeRef.current = -1
+    }
+    if (serverBannerRef.current !== "\u0000unset") {
+      onBanner?.(serverBannerRef.current)
+      serverBannerRef.current = "\u0000unset"
     }
 
     // Apply server-pushed state override before processing button presses.

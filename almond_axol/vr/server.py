@@ -101,6 +101,11 @@ class VRServer:
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
 
+        # Server-driven guidance banner shown by the headset HUD (guided teach
+        # mode and similar flows). ``None`` hides it. Announced to clients on
+        # connect and broadcast on change (see set_banner).
+        self._banner: str | None = None
+
         # The headset streams identical frames (same ``seq``) over both the USB
         # tunnel and the network (WebRTC data channel / WebSocket). We process
         # each ``seq`` once, from whichever transport delivers it first — the
@@ -220,6 +225,24 @@ class VRServer:
         thread (a plain attribute assignment).
         """
         self._episode = episode
+
+    def set_banner(self, text: str | None) -> None:
+        """Set (or clear, with ``None``) the guidance banner shown in-headset.
+
+        Used by guided flows (e.g. ``axol teach-poses``) to prompt the
+        operator inside the headset. Safe to call from any thread: the value
+        is stored for connect-time announcement and, when the server loop is
+        live, broadcast immediately to all connected clients.
+        """
+        self._banner = text
+        loop = self._loop
+        if loop is not None:
+            import json as _json
+
+            asyncio.run_coroutine_threadsafe(
+                self.broadcast_text(_json.dumps({"type": "banner", "value": text})),
+                loop,
+            )
 
     def set_video_expected(self, expected: bool) -> None:
         """Declare whether camera video is expected to become available.
@@ -726,6 +749,14 @@ class VRServer:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort announce
                     _logger.warning("failed to send hud to client: %s", exc)
+            # Guidance banner (guided teach mode): announce to late joiners.
+            if server._banner is not None:
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "banner", "value": server._banner})
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send banner to client: %s", exc)
             try:
                 while True:
                     data = await websocket.receive_text()
