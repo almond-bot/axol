@@ -222,10 +222,19 @@ class LagCompensatedLowPass:
     first-order poles at ``cutoff`` reject tremor (12 dB/oct), and the
     resulting lag is cancelled by adding ``T·v̂`` where ``T`` is the
     cascade's DC group delay (``2/ω_c``) and ``v̂`` a same-pole-filtered
-    velocity estimate of the once-filtered signal. On the same benchmark:
-    136-144% of in-band energy passed (no manufacture, just the FF path's
-    unavoidable in-band gain) with a worst-case tracking error of 30 mm
-    versus OneEuro's 91 mm — better on both axes at once.
+    velocity estimate of the once-filtered signal.
+
+    Defaults were set by replaying a real recorded session's raw VR stream
+    (jit15, 81 s engaged) through candidates: full lag compensation passes
+    102% of the 3-12 Hz band (the FF path's in-band gain undoes the poles'
+    rejection), while ``lag_comp=0.7`` passes 81% at 52 mm p95 tracking
+    error — matching the old OneEuro's in-band rejection (82% on real data)
+    without its nonlinear artifacts, and with far less lag than its
+    worst case. Pushing rejection further is a steep trade (62% costs
+    ~100 mm p95): the raw stream's in-band noise grows with hand speed
+    (0.6 mm RMS at rest → 8 mm at 1.2+ m/s) and sits barely 1.5 octaves
+    above intentional motion, so target-side filtering is inherently
+    capped — the rest of the defence is plant-side damping.
 
     Args:
         freq:     Nominal sampling frequency in Hz, used when ``update`` is
@@ -240,7 +249,7 @@ class LagCompensatedLowPass:
         self,
         freq: float,
         cutoff: float = 2.5,
-        lag_comp: float = 1.0,
+        lag_comp: float = 0.7,
     ) -> None:
         self._freq = freq
         self._w = 2.0 * math.pi * cutoff

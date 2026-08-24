@@ -120,14 +120,24 @@ class JointConfig:
                   ``kd_host``, keeping the spill allowance damping-ratio-
                   consistent at every slider position.
         kd_host_w0: Centre frequency (rad/s) of the band-pass confining this
-                  joint's host damping to its structural-resonance band (see
-                  ``BandPass`` in :mod:`almond_axol.robot.control`). Joints
-                  ring at different frequencies — shoulders near 3 Hz, the
-                  elbow at 6.7 Hz under load (measured during fast teleop
-                  reversals: 5° p2p, ζ≈0.09) up to ~11 Hz at rest — and a
-                  damper centred on the wrong mode is rolled off and
-                  phase-shifted exactly where the joint rings. Default is
-                  the shoulder resonance (``DAMP_BP_W0``).
+                  joint's host damping to its resonance band (see ``BandPass``
+                  in :mod:`almond_axol.robot.control`). A damper centred on
+                  the wrong mode is rolled off and phase-shifted exactly
+                  where the joint needs it: with a fixed centre at the
+                  shoulders' 3.2 Hz *rest* resonance, teleop bursts at
+                  4.3-8.6 Hz (jit14/15 surveys) saw only ~14% of the damping
+                  (-47° band-pass phase, -23° differentiator, -12° loop
+                  delay). ``None`` (the default) makes the centre *track the
+                  pose*: the shoulders' mode is the impedance mode
+                  ωn = √(kp/J(q)) — validated against hardware (2.2 Hz
+                  predicted at rest vs ~2-3 measured; 5.4 Hz raised to the
+                  side vs the 4.3-8.6 Hz burst band) — so motion_control
+                  scales the hardware-anchored rest centre (``DAMP_BP_W0``)
+                  by √(J_rest/J(q)) each cycle. Set an explicit value for
+                  joints whose ringing is *structural* rather than the
+                  impedance mode (the elbow rings at 6.7 Hz under load where
+                  √(kp/J) predicts 2.3 Hz — transmission compliance, not
+                  reflected inertia).
     """
 
     kp: float
@@ -138,8 +148,7 @@ class JointConfig:
     j_eff: float = 0.0
     kd_host: float = 0.0
     kd_host_max: float = 0.0
-    # Matches control.DAMP_BP_W0 (≈3.2 Hz shoulder resonance).
-    kd_host_w0: float = 20.0
+    kd_host_w0: float | None = None
 
 
 @dataclass

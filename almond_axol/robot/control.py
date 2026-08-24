@@ -190,8 +190,20 @@ class BandPass:
         self._bp = [0.0] * n
         self._last_time: float | None = None
 
-    def update(self, x: list[float]) -> list[float]:
-        """Advance one step; returns the band-passed values (zeros on first call)."""
+    def update(self, x: list[float], w0: Sequence[float] | None = None) -> list[float]:
+        """Advance one step; returns the band-passed values (zeros on first call).
+
+        Args:
+            x:  Input sample per channel.
+            w0: Optional per-channel centre frequencies (rad/s) for this step,
+                overriding the constructor values. The Chamberlin SVF computes
+                its coefficient from ``w0`` fresh every step, so a
+                slowly-varying centre is well-behaved — used by
+                ``AxolArm.motion_control`` to keep each shoulder's damper
+                centred on its pose-dependent impedance mode ωn = √(kp/J(q)).
+        """
+        if w0 is not None:
+            self._w0 = [float(v) for v in w0]
         now = time.perf_counter()
         if self._last_time is None:
             self._last_time = now

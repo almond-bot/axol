@@ -115,14 +115,14 @@ class VRTeleopConfig:
             applied to raw VR controller positions, quaternions, and elbow
             positions **before** they enter the IK solver (see
             :class:`~almond_axol.teleop.filter.LagCompensatedLowPass` for why
-            this replaced the One Euro filter: OneEuro's speed-adaptive
-            cutoff *manufactured* 3-12 Hz noise from clean intentional
-            motion — 286% in-band emission on a realistic benchmark — and
-            that band is where the arm's structural modes live).  Lower
-            values reject more tremor but raise the velocity-feedforward
-            gain needed to stay responsive; 2.5 Hz measured best on both
-            axes at once (144% in-band pass, 30 mm worst-case tracking
-            error vs OneEuro's 286% / 91 mm).
+            this replaced the One Euro filter, and for the real-session
+            replay that set this value and the filter's lag-compensation
+            fraction).  Lower values reject more tremor but the trade is
+            steep — the raw stream's 3-12 Hz noise grows with hand speed
+            and sits barely 1.5 octaves above intentional motion — so this
+            stage only trims the band (~81% pass at 2.5 Hz); the resonance
+            itself is handled by pose-tracked host damping on the robot
+            side.
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;

@@ -373,10 +373,21 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n_j)
         self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
+        # Host-damping band-pass centres: joints with an explicit kd_host_w0
+        # (structural modes — the elbow, shoulder_3) keep it fixed; joints
+        # with None get pose-tracked centres each cycle (see motion_control:
+        # the shoulders' impedance mode ωn = √(kp/J(q)) moves 2.2 → 5.4 Hz
+        # between rest and raised-to-the-side, and a fixed rest centre
+        # delivered only ~14% of the damping in the 4.3-8.6 Hz teleop burst
+        # band).
         self._damp_w0 = [
-            getattr(self._arm_config, j.value).kd_host_w0
+            getattr(self._arm_config, j.value).kd_host_w0 or DAMP_BP_W0
             if j != Joint.GRIPPER
             else DAMP_BP_W0
+            for j in Joint
+        ]
+        self._damp_w0_tracked = [
+            j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_w0 is None
             for j in Joint
         ]
         self._damp_bp = BandPass(n=n_j, w0=self._damp_w0)
@@ -1162,29 +1173,6 @@ class AxolArm:
         # so we differentiate the joint-frame ``clipped`` array directly.
         velocities = self._vel_diff.differentiate(list(clipped))
         accelerations = self._accel_diff.differentiate(velocities)
-        # Host damping input: fast-differentiated commanded and measured
-        # velocities, band-passed around the shoulder resonance (see
-        # __init__). The measured side differentiates the positions cached
-        # from impedance feedback frames against the frames' own CAN receive
-        # timestamps (jitter-free — see ``Differentiator.differentiate``).
-        # Falls back to a zero damping input until every cache is filled by
-        # the first set_impedance replies.
-        v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
-        try:
-            pos_list: list[float] = []
-            ts_list: list[float] = []
-            for j in Joint:
-                motor = self.motors.get(j)
-                if motor is not None:
-                    pos_list.append(motor.position)
-                    ts_list.append(motor.feedback_ts)
-                else:
-                    pos_list.append(0.0)
-                    ts_list.append(0.0)
-            v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
-        except MotorError:
-            v_meas_fast = list(v_des_fast)
-        v_damp = self._damp_bp.update([d - m for d, m in zip(v_des_fast, v_meas_fast)])
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
@@ -1219,6 +1207,46 @@ class AxolArm:
         # peaks with the arm extended (up to ~1.6× its rest anchor), exactly
         # where its acceleration FF is needed most.
         j_scale = (self._j_rotor + inertia.astype(np.float64)) / self._j_ff_denom
+
+        # Host-damping band-pass centres for this cycle. Tracked joints (see
+        # __init__) follow their pose-dependent impedance mode by scaling the
+        # hardware-anchored rest centre by √(J_rest/J(q)) — j_scale is exactly
+        # (J_rotor + J(q))/(J_rotor + J_rest). Clamped: below ~12 rad/s the
+        # band starts dragging intentional motion, above 50 rad/s (~8 Hz) the
+        # loop's phase budget is spent and more centre only points the damper
+        # at modes it would excite.
+        damp_w0 = list(self._damp_w0)
+        for i in range(len(ARM_JOINTS)):
+            if self._damp_w0_tracked[i]:
+                damp_w0[i] = float(
+                    np.clip(DAMP_BP_W0 / math.sqrt(max(j_scale[i], 1e-6)), 12.0, 50.0)
+                )
+
+        # Host damping input: fast-differentiated commanded and measured
+        # velocities, band-passed at each joint's resonance (damp_w0 above).
+        # The measured side differentiates the positions cached from
+        # impedance feedback frames against the frames' own CAN receive
+        # timestamps (jitter-free — see ``Differentiator.differentiate``).
+        # Falls back to a zero damping input until every cache is filled by
+        # the first set_impedance replies.
+        v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
+        try:
+            pos_list: list[float] = []
+            ts_list: list[float] = []
+            for j in Joint:
+                motor = self.motors.get(j)
+                if motor is not None:
+                    pos_list.append(motor.position)
+                    ts_list.append(motor.feedback_ts)
+                else:
+                    pos_list.append(0.0)
+                    ts_list.append(0.0)
+            v_meas_fast = self._meas_vel_diff.differentiate(pos_list, ts_list)
+        except MotorError:
+            v_meas_fast = list(v_des_fast)
+        v_damp = self._damp_bp.update(
+            [d - m for d, m in zip(v_des_fast, v_meas_fast)], w0=damp_w0
+        )
 
         # Convert arm joints to motor frame for the impedance command.  Gripper
         # offset is 0, so its raw motor value is unchanged.
