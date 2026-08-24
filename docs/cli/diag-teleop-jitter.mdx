@@ -3,10 +3,10 @@ title: "diag.teleop-jitter"
 description: "Attribute teleop jitter to a pipeline stage from a flight-recorder capture."
 ---
 
-Analyzes a teleop flight-recorder capture and reports where in the pipeline the jitter enters. Record a session first by setting `AXOL_JITTER_RECORD` to a file prefix — recording costs one buffer copy per tick and is entirely inert when the variable is unset:
+Analyzes a teleop flight-recorder capture and reports where in the pipeline the jitter enters. Record a session first by passing `--teleop.jitter_record` with a file prefix — recording costs one buffer copy per tick and is entirely inert when the flag is unset:
 
 ```bash
-AXOL_JITTER_RECORD=/tmp/jit axol teleop
+axol teleop --teleop.jitter_record /tmp/jit
 # reproduce the jitter, then exit teleop
 axol diag.teleop-jitter /tmp/jit
 ```

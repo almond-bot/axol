@@ -49,7 +49,7 @@ from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
-from .recorder import from_env as _recorder_from_env
+from .recorder import make as _recorder_make
 from .worker import run_ik_worker
 
 _logger = logging.getLogger(__name__)
@@ -141,11 +141,11 @@ class VRTeleop:
         # broadcast tracking-state changes to the headset.
         self._vr_loop: asyncio.AbstractEventLoop | None = None
 
-        # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps
-        # the measured side per control tick — cached joint positions and
-        # torques (8 left + 8 right), refreshed by the impedance feedback
+        # Jitter flight recorder (--teleop.jitter_record, see .recorder):
+        # taps the measured side per control tick — cached joint positions
+        # and torques (8 left + 8 right), refreshed by the impedance feedback
         # frames so reading them costs no CAN traffic.
-        self._rec = _recorder_from_env("meas", {"qm": 16, "tq": 16})
+        self._rec = _recorder_make(config.jitter_record, "meas", {"qm": 16, "tq": 16})
 
     # ------------------------------------------------------------------
     # Lifecycle

@@ -42,7 +42,7 @@ import numpy as np
 from ..robot.control import ContactWatchdog
 from .config import VRTeleopConfig
 from .filter import AlphaSmoothFilter, ResetInterpolator, TrapezoidalFilter
-from .recorder import from_env as _recorder_from_env
+from .recorder import make as _recorder_make
 
 _IK_RECV_TIMEOUT = 5.0  # seconds; avoid blocking forever if IK process hangs
 
@@ -189,11 +189,13 @@ class VRTeleopCore:
         # holding perfectly still, so staleness must be measured at ingest.
         self._last_frame_time: float | None = None
 
-        # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps
-        # the smoothing stages this class owns per control tick — the
+        # Jitter flight recorder (--teleop.jitter_record, see .recorder):
+        # taps the smoothing stages this class owns per control tick — the
         # segment-rendered raw target, the EMA output, and the final guarded
         # command (7 left + 7 right arm joints each).
-        self._rec = _recorder_from_env("cmd", {"tgt": 14, "ema": 14, "out": 14})
+        self._rec = _recorder_make(
+            self.config.jitter_record, "cmd", {"tgt": 14, "ema": 14, "out": 14}
+        )
 
     # ------------------------------------------------------------------
     # Seeding (called once at connect, before the IK loop starts)

@@ -22,7 +22,7 @@ from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
 from .filter import LagCompensatedLowPass
-from .recorder import from_env as _recorder_from_env
+from .recorder import make as _recorder_make
 from .trajectory import plan_collision_aware_trajectory
 
 _logger = logging.getLogger(__name__)
@@ -257,11 +257,13 @@ class IKWorker:
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
 
-        # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps the
-        # solve path at every stage boundary this process owns — raw VR pose,
-        # filtered pose, world EE target, IK output.
+        # Jitter flight recorder (--teleop.jitter_record, arriving here via
+        # the pickled config, see .recorder): taps the solve path at every
+        # stage boundary this process owns — raw VR pose, filtered pose,
+        # world EE target, IK output.
         n = self._solver.num_joints
-        self._rec = _recorder_from_env(
+        self._rec = _recorder_make(
+            config.jitter_record,
             "ik",
             {
                 "raw_l": 3,

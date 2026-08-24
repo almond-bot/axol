@@ -5,33 +5,32 @@ pose, EE target, IK output, smoothed command, measured joints — as
 timestamped rows in fixed-size ring buffers, so one jittery session can be
 attributed offline stage by stage (``axol diag.teleop-jitter``).
 
-Activation is by environment variable so it reaches the IK subprocess
-without any plumbing::
+Activation is by the ``jitter_record`` field on
+:class:`~almond_axol.teleop.config.VRTeleopConfig`::
 
-    AXOL_JITTER_RECORD=/tmp/jit axol teleop
+    axol teleop --teleop.jitter_record /tmp/jit
 
-Each process/stage writes ``<prefix>_<stage>.npz`` on exit (the IK worker
-writes ``_ik``, the smoothing core ``_cmd``, the control loop ``_meas``).
-All rows are stamped with ``time.monotonic()``, which shares one epoch
-across processes on Linux, so the files can be merged on time.
+Every tap site holds that config — including the IK worker, which receives
+it pickled through the subprocess spawn — so the prefix needs no other
+plumbing. Each process/stage writes ``<prefix>_<stage>.npz`` on exit (the
+IK worker writes ``_ik``, the smoothing core ``_cmd``, the control loop
+``_meas``). All rows are stamped with ``time.monotonic()``, which shares
+one epoch across processes on Linux, so the files can be merged on time.
 
 Recording costs one array copy into a preallocated buffer per tick —
 negligible against a CAN round-trip — and is entirely inert when the
-environment variable is unset (every hook holds ``None``).
+field is unset (every hook holds ``None``).
 """
 
 from __future__ import annotations
 
 import atexit
 import logging
-import os
 import time
 
 import numpy as np
 
 _logger = logging.getLogger(__name__)
-
-ENV_VAR = "AXOL_JITTER_RECORD"
 
 # Default ring capacity: 5 minutes at 120 Hz. Older rows are overwritten, so
 # a long session keeps its *last* 5 minutes — end the session shortly after
@@ -89,15 +88,17 @@ class JitterRecorder:
         _logger.info("Jitter recorder: wrote %d rows to %s", self._count, self._path)
 
 
-def from_env(
-    stage: str, fields: dict[str, int], capacity: int = _DEFAULT_CAPACITY
+def make(
+    prefix: str | None,
+    stage: str,
+    fields: dict[str, int],
+    capacity: int = _DEFAULT_CAPACITY,
 ) -> JitterRecorder | None:
-    """Build a recorder for ``stage`` if :data:`ENV_VAR` is set, else ``None``.
+    """Build a recorder for ``stage`` if ``prefix`` is set, else ``None``.
 
     The recorder is registered with :mod:`atexit` so a normal shutdown (or
     Ctrl-C) writes ``<prefix>_<stage>.npz`` without any explicit dump call.
     """
-    prefix = os.environ.get(ENV_VAR)
     if not prefix:
         return None
     rec = JitterRecorder(f"{prefix}_{stage}.npz", fields, capacity)

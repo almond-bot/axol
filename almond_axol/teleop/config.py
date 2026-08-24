@@ -149,6 +149,13 @@ class VRTeleopConfig:
             reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
+        jitter_record: File prefix for the jitter flight recorder (see
+            :mod:`almond_axol.teleop.recorder`), e.g. ``/tmp/jit``.  When
+            set, every stage of the teleop pipeline — raw VR pose, filtered
+            pose, IK output, smoothed command, measured joints — is captured
+            to ``<prefix>_{ik,cmd,meas}.npz`` on exit, for offline analysis
+            with ``axol diag.teleop-jitter <prefix>``.  ``None`` (the
+            default) disables recording entirely.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -201,3 +208,4 @@ class VRTeleopConfig:
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
+    jitter_record: str | None = None

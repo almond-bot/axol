@@ -53,7 +53,7 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
     "diag.teleop-jitter": (
         "almond_axol.diagnostics.teleop_jitter",
         "Attribute teleop jitter to a pipeline stage from a flight-recorder "
-        "capture (AXOL_JITTER_RECORD).",
+        "capture (axol teleop --teleop.jitter_record PREFIX).",
     ),
 }
 
