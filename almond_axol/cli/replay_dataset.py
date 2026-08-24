@@ -81,7 +81,7 @@ class ReplayDatasetConfig:
     # reproducing the original timing; set a positive value to override it.
     fps: int = 0
     # Smooth playback by linearly interpolating between recorded actions and
-    # commanding the arms at ~120 Hz (the teleop control rate) instead of the
+    # commanding the arms at ~120 Hz (the teleop IK rate) instead of the
     # dataset fps. Episode timing is unchanged; only the command granularity
     # increases. Off by default (each recorded action is sent once, as-is).
     interpolate: bool = False
