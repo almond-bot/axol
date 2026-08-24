@@ -3,7 +3,7 @@
 Captures every stage boundary of the teleop pipeline — raw VR pose, filtered
 pose, EE target, IK output, smoothed command, measured joints — as
 timestamped rows in fixed-size ring buffers, so one jittery session can be
-attributed offline stage by stage (``scripts/analyze_teleop_jitter.py``).
+attributed offline stage by stage (``axol diag.teleop-jitter``).
 
 Activation is by environment variable so it reaches the IK subprocess
 without any plumbing::

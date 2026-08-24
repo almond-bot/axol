@@ -50,6 +50,11 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
     ),
+    "diag.teleop-jitter": (
+        "almond_axol.diagnostics.teleop_jitter",
+        "Attribute teleop jitter to a pipeline stage from a flight-recorder "
+        "capture (AXOL_JITTER_RECORD).",
+    ),
 }
 
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {

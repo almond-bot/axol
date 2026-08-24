@@ -4,7 +4,7 @@ Record one jittery session first::
 
     AXOL_JITTER_RECORD=/tmp/jit axol teleop
     # reproduce the jitter, then exit teleop
-    uv run python scripts/analyze_teleop_jitter.py /tmp/jit
+    axol diag.teleop-jitter /tmp/jit
 
 The recorder (see ``almond_axol/teleop/recorder.py``) writes three files
 sharing one monotonic clock:
@@ -151,8 +151,8 @@ def _clip(data: dict[str, np.ndarray], span: tuple[float, float]) -> dict:
     return {k: v[m] for k, v in data.items()}
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="axol diag.teleop-jitter")
     ap.add_argument("prefix", help="the AXOL_JITTER_RECORD prefix used during capture")
     ap.add_argument(
         "--full",
@@ -165,7 +165,7 @@ def main() -> None:
         default=None,
         help="restrict joint tables to these names (e.g. elbow wrist_2)",
     )
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     ik = _load(args.prefix, "ik")
     cmd = _load(args.prefix, "cmd")

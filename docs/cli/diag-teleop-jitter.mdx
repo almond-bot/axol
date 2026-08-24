@@ -1,0 +1,28 @@
+---
+title: "diag.teleop-jitter"
+description: "Attribute teleop jitter to a pipeline stage from a flight-recorder capture."
+---
+
+Analyzes a teleop flight-recorder capture and reports where in the pipeline the jitter enters. Record a session first by setting `AXOL_JITTER_RECORD` to a file prefix — recording costs one buffer copy per tick and is entirely inert when the variable is unset:
+
+```bash
+AXOL_JITTER_RECORD=/tmp/jit axol teleop
+# reproduce the jitter, then exit teleop
+axol diag.teleop-jitter /tmp/jit
+```
+
+The recorder writes three time-synchronized files (`_ik`, `_cmd`, `_meas` — raw VR pose through filtered pose, IK output, smoothed command, and measured joints). The analyzer clips to the longest engaged stretch, splits every signal into three bands — below 3 Hz (intentional motion), 3-15 Hz (the **JITTER** column, the band the arm's structure responds to), above 15 Hz (noise the mechanics filter out) — and prints band-RMS tables at every stage boundary, flagging any dominant spectral line with its frequency.
+
+To read the output, walk each joint down its stage list and find the first stage where the JITTER column jumps well above the previous stage:
+
+| Jump at | Points to |
+| --- | --- |
+| `raw -> filt` | VR tracking noise / pose filter |
+| `filt -> ik_q` | the IK solver (e.g. null-space churn) |
+| `tgt -> ema -> out` | the smoothing stages |
+| `out -> meas` | the arm ringing — control/damping territory |
+
+```bash
+axol diag.teleop-jitter /tmp/jit --joints elbow wrist_2   # restrict the tables
+axol diag.teleop-jitter /tmp/jit --full                   # ignore engage gating
+```
