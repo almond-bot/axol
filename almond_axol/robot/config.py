@@ -257,19 +257,24 @@ class ArmConfig:
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # The elbow rings underdamped (ζ≈0.09) at 6.7 Hz under load —
-            # measured as ~5° p2p / 34 Nm p2p shudder during fast teleop
-            # reversals — and firmware kd is as blind to it as it is to the
-            # shoulder resonance. Host damping is band-passed at the
-            # elbow's own mode (kd_host_w0 below, not the 3.2 Hz shoulder
-            # centre where the old kd_host=4 was rolled off to ~nothing at
-            # 6.7 Hz). The historical "host-kd 39 diverged at 11 Hz" was
-            # measured *broadband* at the 120 Hz loop (~45° delay alone);
-            # the band-pass + 240 Hz loop is near-neutral at 11 Hz. Still,
-            # raise this only with a hardware step/teleop check.
+            # The elbow's ring is structural (transmission compliance, not
+            # the impedance mode — √(kp/J) predicts 2.3 Hz) and its
+            # frequency moves with load: 6.7 Hz under load (~5° p2p / 34 Nm
+            # p2p shudder during fast reversals, ζ≈0.09) up to 12.5 Hz
+            # light. Firmware kd is as blind to it as to the shoulder
+            # resonance, so damping is host-side and band-passed. The centre
+            # must cover the whole measured 6.7-12.5 Hz range: at the old
+            # 50 rad/s the 10-12.5 Hz bursts (jit16, elbow bent, light
+            # load) sat at ~-106° total phase — mild *anti*-damping. 60
+            # rad/s is near the geometric mean: in phase at 6.7 Hz
+            # (band-pass lead cancels the loop lags), +0.44 effective at
+            # 10 Hz, neutral at 12.5. The historical "host-kd 39 diverged
+            # at 11 Hz" was measured *broadband* at the 120 Hz loop (~45°
+            # delay alone); still, raise the magnitude only with a hardware
+            # step/teleop check.
             kd_host=8.0,
             kd_host_max=8.0,
-            kd_host_w0=50.0,  # rad/s ≈ 8 Hz: full gain at 6.7, neutral at 11
+            kd_host_w0=60.0,  # rad/s ≈ 9.5 Hz, covering the 6.7-12.5 Hz range
         )
     )
     wrist_1: JointConfig = field(
@@ -288,6 +293,18 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
+            # wrist_2 led the residual teleop bursts once the shoulders were
+            # damped (jit16: up to 613 mdeg, ringing at 7.8-10 Hz with the
+            # elbow bent ~110-120°, measured ripple 2.5-4x commanded). Its
+            # Damiao firmware clamps kd at 5, leaving no firmware headroom —
+            # and raising kd toward the clamp historically produced contact
+            # chatter against the chassis — so the damping is delivered
+            # host-side, band-passed at the measured mode. At 8.8 Hz the
+            # loop still delivers ~cos(55°) ≈ 0.6 of it in phase; with this
+            # joint's small reflected inertia that adds ζ ≈ 0.3.
+            kd_host=1.5,
+            kd_host_max=1.5,
+            kd_host_w0=55.0,  # rad/s ≈ 8.8 Hz, centred on the measured band
         )
     )
     wrist_3: JointConfig = field(
