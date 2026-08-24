@@ -88,9 +88,10 @@ class JointConfig:
                   too filtered to damp the ~2 Hz closed-loop resonance —
                   measured on left shoulder_2 at kp=250: firmware kd=35
                   alone left a 62%-overshoot ring; kd_host=30 on top damped
-                  it critically. The elbow needs a small dose for the same
-                  reason (4 halves its step overshoot). Leave at 0 for
-                  joints whose firmware kd works (wrists, shoulder_3).
+                  it critically. The elbow and shoulder_3 need their own
+                  dose for the same reason, band-passed at their own modes
+                  (see ``kd_host_w0``). Leave at 0 for joints whose
+                  firmware kd works (the wrists).
                   This value is the *max-inertia-pose* anchor: at runtime
                   the controller scales it by J(q)/J_ref, where J_ref is
                   the per-joint maximum reflected inertia over arm shapes
@@ -104,21 +105,29 @@ class JointConfig:
                   the firmware-kd spillover added when ``kd`` exceeds the
                   motor's firmware range (see ``_mit_cmd`` in
                   :mod:`almond_axol.robot.axol`). Host damping runs at the
-                  ~100 Hz command rate on a one-cycle-stale velocity, so it
-                  only works on modes far below that rate: the shoulders'
-                  ~2.3 Hz resonance (40 samples/cycle) damps cleanly up to
-                  the hardware-verified 40–45, but the elbow rings at
-                  ~11 Hz (8 samples/cycle, ~45° phase lag) where host
-                  damping *feeds* the oscillation — host-kd 39 there
-                  diverged violently and even 10 sustained a limit cycle on
-                  a full-size step. Only the motor's internal kHz loop can
-                  damp such fast modes, so joints like the elbow must not
-                  spill (``kd_host_max == kd_host``). Set only to values
-                  verified stable on hardware; ``0`` (default) allows no
+                  command rate on a one-cycle-stale velocity, so it
+                  only works on modes well below that rate: the shoulders'
+                  ~2.3 Hz resonance damps cleanly up to the
+                  hardware-verified 40–45, but broadband host damping at the
+                  old 120 Hz rate *fed* the elbow's ~11 Hz mode (~45° phase
+                  lag) — host-kd 39 there diverged violently and even 10
+                  sustained a limit cycle on a full-size step. The band-pass
+                  (see ``kd_host_w0``) plus the 240 Hz loop halves that lag,
+                  but this ceiling must still only hold values verified
+                  stable on hardware; ``0`` (default) allows no
                   spillover beyond ``kd_host`` itself. The stiffness blend
                   scales this ceiling with the same ``√kp`` factor as
                   ``kd_host``, keeping the spill allowance damping-ratio-
                   consistent at every slider position.
+        kd_host_w0: Centre frequency (rad/s) of the band-pass confining this
+                  joint's host damping to its structural-resonance band (see
+                  ``BandPass`` in :mod:`almond_axol.robot.control`). Joints
+                  ring at different frequencies — shoulders near 3 Hz, the
+                  elbow at 6.7 Hz under load (measured during fast teleop
+                  reversals: 5° p2p, ζ≈0.09) up to ~11 Hz at rest — and a
+                  damper centred on the wrong mode is rolled off and
+                  phase-shifted exactly where the joint rings. Default is
+                  the shoulder resonance (``DAMP_BP_W0``).
     """
 
     kp: float
@@ -129,6 +138,8 @@ class JointConfig:
     j_eff: float = 0.0
     kd_host: float = 0.0
     kd_host_max: float = 0.0
+    # Matches control.DAMP_BP_W0 (≈3.2 Hz shoulder resonance).
+    kd_host_w0: float = 20.0
 
 
 @dataclass
@@ -186,61 +197,76 @@ class ArmConfig:
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=250.0,
-            kd=42.0,
+            kd=35.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_host=50.0,
-            kd_host_max=50.0,
+            kd_host=40.0,
+            kd_host_max=45.0,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=250.0,
-            kd=42.0,
+            kd=35.0,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=45.0,
-            kd_host_max=45.0,
+            kd_host=35.0,
+            kd_host_max=40.0,
         )
     )
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            kd=24.0,
+            kd=20.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
             j_eff=0.25,
-            # If extension jitter returns (arm forward, elbow bent), a small
-            # kd_host (~10-15) is the fix: the J(q)/J_ref schedule keeps it
-            # near zero at rest (J_rest ≈ 3% of max, fast mode) and ramps
-            # it in only where the mode slows into the host loop's band.
+            # Extension jitter did return once kd_host was removed: a full
+            # teleop survey (jit13, 37 tracking-error bursts) showed
+            # shoulder_3 leading ~20 of them on both arms, ringing at
+            # 3.9-5.9 Hz with the hand out to the side / near the head —
+            # the poses where its reflected inertia peaks (~27× rest) and
+            # its mode drops into the host loop's band. The J(q)/J_ref
+            # schedule zeroes this at rest (J_rest ≈ 3% of max, the pose
+            # where un-scheduled kd_host used to jitter) and delivers
+            # ~0.65× at the measured burst poses.
+            kd_host=12.0,
+            kd_host_max=12.0,
+            kd_host_w0=30.0,  # rad/s ≈ 4.8 Hz, centred on the measured band
         )
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=48.0,
+            kd=40.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # Extra elbow damping must come from firmware kd (kHz loop):
-            # its ~11 Hz ring is too fast for the ~100 Hz host loop —
-            # host-kd 39 diverged violently there, and the damping
-            # band-pass rolls off well below 11 Hz. Do not raise kd_host.
-            kd_host=4.0,
-            kd_host_max=4.0,
+            # The elbow rings underdamped (ζ≈0.09) at 6.7 Hz under load —
+            # measured as ~5° p2p / 34 Nm p2p shudder during fast teleop
+            # reversals — and firmware kd is as blind to it as it is to the
+            # shoulder resonance. Host damping is band-passed at the
+            # elbow's own mode (kd_host_w0 below, not the 3.2 Hz shoulder
+            # centre where the old kd_host=4 was rolled off to ~nothing at
+            # 6.7 Hz). The historical "host-kd 39 diverged at 11 Hz" was
+            # measured *broadband* at the 120 Hz loop (~45° delay alone);
+            # the band-pass + 240 Hz loop is near-neutral at 11 Hz. Still,
+            # raise this only with a hardware step/teleop check.
+            kd_host=8.0,
+            kd_host_max=8.0,
+            kd_host_w0=50.0,  # rad/s ≈ 8 Hz: full gain at 6.7, neutral at 11
         )
     )
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            kd=20.0,
+            kd=17.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
@@ -457,12 +483,12 @@ class _ArmGains:
 # extra kp bought no stiffness in practice — a gripped payload would lower
 # the mode's frequency and amplify it further.
 _STIFF_GAINS = _ArmGains(
-    shoulder_1=(350.0, 49.7),
-    shoulder_2=(350.0, 49.7),
-    shoulder_3=(250.0, 28.3),
-    # Ratio-consistent elbow kd at kp=200 would be 55.8, but MyActuator
-    # V4.4 clamps kd at 50 — the stiff half runs slightly underdamped.
-    elbow=(200.0, 50.0),
+    shoulder_1=(350.0, 41.4),
+    shoulder_2=(350.0, 41.4),
+    shoulder_3=(250.0, 23.6),
+    # Ratio-consistent elbow kd at kp=200 is 49.6, just inside the
+    # MyActuator V4.4 firmware clamp of 50.
+    elbow=(200.0, 49.6),
     wrist_1=(200.0, 18.0),
     wrist_2=(160.0, 3.9),
     wrist_3=(250.0, 2.8),
@@ -474,11 +500,11 @@ _STIFF_GAINS = _ArmGains(
 # tuned midpoint (``kd_soft = kd · sqrt(kp_soft / kp)``, tuned values), same
 # rule as :data:`_STIFF_GAINS` above.
 _SOFT_GAINS = _ArmGains(
-    shoulder_1=(40.0, 16.8),
-    shoulder_2=(50.0, 18.8),
-    shoulder_3=(45.0, 12.0),
-    elbow=(40.0, 26.6),
-    wrist_1=(30.0, 8.2),
+    shoulder_1=(40.0, 14.0),
+    shoulder_2=(50.0, 15.7),
+    shoulder_3=(45.0, 10.0),
+    elbow=(40.0, 22.2),
+    wrist_1=(30.0, 6.9),
     wrist_2=(25.0, 1.5),
     wrist_3=(25.0, 0.9),
 )

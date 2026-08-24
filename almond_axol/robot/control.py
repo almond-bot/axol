@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import time
+from collections.abc import Sequence
 
 from ..constants import ARM_JOINTS
 
@@ -163,13 +164,27 @@ class BandPass:
 
     Args:
         n:  Number of independent channels.
-        w0: Centre frequency in rad/s.
+        w0: Centre frequency in rad/s — a scalar shared by all channels, or a
+            per-channel sequence. Structural modes differ per joint (the
+            shoulders ring near 3 Hz, the elbow near 7-11 Hz depending on
+            pose), and a damper centred on the wrong joint's mode is rolled
+            off and phase-shifted exactly where that joint needs it.
         q:  Quality factor (bandwidth = w0/q).
     """
 
-    def __init__(self, n: int, w0: float = DAMP_BP_W0, q: float = DAMP_BP_Q) -> None:
+    def __init__(
+        self,
+        n: int,
+        w0: float | Sequence[float] = DAMP_BP_W0,
+        q: float = DAMP_BP_Q,
+    ) -> None:
+        if isinstance(w0, (int, float)):
+            self._w0 = [float(w0)] * n
+        else:
+            if len(w0) != n:
+                raise ValueError(f"w0 has {len(w0)} entries for {n} channels")
+            self._w0 = [float(v) for v in w0]
         self._n = n
-        self._w0 = w0
         self._q = q
         self._lp = [0.0] * n
         self._bp = [0.0] * n
@@ -185,11 +200,12 @@ class BandPass:
         self._last_time = now
         if ts <= 0:
             return [b / self._q for b in self._bp]
-        # Chamberlin SVF coefficient; the sin() form keeps the centre accurate
-        # at low fs, and clamping keeps the filter stable across loop stalls.
-        f = 2.0 * math.sin(min(0.5 * self._w0 * ts, 0.7))
         out: list[float] = []
         for i in range(self._n):
+            # Chamberlin SVF coefficient; the sin() form keeps the centre
+            # accurate at low fs, and clamping keeps the filter stable
+            # across loop stalls.
+            f = 2.0 * math.sin(min(0.5 * self._w0[i] * ts, 0.7))
             self._lp[i] += f * self._bp[i]
             hp = x[i] - self._lp[i] - self._bp[i] / self._q
             self._bp[i] += f * hp

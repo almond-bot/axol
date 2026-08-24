@@ -111,23 +111,18 @@ class VRTeleopConfig:
             high-frequency jitter at the cost of a small fixed lag
             (``~(1-alpha)/alpha`` frames).  Defaults to ``0.3`` (~20 ms lag
             at 120 Hz), favouring smoothness over minimum latency.
-        pose_min_cutoff: Minimum cutoff frequency (Hz) for the One Euro Filter
+        pose_cutoff: Pole frequency (Hz) of the lag-compensated low-pass
             applied to raw VR controller positions, quaternions, and elbow
-            positions **before** they enter the IK solver.  This is the
-            primary tremor / tracking-noise kill knob.  Lower values give
-            heavier smoothing at rest (more tremor rejection) at the cost of
-            slightly more lag when still.  Typical range: 0.5–3 Hz.  Defaults
-            to ``0.8`` Hz, favouring smoothness over minimum latency (the
-            fixed-lag smoother in the VR server's pose interpolator does the
-            heavy lifting upstream).
-        pose_beta: Speed coefficient for the One Euro Filter.  Raises the
-            filter cutoff proportionally to the signal's instantaneous speed,
-            keeping the filter transparent during fast intentional moves.
-            Increase if fast moves feel sticky.  Defaults to ``0.5``: a
-            flight-recorder replay of a real session measured ``2.0`` passing
-            101% of the 3-15 Hz hand-tremor band during motion (the opened
-            cutoff tracks the hand exactly when it trembles), while ``0.5``
-            cut it to 71% for ~33 ms of extra in-motion lag.
+            positions **before** they enter the IK solver (see
+            :class:`~almond_axol.teleop.filter.LagCompensatedLowPass` for why
+            this replaced the One Euro filter: OneEuro's speed-adaptive
+            cutoff *manufactured* 3-12 Hz noise from clean intentional
+            motion — 286% in-band emission on a realistic benchmark — and
+            that band is where the arm's structural modes live).  Lower
+            values reject more tremor but raise the velocity-feedforward
+            gain needed to stay responsive; 2.5 Hz measured best on both
+            axes at once (144% in-band pass, 30 mm worst-case tracking
+            error vs OneEuro's 286% / 91 mm).
         position_multiplier: Scale factor applied to the controller's
             **position** displacement (not orientation) when mapping hand
             motion to the end-effector target.  ``1.0`` is 1:1 motion;
@@ -202,8 +197,7 @@ class VRTeleopConfig:
     teleop_max_vel: float = 1.0 * 2 * math.pi
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
-    pose_min_cutoff: float = 0.8
-    pose_beta: float = 0.5
+    pose_cutoff: float = 2.5
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5

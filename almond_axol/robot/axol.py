@@ -27,7 +27,13 @@ from ..motor import (
 )
 from .base import RobotBase
 from .config import AxolConfig
-from .control import VEL_CUTOFF_FREQ, BandPass, Differentiator, compute_friction
+from .control import (
+    DAMP_BP_W0,
+    VEL_CUTOFF_FREQ,
+    BandPass,
+    Differentiator,
+    compute_friction,
+)
 from .gravity import GravityCompensator
 
 _logger = logging.getLogger(__name__)
@@ -356,16 +362,24 @@ class AxolArm:
         # Motor-facing paths (v_des impedance target, friction FF, a_des →
         # j_eff FF) keep the slow pole. The host damping term instead gets
         # its own chain — fast differentiators on both commanded and measured
-        # positions feeding a band-pass centred on the shoulder resonance —
-        # so kd_host arrives in phase at ~3 Hz without passing the delayed,
-        # anti-phase gain that excites 25-35 Hz structural modes (see the
-        # BandPass docstring in .control for the measured trade).
+        # positions feeding a band-pass centred on each joint's own
+        # structural mode (``kd_host_w0``: ~3 Hz shoulders, ~8 Hz elbow) —
+        # so kd_host arrives in phase at the mode it must damp without
+        # passing the delayed, anti-phase gain that excites 25-35 Hz
+        # structural modes (see the BandPass docstring in .control for the
+        # measured trade).
         n_j = len(list(Joint))
         self._vel_diff = Differentiator(n=n_j)
         self._accel_diff = Differentiator(n=n_j)
         self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
-        self._damp_bp = BandPass(n=n_j)
+        self._damp_w0 = [
+            getattr(self._arm_config, j.value).kd_host_w0
+            if j != Joint.GRIPPER
+            else DAMP_BP_W0
+            for j in Joint
+        ]
+        self._damp_bp = BandPass(n=n_j, w0=self._damp_w0)
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -1396,7 +1410,7 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n)
         self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
-        self._damp_bp = BandPass(n=n)
+        self._damp_bp = BandPass(n=n, w0=self._damp_w0)
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).

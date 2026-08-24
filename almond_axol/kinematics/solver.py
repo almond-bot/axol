@@ -701,6 +701,7 @@ class KinematicsSolver:
         right_pose: Pose | None = None,
         left_elbow_pos: np.ndarray | None = None,
         right_elbow_pos: np.ndarray | None = None,
+        delta_scale: float = 1.0,
     ) -> np.ndarray:
         """Compute joint positions for absolute Cartesian end-effector targets.
 
@@ -721,6 +722,13 @@ class KinematicsSolver:
             right_pose: Same as ``left_pose`` for the right end-effector.
             left_elbow_pos: ``(3,)`` optional left elbow position hint in world frame.
             right_elbow_pos: ``(3,)`` optional right elbow position hint in world frame.
+            delta_scale: Multiplier on ``config.max_joint_delta`` for this
+                call. The per-call clamp is an implicit velocity limit at the
+                nominal solve cadence; when a solve arrives late the caller
+                should scale the budget by the actual elapsed time, otherwise
+                the effective joint speed silently collapses (a 30 ms solve
+                under the default clamp allows only ~1.1 rad/s instead of
+                4 rad/s) and the accumulated error releases as a lurch.
 
         Returns:
             Updated full ``(N,)`` joint array in radians.
@@ -844,8 +852,9 @@ class KinematicsSolver:
         # releasing with a velocity discontinuity.
         delta = q_result_np - q_current
         max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
-        if max_abs > cfg.max_joint_delta:
-            delta = delta * (cfg.max_joint_delta / max_abs)
+        delta_budget = cfg.max_joint_delta * delta_scale
+        if max_abs > delta_budget:
+            delta = delta * (delta_budget / max_abs)
         q_out = (q_current + delta).astype(np.float32)
         return self.from_pyroki_order(q_out)
 

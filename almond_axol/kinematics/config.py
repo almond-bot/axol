@@ -31,6 +31,14 @@ class KinematicsConfig:
             targets (see ``elbow_fade_band``).
         rest_weight: Weight penalising deviation from the current joint configuration.
             Acts as a per-step damping term; uses q_current as the target.
+            This is what keeps millimetre-scale target noise from churning
+            the arm's null space: recorded teleop showed 1.5 mm of hand
+            tremor coming out of the solver as up to 1° of anti-correlated
+            joint ripple (elbow vs shoulder_1 at r=-0.96) that cancelled at
+            the hand — internal motion the task cost is blind to. Replaying
+            those bursts through the solver: 15 cut the churn 20-35% with no
+            measurable end-effector tracking cost; 30 cut it 2-5x but added
+            ~30% EE lag during fast reaches, so 15 is the sweet spot.
         posture_weight: Weight penalising deviation from the global preferred posture.
             Acts as a persistent attractor toward the home/rest configuration,
             preventing slow null-space drift (e.g. unnecessary shoulder twist).
@@ -144,7 +152,7 @@ class KinematicsConfig:
     pos_weight: float = 50.0
     ori_weight: float = 10.0
     elbow_weight: float = 0.0
-    rest_weight: float = 7.5
+    rest_weight: float = 15.0
     posture_weight: float = 5.0
     manipulability_weight: float = 0.05
     limit_weight: float = 75.0

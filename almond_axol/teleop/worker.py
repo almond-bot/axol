@@ -21,7 +21,7 @@ from ..kinematics.config import KinematicsConfig
 from ..kinematics.solver import KinematicsSolver
 from ..vr.models import VRFrame
 from .config import VRTeleopConfig
-from .filter import OneEuroFilter
+from .filter import LagCompensatedLowPass
 from .recorder import from_env as _recorder_from_env
 from .trajectory import plan_collision_aware_trajectory
 
@@ -230,18 +230,21 @@ class IKWorker:
         self._prev_raw_t: float | None = None
         self._raw_vel: dict[str, np.ndarray] = {}
         self._suspect: dict | None = None
+        # Wall time of the previous solve, for scaling the solver's per-call
+        # step clamp by the actual solve cadence (see delta_scale in step()).
+        self._last_solve_t: float | None = None
 
-        # OneEuro nominal rate: these filters see samples at the VR-frame /
-        # IK dispatch cadence, not the (faster) CAN control rate.
+        # Pose-stream smoothing (see LagCompensatedLowPass for why this is a
+        # linear filter and not OneEuro). Nominal rate is the VR-frame / IK
+        # dispatch cadence, not the (faster) CAN control rate.
         freq = config.ik_frequency
-        mc = config.pose_min_cutoff
-        beta = config.pose_beta
-        self._f_l_pos = OneEuroFilter(freq, mc, beta)
-        self._f_l_quat = OneEuroFilter(freq, mc, beta)
-        self._f_r_pos = OneEuroFilter(freq, mc, beta)
-        self._f_r_quat = OneEuroFilter(freq, mc, beta)
-        self._f_l_elbow = OneEuroFilter(freq, mc, beta)
-        self._f_r_elbow = OneEuroFilter(freq, mc, beta)
+        fc = config.pose_cutoff
+        self._f_l_pos = LagCompensatedLowPass(freq, fc)
+        self._f_l_quat = LagCompensatedLowPass(freq, fc)
+        self._f_r_pos = LagCompensatedLowPass(freq, fc)
+        self._f_r_quat = LagCompensatedLowPass(freq, fc)
+        self._f_l_elbow = LagCompensatedLowPass(freq, fc)
+        self._f_r_elbow = LagCompensatedLowPass(freq, fc)
 
         # Pre-settle the configured rest pose to the manipulability-balanced
         # IK fixed point. The configured pose has a non-zero manipulability
@@ -256,7 +259,7 @@ class IKWorker:
 
         # Jitter flight recorder (AXOL_JITTER_RECORD, see .recorder): taps the
         # solve path at every stage boundary this process owns — raw VR pose,
-        # OneEuro-filtered pose, world EE target, IK output.
+        # filtered pose, world EE target, IK output.
         n = self._solver.num_joints
         self._rec = _recorder_from_env(
             "ik",
@@ -309,12 +312,12 @@ class IKWorker:
         # Filter raw VR poses on *every* frame — engaged or not — so the
         # filters are always warm. They used to run only while engaged and be
         # reset on the engage rising edge, which fixed stale-state sweeps but
-        # made every engage a cold start: a fresh OneEuroFilter's derivative
-        # estimate is zero, pinning the cutoff at its minimum for the first
-        # few hundred ms regardless of hand speed, so moving immediately
-        # after engaging felt heavily over-smoothed. Continuous filtering
-        # keeps the state fresh (no stale sweep) and the derivative already
-        # tracking hand velocity at the engage snap (no cold start).
+        # made every engage a cold start: a fresh pose filter's velocity
+        # estimate is zero, so its lag-compensation feedforward is absent
+        # for the first few hundred ms and moving immediately after
+        # engaging felt heavily over-smoothed. Continuous filtering keeps
+        # the state fresh (no stale sweep) and the velocity estimate already
+        # tracking hand motion at the engage snap (no cold start).
         #
         # ``t`` is the frame's playout/capture stamp: frames reach this worker
         # at the irregular solve cadence, and timestamped updates keep that
@@ -509,12 +512,28 @@ class IKWorker:
                 else self._hold_elbow_fk["right"]
             )
 
+        # The solver's max_joint_delta is a per-call clamp — an implicit
+        # velocity limit at the nominal cadence. Scale it by the actual time
+        # since the last solve so a slow solve (fast motion, contended CPU)
+        # doesn't silently strangle joint speed: with the clamp fixed, a
+        # 30 ms solve capped joints at ~1.1 rad/s, the target fell behind
+        # the hand, and the backlog released as a lurch — the "random
+        # jitter" bursts seen during fast wrist rotations. Capped at 4x so
+        # a multi-second stall can't authorize a giant step.
+        now = time.perf_counter()
+        delta_scale = 1.0
+        if self._last_solve_t is not None:
+            elapsed = now - self._last_solve_t
+            delta_scale = float(np.clip(elapsed * self._config.ik_frequency, 1.0, 4.0))
+        self._last_solve_t = now
+
         q_new = self._solver.ik(
             q_current,
             left_pose=(tl_pos, tl_rot),
             right_pose=(tr_pos, tr_rot),
             left_elbow_pos=elbow_l,
             right_elbow_pos=elbow_r,
+            delta_scale=delta_scale,
         )
         # A frozen arm must not move at all: the hold-pose target keeps the
         # solve consistent (collision terms see the true pose), but the
@@ -595,6 +614,7 @@ class IKWorker:
         self._prev_raw_t = None
         self._raw_vel = {}
         self._suspect = None
+        self._last_solve_t = None
         self._reset_pose_filters()
         # step() pins posture to q_current on each engage; an explicit reset
         # restores the default rest-pose attractor.
@@ -765,7 +785,7 @@ class IKWorker:
             self._freeze_next_warn = duration + _FREEZE_REWARN_EVERY_S
 
     def _reset_pose_filters(self) -> None:
-        """Clear the OneEuroFilter state for every controller and elbow stream."""
+        """Clear the pose-filter state for every controller and elbow stream."""
         self._f_l_pos.reset()
         self._f_l_quat.reset()
         self._f_r_pos.reset()
