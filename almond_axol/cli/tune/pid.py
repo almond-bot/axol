@@ -295,7 +295,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--hold",
         type=float,
         default=2.0,
-        help="[step] Hold time per phase in seconds (default: 2.0)",
+        help="[step] Hold time per phase in seconds (default: 2.0). Also the "
+        "length of the unscored settle at the center before the step, so "
+        "arrival/gain-change ringing dies out before anything is measured.",
     )
     p.add_argument(
         "--rate", type=float, default=100.0, help="Command rate in Hz (default: 100)"

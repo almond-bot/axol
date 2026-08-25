@@ -346,9 +346,26 @@ async def run_step(
     if abs(current - center) > 0.01:
         print(f"  moving to step center ({center:.4f} rad) ...")
         await ramp_impedance(test_motor, kp, kd, center, ff.gravity_fn, rate_hz)
-        await asyncio.sleep(0.5)
 
     dt = 1.0 / rate_hz
+
+    # Settle at the center — same length as a step phase — running the test
+    # gains and live feedforward, before the scored step. The ramp arrival
+    # (or a gain change from the previous sweep candidate) leaves the joint
+    # ringing, and the feedforward differentiators start cold; stepping
+    # right away scores that leftover transient as if the step caused it.
+    # This phase is commanded at full rate but not logged.
+    print(f"  settling at center for {hold:.1f} s ...")
+    settle_start = time.monotonic()
+    while time.monotonic() - settle_start < hold:
+        loop_start = time.monotonic()
+        _, t_ff = ff.compute(center, cached_meas(test_motor))
+        await test_motor.set_impedance(center, 0.0, kp, kd, t_ff)
+        await test_motor.get_position()
+        spent = time.monotonic() - loop_start
+        if spent < dt:
+            await asyncio.sleep(dt - spent)
+
     log: list[dict] = []
     start = time.monotonic()
 
