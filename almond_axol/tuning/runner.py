@@ -184,6 +184,7 @@ class HolderMonitor:
         self._joints = list(self._motors)
         self._i = 0
         self._baseline: dict[Joint, float] = {}
+        self._last: dict[Joint, float] = {}
         self.peak: dict[Joint, float] = dict.fromkeys(self._joints, 0.0)
 
     async def sample(self) -> None:
@@ -193,10 +194,24 @@ class HolderMonitor:
         j = self._joints[self._i % len(self._joints)]
         self._i += 1
         pos = await self._motors[j].get_position()
+        self._last[j] = pos
         base = self._baseline.setdefault(j, pos)
         dev = abs(pos - base)
         if dev > self.peak[j]:
             self.peak[j] = dev
+
+    def rebase(self) -> None:
+        """Freeze each holder's baseline at its latest reading, zero the peaks.
+
+        Call at the boundary between warm-up and the scored phase: the ramp
+        that parks the holders accepts arrival within 0.05 rad (~2.9°), so a
+        holder can still be creeping to its target during the settle — motion
+        that is ramp completion, not reaction-torque wobble. Rebasing after
+        the settle makes the peaks count only motion during the test itself.
+        """
+        for j, pos in self._last.items():
+            self._baseline[j] = pos
+        self.peak = dict.fromkeys(self._joints, 0.0)
 
     def report(self) -> dict[str, float]:
         """Peak deviation per holder, in degrees, largest first."""
@@ -410,12 +425,15 @@ async def run_step(
         await test_motor.set_impedance(center, 0.0, kp, kd, t_ff)
         await test_motor.get_position()
         if monitor is not None:
-            # Baselines land here, in the quiet settle before the step's
-            # reaction torque has anything to shake.
+            # Keep the holders' latest readings warm through the settle …
             await monitor.sample()
         spent = time.monotonic() - loop_start
         if spent < dt:
             await asyncio.sleep(dt - spent)
+    if monitor is not None:
+        # … then freeze the baselines here, so any holder still finishing its
+        # park ramp during the settle doesn't score as reaction-torque wobble.
+        monitor.rebase()
 
     log: list[dict] = []
     start = time.monotonic()
