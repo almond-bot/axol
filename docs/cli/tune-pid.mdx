@@ -7,6 +7,8 @@ Tests one or more `Kp`/`Kd` candidates for a single joint at ~100 Hz — pass se
 
 The feedforward path defaults to exactly what the production control loop applies — gravity + friction + inertia (`j_eff`) + host-side damping (`kd_host`) — so gains found here transfer 1:1 to teleop. Use `--ff` to tune against a reduced feedforward instead (e.g. `--ff none` for bare PD, or `--ff friction` to see how the joint behaves without gravity compensation), and `--host-kd` to override the host-side damping (the shoulders need it — their motor firmware's velocity estimate is too filtered to damp the ~2 Hz closed-loop resonance, so firmware `kd` alone leaves them ringing).
 
+During every probe the other joints are held at rest by the motor firmware's own position servo (the stiffest hold available), and the tool round-robins one position read per cycle across them to prove they actually stayed put: each candidate's report ends with a `Holder peak` line listing how far every holder moved from its pre-step baseline. Past ~0.5° the structure was flexing under the reaction torque, and part of the measured ring belongs to a compliant neighbour rather than the joint under test.
+
 | Flag | Description |
 |---|---|
 | `--l` / `--r` | Arm side (required) |

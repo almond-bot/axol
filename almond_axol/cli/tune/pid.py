@@ -50,10 +50,10 @@ from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig, JointConfig
 from ...robot.control import DAMP_BP_W0, VEL_CUTOFF_FREQ, BandPass, Differentiator
 from ...robot.gravity import GravityCompensator
-from ..motor import add_side_and_channel_arguments, resolve_channel
 from ...tuning import (
     FF_MODES,
     FeedForward,
+    HolderMonitor,
     cached_meas,
     cached_torque,
     joint_frame_motors,
@@ -68,6 +68,7 @@ from ...tuning import (
     sine_metrics,
     step_metrics,
 )
+from ..motor import add_side_and_channel_arguments, resolve_channel
 
 
 def _print_chatter(m: dict) -> None:
@@ -77,6 +78,27 @@ def _print_chatter(m: dict) -> None:
         print(
             f"  Pos ripple:  {math.degrees(m['pos_ripple']) * 1000:.2f} "
             f"millideg RMS (high-frequency)"
+        )
+
+
+def _print_holder_wobble(wobble: dict[str, float]) -> None:
+    """One line on how still the non-test joints stayed during the probe.
+
+    The holders run the firmware's own position servo, so under a clean test
+    they should barely register above encoder noise (~0.1°). Anything past
+    0.5° means the structure was genuinely moving under the reaction torque
+    and part of the test joint's ring came from a compliant neighbour — worth
+    knowing before blaming kp/kd.
+    """
+    if not wobble:
+        return
+    parts = ", ".join(f"{name} {v:.2f}°" for name, v in wobble.items())
+    print(f"  Holder peak: {parts}")
+    culprits = [name for name, v in wobble.items() if v > 0.5]
+    if culprits:
+        print(
+            f"  ! holders moved >0.5° ({', '.join(culprits)}) — the structure "
+            f"was flexing, some of the ring is not the test joint's fault"
         )
 
 
@@ -827,6 +849,10 @@ async def _run(args: argparse.Namespace) -> None:
                     host_kd=host_kd,
                     host_kd_hz=host_kd_hz,
                 )
+                # Verify the POSITION_VELOCITY holds actually stay put while
+                # the test joint shakes the structure — a wobbling holder
+                # contaminates the ring and the test joint's log can't show it.
+                monitor = HolderMonitor(motors, exclude=joint)
                 if args.mode == "sine":
                     log, amp = await run_sine(
                         motors,
@@ -840,6 +866,7 @@ async def _run(args: argparse.Namespace) -> None:
                         is_left,
                         ff,
                         noise=noise,
+                        monitor=monitor,
                     )
                     metrics = sine_metrics(log)
                     _print_stats_sine(metrics, len(log), kp, kd)
@@ -854,9 +881,15 @@ async def _run(args: argparse.Namespace) -> None:
                         args.rate,
                         is_left,
                         ff,
+                        monitor=monitor,
                     )
                     metrics = step_metrics(log, amp, args.hold)
                     _print_stats_step(metrics, len(log), kp, kd)
+                metrics["holder_wobble_deg"] = monitor.report()
+                metrics["holder_peak_deg"] = max(
+                    metrics["holder_wobble_deg"].values(), default=0.0
+                )
+                _print_holder_wobble(metrics["holder_wobble_deg"])
 
                 results.append({"kp": kp, "kd": kd, "metrics": metrics})
                 _persist_run(kp, kd, log, metrics, args.mode)

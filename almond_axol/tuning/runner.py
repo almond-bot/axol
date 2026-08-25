@@ -163,6 +163,49 @@ def cached_meas(motor: JointFrameMotor) -> tuple[float, float] | None:
         return None
 
 
+class HolderMonitor:
+    """Round-robin wobble sampler for the non-test joints during a probe.
+
+    The holders sit in firmware POSITION_VELOCITY holds — the stiffest mode
+    the motors offer — but stiff is not *proven quiet*: a holder wobbling at
+    its own resonance feeds structure motion straight back into the test
+    joint's ring, and the test joint's encoder alone can never show that.
+    One extra position read per command cycle, rotating through the holders
+    (~16 Hz per holder at a 100 Hz probe), is cheap enough to leave the
+    probe rate intact while catching anything at the 2–3 Hz arm modes.
+
+    Each holder's first sample (taken during the pre-step settle, before any
+    reaction torque hits) is its baseline; ``peak`` accumulates the largest
+    deviation seen since.
+    """
+
+    def __init__(self, motors: dict[Joint, JointFrameMotor], exclude: Joint) -> None:
+        self._motors = {j: m for j, m in motors.items() if j != exclude}
+        self._joints = list(self._motors)
+        self._i = 0
+        self._baseline: dict[Joint, float] = {}
+        self.peak: dict[Joint, float] = dict.fromkeys(self._joints, 0.0)
+
+    async def sample(self) -> None:
+        """Read the next holder in the rotation and update its peak."""
+        if not self._joints:
+            return
+        j = self._joints[self._i % len(self._joints)]
+        self._i += 1
+        pos = await self._motors[j].get_position()
+        base = self._baseline.setdefault(j, pos)
+        dev = abs(pos - base)
+        if dev > self.peak[j]:
+            self.peak[j] = dev
+
+    def report(self) -> dict[str, float]:
+        """Peak deviation per holder, in degrees, largest first."""
+        return {
+            j.value: math.degrees(v)
+            for j, v in sorted(self.peak.items(), key=lambda kv: -kv[1])
+        }
+
+
 def make_target_noise(
     rms: float, rate_hz: float, duration: float, cutoff_hz: float = 8.0
 ) -> list[float]:
@@ -197,6 +240,7 @@ async def run_sine(
     is_left: bool,
     ff: FeedForward,
     noise: list[float] | None = None,
+    monitor: HolderMonitor | None = None,
 ) -> tuple[list[dict], float]:
     """Track a sine reference on ``joint`` and log target/actual error.
 
@@ -241,6 +285,8 @@ async def run_sine(
         v_des, t_ff = ff.compute(target, cached_meas(test_motor))
         await test_motor.set_impedance(target, v_des, kp, kd, t_ff)
         actual = await test_motor.get_position()
+        if monitor is not None:
+            await monitor.sample()
         t_read = time.monotonic() - start
         target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
         log.append(
@@ -271,6 +317,7 @@ async def run_step(
     is_left: bool,
     ff: FeedForward,
     relative: bool = False,
+    monitor: HolderMonitor | None = None,
 ) -> tuple[list[dict], float]:
     """Drive a step on ``joint`` and log the step-response error.
 
@@ -362,6 +409,10 @@ async def run_step(
         _, t_ff = ff.compute(center, cached_meas(test_motor))
         await test_motor.set_impedance(center, 0.0, kp, kd, t_ff)
         await test_motor.get_position()
+        if monitor is not None:
+            # Baselines land here, in the quiet settle before the step's
+            # reaction torque has anything to shake.
+            await monitor.sample()
         spent = time.monotonic() - loop_start
         if spent < dt:
             await asyncio.sleep(dt - spent)
@@ -377,6 +428,8 @@ async def run_step(
             _, t_ff = ff.compute(phase_target, cached_meas(test_motor))
             await test_motor.set_impedance(phase_target, 0.0, kp, kd, t_ff)
             actual = await test_motor.get_position()
+            if monitor is not None:
+                await monitor.sample()
             log.append(
                 {
                     "t": round(t, 5),

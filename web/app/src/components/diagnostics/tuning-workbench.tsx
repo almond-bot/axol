@@ -655,6 +655,7 @@ const SINE_COLS: ScoreCol[] = [
   { key: "max", label: "max err °", deg: true, digits: 3, warn: 3, bad: 6 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
   { key: "pos_ripple", label: "ripple", digits: 4 },
+  { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
 ]
 
@@ -674,6 +675,7 @@ const STEP_COLS: ScoreCol[] = [
   { key: "ss_rms", label: "steady-state RMS °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
   { key: "ring_hz", label: "ring Hz", digits: 1 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
+  { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
 ]
 
@@ -687,11 +689,17 @@ const SCORE_LEGEND: Record<string, string> = {
   sine:
     "tracking RMS = average distance from the commanded sine (lower is " +
     "better). score = RMS + 0.2 × worst excursion, the number to compare " +
-    "runs by. torque chatter / ripple = high-frequency roughness.",
+    "runs by. torque chatter / ripple = high-frequency roughness. holder " +
+    "wobble = how far the other joints (held stiff in firmware position " +
+    "mode) moved during the test — past ~0.5° the structure was flexing " +
+    "and part of the error is not this joint's fault.",
   step:
     "settling = time to stay within 5% of the step. overshoot = travel past " +
-    "the target. ring Hz = post-step oscillation frequency, if any. score " +
-    "folds settling, overshoot, and steady-state error — lower is better.",
+    "the target. ring Hz = post-step oscillation frequency, if any. holder " +
+    "wobble = how far the other joints (held stiff in firmware position " +
+    "mode) moved — past ~0.5° the structure was flexing and part of the " +
+    "ring came from a neighbour. score folds settling, overshoot, and " +
+    "steady-state error — lower is better.",
   filter:
     "noise in = error the injected noise put on the input; error out = " +
     "what's left after the stack (raw, includes the stack's delay); " +
