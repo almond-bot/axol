@@ -476,6 +476,20 @@ COMMANDS: dict[str, CommandDef] = {
         drives_motors=True,
         section="tuning",
     ),
+    "tune.filter": CommandDef(
+        "tune.filter",
+        "tune.filter",
+        "Filter noise-rejection test",
+        "Inject stalls, outliers, and jitter into a clean motion and replay "
+        "it through the production teleop filter stack — offline, no "
+        "hardware, seeded and reproducible. Scores how much of the injected "
+        "noise the stack removes, per joint.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.filter"),
+        uses_can_bus=False,
+        section="tuning",
+    ),
     "motion.build": CommandDef(
         "motion.build",
         "motion.build",

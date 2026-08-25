@@ -28,6 +28,7 @@ import {
 
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
+const NOISY_COLOR = "rgba(230,103,103,0.5)"
 
 const ARM_JOINT_OPTIONS = [
   "shoulder_1",
@@ -41,7 +42,7 @@ const ARM_JOINT_OPTIONS = [
 
 // Run kinds this workbench presents. Anything else in the store (e.g. old
 // offline-analysis artifacts) is hidden rather than half-rendered.
-const KNOWN_KINDS = new Set(["sine", "step", "motion"])
+const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter"])
 
 /* ------------------------------------------------------------------ */
 /* Inline launcher: what to run, its parameters, and the Run button   */
@@ -138,6 +139,34 @@ const TABS: WbTab[] = [
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
+  },
+  {
+    key: "filter",
+    label: "Filter",
+    command: "tune.filter",
+    description:
+      "Test the teleop filter stack without moving the robot: inject stalls, " +
+      "outliers, and jitter into a clean motion (a synthetic sine, or a " +
+      "committed reference motion) and replay it through the production " +
+      "smoothing chain. The output is scored against the clean signal — same " +
+      "seed, same corrupted stream, so runs compare exactly.",
+    presets: { save_run: true },
+    fields: [
+      { key: "motion", label: "motion", type: "select", options: [] },
+      { key: "amp", label: "sine amp (rad)", type: "number", placeholder: "0.3" },
+      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.5" },
+      { key: "duration", label: "duration (s)", type: "number", placeholder: "10" },
+      { key: "jitter", label: "jitter (rad RMS)", type: "number", placeholder: "0.005" },
+      { key: "outlier_amp", label: "outlier (rad)", type: "number", placeholder: "0.2" },
+      { key: "outlier_rate", label: "outliers /s", type: "number", placeholder: "0.5" },
+      { key: "stall_ms", label: "stall (ms)", type: "number", placeholder: "150" },
+      { key: "stall_rate", label: "stalls /s", type: "number", placeholder: "0.5" },
+      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config", advanced: true },
+      { key: "seed", label: "seed", type: "number", placeholder: "0", advanced: true },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: [],
+    drivesMotors: false,
   },
   {
     key: "motion",
@@ -273,6 +302,10 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     const v = num(m.mean_rms_err)
     return v == null ? null : { label: "tracking", value: `${fmtNum(toDeg(v))}°` }
   }
+  if (meta.kind === "filter") {
+    const v = num(m.mean_rms_lagfree)
+    return v == null ? null : { label: "residual", value: `${fmtNum(toDeg(v))}°` }
+  }
   if (meta.kind === "sine" || meta.kind === "step") {
     const v = num(m.score)
     return v == null ? null : { label: "score", value: fmtNum(v, 3) }
@@ -317,9 +350,51 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
   return out
 }
 
-/** The arms a motion run has chartable data for (single-arm rigs chart one). */
-function motionArms(run: TuningRunData): string[] {
-  return ["left", "right"].filter((arm) => motionJointCharts(run, arm).length > 0)
+/**
+ * Charts for a filter run: clean reference, corrupted input, and the filter
+ * stack's output, per channel. `arm` is null for runs whose channels carry
+ * no arm prefix (the synthetic sine).
+ */
+function filterJointCharts(run: TuningRunData, arm: string | null): JointChart[] {
+  const columns = (run.meta.params.columns as string[] | undefined) ?? []
+  const t = run.series.t ?? []
+  const out: JointChart[] = []
+  for (let i = 0; i < columns.length; i++) {
+    const name = columns[i]
+    if (arm != null && !name?.startsWith(`${arm}.`)) continue
+    const clean = run.series[`clean/${i}`]
+    const noisy = run.series[`noisy/${i}`]
+    const filtered = run.series[`filtered/${i}`]
+    if (!clean || !filtered) continue
+    if (columns.length > 1) {
+      let min = Infinity
+      let max = -Infinity
+      for (const v of clean) {
+        if (v == null) continue
+        if (v < min) min = v
+        if (v > max) max = v
+      }
+      if (max - min < 0.017) continue
+    }
+    const series: RunChartSeries[] = [
+      { label: "clean", color: COMMANDED_COLOR, x: t, data: clean },
+    ]
+    if (noisy) series.push({ label: "noisy input", color: NOISY_COLOR, x: t, data: noisy })
+    series.push({ label: "filtered", color: ACTUAL_COLOR, x: t, data: filtered })
+    out.push({ joint: arm != null ? name.slice(arm.length + 1) : name, series })
+  }
+  return out
+}
+
+/** The arms a run has chartable per-joint data for (single-arm rigs chart one). */
+function runArms(run: TuningRunData): string[] {
+  if (run.meta.kind === "motion") {
+    return ["left", "right"].filter((arm) => motionJointCharts(run, arm).length > 0)
+  }
+  if (run.meta.kind === "filter") {
+    return ["left", "right"].filter((arm) => filterJointCharts(run, arm).length > 0)
+  }
+  return []
 }
 
 /** The one commanded-vs-actual chart of a single-joint sine/step run. */
@@ -362,6 +437,16 @@ const SINE_COLS: ScoreCol[] = [
   { key: "score", label: "score", digits: 3 },
 ]
 
+const FILTER_COLS: ScoreCol[] = [
+  { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
+  { key: "rms_err", label: "error out °", deg: true, digits: 3 },
+  { key: "rms_err_lagfree", label: "lag-free °", deg: true, digits: 3 },
+  { key: "lag_ms", label: "lag ms", digits: 0 },
+  { key: "jitter_passed", label: "jitter passed ×" },
+  { key: "peak_err", label: "peak err °", deg: true, digits: 3 },
+  { key: "accel_peak", label: "peak accel rad/s²", digits: 1 },
+]
+
 const STEP_COLS: ScoreCol[] = [
   { key: "settling_s", label: "settling s" },
   { key: "overshoot", label: "overshoot °", deg: true, digits: 3 },
@@ -386,6 +471,14 @@ const SCORE_LEGEND: Record<string, string> = {
     "settling = time to stay within 5% of the step. overshoot = travel past " +
     "the target. ring Hz = post-step oscillation frequency, if any. score " +
     "folds settling, overshoot, and steady-state error — lower is better.",
+  filter:
+    "noise in = error the injected noise put on the input; error out = " +
+    "what's left after the stack (raw, includes the stack's delay); " +
+    "lag-free = residual with the delay removed — the cleanliness number. " +
+    "jitter passed <1 = the 3–15 Hz band was attenuated. peak accel must " +
+    "stay under the teleop limit, so outliers and stall catch-ups can " +
+    "never slam the arm. Error during a stall is missing data, not filter " +
+    "failure — the filter owns the smooth catch-up.",
 }
 
 /** Per-joint score rows for one run, in display units. */
@@ -394,7 +487,7 @@ function scoreRows(
   arm: string | null
 ): { cols: ScoreCol[]; rows: { joint: string; values: Record<string, unknown> }[] } | null {
   const m = meta.metrics as Record<string, unknown>
-  if (meta.kind === "motion") {
+  if (meta.kind === "motion" || meta.kind === "filter") {
     const perJoint = m.per_joint as Record<string, Record<string, unknown>> | undefined
     if (!perJoint) return null
     const rows = Object.entries(perJoint)
@@ -403,7 +496,8 @@ function scoreRows(
         joint: arm == null ? name : name.slice(arm.length + 1),
         values,
       }))
-    return rows.length > 0 ? { cols: MOTION_COLS, rows } : null
+    const cols = meta.kind === "motion" ? MOTION_COLS : FILTER_COLS
+    return rows.length > 0 ? { cols, rows } : null
   }
   if (meta.kind === "sine" || meta.kind === "step") {
     return {
@@ -425,12 +519,13 @@ function fmtScore(values: Record<string, unknown>, col: ScoreCol): string {
 /* ------------------------------------------------------------------ */
 
 /**
- * The tuning workbench: pick what to run (sine / step / recorded motion),
- * type the numbers inline, hit Run — and the result lands straight on the
- * graphs below. Everything is joint space: per joint, one chart of commanded
- * vs actual position (split into left/right arm tabs for motion runs) and
- * one score row. Runs are compared by their headline tracking score in the
- * run list.
+ * The tuning workbench: pick what to run (sine / step / filter noise test /
+ * recorded motion), type the numbers inline, hit Run — and the result lands
+ * straight on the graphs below. Everything is joint space: per joint, one
+ * chart of commanded vs actual position (clean vs noisy vs filtered for
+ * filter runs), split into left/right arm tabs when a run covers both arms,
+ * and one score row per joint. Runs are compared by their headline tracking
+ * score in the run list.
  */
 export function TuningWorkbench({
   enabled,
@@ -514,9 +609,9 @@ export function TuningWorkbench({
         if (!active) return
         setRun(r)
         // Keep the arm toggle on an arm the run actually has data for.
-        if (r.meta.kind === "motion") {
-          const arms = motionArms(r)
-          setArm((prev) => (arms.includes(prev) ? prev : (arms[0] ?? prev)))
+        const arms = runArms(r)
+        if (arms.length > 0) {
+          setArm((prev) => (arms.includes(prev) ? prev : arms[0]))
         }
       })
       .catch((e) => toast.error(String(e)))
@@ -575,15 +670,18 @@ export function TuningWorkbench({
   const hasAdvanced = tab.fields.some((f) => f.advanced)
 
   const meta = run?.meta ?? null
-  const isMotion = meta?.kind === "motion"
-  const arms = useMemo(() => (run && isMotion ? motionArms(run) : []), [run, isMotion])
+  const arms = useMemo(() => (run ? runArms(run) : []), [run])
+  const armed = arms.length > 0
   const jointCharts = useMemo(() => {
     if (!run) return []
-    if (isMotion) return motionJointCharts(run, arm)
+    if (run.meta.kind === "motion") return motionJointCharts(run, arm)
+    if (run.meta.kind === "filter") {
+      return filterJointCharts(run, armed ? arm : null)
+    }
     const single = pidJointChart(run)
     return single ? [single] : []
-  }, [run, isMotion, arm])
-  const scores = meta ? scoreRows(meta, isMotion ? arm : null) : null
+  }, [run, arm, armed])
+  const scores = meta ? scoreRows(meta, armed ? arm : null) : null
   const legend = meta ? SCORE_LEGEND[meta.kind] : null
 
   const remove = useCallback(
@@ -753,10 +851,11 @@ export function TuningWorkbench({
           <span className="text-white/60">
             {meta.joint ? `${meta.side} ${meta.joint}` : ""}
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
+            {meta.params.source ? `${meta.params.source as string}` : ""}
             {Object.keys(meta.gains).length > 0 ? ` · ${gainsSummary(meta.gains)}` : ""}
             {meta.label ? ` · ${meta.label}` : ""}
           </span>
-          {isMotion && arms.length > 0 && (
+          {armed && (
             <span className="ml-2 flex overflow-hidden rounded-md border border-white/10">
               {arms.map((a) => (
                 <button
@@ -780,14 +879,16 @@ export function TuningWorkbench({
 
       {/* Commanded vs actual position, one chart per joint. */}
       {run && jointCharts.length > 0 && (
-        <div className={cn("grid grid-cols-1 gap-4", isMotion && "xl:grid-cols-2")}>
+        <div
+          className={cn("grid grid-cols-1 gap-4", jointCharts.length > 1 && "xl:grid-cols-2")}
+        >
           {jointCharts.map((c) => (
             <RunChart
               key={c.joint}
               title={c.joint}
               unit="rad"
               series={c.series}
-              height={isMotion ? 190 : 240}
+              height={jointCharts.length > 1 ? 190 : 240}
             />
           ))}
         </div>
@@ -802,7 +903,7 @@ export function TuningWorkbench({
       {scores && (
         <Card className="gap-3 p-4">
           <h3 className="font-heading text-sm font-semibold">
-            Tracking scores{isMotion ? ` — ${arm} arm` : ""}
+            Tracking scores{armed ? ` — ${arm} arm` : ""}
           </h3>
           <div className="overflow-x-auto">
             <table className="w-full max-w-3xl text-xs">
@@ -890,7 +991,12 @@ export function TuningWorkbench({
                 >
                   <Badge variant="neutral">{r.kind}</Badge>
                   <span className="text-white/70">
-                    {[r.side, r.joint, (r.params.motion as string) ?? null]
+                    {[
+                      r.side,
+                      r.joint,
+                      (r.params.motion as string) ?? null,
+                      (r.params.source as string) ?? null,
+                    ]
                       .filter(Boolean)
                       .join(" · ") || "—"}
                   </span>

@@ -47,6 +47,7 @@ The tuning workbench runs the deterministic tuning suites inline — no dialogs.
 
 - **Sine** / **Step** — [`tune.pid`](https://docs.almond.bot/cli/tune-pid) probes on one joint. Leave kp/kd empty to test the configured gains; space-separated values sweep the grid, one saved run per candidate.
 - **Friction** — [`tune.friction`](https://docs.almond.bot/cli/tune-friction) identifies one joint's friction model; check **save to calibration** to write the fit to `~/.almond/calibration.json`.
+- **Filter** — [`tune.filter`](https://docs.almond.bot/cli/tune-filter) tests the teleop filter stack without moving the robot: seeded stalls, outliers, and jitter are injected into a clean motion (synthetic sine or a committed reference motion) and replayed through the production smoothing chain; the charts show clean vs. noisy vs. filtered per joint, and the scores say how much of the injected noise survived.
 - **Recorded motion** — [`tune.motion`](https://docs.almond.bot/cli/tune-motion) replays a committed reference motion through the production control path and scores tracking per joint, with per-run gain overrides (`left.elbow.kd=4.5 shoulder_3.kd_host=0`).
 - **Build motion** — [`motion.build`](https://docs.almond.bot/cli/motion-build) turns a teleop flight recording into a reference motion, which then shows up in the Recorded motion picker.
 

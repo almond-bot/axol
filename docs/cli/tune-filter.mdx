@@ -1,0 +1,47 @@
+---
+title: "tune.filter"
+description: "Inject stalls, outliers, and jitter into a clean motion and score how much the teleop filter stack removes — offline, no hardware."
+---
+
+Tests the teleop filter stack by feeding it a *known-dirty* stream and checking what comes out — no robot, no VR headset, and exactly reproducible. A clean joint-space signal (a synthetic sine, or a committed [reference motion](/cli/motion-build)) is corrupted with the artifacts a real VR/wifi stream carries, then replayed through the production smoothing chain at the production rates: the lag-compensated pose low-pass, the IK-output EMA, and the trapezoidal velocity/acceleration tracker.
+
+The three artifact types:
+
+- **Jitter** — white noise added to every sample (hand tremor, sensor noise).
+- **Outliers** — isolated samples teleported by a fixed magnitude (tracking glitches, a bad IK solve).
+- **Stalls** — spans where the stream freezes on its last sample and then jumps to catch up (wifi stalls, dropped frames).
+
+The output is scored **against the clean reference**, per joint: the stack should track the intentional motion while removing what was injected. Because the noise is seeded, the corrupted stream is identical from run to run — change a filter parameter (e.g. `--cutoff`), rerun, and compare scores on the exact same input.
+
+| Flag | Description |
+|---|---|
+| `--motion NAME` | Use a committed reference motion as the clean signal (all 14 joints); default is a synthetic sine |
+| `--duration S` / `--amp RAD` / `--freq HZ` | Sine mode: signal length, amplitude, and frequency (defaults: 10 s, 0.3 rad, 0.5 Hz) |
+| `--jitter RAD` | White-noise RMS added to every sample (default: 0.005 ≈ 0.3°; 0 disables) |
+| `--outlier-rate /S` / `--outlier-amp RAD` | Outlier injection rate and teleport magnitude (defaults: 0.5/s, 0.2 rad ≈ 11°) |
+| `--stall-rate /S` / `--stall-ms MS` | Stall injection rate and length (defaults: 0.5/s, 150 ms) |
+| `--cutoff HZ` | Pose low-pass pole frequency (default: the production `pose_cutoff`) |
+| `--seed N` | Noise RNG seed — identical seed, identical corrupted stream (default: 0) |
+| `--label TEXT` | Free-form note stored on the run artifact |
+| `--save-run` | Persist the full time series and scores under `~/.almond/diagnostics/tuning/` for the diagnostics dashboard |
+
+```bash
+axol tune.filter --save-run                                  # sine + default noise
+axol tune.filter --outlier-amp 0.5 --stall-ms 300 --save-run # harsher stream
+axol tune.filter --motion reach-and-place --save-run         # a real motion, all joints
+axol tune.filter --cutoff 1.5 --label "half cutoff" --save-run
+```
+
+## Reading the scorecard
+
+| Column | Meaning |
+|---|---|
+| `in RMS °` | Error the injected noise put on the input, vs the clean reference |
+| `out RMS °` | Error left after the stack (raw — includes the stack's delay on a moving signal) |
+| `lagfree °` | `out RMS` after removing the measured delay: the residual the noise actually left, the cleanliness number |
+| `lag ms` | The stack's command→output delay |
+| `jitter ×` | 3–15 Hz error passed through, out over in — well below 1 means the felt-jitter band was cleaned |
+| `peak °` | Worst excursion from the clean reference (how much of an outlier leaked through) |
+| `accel` | Peak output acceleration (rad/s²) — must stay at or under teleop's configured limit, proving outliers and stall catch-ups can never slam the arm |
+
+One caveat when reading: while the stream is stalled the clean reference keeps moving, so error during a stall is *missing information*, not filter failure. What the filter owns is the catch-up — resuming without overshoot or an acceleration spike.

@@ -3,12 +3,14 @@
 Reusable pieces behind the ``tune.*`` CLI commands and the diagnostics UI:
 single-joint sine/step runners with their safety geometry (:mod:`.runner`),
 the production-matching feedforward (:mod:`.feedforward`), tracking-accuracy
-and smoothness metrics shared by every suite (:mod:`.metrics`), joint-frame
-motor access (:mod:`.joint_frame`), and the persisted run-artifact store
+and smoothness metrics shared by every suite (:mod:`.metrics`), the
+noise-injection filter-stack test (:mod:`.filtering`), joint-frame motor
+access (:mod:`.joint_frame`), and the persisted run-artifact store
 (:mod:`.runs`).
 """
 
 from .feedforward import FF_MODES, FeedForward
+from .filtering import filter_noise_analysis, inject_noise, replay_filter_stack
 from .joint_frame import JointFrameMotor, joint_frame_motors
 from .metrics import (
     BAND_HIGH,
@@ -63,6 +65,8 @@ __all__ = [
     "chatter_metrics",
     "clear_runs",
     "delete_run",
+    "filter_noise_analysis",
+    "inject_noise",
     "joint_frame_motors",
     "list_runs",
     "load_run",
@@ -71,6 +75,7 @@ __all__ = [
     "ramp_impedance",
     "ramp_joints_to",
     "ramp_others_to_zero",
+    "replay_filter_stack",
     "ring_frequency",
     "run_sine",
     "run_step",
