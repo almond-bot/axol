@@ -48,7 +48,7 @@ from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig, JointConfig
-from ...robot.control import VEL_CUTOFF_FREQ, BandPass, Differentiator
+from ...robot.control import DAMP_BP_W0, VEL_CUTOFF_FREQ, BandPass, Differentiator
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from ...tuning import (
@@ -204,6 +204,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "production kd_host term, needed on the high-inertia shoulders "
         "where firmware kd underdelivers (default: this joint's configured "
         "kd_host)",
+    )
+    p.add_argument(
+        "--host-kd-w0",
+        type=float,
+        default=None,
+        metavar="W0",
+        help="Centre frequency (rad/s) of the band-pass confining the host "
+        "damping to the joint's resonance band — matches the production "
+        "kd_host_w0 (default: this joint's configured value, falling back "
+        f"to the shared {DAMP_BP_W0:.0f} rad/s ≈ "
+        f"{DAMP_BP_W0 / (2 * math.pi):.1f} Hz shoulder default)",
     )
     p.add_argument(
         "--stiffness",
@@ -405,6 +416,8 @@ async def _run(args: argparse.Namespace) -> None:
     fric = (f.fc, f.k, f.fv, f.fo) if use_friction else (0.0, 0.0, 0.0, 0.0)
     j_eff = jc.j_eff if args.ff == "full" else 0.0
     host_kd = args.host_kd if args.host_kd is not None else jc.kd_host
+    host_kd_w0 = args.host_kd_w0 if args.host_kd_w0 is not None else jc.kd_host_w0
+    host_kd_w0_eff = host_kd_w0 if host_kd_w0 is not None else DAMP_BP_W0
 
     gravity_comp = GravityCompensator() if use_gravity else None
     test_idx = ARM_JOINTS.index(joint)
@@ -452,7 +465,11 @@ async def _run(args: argparse.Namespace) -> None:
     if args.ff == "full":
         print(f"  inertia  j_eff={j_eff}")
     if host_kd:
-        print(f"  host-kd  {host_kd} (host-side damping via t_ff, kd_host)")
+        print(
+            f"  host-kd  {host_kd} (host-side damping via t_ff, kd_host) "
+            f"band-passed at {host_kd_w0_eff:.0f} rad/s "
+            f"≈ {host_kd_w0_eff / (2 * math.pi):.1f} Hz (kd_host_w0)"
+        )
 
     noise: list[float] | None = None
     if args.target_noise is not None:
@@ -490,7 +507,11 @@ async def _run(args: argparse.Namespace) -> None:
             metrics,
             side=side_str,
             joint=joint.value,
-            gains={"kp": kp, "kd": kd, "kd_host": host_kd},
+            gains=(
+                {"kp": kp, "kd": kd, "kd_host": host_kd, "kd_host_w0": host_kd_w0_eff}
+                if host_kd
+                else {"kp": kp, "kd": kd, "kd_host": host_kd}
+            ),
             params={
                 "mode": mode_label,
                 "ff": args.ff,
@@ -543,7 +564,14 @@ async def _run(args: argparse.Namespace) -> None:
         # band-passed around the shoulder resonance (targets are frozen, so
         # v_des ≡ 0 and the damper input is just -v_meas).
         hand_diff = Differentiator(len(ARM_JOINTS), cutoff=VEL_CUTOFF_FREQ)
-        hand_bp = BandPass(len(ARM_JOINTS))
+        # Holders damp at their own configured band centre, like production.
+        hand_bp = BandPass(
+            len(ARM_JOINTS),
+            [
+                jc_all[j].kd_host_w0 if jc_all[j].kd_host_w0 is not None else DAMP_BP_W0
+                for j in ARM_JOINTS
+            ],
+        )
         hand_q_buf = np.zeros(len(ARM_JOINTS), dtype=np.float32)
         hand_landed = False
 
@@ -703,6 +731,7 @@ async def _run(args: argparse.Namespace) -> None:
                             j_eff=j_eff,
                             differentiate_target=False,
                             host_kd=host_kd,
+                            host_kd_w0=host_kd_w0,
                         )
                         log, amp = await run_step(
                             motors,
@@ -785,6 +814,7 @@ async def _run(args: argparse.Namespace) -> None:
                     j_eff=j_eff,
                     differentiate_target=(args.mode == "sine"),
                     host_kd=host_kd,
+                    host_kd_w0=host_kd_w0,
                 )
                 if args.mode == "sine":
                     log, amp = await run_sine(

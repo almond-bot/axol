@@ -43,9 +43,11 @@ Powering the robot host off or rebooting it is done from the [control panel's Ax
 
 ## Tuning
 
-The tuning workbench runs the deterministic tuning suites inline — no dialogs. Pick what to run across the tabs, type the numbers, and hit **Run**; when it finishes, the result lands straight on the graphs below:
+The tuning workbench runs the deterministic tuning suites inline — no dialogs, and every parameter is always visible. Pick what to run across the tabs, set the numbers, and hit **Run**; when it finishes, the result lands straight on the graphs below.
 
-- **Sine** / **Step** — [`tune.pid`](https://docs.almond.bot/cli/tune-pid) probes on one joint. Leave kp/kd empty to test the configured gains; space-separated values sweep the grid, one saved run per candidate.
+Gain fields (kp, kd, kd_host, kd_host_w0) show the selected joint's **current config value** — the shipping defaults with this robot's calibration overlaid, i.e. exactly what runs when the field is left empty — and a slider seeded there, so tuning is "nudge from where production is" rather than typing blind:
+
+- **Sine** / **Step** — [`tune.pid`](https://docs.almond.bot/cli/tune-pid) probes on one joint. Leave the gain boxes empty to test the configured gains; space-separated kp/kd values sweep the grid, one saved run per candidate. kd_host and its band-pass centre kd_host_w0 are both overridable per run.
 - **Friction** — [`tune.friction`](https://docs.almond.bot/cli/tune-friction) identifies one joint's friction model; check **save to calibration** to write the fit to `~/.almond/calibration.json`.
 - **Filter** — [`tune.filter`](https://docs.almond.bot/cli/tune-filter) tests the teleop filter stack without moving the robot, one noise source at a time: **network** noise (seeded stalls, outliers, jitter) is injected before the pose low-pass, **IK** noise (solver churn, solution jumps) after it — each at its real entry point in the pipeline — or both **combined**. The corrupted stream replays through the production smoothing chain; the charts show clean vs. noisy vs. filtered per joint, and the scores say how much of the injected noise survived.
 - **Recorded motion** — [`tune.motion`](https://docs.almond.bot/cli/tune-motion) replays a committed reference motion through the production control path and scores tracking per joint, with per-run gain overrides (`left.elbow.kd=4.5 shoulder_3.kd_host=0`).

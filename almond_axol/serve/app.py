@@ -587,6 +587,43 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # from the diagnostics run *history* above: a tuning run is a scored
     # experiment with full time series, made for charting and A/B comparison.
 
+    @app.get("/api/tuning/gains")
+    async def tuning_gains() -> dict[str, Any]:
+        """Effective per-joint control gains for both arms.
+
+        Shipping defaults from ``config.py`` with this robot's calibration
+        file overlaid — exactly what a tuning run uses when a gain field is
+        left empty. The workbench shows these as the slider baselines.
+        ``kd_host_w0`` is resolved to the shared default where a joint
+        doesn't set its own band centre.
+        """
+        from ..constants import ARM_JOINTS
+        from ..robot.config import AxolConfig
+        from ..robot.control import DAMP_BP_W0
+
+        def _load() -> dict[str, Any]:
+            cfg = AxolConfig()
+            out: dict[str, Any] = {}
+            for side in ("left", "right"):
+                arm_cfg = getattr(cfg, side)
+                joints: dict[str, Any] = {}
+                for j in ARM_JOINTS:
+                    jc = getattr(arm_cfg, j.value)
+                    joints[j.value] = {
+                        "kp": jc.kp,
+                        "kd": jc.kd,
+                        "kd_host": jc.kd_host,
+                        "kd_host_w0": (
+                            jc.kd_host_w0 if jc.kd_host_w0 is not None else DAMP_BP_W0
+                        ),
+                        "kd_host_max": jc.kd_host_max,
+                        "j_eff": jc.j_eff,
+                    }
+                out[side] = joints
+            return out
+
+        return {"gains": await asyncio.to_thread(_load)}
+
     @app.get("/api/tuning/runs")
     async def tuning_runs() -> dict[str, Any]:
         from ..tuning import list_runs

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..robot.control import (
+    DAMP_BP_W0,
     VEL_CUTOFF_FREQ,
     BandPass,
     Differentiator,
@@ -31,6 +32,10 @@ class FeedForward:
     jitter-free, and it stays *fresh*, unlike the motor-reported velocity
     (MyActuator's firmware estimate lags too much to damp the shoulders'
     ~2.3 Hz resonance — the same reason firmware kd underdelivers there).
+    ``host_kd_w0`` sets the band-pass centre (rad/s) confining that damping
+    to the joint's resonance band, matching the production per-joint
+    ``kd_host_w0``; ``None`` uses the shared shoulder default
+    (:data:`~almond_axol.robot.control.DAMP_BP_W0`, 20 rad/s ≈ 3.2 Hz).
 
     Construct one instance per candidate run: the differentiators are
     stateful low-pass filters and must not leak between runs. For step
@@ -50,6 +55,7 @@ class FeedForward:
         j_eff: float,
         differentiate_target: bool = True,
         host_kd: float = 0.0,
+        host_kd_w0: float | None = None,
     ) -> None:
         self.gravity_fn = gravity_fn
         self._fric = (fc, k, fv, fo)
@@ -64,7 +70,9 @@ class FeedForward:
         self._a_des_diff = Differentiator(1)
         self._v_des_fast_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
         self._v_meas_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
-        self._damp_bp = BandPass(1)
+        self._damp_bp = BandPass(
+            1, host_kd_w0 if host_kd_w0 is not None else DAMP_BP_W0
+        )
 
     def compute(
         self, q_target: float, meas: tuple[float, float] | None = None

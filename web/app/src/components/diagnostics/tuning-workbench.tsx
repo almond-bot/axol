@@ -1,13 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import {
-  ChevronDown,
-  ChevronRight,
-  Loader2,
-  Play,
-  RefreshCw,
-  Square,
-  Trash2,
-} from "lucide-react"
+import { Loader2, Play, RefreshCw, Square, Trash2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -18,9 +10,11 @@ import type { CommandSpec, FormValue } from "@/lib/supervisor"
 import {
   clearTuningRuns,
   deleteTuningRun,
+  fetchTuningGains,
   fetchTuningMotions,
   fetchTuningRun,
   fetchTuningRuns,
+  type TuningGains,
   type TuningMotion,
   type TuningRunData,
   type TuningRunMeta,
@@ -60,9 +54,16 @@ interface WbField {
   /** Placeholder shown when empty; empty means "command default". */
   placeholder?: string
   hint?: string
-  advanced?: boolean
   /** Tailwind width class for the input (defaults to a narrow number box). */
   width?: string
+  /**
+   * Key into the fetched per-joint gains (`kp` | `kd` | `kd_host` |
+   * `kd_host_w0`): the field shows the selected joint's current config value
+   * and an empty box means "run with config".
+   */
+  gainKey?: string
+  /** Render a slider next to the value box, over this range. */
+  slider?: { min: number; max: number; step: number }
 }
 
 interface WbTab {
@@ -76,39 +77,79 @@ interface WbTab {
   drivesMotors: boolean
 }
 
+/**
+ * The gain knobs shared by the sine and step tabs. Each shows the selected
+ * joint's current config value (defaults + this robot's calibration) and a
+ * slider seeded there; an empty box runs with config. kp/kd also take
+ * space-separated sweeps typed into the box. Slider ceilings are the
+ * hardware encodings' (kp 500, kd 5) and the hardware-verified host-damping
+ * range (kd_host up to the 45 ceiling, band centre up to ~19 Hz).
+ */
+const GAIN_FIELDS: WbField[] = [
+  {
+    key: "kp",
+    label: "kp",
+    type: "text",
+    gainKey: "kp",
+    slider: { min: 0, max: 500, step: 5 },
+    hint: "space-separated sweeps",
+  },
+  {
+    key: "kd",
+    label: "kd",
+    type: "text",
+    gainKey: "kd",
+    slider: { min: 0, max: 5, step: 0.05 },
+    hint: "space-separated sweeps",
+  },
+  {
+    key: "host_kd",
+    label: "kd_host",
+    type: "number",
+    gainKey: "kd_host",
+    slider: { min: 0, max: 60, step: 0.5 },
+    hint: "host-side damping via t_ff",
+  },
+  {
+    key: "host_kd_w0",
+    label: "kd_host_w0 (rad/s)",
+    type: "number",
+    gainKey: "kd_host_w0",
+    slider: { min: 5, max: 120, step: 1 },
+    hint: "band-pass centre of the host damping",
+  },
+]
+
 const TABS: WbTab[] = [
   {
     key: "sine",
     label: "Sine",
     command: "tune.pid",
     description:
-      "Drive one joint through a sine wave and score tracking. Leave kp/kd " +
-      "empty to test the configured gains; several space-separated values " +
-      "sweep the grid (each candidate becomes its own run).",
+      "Drive one joint through a sine wave and score tracking. Gain sliders " +
+      "start at the joint's current config value (shown next to each label); " +
+      "leave a box empty to run with config, or type several space-separated " +
+      "kp/kd values to sweep the grid (each candidate becomes its own run).",
     presets: { mode: "sine", save_run: true },
     fields: [
       { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
-      { key: "kp", label: "kp", type: "text", placeholder: "config", hint: "space-separated sweeps" },
-      { key: "kd", label: "kd", type: "text", placeholder: "config", hint: "space-separated sweeps" },
+      ...GAIN_FIELDS,
       { key: "amp", label: "amp (rad)", type: "number", placeholder: "0.175" },
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
-      { key: "host_kd", label: "kd_host", type: "number", placeholder: "config", advanced: true },
       {
         key: "ff",
         label: "feedforward",
         type: "select",
         options: ["full", "gravity", "friction", "none"],
-        advanced: true,
       },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—", advanced: true },
+      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
       {
         key: "target_noise",
         label: "target noise (rad)",
         type: "number",
         placeholder: "off",
-        advanced: true,
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
@@ -121,24 +162,22 @@ const TABS: WbTab[] = [
     command: "tune.pid",
     description:
       "Step one joint and score settling, overshoot, and ring frequency. " +
-      "Leave kp/kd empty to test the configured gains; several values sweep.",
+      "Gain sliders start at the joint's current config value; leave a box " +
+      "empty to run with config, or type several kp/kd values to sweep.",
     presets: { mode: "step", save_run: true },
     fields: [
       { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
-      { key: "kp", label: "kp", type: "text", placeholder: "config", hint: "space-separated sweeps" },
-      { key: "kd", label: "kd", type: "text", placeholder: "config", hint: "space-separated sweeps" },
+      ...GAIN_FIELDS,
       { key: "amp", label: "amp (rad)", type: "number", placeholder: "0.175" },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
-      { key: "host_kd", label: "kd_host", type: "number", placeholder: "config", advanced: true },
       {
         key: "ff",
         label: "feedforward",
         type: "select",
         options: ["full", "gravity", "friction", "none"],
-        advanced: true,
       },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—", advanced: true },
+      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: ["arm", "joint"],
@@ -168,11 +207,11 @@ const TABS: WbTab[] = [
       { key: "outlier_rate", label: "net outliers /s", type: "number", placeholder: "0.5" },
       { key: "stall_ms", label: "net stall (ms)", type: "number", placeholder: "150" },
       { key: "stall_rate", label: "net stalls /s", type: "number", placeholder: "0.5" },
-      { key: "ik_churn", label: "ik churn (rad RMS)", type: "number", placeholder: "0.003", advanced: true },
-      { key: "ik_jump_amp", label: "ik jump (rad)", type: "number", placeholder: "0.05", advanced: true },
-      { key: "ik_jump_rate", label: "ik jumps /s", type: "number", placeholder: "0.2", advanced: true },
-      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config", advanced: true },
-      { key: "seed", label: "seed", type: "number", placeholder: "0", advanced: true },
+      { key: "ik_churn", label: "ik churn (rad RMS)", type: "number", placeholder: "0.003" },
+      { key: "ik_jump_amp", label: "ik jump (rad)", type: "number", placeholder: "0.05" },
+      { key: "ik_jump_rate", label: "ik jumps /s", type: "number", placeholder: "0.2" },
+      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config" },
+      { key: "seed", label: "seed", type: "number", placeholder: "0" },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
     required: [],
@@ -204,7 +243,6 @@ const TABS: WbTab[] = [
         label: "contact Nm",
         type: "number",
         placeholder: "8",
-        advanced: true,
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
@@ -229,11 +267,22 @@ const TABS: WbTab[] = [
         label: "velocities (rad/s)",
         type: "text",
         placeholder: "0.1 0.3 0.6 0.9 1.3",
-        advanced: true,
         width: "w-44",
       },
-      { key: "kp", label: "kp", type: "number", placeholder: "config", advanced: true },
-      { key: "kd", label: "kd", type: "number", placeholder: "config", advanced: true },
+      {
+        key: "kp",
+        label: "kp",
+        type: "number",
+        gainKey: "kp",
+        slider: { min: 0, max: 500, step: 5 },
+      },
+      {
+        key: "kd",
+        label: "kd",
+        type: "number",
+        gainKey: "kd",
+        slider: { min: 0, max: 5, step: 0.05 },
+      },
     ],
     required: ["arm", "joint"],
     drivesMotors: true,
@@ -252,16 +301,15 @@ const TABS: WbTab[] = [
     fields: [
       { key: "prefix", label: "recording prefix", type: "text", placeholder: "/tmp/jit17", width: "w-52" },
       { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
-      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "6", advanced: true },
-      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "100", advanced: true },
+      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "6" },
+      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "100" },
       {
         key: "time_scale",
         label: "time scale",
         type: "number",
         placeholder: "1.0",
-        advanced: true,
       },
-      { key: "notes", label: "notes", type: "text", placeholder: "provenance", width: "w-40", advanced: true },
+      { key: "notes", label: "notes", type: "text", placeholder: "provenance", width: "w-40" },
     ],
     required: ["prefix", "name"],
     drivesMotors: false,
@@ -714,8 +762,11 @@ function FailureMap({
 
 /**
  * The tuning workbench: pick what to run (sine / step / filter noise test /
- * recorded motion), type the numbers inline, hit Run — and the result lands
- * straight on the graphs below. Everything is joint space and built to
+ * recorded motion), set the numbers inline, hit Run — and the result lands
+ * straight on the graphs below. Every parameter is always visible (no
+ * advanced fold), and gain fields (kp / kd / kd_host / kd_host_w0) show the
+ * selected joint's current config value with a slider seeded there — leave
+ * the box empty to run with config. Everything is joint space and built to
  * localize failures visually: a failure map shows both arms' per-joint error
  * at once (click a joint to jump to its graph), each joint gets a commanded
  * vs actual chart (clean vs noisy vs filtered for filter runs) with an
@@ -747,9 +798,11 @@ export function TuningWorkbench({
   const spec = commands.find((c) => c.id === tab.command) ?? null
   // Per-tab form values, kept across tab switches.
   const [values, setValues] = useState<Record<string, Record<string, string>>>({})
-  const [showAdvanced, setShowAdvanced] = useState(false)
   const [missing, setMissing] = useState<string[]>([])
   const [motions, setMotions] = useState<TuningMotion[]>([])
+  // Effective per-joint config gains (defaults + calibration): the slider
+  // baselines and "config N" labels on the gain fields.
+  const [gains, setGains] = useState<TuningGains | null>(null)
 
   const [runs, setRuns] = useState<TuningRunMeta[]>([])
   const [loading, setLoading] = useState(false)
@@ -771,6 +824,12 @@ export function TuningWorkbench({
       .catch(() => {})
   }, [])
 
+  const refreshGains = useCallback(() => {
+    fetchTuningGains()
+      .then(({ gains }) => setGains(gains))
+      .catch(() => {})
+  }, [])
+
   const refreshRuns = useCallback((): Promise<TuningRunMeta[]> => {
     setLoading(true)
     return fetchTuningRuns()
@@ -788,7 +847,8 @@ export function TuningWorkbench({
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on connect
     refreshRuns()
     refreshMotions()
-  }, [enabled, refreshRuns, refreshMotions])
+    refreshGains()
+  }, [enabled, refreshRuns, refreshMotions, refreshGains])
 
   // The selection setter clears loaded data immediately so a stale chart
   // never shows under a new selection; the effect below only fetches.
@@ -831,6 +891,8 @@ export function TuningWorkbench({
       knownNewest.current = newest.id
       select(newest.id)
     })
+    // A finished run may have --save'd new calibration values.
+    refreshGains()
     if (was === "motion.build") refreshMotions()
     // eslint-disable-next-line react-hooks/exhaustive-deps -- fires on run completion only
   }, [activeCommand])
@@ -847,7 +909,7 @@ export function TuningWorkbench({
     },
     [tab.key]
   )
-  const tabValues = values[tab.key] ?? {}
+  const tabValues = useMemo(() => values[tab.key] ?? {}, [values, tab.key])
 
   function handleRun() {
     const miss = tab.required.filter((k) => !(tabValues[k] ?? "").trim())
@@ -862,8 +924,21 @@ export function TuningWorkbench({
     onLaunch(tab.command, args)
   }
 
-  const fieldsShown = tab.fields.filter((f) => !f.advanced || showAdvanced)
-  const hasAdvanced = tab.fields.some((f) => f.advanced)
+  /**
+   * The selected joint's current config value for a gain field, or null
+   * until an arm and joint are picked (or while gains haven't loaded).
+   */
+  const configValue = useCallback(
+    (f: WbField): number | null => {
+      if (!f.gainKey || !gains) return null
+      const side = tabValues["arm"]
+      const joint = tabValues["joint"]
+      if (!side || !joint) return null
+      const v = gains[side]?.[joint]?.[f.gainKey]
+      return typeof v === "number" && Number.isFinite(v) ? v : null
+    },
+    [gains, tabValues]
+  )
 
   const meta = run?.meta ?? null
   const arms = useMemo(() => (run ? runArms(run) : []), [run])
@@ -953,11 +1028,16 @@ export function TuningWorkbench({
         <p className="max-w-3xl text-xs leading-relaxed text-white/45">{tab.description}</p>
 
         <div className="flex flex-wrap items-end gap-x-3 gap-y-2">
-          {fieldsShown.map((f) => (
+          {tab.fields.map((f) => {
+            const cfg = configValue(f)
+            return (
             <label key={f.key} className="flex flex-col gap-1">
               <span className="text-[0.65rem] text-white/40">
                 {f.label}
                 {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
+                {cfg != null && (
+                  <span className="text-white/25"> · config {fmtNum(cfg)}</span>
+                )}
               </span>
               {f.type === "boolean" ? (
                 <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
@@ -991,6 +1071,42 @@ export function TuningWorkbench({
                     )
                   )}
                 </select>
+              ) : f.slider ? (
+                (() => {
+                  // The slider tracks the typed value (first number of a
+                  // sweep) and starts at the joint's config value; dragging
+                  // it fills the box, an empty box runs with config.
+                  const raw = (tabValues[f.key] ?? "").trim()
+                  const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
+                  const sliderVal = Number.isFinite(first)
+                    ? first
+                    : (cfg ?? f.slider.min)
+                  return (
+                    <span className="flex h-8 items-center gap-2">
+                      <input
+                        type="range"
+                        min={f.slider.min}
+                        max={f.slider.max}
+                        step={f.slider.step}
+                        value={sliderVal}
+                        onChange={(e) => setValue(f.key, e.target.value)}
+                        disabled={runningOurs || busy || (cfg == null && !raw)}
+                        title={f.hint}
+                        className="w-24 accent-[#eff483] disabled:opacity-40"
+                      />
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={tabValues[f.key] ?? ""}
+                        placeholder={cfg != null ? fmtNum(cfg) : "config"}
+                        title={f.hint}
+                        onChange={(e) => setValue(f.key, e.target.value)}
+                        disabled={runningOurs || busy}
+                        className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+                      />
+                    </span>
+                  )
+                })()
               ) : (
                 <input
                   type="text"
@@ -1007,17 +1123,8 @@ export function TuningWorkbench({
                 />
               )}
             </label>
-          ))}
-          {hasAdvanced && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="h-8 text-white/40"
-              onClick={() => setShowAdvanced((v) => !v)}
-            >
-              {showAdvanced ? <ChevronDown /> : <ChevronRight />} advanced
-            </Button>
-          )}
+            )
+          })}
           <div className="ml-auto">
             {runningThisTab ? (
               <Button variant="destructive" size="sm" onClick={onStop} disabled={busy}>
