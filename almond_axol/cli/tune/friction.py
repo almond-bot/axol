@@ -50,7 +50,6 @@ from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .joint_frame import JointFrameMotor, joint_frame_motors
-from .pid import _BASE_COLLISION_JOINTS
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s
@@ -85,39 +84,81 @@ async def _ramp_to(
         await asyncio.sleep(dt)
 
 
-async def _ramp_others(
-    motors: dict[Joint, JointFrameMotor],
-    exclude: Joint,
-    targets: dict[Joint, float] | None = None,
-) -> None:
-    """Move all joints except `exclude` to their joint-frame targets (default 0 = rest).
+# Homing order: distal to proximal. This ordering is what makes commanding
+# the all-zero rest pose safe from *any* starting pose — straightening the
+# wrists and then the elbow first means each shoulder later swings an
+# already-straight arm, whose path down to vertical stays outboard of the
+# base. Zeroing everything at once can sweep a bent forearm through the
+# chassis (which is why shoulder_2/wrist_2 were historically left unhomed —
+# leaving every run to start from a partially unknown pose instead).
+_HOME_ORDER: tuple[Joint, ...] = (
+    Joint.WRIST_3,
+    Joint.WRIST_2,
+    Joint.WRIST_1,
+    Joint.ELBOW,
+    Joint.SHOULDER_3,
+    Joint.SHOULDER_2,
+    Joint.SHOULDER_1,
+)
 
-    Joints in ``_BASE_COLLISION_JOINTS`` (shoulder_2, wrist_2 — their 0
-    collides with the robot base) are left in place unless an explicit
-    target is given, same as the PID tuner's ``_ramp_others_to_zero``. The
-    operator is responsible for initially posing them outside the danger
-    zone.
+
+async def _ramp_verified(
+    motors: dict[Joint, JointFrameMotor], targets: dict[Joint, float]
+) -> None:
+    """Command joint-frame POSITION_VELOCITY targets and verify arrival.
+
+    Arrival is verified, not assumed: a position command sent right after
+    ``set_control_mode`` can be silently dropped (the MyActuator reset drops
+    torque and ignores commands for ~2 s), and a sweep started from an
+    unverified pose is how wrist_2 once met the base with its elbow
+    clearance move never executed. A dropped command gets one resend; a
+    joint still off target after that raises instead of moving on.
     """
-    t = targets or {}
-    joints = [
-        j
-        for j in ARM_JOINTS
-        if j != exclude and (j not in _BASE_COLLISION_JOINTS or j in t)
-    ]
-    pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
-    max_dist = max(
-        (abs(pos - t.get(j, 0.0)) for j, pos in zip(joints, pos_vals)), default=0.0
-    )
-    await asyncio.gather(
-        *[motors[j].set_position_velocity(t.get(j, 0.0), _RAMP_SPEED) for j in joints]
-    )
-    timeout = max_dist / _RAMP_SPEED + 2.0
-    t0 = time.monotonic()
-    while time.monotonic() - t0 < timeout:
-        await asyncio.sleep(0.1)
+    joints = list(targets)
+    if not joints:
+        return
+    positions: list[float] = []
+    for _attempt in range(2):
+        await asyncio.gather(
+            *[motors[j].set_position_velocity(targets[j], _RAMP_SPEED) for j in joints]
+        )
         positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
-        if all(abs(pos - t.get(j, 0.0)) < 0.05 for j, pos in zip(joints, positions)):
-            break
+        max_dist = max(
+            (abs(pos - targets[j]) for j, pos in zip(joints, positions)),
+            default=0.0,
+        )
+        timeout = max_dist / _RAMP_SPEED + 2.0
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            await asyncio.sleep(0.1)
+            positions = await asyncio.gather(
+                *[motors[j].get_position() for j in joints]
+            )
+            if all(abs(pos - targets[j]) < 0.05 for j, pos in zip(joints, positions)):
+                return
+    stragglers = ", ".join(
+        f"{j.value} at {pos:+.3f} rad (target {targets[j]:+.3f})"
+        for j, pos in zip(joints, positions)
+        if abs(pos - targets[j]) >= 0.05
+    )
+    raise RuntimeError(
+        f"joints never reached their target after a resend: {stragglers} "
+        f"— aborting before anything runs from an unsafe pose"
+    )
+
+
+async def _home_all(
+    motors: dict[Joint, JointFrameMotor], exclude: Joint | None = None
+) -> None:
+    """Ramp every joint to 0 (the rest pose), one at a time in ``_HOME_ORDER``.
+
+    Joints already at rest verify in one poll, so a mostly-homed arm costs
+    a fraction of a second per joint.
+    """
+    for j in _HOME_ORDER:
+        if j == exclude or j not in motors:
+            continue
+        await _ramp_verified(motors, {j: 0.0})
 
 
 async def _run_sweep_raw(
@@ -542,20 +583,26 @@ async def _run(args: argparse.Namespace) -> None:
         # poses, and park targets below are joint frame (0 = rest), so wrap
         # the motors in the frame conversion before any position I/O.
         motors = await joint_frame_motors(raw_motors, is_left)
+        # Everything (test joint included) starts in POSITION_VELOCITY so the
+        # whole arm can be homed to the rest pose first — every run then
+        # starts from a known pose instead of wherever the operator (or a
+        # previous run) left the base-collision joints. The test joint
+        # switches to IMPEDANCE only after homing and the clearance move,
+        # because the MyActuator mode switch is a ~2 s reset that silently
+        # drops commands sent during it.
         await asyncio.gather(
             *[
-                motors[j].set_control_mode(
-                    ControlMode.IMPEDANCE
-                    if j == joint
-                    else ControlMode.POSITION_VELOCITY
-                )
-                for j in motors
+                m.set_control_mode(ControlMode.POSITION_VELOCITY)
+                for m in motors.values()
             ]
         )
 
         try:
+            print("  Homing all joints to rest (distal to proximal) ...")
+            await _home_all(motors)
+
             # wrist_2: elbow at midpoint of its range so wrist_2 can sweep
-            # its full ±range without the forearm hitting the robot base.
+            # its outboard half without the gripper hitting the robot base.
             other_targets: dict[Joint, float] = {}
             if joint == Joint.WRIST_2:
                 elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
@@ -563,14 +610,10 @@ async def _run(args: argparse.Namespace) -> None:
                 print(
                     f"  Moving elbow to {other_targets[Joint.ELBOW]:.3f} rad (midpoint of range) for wrist_2 clearance."
                 )
-            print("  Ramping other joints to start position ...")
-            await _ramp_others(motors, joint, other_targets)
+                await _ramp_verified(motors, other_targets)
+
+            await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
-            # Base-collision joints were left wherever the operator posed
-            # them (not commanded to 0) — feed their measured positions to
-            # the gravity model so the Fo fit uses the real pose.
-            for j in _BASE_COLLISION_JOINTS - {joint} - set(other_targets):
-                other_targets[j] = await motors[j].get_position()
 
             # shoulder_2 swings into the robot base on the inboard side; cap
             # the sweep at 0 so it stays on the safe half of its range.
@@ -581,6 +624,17 @@ async def _run(args: argparse.Namespace) -> None:
                 else:
                     lo_default = 0.0
                 print("  Capping shoulder_2 sweep at 0 rad to avoid the base.")
+            elif joint == Joint.WRIST_2:
+                # Even with the elbow raised, wrist_2's inboard half swings
+                # the gripper into the base (observed on hardware) — the same
+                # constraint the PID tuner encodes via _BASE_COLLISION_JOINTS
+                # and _safe_outboard_direction. Sweep only the outboard half:
+                # +π/2 on the left arm, −π/2 on the right.
+                if is_left:
+                    lo_default = 0.0
+                else:
+                    hi_default = 0.0
+                print("  Capping wrist_2 sweep at 0 rad to avoid the base.")
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
@@ -659,12 +713,21 @@ async def _run(args: argparse.Namespace) -> None:
             print("\n  Interrupted.")
         finally:
             print("  Returning to rest and disabling ...")
+            # The test joint gets an impedance ramp only if it actually made
+            # it into IMPEDANCE mode (a homing failure aborts before the
+            # switch, and a Damiao in POSITION_VELOCITY ignores impedance
+            # frames); otherwise _home_all covers it like any other joint.
+            in_impedance = motors[joint].motor.mode == ControlMode.IMPEDANCE
+            if in_impedance:
+                try:
+                    await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
+                except Exception:
+                    pass
             try:
-                await _ramp_to(motors[joint], kp, kd, 0.0, duration=4.0)
-            except Exception:
-                pass
-            try:
-                await _ramp_others(motors, joint)
+                # Home the rest in the safe distal-to-proximal order,
+                # including the base-collision joints the old flow used to
+                # leave in place.
+                await _home_all(motors, exclude=joint if in_impedance else None)
             except Exception:
                 pass
             await asyncio.gather(
