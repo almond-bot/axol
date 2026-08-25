@@ -46,6 +46,11 @@ async def spawn_proc(
     """
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
+    # Sessions stream their stdout to the browser, so runners that can narrate
+    # live chart samples (@@live lines — see tuning/runner.py LiveStream)
+    # should: the workbench plots them as the run executes. Terminal users
+    # never set this, so plain CLI output stays clean.
+    env.setdefault("AXOL_TUNE_LIVE", "1")
     return await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",

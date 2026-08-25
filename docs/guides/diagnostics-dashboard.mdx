@@ -43,7 +43,7 @@ Powering the robot host off or rebooting it is done from the [control panel's Ax
 
 ## Tuning
 
-The tuning workbench runs the deterministic tuning suites inline — no dialogs, and every parameter is always visible. Pick what to run across the tabs, set the numbers, and hit **Run**; when it finishes, the result lands straight on the graphs below.
+The tuning workbench runs the deterministic tuning suites inline — no dialogs, and every parameter is always visible. Pick what to run across the tabs, set the numbers, and hit **Run**. Sine and step probes chart **live** while they run — commanded vs actual (with the error lane) streams in at ~25 Hz as the probe executes — and the full-resolution charts and scorecards land below when the run finishes.
 
 Gain fields (kp, kd, kd_host, kd_host_hz, kd_host_q) show the selected joint's **current config value** — the shipping defaults with this robot's calibration overlaid, i.e. exactly what runs when the field is left empty — and a slider seeded there, so tuning is "nudge from where production is" rather than typing blind. Angles are degrees everywhere in the workbench (fields, charts, scores); gains keep their per-radian units (Nm/rad, Nm·s/rad) because that's what the config and firmware speak:
 

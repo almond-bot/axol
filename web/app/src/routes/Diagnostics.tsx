@@ -183,7 +183,7 @@ export default function Diagnostics() {
   const promptTail = useMemo(() => {
     for (let i = activeLines.length - 1; i >= 0; i--) {
       const l = activeLines[i]
-      if (!l.trim() || l.startsWith("[serve]")) continue
+      if (!l.trim() || l.startsWith("[serve]") || l.startsWith("@@live")) continue
       return l.startsWith("[prompt] ") ? l.slice("[prompt] ".length).trim() : null
     }
     return null
@@ -203,7 +203,10 @@ export default function Diagnostics() {
   const activeLine =
     [...activeLines]
       .reverse()
-      .find((l) => l.trim() && !l.startsWith("[serve]") && !l.startsWith("[prompt] ")) ?? null
+      .find(
+        (l) =>
+          l.trim() && !l.startsWith("[serve]") && !l.startsWith("[prompt] ") && !l.startsWith("@@live")
+      ) ?? null
 
   const stream = useTelemetryStream(serverOk)
 
@@ -918,6 +921,7 @@ export default function Diagnostics() {
           activeCommand={activeRun?.command ?? null}
           busy={launchBusy}
           disabled={busyElsewhere}
+          liveLines={activeLines}
           onLaunch={launch}
           onStop={stopActive}
         />

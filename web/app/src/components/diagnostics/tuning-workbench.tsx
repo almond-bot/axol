@@ -489,6 +489,48 @@ function degSeries(data: (number | null)[]): (number | null)[] {
   return data.map((v) => (v == null ? null : toDeg(v)))
 }
 
+/* ------------------------------------------------------------------ */
+/* Live probe stream (@@live lines from tuning/runner.py LiveStream)   */
+/* ------------------------------------------------------------------ */
+
+interface LiveProbe {
+  mode: string
+  joint: string
+  t: (number | null)[]
+  target: (number | null)[]
+  actual: (number | null)[]
+}
+
+/**
+ * The in-flight probe's samples, parsed from the active session's log lines.
+ * The runner prints a `new` marker at each probe start (a gain sweep runs
+ * several) and sample batches after it; only the latest probe is charted.
+ */
+function parseLiveProbe(lines: string[]): LiveProbe | null {
+  let probe: LiveProbe | null = null
+  for (const l of lines) {
+    if (!l.startsWith("@@live ")) continue
+    try {
+      const msg = JSON.parse(l.slice("@@live ".length)) as {
+        new?: { mode: string; joint: string }
+        samples?: [number, number, number][]
+      }
+      if (msg.new) {
+        probe = { mode: msg.new.mode, joint: msg.new.joint, t: [], target: [], actual: [] }
+      } else if (msg.samples && probe) {
+        for (const [t, tgt, act] of msg.samples) {
+          probe.t.push(t)
+          probe.target.push(tgt)
+          probe.actual.push(act)
+        }
+      }
+    } catch {
+      // a malformed line (e.g. output interleaving) just skips that batch
+    }
+  }
+  return probe
+}
+
 function fmtNum(v: unknown, digits = 2): string {
   if (v == null || typeof v !== "number" || !Number.isFinite(v)) return "–"
   const a = Math.abs(v)
@@ -1180,6 +1222,7 @@ export function TuningWorkbench({
   activeCommand,
   busy,
   disabled,
+  liveLines = [],
   onLaunch,
   onStop,
 }: {
@@ -1189,6 +1232,8 @@ export function TuningWorkbench({
   activeCommand: string | null
   busy: boolean
   disabled: boolean
+  /** The active session's streamed log lines (live probe samples ride them). */
+  liveLines?: string[]
   onLaunch: (command: string, args: Record<string, FormValue>) => void
   onStop: () => void
 }) {
@@ -1220,6 +1265,12 @@ export function TuningWorkbench({
   const tuningCommandIds = useMemo(() => new Set(TABS.map((t) => t.command)), [])
   const runningOurs = activeCommand != null && tuningCommandIds.has(activeCommand)
   const runningThisTab = activeCommand === tab.command
+  // The in-flight probe, charted live as its samples stream in over the
+  // session log (sine/step only — the other runs have no single trace).
+  const live = useMemo(
+    () => (runningOurs ? parseLiveProbe(liveLines) : null),
+    [runningOurs, liveLines]
+  )
 
   const refreshMotions = useCallback(() => {
     fetchTuningMotions()
@@ -1674,10 +1725,27 @@ export function TuningWorkbench({
         )}
         {runningOurs && (
           <p className="text-xs text-emerald-300/80">
-            Running — the charts below update when it finishes.
+            {live && live.t.length > 1
+              ? "Running — tracking live; the full-resolution charts and scores land below when it finishes."
+              : "Running — the charts below update when it finishes."}
           </p>
         )}
       </Card>
+
+      {/* Live view of the probe in flight: commanded vs actual streamed from
+          the runner (decimated ~25 Hz), full-resolution artifact follows. */}
+      {runningOurs && live && live.t.length > 1 && (
+        <RunChart
+          title={`live · ${live.joint} — ${live.mode}`}
+          unit="°"
+          series={[
+            { label: "commanded", color: COMMANDED_COLOR, x: live.t, data: degSeries(live.target) },
+            { label: "actual", color: ACTUAL_COLOR, x: live.t, data: degSeries(live.actual) },
+          ]}
+          sub={errorLane(live.t, live.target, live.actual)}
+          height={240}
+        />
+      )}
 
       {/* Compare mode: the two ticked runs, overlaid per joint. */}
       {comparing && (

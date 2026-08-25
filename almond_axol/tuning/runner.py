@@ -12,7 +12,9 @@ hardware session, and the serve session manager streams stdout to the UI.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
+import os
 import time
 
 import numpy as np
@@ -377,6 +379,50 @@ class HolderMonitor:
         }
 
 
+class LiveStream:
+    """Streams probe samples to stdout live, for the workbench's live chart.
+
+    The serve session manager already pipes every stdout line to the browser
+    over the session WebSocket, so live charting needs no new transport: the
+    runner prints ``@@live {…}`` lines, the workbench plots them as they
+    arrive, and the console hides them. Only active under ``axol serve``
+    (``AXOL_TUNE_LIVE=1``) — a terminal user just gets the normal narration.
+
+    Samples are decimated to ~25 Hz and batched into ~4 lines/s: plenty for
+    a chart that's watched, light enough that a run adds tens of log lines,
+    not thousands. Each probe phase starts with a ``new`` marker so the
+    chart clears between sweep candidates instead of overlaying their
+    restarted time axes.
+    """
+
+    _RATE_HZ = 25.0
+    _FLUSH_S = 0.25
+
+    def __init__(self, mode: str, joint: Joint) -> None:
+        self._on = os.environ.get("AXOL_TUNE_LIVE") == "1"
+        self._buf: list[list[float]] = []
+        self._last_t = -math.inf
+        self._last_flush = time.monotonic()
+        if self._on:
+            print(f'@@live {{"new": {{"mode": "{mode}", "joint": "{joint.value}"}}}}')
+
+    def add(self, t: float, target: float, actual: float) -> None:
+        if not self._on or t - self._last_t < 1.0 / self._RATE_HZ:
+            return
+        self._last_t = t
+        self._buf.append([round(t, 4), round(target, 5), round(actual, 5)])
+        now = time.monotonic()
+        if now - self._last_flush >= self._FLUSH_S:
+            self.flush()
+            self._last_flush = now
+
+    def flush(self) -> None:
+        if not self._on or not self._buf:
+            return
+        print(f'@@live {{"samples": {json.dumps(self._buf)}}}', flush=True)
+        self._buf.clear()
+
+
 def make_target_noise(
     rms: float, rate_hz: float, duration: float, cutoff_hz: float = 8.0
 ) -> list[float]:
@@ -449,6 +495,7 @@ async def run_sine(
     print(f"  running {duration:.1f} s at {rate_hz:.0f} Hz ...")
     dt = 1.0 / rate_hz
     log: list[dict] = []
+    live = LiveStream("sine", joint)
     start = time.monotonic()
     k = 0
 
@@ -483,11 +530,13 @@ async def run_sine(
                 "torque": cached_torque(test_motor),
             }
         )
+        live.add(t_read, target_at_read, actual)
 
         spent = time.monotonic() - loop_start
         if spent < dt:
             await asyncio.sleep(dt - spent)
 
+    live.flush()
     report_achieved_rate(log, rate_hz)
     return log, amp
 
@@ -617,6 +666,7 @@ async def run_step(
         monitor.rebase()
 
     log: list[dict] = []
+    live = LiveStream("step", joint)
     start = time.monotonic()
 
     for phase_target in [step_target, center]:
@@ -641,9 +691,11 @@ async def run_step(
                     "torque": cached_torque(test_motor),
                 }
             )
+            live.add(t, phase_target, actual)
             spent = time.monotonic() - loop_start
             if spent < dt:
                 await asyncio.sleep(dt - spent)
 
+    live.flush()
     report_achieved_rate(log, rate_hz)
     return log, amp
