@@ -84,7 +84,7 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
+| 1 | Left grip | From rest, press both grips (1 + 2) together to **engage** tracking. Once engaged, each grip **toggles its own arm** — click to freeze that arm in place (holding its pose *and* its grasp, e.g. to keep a held object steady) and click again to resume it. With the **Hold grips to engage** setting the grips are **dead-man** switches instead: hold both to start, release one to freeze that arm, keep holding to keep it going |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
 | 4 | Right trigger | Actuate right gripper. While tracking is disengaged: point at a camera screen and hold to **move** it — grabbing one screen with **both** triggers **resizes** it |
@@ -98,7 +98,15 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 | — | Right thumbstick (click) | **Raise** the cart's telescoping lift while held |
 
 <Note>
+  **Engaging and freezing arms.** Tracking always *starts* with both grips together from rest. Once engaged, the grips act **per arm**: a click freezes only that arm — it holds its pose and keeps its gripper where it is, so it can steady a grasped object while the other arm keeps working — and another click resumes it. A forced disengage (a reset, a [contact stop](/operations/teleop), or a dropped link) drops **both** arms and needs a deliberate both-grips re-engage. Prefer a dead-man feel? Turn on **Hold grips to engage** (the `hold_to_engage` setting, or `--teleop.hold_to_engage`) and each arm tracks only while you hold its grip.
+</Note>
+
+<Note>
   The session's **mode is fixed by the command that launched it** — there's no in-headset toggle between the two. [`axol teleop`](/cli/teleop) runs plain teleop (recording is unavailable, so **A** does nothing and the HUD stays on `Teleop`), while [`axol collect-data`](/cli/collect-data) runs data collection (recording enabled, HUD starts on `Data Collection`).
+</Note>
+
+<Note>
+  **A dropped link never moves the robot.** If the pose stream stops while tracking is engaged — you doff the headset, open the system menu, quit the app, or the link drops — the arms **auto-disengage** after about half a second and **hold position** wherever they are. When you return, re-engaging (both grips) takes a fresh snapshot, so the arms never jerk toward the controllers on the next entry; press **X** to send them back to the rest pose when you're ready.
 </Note>
 
 ## Powered cart
@@ -112,6 +120,8 @@ Robots equipped with the **powered Axol Cart** (an x-drive omni-wheel base plus 
 The sticks are their own **deadman**: the base only moves while a stick is deflected and coasts to a smooth stop the moment you let go, independent of whether arm tracking is engaged. Cart motion is **operator mobility only** — it's never recorded into a dataset and a policy never controls it, so you can reposition the robot mid-session (during teleop *or* data collection) without touching the recorded data.
 
 Enable the cart per-robot from the control panel's **Powered cart** toggle (Robot settings) or with [`axol teleop --cart.enabled true`](/cli/teleop); the tunables live under **Advanced → Cart** (or the `--cart.*` flags). To drive **only** the cart with the arms left untouched — no Axol hub needed — use the control panel's **Cart only** checkbox or [`axol teleop --cart_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring the cart's own CAN adapter.
+
+The telescoping lift needs a one-time [`axol lift.home`](/cli/lift-home) calibration before it will move, and [`axol lift.goto`](/cli/lift-goto) raises it to the robot-install height; both are also on the panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics**.
 
 ## State machine
 

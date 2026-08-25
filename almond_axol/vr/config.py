@@ -24,6 +24,15 @@ class VRServerConfig:
         interp_min_delay_s: Floor on the adaptive playout delay (seconds).
         interp_max_delay_s: Cap on the adaptive playout delay (seconds); bounds
             the teleop latency added in exchange for smoothness.
+        interp_smooth_window_s: Width (seconds) of the Gaussian fixed-lag
+            smoothing window rendered around the playout point. Adds a fixed
+            ``window / 2`` of latency in exchange for zero-phase smoothing and
+            tracking-glitch rejection (glitches shorter than ~half the window
+            are dropped entirely). ``0`` disables smoothing and restores the
+            plain two-frame lerp.
+        interp_outlier_k: Hampel outlier threshold in robust standard
+            deviations for the glitch rejection inside the smoothing window.
+            Lower is more aggressive. ``<= 0`` disables rejection.
     """
 
     port: int = VR_PORT
@@ -31,4 +40,6 @@ class VRServerConfig:
     keyfile: str | None = None
     interp_enabled: bool = True
     interp_min_delay_s: float = 0.0
-    interp_max_delay_s: float = 0.1
+    interp_max_delay_s: float = 0.15
+    interp_smooth_window_s: float = 0.12
+    interp_outlier_k: float = 4.0

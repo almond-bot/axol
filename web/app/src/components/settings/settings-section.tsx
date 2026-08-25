@@ -1,7 +1,18 @@
 import { useMemo, useRef, useState } from "react"
-import { ChevronDown, Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
+import {
+  ChevronDown,
+  Download,
+  Eye,
+  EyeOff,
+  Loader2,
+  Plug,
+  RotateCcw,
+  Search,
+  Upload,
+} from "lucide-react"
 import {
   flattenFields,
+  setQuestProximityDisabled,
   type AdvancedSection,
   type CameraDevice,
   type CameraSpec,
@@ -371,7 +382,9 @@ function UpdateRequired({ error }: { error: string }) {
   )
 }
 
-/** The Quest-over-USB pose link: live status + connect, from the old tile. */
+/** The Quest-over-USB pose link: live status + connect, from the old tile —
+ * plus the headless "keep awake" proximity-sensor override over the same
+ * cable, so nobody has to type adb commands. */
 function UsbPanel({
   usb,
   usbBusy,
@@ -381,6 +394,27 @@ function UsbPanel({
   usbBusy: boolean
   onUsbConnect: () => void
 }) {
+  const toast = useToast()
+  // Which proximity action is in flight ("off" = disabling the sensor).
+  const [proxBusy, setProxBusy] = useState<"off" | "on" | null>(null)
+  const setProximity = async (disabled: boolean) => {
+    setProxBusy(disabled ? "off" : "on")
+    try {
+      await setQuestProximityDisabled(disabled)
+      toast.success(
+        disabled
+          ? "Proximity sensor disabled — the headset stays awake until it reboots."
+          : "Proximity sensor restored."
+      )
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setProxBusy(null)
+    }
+  }
+  // The broadcast needs an attached, authorized headset — same bar as the
+  // pose tunnel's Connect.
+  const proxReady = usb?.state === "device"
   const dotClass = !usb
     ? "bg-white/30"
     : !usb.installed
@@ -441,6 +475,38 @@ function UsbPanel({
           </Button>
         </div>
         <p className="max-w-prose text-xs text-white/35">{hint}</p>
+      </div>
+      <div className="flex max-w-xl flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-4">
+          <Label>Keep awake (headless)</Label>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setProximity(true)}
+              disabled={!proxReady || proxBusy != null}
+              title="Disable the proximity sensor (adb) so the headset stays awake with nobody wearing it."
+            >
+              {proxBusy === "off" ? <Loader2 className="animate-spin" /> : <EyeOff />}
+              Keep awake
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setProximity(false)}
+              disabled={!proxReady || proxBusy != null}
+              title="Restore normal proximity-sensor behavior (the headset sleeps when taken off)."
+            >
+              {proxBusy === "on" ? <Loader2 className="animate-spin" /> : <Eye />}
+              Restore
+            </Button>
+          </div>
+        </div>
+        <p className="max-w-prose text-xs text-white/35">
+          Disables the headset's proximity sensor so it keeps running when set down — for sessions
+          driven from this panel with nobody wearing it. Resets when the headset reboots; battery
+          drains at full rate, so keep it charging. Needs the headset plugged in and authorized.
+        </p>
       </div>
     </div>
   )
@@ -517,6 +583,55 @@ function SettingRow({
     )
   }
 
+  if (field.ui.widget === "toggle-number") {
+    // One combined control: the switch arms the feature and its numeric
+    // value (e.g. a contact-stop torque threshold) edits inline next to
+    // it; off stores the default (0 = disabled). Mid-edit text is kept as
+    // a string (same round-trip rule as the plain number field below), so
+    // typing "0." or clearing doesn't collapse the row; blur cleans up
+    // anything that isn't a positive number by switching off.
+    const raw = set ? value : field.default
+    const enabled = typeof raw === "string" || (typeof raw === "number" && raw > 0)
+    const onValue = field.ui.onValue ?? 16
+    const text = set ? String(value) : enabled ? String(raw) : ""
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="flex items-center justify-between gap-4">
+          {labelNode}
+          <div className="flex shrink-0 items-center gap-3">
+            {enabled && (
+              <Input
+                id={id}
+                inputMode="decimal"
+                className="h-7 w-20 text-right"
+                value={text}
+                placeholder={String(onValue)}
+                onBlur={() => {
+                  const n = Number(text)
+                  if (text.trim() === "" || !Number.isFinite(n) || n <= 0) {
+                    onChange(field.key, null)
+                  }
+                }}
+                onChange={(e) => {
+                  const s = e.target.value
+                  const n = Number(s)
+                  const clean = Number.isFinite(n) && String(n) === s.trim() && n > 0
+                  onChange(field.key, clean ? n : s)
+                }}
+              />
+            )}
+            <Switch
+              checked={enabled}
+              onChange={(v) => onChange(field.key, v ? onValue : null)}
+              aria-label={field.label}
+            />
+          </div>
+        </div>
+        <p className="max-w-prose text-xs text-white/35">{field.help}</p>
+      </div>
+    )
+  }
+
   if (field.ui.widget === "slider") {
     const current = set ? Number(value) : Number(field.default ?? field.ui.min ?? 0)
     return (
@@ -568,8 +683,11 @@ function SettingRow({
           const raw = e.target.value
           if (raw === "") return onChange(field.key, null)
           if (field.type === "number") {
+            // Store a number only when the text round-trips exactly, so
+            // mid-edit states like "0." aren't rewritten to "0" under the
+            // cursor (see parseComponent in config-form.tsx).
             const n = Number(raw)
-            return onChange(field.key, Number.isFinite(n) ? n : raw)
+            return onChange(field.key, Number.isFinite(n) && String(n) === raw.trim() ? n : raw)
           }
           onChange(field.key, raw)
         }}

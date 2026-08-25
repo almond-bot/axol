@@ -70,6 +70,9 @@ class ReplayDatasetConfig:
     time so the arm tracks the recorded actions the same way.
     """
 
+    # Dataset to replay: a repo id under $HF_LEROBOT_HOME (as recorded by
+    # collect-data, e.g. ``almond/pick-place``), or a filesystem path to a
+    # dataset directory (one containing ``meta/info.json``) anywhere on disk.
     repo_id: str
     episode: int
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
@@ -86,6 +89,24 @@ class ReplayDatasetConfig:
     # returning to rest between takes. Off by default (a single replay). Either
     # way the arm returns to the rest pose before the operation exits.
     loop: bool = False
+    # Contact watchdog for every return-to-rest: a joint torque residual
+    # (measured minus modeled gravity, Nm) sustained above this drops the
+    # arms into a limp gravity-comp hold instead of pulling through. Replay
+    # has no interactive retry channel, so the hold lasts until the run is
+    # stopped (Ctrl+C or the UI's Stop). 0 disables the watchdog.
+    reset_torque_threshold: float = 4.0
+    # Contact watchdog while the episode itself plays back: the same
+    # sustained-torque-residual trip, checked on every command. On a trip
+    # playback stops and the arms drop into the limp gravity-comp hold until
+    # the run is stopped. 0 (the default) disables it — replayed episodes
+    # touch the scene on purpose, so only the return-to-rest guard is always
+    # on; set a threshold (16 is the control panel's suggested value) to
+    # enable. Mirrors the teleop config's field of the same name (`axol
+    # teleop` and collect-data share the same knob in the control panel).
+    teleop_torque_threshold: float = 0.0
+    # Velocity damping (Nm·s/rad) for that contact-fallback hold; same
+    # semantics as `axol gravity-comp --kd`.
+    reset_gravity_comp_kd: float = 0.25
     log_level: LogLevel = "INFO"
 
 
@@ -131,14 +152,38 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     episode = cfg.episode
     root = cfg.root
 
+    # ``repo_id`` doubles as a filesystem path: a dataset directory anywhere
+    # on disk (absolute, relative, or ~) is addressed directly, so operators
+    # can point at datasets outside $HF_LEROBOT_HOME without a separate
+    # --root. LeRobotDataset only needs a valid-looking repo id once a root
+    # is given, so the directory name stands in for it.
+    from ..recording.datasets import is_dataset_dir, list_datasets
+
+    repo_path = Path(repo_id).expanduser()
+    if root is None and is_dataset_dir(repo_path):
+        root = str(repo_path)
+        repo_id = repo_path.name
+
     # Verify the dataset is present and complete before loading (a clear error
     # beats LeRobotDataset's deeper failure, and mirrors collect-data's checks).
     dataset_root = Path(root) if root else HF_LEROBOT_HOME / repo_id
     meta = dataset_root / "meta"
     if not (meta / "info.json").exists():
+        available = list_datasets()
+        listing = (
+            "Datasets on this machine:\n"
+            + "\n".join(
+                f"  {d.repo_id}"
+                + (f"  ({d.episodes} episodes)" if d.episodes is not None else "")
+                for d in available
+            )
+            if available
+            else "No datasets found under $HF_LEROBOT_HOME."
+        )
         raise FileNotFoundError(
             f"No LeRobot dataset found at {dataset_root} (missing meta/info.json). "
-            "Pass --repo_id (and --root if it isn't under $HF_LEROBOT_HOME)."
+            "Pass --repo_id as one of the ids below or as a path to a dataset "
+            f"directory (and --root if it isn't under $HF_LEROBOT_HOME).\n{listing}"
         )
 
     log_say(f"Loading episode {episode} from {dataset_root}.")
@@ -201,14 +246,33 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # right after a loop iteration already ended at rest).
     rested = False
 
-    def _go_to_rest(message: str = "Returning to rest pose.") -> None:
-        nonlocal rested
-        log_say(message)
-        reset_controller.return_to_rest(robot)
-        rested = True
-
     def _stopped() -> bool:
         return stop_event.is_set()
+
+    def _go_to_rest(
+        message: str = "Returning to rest pose.", *, final: bool = False
+    ) -> None:
+        # Guarded: a sustained torque residual (contact) drops the arms into
+        # a limp gravity-comp hold. Replay has no interactive retry channel, so the
+        # hold lasts until the run is stopped — `rested` then stays False and
+        # the teardown skips its redundant return attempt. The teardown's own
+        # return (``final=True``) must play even though the stop flag is
+        # already set, so it passes no stop hook; on contact it aborts
+        # immediately instead of holding (nothing could end that hold).
+        nonlocal rested
+        log_say(message)
+        rested = reset_controller.return_to_rest(
+            robot,
+            torque_threshold=cfg.reset_torque_threshold,
+            gravity_comp_kd=cfg.reset_gravity_comp_kd,
+            stopped=None if final else _stopped,
+            on_contact=None
+            if final
+            else lambda: log_say(
+                "Contact during return to rest — arms are limp. Free them, "
+                "then stop the run."
+            ),
+        )
 
     # Interpolated playback commands the arms at ~_INTERP_HZ (the teleop rate)
     # by linearly blending between consecutive recorded actions. Episode timing
@@ -218,7 +282,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
     # are close enough that lerp ~= slerp at these deltas).
     substeps = max(1, round(_INTERP_HZ / fps)) if cfg.interpolate else 1
 
-    async def _play_episode() -> None:
+    async def _play_episode() -> tuple[str, float] | None:
         """Stream the episode's actions from the robot's event loop.
 
         Runs *on* the robot's event loop so each command is dispatched inline
@@ -229,7 +293,20 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         ``motion_control`` derives its velocity/acceleration feedforward by
         differentiating commanded positions against wall time, so interval
         jitter comes out of the arm as torque jitter.
+
+        With ``teleop_torque_threshold`` set (> 0), a torque residual
+        sustained above it (the scene changed since the recording —
+        something is in the way, or a gripper caught) stops playback and
+        returns the tripped ``(joint, residual)``; ``None`` on a clean
+        finish or stop.
         """
+        from ..robot.control import ContactWatchdog
+
+        watchdog = (
+            ContactWatchdog(cfg.teleop_torque_threshold)
+            if cfg.teleop_torque_threshold > 0
+            else None
+        )
         send_period = 1.0 / (fps * substeps)
         deadline = time.perf_counter()
         for idx in range(num_frames):
@@ -239,23 +316,37 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
             nxt = action_matrix[idx + 1] if idx + 1 < num_frames else base
             for sub in range(substeps):
                 if _stopped():
-                    return
+                    return None
                 deadline += send_period
                 values = base if sub == 0 else base + (nxt - base) * (sub / substeps)
                 action = {name: float(values[i]) for i, name in enumerate(action_names)}
                 await robot.send_action_async(action)
+                if watchdog is not None:
+                    tripped = watchdog.update(robot.torque_residuals())
+                    if tripped is not None:
+                        joint, residual = tripped
+                        _logger.warning(
+                            "replay contact: %s torque residual %.1f exceeds "
+                            "%.1f — stopping playback",
+                            joint,
+                            residual,
+                            cfg.teleop_torque_threshold,
+                        )
+                        return tripped
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
+        return None
 
-    def _play_episode_blocking() -> None:
+    def _play_episode_blocking() -> tuple[str, float] | None:
         """Run the playback coroutine on the robot's loop; block until done.
 
         On Ctrl+C, signal the coroutine to unwind and wait for it to finish so
         it stops commanding the robot before teardown, then re-raise (the
-        outer handler falls through to the return-to-rest teardown).
+        outer handler falls through to the return-to-rest teardown). Returns
+        the playback watchdog's trip, or ``None``.
         """
         fut = asyncio.run_coroutine_threadsafe(_play_episode(), robot.event_loop)
         try:
-            fut.result()
+            return fut.result()
         except KeyboardInterrupt:
             stop_event.set()
             try:
@@ -300,7 +391,29 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
                     f"Replaying episode {episode}: {num_frames} frames at "
                     f"{fps} fps{interp_note}."
                 )
-            _play_episode_blocking()
+            contact = _play_episode_blocking()
+
+            if contact is not None:
+                # Playback hit something the recording didn't expect: hold
+                # the arms limp so the operator can clear them by hand.
+                # Replay has no interactive continue channel, so the hold
+                # lasts until the run is stopped (Ctrl+C or the UI's Stop);
+                # the teardown's final return then parks the arm.
+                log_say(
+                    "Contact during playback — the arms are limp and free "
+                    "to move. Free them, then stop the run."
+                )
+                reset_controller.hold_limp(
+                    robot,
+                    gravity_comp_kd=cfg.reset_gravity_comp_kd,
+                    wait=None,
+                    stopped=_stopped,
+                )
+                # The arms were hand-guided during the hold: clear the stale
+                # command history so the teardown's return-to-rest isn't
+                # rejected by the max-step safety check.
+                robot.reset_command_state()
+                break
 
             if not loop or _stopped():
                 break
@@ -326,7 +439,7 @@ def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) 
         # force-kills the worker mid-move.
         if robot.is_connected and not rested:
             try:
-                _go_to_rest("Replay finished. Returning to rest pose.")
+                _go_to_rest("Replay finished. Returning to rest pose.", final=True)
             except Exception:  # noqa: BLE001 - best-effort; still tear down
                 _logger.warning("return-to-rest during teardown failed", exc_info=True)
 

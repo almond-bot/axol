@@ -75,6 +75,11 @@ async def _enable(arm: AxolArm, present: set[Joint]) -> None:
     if present == set(Joint):
         await arm.enable()
         return
+    # This subset path bypasses AxolArm.enable, so resolve/verify the present
+    # joints' encoder zeros (either-stop side detection + unset-zero
+    # rejection) before any torque is applied — position reads work on
+    # disabled motors.
+    await arm.resolve_joint_offsets(present)
     await asyncio.gather(*[arm.motors[j].enable() for j in present])
     await asyncio.gather(
         *[arm.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in present]

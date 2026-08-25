@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lerobot_robot_axol"
+version = "0.1.0"
+description = "LeRobot plugin for the Almond Axol dual-arm robot: robot `axol`, VR teleoperator `axol_vr`, camera `zed`."
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.12"
+# 0.1.24 is the first release published to PyPI (and the first with the
+# LeRobot bindings this plugin re-exports).
+dependencies = ["almond-axol[lerobot]>=0.1.24"]
+
+[project.urls]
+Homepage = "https://docs.almond.bot"
+Repository = "https://github.com/almond-bot/axol"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lerobot_robot_axol"]

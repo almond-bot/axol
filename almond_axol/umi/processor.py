@@ -42,8 +42,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-from torch import Tensor
-
 from lerobot.processor import ProcessorStepRegistry
 from lerobot.processor.relative_action_processor import (
     AbsoluteActionsProcessorStep,
@@ -51,6 +49,7 @@ from lerobot.processor.relative_action_processor import (
 )
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
+from torch import Tensor
 
 _EE_AXES = ("x", "y", "z", "rx", "ry", "rz")
 

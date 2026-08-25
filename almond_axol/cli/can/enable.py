@@ -1,11 +1,14 @@
 """
 axol can.enable
 
-Runs the CAN startup script to bring up the Almond Axol CAN interfaces.
-Requires can.setup to have been run at least once to generate the script.
+Runs the CAN startup script to bring up the Almond Axol CAN interfaces —
+every configured bus the host has: the arm hub pair (can_alm_axol_l/r), the
+cart wheel bus (can_alm_axol_b), and the chest bus (can_alm_axol_c), each
+skipped when its adapter isn't attached. Requires can.setup to have been run
+at least once to generate the script.
 ``--umi`` brings up the Mantis UMI's interfaces instead of the arm's.
 
-For setups without the Axol hub CAN adapter, pass ``--channels`` to bring up
+For setups without the Axol-named adapters, pass ``--channels`` to bring up
 other SocketCAN interfaces directly instead (no startup script needed):
 
     axol can.enable --channels can0

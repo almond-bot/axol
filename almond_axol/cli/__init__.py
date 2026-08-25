@@ -19,6 +19,8 @@ from .can import setup as can_setup
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .jetson import setup as jetson_setup
+from .lift import goto as lift_goto
+from .lift import home as lift_home
 from .motor import dump_config as motor_dump_config
 from .motor import flash as motor_flash
 from .motor import health as motor_health
@@ -111,6 +113,8 @@ def main() -> None:
     umi_latency.add_parser(subparsers)
     tracker_bridge.add_parser(subparsers)
     tracker_identify.add_parser(subparsers)
+    lift_home.add_parser(subparsers)
+    lift_goto.add_parser(subparsers)
     set_can_id.add_parser(subparsers)
     set_zero_pos.add_parser(subparsers)
     motor_info.add_parser(subparsers)

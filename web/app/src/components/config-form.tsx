@@ -21,6 +21,118 @@ interface CommonProps {
   onReset: (key: string) => void
 }
 
+/** One suggestion offered inside a text field (typing stays free-form). */
+export interface FieldSuggestion {
+  value: string
+  /** Secondary text shown next to the value (e.g. "12 episodes"). */
+  label?: string
+}
+
+/**
+ * A text input with an attached suggestion dropdown — one visual control, not
+ * an input plus a separate picker. Focusing (or typing) opens a styled list
+ * of suggestions filtered by the current text; clicking or Enter fills the
+ * field, while any free-form text remains valid. Used for the dataset repo id
+ * on the replay / collect-data panels.
+ */
+function SuggestInput({
+  id,
+  value,
+  placeholder,
+  disabled,
+  suggestions,
+  onChange,
+}: {
+  id: string
+  value: string
+  placeholder?: string
+  disabled: boolean
+  suggestions: FieldSuggestion[]
+  onChange: (value: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [highlight, setHighlight] = useState(-1)
+
+  // Filter by the typed text; an exact match (a suggestion was just picked,
+  // or the field reopened on a stored value) shows the full list again so
+  // the operator can switch datasets without clearing the field first.
+  const text = value.trim().toLowerCase()
+  const exact = suggestions.some((s) => s.value.toLowerCase() === text)
+  const shown =
+    text === "" || exact
+      ? suggestions
+      : suggestions.filter((s) => s.value.toLowerCase().includes(text))
+
+  function pick(v: string) {
+    onChange(v)
+    setOpen(false)
+    setHighlight(-1)
+  }
+
+  return (
+    <div className="relative">
+      <Input
+        id={id}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        autoComplete="off"
+        onChange={(e) => {
+          onChange(e.target.value)
+          setOpen(true)
+          setHighlight(-1)
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => {
+          setOpen(false)
+          setHighlight(-1)
+        }}
+        onKeyDown={(e) => {
+          if (!open || shown.length === 0) return
+          if (e.key === "ArrowDown") {
+            e.preventDefault()
+            setHighlight((h) => (h + 1) % shown.length)
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault()
+            setHighlight((h) => (h <= 0 ? shown.length - 1 : h - 1))
+          } else if (e.key === "Enter" && highlight >= 0) {
+            e.preventDefault()
+            pick(shown[highlight].value)
+          } else if (e.key === "Escape") {
+            setOpen(false)
+            setHighlight(-1)
+          }
+        }}
+      />
+      {open && shown.length > 0 && (
+        <ul className="absolute top-full right-0 left-0 z-20 mt-1 max-h-52 overflow-auto rounded-md border border-white/10 bg-[#1c1c1c] py-1 shadow-xl">
+          {shown.map((s, i) => (
+            <li key={s.value}>
+              <button
+                type="button"
+                // mousedown fires before the input's blur, which would
+                // otherwise close the list under the click.
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  pick(s.value)
+                }}
+                onMouseEnter={() => setHighlight(i)}
+                className={cn(
+                  "flex w-full items-baseline justify-between gap-3 px-3 py-1.5 text-left text-sm",
+                  i === highlight ? "bg-white/10 text-foreground" : "text-white/80"
+                )}
+              >
+                <span className="truncate">{s.value}</span>
+                {s.label && <span className="shrink-0 text-xs text-white/40">{s.label}</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 // -- vector fields (numeric arrays rendered one input per component) ---------
 
 const XYZ = ["x", "y", "z"]
@@ -33,7 +145,12 @@ const vectorDefault = (field: SchemaField): number[] =>
 /** Parse one component's text: number when it is one, raw text while mid-edit. */
 const parseComponent = (text: string): number | string => {
   const t = text.trim()
-  return t !== "" && Number.isFinite(Number(t)) ? Number(t) : text
+  const n = Number(t)
+  // Only commit to a number when it round-trips exactly: Number("0.") is 0,
+  // so converting eagerly would rewrite "0." to "0" under the cursor and make
+  // it impossible to type a decimal point. Non-canonical text ("0.", "-0",
+  // ".5") stays a string and is coerced server-side.
+  return t !== "" && Number.isFinite(n) && String(n) === t ? n : text
 }
 
 /** Current component values: the override if set, else the defaults. */
@@ -62,14 +179,22 @@ function setVectorComponent(
  * Renders a curated, flat list of fields (a hand-picked subset of an op's
  * full schema) — used by the operation panels and the diagnostics actions.
  */
-export function CuratedForm({ fields, ...common }: CommonProps & { fields: SchemaField[] }) {
+export function CuratedForm({
+  fields,
+  suggestions,
+  ...common
+}: CommonProps & {
+  fields: SchemaField[]
+  /** Optional suggestions per field key (e.g. datasets on disk under repo_id). */
+  suggestions?: Record<string, FieldSuggestion[]>
+}) {
   if (fields.length === 0) {
     return <p className="text-sm text-white/40">No settings — just press Start.</p>
   }
   return (
     <div className="flex flex-col gap-4">
       {fields.map((f) => (
-        <FieldRow key={f.key} field={f} {...common} />
+        <FieldRow key={f.key} field={f} suggestions={suggestions?.[f.key]} {...common} />
       ))}
     </div>
   )
@@ -298,11 +423,17 @@ export function FlatSchemaForm({
 export function FieldRow({
   field,
   showPath,
+  suggestions,
   overrides,
   disabled,
   onChange,
   onReset,
-}: CommonProps & { field: SchemaField; showPath?: boolean }) {
+}: CommonProps & {
+  field: SchemaField
+  showPath?: boolean
+  /** Suggestions offered inside a text input (typing stays free-form). */
+  suggestions?: FieldSuggestion[]
+}) {
   const has = field.key in overrides
   const value = has ? overrides[field.key] : undefined
   const modified = isModified(field, value)
@@ -397,6 +528,15 @@ export function FieldRow({
             </option>
           ))}
         </select>
+      ) : suggestions && suggestions.length > 0 ? (
+        <SuggestInput
+          id={fieldId}
+          value={text}
+          placeholder={field.required ? "required" : defaultString(field)}
+          disabled={disabled}
+          suggestions={suggestions}
+          onChange={(v) => onChange(field.key, v)}
+        />
       ) : (
         <Input
           id={fieldId}

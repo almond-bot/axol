@@ -1,6 +1,13 @@
 """Public re-exports for almond_axol.robot."""
 
-from .axol import Axol, AxolArm, arm_limits, closer_end_stop
+from .axol import (
+    EITHER_STOP_JOINTS,
+    Axol,
+    AxolArm,
+    arm_limits,
+    closer_end_stop,
+    end_stop_offset_from_position,
+)
 from .base import RobotBase
 from .cart import Cart, CartConfig
 from .config import (
@@ -19,6 +26,8 @@ __all__ = [
     "AxolArm",
     "arm_limits",
     "closer_end_stop",
+    "EITHER_STOP_JOINTS",
+    "end_stop_offset_from_position",
     "ArmConfig",
     "AxolConfig",
     "Cart",

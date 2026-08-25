@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import time
 from pathlib import Path
 from typing import Callable
 
 import can
+
+from ..constants import CAN_BRINGUP_SCRIPT
+from ..utils.sudo import run_root
 
 _logger = logging.getLogger(__name__)
 
@@ -32,13 +36,64 @@ _RECONNECT_POLL_S = 0.2
 # is missing — remind operators at this cadence rather than spamming.
 _RECONNECT_REMIND_S = 30.0
 
+# A send failing with ENOBUFS means the interface TX queue is full. Two very
+# different situations produce it:
+#
+#  - Transient host-side congestion: both channels share one dual-channel
+#    gs_usb adapter, so a brief stall of its USB pipe (e.g. camera traffic
+#    during data collection) backs the queue up while the bus itself is
+#    healthy and draining. The frame is simply dropped, like a send during
+#    a lost interface.
+#  - A dead bus: no node is ACKing frames — on the Axol that's the e-stop
+#    cutting motor power mid-stream. Everything queued behind the dead bus is
+#    a stale motion command that would replay all at once when power returns
+#    (the arm suddenly snapping back to its pre-e-stop position), so the
+#    queue must be purged and sends held off until the bus is proven alive.
+#
+# The two are told apart by duration: at 1 Mbit/s a healthy full queue
+# (txqueuelen 512) drains in ~65 ms, so ENOBUFS persisting across sends for
+# longer than this means nothing is draining — the bus is dead.
+_STALL_DETECT_S = 1.0
 
-def _iface_lost(exc: BaseException) -> bool:
-    """True when *exc* is a socket failure meaning the interface went away."""
+# Transient overflows come in bursts at telemetry rates; warn at most this
+# often so congestion doesn't flood the log with one line per dropped frame.
+_TX_FULL_WARN_INTERVAL_S = 5.0
+
+# Arbitration ID of the aliveness probe frame. Unused by both motor protocols
+# (Damiao: motor IDs 0x01-0x08 plus 0x100/0x200/0x300 offsets, feedback
+# 0x11-0x18, register access 0x7FF; MyActuator: 0x140/0x240/0x400/0x500 + ID),
+# so every device on the bus ignores it — but any powered CAN node still ACKs
+# it at the link layer, which is exactly the signal we need.
+_PROBE_ID = 0x7F0
+_PROBE_POLL_S = 0.25
+# One flush of the bring-up script flaps *every* channel, so when both arms'
+# buses stall together (they share the e-stop), the second one can skip it.
+_FLUSH_DEDUPE_S = 3.0
+
+_flush_lock = asyncio.Lock()
+_last_flush_monotonic = 0.0
+
+
+def _error_code(exc: BaseException) -> int | None:
+    """Extract the errno from a python-can or OS-level exception."""
     code = getattr(exc, "error_code", None)  # python-can CanOperationError
     if code is None:
         code = getattr(exc, "errno", None)
-    return code in _IFACE_LOST_ERRNOS
+    return code
+
+
+def _iface_lost(exc: BaseException) -> bool:
+    """True when *exc* is a socket failure meaning the interface went away."""
+    return _error_code(exc) in _IFACE_LOST_ERRNOS
+
+
+def _tx_queue_full(exc: BaseException) -> bool:
+    """True when *exc* means the interface's TX queue is full (``ENOBUFS``).
+
+    Whether that's transient host-side congestion or a dead bus is decided
+    by how long it persists — see :data:`_STALL_DETECT_S`.
+    """
+    return _error_code(exc) == errno.ENOBUFS
 
 
 def _iface_is_up(channel: str) -> bool:
@@ -62,6 +117,18 @@ class CanBus:
     interface is back up, keeping every registered listener attached. Sends
     during the gap are dropped, so request/response commands fall into their
     usual timeout path (``MotorError``) and resume after the reconnect.
+    A momentarily full TX queue (``ENOBUFS`` under host-side USB congestion)
+    is handled the same way, minus the reconnect: the frame is dropped and
+    the next command cycle proceeds normally.
+
+    A stalled bus — the e-stop cutting motor power so nothing ACKs frames and
+    the kernel TX queue fills (``ENOBUFS`` persisting past
+    :data:`_STALL_DETECT_S`, past any transient congestion) — is handled the
+    same way, with two extra steps: the queued (now stale) motion commands are purged by
+    flapping the interface, and sends stay dropped until a probe frame is
+    actually ACKed on the wire again. Without the purge, up to ``txqueuelen``
+    stale position commands replay the instant the arm is powered back on,
+    snapping it to its pre-e-stop pose.
 
     Use as an async context manager:
 
@@ -86,9 +153,18 @@ class CanBus:
         # Set while the interface is gone (USB drop): sends are dropped and
         # the reader loop is waiting to reopen the socket.
         self._lost = False
+        # Set while the bus is stalled (e-stop cut motor power, nothing ACKs):
+        # sends are dropped until a probe frame is ACKed on the wire again.
+        self._stalled = False
         # Poked by socket readability or a failed send, so the idle reader
         # wakes both for frames and for lost-interface handling.
         self._wake = asyncio.Event()
+        # Monotonic deadline for the next TX-queue-full warning (rate limit).
+        self._next_tx_full_warn = 0.0
+        # Loop time of the first ENOBUFS in the current burst (None outside
+        # one); a successful send resets it. Overflow persisting longer than
+        # _STALL_DETECT_S means the queue isn't draining — bus dead (e-stop).
+        self._enobufs_since: float | None = None
 
     async def start(self) -> None:
         """Start the background frame-dispatch loop. Idempotent.
@@ -128,9 +204,10 @@ class CanBus:
         self._listeners.append(listener)
 
     async def _send(self, arbitration_id: int, data: bytes) -> None:
-        if self._lost or self._bus is None:
-            # Interface is gone (USB drop) — drop the frame; motor commands
-            # time out upstream and resume once the reader has reconnected.
+        if self._lost or self._stalled or self._bus is None:
+            # Interface is gone (USB drop) or the bus is stalled (e-stop) —
+            # drop the frame; motor commands time out upstream and resume
+            # once the reader has recovered the bus.
             return
         msg = can.Message(
             arbitration_id=arbitration_id, data=data, is_extended_id=False
@@ -140,9 +217,39 @@ class CanBus:
         try:
             self._bus.send(msg)
         except (can.CanError, OSError) as exc:
-            if not _iface_lost(exc):
+            if _tx_queue_full(exc):
+                self._on_tx_queue_full(exc)
+            elif _iface_lost(exc):
+                self._mark_lost(exc)
+            else:
                 raise
-            self._mark_lost(exc)
+        else:
+            self._enobufs_since = None
+
+    def _on_tx_queue_full(self, exc: BaseException) -> None:
+        """Classify an ``ENOBUFS`` send: transient congestion or a dead bus.
+
+        The frame is dropped either way — commands time out upstream
+        (``MotorError``) and resume. Transient host-side congestion drains
+        within milliseconds, so overflow persisting across sends for
+        :data:`_STALL_DETECT_S` means no node is ACKing (e-stop) and stall
+        recovery (purge + probe) takes over.
+        """
+        now = asyncio.get_running_loop().time()
+        if self._enobufs_since is None:
+            self._enobufs_since = now
+        elif now - self._enobufs_since >= _STALL_DETECT_S:
+            self._enobufs_since = None
+            self._mark_stalled(exc)
+            return
+        if now >= self._next_tx_full_warn:
+            self._next_tx_full_warn = now + _TX_FULL_WARN_INTERVAL_S
+            _logger.warning(
+                "CAN %s: TX queue full (%s) — dropping frame(s); "
+                "consider raising txqueuelen if this persists",
+                self._channel,
+                exc,
+            )
 
     def _mark_lost(self, cause: BaseException) -> None:
         """Flag the interface as gone and wake the reader to start reconnecting."""
@@ -156,11 +263,34 @@ class CanBus:
         )
         self._wake.set()
 
+    def _mark_stalled(self, cause: BaseException) -> None:
+        """Flag the bus as stalled and wake the reader to purge the TX queue."""
+        if self._stalled:
+            return
+        self._stalled = True
+        # Also flag lost so the pump exits and hands control to the recovery
+        # path; _reconnect clears it once the socket is reopened, while
+        # _stalled keeps sends dropped until the bus is proven alive.
+        self._lost = True
+        _logger.warning(
+            "CAN %s: TX queue full (%s) — no node is ACKing frames, so the "
+            "motors are most likely unpowered (e-stop?). Dropping commands and "
+            "purging the queued ones so the arm doesn't replay them when power "
+            "returns.",
+            self._channel,
+            cause,
+        )
+        self._wake.set()
+
     async def _reader_loop(self) -> None:
         loop = asyncio.get_running_loop()
         while True:
             await self._pump(loop)
+            if self._stalled:
+                await self._flush_tx_queue()
             await self._reconnect(loop)
+            if self._stalled:
+                await self._wait_bus_alive(loop)
 
     async def _pump(self, loop: asyncio.AbstractEventLoop) -> None:
         """Dispatch frames until the interface is lost (or the task is cancelled)."""
@@ -231,6 +361,124 @@ class CanBus:
         self._lost = False
         _logger.warning(
             "CAN %s: interface is back after %.1fs — resuming",
+            self._channel,
+            loop.time() - started,
+        )
+
+    async def _flush_tx_queue(self) -> None:
+        """Purge the stale frames queued behind a dead (e-stopped) bus.
+
+        Closing the socket does not help: frames already handed to the
+        interface queue survive socket close and transmit the moment a
+        powered-on motor ACKs again. Only taking the interface down drops
+        them. Robots configured by ``axol can.setup`` have the bring-up
+        script, which flaps both arm-hub channels together (flapping one at
+        a time can wedge the adapter's RX path) and leaves them configured
+        and up; without it, flap just this channel.
+        """
+        global _last_flush_monotonic
+        async with _flush_lock:
+            script_exists = CAN_BRINGUP_SCRIPT.exists()
+            if (
+                script_exists
+                and time.monotonic() - _last_flush_monotonic < _FLUSH_DEDUPE_S
+            ):
+                # The other arm's bus just ran the script, which flapped this
+                # channel too — the queue is already empty.
+                return
+            try:
+                if script_exists:
+                    await asyncio.to_thread(
+                        run_root, ["bash", str(CAN_BRINGUP_SCRIPT)], check=True
+                    )
+                else:
+                    await asyncio.to_thread(
+                        run_root,
+                        ["ip", "link", "set", self._channel, "down"],
+                        check=True,
+                    )
+                    await asyncio.to_thread(
+                        run_root, ["ip", "link", "set", self._channel, "up"], check=True
+                    )
+            except (RuntimeError, OSError) as exc:
+                _logger.error(
+                    "CAN %s: could not purge the TX queue (%s) — stale motion "
+                    "commands will replay when the motors power back on. Flap "
+                    "the interface (`axol can.setup`, or ip link set %s "
+                    "down/up) before re-powering the arm.",
+                    self._channel,
+                    exc,
+                    self._channel,
+                )
+                return
+            _last_flush_monotonic = time.monotonic()
+            _logger.warning(
+                "CAN %s: purged the stale TX queue — commands stay disabled "
+                "until the motors are powered back on",
+                self._channel,
+            )
+
+    async def _wait_bus_alive(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Hold sends off until a probe frame is ACKed on the wire again.
+
+        A CAN frame only completes once *some* powered node ACKs it, so a
+        single probe on an ID no motor listens to (:data:`_PROBE_ID`) detects
+        power returning without commanding anything: it sits at the head of
+        the (freshly purged) TX queue, silently retrying, and its own-message
+        echo arrives the moment the transmission actually completes. Only
+        then are application sends re-enabled — everything commanded while
+        the bus was dead stays dropped instead of becoming the next stale
+        replay.
+        """
+        started = loop.time()
+        next_reminder = started + _RECONNECT_REMIND_S
+        try:
+            probe_bus = can.Bus(
+                channel=self._channel,
+                bustype="socketcan",
+                receive_own_messages=True,
+                can_filters=[{"can_id": _PROBE_ID, "can_mask": 0x7FF}],
+            )
+        except (can.CanError, OSError) as exc:
+            self._mark_lost(exc)
+            return
+        # 8 zero bytes rather than an empty payload: motor-driver listeners
+        # index into msg.data, and this frame loops back to their socket too.
+        probe = can.Message(
+            arbitration_id=_PROBE_ID, data=bytes(8), is_extended_id=False
+        )
+        sent = False
+        try:
+            while True:
+                try:
+                    if not sent:
+                        probe_bus.send(probe)
+                        sent = True
+                    if sent and probe_bus.recv(timeout=0) is not None:
+                        break
+                except (can.CanError, OSError) as exc:
+                    if _iface_lost(exc):
+                        self._mark_lost(exc)
+                        return
+                    if not _tx_queue_full(exc):
+                        raise
+                    # Queue still full (the purge failed, e.g. no root) — the
+                    # probe doesn't fit yet; keep trying so recovery is still
+                    # detected once the stale frames drain on power-up.
+                if loop.time() >= next_reminder:
+                    _logger.warning(
+                        "CAN %s: still waiting for a motor to ACK (%.0fs) — "
+                        "commands stay disabled until the arm is powered on",
+                        self._channel,
+                        loop.time() - started,
+                    )
+                    next_reminder = loop.time() + _RECONNECT_REMIND_S
+                await asyncio.sleep(_PROBE_POLL_S)
+        finally:
+            probe_bus.shutdown()
+        self._stalled = False
+        _logger.warning(
+            "CAN %s: bus is ACKing again after %.1fs — resuming commands",
             self._channel,
             loop.time() - started,
         )

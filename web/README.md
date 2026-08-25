@@ -91,10 +91,12 @@ Each frame sends a JSON message over the WebSocket:
   r_ee:    { position: { x, y, z }, quaternion: { x, y, z, w } }  // right controller
   l_elbow: { x, y, z }
   r_elbow: { x, y, z }
-  l_lock:  boolean   // left grip button state (True = pressed); rising edge of both together enables tracking, either alone disables it
+  l_lock:  boolean   // left grip button state (True = pressed); rising edge of both together enables tracking from rest, then each grip toggles (or, with hold_to_engage, holds) its own arm
   r_lock:  boolean   // right grip button state (True = pressed); see l_lock
   l_grip:  number    // left grip (0 = fully gripped, 1 = open)
   r_grip:  number    // right grip
+  l_tracked: boolean // false when the left controller is only inertially tracked (WebXR emulatedPosition — occluded/out of view); the server holds the last clean pose. Omit to default true
+  r_tracked: boolean // right controller optical-tracking state; see l_tracked
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — powered-cart strafe (ignored without a cart)
@@ -114,7 +116,7 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 
 | # | Button | Action |
 |---|---|---|
-| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking; press either alone to **disable** it (toggle, not hold) |
+| 1 | Left grip | Press both grips (1 + 2) together to **enable** arm tracking from rest; once engaged each grip **toggles its own arm** — click to freeze that arm in place (e.g. while it holds something), click again to resume it. With the `hold_to_engage` setting the grips are dead-man switches instead: hold both to start, release one to freeze that arm, hold to keep it going |
 | 2 | Right grip | See above |
 | 3 | Left trigger | Actuate left gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
 | 4 | Right trigger | Actuate right gripper; while tracking is disengaged, point at a camera screen and hold to **move** it — grab one screen with **both** triggers to **resize** it |
@@ -240,6 +242,6 @@ The server additionally **relays a HUD message between clients**: the headset pu
 
 **Camera video (WebRTC)**
 
-When the server has video sources registered (`VRServer.set_video_sources`, see `almond_axol/video/video.py`), the headset negotiates a WebRTC connection over the same WebSocket: it sends `{ "type": "webrtc-request" }`, the server replies with `{ "type": "webrtc-offer", "sdp": ..., "tracks": { mid: cameraName } }`, and the client answers with `{ "type": "webrtc-answer", "sdp": ... }`. The `useAxolVideo` hook implements the client side and returns the labelled video tracks. A stereo overhead arrives as a single side-by-side track, `overhead_sbs` (both eyes packed into one stream — one decoder session on the headset), which the app renders per-lens through a WebXR media layer; the SDK-fallback path (no gst) instead sends the two per-eye tracks `overhead_left` / `overhead_right`.
+When the server has video sources registered (`VRServer.set_video_sources`, see `almond_axol/video/video.py`), the headset negotiates a WebRTC connection over the same WebSocket: it sends `{ "type": "webrtc-request" }`, the server replies with `{ "type": "webrtc-offer", "sdp": ..., "tracks": { mid: cameraName } }`, and the client answers with `{ "type": "webrtc-answer", "sdp": ... }`. A request that arrives while the robot's cameras are still starting (they can take a while after the server begins accepting connections) is answered with `{ "type": "webrtc-pending" }` and the offer is pushed automatically once video comes up; a server with no video answers `{ "type": "webrtc-unavailable" }`. The `useAxolVideo` hook implements the client side — re-sending the request until an offer lands, so it also recovers against servers that predate `webrtc-pending` — and returns the labelled video tracks. A stereo overhead arrives as a single side-by-side track, `overhead_sbs` (both eyes packed into one stream — one decoder session on the headset), which the app renders per-lens through a WebXR media layer; the SDK-fallback path (no gst) instead sends the two per-eye tracks `overhead_left` / `overhead_right`.
 
 The **control panel** joins the same `/ws` as one more **view-only** WebRTC client (`app/src/components/camera-feeds.tsx`, via `useAxolVideo`) to mirror these feeds in the panel — a headset-off operator view for headset-driven operations, with an optional fullscreen layout. There's no extra backend video path; the relay's encoders are shared. A side-by-side track is displayed cropped to its left eye, and a repeatedly-failing connection offers the same certificate-authorize flow the VR app uses.

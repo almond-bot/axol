@@ -13,8 +13,10 @@ import { useFrame, useThree } from "@react-three/fiber"
  *
  * Until the server has pushed tracking state at least once, this falls back to
  * mirroring the grip toggle locally (both grips together engage, either grip
- * alone disengages — the same edges as the teleop server), so callers behave
- * correctly against an older backend that doesn't broadcast tracking yet.
+ * alone disengages — the edges of the old both-or-nothing teleop servers, the
+ * only ones that don't broadcast tracking), so callers behave correctly
+ * against such an older backend. Newer servers with per-arm engage always
+ * push, so their state wins immediately.
  *
  * A `message` *listener* is added (not `ws.onmessage`) so this coexists with
  * other consumers on the same socket (e.g. `AxolVRClient`, `useAxolVideo`).

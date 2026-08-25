@@ -351,8 +351,16 @@ export function AxolVRClient({
       if (!pose) return null
       const { position: p, orientation: o } = pose.transform
       return {
-        position: { x: p.x, y: p.y, z: p.z },
-        quaternion: { x: o.x, y: o.y, z: o.z, w: o.w },
+        pose: {
+          position: { x: p.x, y: p.y, z: p.z },
+          quaternion: { x: o.x, y: o.y, z: o.z, w: o.w },
+        },
+        // WebXR sets emulatedPosition while the controller's position is only
+        // inertially dead-reckoned (occluded / out of camera view): it drifts
+        // while coasting and snaps when optical tracking re-acquires. Ship the
+        // flag so the server holds the last clean pose instead of chasing the
+        // glitch. `!== true` keeps runtimes that omit the field as tracked.
+        tracked: pose.emulatedPosition !== true,
       }
     }
 
@@ -364,14 +372,16 @@ export function AxolVRClient({
       return { x: p.x, y: p.y, z: p.z }
     }
 
-    const l_ee = getPose(leftSource?.targetRaySpace)
-    const r_ee = getPose(rightSource?.targetRaySpace)
+    const l_hand = getPose(leftSource?.targetRaySpace)
+    const r_hand = getPose(rightSource?.targetRaySpace)
 
-    if (!l_ee || !r_ee) {
+    if (!l_hand || !r_hand) {
       // Lost controller tracking — can't ship a pose frame; leave XR anyway.
       if (yEdge) onExit?.()
       return
     }
+    const l_ee = l_hand.pose
+    const r_ee = r_hand.pose
 
     const body = (frame as XRFrame & { body?: XRBody }).body
     const l_elbow = getPosition(body?.get(L_ELBOW_JOINT))
@@ -408,6 +418,10 @@ export function AxolVRClient({
       r_lock,
       l_grip,
       r_grip,
+      // Per-hand optical-tracking state (see getPose): the server holds a
+      // hand's last tracked pose while its flag is false.
+      l_tracked: l_hand.tracked,
+      r_tracked: r_hand.tracked,
       reset,
       state: stateRef.current,
       l_stick_x,
@@ -426,7 +440,18 @@ export function AxolVRClient({
 
     // End the XR session only now that the Y-press reset frame has been sent, so
     // the backend receives the return-to-rest before the pose stream stops.
-    if (yEdge) onExit?.()
+    if (yEdge) {
+      // This exit frame carries the return-to-rest reset and is the last one
+      // sent — no later frame can re-carry it. The preferred pose channel is
+      // deliberately unreliable (maxRetransmits: 0), so one dropped datagram
+      // would leave VR with the robot still engaged mid-air; duplicate the
+      // frame over the reliable WebSocket too (the server de-dupes by seq).
+      const ws = wsRef.current
+      if (ws && ws.readyState === WebSocket.OPEN && netSink !== ws) {
+        ws.send(payload)
+      }
+      onExit?.()
+    }
   })
 
   return null

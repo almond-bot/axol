@@ -426,7 +426,9 @@ class OperationRunner:
             # Fold the camera spec into the argv-style args for the ops whose
             # camera serials are required draccus inputs.
             if cameras and cmd.camera_mode == "argv":
-                args = self._merge_camera_args(args, cameras)
+                args = self._merge_camera_args(
+                    args, cameras, streams_video=cmd.streams_video
+                )
 
             cfg = self._build_config(op_id, args)
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
@@ -712,7 +714,7 @@ class OperationRunner:
         return (global_on and enabled), eyes
 
     def _merge_camera_args(
-        self, args: dict[str, Any], cameras: dict[str, Any]
+        self, args: dict[str, Any], cameras: dict[str, Any], *, streams_video: bool
     ) -> dict[str, Any]:
         """Fold a camera spec into collect-data / run-policy form args.
 
@@ -738,6 +740,11 @@ class OperationRunner:
         A camera that takes part in neither branch is omitted entirely. Capture
         resolution per camera is the streaming resolution when it streams, else
         the recording resolution (no point grabbing larger than it records).
+        ``streams_video`` says whether the *command* relays camera video to the
+        headset at all; when it doesn't (run-policy), the whole streaming
+        branch is ignored so every camera captures at the recording
+        resolution — the size the dataset was recorded at and the policy was
+        trained on.
 
         A recording fps above the cameras' default capture rate raises each
         *recording* camera's capture fps to match: on the encoded relay
@@ -755,7 +762,13 @@ class OperationRunner:
 
         merged = dict(args)
         serials = self._camera_serials(cameras)
-        stream_res = self._resolution(cameras, "stream_resolution", legacy="resolution")
+        # A command that never streams headset video has no streaming branch,
+        # whatever the saved settings say.
+        stream_res = (
+            self._resolution(cameras, "stream_resolution", legacy="resolution")
+            if streams_video
+            else None
+        )
         record_res = self._resolution(cameras, "record_resolution")
         detected = stereo_serials()
 

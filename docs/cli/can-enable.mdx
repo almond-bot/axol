@@ -7,7 +7,7 @@ Re-runs the CAN startup script to configure and bring up the interfaces. Normall
 
 For setups without the Axol Hub CAN adapter, pass `--channels` to bring up other SocketCAN interfaces directly — one for a single arm, two for both. This skips the hub startup script (no `can.setup` needed): each named interface is configured (1 Mbit/s bitrate, txqueuelen) and brought up; interfaces already up are left untouched.
 
-The startup script also brings up the [powered cart](/guides/vr-interface#powered-cart)'s pinned wheel bus when one was configured, and skips any interface — arm hub or cart — that isn't attached, so a cart-only host (no arm hub) and an arm-only host (no cart) each come up cleanly. You rarely need to run this for the cart anyway: [`axol teleop`](/cli/teleop) brings the cart's interface up itself when it starts.
+The startup script also brings up the [powered cart](/guides/vr-interface#powered-cart)'s pinned wheel bus (`can_alm_axol_b`) and the chest bus carrying the lift controller (`can_alm_axol_c`) when they were configured, and skips any interface — arm hub, cart, or chest — that isn't attached, so every hardware combination (cart-only, arm-only, all of them) comes up cleanly. You rarely need to run this for the cart or lift anyway: [`axol teleop`](/cli/teleop) brings their interfaces up itself when it starts.
 
 ```bash
 axol can.enable                      # Axol Hub (startup script)

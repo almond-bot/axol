@@ -45,8 +45,12 @@ def _urls() -> list[str]:
 def ice_servers() -> list[RTCIceServer]:
     """aiortc ``RTCIceServer`` list from the environment; empty when unset.
 
-    An empty list is the signal to construct ``RTCPeerConnection()`` with no
-    explicit configuration (aiortc's default), keeping the LAN path untouched.
+    Callers must pass the result — even when empty — as an explicit
+    ``RTCConfiguration(iceServers=...)``: a bare ``RTCPeerConnection()`` uses
+    aiortc's default configuration, which includes Google's public STUN
+    server, and on hosts that can't reach it ICE gathering stalls ~5s per
+    offer waiting for the STUN timeout. The LAN path needs host candidates
+    only, which an empty list gathers instantly.
     """
     urls = _urls()
     if not urls:

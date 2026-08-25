@@ -191,6 +191,13 @@ class Motor:
         end stops, not at the rest position (see ``closer_end_stop``).
         """
         await self._driver.set_zero_position()
+        # Any cached sample predates the new zero (and MyActuator also
+        # reboots, re-deriving position within ±180° of it), so it no longer
+        # describes the motor frame. Drop it; telemetry or the next feedback
+        # frame repopulates with a post-rezero reading. Safe to clear after
+        # the await: the MyActuator driver sleeps out the ~2 s reboot before
+        # returning, so no pre-reset frame can land later.
+        self._position = None
 
     async def set_control_mode(self, mode: ControlMode) -> None:
         """Set the active control mode.
@@ -209,6 +216,15 @@ class Motor:
         """
         await self._driver.set_control_mode(mode)
         self.mode = mode
+        # The MyActuator reset re-derives the multi-turn position from the
+        # single-turn absolute encoder (within ±180° of zero), so a cached
+        # pre-reboot sample can be 360° off the new frame — stale enough to
+        # poison the wrap re-verification in AxolArm.resolve_joint_offsets.
+        # Drop it; telemetry or the next feedback frame repopulates with a
+        # post-reboot reading. (Damiao doesn't reboot; clearing is harmless.)
+        # Safe to clear after the await: the driver sleeps out the ~2 s
+        # reboot before returning, so no pre-reset frame can land later.
+        self._position = None
 
     async def get_control_mode(self) -> ControlMode | None:
         """Return the active control mode read from hardware, or None if unsupported.
@@ -290,6 +306,11 @@ class Motor:
                 pass  # Dropped CAN frames are normal on physical buses; skip cycle
             elapsed = asyncio.get_event_loop().time() - start
             await asyncio.sleep(max(0.0, interval - elapsed))
+
+    @property
+    def telemetry_active(self) -> bool:
+        """True while the background telemetry polling loop is running."""
+        return self._telemetry_task is not None
 
     @property
     def has_position(self) -> bool:

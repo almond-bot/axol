@@ -25,8 +25,7 @@ function applyOverlayMaterials(root: THREE.Object3D) {
     const mesh = obj as THREE.Mesh
     if (!mesh.isMesh) return
     const source = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
-    const color =
-      (source as THREE.MeshStandardMaterial | undefined)?.color?.getHex() ?? 0x888888
+    const color = (source as THREE.MeshStandardMaterial | undefined)?.color?.getHex() ?? 0x888888
     let mat = cache.get(color)
     if (!mat) {
       mat = new THREE.MeshBasicMaterial({

@@ -42,6 +42,7 @@ import numpy as np
 from ..kinematics import KinematicsConfig
 from ..robot.base import RobotBase
 from ..robot.cart import Cart
+from ..robot.control import ContactWatchdog
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
@@ -252,6 +253,13 @@ class VRTeleop:
 
         if self._parent_conn is not None:
             try:
+                # Drain in-flight worker responses before closing: the dispatch
+                # thread can stop mid solve, and closing a connection with
+                # unread data RSTs the peer — the worker's blocking recv then
+                # dies with ConnectionResetError instead of reading the None
+                # shutdown sentinel.
+                while self._parent_conn.poll(0):
+                    self._parent_conn.recv()
                 self._parent_conn.send(None)
             except Exception:
                 pass
@@ -296,6 +304,20 @@ class VRTeleop:
 
     async def __aexit__(self, *_: object) -> None:
         await self.disable()
+
+    def set_video_expected(self, expected: bool) -> None:
+        """Declare that camera video will be registered once it finishes starting.
+
+        Call before ``async with`` / :meth:`enable` when cameras are
+        configured: the VR server starts accepting headsets long before the
+        video relay finishes opening the cameras, and an early video request
+        would otherwise be answered "unavailable" — hiding the camera screens
+        for the whole session. With this set, early requests wait
+        (``webrtc-pending``) and receive their offer the moment
+        :meth:`set_video_manager` / :meth:`set_video_sources` lands. See
+        :meth:`almond_axol.vr.server.VRServer.set_video_expected`.
+        """
+        self._vr_server.set_video_expected(expected)
 
     def set_video_sources(self, sources: dict[str, object] | None) -> None:
         """Stream camera frames to the headset via WebRTC.
@@ -355,17 +377,117 @@ class VRTeleop:
         tegra = TegraStatsDiag(_logger)
         tegra.start()
 
+        # Guarded return-to-rest needs torque feedback and gravity comp —
+        # hardware (Axol) only. The Sim target has neither (and nothing
+        # physical to protect), so its resets play through the normal path
+        # below.
+        guard = all(
+            hasattr(self._robot, attr)
+            for attr in (
+                "torque_residuals",
+                "gravity_compensate",
+                "reset_command_state",
+            )
+        )
+
+        async def _guard_send_step() -> None:
+            left, right = self.step()
+            if left is not None:
+                await self._robot.motion_control(left=left, right=right)
+
+        async def _guard_gravity_step() -> None:
+            await self._robot.gravity_compensate(  # type: ignore[attr-defined]
+                kd=self._config.reset_gravity_comp_kd
+            )
+
+        def _guard_positions() -> tuple[np.ndarray | None, np.ndarray | None]:
+            left_arm = getattr(self._robot, "left", None)
+            right_arm = getattr(self._robot, "right", None)
+            return (
+                left_arm.positions if left_arm is not None else None,
+                right_arm.positions if right_arm is not None else None,
+            )
+
+        def _guard_vr_alive() -> bool:
+            # Frames within the last ~2s: a Y-exit ends the XR session (the
+            # stream stops instantly), so a contact hold on the way out has
+            # no headset left to press reset — the engine settles it instead
+            # of waiting forever.
+            with self._vr_frame_times_lock:
+                last = self._vr_frame_times[-1] if self._vr_frame_times else None
+            return last is not None and (time.perf_counter() - last) < 2.0
+
+        # Tracking-phase contact watchdog (hardware only, opt-in — the
+        # threshold defaults to 0 = off): the same sustained-torque trip the
+        # guarded return uses, but active while the operator drives (or
+        # holds) the arms. On a trip tracking disengages and the arms go
+        # limp until reset — see VRTeleopCore.contact_hold.
+        track_watchdog = (
+            ContactWatchdog(self._config.teleop_torque_threshold)
+            if guard and self._config.teleop_torque_threshold > 0
+            else None
+        )
+
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
         deadline = time.perf_counter()
         try:
             while True:
+                # Every rest move — the startup trajectory, an X reset, the
+                # Y-exit reset — plays through the shared guarded engine on
+                # hardware: torque watchdog, and a limp gravity-comp hold on
+                # contact (reset replans from wherever the arms are left).
+                # See VRTeleopCore.guarded_return.
+                if guard and self._core.is_resetting:
+                    await self._core.guarded_return(
+                        send_step=_guard_send_step,
+                        gravity_step=_guard_gravity_step,
+                        torque_residuals=self._robot.torque_residuals,  # type: ignore[attr-defined]
+                        reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                        get_positions=_guard_positions,
+                        stopped=lambda: False,  # unwound by task cancellation
+                        announce=_logger.info,
+                        vr_alive=_guard_vr_alive,
+                    )
+                    # Re-anchor pacing after the excursion so the next cycle
+                    # doesn't try to catch up on the elapsed time.
+                    deadline = time.perf_counter()
+                    prev_iter = 0.0
+                    continue
                 deadline += interval
                 t_start = time.perf_counter()
                 left, right = self.step()
                 t_step = time.perf_counter()
                 await self._robot.motion_control(left=left, right=right)
+
+                if track_watchdog is not None and left is not None:
+                    tripped = track_watchdog.update(
+                        self._robot.torque_residuals()  # type: ignore[attr-defined]
+                    )
+                    if tripped is not None:
+                        joint, residual = tripped
+                        _logger.warning(
+                            "teleop contact: %s torque residual %.1f exceeds "
+                            "%.1f — going limp",
+                            joint,
+                            residual,
+                            self._config.teleop_torque_threshold,
+                        )
+                        await self._core.contact_hold(
+                            gravity_step=_guard_gravity_step,
+                            reset_command_state=self._robot.reset_command_state,  # type: ignore[attr-defined]
+                            get_positions=_guard_positions,
+                            stopped=lambda: False,  # unwound by task cancellation
+                            announce=_logger.info,
+                            vr_alive=_guard_vr_alive,
+                        )
+                        track_watchdog = ContactWatchdog(
+                            self._config.teleop_torque_threshold
+                        )
+                        deadline = time.perf_counter()
+                        prev_iter = 0.0
+                        continue
 
                 now = time.perf_counter()
                 sect["step"] += t_step - t_start
@@ -375,6 +497,20 @@ class VRTeleop:
                 prev_iter = now
                 loop_times.append(now)
                 if now - last_log >= 1.0 and len(loop_times) > 1:
+                    # Surface silent freeze modes: the control loop keeps
+                    # commanding the last smoothed target when either of these
+                    # dies, which reads as "teleop froze" with no explanation.
+                    if self._ik_process is not None and not self._ik_process.is_alive():
+                        _logger.error(
+                            "IK worker process died (exit code %s) — arms are "
+                            "holding the last target; restart teleop",
+                            self._ik_process.exitcode,
+                        )
+                    elif self._ik_thread is not None and not self._ik_thread.is_alive():
+                        _logger.error(
+                            "IK dispatch thread died — arms are holding the "
+                            "last target; restart teleop"
+                        )
                     total = loop_times[-1] - loop_times[0]
                     rate = (len(loop_times) - 1) / total
                     with self._ik_loop_times_lock:

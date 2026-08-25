@@ -1,21 +1,24 @@
 """User-initiated update for ``axol serve`` installed as a uv tool.
 
 The hosted installer (``curl https://axol.almond.bot/install | bash``) installs
-the package with ``uv tool install`` from GitHub, pinned to the latest release
-tag, and runs ``axol serve`` under a systemd service with ``Restart=always``.
-This module surfaces, to the control panel, whether a newer release tag exists
-on the repository and lets the operator apply the update on demand:
+the package with ``uv tool install`` from PyPI, pinned to the version of the
+latest GitHub release (the release workflow publishes every release to PyPI),
+and runs ``axol serve`` under a systemd service with ``Restart=always``. This
+module surfaces, to the control panel, whether a newer release exists and lets
+the operator apply the update on demand:
 
 - :meth:`SelfUpdater.status` answers the polled control-panel indicator. It
   reports the installed version and the highest release tag (resolved by a
-  read-only ``git ls-remote --tags``, debounced and cached), so the UI can show
-  "update available" and a button. Nothing upgrades as a side effect of this
-  check. An update is offered only when a release tag with a *higher* version
-  than the installed one exists -- commits landing on ``main`` between releases
-  are invisible to installs.
+  read-only ``git ls-remote --tags`` against the repository, debounced and
+  cached), so the UI can show "update available" and a button. Nothing upgrades
+  as a side effect of this check. An update is offered only when a release tag
+  with a *higher* version than the installed one exists -- commits landing on
+  ``main`` between releases are invisible to installs.
 - :meth:`SelfUpdater.start` is the Update button. It reinstalls the tool pinned
-  to the newest release tag; once the reinstall succeeds, the process exits so
-  systemd restarts it on the new code. The UI then hard-reloads.
+  to the newest release's version from PyPI; once the reinstall succeeds, the
+  process exits so systemd restarts it on the new code. The UI then
+  hard-reloads. Hosts originally installed from GitHub (pre-PyPI releases)
+  migrate to the PyPI artifact on their next update through the same path.
 
 Because the reinstall rebuilds the tool environment, anything that isn't a
 declared PyPI dependency is dropped and must be reinstalled before we restart
@@ -37,8 +40,8 @@ about ``axol provision`` -- so the new code self-heals on its first control-pane
 contact after the restart.
 
 Dev checkouts (``uv run axol serve`` from a clone) are untouched: the package
-metadata then points at a local directory, not a git URL, and the updater
-no-ops.
+metadata then points at a local directory, not an index or git install, and
+the updater no-ops.
 """
 
 from __future__ import annotations
@@ -59,10 +62,15 @@ from typing import Callable
 _logger = logging.getLogger(__name__)
 
 _PACKAGE = "almond-axol"
-# The tag-pinned reinstall must reproduce the hosted installer's requirement
-# (web/app/public/install): same extras, same Python. Keep the two in sync.
+# The version-pinned reinstall must reproduce the hosted installer's
+# requirement (web/app/public/install): same extras, same Python. Keep the two
+# in sync.
 _EXTRAS = "lerobot,sim"
 _PYTHON_VERSION = "3.13"
+# Where release tags live. Index (PyPI) installs carry no repository metadata,
+# so the release check falls back to this; git installs keep using their own
+# origin URL so forks still see their own releases.
+_REPO_URL = "https://github.com/almond-bot/axol"
 # Release tags look like ``v0.1.2``: a leading "v" plus dotted integers.
 # Anything else (pre-release suffixes, arbitrary tags) is ignored by the
 # updater, so cutting a release is what makes installs see an update.
@@ -113,6 +121,21 @@ def installed_origin() -> tuple[str, str] | None:
     if url.startswith("git+"):
         url = url[len("git+") :]
     return url, commit
+
+
+def installed_from_index() -> bool:
+    """Whether this is a regular index (PyPI) install of the package.
+
+    PEP 610: index installs carry **no** ``direct_url.json`` at all, while git
+    installs record ``vcs_info`` and dev checkouts (editable / directory
+    installs) record ``dir_info`` -- so "metadata exists but no dist at all"
+    and "metadata present" both mean not-an-index-install.
+    """
+    try:
+        dist = distribution(_PACKAGE)
+    except PackageNotFoundError:
+        return False
+    return dist.read_text("direct_url.json") is None
 
 
 def _git(repo_root: Path, *args: str) -> bytes | None:
@@ -225,19 +248,19 @@ class SelfUpdater:
 
     @property
     def release_install(self) -> bool:
-        """Whether this backend is a tag-pinned git tool install.
+        """Whether this backend is a release install (PyPI or tag-pinned git).
 
-        Release installs only ever sit on release-tag commits, so the control
+        Release installs only ever sit on released versions, so the control
         panel compares *versions* against them (a hosted UI built from main
         legitimately differs in commit between releases). Dev checkouts can be
         on any commit, so the panel compares commits directly.
         """
-        return self._origin is not None
+        return self._origin is not None or installed_from_index()
 
     @property
     def enabled(self) -> bool:
-        """Updatable only when installed from git and uv is available."""
-        return self._origin is not None and shutil.which("uv") is not None
+        """Updatable only for release installs with uv available."""
+        return self.release_install and shutil.which("uv") is not None
 
     def ensure_provisioned(self) -> None:
         """Run the once-per-process ``axol provision`` startup heal (see below)."""
@@ -298,7 +321,7 @@ class SelfUpdater:
         relaunches the new code.
         """
         if not self.enabled:
-            return False, "not a git tool install"
+            return False, "not a release install"
         if self._state == "updating" or (
             self._update_task is not None and not self._update_task.done()
         ):
@@ -336,10 +359,12 @@ class SelfUpdater:
         install (unlike the reinstall, which would prune the camera stack),
         which is why the indicator can poll it freely.
         """
-        if self._origin is None:
+        if not self.release_install:
             self._remote_checked_at = time.monotonic()
             return
-        url, _commit = self._origin
+        # Git installs check their own origin (forks see their own releases);
+        # index installs carry no repository metadata, so use the canonical repo.
+        url = self._origin[0] if self._origin is not None else _REPO_URL
         latest = await self._resolve_latest_release(url)
         self._remote_checked_at = time.monotonic()
         if latest is not None:
@@ -400,18 +425,19 @@ class SelfUpdater:
         # take ``_env_lock``; we release it before the post-upgrade
         # `_provision()` below, which re-acquires it (the lock is not reentrant).
         try:
-            if self._origin is None or self._remote_tag is None:
+            if not self.release_install or self._remote_tag is None:
                 self._fail("no release to install")
                 return
-            url, _commit = self._origin
             # Snapshot the release being installed: a background status poll
             # could refresh the cached remote mid-update.
             tag, target_version = self._remote_tag, self._remote_version
-            # Reinstall pinned to the newest release tag. `uv tool upgrade`
-            # cannot be used here: it re-resolves the originally requested
-            # revision (the previous tag), so it would never move to a new
-            # release. The requirement mirrors the hosted installer's.
-            requirement = f"{_PACKAGE}[{_EXTRAS}] @ git+{url}@{tag}"
+            # Reinstall pinned to the newest release's version, from PyPI (the
+            # release workflow publishes every release there; GitHub tags stay
+            # the source of truth for what the newest release *is*). `uv tool
+            # upgrade` cannot be used here: it re-resolves the originally
+            # requested version, so it would never move to a new release. The
+            # requirement mirrors the hosted installer's.
+            requirement = f"{_PACKAGE}[{_EXTRAS}]=={target_version or tag.lstrip('v')}"
             self._phase = "upgrading"
             async with self._env_lock:
                 try:

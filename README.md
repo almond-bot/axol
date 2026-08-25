@@ -20,7 +20,7 @@ The full documentation is hosted at [docs.almond.bot](https://docs.almond.bot). 
 
 ### One-command install (recommended)
 
-One command installs `uv`, the `axol` CLI (from GitHub, with every extra), and a root systemd service that keeps `axol serve` running at boot:
+One command installs `uv`, the `axol` CLI (from PyPI, with every extra), and a root systemd service that keeps `axol serve` running at boot:
 
 ```bash
 curl https://axol.almond.bot/install -fsS | bash
@@ -30,7 +30,7 @@ Then open [axol.almond.bot](https://axol.almond.bot) and connect to the machine.
 
 ### Development install
 
-Install the package from a clone using [`uv`](https://docs.astral.sh/uv/). `pyroki` and `lerobot` are sourced from Git and are resolved automatically:
+Install the package from a clone using [`uv`](https://docs.astral.sh/uv/) — every dependency resolves from PyPI (kinematics comes through our published forks, `almond-pyroki` and `almond-jaxls`):
 
 ```bash
 uv sync
@@ -46,7 +46,7 @@ Install optional dependency groups as needed:
 
 | Extra | Contents | When to use |
 |---|---|---|
-| `lerobot` | LeRobot (from GitHub) | `collect-data`, `run-policy` |
+| `lerobot` | LeRobot (from PyPI, >= 0.6.1) | `collect-data`, `run-policy` |
 | `sim` | viser | `teleop --sim` |
 
 ```bash
@@ -111,6 +111,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) — live motor telemetry, health tiles, and diagnostics scripts, served by `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
 - [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
+- [Quest Without Wearing It](https://docs.almond.bot/guides/quest-headless) — keep the headset awake with nobody wearing it (proximity sensor off) for headless sessions
 
 ### Advanced
 
@@ -123,6 +124,8 @@ Each operation can be driven from the web control panel or the CLI:
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
 - [`can.driver`](https://docs.almond.bot/cli/can-driver)
+- [`lift.home`](https://docs.almond.bot/cli/lift-home)
+- [`lift.goto`](https://docs.almond.bot/cli/lift-goto)
 - [`motor.info`](https://docs.almond.bot/cli/motor-info)
 - [`motor.health`](https://docs.almond.bot/cli/motor-health)
 - [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable)

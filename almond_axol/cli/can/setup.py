@@ -3,20 +3,32 @@ axol can.setup
 
 Sets persistent CAN interface names for the Almond Axol CAN bus adapters,
 registers a root crontab @reboot entry to bring up the interfaces, and
-installs a udev-triggered systemd unit that re-runs the bring-up whenever the
+installs a udev-triggered systemd unit that re-runs the bring-up whenever an
 adapter (re-)enumerates — so a mid-session USB drop of the hub (EMI from the
 arms can kick it off the bus, most visibly on Raspberry Pi 5 hosts) heals
 itself without operator action.
 
-The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two CAN
-channels on a single USB device:
-  channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
-  channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+Up to four Axol buses, every one of them optional and independent:
 
-Robots on the powered cart additionally carry a single-channel candlelight
-adapter (same generic VID/PID) for the wheel bus, named can_alm_axol_b. The
-channel count tells the two apart: the hub always enumerates both channels
-under one serial, the cart adapter exactly one.
+  - The Almond Axol arm hub adapter (VID 0x1D50 / PID 0x606F) exposes two
+    CAN channels on a single USB device:
+      channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
+      channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
+  - The powered cart's wheel bus: a single-channel candlelight adapter
+    (same generic VID/PID) carrying the four Damiao wheel motors at CAN
+    IDs 0x01-0x04, named can_alm_axol_b.
+  - The chest bus: another single-channel adapter, carrying the jelly_legs
+    lift controller (listens on 0x420, answers on 0x421 — see
+    ``almond_axol.robot.lift``), named can_alm_axol_c.
+
+The hub is told apart from the single-channel adapters by channel count: it
+always enumerates both channels under one serial, the others exactly one.
+The two single-channel adapters are physically identical, so they are told
+apart by *probing*: a bus whose jelly_legs board answers a GET_STATUS is the
+chest, one whose Damiao motors answer a register read is the wheels; a bus
+where nothing answers (devices unpowered) falls back to asking the operator.
+A Jetson host's built-in system CAN controller (mttcan) has no USB serial
+and is never touched.
 
 On Raspberry Pi 5 hosts the setup additionally raises the RP1 USB
 controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
@@ -35,13 +47,18 @@ for the other's adapter.
 """
 
 import re
+import socket
+import struct
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from ...constants import (
     CAN_BASE,
+    CAN_BRINGUP_SCRIPT,
+    CAN_CHEST,
     CAN_LEFT,
     CAN_RIGHT,
     CAN_UMI_LEFT,
@@ -53,11 +70,16 @@ from . import driver
 
 _VID = "1d50"
 _PID = "606f"
+_CAN_L = CAN_LEFT
+_CAN_R = CAN_RIGHT
 _CAN_B = CAN_BASE
+_CAN_C = CAN_CHEST
 _BITRATE = 1_000_000
 _TXQUEUELEN = 512
 
-_CAN_DIR = Path.home() / ".almond" / "can"
+_UDEV_RULES_FILE = Path("/etc/udev/rules.d/90-can.rules")
+_CAN_DIR = CAN_BRINGUP_SCRIPT.parent
+_CRON_SCRIPT = CAN_BRINGUP_SCRIPT
 
 
 @dataclass(frozen=True)
@@ -90,10 +112,10 @@ class _Profile:
 
 _AXOL_PROFILE = _Profile(
     label="Almond Axol arm",
-    left=CAN_LEFT,
-    right=CAN_RIGHT,
-    rules_file=Path("/etc/udev/rules.d/90-can.rules"),
-    cron_script=_CAN_DIR / "startup.sh",
+    left=_CAN_L,
+    right=_CAN_R,
+    rules_file=_UDEV_RULES_FILE,
+    cron_script=_CRON_SCRIPT,
     probe_joint=Joint.SHOULDER_1,
     lock_name="axol-can-up.lock",
     hotplug_unit="axol-can-up.service",
@@ -138,10 +160,9 @@ def _scan_adapters() -> dict[str, dict]:
     Dual-channel boards (the Axol arm hub, the Mantis UMI) show up as one
     serial with dev_ids {0, 1}; a single-channel adapter (the cart's
     wheel-bus CANable) as one serial with {0}. Matched on the gs_usb driver
-    rather than a VID/PID
-    so CANable firmware variants that don't use the candlelight 1d50:606f IDs
-    still count; the Jetson's built-in mttcan controller has no USB serial and
-    is excluded either way.
+    rather than a VID/PID so CANable firmware variants that don't use the
+    candlelight 1d50:606f IDs still count; the Jetson's built-in mttcan
+    controller has no USB serial and is excluded either way.
     """
     adapters: dict[str, dict] = {}
     for iface_path in Path("/sys/class/net").glob("can*"):
@@ -182,12 +203,12 @@ def _detect_serials() -> list[str]:
     ]
 
 
-def _detect_base_serials(exclude: str) -> list[str]:
-    """Serials of attached single-channel adapters — cart wheel-bus candidates."""
+def _detect_single_serials(exclude: set[str]) -> list[str]:
+    """Serials of attached single-channel adapters — wheel/chest bus candidates."""
     return [
         serial
         for serial, a in _scan_adapters().items()
-        if len(a["dev_ids"]) == 1 and serial != exclude
+        if len(a["dev_ids"]) == 1 and serial not in exclude
     ]
 
 
@@ -223,7 +244,7 @@ def _serial_of_interface(iface: str) -> str | None:
 def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
     """The serial pinned to interface ``name`` in a profile's udev rules."""
     try:
-        rules = (rules_file or _AXOL_PROFILE.rules_file).read_text()
+        rules = (rules_file or _UDEV_RULES_FILE).read_text()
     except OSError:
         return None
     match = re.search(
@@ -249,46 +270,59 @@ def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
     )
 
 
-def _configured_base_serial() -> str | None:
-    """The cart wheel-bus adapter's serial as pinned by a previous setup.
+def _configured_named_serial(name: str) -> str | None:
+    """A single-channel adapter's serial as pinned by a previous setup.
 
     Never auto-detected outside the interactive ``axol can.setup`` flow: a
     single-channel candlelight adapter is indistinguishable from unrelated
-    hardware, so only a serial the operator has already confirmed — a live
-    ``can_alm_axol_b`` interface or a written udev rule — counts.
+    hardware without probing, so only a serial the operator has already
+    confirmed — a live named interface or a written udev rule — counts here.
     """
-    return _serial_of_interface(_CAN_B) or _rules_serial_for(_CAN_B)
+    return _serial_of_interface(name) or _rules_serial_for(name)
 
 
-def _resolve_serial() -> str:
-    """Pick the adapter serial without prompting (for headless ``ensure_setup``).
+def _resolve_hub_serial() -> str | None:
+    """Pick the hub serial without prompting (for headless ``ensure_setup``).
 
     A previously configured serial (named ``can_alm_axol_*`` interfaces, or
-    the pinned serial in the udev rules) wins outright, so re-running setup on
-    an already-configured host works no matter how many other candlelight
-    adapters are attached. Only a genuinely fresh machine falls back to live
-    detection, where serials the Mantis UMI's rules already claim are excluded —
-    the rig uses the same dual-channel board as the hub (1d50:606f), so with
-    the rig plugged in it would otherwise make the robot's adapter ambiguous.
-    Raises ``RuntimeError`` when zero or several candidates remain, since that
-    needs the interactive ``axol can.setup`` flow to disambiguate.
+    the pinned serial in the udev rules) wins while its adapter is attached —
+    or while no dual-channel candidate is attached at all (an unplugged hub
+    keeps its pin for whenever it returns) — so re-running setup on an
+    already-configured host works no matter how many other candlelight
+    adapters are attached.
+
+    A configured serial that is *absent* while a different hub is attached is
+    stale — this host last ran on another Axol, or the hub was replaced — and
+    must not win: preferring it would re-pin the missing adapter and leave the
+    attached hub unnamed on ``canX``, which is exactly what the control
+    panel's Connect used to trip over. The attached hub is registered instead
+    (when it's unambiguous), matching what the interactive ``axol can.setup``
+    picks in the same situation. Serials the Mantis UMI's rules already claim
+    are excluded from live detection — the rig uses the same dual-channel
+    board as the hub (1d50:606f), so with the rig plugged in it would
+    otherwise make the robot's adapter ambiguous. Several attached candidates
+    still raise, since that needs the interactive flow to disambiguate.
     """
     configured = _configured_serial()
-    if configured:
-        return configured
-    unique = _detect_serials()
     claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
-    unique = [s for s in unique if s not in claimed]
-    if len(unique) == 1:
-        return unique[0]
-    if not unique:
-        raise RuntimeError("Robot not detected")
+    attached = [s for s in _detect_serials() if s not in claimed]
+    if configured and (configured in attached or not attached):
+        return configured
+    if len(attached) == 1:
+        return attached[0]
+    if not attached:
+        return None
     raise RuntimeError(
         "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
     )
 
 
-def _find_serial(profile: _Profile) -> str:
+def _find_serial(profile: _Profile) -> str | None:
+    """Interactively pick a profile's dual-channel adapter.
+
+    Returns None only for the robot profile, when there is no hub (a
+    cart/chest-only robot).
+    """
     print(f"Scanning for {profile.label} CAN adapter ({_VID}:{_PID})...")
 
     unique = _detect_serials()
@@ -309,6 +343,12 @@ def _find_serial(profile: _Profile) -> str:
         if configured:
             print(f"  No adapter attached — keeping configured serial {configured}.")
             return configured
+        if profile is _AXOL_PROFILE:
+            print(
+                "\n  No arm hub found. Enter its serial manually, or leave blank "
+                "for a robot without one (cart/chest only):"
+            )
+            return input("  Serial: ").strip() or None
         print(
             "\n  No adapter found. Enter the serial number manually (blank to abort):"
         )
@@ -328,11 +368,173 @@ def _find_serial(profile: _Profile) -> str:
     return unique[int(idx)]
 
 
-def _write_udev_rules(
-    serial: str, profile: _Profile, base_serial: str | None = None
-) -> None:
-    print(f"Writing udev rules to {profile.rules_file} (requires sudo)...")
-    content = (
+# --------------------------------------------------------------------------
+# Single-channel adapter identification (wheels vs chest)
+# --------------------------------------------------------------------------
+
+# The jelly_legs lift controller listens on 0x420 and answers on 0x421
+# (see almond_axol.robot.lift); a GET_STATUS (opcode 0x04) provokes exactly
+# one status frame. Both IDs are clear of every Damiao/MyActuator range.
+_JELLY_CMD_ID = 0x420
+_JELLY_STATUS_ID = 0x421
+_JELLY_GET_STATUS = bytes([0x04])
+# SET_RATE 0 (opcode 0x05, uint16 period 0): turns the 50 ms status
+# broadcast off. The board starts broadcasting as soon as it has received
+# *any* frame, and that stream starves the CANable's gs_usb TX path (see
+# the firmware README bench note) — so every probe sequence must silence
+# the board before expecting its own transmissions to get through.
+_JELLY_SET_RATE_OFF = bytes([0x05, 0x00, 0x00])
+# Damiao register read: 0x7FF [id_lo, id_hi, 0x33, rid, ...]; the motor
+# echoes a 0x33 reply on its feedback ID. Register 60 (VBUS) is read-only.
+_DAMIAO_CFG_ID = 0x7FF
+_DAMIAO_WHEEL_IDS = (0x01, 0x02, 0x03, 0x04)
+_PROBE_ATTEMPTS = 3
+_PROBE_WINDOW_S = 0.4
+
+
+def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
+    """Send probe frames on ``iface`` and wait briefly for a matching reply.
+
+    Raw SocketCAN (no python-can machinery needed for a one-shot probe).
+    Unanswered probes are harmless: the IDs used command nothing, and a
+    frame left queued behind an unpowered bus is dropped by the bring-up
+    script's interface flap.
+    """
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+    except OSError:
+        return False
+    try:
+        for _ in range(_PROBE_ATTEMPTS):
+            for can_id, data in frames:
+                try:
+                    s.send(
+                        struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0"))
+                    )
+                except OSError:
+                    return False  # interface down / TX queue wedged
+            deadline = time.monotonic() + _PROBE_WINDOW_S
+            while (remaining := deadline - time.monotonic()) > 0:
+                s.settimeout(remaining)
+                try:
+                    frame = s.recv(16)
+                except (TimeoutError, OSError):
+                    break
+                can_id, dlc = struct.unpack("<IB3x", frame[:8])
+                if match(can_id & 0x7FF, frame[8 : 8 + dlc]):
+                    return True
+    finally:
+        s.close()
+    return False
+
+
+def _send_once(iface: str, can_id: int, data: bytes) -> None:
+    """Fire one frame on ``iface`` and return; no reply expected."""
+    try:
+        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+        s.bind((iface,))
+    except OSError:
+        return
+    try:
+        s.send(struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0")))
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def _probe_chest(iface: str) -> bool:
+    """True when a jelly_legs board answers a GET_STATUS on ``iface``.
+
+    Each attempt sends SET_RATE 0 before the GET_STATUS so the board's
+    status broadcast stays off — both for the probe's own reply and for
+    whatever runs on this bus next.
+    """
+    return _probe(
+        iface,
+        [
+            (_JELLY_CMD_ID, _JELLY_SET_RATE_OFF),
+            (_JELLY_CMD_ID, _JELLY_GET_STATUS),
+        ],
+        lambda can_id, _data: can_id == _JELLY_STATUS_ID,
+    )
+
+
+def _probe_wheels(iface: str) -> bool:
+    """True when a Damiao wheel motor (ID 0x01-0x04) answers on ``iface``."""
+    frames = [
+        (_DAMIAO_CFG_ID, bytes([mid, 0x00, 0x33, 60, 0, 0, 0, 0]))
+        for mid in _DAMIAO_WHEEL_IDS
+    ]
+
+    def is_reply(_can_id: int, data: bytes) -> bool:
+        return (
+            len(data) == 8
+            and data[2] == 0x33
+            and data[1] == 0x00
+            and data[0] in _DAMIAO_WHEEL_IDS
+        )
+
+    return _probe(iface, frames, is_reply)
+
+
+def _iface_for_serial(serial: str) -> str | None:
+    """The current interface name of a single-channel adapter, or None."""
+    for iface_path in Path("/sys/class/net").glob("can*"):
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        if _udev_attr(info, "ATTRS{serial}") == serial:
+            return iface_path.name
+    return None
+
+
+def _identify_adapter(serial: str) -> str | None:
+    """Probe a single-channel adapter's bus: ``"wheels"``, ``"chest"``, or None.
+
+    Brings the interface up first (root); a bus where nothing answers —
+    devices unpowered, or unrelated hardware — stays None and is left to the
+    operator.
+    """
+    iface = _iface_for_serial(serial)
+    if iface is None:
+        return None
+    try:
+        bring_up_interfaces([iface])
+    except RuntimeError:
+        return None
+    # Silence any jelly_legs board before the wheel probe: the board starts
+    # its 50 ms broadcast after the first frame it sees (the wheel probe's
+    # own Damiao reads would wake it), and that stream starves the CANable's
+    # TX path — on a combined bus the wheel probe would then go deaf and the
+    # bus would be misclassified as chest-only. Harmless where no board is
+    # listening; a frame queued on a dead bus is dropped by the bring-up flap.
+    _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
+    time.sleep(0.05)
+    wheels = _probe_wheels(iface)
+    chest = _probe_chest(iface)
+    if chest and wheels:
+        # The pre-split combined cart bus (jelly_legs next to the wheels).
+        print(
+            f"  WARNING: both the wheel motors and the jelly_legs board "
+            f"answer on {iface} — treating it as the wheel bus. Point the "
+            f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
+            f"the lift onto its own chest bus."
+        )
+        return "wheels"
+    if chest:
+        return "chest"
+    if wheels:
+        return "wheels"
+    return None
+
+
+def _dual_channel_rules(serial: str, profile: _Profile) -> str:
+    """udev rules block for a profile's dual-channel adapter."""
+    return (
         f"# {profile.label} dual-channel CAN adapter\n"
         f"# Adapter serial: {serial}\n"
         f"# Channel 0 -> left\n"
@@ -346,14 +548,32 @@ def _write_udev_rules(
         f'# skips SYSTEMD_WANTS on renaming devices ("device is renaming").\n'
         f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{idVendor}}=="{_VID}", ATTR{{idProduct}}=="{_PID}", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
     )
-    if base_serial:
-        # Matched by serial alone: CANable firmware variants ship various
-        # VID/PIDs, and the serial already identifies the exact adapter.
+
+
+def _write_udev_rules(
+    hub_serial: str | None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+    profile: _Profile = _AXOL_PROFILE,
+) -> None:
+    print(f"Writing udev rules to {profile.rules_file} (requires sudo)...")
+    content = ""
+    if hub_serial:
+        content += _dual_channel_rules(hub_serial, profile)
+    # Single-channel adapters, matched by serial alone: CANable firmware
+    # variants ship various VID/PIDs, and the serial already identifies the
+    # exact adapter.
+    for label, name, serial in (
+        ("Powered-cart wheel bus", _CAN_B, wheels_serial),
+        ("Chest bus (jelly_legs lift controller)", _CAN_C, chest_serial),
+    ):
+        if not serial:
+            continue
         content += (
-            f"# Powered-cart wheel bus (single-channel adapter)\n"
-            f"# Adapter serial: {base_serial}\n"
-            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{base_serial}", NAME="{_CAN_B}"\n'
-            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{base_serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
+            f"# {label} (single-channel adapter)\n"
+            f"# Adapter serial: {serial}\n"
+            f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{serial}}=="{serial}", NAME="{name}"\n'
+            f'SUBSYSTEM=="usb", ENV{{DEVTYPE}}=="usb_device", ACTION=="add", ATTR{{serial}}=="{serial}", TAG+="systemd", ENV{{SYSTEMD_WANTS}}+="{profile.hotplug_unit}"\n'
         )
     run_root(["tee", str(profile.rules_file)], input_text=content, check=True)
     print("  Done.")
@@ -367,15 +587,23 @@ def _reload_udev() -> None:
 
 
 def _rename_interfaces(
-    serial: str, profile: _Profile, base_serial: str | None = None
+    hub_serial: str | None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+    profile: _Profile = _AXOL_PROFILE,
 ) -> None:
     """Rename existing canX interfaces to their target names without replug."""
     print("Renaming CAN interfaces (requires sudo)...")
-    # (adapter serial, channel dev_id) -> persistent name. The cart adapter is
-    # single-channel, so its only interface is dev_id 0.
-    target = {(serial, 0): profile.left, (serial, 1): profile.right}
-    if base_serial:
-        target[(base_serial, 0)] = _CAN_B
+    # (adapter serial, channel dev_id) -> persistent name. The wheel/chest
+    # adapters are single-channel, so their only interface is dev_id 0.
+    target: dict[tuple[str, int], str] = {}
+    if hub_serial:
+        target[(hub_serial, 0)] = profile.left
+        target[(hub_serial, 1)] = profile.right
+    if wheels_serial:
+        target[(wheels_serial, 0)] = _CAN_B
+    if chest_serial:
+        target[(chest_serial, 0)] = _CAN_C
 
     for iface_path in Path("/sys/class/net").glob("can*"):
         iface = iface_path.name
@@ -402,7 +630,14 @@ def _rename_interfaces(
     print("  Done.")
 
 
-def _write_cron_script(profile: _Profile, *, with_base: bool = False) -> None:
+def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
+    """Write a profile's bring-up script.
+
+    On the robot profile the script also covers the wheel and chest buses;
+    every interface is optional and checked for presence at runtime, so one
+    script serves every hardware combination — arm-only, cart-only, chest-
+    only, or all of them — and an unplugged adapter never blocks the rest.
+    """
     print(f"Writing CAN startup script to {profile.cron_script}...")
     _CAN_DIR.mkdir(parents=True, exist_ok=True)
     script = (
@@ -410,15 +645,15 @@ def _write_cron_script(profile: _Profile, *, with_base: bool = False) -> None:
         f"# Bring up {profile.label} CAN interfaces\n"
         f"#\n"
         f"# Runs at boot (@reboot root crontab) and on every (re-)enumeration\n"
-        f"# of the adapter (udev -> {profile.hotplug_unit}), so a mid-session USB\n"
+        f"# of an adapter (udev -> {profile.hotplug_unit}), so a mid-session USB\n"
         f"# drop of the hub comes back configured without operator action.\n"
         f"#\n"
-        f"# The interfaces are brought down together, configured, then up\n"
-        f"# together — on the dual-channel hub, flapping the channels one at a\n"
-        f"# time (down/up L, then down/up R) toggles the adapter into a state\n"
-        f"# where TX works but no RX frame is delivered. Skipped entirely when\n"
-        f"# the adapter is unplugged (a cart-only session must still bring up\n"
-        f"# the wheel bus below).\n"
+        f"# The left/right interfaces are channels of one dual-channel gs_usb\n"
+        f"# adapter. Bring them down together, configure, then up together —\n"
+        f"# flapping the channels one at a time (down/up L, then down/up R)\n"
+        f"# toggles the adapter into a state where TX works but no RX frame is\n"
+        f"# delivered. Skipped entirely when the adapter is unplugged (other\n"
+        f"# buses below must still come up).\n"
         f"set -euo pipefail\n\n"
         f"# Boot and hotplug triggers can race (the hub's two channels fire one\n"
         f"# udev add event each) — serialize whole runs.\n"
@@ -449,24 +684,26 @@ def _write_cron_script(profile: _Profile, *, with_base: bool = False) -> None:
         f'    echo "{profile.left}/{profile.right} not present — skipping bring-up"\n'
         f"fi\n"
     )
-    if with_base:
+    if profile is _AXOL_PROFILE:
         script += (
-            f"\n# Powered-cart wheel bus: its own single-channel adapter, so no\n"
-            f"# flap-together dance — and skipped when absent, so an unplugged\n"
-            f"# cart never blocks the arm bring-up.\n"
-            f"if ip link show {_CAN_B} >/dev/null 2>&1; then\n"
-            f'    ip link set "{_CAN_B}" down 2>/dev/null || true\n'
-            f'    ip link set "{_CAN_B}" type can bitrate {_BITRATE}\n'
-            f'    ip link set "{_CAN_B}" txqueuelen {_TXQUEUELEN}\n'
-            f'    ip link set "{_CAN_B}" up\n'
-            f"fi\n"
+            f"\n# Wheel and chest buses: their own single-channel adapters, so no\n"
+            f"# flap-together dance — and each skipped when absent, so an\n"
+            f"# unplugged adapter never blocks the others' bring-up.\n"
+            f"for IFACE in {_CAN_B} {_CAN_C}; do\n"
+            f'    if ip link show "${{IFACE}}" >/dev/null 2>&1; then\n'
+            f'        ip link set "${{IFACE}}" down 2>/dev/null || true\n'
+            f'        ip link set "${{IFACE}}" type can bitrate {_BITRATE}\n'
+            f'        ip link set "${{IFACE}}" txqueuelen {_TXQUEUELEN}\n'
+            f'        ip link set "${{IFACE}}" up\n'
+            f"    fi\n"
+            f"done\n"
         )
     profile.cron_script.write_text(script)
     profile.cron_script.chmod(0o755)
     print("  Done.")
 
 
-def _register_cron(profile: _Profile) -> None:
+def _register_cron(profile: _Profile = _AXOL_PROFILE) -> None:
     print("Registering @reboot cron entry in root crontab (requires sudo)...")
     cron_entry = f"@reboot {profile.cron_script}"
     existing = run_root(["crontab", "-l"]).stdout or ""
@@ -478,7 +715,7 @@ def _register_cron(profile: _Profile) -> None:
         print(f"  Added: {cron_entry}")
 
 
-def _write_hotplug_unit(profile: _Profile) -> None:
+def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
     """Install the systemd unit the udev rules pull in on adapter hotplug.
 
     udev tags the adapter's USB device with ``SYSTEMD_WANTS=<hotplug unit>``
@@ -586,7 +823,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.setup`` subcommand."""
     parser = subparsers.add_parser(
         "can.setup",
-        help="Configure CAN interfaces for the Axol arm (or the Mantis UMI with --umi).",
+        help="Configure CAN interfaces (arm hub, wheel bus, chest bus; "
+        "or the Mantis UMI with --umi).",
     )
     parser.add_argument(
         "--umi",
@@ -597,8 +835,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.set_defaults(func=run)
 
 
-def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
-    """True when at least one motor answers on either channel.
+def rx_alive_per_arm(profile: _Profile = _AXOL_PROFILE) -> tuple[bool, bool]:
+    """(left, right) — True where a motor answers on that side's bus.
 
     Verifies the adapter's receive path, not just the interface state: the
     dual-channel gs_usb adapter can come out of a down/up cycle in a state
@@ -606,6 +844,10 @@ def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
     everything looks healthy — UP, ERROR-ACTIVE, correct bitrate). Probes the
     profile's ``probe_joint`` — the shoulder on the robot arm, the gripper on
     the Mantis UMI (its buses carry nothing else).
+
+    Per-side results matter because one healthy side must not mask the other:
+    a bus with no responding motors (arm powered off, harness fault, dead
+    transceiver channel) looks identical to the adapter wedge on that side.
     """
     import asyncio
 
@@ -621,37 +863,59 @@ def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
         except Exception:  # noqa: BLE001 - silence means "no RX", whatever the cause
             return False
 
-    async def probe_all() -> bool:
+    async def probe_all() -> tuple[bool, bool]:
         await asyncio.sleep(0.5)  # let the freshly-upped interfaces settle
-        results = await asyncio.gather(probe(profile.left), probe(profile.right))
-        return any(results)
+        left, right = await asyncio.gather(probe(profile.left), probe(profile.right))
+        return left, right
 
     return asyncio.run(probe_all())
+
+
+def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
+    """True when at least one motor answers on either side."""
+    return any(rx_alive_per_arm(profile))
 
 
 def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
     """Run the bring-up script, then verify RX and re-flap once if it's dead.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
-    state and the TX-only wedge described in :func:`rx_alive`, so a bring-up
-    that lands in the wedge is recovered by exactly one more cycle. A device
-    with its motors powered off is indistinguishable from the wedge, hence the
-    bounded retries and the warning instead of an error.
+    state and the TX-only wedge described in :func:`rx_alive_per_arm`, so a
+    bring-up that lands in the wedge is recovered by exactly one more cycle.
+    A robot with its motors powered off is indistinguishable from the wedge,
+    hence the bounded retries and the warning instead of an error. Results are
+    reported per side: one answering side proves the adapter is healthy (no
+    retry), while the other side staying silent is called out instead of being
+    masked by it.
     """
     print("Bringing up CAN interfaces (requires sudo)...")
+    noun = "arm" if profile is _AXOL_PROFILE else "gripper"
     adapter_present = (Path("/sys/class/net") / profile.left).exists() and (
         Path("/sys/class/net") / profile.right
     ).exists()
     if not adapter_present:
-        # Cart-only host state: the script still brings up the wheel bus; the
-        # RX-wedge probe/re-flap is adapter-specific, so nothing to verify.
+        # Adapter-less host state: the script still brings up the wheel/chest
+        # buses; the RX-wedge probe/re-flap is adapter-specific, so there's
+        # nothing to verify.
         run_root(["bash", str(profile.cron_script)], check=True)
         print(f"  Done — {profile.label} not attached, its interfaces skipped.")
         return
     for attempt in range(3):
         run_root(["bash", str(profile.cron_script)], check=True)
-        if rx_alive(profile):
-            print("  Done — motors responding.")
+        left, right = rx_alive_per_arm(profile)
+        if left and right:
+            print(f"  Done — motors responding on both {noun}s.")
+            return
+        if left or right:
+            # One side answering proves the adapter's RX path is healthy, so
+            # more cycling can't help the silent side — that's a device-level
+            # problem (power, harness, or the adapter's transceiver channel).
+            alive, silent = ("left", "right") if left else ("right", "left")
+            print(f"  Done — motors responding on the {alive} {noun}.")
+            print(
+                f"  WARNING: no motor answered on the {silent} {noun}. Check "
+                f"that it is powered and its CAN connection is intact."
+            )
             return
         if attempt < 2:
             print("  No motor responses (adapter RX may be wedged) — cycling again...")
@@ -706,8 +970,8 @@ def is_configured() -> bool:
 
     Used by the control panel to decide whether connecting needs to run the
     full :func:`ensure_setup` (first time on a machine) or can just bring the
-    already-named interfaces up. Refers to the robot-arm profile; the Mantis UMI
-    is configured explicitly via ``axol can.setup --umi``.
+    already-named interfaces up. Refers to the robot-arm profile; the Mantis
+    UMI is configured explicitly via ``axol can.setup --umi``.
     """
     return (
         _AXOL_PROFILE.rules_file.exists()
@@ -716,104 +980,183 @@ def is_configured() -> bool:
     )
 
 
-def ensure_setup(*, serial: str | None = None, base_serial: str | None = None) -> None:
+def _apply_setup(
+    hub_serial: str | None,
+    wheels_serial: str | None,
+    chest_serial: str | None,
+) -> None:
+    """Write the persistent config for the given adapters and bring them up.
+
+    Each step is idempotent, so this is safe to re-run on a
+    partially-configured machine.
+    """
+    _write_udev_rules(hub_serial, wheels_serial, chest_serial)
+    _write_cron_script()
+    _write_hotplug_unit()
+    _reload_udev()
+    _rename_interfaces(hub_serial, wheels_serial, chest_serial)
+    _register_cron()
+    try:
+        _setup_rp1_usb_quirk()
+    except Exception as exc:  # noqa: BLE001 - the quirk must never block CAN setup
+        print(f"  WARNING: RP1 USB quirk setup failed: {exc}")
+    bring_up_can()
+
+
+def _configure_umi(serial: str) -> None:
+    """Write the Mantis UMI's persistent config and bring its buses up.
+
+    Same dual-channel board as the arm hub: channel 0 -> left gripper,
+    channel 1 -> right. No wheel/chest/RP1 handling on the rig profile.
+    """
+    _write_udev_rules(serial, profile=_UMI_PROFILE)
+    _write_cron_script(_UMI_PROFILE)
+    _write_hotplug_unit(_UMI_PROFILE)
+    _reload_udev()
+    _rename_interfaces(serial, profile=_UMI_PROFILE)
+    _register_cron(_UMI_PROFILE)
+    bring_up_can(_UMI_PROFILE)
+
+
+def ensure_setup(
+    *,
+    hub_serial: str | None = None,
+    wheels_serial: str | None = None,
+    chest_serial: str | None = None,
+) -> None:
     """Run the full CAN configuration non-interactively (for the control panel).
 
     Mirrors :func:`run` but resolves the adapter serials without prompting.
-    Each step is idempotent, so this is safe to call on a partially-configured
-    machine. Configures the robot-arm profile only. The cart wheel-bus adapter
-    is only ever *re*-pinned here (from a previous setup's rules or a live
-    interface); confirming a new one needs the interactive flow — see
-    :func:`_configured_base_serial`.
+    The wheel-bus and chest adapters are only ever *re*-pinned here (from a
+    previous setup's rules or a live interface); identifying a new one needs
+    the interactive flow's probing — see :func:`_identify_adapter`. Configures
+    the robot-arm profile only; the Mantis UMI is configured explicitly via
+    ``axol can.setup --umi``.
     """
     driver.ensure_driver()
-    serial = serial or _resolve_serial()
-    base_serial = base_serial or _configured_base_serial()
-    _configure(serial, _AXOL_PROFILE, base_serial=base_serial)
+    hub_serial = hub_serial or _resolve_hub_serial()
+    wheels_serial = wheels_serial or _configured_named_serial(_CAN_B)
+    chest_serial = chest_serial or _configured_named_serial(_CAN_C)
+    if not (hub_serial or wheels_serial or chest_serial):
+        raise RuntimeError("Robot not detected")
+    _apply_setup(hub_serial, wheels_serial, chest_serial)
 
 
-def _configure(serial: str, profile: _Profile, base_serial: str | None = None) -> None:
-    _write_udev_rules(serial, profile, base_serial=base_serial)
-    _write_cron_script(profile, with_base=base_serial is not None)
-    _write_hotplug_unit(profile)
-    _reload_udev()
-    _rename_interfaces(serial, profile, base_serial=base_serial)
-    _register_cron(profile)
-    if profile is _AXOL_PROFILE:
-        try:
-            _setup_rp1_usb_quirk()
-        except Exception as exc:  # noqa: BLE001 - the quirk must never block CAN setup
-            print(f"  WARNING: RP1 USB quirk setup failed: {exc}")
-    bring_up_can(profile)
+def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
+    """Interactively assign single-channel adapters to the wheel/chest buses.
 
+    Previously pinned adapters are kept without prompting. Every other
+    attached single-channel adapter is identified by probing its bus (see
+    :func:`_identify_adapter`); one where nothing answers — devices
+    unpowered, or unrelated hardware — is offered to the operator instead of
+    guessed at. Serials the Mantis UMI's rules already claim are excluded
+    outright (a belt-and-braces guard; the rig's board is dual-channel, so it
+    should never appear here).
 
-def _find_base_serial(hub_serial: str) -> str | None:
-    """Interactively pick the cart wheel-bus adapter, or None for no cart.
-
-    A previously pinned adapter is kept without prompting; otherwise any
-    attached single-channel candlelight adapter is offered — except serials
-    the Mantis UMI's rules already claim (a belt-and-braces guard; the rig's
-    board is dual-channel, so it should never appear here). Opt-in ([y/N])
-    because a single-channel adapter isn't necessarily a cart — it could be
-    any other candlelight device on the host.
+    Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
-    configured = _configured_base_serial()
-    if configured:
-        print(f"Cart wheel bus: keeping configured adapter (serial {configured}).")
-        return configured
-    claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
-    candidates = [
-        s for s in _detect_base_serials(exclude=hub_serial) if s not in claimed
-    ]
+    wheels = _configured_named_serial(_CAN_B)
+    chest = _configured_named_serial(_CAN_C)
+    if wheels:
+        print(f"Cart wheel bus: keeping configured adapter (serial {wheels}).")
+    if chest:
+        print(f"Chest bus: keeping configured adapter (serial {chest}).")
+
+    exclude = {s for s in (hub_serial, wheels, chest) if s}
+    exclude |= _serials_in_rules(_UMI_PROFILE.rules_file)
+    candidates = _detect_single_serials(exclude)
     if not candidates:
-        return None
-    if len(candidates) == 1:
-        prompt = (
-            f"Found a single-channel CAN adapter (serial {candidates[0]}). "
-            f"Use it as the powered cart's wheel bus ({_CAN_B})? [y/N]: "
+        return wheels, chest
+
+    print(
+        f"Identifying {len(candidates)} single-channel CAN adapter(s) by "
+        f"probing (wheel motors / jelly_legs board must be powered)..."
+    )
+    unidentified: list[str] = []
+    for serial in candidates:
+        role = _identify_adapter(serial)
+        if role == "wheels" and wheels is None:
+            wheels = serial
+            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}")
+        elif role == "chest" and chest is None:
+            chest = serial
+            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}")
+        elif role is not None:
+            print(
+                f"  {serial}: identified as the {role} bus, but that bus is "
+                f"already pinned to another adapter — skipping."
+            )
+        else:
+            unidentified.append(serial)
+
+    for serial in unidentified:
+        print(f"  {serial}: nothing answered on this adapter's bus.")
+        choice = (
+            input(
+                f"    Assign it to the [w]heel bus ({_CAN_B}), the [c]hest "
+                f"bus ({_CAN_C}), or leave blank to skip: "
+            )
+            .strip()
+            .lower()
         )
-        return candidates[0] if input(prompt).strip().lower() == "y" else None
-    print("  Multiple single-channel CAN adapters found:")
-    for i, s in enumerate(candidates):
-        print(f"    [{i}] {s}")
-    choice = input(
-        f"  Index of the powered cart's wheel-bus adapter ({_CAN_B}), blank for none: "
-    ).strip()
-    return candidates[int(choice)] if choice else None
+        if choice == "w" and wheels is None:
+            wheels = serial
+        elif choice == "c" and chest is None:
+            chest = serial
+        elif choice in ("w", "c"):
+            print("    That bus is already assigned — skipping.")
+    return wheels, chest
 
 
 def run(args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
-    profile = _UMI_PROFILE if getattr(args, "umi", False) else _AXOL_PROFILE
     installed = driver.ensure_driver()
     if installed:
         # The freshly-loaded driver may claim adapters the old one ignored
         # (CANable 2.0); give their interfaces a moment to appear.
-        import time
-
         time.sleep(2.0)
 
-    if profile is _UMI_PROFILE:
-        # Same dual-channel board as the arm hub: channel 0 -> left gripper,
-        # channel 1 -> right. No cart / RP1 handling on the rig profile.
-        serial = _find_serial(profile)
-        _configure(serial, profile)
-        base_serial = None
-    else:
-        serial = _find_serial(profile)
-        base_serial = _find_base_serial(serial)
-        ensure_setup(serial=serial, base_serial=base_serial)
+    if getattr(args, "umi", False):
+        serial = _find_serial(_UMI_PROFILE)
+        assert serial is not None  # _find_serial dies on blank for the UMI
+        _configure_umi(serial)
+
+        print()
+        print("Setup complete.")
+        print(f"  Left  : {_UMI_PROFILE.left}")
+        print(f"  Right : {_UMI_PROFILE.right}")
+        print(
+            f"  Startup  : {_UMI_PROFILE.cron_script} "
+            f"(runs at @reboot via root crontab)"
+        )
+        print(
+            f"  Hotplug  : {_UMI_PROFILE.hotplug_unit} (re-runs the startup script "
+            f"whenever the adapter re-enumerates, e.g. after a mid-session USB drop)"
+        )
+        return
+
+    hub_serial = _find_serial(_AXOL_PROFILE)
+    wheels_serial, chest_serial = _find_single_serials(hub_serial)
+    if not (hub_serial or wheels_serial or chest_serial):
+        _die(
+            "No CAN adapters found or configured. Connect the arm hub, "
+            "wheel-bus, or chest adapter and re-run."
+        )
+    _apply_setup(hub_serial, wheels_serial, chest_serial)
 
     print()
     print("Setup complete.")
-    print(f"  Left  : {profile.left}")
-    print(f"  Right : {profile.right}")
-    if base_serial:
-        print(f"  Cart     : {_CAN_B}")
-    print(f"  Startup  : {profile.cron_script} (runs at @reboot via root crontab)")
+    if hub_serial:
+        print(f"  Left arm : {_CAN_L}")
+        print(f"  Right arm: {_CAN_R}")
+    if wheels_serial:
+        print(f"  Wheels   : {_CAN_B}")
+    if chest_serial:
+        print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
+    print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
     print(
-        f"  Hotplug  : {profile.hotplug_unit} (re-runs the startup script whenever "
-        f"the adapter re-enumerates, e.g. after a mid-session USB drop)"
+        f"  Hotplug  : {_AXOL_PROFILE.hotplug_unit} (re-runs the startup script "
+        f"whenever an adapter re-enumerates, e.g. after a mid-session USB drop)"
     )
-    if profile is _AXOL_PROFILE and _is_raspberry_pi_5():
+    if _is_raspberry_pi_5():
         print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")

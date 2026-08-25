@@ -514,8 +514,9 @@ export default function Diagnostics() {
           key: "guided",
           label: "Guided",
           description:
-            "Walk the selected joints of one arm and zero each against its closer " +
-            "end stop — each step pauses with instructions and a Continue button.",
+            "Walk the selected joints of one arm and zero each against an end " +
+            "stop (wrist_2/wrist_3 accept either side) — each step pauses with " +
+            "instructions and a Continue button.",
           presetArgs: { guided: true },
           hideKeys: ["id", "type"],
         },

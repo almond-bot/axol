@@ -65,9 +65,11 @@ class VRFrame(BaseModel):
         r_elbow: Right elbow position.
         l_grip:  Left gripper command — 0.0 = fully closed, 1.0 = fully open.
         r_grip:  Right gripper command — 0.0 = fully closed, 1.0 = fully open.
-        l_lock:  Left grip button state (True = pressed). VRTeleop uses rising
-            edges of both buttons together to enable tracking, and a rising edge
-            of either button alone to disable it.
+        l_lock:  Left grip button state (True = pressed). VRTeleop engages
+            tracking on both buttons together (a rising edge, or a hold with
+            ``hold_to_engage``); once engaged each button acts per-arm —
+            toggling (or, in hold mode, holding) that arm between tracking
+            and frozen. See :meth:`VRTeleopCore.update_engage`.
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
@@ -88,6 +90,15 @@ class VRFrame(BaseModel):
             when the pose stream is the ground truth (UMI recording): it names
             when the hand actually was at this pose, not when the frame was
             played out. ``None`` until the interpolator has seen the frame.
+        l_tracked: True while the left controller's position is optically
+            tracked. ``False`` means the headset lost sight of the controller
+            (occlusion, edge of camera FOV, very fast motion) and the reported
+            position is inertially dead-reckoned (WebXR ``emulatedPosition``) —
+            it drifts while coasting and snaps when tracking re-acquires, so
+            the server's pose smoother excludes these frames and holds the last
+            clean pose instead. Defaults to True so older web builds (which
+            omit the field) keep the previous always-trusted behaviour.
+        r_tracked: Same as ``l_tracked`` for the right controller.
         l_stick_x: Left thumbstick x, [-1, 1], right = +1. With ``l_stick_y``
             it drives the powered cart's translation when one is configured
             (see :class:`almond_axol.robot.cart.Cart`). Neutral defaults keep
@@ -113,6 +124,8 @@ class VRFrame(BaseModel):
     t: float | None = None
     seq: int | None = None
     t_host: float | None = None
+    l_tracked: bool = True
+    r_tracked: bool = True
     l_stick_x: float = 0.0
     l_stick_y: float = 0.0
     r_stick_x: float = 0.0

@@ -1,0 +1,20 @@
+---
+title: "lift.home"
+description: "One-time calibration (homing) of the telescoping lift."
+---
+
+Calibrates the telescoping lift by running the lift controller's two-ended homing sequence: both legs drive down until they reach the bottom stop, then up to the top stop. On success the controller rebases its position counters (bottom = 0), sets soft limits a margin inside the hard stops, and saves everything to its flash — establishing the height scale that [`lift.goto`](/cli/lift-goto) and the teleop height display use.
+
+```bash
+axol lift.home
+```
+
+The sequence takes **1–2 minutes** and intentionally touches both end stops. Progress streams as status lines; Ctrl-C (or **Stop** in the control panel) aborts safely — an interrupted homing rolls back to the previous calibration, so the lift is never left half-homed.
+
+<Info>
+  Homing normally happens **once ever**, not per boot: the legs are self-locking (they cannot move unpowered), so the saved position stays valid across power cycles. Re-home only if the columns were turned by hand or the controller died mid-move.
+</Info>
+
+<Note>
+  Requires the chest CAN bus (`can_alm_axol_c`, named by [`can.setup`](/cli/can-setup)) and a powered lift board. Pass `--channel` to use a different interface. Also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Home the lift**.
+</Note>

@@ -42,7 +42,8 @@ async with VRServer() as vr:
 | `l_ee` / `r_ee` | `VRPose` | 6-DOF end-effector pose (position + quaternion) |
 | `l_elbow` / `r_elbow` | `VRPosition` | 3D elbow positions |
 | `l_grip` / `r_grip` | `float [0, 1]` | Gripper commands |
-| `l_lock` / `r_lock` | `bool` | Grip toggles (engage/disengage tracking) |
+| `l_lock` / `r_lock` | `bool` | Grip button states. Both together (from rest) engage tracking; once engaged each **toggles its own arm** between tracking and frozen — or, with `hold_to_engage`, holds it while pressed |
+| `l_tracked` / `r_tracked` | `bool` | Whether each controller's position is optically tracked. `False` means the headset is dead-reckoning it (WebXR `emulatedPosition` — occluded / out of FOV / fast whip), so the pose smoother excludes those frames and holds the last clean pose. Defaults to `True`, so older web builds (which omit the field) keep the previous always-trusted behaviour |
 | `reset` | `bool` | Rising edge triggers a reset move |
 | `state` | `VRState` | `TELEOP`, `DATA_COLLECTION`, or `RECORDING` (headset-driven); `SAVING` and `ERROR` are server-pushed only |
 | `t` | `float \| None` | Client capture timestamp in ms (`performance.now()`), used by the pose interpolator. `None` falls back to latest-wins |
@@ -105,7 +106,9 @@ Requires the GPU-resident camera stack the host installer sets up once: the GStr
 | `keyfile` | auto | Path to TLS private key |
 | `interp_enabled` | `True` | Enable the adaptive playout buffer that interpolates pose frames using the headset timestamp `t`, smoothing jittery / batched frame arrivals |
 | `interp_min_delay_s` | `0.0` | Minimum playout delay in seconds |
-| `interp_max_delay_s` | `0.1` | Maximum playout delay in seconds — caps how much latency the buffer may add |
+| `interp_max_delay_s` | `0.15` | Maximum playout delay in seconds — caps how much latency the adaptive jitter buffer may add (spent only while delivery is actually bursty) |
+| `interp_smooth_window_s` | `0.12` | Width of the Gaussian fixed-lag smoothing window rendered around the playout point. Adds a fixed `window / 2` of latency in exchange for zero-phase smoothing and tracking-glitch rejection; `0` disables it (plain two-frame lerp) |
+| `interp_outlier_k` | `4.0` | Hampel outlier threshold (in robust standard deviations) for the glitch rejection inside the smoothing window. Lower is more aggressive; `<= 0` disables rejection |
 
 <Warning>
   Before opening the VR app, accept the self-signed certificate by navigating to `https://<hostname>.local:8000` in the VR browser and proceeding past the security warning.

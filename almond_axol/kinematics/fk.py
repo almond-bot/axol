@@ -18,23 +18,22 @@ import logging
 import jax.numpy as jnp
 import jaxlie
 import numpy as np
-import pyroki as pk
-import yourdfpy
 
 from ..constants import (
-    URDF_PATH,
     Joint,
     urdf_arm_joint_names,
     urdf_body_name,
 )
 from .jax_cache import enable_persistent_compilation_cache
+from .model import shared_robot
 
 _logger = logging.getLogger(__name__)
 
 
 # 6-axis end-effector pose layout: Cartesian position (metres) followed by an
-# axis-angle rotation vector (radians), both in the robot's world frame (FLU).
-# The order matches the per-arm vector returned by :meth:`AxolForwardKinematics.ee_poses`.
+# axis-angle rotation vector (radians), both in the robot's world frame
+# (FLU: +x forward, +y left, +z up). The order matches the per-arm vector
+# returned by :meth:`AxolForwardKinematics.ee_poses`.
 EE_AXES: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz")
 
 
@@ -63,16 +62,18 @@ def pose6_to_pos_rot(pose6: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 class AxolForwardKinematics:
     """Forward kinematics for the Axol end-effectors, no IK or collision model.
 
-    Loads the bundled URDF, builds the pyroki robot, and caches the EE link and
-    per-arm joint indices. A single warm-up call JIT-compiles the forward pass
-    so the first :meth:`ee_poses` in the observation loop isn't slow.
+    Reuses the per-process pyroki robot (built on first use) and caches the EE
+    link and per-arm joint indices. A single warm-up call JIT-compiles the
+    forward pass so the first :meth:`ee_poses` in the observation loop isn't
+    slow.
     """
 
     def __init__(self) -> None:
         enable_persistent_compilation_cache()
-        _logger.info("Loading Axol URDF for forward kinematics...")
-        urdf = yourdfpy.URDF.load(str(URDF_PATH), mesh_dir=str(URDF_PATH.parent))
-        self.robot = pk.Robot.from_urdf(urdf)
+        # Shared per-process robot (see .model): a KinematicsSolver in the
+        # same process reuses this instance and vice versa, so the forward
+        # pass is only ever traced once.
+        self.robot = shared_robot()
 
         names = self.robot.links.names
         self._l_ee_idx = names.index(urdf_body_name(Joint.GRIPPER, is_left=True))
@@ -108,7 +109,8 @@ class AxolForwardKinematics:
         Returns:
             ``(left_pose, right_pose)``, each a ``(6,)`` array of
             ``[x, y, z, rx, ry, rz]`` (position + axis-angle rotation vector) in
-            the robot's world frame (FLU). See :data:`EE_AXES`.
+            the robot's world frame (FLU: +x forward, +y left, +z up). See
+            :data:`EE_AXES`.
         """
         n = len(self._left_indices)
         q = np.zeros(self._num_joints, dtype=np.float32)

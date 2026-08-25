@@ -20,7 +20,6 @@ from __future__ import annotations
 
 # ruff: noqa: E402 — the XLA/threading env vars must be set before the first
 # JAX import (mirrors run_ik_worker), which forces imports below that block.
-
 # Mirror run_ik_worker's environment so solve timings match production.
 import os
 

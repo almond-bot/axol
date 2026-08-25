@@ -1604,8 +1604,10 @@
         <parent link="camera_component___body_zed_x_one___front_1" />
         <child link="fisheye_lens__1__1" />
     </joint>
+    <!-- The CAD export faces -y; this +90-degree yaw turns the model so the
+         world frame is FLU: +x forward, +y left, +z up. -->
     <joint name="hanging_node_to_root_joint" type="fixed">
-        <origin xyz="-0.0212132 -0.0137132 0.973175" rpy="2.69507e-14 -2.20045e-16 1.11943e-16" />
+        <origin xyz="-0.0212132 -0.0137132 0.973175" rpy="2.69507e-14 -2.20045e-16 1.5707963267948966" />
         <axis xyz="0 0 1" />
         <parent link="root" />
         <child link="sh_hx_mx_xx_xx_10" />

@@ -12,10 +12,48 @@ driven by an irregular, lossy sample stream.
 :class:`PoseInterpolator` reconstructs the original smooth motion: it buffers
 recent frames stamped with the headset's **capture** time (``VRFrame.t``) and,
 when the consumer asks for the current target, renders the pose at a playout
-time held slightly in the past (``now - delay``) by interpolating between the
-two buffered frames that bracket it (lerp for positions/grips, slerp for
-orientation). A whole 150 ms burst then plays back as the smooth stream it
-originally was.
+time held slightly in the past (``now - delay``). A whole 150 ms burst then
+plays back as the smooth stream it originally was.
+
+On top of the jitter buffer, the playout point is rendered as a **fixed-lag
+smoother**: a Gaussian-weighted average over every buffered frame within
+``smooth_window_s`` of the playout time (weighted mean for positions / grips,
+weighted quaternion mean for orientation). Because the window extends into the
+*future* relative to the playout point, this is zero-phase smoothing whose lag
+is fixed (``delay + smooth_window_s / 2``) rather than growing with hand speed
+the way a causal low-pass filter's does.
+
+The buffered lookahead also enables **glitch rejection**, which no causal
+filter can do (at the instant of a jump it cannot distinguish a tracking
+glitch from the start of a fast intentional move). Before averaging, a Hampel
+test — computed over a wider window (``_REJECT_WINDOW_MULT`` x the smoothing
+window) so a glitch burst stays a minority for the median — drops frames whose
+EE/elbow positions deviate from the window median by more than ``outlier_k``
+robust standard deviations (with an absolute floor so a still hand's
+micro-noise never flags). A tracking excursion that jumps away and comes back
+within roughly the smoothing window is erased entirely instead of being
+chased; while it lasts, the nearest clean frames dominate the renormalized
+weights so the output bridges smoothly across it. A *sustained* jump
+eventually wins the median and is followed normally after the fixed lag. When
+the window holds too few frames (startup, sparse or unstamped streams),
+rendering falls back to plain lerp/slerp between the two bracketing frames.
+
+Frames also carry a **per-hand tracked flag** (``VRFrame.l_tracked`` /
+``r_tracked``, from WebXR ``emulatedPosition``): the headset sets it False
+while a controller's position is only inertially dead-reckoned (occluded, out
+of camera view, whipped too fast) — the pose drifts while coasting and snaps
+when optical tracking re-acquires. Unlike the Hampel test, this identifies the
+bad samples *deterministically*, including drifts too long or too gentle for
+the median to out-vote. Untracked frames are excluded from that hand's average
+(each hand is gated independently, so one occluded controller never freezes
+the other arm); if a hand's whole window is untracked, its last cleanly
+tracked pose (EE + elbow) is held until tracking returns, and the downstream
+velocity limits turn the eventual re-acquire step into a bounded catch-up.
+Grip values keep flowing regardless — the trigger is electronic, not
+optically tracked. Streams that never carried a tracked frame (older web
+builds after an upgrade race, or a runtime that always reports emulation)
+pass through un-gated, so the mechanism can only ever engage when real
+tracked/untracked transitions are observed.
 
 ``delay`` is **adaptive**: it tracks the observed arrival jitter (clamped to
 ``[min_delay, max_delay]``), so a clean LAN adds almost no latency while a
@@ -32,12 +70,20 @@ server arrival time, where bursts can't be reconstructed but nothing breaks.
 from __future__ import annotations
 
 import bisect
+import logging
 import threading
 import time
 
 import numpy as np
 
 from .models import VRFrame, VRPose, VRPosition, VRQuaternion
+
+_logger = logging.getLogger(__name__)
+
+# Warn once per hold episode after this long, so an unexpectedly sticky hold
+# (e.g. a controller left face-down on a table while engaged) is explained in
+# the logs rather than looking like a dead arm.
+_HOLD_WARN_AFTER_S = 1.0
 
 
 class PoseInterpolator:
@@ -57,16 +103,30 @@ class PoseInterpolator:
         max_frames: Hard cap on buffered frames (safety bound).
         pos_eps: Position change (metres) below which a re-render is considered
             unchanged, so the consumer's identity check can skip redundant IK.
+        smooth_window_s: Width (seconds) of the Gaussian fixed-lag smoothing
+            window centred on the playout point. Adds ``smooth_window_s / 2``
+            of fixed latency in exchange for zero-phase smoothing and glitch
+            rejection. ``0`` disables smoothing (plain two-frame lerp).
+        outlier_k: Hampel threshold in robust standard deviations (MAD-based).
+            Frames whose EE/elbow positions deviate from the window median by
+            more than this are excluded from the average, so transient
+            tracking glitches are dropped rather than followed. ``<= 0``
+            disables rejection.
+        outlier_floor_m: Absolute floor (metres) on the Hampel threshold so a
+            perfectly still hand's micro-noise is never flagged as outliers.
     """
 
     def __init__(
         self,
         enabled: bool = True,
         min_delay_s: float = 0.0,
-        max_delay_s: float = 0.1,
+        max_delay_s: float = 0.15,
         window_s: float = 2.0,
         max_frames: int = 512,
         pos_eps: float = 1e-4,
+        smooth_window_s: float = 0.12,
+        outlier_k: float = 4.0,
+        outlier_floor_m: float = 0.02,
     ) -> None:
         self.enabled = enabled
         self._min_delay = float(min_delay_s)
@@ -74,11 +134,21 @@ class PoseInterpolator:
         self._window = float(window_s)
         self._max_frames = int(max_frames)
         self._pos_eps = float(pos_eps)
+        self._half_smooth = max(0.0, float(smooth_window_s)) / 2.0
+        self._outlier_k = float(outlier_k)
+        self._outlier_floor = float(outlier_floor_m)
 
         self._lock = threading.Lock()
         # Buffer of (capture_time_s, frame), kept sorted by capture time.
         self._caps: list[float] = []
         self._frames: list[VRFrame] = []
+        # Per-frame numeric vector (see _frame_vec), parallel to _caps/_frames.
+        # Precomputed at push time (~90 Hz) so the smoothing render in sample()
+        # is pure vectorized numpy — walking the pydantic models per sample was
+        # ~0.8 ms/call on Jetson, enough to slow the IK dispatch loop it runs
+        # on (in series with every solve) and cost more smoothness through a
+        # coarser IK staircase than the smoothing itself bought.
+        self._vecs: list[np.ndarray] = []
         # Recent (local_recv_s, transit_s) for jitter/offset estimation.
         self._transits: list[tuple[float, float]] = []
         self._clock_offset: float | None = None
@@ -93,11 +163,23 @@ class PoseInterpolator:
         self._last_out: VRFrame | None = None
         self._last_pos: np.ndarray | None = None
 
+        # Last per-hand pose rendered from optically tracked frames, as a
+        # (10,) vector [ee_pos(3), ee_quat(4), elbow(3)]. Substituted while a
+        # hand's whole rejection window is untracked (WebXR emulatedPosition),
+        # so the arm holds instead of chasing inertial drift. ``None`` until
+        # the stream shows its first tracked frame — see the module docstring
+        # for the pass-through this implies.
+        self._held: dict[str, np.ndarray | None] = {"left": None, "right": None}
+        # Hold-episode bookkeeping for the rate-limited log warning.
+        self._hold_since: dict[str, float | None] = {"left": None, "right": None}
+        self._hold_warned: dict[str, bool] = {"left": False, "right": False}
+
     def reset(self) -> None:
         """Drop all buffered state (e.g. on reconnect)."""
         with self._lock:
             self._caps.clear()
             self._frames.clear()
+            self._vecs.clear()
             self._transits.clear()
             self._clock_offset = None
             self._delay = self._min_delay
@@ -105,6 +187,9 @@ class PoseInterpolator:
             self._latest = None
             self._last_out = None
             self._last_pos = None
+            self._held = {"left": None, "right": None}
+            self._hold_since = {"left": None, "right": None}
+            self._hold_warned = {"left": False, "right": False}
 
     def push(self, frame: VRFrame, now: float | None = None) -> None:
         """Ingest a freshly received frame.
@@ -124,6 +209,7 @@ class PoseInterpolator:
             if self._t_is_client is not None and is_client != self._t_is_client:
                 self._caps.clear()
                 self._frames.clear()
+                self._vecs.clear()
                 self._transits.clear()
                 self._clock_offset = None
                 self._delay = self._min_delay
@@ -157,9 +243,11 @@ class PoseInterpolator:
             i = bisect.bisect_right(self._caps, cap_t)
             self._caps.insert(i, cap_t)
             self._frames.insert(i, frame)
+            self._vecs.insert(i, _frame_vec(frame))
 
-            # Prune: keep a little history behind the current playout point.
-            play = (local_recv - self._clock_offset) - self._delay
+            # Prune: keep a little history behind the current playout point
+            # (which is held an extra half smoothing-window in the past).
+            play = (local_recv - self._clock_offset) - self._delay - self._half_smooth
             keep_before = play - 0.5
             drop = 0
             while drop < len(self._caps) - 2 and self._caps[drop] < keep_before:
@@ -167,13 +255,53 @@ class PoseInterpolator:
             if drop:
                 del self._caps[:drop]
                 del self._frames[:drop]
+                del self._vecs[:drop]
             extra = len(self._caps) - self._max_frames
             if extra > 0:
                 del self._caps[:extra]
                 del self._frames[:extra]
+                del self._vecs[:extra]
+
+    def _update_hold(
+        self,
+        side: str,
+        live: bool,
+        held_prev: np.ndarray | None,
+        out: np.ndarray,
+        now: float,
+    ) -> bool:
+        """Advance one hand's hold bookkeeping after a smoothing render.
+
+        Must be called with the lock held. ``live`` means the hand was rendered
+        from optically tracked frames, so ``out`` becomes the new held pose.
+        Returns True when a hold episode just crossed the warning threshold
+        (the caller logs outside the lock).
+        """
+        if live:
+            self._held[side] = out
+            self._hold_since[side] = None
+            self._hold_warned[side] = False
+            return False
+        if held_prev is None:
+            return False  # pass-through: this stream has never been tracked
+        if self._hold_since[side] is None:
+            self._hold_since[side] = now
+            return False
+        if (
+            not self._hold_warned[side]
+            and now - self._hold_since[side] >= _HOLD_WARN_AFTER_S
+        ):
+            self._hold_warned[side] = True
+            return True
+        return False
 
     def sample(self, now: float | None = None) -> VRFrame | None:
-        """Render the current interpolated target frame.
+        """Render the current smoothed target frame.
+
+        Renders a Gaussian-weighted, outlier-rejected average of the buffered
+        frames within the smoothing window around the playout point; falls back
+        to plain lerp/slerp between the two bracketing frames when the window
+        is too sparse (startup, unstamped transports, ``smooth_window_s == 0``).
 
         Returns ``None`` only before any frame has been received. The returned
         object is *identity-stable*: when the rendered pose hasn't moved beyond
@@ -194,27 +322,88 @@ class PoseInterpolator:
                 self._last_pos = None
                 return latest
 
+            # The extra half-window playout shift only applies when smoothing
+            # is active (client-stamped streams); unstamped streams keep the
+            # undelayed playout point so they still render the latest frame.
+            smoothing = self._half_smooth > 0.0 and bool(self._t_is_client)
             play = (now - self._clock_offset) - self._delay
+            if smoothing:
+                play -= self._half_smooth
             caps = self._caps
             frames = self._frames
-            if play <= caps[0]:
-                a = b = frames[0]
-                alpha = 0.0
-            elif play >= caps[-1]:
-                a = b = frames[-1]
-                alpha = 0.0
-            else:
-                j = bisect.bisect_right(caps, play)
-                a, b = frames[j - 1], frames[j]
-                span = caps[j] - caps[j - 1]
-                alpha = (play - caps[j - 1]) / span if span > 1e-9 else 0.0
+
+            # Fixed-lag smoothing: snapshot the window slices under the lock
+            # (frames are immutable models; slicing copies only the refs).
+            # The slice spans the *rejection* window — wider than the Gaussian
+            # smoothing window so the Hampel median sees enough clean frames to
+            # out-vote a glitch burst, at no extra latency (the history side is
+            # already buffered; the future side is capped by what has arrived).
+            # Only client-stamped streams are smoothed: unstamped frames carry
+            # arrival timestamps, so a delivery burst collapses distinct poses
+            # onto near-identical time coordinates and the weighted average
+            # would blend them into a false target. Unstamped streams fall
+            # through to the lerp path, which renders the latest frame.
+            win_caps: list[float] | None = None
+            win_vecs: list[np.ndarray] | None = None
+            if smoothing:
+                half_rej = self._half_smooth * _REJECT_WINDOW_MULT
+                lo = bisect.bisect_left(caps, play - half_rej)
+                hi = bisect.bisect_right(caps, play + half_rej)
+                if hi - lo >= 3:
+                    win_caps = caps[lo:hi]
+                    win_vecs = self._vecs[lo:hi]
+
+            if win_vecs is None:
+                if play <= caps[0]:
+                    a = b = frames[0]
+                    alpha = 0.0
+                elif play >= caps[-1]:
+                    a = b = frames[-1]
+                    alpha = 0.0
+                else:
+                    j = bisect.bisect_right(caps, play)
+                    a, b = frames[j - 1], frames[j]
+                    span = caps[j] - caps[j - 1]
+                    alpha = (play - caps[j - 1]) / span if span > 1e-9 else 0.0
             last_out = self._last_out
             last_pos = self._last_pos
+            held_l = self._held["left"]
+            held_r = self._held["right"]
             # The rendered pose corresponds to headset-time ``play``; map it
             # back onto the host clock for consumers that align to capture time.
             play_host = play + self._clock_offset
 
-        rendered, pos = _interpolate(a, b, alpha, latest, play_host)
+        if win_vecs is not None and win_caps is not None:
+            rendered, pos, l_out, l_live, r_out, r_live = _smooth_window(
+                win_vecs,
+                win_caps,
+                play,
+                self._half_smooth,
+                self._outlier_k,
+                self._outlier_floor,
+                latest,
+                held_l,
+                held_r,
+                play_host,
+            )
+            with self._lock:
+                warn_l = self._update_hold("left", l_live, held_l, l_out, now)
+                warn_r = self._update_hold("right", r_live, held_r, r_out, now)
+            for side, warn in (("left", warn_l), ("right", warn_r)):
+                if warn:
+                    _logger.warning(
+                        "%s controller position untracked for %.1fs — holding "
+                        "its last optically-tracked pose until tracking returns",
+                        side,
+                        _HOLD_WARN_AFTER_S,
+                    )
+        else:
+            # Playout stamps are only meaningful for client-stamped streams;
+            # unstamped frames keep their original (absent) stamp so the
+            # worker's filters fall back to their fixed rate.
+            rendered, pos = _interpolate(
+                a, b, alpha, latest, play if self._t_is_client else None, play_host
+            )
 
         # Identity-stable: reuse the previous object when nothing moved and the
         # control state matches, so the consumer's `is` check skips the solve.
@@ -264,8 +453,240 @@ def _quat(q: VRQuaternion) -> np.ndarray:
     return np.array([q.x, q.y, q.z, q.w], dtype=np.float64)
 
 
+def _quat_weighted_mean(quats: np.ndarray, w: np.ndarray, ref_i: int) -> np.ndarray:
+    """Weighted mean of ``(n, 4)`` quaternions, hemisphere-aligned to row ``ref_i``.
+
+    Sign-aligning every quaternion to the reference before the weighted sum
+    makes the normalized result a good mean for the small angular spreads seen
+    within a smoothing window.
+    """
+    ref = quats[ref_i]
+    sign = np.where(quats @ ref < 0.0, -1.0, 1.0)
+    q = (w * sign) @ quats
+    norm = np.linalg.norm(q)
+    return q / norm if norm > 1e-12 else ref.copy()
+
+
+# The Hampel rejection window is this multiple of the smoothing window, so a
+# glitch burst as long as the whole smoothing window is still a minority for
+# the median and gets rejected. Costs no latency: the extra frames come from
+# history already buffered (and whatever future frames have arrived).
+_REJECT_WINDOW_MULT = 2.5
+
+
+# _frame_vec layout: 4 position streams, 2 quaternions, 2 grips, 2 tracked flags.
+_VEC_LEE = slice(0, 3)
+_VEC_REE = slice(3, 6)
+_VEC_LEL = slice(6, 9)
+_VEC_REL = slice(9, 12)
+_VEC_LQ = slice(12, 16)
+_VEC_RQ = slice(16, 20)
+_VEC_LGRIP = 20
+_VEC_RGRIP = 21
+_VEC_LTRK = 22
+_VEC_RTRK = 23
+
+
+def _frame_vec(f: VRFrame) -> np.ndarray:
+    """Flatten a frame's motion fields into a (24,) float64 vector.
+
+    Computed once per received frame so the smoothing render never walks the
+    pydantic models on the hot sampling path.
+    """
+    lp, rp, le, re = f.l_ee.position, f.r_ee.position, f.l_elbow, f.r_elbow
+    lq, rq = f.l_ee.quaternion, f.r_ee.quaternion
+    return np.array(
+        [
+            lp.x, lp.y, lp.z,
+            rp.x, rp.y, rp.z,
+            le.x, le.y, le.z,
+            re.x, re.y, re.z,
+            lq.x, lq.y, lq.z, lq.w,
+            rq.x, rq.y, rq.z, rq.w,
+            f.l_grip, f.r_grip,
+            1.0 if f.l_tracked else 0.0,
+            1.0 if f.r_tracked else 0.0,
+        ],
+        dtype=np.float64,
+    )  # fmt: skip
+
+
+def _hampel_mean(
+    Vt: np.ndarray,
+    gt: np.ndarray,
+    ee_sl: slice,
+    q_sl: slice,
+    el_sl: slice,
+    outlier_k: float,
+    outlier_floor: float,
+) -> np.ndarray:
+    """Hampel-rejected Gaussian mean of one hand's streams over ``Vt``.
+
+    Returns the (10,) vector ``[ee_pos(3), ee_quat(4), elbow(3)]``.
+    """
+    m = len(Vt)
+    inlier = np.ones(m, dtype=bool)
+    if outlier_k > 0.0 and m >= 3:
+        # (m, 2, 3): this hand's EE + elbow position streams. Medians use
+        # np.partition (upper median for even m) — np.median's generality is
+        # ~10x the cost on windows this small, and robust statistics don't
+        # care about the midpoint averaging.
+        P = np.stack((Vt[:, ee_sl], Vt[:, el_sl]), axis=1)
+        mid = m // 2
+        med = np.partition(P, mid, axis=0)[mid]  # (2, 3)
+        diff = P - med
+        d = np.sqrt(np.einsum("ijk,ijk->ij", diff, diff))  # (m, 2)
+        mad = np.partition(d, mid, axis=0)[mid]  # (2,)
+        thresh = np.maximum(outlier_k * 1.4826 * mad, outlier_floor)
+        inlier = np.all(d <= thresh, axis=1)
+        if int(inlier.sum()) < 2:
+            # Degenerate (e.g. bimodal window mid-jump): rejecting almost
+            # everything would leave a meaningless average, so keep all frames.
+            inlier[:] = True
+
+    w = gt * inlier
+    w = w / w.sum()
+    ref_i = int(np.argmax(w))
+    out = np.empty(10)
+    out[0:3] = w @ Vt[:, ee_sl]
+    out[3:7] = _quat_weighted_mean(Vt[:, q_sl], w, ref_i)
+    out[7:10] = w @ Vt[:, el_sl]
+    return out
+
+
+def _hand_mean(
+    V: np.ndarray,
+    g: np.ndarray,
+    trk: np.ndarray,
+    ee_sl: slice,
+    q_sl: slice,
+    el_sl: slice,
+    outlier_k: float,
+    outlier_floor: float,
+    held: np.ndarray | None,
+) -> tuple[np.ndarray, bool]:
+    """Weighted mean of one hand's streams over its tracked, inlier frames.
+
+    Returns ``(out, live)`` where ``out`` is the (10,) vector
+    ``[ee_pos(3), ee_quat(4), elbow(3)]`` rendered for this hand:
+
+      - some frames tracked: Hampel-rejected Gaussian mean over the tracked
+        frames only, ``live=True``;
+      - none tracked, held pose available: the held pose, ``live=False`` —
+        the arm holds instead of chasing inertial dead-reckoning drift;
+      - none tracked, nothing held (the stream has never carried a tracked
+        frame, e.g. a runtime that always reports emulated positions): the
+        same Hampel-rejected mean over all frames, ``live=False`` — exactly
+        the pre-gating behaviour rather than freezing teleop.
+    """
+    if not bool(trk.any()):
+        if held is not None:
+            return held, False
+        return _hampel_mean(V, g, ee_sl, q_sl, el_sl, outlier_k, outlier_floor), False
+
+    all_tracked = bool(trk.all())
+    Vt = V if all_tracked else V[trk]
+    gt = g if all_tracked else g[trk]
+    return _hampel_mean(Vt, gt, ee_sl, q_sl, el_sl, outlier_k, outlier_floor), True
+
+
+def _smooth_window(
+    vecs: list[np.ndarray],
+    caps: list[float],
+    play: float,
+    half_window: float,
+    outlier_k: float,
+    outlier_floor: float,
+    latest: VRFrame,
+    held_l: np.ndarray | None,
+    held_r: np.ndarray | None,
+    t_host: float | None = None,
+) -> tuple[VRFrame, np.ndarray, np.ndarray, bool, np.ndarray, bool]:
+    """Render the Gaussian-weighted, outlier-rejected mean pose of a window.
+
+    ``vecs`` (per-frame :func:`_frame_vec` vectors) spans the wide *rejection*
+    window; the Gaussian sigma comes from the narrower smoothing
+    ``half_window``, so frames beyond the smoothing window carry negligible
+    weight — *unless* the frames near the playout point are rejected as
+    glitches, in which case the nearest clean frames dominate the renormalized
+    weights and the output bridges smoothly across the glitch.
+
+    Each hand is rendered independently by :func:`_hand_mean`: frames the
+    headset marked untracked (inertially dead-reckoned) are excluded outright,
+    then Hampel rejection drops statistical outliers among the tracked frames
+    — a frame whose EE or elbow position deviates from the tracked median by
+    more than ``outlier_k * 1.4826 * MAD`` (floored at ``outlier_floor``
+    metres) is excluded entirely, orientation included, since a glitched
+    tracking sample corrupts position and orientation together. The MAD scale
+    grows with genuine motion spread, so fast intentional moves are never
+    flagged; only a minority cluster far from the median is. Grips are
+    electronic reads, valid regardless of optical tracking, and are averaged
+    over every frame. Control state comes from ``latest``, exactly like
+    :func:`_interpolate`.
+
+    Returns ``(frame, pos_vector, l_out, l_live, r_out, r_live)`` where
+    ``l_out`` / ``r_out`` are each hand's rendered (10,) vectors and ``l_live``
+    / ``r_live`` flag whether that hand was rendered from tracked frames (the
+    caller adopts it as the new held pose) rather than held or passed through.
+    """
+    V = np.stack(vecs)  # (n, 24)
+    t = np.array(caps, dtype=np.float64)
+
+    # Gaussian weights centred on the playout point; smoothing-window edges sit
+    # at ~2 sigma so the average is dominated by frames near the playout time.
+    sigma = max(half_window / 2.0, 1e-6)
+    g = np.exp(-0.5 * ((t - play) / sigma) ** 2)
+    w_all = g / g.sum()
+
+    l_grip = float(w_all @ V[:, _VEC_LGRIP])
+    r_grip = float(w_all @ V[:, _VEC_RGRIP])
+
+    l_out, l_live = _hand_mean(
+        V,
+        g,
+        V[:, _VEC_LTRK] > 0.5,
+        _VEC_LEE,
+        _VEC_LQ,
+        _VEC_LEL,
+        outlier_k,
+        outlier_floor,
+        held_l,
+    )
+    r_out, r_live = _hand_mean(
+        V,
+        g,
+        V[:, _VEC_RTRK] > 0.5,
+        _VEC_REE,
+        _VEC_RQ,
+        _VEC_REL,
+        outlier_k,
+        outlier_floor,
+        held_r,
+    )
+
+    frame, pos = _build_frame(
+        l_out[0:3],
+        l_out[3:7],
+        r_out[0:3],
+        r_out[3:7],
+        l_out[7:10],
+        r_out[7:10],
+        l_grip,
+        r_grip,
+        latest,
+        play,
+        t_host,
+    )
+    return frame, pos, l_out, l_live, r_out, r_live
+
+
 def _interpolate(
-    a: VRFrame, b: VRFrame, alpha: float, latest: VRFrame, t_host: float | None = None
+    a: VRFrame,
+    b: VRFrame,
+    alpha: float,
+    latest: VRFrame,
+    play: float | None,
+    t_host: float | None = None,
 ) -> tuple[VRFrame, np.ndarray]:
     """Interpolate motion between ``a`` and ``b``; take control state from
     ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
@@ -278,26 +699,79 @@ def _interpolate(
     r_el = _lerp(_pos(a.r_elbow), _pos(b.r_elbow), alpha)
     l_grip = float(a.l_grip + alpha * (b.l_grip - a.l_grip))
     r_grip = float(a.r_grip + alpha * (b.r_grip - a.r_grip))
+    return _build_frame(
+        l_ee_p, l_ee_q, r_ee_p, r_ee_q, l_el, r_el, l_grip, r_grip, latest, play, t_host
+    )
 
-    frame = VRFrame(
-        l_ee=VRPose(
-            position=VRPosition(x=l_ee_p[0], y=l_ee_p[1], z=l_ee_p[2]),
-            quaternion=VRQuaternion(x=l_ee_q[0], y=l_ee_q[1], z=l_ee_q[2], w=l_ee_q[3]),
+
+def _build_frame(
+    l_ee_p: np.ndarray,
+    l_ee_q: np.ndarray,
+    r_ee_p: np.ndarray,
+    r_ee_q: np.ndarray,
+    l_el: np.ndarray,
+    r_el: np.ndarray,
+    l_grip: float,
+    r_grip: float,
+    latest: VRFrame,
+    play: float | None,
+    t_host: float | None = None,
+) -> tuple[VRFrame, np.ndarray]:
+    """Assemble a rendered frame; motion from the args, control state from
+    ``latest``. Returns ``(frame, pos_vector)`` where ``pos_vector`` is the
+    concatenated EE+elbow positions used for the change/identity check.
+
+    ``play`` is the playout time this pose was rendered at (client-clock
+    seconds); it becomes the frame's ``t`` so downstream consumers timestamp
+    the *motion* correctly — the IK worker's One Euro filters use consecutive
+    ``t`` values as true sample spacing. ``None`` (unstamped stream) falls
+    back to the latest arrival stamp.
+
+    ``t_host`` is the same playout instant mapped onto the host clock
+    (``time.perf_counter`` seconds); it becomes the frame's ``t_host`` for
+    consumers that align dataset rows to capture time (UMI recording).
+
+    Uses ``model_construct`` (no validation) with explicit ``float()``
+    conversion: this runs per sample on the IK dispatch thread and the fields
+    are numerics we computed ourselves, so validation is pure overhead.
+    """
+    frame = VRFrame.model_construct(
+        l_ee=VRPose.model_construct(
+            position=VRPosition.model_construct(
+                x=float(l_ee_p[0]), y=float(l_ee_p[1]), z=float(l_ee_p[2])
+            ),
+            quaternion=VRQuaternion.model_construct(
+                x=float(l_ee_q[0]),
+                y=float(l_ee_q[1]),
+                z=float(l_ee_q[2]),
+                w=float(l_ee_q[3]),
+            ),
         ),
-        r_ee=VRPose(
-            position=VRPosition(x=r_ee_p[0], y=r_ee_p[1], z=r_ee_p[2]),
-            quaternion=VRQuaternion(x=r_ee_q[0], y=r_ee_q[1], z=r_ee_q[2], w=r_ee_q[3]),
+        r_ee=VRPose.model_construct(
+            position=VRPosition.model_construct(
+                x=float(r_ee_p[0]), y=float(r_ee_p[1]), z=float(r_ee_p[2])
+            ),
+            quaternion=VRQuaternion.model_construct(
+                x=float(r_ee_q[0]),
+                y=float(r_ee_q[1]),
+                z=float(r_ee_q[2]),
+                w=float(r_ee_q[3]),
+            ),
         ),
-        l_elbow=VRPosition(x=l_el[0], y=l_el[1], z=l_el[2]),
-        r_elbow=VRPosition(x=r_el[0], y=r_el[1], z=r_el[2]),
-        l_grip=l_grip,
-        r_grip=r_grip,
+        l_elbow=VRPosition.model_construct(
+            x=float(l_el[0]), y=float(l_el[1]), z=float(l_el[2])
+        ),
+        r_elbow=VRPosition.model_construct(
+            x=float(r_el[0]), y=float(r_el[1]), z=float(r_el[2])
+        ),
+        l_grip=float(l_grip),
+        r_grip=float(r_grip),
         # Control state is responsive: always the latest received, never delayed.
         l_lock=latest.l_lock,
         r_lock=latest.r_lock,
         reset=latest.reset,
         state=latest.state,
-        t=latest.t,
+        t=(play * 1000.0) if play is not None else latest.t,
         seq=latest.seq,
         t_host=t_host,
     )

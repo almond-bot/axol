@@ -173,6 +173,144 @@ def arm_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
 # disambiguated by their range and don't need to be listed here.
 _MIRRORED_SYMMETRIC_JOINTS: frozenset[Joint] = frozenset({Joint.WRIST_2, Joint.WRIST_3})
 
+# Joints that may be zeroed at EITHER of their two end stops.  The wrist_2 /
+# wrist_3 stops are the only ones that are not laser-aligned, so per unit one
+# stop can be better placed than the other; the guided zeroing flow therefore
+# accepts whichever stop the operator brings the joint to.  Which stop a
+# given robot was zeroed at is detected at runtime from the encoder reading
+# itself (see end_stop_offset_from_position) — no per-robot file is needed,
+# and robots zeroed by the old forced-side flow resolve to the offsets they
+# have always had.
+EITHER_STOP_JOINTS: frozenset[Joint] = frozenset({Joint.WRIST_2, Joint.WRIST_3})
+
+# A motor-frame reading within this band of 0 means the joint is parked at
+# (or pressed against) its calibration end stop — the one position where the
+# two zeroing conventions cannot be told apart.  The reading at the
+# calibration stop is ~0 by construction regardless of the stop's placement
+# error, so only backlash/compliance widens the band; 3° is generous.
+_STOP_SIDE_AMBIGUOUS_RAD = math.radians(3.0)
+
+# Slack past the nominal end-to-end travel when sanity-checking a reading in
+# end_stop_offset_from_position, covering stop placement error on both ends.
+_STOP_SIDE_RANGE_SLACK_RAD = math.radians(15.0)
+
+
+def end_stop_offset_from_position(joint: Joint, motor_pos: float) -> float:
+    """Infer an either-stop joint's motor→joint offset from one encoder reading.
+
+    Joints in :data:`EITHER_STOP_JOINTS` have symmetric limits ``(-L, +L)``
+    and are zeroed at one of the two physical end stops.  The zero location
+    fixes the sign of every reachable motor-frame reading, so a single read
+    reveals which stop was used:
+
+    - zeroed at the upper stop (``+L``): readings span ``[-2L, 0]`` → offset ``+L``
+    - zeroed at the lower stop (``-L``): readings span ``[0, +2L]`` → offset ``-L``
+
+    Args:
+        joint:     Joint to resolve; must be in :data:`EITHER_STOP_JOINTS`.
+        motor_pos: Current motor-frame position (rad).
+
+    Returns:
+        The offset such that ``joint_angle = motor_angle + offset``.
+
+    Raises:
+        MotorError: If the reading is too close to 0 (parked at the
+            calibration stop — ambiguous), too close to the far stop (a
+            single-turn boot reading past ±180° wraps by 360° and mimics the
+            other side — also ambiguous), or outside the joint's physical
+            travel (the encoder zero is not at either stop; re-zero).
+    """
+    if joint not in EITHER_STOP_JOINTS:
+        raise ValueError(f"{joint} is not zeroed at a variable end stop")
+    lo, hi = LIMITS[joint]
+    travel = hi - lo
+    if abs(motor_pos) < _STOP_SIDE_AMBIGUOUS_RAD:
+        raise MotorError(
+            f"Cannot tell which end stop {joint.name} was zeroed at: the "
+            f"joint is at/near an end stop (motor frame "
+            f"{math.degrees(motor_pos):+.1f}°). Move it away from the end "
+            f"stops and retry."
+        )
+    if abs(motor_pos) > travel + _STOP_SIDE_RANGE_SLACK_RAD:
+        raise MotorError(
+            f"{joint.name} reads {math.degrees(motor_pos):+.1f}° in the motor "
+            f"frame — outside its physical travel, so its encoder zero is not "
+            f"at an end stop. Re-run `axol motor.set-zero-pos --guided`."
+        )
+    # These joints span exactly 180° of travel, and after a power cycle the
+    # single-turn encoder re-reads position within ±180° of zero — so a
+    # joint pressed slightly PAST the far stop wraps by 360° and reads like a
+    # small excursion past the OPPOSITE stop, flipping the detected side.
+    # Readings within the stop-placement slack of the far stop are therefore
+    # genuinely ambiguous and must not be trusted.
+    if abs(motor_pos) > travel - _STOP_SIDE_RANGE_SLACK_RAD:
+        raise MotorError(
+            f"Cannot tell which end stop {joint.name} was zeroed at: the "
+            f"joint is at/near the far end stop (motor frame "
+            f"{math.degrees(motor_pos):+.1f}°), where a reading can also be "
+            f"a 360° single-turn wrap from just past the opposite stop. Move "
+            f"it away from the end stops and retry."
+        )
+    return hi if motor_pos < 0 else lo
+
+
+def fixed_stop_wrap_correction(joint: Joint, is_left: bool, motor_pos: float) -> float:
+    """Return the ±2π unwrap a fixed-stop joint's reading needs (0.0 if none).
+
+    Joints outside :data:`EITHER_STOP_JOINTS` are always zeroed at
+    :func:`closer_end_stop`, so the encoder zero coincides with that stop and
+    every reachable motor-frame position lies between the two stops:
+    ``lo - offset`` to ``hi - offset`` (one of which is 0).
+
+    Both motor families track multi-turn position only in RAM; the persistent
+    zero lives in a single-turn absolute encoder on the output shaft.  After a
+    power cycle — or a MyActuator 0x76 reset, issued by ``set_control_mode``
+    and ``set_zero_position`` — the position is re-read within ±180° of the
+    stored zero, so a joint parked more than 180° from its calibration stop
+    comes back reading exactly 360° off.  Every fixed-stop joint's travel plus
+    slack is under 360° (the widest is 270° + 2·15°), so at most one of
+    ``{reading, reading ± 360°}`` lands in the expected band: that candidate
+    is the true position, and the returned correction folds into the joint's
+    motor→joint offset (``joint = motor + offset + correction``; commands
+    apply the inverse) so the wrapped motor frame is handled transparently.
+
+    The check is necessarily one-sided: an unset zero that happens to land
+    inside the band (directly or after unwrapping) cannot be told apart from
+    a valid calibration by a position read alone.
+
+    Args:
+        joint:     Joint to check; must not be in :data:`EITHER_STOP_JOINTS`
+                   (nor the gripper, which has no zero to set).
+        is_left:   Which arm the joint is on (limits are mirrored).
+        motor_pos: Current motor-frame position (rad).
+
+    Returns:
+        The wrap correction in radians: ``0.0``, ``+2π``, or ``-2π``.
+
+    Raises:
+        MotorError: If neither the reading nor a ±360° unwrap of it falls
+            inside the joint's physical travel measured from its calibration
+            end stop — the zero was never set, or is stale.
+    """
+    if joint in EITHER_STOP_JOINTS or joint == Joint.GRIPPER:
+        raise ValueError(f"{joint} is not zeroed at a fixed end stop")
+    offset, _ = closer_end_stop(joint, is_left)
+    lo, hi = arm_limits(joint, is_left)
+    band_lo = lo - offset - _STOP_SIDE_RANGE_SLACK_RAD
+    band_hi = hi - offset + _STOP_SIDE_RANGE_SLACK_RAD
+    for correction in (0.0, math.tau, -math.tau):
+        if band_lo <= motor_pos + correction <= band_hi:
+            return correction
+    raise MotorError(
+        f"{joint.name} reads {math.degrees(motor_pos):+.1f}° in the motor "
+        f"frame — neither it nor a ±360° single-turn wrap of it falls in "
+        f"the [{math.degrees(lo - offset):+.1f}°, "
+        f"{math.degrees(hi - offset):+.1f}°] band expected when its "
+        f"encoder zero is at the calibration end stop, so the zero has "
+        f"not been set (or is stale). "
+        f"Re-run `axol motor.set-zero-pos --guided`."
+    )
+
 
 def closer_end_stop(joint: Joint, is_left: bool) -> tuple[float, int]:
     """Return ``(target_rad, expected_motion_sign)`` for the joint's calibration end stop.
@@ -192,7 +330,11 @@ def closer_end_stop(joint: Joint, is_left: bool) -> tuple[float, int]:
 
     Used by the guided ``set-zero-pos`` flow and by :class:`AxolArm` to derive
     the per-joint offset between motor frame (zero at end stop) and joint
-    frame (zero at rest).  Not defined for ``Joint.GRIPPER``.
+    frame (zero at rest).  For joints in :data:`EITHER_STOP_JOINTS` this is
+    only the historical/default side: those may be zeroed at either stop, and
+    the side actually used is detected at runtime from the encoder reading
+    (:func:`end_stop_offset_from_position`).  Not defined for
+    ``Joint.GRIPPER``.
     """
     if joint == Joint.GRIPPER:
         raise ValueError("closer_end_stop is undefined for the gripper")
@@ -283,16 +425,35 @@ class AxolArm:
         # Per-joint offset between motor frame and joint frame:
         #   joint_angle (rad) = motor_angle (rad) + offset
         # After end-stop calibration the motor's encoder zero coincides with
-        # the closer end stop, so motor 0 → joint angle ``target_rad``.  The
-        # gripper offset is 0 because the gripper uses its own [0, 1]
+        # an end stop, so motor 0 → joint angle = that stop's limit.  Most
+        # joints are always zeroed at closer_end_stop(); EITHER_STOP_JOINTS
+        # (wrist_2/wrist_3) may be zeroed at either stop, so their offsets
+        # start as NaN and are detected from the first encoder reading by
+        # resolve_joint_offsets().  Fixed-stop offsets may additionally gain
+        # a ±2π term when the motor booted with a single-turn wrap (parked
+        # >180° from zero at power-up/reset — see
+        # fixed_stop_wrap_correction), applied during zero verification.
+        # The gripper offset is 0 because the gripper uses its own [0, 1]
         # normalisation and is calibrated against torque, not an end stop.
         self._joint_offsets = np.array(
             [
-                0.0 if j == Joint.GRIPPER else closer_end_stop(j, is_left)[0]
+                0.0
+                if j == Joint.GRIPPER
+                else math.nan
+                if j in EITHER_STOP_JOINTS
+                else closer_end_stop(j, is_left)[0]
                 for j in joints
             ],
             dtype=float,
         )
+        self._unresolved_offsets: set[Joint] = set(EITHER_STOP_JOINTS)
+        # Fixed-stop joints whose encoder zero has not been sanity-checked
+        # yet.  resolve_joint_offsets() verifies each one's reading is
+        # plausible for a zero at its calibration stop (an unset zero would
+        # make every joint-frame value garbage), folds any ±360° single-turn
+        # boot wrap into the joint's offset, and removes it from the set.
+        self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
+        self._offset_lock = asyncio.Lock()
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -306,6 +467,168 @@ class AxolArm:
         return values
 
     # ------------------------------------------------------------------ #
+    # Joint-offset resolution                                              #
+    # ------------------------------------------------------------------ #
+
+    async def resolve_joint_offsets(self, joints: set[Joint] | None = None) -> None:
+        """Detect either-stop zeros and reject joints whose zero was never set.
+
+        Two one-shot bring-up gates, both driven by a single encoder read per
+        joint:
+
+        - :data:`EITHER_STOP_JOINTS`: derive the motor→joint offset from the
+          sign of the reading (see :func:`end_stop_offset_from_position`),
+          which also rejects readings outside the joint's physical travel.
+        - Every other arm joint: verify the reading is plausible for an
+          encoder zero at the calibration stop and detect a ±360°
+          single-turn boot wrap (:func:`fixed_stop_wrap_correction`) — the
+          wrap is folded into the joint's offset so positions and commands
+          stay correct, while an unset zero (nothing lands in the band)
+          fails bring-up.
+
+        Idempotent and near-free once resolved/verified, so every ``AxolArm``
+        entry point that uses joint-frame values calls it; diagnostics that
+        enable motors directly and then read ``_joint_offsets`` must call it
+        themselves.
+
+        Args:
+            joints: Restrict resolution to this subset (for flows where only
+                some motors are on the bus).  ``None`` resolves all.
+
+        Raises:
+            MotorError: If a joint cannot be read, is parked at an end stop
+                (ambiguous), or reads outside its physical travel — meaning
+                its encoder zero has not been set (or is stale).
+        """
+        if not self._unresolved_offsets and not self._unverified_zeros:
+            return
+        async with self._offset_lock:
+            pending = (
+                set(self._unresolved_offsets)
+                if joints is None
+                else self._unresolved_offsets & set(joints)
+            )
+            pending_verify = (
+                set(self._unverified_zeros)
+                if joints is None
+                else self._unverified_zeros & set(joints)
+            )
+            if not pending and not pending_verify:
+                return
+            joint_index = {j: i for i, j in enumerate(Joint)}
+            side = "left" if self._is_left else "right"
+            for joint in pending:
+                offset, pos = await self._detect_stop_side(joint, side)
+                self._joint_offsets[joint_index[joint]] = offset
+                self._unresolved_offsets.discard(joint)
+                _logger.info(
+                    "%s %s zero detected at the %+.0f° end stop "
+                    "(motor %+.3f rad → joint offset %+.3f rad)",
+                    side,
+                    joint.name,
+                    math.degrees(offset),
+                    pos,
+                    offset,
+                )
+            for joint in pending_verify:
+                correction = await self._verify_fixed_stop_zero(joint, side)
+                self._joint_offsets[joint_index[joint]] = (
+                    closer_end_stop(joint, self._is_left)[0] + correction
+                )
+                self._unverified_zeros.discard(joint)
+                if correction:
+                    _logger.warning(
+                        "%s %s reads 360° off its zero (single-turn encoder "
+                        "wrap after a power cycle/reset) — compensating with "
+                        "a %+.0f° offset",
+                        side,
+                        joint.name,
+                        math.degrees(correction),
+                    )
+
+    async def _read_motor_position(self, joint: Joint, use_cache: bool) -> float:
+        """Read one joint's motor-frame position, telemetry-aware.
+
+        ``use_cache=True`` accepts an already-cached telemetry sample;
+        otherwise a direct read is made — or, while telemetry is polling
+        (direct reads are rejected then), a sample is awaited.
+        """
+        motor = self.motors[joint]
+        if use_cache and motor.has_position:
+            return motor.position
+        if not motor.telemetry_active:
+            return await motor.get_position()
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + 5.0
+        while not motor.has_position:
+            if loop.time() >= deadline:
+                raise MotorError("no telemetry sample within 5 s")
+            await asyncio.sleep(0.01)
+        return motor.position
+
+    async def _detect_stop_side(self, joint: Joint, side: str) -> tuple[float, float]:
+        """Read one joint's position and detect its zeroed end stop.
+
+        Retries once on an implausible reading: detection is a one-shot gate
+        at bring-up, and a single poisoned frame (e.g. a command ack decoded
+        as feedback) must not abort the whole enable when a fresh read
+        settles it.  Returns ``(offset, motor_pos)``.
+        """
+        last_exc: MotorError | None = None
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(0.05)
+            try:
+                pos = await self._read_motor_position(joint, use_cache=attempt == 0)
+            except MotorError as exc:
+                raise MotorError(
+                    f"Could not read {side} {joint.name} to detect its "
+                    f"zeroed end stop: {exc}"
+                ) from exc
+            try:
+                return end_stop_offset_from_position(joint, pos), pos
+            except MotorError as exc:
+                last_exc = exc
+        raise MotorError(f"{side} arm: {last_exc}") from last_exc
+
+    async def _verify_fixed_stop_zero(self, joint: Joint, side: str) -> float:
+        """Verify one fixed-stop joint's zero; return its ±2π wrap correction.
+
+        Rejects a joint whose reading implies an unset zero (see
+        :func:`fixed_stop_wrap_correction`).  Same retry rationale as
+        :meth:`_detect_stop_side`: the check is a one-shot gate at bring-up,
+        and a single poisoned frame must not fail the whole enable when a
+        fresh read settles it.
+        """
+        last_exc: MotorError | None = None
+        for attempt in range(2):
+            if attempt:
+                await asyncio.sleep(0.05)
+            try:
+                pos = await self._read_motor_position(joint, use_cache=attempt == 0)
+            except MotorError as exc:
+                raise MotorError(
+                    f"Could not read {side} {joint.name} to verify its "
+                    f"encoder zero: {exc}"
+                ) from exc
+            try:
+                return fixed_stop_wrap_correction(joint, self._is_left, pos)
+            except MotorError as exc:
+                last_exc = exc
+        raise MotorError(f"{side} arm: {last_exc}") from last_exc
+
+    def _require_offsets_resolved(self) -> None:
+        """Raise if any arm joint's zero is still undetected or unverified."""
+        pending = self._unresolved_offsets | self._unverified_zeros
+        if pending:
+            names = ", ".join(j.name for j in Joint if j in pending)
+            raise MotorError(
+                f"The encoder zero of {names} has not been detected/verified "
+                f"yet — enable(), start_telemetry(), or get_positions() first "
+                f"(each resolves it automatically)"
+            )
+
+    # ------------------------------------------------------------------ #
     # Polling                                                              #
     # ------------------------------------------------------------------ #
 
@@ -316,6 +639,10 @@ class AxolArm:
             hz:     Poll frequency in Hz.
             torque: If True, also fetch and cache torque each cycle.
         """
+        # Resolve before polling starts: direct position reads are rejected
+        # while telemetry runs, and the ``positions`` property needs the
+        # offsets as soon as the cache fills.
+        await self.resolve_joint_offsets()
         await asyncio.gather(
             *[m.start_telemetry(hz, torque=torque) for m in self.motors.values()]
         )
@@ -358,6 +685,7 @@ class AxolArm:
         with set_position_velocity and motion_control. On the gripperless
         SKU the gripper element is 0.0.
         """
+        self._require_offsets_resolved()
         values = self._pad_gripper([self.motors[j].position for j in self.motors])
         gripper_i = self._gripper_i
         if self._has_gripper:
@@ -435,8 +763,18 @@ class AxolArm:
                 :meth:`disable` then re-enable), or if a holding gripper has
                 no valid persisted calibration (re-measuring would drop
                 whatever it grips — empty the gripper, then :meth:`disable`
-                and re-enable).
+                and re-enable), or if any arm joint's encoder reading is
+                implausible for a zero at its calibration end stop — the
+                zero was never set (or is stale), and the robot must not be
+                brought up on garbage joint-frame values; run
+                ``axol motor.set-zero-pos --guided`` first.
         """
+        # Gate bring-up on plausible encoder zeros BEFORE anything is
+        # actuated (position reads work on disabled motors): detect which
+        # end stop the either-stop joints were zeroed at, and refuse to
+        # enable a robot whose zeros were never set.
+        await self.resolve_joint_offsets()
+
         flags = dict(zip(self.motors.keys(), await self.get_holding()))
         held = [j for j, holding in flags.items() if holding]
         cold = [j for j, holding in flags.items() if not holding]
@@ -455,6 +793,19 @@ class AxolArm:
         await asyncio.gather(
             *[self.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in cold]
         )
+
+        # The mode switch reboots MyActuator motors, which re-derive their
+        # multi-turn position from the single-turn absolute encoder (within
+        # ±180° of zero) — a joint parked past 180° from its calibration stop
+        # comes back reading 360° off, invalidating the wrap correction
+        # detected by the resolve above.  Re-verify the freshly brought-up
+        # fixed-stop joints against the post-reset frame.  (Either-stop
+        # joints are Damiao, whose mode switch is a register write — no
+        # reboot, no re-detection needed.)
+        recheck = set(cold) & (set(ARM_JOINTS) - EITHER_STOP_JOINTS)
+        if recheck:
+            self._unverified_zeros |= recheck
+            await self.resolve_joint_offsets(recheck)
 
         if self._has_gripper:
             if Joint.GRIPPER in held:
@@ -527,6 +878,12 @@ class AxolArm:
             mode: Desired control mode.
         """
         await asyncio.gather(*[m.set_control_mode(mode) for m in self.motors.values()])
+        # The reboot re-derives each MyActuator's multi-turn position from
+        # its single-turn absolute encoder (within ±180° of zero), so any
+        # ±360° wrap correction detected earlier may be stale.  Mark the
+        # fixed-stop joints (all MyActuator) for re-verification; the next
+        # joint-frame entry point resolves them.
+        self._unverified_zeros |= set(ARM_JOINTS) - EITHER_STOP_JOINTS
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #
@@ -541,6 +898,7 @@ class AxolArm:
         with set_position_velocity and motion_control. On the gripperless
         SKU the gripper element is 0.0.
         """
+        await self.resolve_joint_offsets()
         values = self._pad_gripper(
             list(
                 await asyncio.gather(
@@ -647,14 +1005,25 @@ class AxolArm:
     async def set_zero_position(self, joints: list[Joint]) -> None:
         """Save the current shaft position as the encoder zero for the specified joints.
 
-        The encoder zero is calibrated at the joint's mechanical end stop, not
-        at the rest position; ``AxolArm`` applies a per-joint offset so the
-        public API stays in joint frame (``0`` = rest).
+        The encoder zero is calibrated at one of the joint's mechanical end
+        stops, not at the rest position; ``AxolArm`` applies a per-joint
+        offset so the public API stays in joint frame (``0`` = rest).
 
         Args:
             joints: List of joints to zero.
         """
         await asyncio.gather(*[self.motors[j].set_zero_position() for j in joints])
+        # A re-zeroed joint's encoder moved under us: an either-stop joint's
+        # detected offset no longer describes it (Damiao applies the new zero
+        # after a power cycle, but the old detection is stale either way),
+        # and a fixed-stop joint's plausibility check must run again.
+        joint_index = {j: i for i, j in enumerate(Joint)}
+        for j in joints:
+            if j in EITHER_STOP_JOINTS:
+                self._joint_offsets[joint_index[j]] = math.nan
+                self._unresolved_offsets.add(j)
+            elif j != Joint.GRIPPER:
+                self._unverified_zeros.add(j)
 
     async def set_acceleration(self, accelerations: dict[Joint, float]) -> None:
         """Set the acceleration ramp per joint. Deceleration matches acceleration.
@@ -682,6 +1051,7 @@ class AxolArm:
                        gripperless SKU).
             max_speed: Maximum speed for all joints (rad/s).
         """
+        await self.resolve_joint_offsets()
         positions = positions.copy()
         gripper_i = self._gripper_i
         if self._has_gripper:
@@ -737,6 +1107,7 @@ class AxolArm:
                Arm joints are in radians in the joint frame (0 = rest);
                gripper is normalized to [0, 1] (0.0 = closed, 1.0 = fully open).
         """
+        await self.resolve_joint_offsets()
         q = q.copy()
 
         # Safety: reject commands with arm-joint deltas that exceed max_step_rad.
@@ -869,6 +1240,7 @@ class AxolArm:
                 hand-guided (``axol waypoints``). ``None`` (the default) holds
                 wherever the gripper currently is, softly.
         """
+        await self.resolve_joint_offsets()
         free_set: frozenset[Joint] = (
             frozenset(ARM_JOINTS) if free_joints is None else frozenset(free_joints)
         )
@@ -964,6 +1336,25 @@ class AxolArm:
         self._vel_diff = Differentiator(n=n)
         self._accel_diff = Differentiator(n=n)
         self._meas_vel_diff = Differentiator(n=n)
+
+    def torque_residuals(self) -> np.ndarray:
+        """Measured minus model-gravity torque per arm joint, shape (7,).
+
+        Both terms are evaluated at the cached measured positions, so during
+        slow, quasi-static moves the residual background is just friction
+        plus tracking effort; unexpected contact (a gripper still hooked on
+        the scene, an operator grabbing the arm) shows up as a residual well
+        above that background. Units are the motor's reported torque units
+        (Nm on Damiao). Entries are in :data:`ARM_JOINTS` order; the gripper
+        is excluded (position-force mode — its torque tracks grasp effort,
+        not contact). Requires fresh feedback (telemetry or streaming
+        commands, whose replies refresh the position/torque cache).
+        """
+        positions = self.positions
+        arm_q = positions[: len(ARM_JOINTS)].astype(np.float32)
+        gravity = self._gravity_comp.gravity_arm(arm_q, is_left=self._is_left)
+        tau = self.torques[: len(ARM_JOINTS)].astype(np.float32)
+        return tau - gravity
 
 
 class Axol(RobotBase):
@@ -1510,3 +1901,15 @@ class Axol(RobotBase):
             self.left.reset_command_state()
         if self.right is not None:
             self.right.reset_command_state()
+
+    def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm measured-minus-gravity torques, ``(left, right)``.
+
+        Each present arm contributes a shape ``(7,)`` array in
+        :data:`ARM_JOINTS` order (``None`` for an absent arm). See
+        :meth:`AxolArm.torque_residuals` for semantics; reads only the
+        telemetry cache, so it costs no CAN traffic.
+        """
+        left = self.left.torque_residuals() if self.left is not None else None
+        right = self.right.torque_residuals() if self.right is not None else None
+        return left, right
