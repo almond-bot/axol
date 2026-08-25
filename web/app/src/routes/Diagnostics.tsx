@@ -135,9 +135,10 @@ const HUB: Record<"left" | "right", string> = {
  * filtering and zoom/pan, one-click diagnostics with parameter dialogs, and
  * the recorded history of past runs.
  *
- * Telemetry streams whenever the idle robot link owns the CAN bus. While a
- * diagnostic or operation owns it the stream pauses (single owner) — charts
- * keep their history and show why.
+ * Telemetry streams whenever the robot link is up. Idle, the link polls the
+ * motors itself; while a diagnostic or operation owns command of the bus,
+ * the server decodes the task's own CAN traffic through a passive observer
+ * socket, so the charts stay live throughout.
  */
 export default function Diagnostics() {
   const toast = useToast()
@@ -428,9 +429,13 @@ export default function Diagnostics() {
 
   const linkState = robot?.state ?? stream.state
   const stateBadge = STATE_BADGE[linkState] ?? STATE_BADGE.disconnected
+  // "busy" no longer silences the chart: the server keeps decoding the
+  // running task's own CAN traffic through a passive bus observer, so frames
+  // keep arriving whenever the task is actually commanding the motors. The
+  // note explains both the passive source and any lull between commands.
   const quietReason =
     linkState === "busy"
-      ? "paused — a test or operation owns the bus"
+      ? "a task owns command — live from passive bus tap"
       : linkState !== "connected"
         ? "robot link down"
         : null

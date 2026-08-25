@@ -23,7 +23,7 @@ The saved mapping then drives the whole dashboard: every diagnostic and calibrat
 
 One chart for the selected arm streams continuously while the robot link is connected, toggled between **Position**, **Velocity**, **Torque** (10 Hz), and **Temp** (from the 1 Hz health sweep). The server keeps a 10-minute rolling buffer for all of them, so the chart backfills on page load. The filter row scopes it: metric, time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**. The chart's header button expands it to full screen (Esc to exit) for a closer look.
 
-Telemetry is sampled by the idle robot link, which is the single owner of the CAN bus. While a diagnostic or operation owns the bus the stream pauses and the charts label the gap — history is kept, and streaming resumes as soon as the bus is released.
+Bus access is split into command and observation. Only one process may *command* the motors at a time, but the server also keeps a passive, never-transmitting observer socket on each CAN channel: while a diagnostic, tuning run, or teleop session owns command, the observer decodes that task's own motor traffic and the charts stay live (labeled "live from passive bus tap"). The chart only goes quiet when the running task isn't actually commanding — e.g. while it sits at a prompt.
 
 ## Tests
 
@@ -55,4 +55,4 @@ Every run is persisted under `~/.almond/diagnostics/tuning/` on the serve host �
 
 ## Run history
 
-Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The list is paginated newest-first (10 runs per page). The ROM test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.
+Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The list is paginated newest-first (10 runs per page). The ROM test additionally writes its own 5 Hz position/torque capture from its cached motor state, which is preferred over the passive-observer frames when charting — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.

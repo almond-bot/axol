@@ -8,7 +8,9 @@ event loop, mirroring the Session log fan-out in :mod:`.manager`.
 
 Wire/message shapes (also served over REST for backfill):
 
-- fast frame, ~SAMPLE_HZ per second while the link owns the CAN bus::
+- fast frame, ~SAMPLE_HZ per second while the link is up — polled by the link
+  when it owns command of the CAN bus, decoded from the running task's own
+  traffic by the passive bus observers otherwise::
 
     {"type": "frame", "t": <epoch s>,
      "m": {"left:SHOULDER_1": [pos_rad, vel_rad_s, torque_nm], ...}}
@@ -277,8 +279,8 @@ class DiagnosticsRunStore:
         csv_path = meta.get("telemetryCsv")
         if csv_path:
             csv_frames = _read_csv_frames(Path(csv_path))
-            # A script's own capture is denser and spans bus-owned time the
-            # server couldn't observe — prefer it when present.
+            # A script's own capture samples at its chosen cadence, denser
+            # than the passive-observer stream — prefer it when present.
             if csv_frames:
                 frames = csv_frames
         if len(frames) > max_frames:

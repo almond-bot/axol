@@ -182,6 +182,19 @@ def _ma_error_to_status(error_code: int) -> MotorStatus:
     return MotorStatus.UNKNOWN
 
 
+def mit_ranges(version: int | None, model: str | None) -> tuple[float, float]:
+    """``(p_max, t_max)`` the given firmware scales MIT command/feedback against.
+
+    The single source of truth for the firmware-dependent ranges: used by the
+    driver's capability detection and by anything decoding feedback frames
+    without owning the motor (e.g. :class:`~.observer.BusObserver`, whose
+    ranges the serve robot link syncs from the motors' version/model reads).
+    """
+    if version is not None and version >= _MA_FW_V44_VERSION:
+        return _MA_P_MAX_V44, _model_max_torque(model)
+    return _MA_P_MAX_LEGACY, _MA_T_MAX_LEGACY
+
+
 def _model_max_torque(model: str | None) -> float:
     """Return the motor's max torque (Nm) inferred from its 0xB5 model string.
 
@@ -378,12 +391,7 @@ class MyActuatorMotor(MotorDriver):
         self._fw_version = version
         self._model = model
         self._max_torque = _model_max_torque(model)
-        if version >= _MA_FW_V44_VERSION:
-            self._p_max = _MA_P_MAX_V44
-            self._t_max = self._max_torque
-        else:
-            self._p_max = _MA_P_MAX_LEGACY
-            self._t_max = _MA_T_MAX_LEGACY
+        self._p_max, self._t_max = mit_ranges(version, model)
 
     # ------------------------------------------------------------------ #
     # Public API (implements MotorDriver)                                  #
