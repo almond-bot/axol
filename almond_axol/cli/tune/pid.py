@@ -62,6 +62,7 @@ from ...tuning import (
     HolderMonitor,
     cached_meas,
     cached_torque,
+    camera_clearance_targets,
     joint_frame_motors,
     log_to_series,
     make_target_noise,
@@ -874,6 +875,17 @@ async def _run(args: argparse.Namespace) -> None:
                 return
 
             print("  ramping other joints to rest (joint-frame 0) ...")
+            # The camera-clearance move (shoulder_2 held 10° outboard for the
+            # shoulder_3 / wrist_1 probes) happens inside ramp_others_to_zero;
+            # record where those joints were first so the teardown ramps them
+            # back instead of letting the arm fall from the clearance pose at
+            # the final disable.
+            clearance = camera_clearance_targets(joint, is_left)
+            if clearance:
+                vals = await asyncio.gather(
+                    *[motors[j].get_position() for j in clearance]
+                )
+                pre_pose.update(dict(zip(clearance, vals)))
             await ramp_others_to_zero(motors, joint, is_left)
 
             if pose:
@@ -882,7 +894,10 @@ async def _run(args: argparse.Namespace) -> None:
                 )
                 print(f"  posing: {desc} ...")
                 vals = await asyncio.gather(*[motors[j].get_position() for j in pose])
-                pre_pose = dict(zip(pose, vals))
+                for j, v in zip(pose, vals):
+                    # A clearance joint's true origin was captured above —
+                    # here it would read the clearance pose instead.
+                    pre_pose.setdefault(j, v)
                 await ramp_joints_to(motors, pose)
 
             # Fill the gravity pose with the *measured* positions of the
