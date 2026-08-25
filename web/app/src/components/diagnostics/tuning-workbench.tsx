@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { Loader2, Play, RefreshCw, Square, Trash2 } from "lucide-react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { Loader2, Play, RefreshCw, Square, Trash2, X } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -24,6 +24,9 @@ const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
 const NOISY_COLOR = "rgba(230,103,103,0.5)"
 const ERROR_COLOR = "#e6906b"
+// Compare mode: run A keeps the yellow "actual" color, run B gets blue.
+const B_COLOR = "#7fb4e6"
+const B_ERROR_COLOR = "rgba(127,180,230,0.8)"
 const MAP_GOOD = "#79c98c"
 const MAP_WARN = "#e6c067"
 const MAP_BAD = "#e66767"
@@ -392,7 +395,9 @@ interface JointChart {
 function errorLane(
   t: (number | null)[],
   reference: (number | null)[],
-  output: (number | null)[]
+  output: (number | null)[],
+  label = "error °",
+  color = ERROR_COLOR
 ): RunChartSeries[] {
   const n = Math.min(reference.length, output.length)
   const err: (number | null)[] = new Array(n)
@@ -401,7 +406,7 @@ function errorLane(
     const o = output[i]
     err[i] = r == null || o == null ? null : toDeg(o - r)
   }
-  return [{ label: "error °", color: ERROR_COLOR, x: t, data: err }]
+  return [{ label, color, x: t, data: err }]
 }
 
 /** Commanded-vs-actual charts for every joint of `arm` that actually moved. */
@@ -503,6 +508,122 @@ function pidJointChart(run: TuningRunData): JointChart | null {
     ],
     sub: errorLane(t, commanded, actual),
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Compare mode: overlay two runs of the same kind                     */
+/* ------------------------------------------------------------------ */
+
+/** The run-list headline as a raw comparable number (lower is better). */
+function headlineNum(meta: TuningRunMeta): number | null {
+  const m = meta.metrics as Record<string, unknown>
+  const key =
+    meta.kind === "motion"
+      ? "mean_rms_err"
+      : meta.kind === "filter"
+        ? "mean_rms_lagfree"
+        : "score"
+  const v = m[key]
+  return typeof v === "number" && Number.isFinite(v) ? v : null
+}
+
+function firstFinite(data: (number | null)[]): number {
+  for (const v of data) if (v != null) return v
+  return 0
+}
+
+function rebased(data: (number | null)[], base: number): (number | null)[] {
+  return data.map((v) => (v == null ? null : v - base))
+}
+
+/**
+ * Overlay charts for two runs of the same kind: the reference plus both
+ * runs' outputs per joint, with both error traces in the lane. Each series
+ * carries its own time base (the runs may have different durations).
+ * Sine/step positions are rebased to each run's starting position so runs
+ * probed at different centers still overlay; errors are unaffected.
+ */
+function compareJointCharts(
+  a: TuningRunData,
+  b: TuningRunData,
+  arm: string | null
+): JointChart[] {
+  const kind = a.meta.kind
+  const tA = a.series.t ?? []
+  const tB = b.series.t ?? []
+
+  if (kind === "sine" || kind === "step") {
+    const cmdA = a.series.target
+    const actA = a.series.actual
+    const cmdB = b.series.target
+    const actB = b.series.actual
+    if (!cmdA || !actA || !cmdB || !actB) return []
+    const baseA = firstFinite(actA)
+    const baseB = firstFinite(actB)
+    const joint =
+      a.meta.joint === b.meta.joint
+        ? (a.meta.joint ?? "joint")
+        : `${a.meta.joint ?? "?"} (A) vs ${b.meta.joint ?? "?"} (B)`
+    return [
+      {
+        joint,
+        series: [
+          {
+            label: "commanded (A)",
+            color: COMMANDED_COLOR,
+            x: tA,
+            data: degSeries(rebased(cmdA, baseA)),
+          },
+          { label: "A actual", color: ACTUAL_COLOR, x: tA, data: degSeries(rebased(actA, baseA)) },
+          { label: "B actual", color: B_COLOR, x: tB, data: degSeries(rebased(actB, baseB)) },
+        ],
+        sub: [
+          ...errorLane(tA, cmdA, actA, "A error °"),
+          ...errorLane(tB, cmdB, actB, "B error °", B_ERROR_COLOR),
+        ],
+      },
+    ]
+  }
+
+  // motion / filter: channels matched across the runs by column name.
+  const refKey = kind === "motion" ? "target" : "clean"
+  const outKey = kind === "motion" ? "actual" : "filtered"
+  const refLabel = kind === "motion" ? "commanded" : "clean"
+  const colsA = (a.meta.params.columns as string[] | undefined) ?? []
+  const colsB = (b.meta.params.columns as string[] | undefined) ?? []
+  const idxB = new Map(colsB.map((n, i) => [n, i]))
+  const out: JointChart[] = []
+  for (let i = 0; i < colsA.length; i++) {
+    const name = colsA[i]
+    if (arm != null && !name?.startsWith(`${arm}.`)) continue
+    const j = idxB.get(name)
+    const refA = a.series[`${refKey}/${i}`]
+    const outA = a.series[`${outKey}/${i}`]
+    const refB = j != null ? b.series[`${refKey}/${j}`] : undefined
+    const outB = j != null ? b.series[`${outKey}/${j}`] : undefined
+    if (!refA || !outA || !refB || !outB) continue
+    let min = Infinity
+    let max = -Infinity
+    for (const v of refA) {
+      if (v == null) continue
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    if (max - min < 0.017) continue
+    out.push({
+      joint: arm != null ? name.slice(arm.length + 1) : name,
+      series: [
+        { label: refLabel, color: COMMANDED_COLOR, x: tA, data: degSeries(refA) },
+        { label: "A", color: ACTUAL_COLOR, x: tA, data: degSeries(outA) },
+        { label: "B", color: B_COLOR, x: tB, data: degSeries(outB) },
+      ],
+      sub: [
+        ...errorLane(tA, refA, outA, "A error °"),
+        ...errorLane(tB, refB, outB, "B error °", B_ERROR_COLOR),
+      ],
+    })
+  }
+  return out
 }
 
 /** A scorecard column: which metric key, how to show it. */
@@ -778,8 +899,11 @@ function FailureMap({
  * at once (click a joint to jump to its graph), each joint gets a commanded
  * vs actual chart (clean vs noisy vs filtered for filter runs) with an
  * error lane underneath at the error's own scale, and the score table
- * colors cells amber/red past the same thresholds. Runs are compared by
- * their headline tracking score in the run list.
+ * colors cells amber/red past the same thresholds. Tick two runs of the
+ * same kind in the run list to compare them: charts overlay both outputs
+ * (A yellow, B blue) with both error traces, a verdict line names the
+ * better run by its headline score, and the score table pairs every metric
+ * with the better value highlighted.
  */
 export function TuningWorkbench({
   enabled,
@@ -815,6 +939,11 @@ export function TuningWorkbench({
   const [loading, setLoading] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [run, setRun] = useState<TuningRunData | null>(null)
+  // Compare mode: tick two runs of the same kind and the detail area
+  // overlays them (A = first ticked, yellow; B = blue). Ticking a third
+  // swaps out the older pick; unticking drops back to the single-run view.
+  const [compareIds, setCompareIds] = useState<string[]>([])
+  const [compareData, setCompareData] = useState<Record<string, TuningRunData>>({})
   // Which arm's joints to chart for a motion run — mirrors the live
   // telemetry arm toggle (and starts from the same remembered choice).
   const [arm, setArm] = useState<string>(
@@ -883,6 +1012,29 @@ export function TuningWorkbench({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- toast is stable
   }, [selectedId])
+
+  const toggleCompare = useCallback((id: string) => {
+    setCompareIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev.slice(-1), id]
+    )
+  }, [])
+
+  // Fetch full run data for compare picks (cached; picks change rarely).
+  useEffect(() => {
+    let active = true
+    for (const id of compareIds) {
+      if (compareData[id]) continue
+      fetchTuningRun(id)
+        .then((r) => {
+          if (active) setCompareData((prev) => ({ ...prev, [id]: r }))
+        })
+        .catch((e) => toast.error(String(e)))
+    }
+    return () => {
+      active = false
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- compareData is the cache being filled; toast is stable
+  }, [compareIds])
 
   // When a tuning run we launched finishes, pull the new artifacts in and
   // show the newest run's graphs right away.
@@ -965,6 +1117,55 @@ export function TuningWorkbench({
     | Record<string, Record<string, unknown>>
     | undefined
 
+  /* --- compare mode ------------------------------------------------ */
+  const comparing = compareIds.length === 2
+  const cmpA = compareData[compareIds[0] ?? ""] ?? null
+  const cmpB = compareData[compareIds[1] ?? ""] ?? null
+  const cmpReady = comparing && cmpA != null && cmpB != null
+  // The kind of the first pick gates the other rows' checkboxes: comparing
+  // a step against a filter run has no meaning.
+  const compareKind =
+    compareIds.length > 0
+      ? (runs.find((r) => r.id === compareIds[0])?.kind ?? null)
+      : null
+  const cmpArms = useMemo(
+    () =>
+      cmpReady ? Array.from(new Set([...runArms(cmpA), ...runArms(cmpB)])) : [],
+    [cmpReady, cmpA, cmpB]
+  )
+  const cmpArm = cmpArms.length > 0 ? (cmpArms.includes(arm) ? arm : cmpArms[0]) : null
+  const cmpCharts = useMemo(
+    () => (cmpReady ? compareJointCharts(cmpA, cmpB, cmpArm) : []),
+    [cmpReady, cmpA, cmpB, cmpArm]
+  )
+  const cmpVerdict = useMemo(() => {
+    if (!cmpReady) return null
+    const va = headlineNum(cmpA.meta)
+    const vb = headlineNum(cmpB.meta)
+    if (va == null || vb == null) return null
+    const label = headline(cmpA.meta)?.label ?? "score"
+    const isScore = cmpA.meta.kind === "sine" || cmpA.meta.kind === "step"
+    const fmt = (v: number) => (isScore ? fmtNum(v, 3) : `${fmtNum(toDeg(v))}°`)
+    if (va === vb) return { better: null as string | null, text: `${label}: dead even at ${fmt(va)}` }
+    const better = va < vb ? "A" : "B"
+    const pct = Math.round((1 - Math.min(va, vb) / Math.max(va, vb)) * 100)
+    return {
+      better,
+      text: `${label} ${fmt(va)} (A) vs ${fmt(vb)} (B) — ${better} is ${pct}% better`,
+    }
+  }, [cmpReady, cmpA, cmpB])
+  const cmpScores = useMemo(() => {
+    if (!cmpReady) return null
+    const sa = scoreRows(cmpA.meta, cmpArm)
+    const sb = scoreRows(cmpB.meta, cmpArm)
+    if (!sa && !sb) return null
+    const cols = (sa ?? sb)!.cols
+    const mapA = new Map((sa?.rows ?? []).map((r) => [r.joint, r.values]))
+    const mapB = new Map((sb?.rows ?? []).map((r) => [r.joint, r.values]))
+    const joints = Array.from(new Set([...mapA.keys(), ...mapB.keys()]))
+    return { cols, joints, mapA, mapB }
+  }, [cmpReady, cmpA, cmpB, cmpArm])
+
   // Failure-map click: chart that arm, then scroll to that joint's graph
   // (after the arm switch has re-rendered the chart grid).
   const pickJoint = useCallback((side: string, joint: string) => {
@@ -981,6 +1182,7 @@ export function TuningWorkbench({
       try {
         await deleteTuningRun(id)
         setRuns((prev) => prev.filter((r) => r.id !== id))
+        setCompareIds((prev) => prev.filter((x) => x !== id))
         if (selectedId === id) select(null)
       } catch (e) {
         toast.error(String(e))
@@ -993,6 +1195,7 @@ export function TuningWorkbench({
     try {
       await clearTuningRuns()
       setRuns([])
+      setCompareIds([])
       select(null)
     } catch (e) {
       toast.error(String(e))
@@ -1168,8 +1371,209 @@ export function TuningWorkbench({
         )}
       </Card>
 
+      {/* Compare mode: the two ticked runs, overlaid per joint. */}
+      {comparing && (
+        <>
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <Badge variant="neutral">compare</Badge>
+            {compareIds.map((id, i) => {
+              const r = runs.find((x) => x.id === id)
+              if (!r) return null
+              const head = headline(r)
+              return (
+                <span
+                  key={id}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-md border border-white/10 bg-white/[0.03] px-2 py-1"
+                >
+                  <span
+                    className="size-2 shrink-0 rounded-full"
+                    style={{ background: i === 0 ? ACTUAL_COLOR : B_COLOR }}
+                  />
+                  <span className="font-semibold text-white/75">{i === 0 ? "A" : "B"}</span>
+                  <span className="text-white/60">
+                    {[
+                      r.side,
+                      r.joint,
+                      (r.params.motion as string) ?? null,
+                      (r.params.source as string) ?? null,
+                      r.params.noise ? `${r.params.noise as string} noise` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ") || "—"}
+                  </span>
+                  {Object.keys(r.gains).length > 0 && (
+                    <span className="font-mono text-white/45">{gainsSummary(r.gains)}</span>
+                  )}
+                  {r.label && <span className="italic text-white/45">{r.label}</span>}
+                  {head && (
+                    <span className="font-mono text-white/60 tabular-nums">
+                      {head.label} {head.value}
+                    </span>
+                  )}
+                  <span className="text-white/35">{fmtWhen(r.startedAt)}</span>
+                </span>
+              )
+            })}
+            {cmpArms.length > 1 && (
+              <span className="flex overflow-hidden rounded-md border border-white/10">
+                {cmpArms.map((a) => (
+                  <button
+                    key={a}
+                    type="button"
+                    onClick={() => setArm(a)}
+                    className={cn(
+                      "px-3 py-1 text-xs capitalize transition-colors",
+                      cmpArm === a
+                        ? "bg-[#eff483]/15 text-[#eff483]"
+                        : "text-white/50 hover:bg-white/[0.05]"
+                    )}
+                  >
+                    {a} arm
+                  </button>
+                ))}
+              </span>
+            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto text-white/50"
+              onClick={() => setCompareIds([])}
+            >
+              <X /> Exit compare
+            </Button>
+          </div>
+
+          {cmpVerdict && (
+            <p className="text-xs">
+              <span
+                className="rounded-md bg-white/[0.04] px-2.5 py-1.5 font-medium"
+                style={{
+                  color:
+                    cmpVerdict.better === "B"
+                      ? B_COLOR
+                      : cmpVerdict.better === "A"
+                        ? ACTUAL_COLOR
+                        : "rgba(255,255,255,0.7)",
+                }}
+              >
+                {cmpVerdict.text}
+              </span>
+            </p>
+          )}
+
+          {!cmpReady && <p className="text-xs text-white/40">Loading both runs…</p>}
+          {cmpReady && cmpCharts.length > 0 && (
+            <div
+              className={cn("grid grid-cols-1 gap-4", cmpCharts.length > 1 && "xl:grid-cols-2")}
+            >
+              {cmpCharts.map((c) => (
+                <RunChart
+                  key={c.joint}
+                  id={`cmp-chart-${c.joint}`}
+                  title={c.joint}
+                  unit="°"
+                  series={c.series}
+                  sub={c.sub}
+                  height={cmpCharts.length > 1 ? 260 : 310}
+                />
+              ))}
+            </div>
+          )}
+          {cmpReady && cmpCharts.length === 0 && (
+            <p className="text-xs text-white/40">
+              These two runs share no moving joints to overlay.
+            </p>
+          )}
+
+          {cmpScores && (
+            <Card className="gap-3 p-4">
+              <h3 className="font-heading text-sm font-semibold">
+                Scores — A vs B{cmpArm ? ` — ${cmpArm} arm` : ""}
+              </h3>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-white/40">
+                      <th rowSpan={2} className="py-1 pr-4 align-bottom font-normal">
+                        joint
+                      </th>
+                      {cmpScores.cols.map((c) => (
+                        <th key={c.key} colSpan={2} className="py-1 pr-4 font-normal">
+                          {c.label}
+                        </th>
+                      ))}
+                    </tr>
+                    <tr className="text-left">
+                      {cmpScores.cols.map((c) => (
+                        <Fragment key={c.key}>
+                          <th
+                            className="py-0.5 pr-2 font-normal"
+                            style={{ color: ACTUAL_COLOR }}
+                          >
+                            A
+                          </th>
+                          <th className="py-0.5 pr-4 font-normal" style={{ color: B_COLOR }}>
+                            B
+                          </th>
+                        </Fragment>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono tabular-nums">
+                    {cmpScores.joints.map((joint) => (
+                      <tr key={joint} className="border-t border-white/[0.06]">
+                        <td className="py-1 pr-4 font-sans text-white/55">{joint}</td>
+                        {cmpScores.cols.map((c) => {
+                          const rowA = cmpScores.mapA.get(joint)
+                          const rowB = cmpScores.mapB.get(joint)
+                          const va = rowA ? scoreValue(rowA, c) : null
+                          const vb = rowB ? scoreValue(rowB, c) : null
+                          // Lower is better on every ranked column; ring_hz
+                          // is descriptive, not a quality score.
+                          const ranked =
+                            c.key !== "ring_hz" && va != null && vb != null && va !== vb
+                          return (
+                            <Fragment key={c.key}>
+                              <td
+                                className={cn(
+                                  "py-1 pr-2",
+                                  ranked && va! < vb!
+                                    ? "font-semibold text-emerald-300"
+                                    : "text-white/70"
+                                )}
+                              >
+                                {va == null ? "–" : fmtNum(va, c.digits ?? 2)}
+                              </td>
+                              <td
+                                className={cn(
+                                  "py-1 pr-4",
+                                  ranked && vb! < va!
+                                    ? "font-semibold text-emerald-300"
+                                    : "text-white/70"
+                                )}
+                              >
+                                {vb == null ? "–" : fmtNum(vb, c.digits ?? 2)}
+                              </td>
+                            </Fragment>
+                          )
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
+                Green marks the better (lower) value of each pair. Sine/step charts are
+                rebased to each run's starting position so runs probed at different
+                centers still overlay; the error lanes are unaffected.
+              </p>
+            </Card>
+          )}
+        </>
+      )}
+
       {/* Selected run: what it is, arm tabs, per-joint graphs, scores. */}
-      {meta && (
+      {!comparing && meta && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           <Badge variant="neutral">{meta.kind}</Badge>
           <span className="text-white/60">
@@ -1203,12 +1607,12 @@ export function TuningWorkbench({
       )}
 
       {/* Both arms at a glance: where the tracking error concentrates. */}
-      {meta && perJoint && (
+      {!comparing && meta && perJoint && (
         <FailureMap perJoint={perJoint} kind={meta.kind} arm={arm} onPick={pickJoint} />
       )}
 
       {/* Commanded vs actual position + error lane, one chart per joint. */}
-      {run && jointCharts.length > 0 && (
+      {!comparing && run && jointCharts.length > 0 && (
         <div
           className={cn("grid grid-cols-1 gap-4", jointCharts.length > 1 && "xl:grid-cols-2")}
         >
@@ -1225,14 +1629,14 @@ export function TuningWorkbench({
           ))}
         </div>
       )}
-      {run && jointCharts.length === 0 && (
+      {!comparing && run && jointCharts.length === 0 && (
         <p className="text-xs text-white/40">
           No joint moved more than 1° in this run — nothing to chart.
         </p>
       )}
 
       {/* Per-joint scores under the graphs. */}
-      {scores && (
+      {!comparing && scores && (
         <Card className="gap-3 p-4">
           <h3 className="font-heading text-sm font-semibold">
             Tracking scores{armed ? ` — ${arm} arm` : ""}
@@ -1307,6 +1711,9 @@ export function TuningWorkbench({
             {runs.map((r) => {
               const selected = r.id === selectedId
               const head = headline(r)
+              const cmpIdx = compareIds.indexOf(r.id)
+              const cmpBlocked =
+                compareKind != null && r.kind !== compareKind && cmpIdx < 0
               return (
                 <div
                   key={r.id}
@@ -1326,6 +1733,28 @@ export function TuningWorkbench({
                       : "hover:bg-white/[0.04]"
                   )}
                 >
+                  <input
+                    type="checkbox"
+                    checked={cmpIdx >= 0}
+                    disabled={cmpBlocked}
+                    title={
+                      cmpBlocked
+                        ? `compare needs another ${compareKind} run`
+                        : "tick two runs to compare them"
+                    }
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={() => toggleCompare(r.id)}
+                    className="accent-[#eff483] disabled:opacity-30"
+                    style={cmpIdx >= 0 ? { accentColor: cmpIdx === 0 ? ACTUAL_COLOR : B_COLOR } : undefined}
+                  />
+                  {cmpIdx >= 0 && (
+                    <span
+                      className="font-semibold"
+                      style={{ color: cmpIdx === 0 ? ACTUAL_COLOR : B_COLOR }}
+                    >
+                      {cmpIdx === 0 ? "A" : "B"}
+                    </span>
+                  )}
                   <Badge variant="neutral">{r.kind}</Badge>
                   <span className="text-white/70">
                     {[

@@ -135,7 +135,10 @@ export function MotorGrid({
                 )}
               />
               <Stat label="Bus" value={fmt(reading?.voltage, 1, "V")} />
-              <Stat label="Pos (rad)" value={fmt(pos, 2, "")} />
+              <Stat
+                label="Pos"
+                value={fmt(pos == null ? null : (pos * 180) / Math.PI, 1, "°")}
+              />
             </div>
           </button>
         )
@@ -182,8 +185,8 @@ function MotorDetailsDialog({
     }
   }, [arm, joint])
 
-  const rad = (v: number | null) =>
-    v == null ? "–" : `${v.toFixed(3)} rad (${((v * 180) / Math.PI).toFixed(1)}°)`
+  const deg = (v: number | null) =>
+    v == null ? "–" : `${((v * 180) / Math.PI).toFixed(1)}°`
 
   return (
     <div
@@ -221,8 +224,17 @@ function MotorDetailsDialog({
             <DetailRow label="Control mode" value={details.mode ?? "–"} />
             <DetailRow label="Model" value={details.model ?? "–"} />
             <DetailRow label="Firmware" value={details.firmware?.toString() ?? "–"} />
-            <DetailRow label="Position" value={rad(details.position)} />
-            <DetailRow label="Velocity" value={fmt(details.velocity, 3, " rad/s")} />
+            <DetailRow label="Position" value={deg(details.position)} />
+            <DetailRow
+              label="Velocity"
+              value={fmt(
+                details.velocity == null
+                  ? null
+                  : (details.velocity * 180) / Math.PI,
+                1,
+                " °/s"
+              )}
+            />
             <DetailRow label="Torque" value={fmt(details.torque, 3, " Nm")} />
             <DetailRow label="Temperature" value={fmt(details.temperature, 1, " °C")} />
             <DetailRow label="Bus voltage" value={fmt(details.voltage, 1, " V")} />
