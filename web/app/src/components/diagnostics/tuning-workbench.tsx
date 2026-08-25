@@ -142,6 +142,13 @@ const TABS: WbTab[] = [
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
       {
+        key: "rate",
+        label: "rate (Hz)",
+        type: "number",
+        placeholder: "100",
+        hint: "command-loop rate — production teleop runs 240; the loop Hz score shows what was actually sustained",
+      },
+      {
         key: "ff",
         label: "feedforward",
         type: "select",
@@ -174,6 +181,13 @@ const TABS: WbTab[] = [
       ...GAIN_FIELDS,
       { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
+      {
+        key: "rate",
+        label: "rate (Hz)",
+        type: "number",
+        placeholder: "100",
+        hint: "command-loop rate — production teleop runs 240; the loop Hz score shows what was actually sustained",
+      },
       {
         key: "ff",
         label: "feedforward",
@@ -368,6 +382,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("freq", p.freq)
       put("duration", p.duration)
       put("hold", p.hold)
+      put("rate", p.rate)
       put("ff", p.ff)
       put("stiffness", p.stiffness)
       put("target_noise", p.target_noise_deg)
@@ -723,6 +738,7 @@ const MOTION_COLS: ScoreCol[] = [
 const SINE_COLS: ScoreCol[] = [
   { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
   { key: "max", label: "max err °", deg: true, digits: 3, warn: 3, bad: 6 },
+  { key: "hz", label: "loop Hz", digits: 0 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
   { key: "pos_ripple", label: "ripple", digits: 4 },
   { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
@@ -744,6 +760,7 @@ const STEP_COLS: ScoreCol[] = [
   { key: "overshoot", label: "overshoot °", deg: true, digits: 3, warn: 1, bad: 3 },
   { key: "ss_rms", label: "steady-state RMS °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
   { key: "ring_hz", label: "ring Hz", digits: 1 },
+  { key: "hz", label: "loop Hz", digits: 0 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
   { key: "holder_peak_deg", label: "holder wobble °", digits: 2, warn: 0.2, bad: 0.5 },
   { key: "score", label: "score", digits: 3 },
@@ -759,13 +776,17 @@ const SCORE_LEGEND: Record<string, string> = {
   sine:
     "tracking RMS = average distance from the commanded sine (lower is " +
     "better). score = RMS + 0.2 × worst excursion, the number to compare " +
-    "runs by. torque chatter / ripple = high-frequency roughness. holder " +
+    "runs by. loop Hz = the command rate actually sustained — if it sits " +
+    "below the requested rate, CAN round trips saturated the loop. torque " +
+    "chatter / ripple = high-frequency roughness. holder " +
     "wobble = how far the other joints (held stiff in firmware position " +
     "mode) moved during the test — past ~0.5° the structure was flexing " +
     "and part of the error is not this joint's fault.",
   step:
     "settling = time to stay within 5% of the step. overshoot = travel past " +
-    "the target. ring Hz = post-step oscillation frequency, if any. holder " +
+    "the target. ring Hz = post-step oscillation frequency, if any. loop Hz " +
+    "= the command rate actually sustained — if it sits below the requested " +
+    "rate, CAN round trips saturated the loop. holder " +
     "wobble = how far the other joints (held stiff in firmware position " +
     "mode) moved — past ~0.5° the structure was flexing and part of the " +
     "ring came from a neighbour. score folds settling, overshoot, and " +

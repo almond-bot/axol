@@ -24,7 +24,7 @@ During every probe the other joints are held at rest by the motor firmware's own
 | `--freq FLOAT` | [sine] Frequency in Hz (default: 1.0) |
 | `--duration FLOAT` | [sine] Duration in seconds (default: 5.0) |
 | `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) — also the length of the unscored settle at the center before the step, so arrival/gain-change ringing dies out before anything is measured |
-| `--rate FLOAT` | Command rate in Hz (default: 100.0) |
+| `--rate FLOAT` | Command rate in Hz (default: 100.0; production teleop runs 240). The loop runs open-throttle when CAN round trips exceed the cycle budget, so the report prints the rate actually achieved and warns when it saturates below the request. Gains tuned at a lower rate see more host-damping transport delay than teleop will |
 | `--save` | Save the best candidate's Kp/Kd to `~/.almond/calibration.json` |
 | `--save-run` | Persist each candidate's full time series and metrics as a tuning-run artifact (`~/.almond/diagnostics/tuning/`) for charting and A/B comparison in the diagnostics UI |
 | `--dump-csv [PATH]` | Write per-sample `(kp, kd, t, target, actual, error)` rows to a CSV for offline plotting. Pass without a value to auto-name as `logs/pid_<side>_<joint>_<timestamp>.csv` |

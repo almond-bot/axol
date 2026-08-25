@@ -147,6 +147,28 @@ async def ramp_joints_to(
             break
 
 
+def report_achieved_rate(log: list[dict], rate_hz: float) -> None:
+    """Print the loop rate the run actually sustained.
+
+    The loop runs open-throttle when a cycle's CAN round trips exceed the
+    period, so the requested rate is a ceiling, not a guarantee — and gains
+    tuned at a lower-than-production rate see more host-damping transport
+    delay than teleop will. Warn when the shortfall is real (>10%).
+    """
+    if len(log) < 2:
+        return
+    span = log[-1]["t"] - log[0]["t"]
+    if span <= 0:
+        return
+    achieved = (len(log) - 1) / span
+    print(f"  achieved rate: {achieved:.0f} Hz (requested {rate_hz:.0f})")
+    if achieved < 0.9 * rate_hz:
+        print(
+            "  ! loop saturated below the requested rate — CAN round trips "
+            "exceed the cycle budget; the results reflect the achieved rate"
+        )
+
+
 def cached_torque(motor: JointFrameMotor) -> float:
     """Torque cached by the last impedance response (Nm), or NaN if absent."""
     try:
@@ -299,7 +321,12 @@ async def run_sine(
         k += 1
         v_des, t_ff = ff.compute(target, cached_meas(test_motor))
         await test_motor.set_impedance(target, v_des, kp, kd, t_ff)
-        actual = await test_motor.get_position()
+        # The impedance response frame already carried position feedback
+        # (just cached) — reading it instead of a separate poll halves the
+        # CAN round trips per cycle, which is what makes production-rate
+        # (240 Hz) testing reachable. Production never polls separately.
+        meas = cached_meas(test_motor)
+        actual = meas[0] if meas is not None else await test_motor.get_position()
         if monitor is not None:
             await monitor.sample()
         t_read = time.monotonic() - start
@@ -318,6 +345,7 @@ async def run_sine(
         if spent < dt:
             await asyncio.sleep(dt - spent)
 
+    report_achieved_rate(log, rate_hz)
     return log, amp
 
 
@@ -423,7 +451,6 @@ async def run_step(
         loop_start = time.monotonic()
         _, t_ff = ff.compute(center, cached_meas(test_motor))
         await test_motor.set_impedance(center, 0.0, kp, kd, t_ff)
-        await test_motor.get_position()
         if monitor is not None:
             # Keep the holders' latest readings warm through the settle …
             await monitor.sample()
@@ -445,7 +472,10 @@ async def run_step(
             t = time.monotonic() - start
             _, t_ff = ff.compute(phase_target, cached_meas(test_motor))
             await test_motor.set_impedance(phase_target, 0.0, kp, kd, t_ff)
-            actual = await test_motor.get_position()
+            # Position from the impedance response just cached — no separate
+            # poll (see run_sine).
+            meas = cached_meas(test_motor)
+            actual = meas[0] if meas is not None else await test_motor.get_position()
             if monitor is not None:
                 await monitor.sample()
             log.append(
@@ -461,4 +491,5 @@ async def run_step(
             if spent < dt:
                 await asyncio.sleep(dt - spent)
 
+    report_achieved_rate(log, rate_hz)
     return log, amp
