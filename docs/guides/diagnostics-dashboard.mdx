@@ -39,4 +39,4 @@ Powering the robot host off or rebooting it is done from the [control panel's Ax
 
 ## Run history
 
-Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The ROM test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.
+Every *diagnostic test* (the cards above — not the ad-hoc CAN/calibration buttons) is recorded as a run: command, arguments, duration, exit status, log, and the telemetry observed while it executed (persisted under `~/.almond/diagnostics/runs` on the serve host; the **Clear** button deletes the history). The list is paginated newest-first (10 runs per page). The ROM test additionally writes its own 5 Hz position/torque capture, since it owns the CAN bus while it runs — opening a run charts its capture with the same joint filter and zoom/pan as the live charts.
