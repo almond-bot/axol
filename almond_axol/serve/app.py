@@ -454,8 +454,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def telemetry_history(
         seconds: float = 120.0, max_frames: int = 2000
     ) -> dict[str, Any]:
-        """Buffered telemetry frames for chart backfill on page load."""
-        return {"frames": hub.history(seconds, max_frames)}
+        """Buffered telemetry frames for chart backfill on page load.
+
+        ``slow`` carries the 1 Hz sweep history (temperature/voltage) so the
+        temperature chart backfills too.
+        """
+        return {
+            "frames": hub.history(seconds, max_frames),
+            "slow": hub.slow_history(seconds),
+        }
 
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:

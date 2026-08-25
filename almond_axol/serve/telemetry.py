@@ -52,6 +52,8 @@ _logger = logging.getLogger(__name__)
 SAMPLE_HZ = 10.0
 # Ring buffer length: 10 minutes at SAMPLE_HZ.
 _BUFFER_FRAMES = int(SAMPLE_HZ * 600)
+# Slow (1 Hz) sweep ring: same 10-minute span, for temperature charting.
+_SLOW_BUFFER_FRAMES = 600
 
 RUNS_DIR = Path.home() / ".almond" / "diagnostics" / "runs"
 
@@ -69,6 +71,8 @@ class TelemetryHub:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._frames: deque[dict[str, Any]] = deque(maxlen=_BUFFER_FRAMES)
+        # Slow-sweep history ({"t": ..., "m": {...}}), for temperature charts.
+        self._slow_frames: deque[dict[str, Any]] = deque(maxlen=_SLOW_BUFFER_FRAMES)
         # motor key -> latest slow reading (temperature/voltage/status/...).
         self._slow: dict[str, dict[str, Any]] = {}
         self._slow_t: float | None = None
@@ -89,6 +93,7 @@ class TelemetryHub:
         with self._lock:
             self._slow.update(motors)
             self._slow_t = now
+            self._slow_frames.append({"t": now, "m": motors})
         self._fanout({"type": "slow", "t": now, "m": motors})
 
     def push_state(self, state: str) -> None:
@@ -151,6 +156,12 @@ class TelemetryHub:
             stride = len(frames) / max_frames
             frames = [frames[int(i * stride)] for i in range(max_frames)]
         return frames
+
+    def slow_history(self, seconds: float) -> list[dict[str, Any]]:
+        """Buffered slow sweeps (temperature/voltage) from the last ``seconds``."""
+        cutoff = time.time() - seconds
+        with self._lock:
+            return [f for f in self._slow_frames if f["t"] >= cutoff]
 
     def frames_between(self, start: float, end: float) -> list[dict[str, Any]]:
         with self._lock:

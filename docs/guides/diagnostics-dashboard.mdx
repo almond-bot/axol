@@ -21,7 +21,7 @@ The saved mapping then drives the whole dashboard: every diagnostic and calibrat
 
 ## Live telemetry
 
-Position, velocity, and torque charts for the selected arm stream continuously at 10 Hz while the robot link is connected. The server keeps a 10-minute rolling buffer, so the charts backfill on page load. The filter row scopes all three charts: time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**. Each chart's header button expands it to full screen (Esc to exit) for a closer look.
+One chart for the selected arm streams continuously while the robot link is connected, toggled between **Position**, **Velocity**, **Torque** (10 Hz), and **Temp** (from the 1 Hz health sweep). The server keeps a 10-minute rolling buffer for all of them, so the chart backfills on page load. The filter row scopes it: metric, time window presets (30s–10m), arm, and per-joint toggles; scroll to zoom and drag to pan, which pins the view until you press **Go live**. The chart's header button expands it to full screen (Esc to exit) for a closer look.
 
 Telemetry is sampled by the idle robot link, which is the single owner of the CAN bus. While a diagnostic or operation owns the bus the stream pauses and the charts label the gap — history is kept, and streaming resumes as soon as the bus is released.
 

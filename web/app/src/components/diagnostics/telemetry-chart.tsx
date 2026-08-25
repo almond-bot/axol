@@ -35,6 +35,11 @@ interface TelemetryChartProps {
   quietReason?: string | null
   /** Plot height in px (fullscreen mode sizes itself). */
   height?: number
+  /**
+   * Longest sample gap (s) still drawn as a connected line. The default suits
+   * the 10 Hz fast stream; the 1 Hz slow (temperature) series needs more.
+   */
+  gapBreakS?: number
   className?: string
 }
 
@@ -140,6 +145,7 @@ export function TelemetryChart({
   onViewChange,
   quietReason,
   height = 260,
+  gapBreakS = GAP_BREAK_S,
   className,
 }: TelemetryChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -333,7 +339,7 @@ export function TelemetryChart({
       ctx.beginPath()
       let prevT = -Infinity
       for (const [t, v] of pts) {
-        if (t - prevT > GAP_BREAK_S) ctx.moveTo(x(t), y(v))
+        if (t - prevT > gapBreakS) ctx.moveTo(x(t), y(v))
         else ctx.lineTo(x(t), y(v))
         prevT = t
       }
@@ -361,7 +367,7 @@ export function TelemetryChart({
         ctx.stroke()
       }
     }
-  }, [data, size, series, hover, quietReason, view, plotW])
+  }, [data, size, series, hover, quietReason, view, plotW, gapBreakS])
 
   const toTime = useCallback(
     (clientX: number) => {

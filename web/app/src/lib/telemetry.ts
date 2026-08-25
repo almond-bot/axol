@@ -88,7 +88,11 @@ export async function fetchTelemetry(): Promise<TelemetrySnapshot> {
 export async function fetchTelemetryHistory(
   seconds: number,
   maxFrames = 2000
-): Promise<{ frames: TelemetryFrame[] }> {
+): Promise<{
+  frames: TelemetryFrame[]
+  /** 1 Hz sweep history (temperature/voltage); absent on older hosts. */
+  slow?: { t: number; m: Record<string, SlowReading> }[]
+}> {
   return json(
     await fetch(apiUrl(`/api/telemetry/history?seconds=${seconds}&max_frames=${maxFrames}`))
   )
@@ -177,7 +181,18 @@ async function json<T>(res: Response): Promise<T> {
 
 /** Client-side frame buffer: 10 minutes at the server's 10 Hz sample rate. */
 const MAX_FRAMES = 6000
+/** Slow (1 Hz) sweep buffer: the same 10-minute span. */
+const MAX_SLOW_FRAMES = 600
 const RECONNECT_MS = 3000
+
+/** Chart-shaped frame from one slow sweep: m[key] = [temperature, voltage]. */
+function slowToFrame(t: number, m: Record<string, SlowReading>): TelemetryFrame {
+  const out: Record<string, FastSample> = {}
+  for (const [key, r] of Object.entries(m)) {
+    out[key] = [r.temperature, r.voltage]
+  }
+  return { t, m: out }
+}
 
 type WsMessage =
   | ({ type: "hello" } & TelemetrySnapshot)
@@ -192,6 +207,11 @@ export interface TelemetryStream {
   slow: Record<string, SlowReading>
   /** Shared, append-only frame buffer (same array identity across renders). */
   frames: TelemetryFrame[]
+  /**
+   * 1 Hz sweep history in chart-frame shape: m[key] = [temperature, voltage].
+   * Same in-place-mutated identity contract as `frames`.
+   */
+  slowFrames: TelemetryFrame[]
   /** Bumped on every appended frame — subscribe charts to this. */
   version: number
   /** WebSocket currently open. */
@@ -208,6 +228,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
   // The buffer is intentionally a stable, in-place-mutated array (returning a
   // new 6k-frame array per sample would thrash); `version` signals changes.
   const [frames] = useState<TelemetryFrame[]>(() => [])
+  const [slowFrames] = useState<TelemetryFrame[]>(() => [])
   const [version, setVersion] = useState(0)
   const [state, setState] = useState<RobotState>("disconnected")
   const [slow, setSlow] = useState<Record<string, SlowReading>>({})
@@ -220,20 +241,36 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
     let closed = false
 
     const buf = frames
+    const slowBuf = slowFrames
     const append = (frame: TelemetryFrame) => {
       buf.push(frame)
       if (buf.length > MAX_FRAMES) buf.splice(0, buf.length - MAX_FRAMES)
       setVersion((v) => v + 1)
     }
+    const appendSlow = (frame: TelemetryFrame) => {
+      slowBuf.push(frame)
+      if (slowBuf.length > MAX_SLOW_FRAMES)
+        slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+      setVersion((v) => v + 1)
+    }
 
     const backfill = async () => {
       try {
-        const { frames: history } = await fetchTelemetryHistory(600, 3000)
+        const { frames: history, slow: slowHistory } = await fetchTelemetryHistory(600, 3000)
         const newest = buf.length > 0 ? buf[buf.length - 1].t : -Infinity
         // Only frames older than what we already streamed, to keep t monotonic.
         const older = history.filter((f) => f.t < newest || buf.length === 0)
         buf.splice(0, 0, ...older)
         if (buf.length > MAX_FRAMES) buf.splice(0, buf.length - MAX_FRAMES)
+        if (slowHistory) {
+          const newestSlow = slowBuf.length > 0 ? slowBuf[slowBuf.length - 1].t : -Infinity
+          const olderSlow = slowHistory
+            .filter((f) => f.t < newestSlow || slowBuf.length === 0)
+            .map((f) => slowToFrame(f.t, f.m))
+          slowBuf.splice(0, 0, ...olderSlow)
+          if (slowBuf.length > MAX_SLOW_FRAMES)
+            slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+        }
         setVersion((v) => v + 1)
       } catch {
         // history is best-effort; the live stream still works without it
@@ -253,6 +290,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
           append({ t: msg.t, m: msg.m })
         } else if (msg.type === "slow") {
           setSlow((prev) => ({ ...prev, ...msg.m }))
+          appendSlow(slowToFrame(msg.t, msg.m))
         } else if (msg.type === "state") {
           setState(msg.state)
         } else if (msg.type === "hello") {
@@ -277,7 +315,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
       }
       setStreaming(false)
     }
-  }, [enabled, frames])
+  }, [enabled, frames, slowFrames])
 
-  return { state, slow, frames, version, streaming }
+  return { state, slow, frames, slowFrames, version, streaming }
 }

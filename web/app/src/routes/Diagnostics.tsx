@@ -72,6 +72,29 @@ const WINDOWS: { label: string; seconds: number }[] = [
   { label: "10m", seconds: 600 },
 ]
 
+/** The live chart's selectable metrics. `slow` charts the 1 Hz sweep buffer
+ * (temperature) instead of the 10 Hz fast frames. */
+const METRICS: {
+  key: string
+  label: string
+  title: string
+  unit: string
+  metric: number
+  slow?: boolean
+}[] = [
+  { key: "pos", label: "Position", title: "Position", unit: "rad", metric: 0 },
+  { key: "vel", label: "Velocity", title: "Velocity", unit: "rad/s", metric: 1 },
+  { key: "torque", label: "Torque", title: "Torque", unit: "Nm", metric: 2 },
+  {
+    key: "temp",
+    label: "Temp",
+    title: "Temperature",
+    unit: "°C",
+    metric: 0,
+    slow: true,
+  },
+]
+
 const STATE_BADGE: Record<
   RobotState,
   { variant: "success" | "warning" | "destructive" | "neutral"; text: string }
@@ -125,6 +148,9 @@ export default function Diagnostics() {
 
   const [arm, setArm] = useState<ArmSide>(
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
+  )
+  const [metricKey, setMetricKey] = useState(
+    () => localStorage.getItem("axolDiagMetric") || "pos"
   )
   const [windowSec, setWindowSec] = useState(120)
   const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
@@ -595,10 +621,14 @@ export default function Diagnostics() {
     ? (commands.find((c) => c.id === activeRun.command)?.label ?? activeRun.command)
     : null
 
+  const metric = METRICS.find((m) => m.key === metricKey) ?? METRICS[0]
+  const chartFrames = metric.slow ? stream.slowFrames : stream.frames
+
   // Follow mode anchors the window to the newest sample; the page re-renders
   // on every stream tick, so the live edge advances with the data (and holds
   // still while the stream is paused). Zoom/pan pins a fixed range.
-  const lastT = stream.frames.length > 0 ? stream.frames[stream.frames.length - 1].t : windowSec
+  const lastT =
+    chartFrames.length > 0 ? chartFrames[chartFrames.length - 1].t : windowSec
   const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
   return (
@@ -746,6 +776,26 @@ export default function Diagnostics() {
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="mr-2 font-heading text-base font-semibold">Live telemetry</h2>
             <div className="flex overflow-hidden rounded-md border border-white/10">
+              {METRICS.map((m) => (
+                <button
+                  key={m.key}
+                  type="button"
+                  onClick={() => {
+                    setMetricKey(m.key)
+                    localStorage.setItem("axolDiagMetric", m.key)
+                  }}
+                  className={cn(
+                    "px-2.5 py-1 text-xs transition-colors",
+                    metricKey === m.key
+                      ? "bg-[#eff483]/15 text-[#eff483]"
+                      : "text-white/50 hover:bg-white/[0.05]"
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex overflow-hidden rounded-md border border-white/10">
               {WINDOWS.map((w) => (
                 <button
                   key={w.seconds}
@@ -797,46 +847,21 @@ export default function Diagnostics() {
           <p className="text-xs text-white/30">
             Scroll to zoom, drag to pan — zooming pauses the live follow until you go live again.
           </p>
-          {/* Stacked full-width so each chart gets real reading space; the
-              header button on each takes it truly full screen. */}
-          <div className="grid grid-cols-1 gap-4">
-            <TelemetryChart
-              title="Position"
-              unit="rad"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={0}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Velocity"
-              unit="rad/s"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={1}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-            <TelemetryChart
-              title="Torque"
-              unit="Nm"
-              series={series}
-              frames={stream.frames}
-              version={stream.version}
-              metric={2}
-              view={view}
-              onViewChange={setPinnedView}
-              quietReason={quietReason}
-              height={300}
-            />
-          </div>
+          {/* One chart, toggled between metrics — the toggle row above picks
+              what it shows. Temperature reads the 1 Hz sweep buffer. */}
+          <TelemetryChart
+            title={metric.title}
+            unit={metric.unit}
+            series={series}
+            frames={chartFrames}
+            version={stream.version}
+            metric={metric.metric}
+            view={view}
+            onViewChange={setPinnedView}
+            quietReason={quietReason}
+            height={380}
+            gapBreakS={metric.slow ? 5 : undefined}
+          />
         </section>
 
         {/* Tests: pass/fail checks (ROM soaks, camera cable). */}
