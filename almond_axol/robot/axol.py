@@ -1325,9 +1325,10 @@ class AxolArm:
             f = gains.friction
             motor = self.motors[j]
             # The firmware silently clamps kd to its supported range (5 on
-            # Damiao and legacy MyActuator, 50 on MyActuator V4.4+). Deliver
-            # part of the clamped-off excess host-side so robots on legacy
-            # firmware keep some of the tuned damping instead of ringing —
+            # every motor family and firmware). Tuned kd defaults sit within
+            # the clamp, so this spill is normally zero; it exists so a
+            # deliberately oversized kd (e.g. an experiment) degrades into
+            # host damping instead of being silently lost —
             # but never beyond ``kd_host_max``: host damping runs at ~100 Hz
             # on a one-cycle-stale velocity, so on modes anywhere near that
             # rate the delayed torque arrives out of phase and *excites* the

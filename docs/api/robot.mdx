@@ -188,7 +188,7 @@ left = replace(
 | Field | Type | Description |
 |---|---|---|
 | `kp` | `float` (`[0, 500]`) | Impedance position stiffness |
-| `kd` | `float` | Impedance velocity damping. Clamped by the motor to its firmware's range — `5` on Damiao and legacy MyActuator, up to `50` on newer (V4.4+) MyActuator firmware (auto-detected on `enable()`). On legacy firmware the clamped-off excess is partially recovered host-side, up to the joint's `kd_host_max` (see below). |
+| `kd` | `float` | Impedance velocity damping, encoded against `[0, 5]` on every motor family and firmware. (The MyActuator V4.4 changelog claims a widened 0–50 range, but hardware decodes the field against 0–5 on all versions; historical kd values tuned under the 0–50 encoding are 10× inflated — the loader migrates saved calibration values automatically.) Values above 5 are silently clamped, with the excess partially recoverable host-side up to `kd_host_max` (see below). |
 | `friction` | `FrictionParams` | `fc`, `k`, `fv`, `fo` — friction-comp model `fc·tanh(0.1·k·v) + fv·v + fo` (see `compute_friction` in `robot/control.py`) |
 | `mass` | `float` | Mass of the URDF body this joint drives (kg). For `wrist_3` this includes the gripper. |
 | `com` | `tuple[float, float, float]` | Centre-of-mass of the same body in its URDF link frame (m). Used by gravity comp. |

@@ -56,11 +56,11 @@ class MotorDriver(ABC):
         """Upper bound of the firmware's impedance ``kd`` range (Nm·s/rad).
 
         :meth:`set_impedance` encodings clamp ``kd`` to this silently, so a
-        request above it is *lost*, not an error. 5 on Damiao and legacy
-        MyActuator; MyActuator V4.4+ raises it to 50 (detected on
-        :meth:`enable` / :meth:`attach` and overridden by that driver).
-        Consumers can deliver the clamped-off excess host-side instead — see
-        the ``kd_host`` spillover in ``AxolArm.motion_control``.
+        request above it is *lost*, not an error. 5 on every motor: Damiao,
+        and MyActuator on ALL firmware — the V4.4 changelog claims a widened
+        0-50 kd range, but hardware decodes the field against 0-5 regardless
+        of version. Consumers can deliver excess damping host-side instead —
+        see the ``kd_host`` spillover in ``AxolArm.motion_control``.
         """
         return 5.0
 
@@ -422,10 +422,8 @@ class MotorDriver(ABC):
             p_des: Desired position (rad)
             v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
-            kd:    Velocity damping. The motor clamps this to its firmware's
-                   range: [0, 5] on Damiao and legacy MyActuator, [0, 50] on
-                   newer (V4.4+) MyActuator firmware. MyActuator detects this
-                   on enable() and scales the command to match.
+            kd:    Velocity damping, encoded against [0, 5] on every motor
+                   family and firmware; values above 5 are silently lost.
             t_ff:  Feedforward torque (Nm)
         """
         ...

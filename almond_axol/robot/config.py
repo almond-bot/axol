@@ -67,10 +67,13 @@ class JointConfig:
 
     Attributes:
         kp:       Position stiffness for impedance control [0, 500].
-        kd:       Velocity damping for impedance control. The motor clamps
-                  this to its firmware's range — 5 on Damiao and legacy
-                  MyActuator, up to 50 on newer (V4.4+) MyActuator firmware
-                  (auto-detected on ``enable()``).
+        kd:       Velocity damping for impedance control, encoded against
+                  [0, 5] on every motor family and firmware. (The MyActuator
+                  V4.4 changelog claims a widened 0-50 range, but hardware
+                  decodes the 12-bit field against 0-5 on all versions; the
+                  historical defaults here were tuned under the wrong 0-50
+                  encoding and have been divided by 10, preserving the exact
+                  wire bits and therefore the tuned behavior.)
         friction: Parameters of the friction-compensation model.
         mass:     Mass of the body driven by this joint (kg). For ``wrist_3``
                   this includes the gripper assembly (fixed-jointed to
@@ -86,9 +89,10 @@ class JointConfig:
                   the command rate. Needed on the high-inertia shoulders,
                   where the motor firmware's internal velocity estimate is
                   too filtered to damp the ~2 Hz closed-loop resonance —
-                  measured on left shoulder_2 at kp=250: firmware kd=35
-                  alone left a 62%-overshoot ring; kd_host=30 on top damped
-                  it critically. The elbow needs its own dose for the same
+                  measured on left shoulder_2 at kp=250: firmware kd=3.5
+                  (tuned as "35" under the old 0-50 encoding) alone left a
+                  62%-overshoot ring; kd_host=30 on top damped it
+                  critically. The elbow needs its own dose for the same
                   reason, band-passed at its own mode (see ``kd_host_w0``).
                   Leave at 0 for joints whose firmware kd works (the wrists)
                   — and beware the failure mode that took shoulder_3's and
@@ -211,7 +215,7 @@ class ArmConfig:
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=250.0,
-            kd=35.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
@@ -223,7 +227,7 @@ class ArmConfig:
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=250.0,
-            kd=35.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
@@ -235,7 +239,7 @@ class ArmConfig:
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            kd=20.0,
+            kd=2.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
@@ -259,7 +263,7 @@ class ArmConfig:
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=40.0,
+            kd=4.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
@@ -287,7 +291,7 @@ class ArmConfig:
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            kd=17.0,
+            kd=1.7,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
@@ -483,11 +487,10 @@ class _ArmGains:
 # every ``s``, so intermediate slider positions stay as well damped as the
 # tuned endpoint (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10°
 # step, the consistent 100/1.6 overshot 0.5%). ``kp_stiff`` is capped where
-# the required ``kd`` would exceed the firmware range: Damiao clamps kd at 5
-# (wrist_2: 250 → kd 4.9), MyActuator V4.4 at 50 (elbow: 200 → kd 50).
-# Legacy MyActuator firmware clamps kd at 5; part of the excess is
-# delivered host-side instead, up to each joint's ``kd_host_max`` stability
-# ceiling (see ``kd_host`` spillover in :mod:`almond_axol.robot.axol`).
+# the required ``kd`` would exceed the firmware range, which is [0, 5] on
+# every motor family and firmware (Damiao wrist_2: 250 → kd 4.9; MyActuator
+# elbow: 200 → kd 4.96 — MyActuator kd values here are on the true 0-5
+# wire scale, see ``JointConfig.kd``).
 #
 # The shoulders are capped at 350 by measured torque chatter, not firmware:
 # at kp=500 each shoulder injected ~1.5 Nm RMS of cycle-to-cycle torque
@@ -513,13 +516,13 @@ class _ArmGains:
 # extra kp bought no stiffness in practice — a gripped payload would lower
 # the mode's frequency and amplify it further.
 _STIFF_GAINS = _ArmGains(
-    shoulder_1=(350.0, 41.4),
-    shoulder_2=(350.0, 41.4),
-    shoulder_3=(250.0, 23.6),
-    # Ratio-consistent elbow kd at kp=200 is 49.6, just inside the
-    # MyActuator V4.4 firmware clamp of 50.
-    elbow=(200.0, 49.6),
-    wrist_1=(200.0, 18.0),
+    shoulder_1=(350.0, 4.14),
+    shoulder_2=(350.0, 4.14),
+    shoulder_3=(250.0, 2.36),
+    # Ratio-consistent elbow kd at kp=200 is 4.96, just inside the
+    # universal firmware clamp of 5.
+    elbow=(200.0, 4.96),
+    wrist_1=(200.0, 1.8),
     wrist_2=(160.0, 3.9),
     wrist_3=(250.0, 2.8),
 )
@@ -530,11 +533,11 @@ _STIFF_GAINS = _ArmGains(
 # tuned midpoint (``kd_soft = kd · sqrt(kp_soft / kp)``, tuned values), same
 # rule as :data:`_STIFF_GAINS` above.
 _SOFT_GAINS = _ArmGains(
-    shoulder_1=(40.0, 14.0),
-    shoulder_2=(50.0, 15.7),
-    shoulder_3=(45.0, 10.0),
-    elbow=(40.0, 22.2),
-    wrist_1=(30.0, 6.9),
+    shoulder_1=(40.0, 1.4),
+    shoulder_2=(50.0, 1.57),
+    shoulder_3=(45.0, 1.0),
+    elbow=(40.0, 2.22),
+    wrist_1=(30.0, 0.69),
     wrist_2=(25.0, 1.5),
     wrist_3=(25.0, 0.9),
 )

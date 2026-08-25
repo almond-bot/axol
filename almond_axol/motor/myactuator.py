@@ -113,16 +113,20 @@ _MA_FW_V44_VERSION = 2026042402
 # Unchanged across firmware versions.
 _MA_V_MAX = 45.0  # rad/s
 _MA_KP_MAX = 500.0
+# kd decodes against 0-5 on ALL firmware. The V4.4 changelog claims the MIT
+# kd range widened to 0-50, but hardware behavior says otherwise: encoding
+# against 0-50 delivers one tenth of the requested damping (verified by the
+# tuning history — every gain tuned under the 0-50 encoding matched the
+# behavior of value/10 on the 0-5 scale).
+_MA_KD_MAX = 5.0
 
 # Legacy firmware (< V4.4).
 _MA_P_MAX_LEGACY = 12.5  # rad
-_MA_KD_MAX_LEGACY = 5.0
 _MA_T_MAX_LEGACY = 24.0  # Nm — fixed range for both t_ff and feedback torque
 
-# V4.4 firmware (>= _MA_FW_V44_VERSION). p_des and kd widened; the t_ff /
+# V4.4 firmware (>= _MA_FW_V44_VERSION). p_des widened; the t_ff /
 # feedback-torque range becomes ±(motor max torque) read from the model.
 _MA_P_MAX_V44 = 12.566  # rad
-_MA_KD_MAX_V44 = 50.0
 
 # Motor max torque (Nm) keyed by model series — the "X<n>" token found in the
 # 0xB5 model string (e.g. "RMD-X8-P20" -> 8). Used as the V4.4 t_ff range and
@@ -222,7 +226,7 @@ class MyActuatorMotor(MotorDriver):
         self._fw_version: int | None = None
         self._model: str | None = None
         self._p_max = _MA_P_MAX_LEGACY
-        self._kd_max = _MA_KD_MAX_LEGACY
+        self._kd_max = _MA_KD_MAX  # same on every firmware, see the constant
         self._t_max = _MA_T_MAX_LEGACY  # range for t_ff and feedback torque
         self._max_torque = _MA_DEFAULT_MAX_TORQUE  # motor's rated max torque (Nm)
 
@@ -376,11 +380,9 @@ class MyActuatorMotor(MotorDriver):
         self._max_torque = _model_max_torque(model)
         if version >= _MA_FW_V44_VERSION:
             self._p_max = _MA_P_MAX_V44
-            self._kd_max = _MA_KD_MAX_V44
             self._t_max = self._max_torque
         else:
             self._p_max = _MA_P_MAX_LEGACY
-            self._kd_max = _MA_KD_MAX_LEGACY
             self._t_max = _MA_T_MAX_LEGACY
 
     # ------------------------------------------------------------------ #
@@ -389,7 +391,11 @@ class MyActuatorMotor(MotorDriver):
 
     @property
     def kd_max(self) -> float:
-        # 5 until _detect_capabilities() has run; 50 on V4.4+ firmware.
+        # 5 on every firmware. The V4.4 changelog advertises a widened 0-50
+        # kd range, but hardware decodes the 12-bit kd field against 0-5
+        # regardless of version — encoding against 0-50 silently delivered
+        # one tenth of the requested damping (all pre-rescale tuned kd
+        # values were set under that encoding; see config.py).
         return self._kd_max
 
     async def enable(self) -> None:

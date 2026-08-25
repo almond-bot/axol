@@ -104,6 +104,22 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
             for field in _SCALAR_FIELDS:
                 value = _coerce_float(entry.get(field))
                 if value is not None:
+                    if field == "kd" and value > 5.0:
+                        # Saved under the old 0-50 kd wire encoding (the
+                        # MIT kd field actually decodes against 0-5 on every
+                        # firmware): divide by 10 to preserve the behavior
+                        # the value was tuned to. No legitimate post-fix kd
+                        # exceeds 5 — the encoder clamps there.
+                        _logger.warning(
+                            "Calibration for %s %s has kd=%.1f from the old "
+                            "0-50 encoding; interpreting as %.2f on the true "
+                            "0-5 scale. Re-save to silence this.",
+                            side,
+                            joint,
+                            value,
+                            value / 10.0,
+                        )
+                        value /= 10.0
                     clean[field] = value
             friction = entry.get("friction")
             if isinstance(friction, dict):

@@ -316,9 +316,10 @@ class Motor:
     def kd_max(self) -> float:
         """Upper bound of the firmware's impedance ``kd`` range (Nm·s/rad).
 
-        ``set_impedance`` clamps ``kd`` to this silently: 5 on Damiao and
-        legacy MyActuator, 50 on MyActuator V4.4+ (detected on ``enable()`` /
-        ``attach()``).
+        ``set_impedance`` clamps ``kd`` to this silently: 5 on every motor
+        family and firmware (the MyActuator V4.4 changelog's widened 0-50 kd
+        range does not match hardware behavior — the field decodes against
+        0-5 on all versions).
         """
         return self._driver.kd_max
 
@@ -564,10 +565,8 @@ class Motor:
             p_des: Desired position (rad)
             v_des: Desired velocity (rad/s)
             kp:    Position stiffness [0, 500]
-            kd:    Velocity damping. The motor clamps this to its firmware's
-                   range: [0, 5] on Damiao and legacy MyActuator, [0, 50] on
-                   newer (V4.4+) MyActuator firmware. MyActuator detects this
-                   on enable() and scales the command to match.
+            kd:    Velocity damping, encoded against [0, 5] on every motor
+                   family and firmware; values above 5 are silently lost.
             t_ff:  Feedforward torque (Nm)
         """
         if self.mode != ControlMode.IMPEDANCE:
