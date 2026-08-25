@@ -325,6 +325,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Motion amplitude in degrees (default: 10°, clamped to joint headroom)",
     )
     p.add_argument(
+        "--center",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="Start/centre angle of the probe in joint-frame degrees "
+        "(0 = rest). Step frames the step around it; sine centres the wave "
+        "there (amplitude clamped to the remaining headroom). Gains that "
+        "look fine hanging at rest can misbehave under gravity load, so "
+        "probe 45, -45, … too. Default: step starts at the joint's current "
+        "position, sine at the joint midpoint. shoulder_2/wrist_2 must stay "
+        "in their outboard (base-free) half. Incompatible with "
+        "--pose-by-hand (the probe runs at the hand-set pose).",
+    )
+    p.add_argument(
         "--freq", type=float, default=1.0, help="[sine] Frequency in Hz (default: 1.0)"
     )
     p.add_argument(
@@ -444,6 +458,11 @@ async def _run(args: argparse.Namespace) -> None:
             )
         if pose:
             raise SystemExit("--pose-by-hand and --pose are mutually exclusive")
+        if args.center is not None:
+            raise SystemExit(
+                "--pose-by-hand and --center are mutually exclusive — the "
+                "probe runs at the hand-set pose"
+            )
         if args.save:
             raise SystemExit(
                 "--pose-by-hand is for exploring pose margins; re-run the "
@@ -469,6 +488,7 @@ async def _run(args: argparse.Namespace) -> None:
     host_kd_q_eff = host_kd_q if host_kd_q is not None else DAMP_BP_Q
     # User-facing angles are degrees; everything below the CLI runs radians.
     amp_rad = math.radians(args.amp) if args.amp is not None else None
+    center_rad = math.radians(args.center) if args.center is not None else None
 
     gravity_comp = GravityCompensator() if use_gravity else None
     test_idx = ARM_JOINTS.index(joint)
@@ -578,6 +598,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "mode": mode_label,
                 "ff": args.ff,
                 "amp_deg": args.amp,
+                "center_deg": args.center,
                 "freq": args.freq,
                 "duration": args.duration,
                 "hold": args.hold,
@@ -904,6 +925,7 @@ async def _run(args: argparse.Namespace) -> None:
                         ff,
                         noise=noise,
                         monitor=monitor,
+                        center=center_rad,
                     )
                     metrics = sine_metrics(log)
                     _print_stats_sine(metrics, len(log), kp, kd)
@@ -919,6 +941,7 @@ async def _run(args: argparse.Namespace) -> None:
                         is_left,
                         ff,
                         monitor=monitor,
+                        center=center_rad,
                     )
                     metrics = step_metrics(log, amp, args.hold)
                     _print_stats_step(metrics, len(log), kp, kd)

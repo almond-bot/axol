@@ -150,6 +150,15 @@ const TABS: WbTab[] = [
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
       { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "auto",
+        hint:
+          "joint-frame start angle (0 = rest, empty = joint midpoint) — probe " +
+          "under gravity load too, e.g. 45 / -45",
+      },
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
       {
@@ -191,6 +200,15 @@ const TABS: WbTab[] = [
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
       { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
+      {
+        key: "center",
+        label: "center (°)",
+        type: "number",
+        placeholder: "auto",
+        hint:
+          "joint-frame start angle the step is framed around (0 = rest, " +
+          "empty = current position) — probe under gravity load too, e.g. 45 / -45",
+      },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
       {
         key: "rate",
@@ -391,6 +409,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("host_kd_hz", g.kd_host_hz)
       put("host_kd_q", g.kd_host_q)
       put("amp", p.amp_deg)
+      put("center", p.center_deg)
       put("freq", p.freq)
       put("duration", p.duration)
       put("hold", p.hold)

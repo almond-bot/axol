@@ -58,10 +58,42 @@ def sine_center(joint: Joint, is_left: bool) -> float:
     return (lo + hi) / 2.0
 
 
-def safe_amplitude(
-    joint: Joint, is_left: bool, center: float, requested: float | None
-) -> float:
+def check_center(joint: Joint, is_left: bool, center: float) -> tuple[float, float]:
+    """Validate an explicit probe centre; returns the effective limits.
+
+    For the base-collision joints the inboard half physically hits the robot
+    base, so the centre must sit outboard and the returned limits pin the
+    inboard boundary at 0 — the swing can then never cross toward the base.
+    """
     lo, hi = arm_limits(joint, is_left)
+    safe_dir = safe_outboard_direction(joint, is_left)
+    if safe_dir is not None:
+        if center * safe_dir < 0:
+            side = "positive" if safe_dir > 0 else "negative"
+            raise ValueError(
+                f"{joint.value} center {math.degrees(center):.1f}° is in the "
+                f"inboard half — the robot base is there. Use the {side} half."
+            )
+        if safe_dir > 0:
+            lo = 0.0
+        else:
+            hi = 0.0
+    if not (lo <= center <= hi):
+        raise ValueError(
+            f"center {math.degrees(center):.1f}° is outside "
+            f"[{math.degrees(lo):.1f}, {math.degrees(hi):.1f}]° for {joint.value}"
+        )
+    return lo, hi
+
+
+def safe_amplitude(
+    joint: Joint,
+    is_left: bool,
+    center: float,
+    requested: float | None,
+    limits: tuple[float, float] | None = None,
+) -> float:
+    lo, hi = limits if limits is not None else arm_limits(joint, is_left)
     if not (lo <= center <= hi):
         raise ValueError(
             f"Current position {center:.4f} rad is outside [{lo:.4f}, {hi:.4f}] for {joint.value}"
@@ -77,7 +109,8 @@ def safe_amplitude(
         amp = min(requested, headroom)
         if amp < requested:
             print(
-                f"  ! requested amp {requested:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+                f"  ! requested amp {math.degrees(requested):.1f}° exceeds "
+                f"headroom; clamped to {math.degrees(amp):.1f}°"
             )
     else:
         amp = min(DEFAULT_AMP_RAD, headroom)
@@ -278,8 +311,14 @@ async def run_sine(
     ff: FeedForward,
     noise: list[float] | None = None,
     monitor: HolderMonitor | None = None,
+    center: float | None = None,
 ) -> tuple[list[dict], float]:
     """Track a sine reference on ``joint`` and log target/actual error.
+
+    ``center`` (rad, joint frame) overrides the default joint-midpoint
+    centre — probe at 45°/-45°/… to see the gains under real gravity load.
+    Amplitude is clamped to the headroom around it, and for base-collision
+    joints the inboard boundary counts as a limit.
 
     ``noise`` (optional, pre-generated band-limited samples) is added to
     the commanded reference to emulate teleop hand-tracking jitter; the
@@ -291,9 +330,12 @@ async def run_sine(
     to the joint's headroom).
     """
     test_motor = motors[joint]
-    lo, hi = arm_limits(joint, is_left)
-    center = sine_center(joint, is_left)
-    amp = safe_amplitude(joint, is_left, center, requested_amp)
+    if center is None:
+        lo, hi = arm_limits(joint, is_left)
+        center = sine_center(joint, is_left)
+    else:
+        lo, hi = check_center(joint, is_left, center)
+    amp = safe_amplitude(joint, is_left, center, requested_amp, limits=(lo, hi))
     print(
         f"  limits=[{lo:.4f}, {hi:.4f}] rad  center={center:.4f} rad  "
         f"amp=±{amp:.4f} rad  freq={freq:.2f} Hz"
@@ -361,6 +403,7 @@ async def run_step(
     ff: FeedForward,
     relative: bool = False,
     monitor: HolderMonitor | None = None,
+    center: float | None = None,
 ) -> tuple[list[dict], float]:
     """Drive a step on ``joint`` and log the step-response error.
 
@@ -369,15 +412,23 @@ async def run_step(
     direction) — used by ``--pose-by-hand``, where the whole point is to
     probe at the pose the operator set, not at a canned center.
 
+    ``center`` (rad, joint frame) frames the step around an explicit start
+    angle instead of the joint's current position — probe at 45°/-45°/… to
+    see the gains under real gravity load. The step direction picks the
+    side with more headroom (outboard, for base-collision joints).
+
     Returns the per-sample log and the amplitude actually used (clamped
     to the joint's safe headroom).
     """
     test_motor = motors[joint]
     current = await test_motor.get_position()
-    lo, hi = arm_limits(joint, is_left)
+    if center is not None:
+        lo, hi = check_center(joint, is_left, center)
+    else:
+        lo, hi = arm_limits(joint, is_left)
 
     safe_dir = safe_outboard_direction(joint, is_left)
-    if safe_dir is not None and not relative:
+    if safe_dir is not None and not relative and center is None:
         # 0 physically collides with the robot base; frame the whole test in
         # the safe half so that center *and* step_target stay outboard. amp
         # goes from 0 → safe-limit/2 (room for a 2× swing).
@@ -395,7 +446,8 @@ async def run_step(
                 f"  ! requested amp {requested_amp:.4f} rad would push past the safe half; clamped to {amp:.4f} rad"
             )
     else:
-        center = current
+        if center is None:
+            center = current
         headroom_up = hi - center
         headroom_down = center - lo
         if safe_dir is not None:
@@ -421,7 +473,8 @@ async def run_step(
             amp = min(requested_amp, headroom)
             if amp < requested_amp:
                 print(
-                    f"  ! requested amp {requested_amp:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+                    f"  ! requested amp {math.degrees(requested_amp):.1f}° exceeds "
+                    f"headroom; clamped to {math.degrees(amp):.1f}°"
                 )
         else:
             amp = min(DEFAULT_AMP_RAD, headroom)
