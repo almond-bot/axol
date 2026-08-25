@@ -111,6 +111,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) — live motor telemetry, health tiles, and diagnostics scripts, served by `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
 - [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
+- [Quest Without Wearing It](https://docs.almond.bot/guides/quest-headless) — keep the headset awake with nobody wearing it (proximity sensor off) for headless sessions
 
 ### Advanced
 
