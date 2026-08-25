@@ -230,14 +230,23 @@ class ArmConfig:
     # tune.friction --save`` store per-robot values that override these.
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Step/sine-validated on hardware (2026-08, tuning workbench):
+            # kp 350 / kd 5 with the host damping pinned on the measured
+            # ~2 Hz impedance ring (kd_host_hz) and narrowed to it
+            # (kd_host_q 1.5 — the shared 0.8 band reaches into the <1.5 Hz
+            # intentional-motion band and drags the final approach). Result
+            # at 80° under full gravity load: no ring, 0.15° lag-free sine
+            # tracking, parked error at the stiction floor.
+            kp=350.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_host=40.0,
+            kd_host=45.0,
             kd_host_max=45.0,
+            kd_host_hz=2.0,
+            kd_host_q=1.5,
         )
     )
     shoulder_2: JointConfig = field(
