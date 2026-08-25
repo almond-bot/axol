@@ -90,6 +90,7 @@
               "cli/jetson-setup",
               "cli/tune-pid",
               "cli/tune-friction",
+              "cli/tune-gravity",
               "cli/tune-motion",
               "cli/tune-filter",
               "cli/motion-build",

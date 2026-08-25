@@ -1,0 +1,32 @@
+---
+title: "tune.gravity"
+description: "Fit one link's real centre of mass from the motors, correcting the gravity feedforward."
+---
+
+Identifies one link's real centre of mass from a friction-cancelled torque sweep instead of trusting the CAD constants, and corrects the gravity feedforward with it. Also available from the diagnostics dashboard (`axol serve`).
+
+**Why:** gravity feedforward comes from the URDF masses/CoMs — CAD values shared by every robot. If the real link is a few percent off (cables, end-effector variance, build spread), the `kp` spring has to make up the missing torque and the joint parks with a static droop under load: `droop = unmodeled torque / kp`. No amount of kp/kd tuning fixes that cleanly; correcting the model does, at every angle at once.
+
+**How:** the same bidirectional constant-velocity sweep as [`tune.friction`](/cli/tune-friction) — averaging forward and backward torque at the same position cancels friction exactly, leaving `gravity(q) + Fo`. The residual against the current model is fit to a shift of this link's centre of mass, by least squares straight through the MuJoCo gravity model, so the correction generalizes to every arm pose. Mass stays at CAD: gravity torque only depends on the first moment `m·c`, so a CoM shift with fixed mass covers every identifiable error. Sweeps with no gravity variation (joint axis parallel to gravity at the rest pose, e.g. `shoulder_3` hanging) are reported as unobservable and left at CAD.
+
+Run **distal → proximal** (`wrist_3` → … → `shoulder_1`): a proximal joint's sweep carries every distal link, so distal CoMs should be corrected first. Run [`tune.friction --save`](/cli/tune-friction) beforehand — the friction offset `Fo` is refit against the corrected model and saved with the CoM (the two are coupled: what the old `Fo` absorbed as a constant may really have been gravity shape).
+
+| Flag | Description |
+|---|---|
+| `--l` / `--r` | Arm side (required) |
+| `--channel IFACE` | SocketCAN interface override for setups without the Axol hub adapter |
+| `--joint JOINT` | `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` (required) |
+| `--velocity DEG_S` | Sweep velocity in deg/s (default: 18). Keep ≤25 so shoulder torque telemetry stays clean |
+| `--lo DEG` / `--hi DEG` | Override the sweep limits (degrees) |
+| `--kp FLOAT` / `--kd FLOAT` | Sweep-hold gains (default: from `AxolConfig`) |
+| `--save` | Write the fitted CoM (and refit `Fo`) to `~/.almond/calibration.json`; the gravity model then uses it everywhere on this machine |
+| `--save-run` | Persist the sweep (measured vs model torque per angle) as a tuning run for the dashboard charts |
+| `--label NOTE` | Free-form note stored with the saved run |
+
+The report prints the CoM shift in mm, the shape residual before/after, and the **worst parked droop** before/after at the joint's config `kp` — the user-visible payoff.
+
+```bash
+axol tune.gravity --l --joint shoulder_1
+axol tune.gravity --l --joint elbow --save
+axol tune.gravity --r --joint wrist_1 --velocity 25 --save
+```

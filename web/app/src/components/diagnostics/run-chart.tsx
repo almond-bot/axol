@@ -18,6 +18,12 @@ export interface RunChartSeries {
 interface RunChartProps {
   title: string
   unit?: string
+  /**
+   * X-axis unit suffix (default "s"). Most runs chart against time, but e.g.
+   * gravity sweeps chart torque against joint angle ("°"). The axis is still
+   * rebased to the first sample, so it reads as travel from the sweep start.
+   */
+  xUnit?: string
   series: RunChartSeries[]
   /**
    * Optional error lane rendered under the main plot on a shared time axis
@@ -100,11 +106,7 @@ interface Pane {
   points: [number, number][][]
 }
 
-function windowPane(
-  all: [number, number][][],
-  view: View,
-  zeroCentered: boolean
-): Pane | null {
+function windowPane(all: [number, number][][], view: View, zeroCentered: boolean): Pane | null {
   let min = Infinity
   let max = -Infinity
   const points: [number, number][][] = all.map((pts) => {
@@ -155,6 +157,7 @@ function windowPane(
 export function RunChart({
   title,
   unit,
+  xUnit = "s",
   series,
   sub,
   height = 240,
@@ -367,7 +370,7 @@ export function RunChart({
     ctx.textBaseline = "top"
     for (const tick of ticks(v.t0, v.t1, Math.max(2, Math.floor(plotW / 70)))) {
       ctx.fillStyle = AXIS_INK
-      ctx.fillText(`${fmtValue(tick)}s`, px(tick), size.h - PAD.bottom + 8)
+      ctx.fillText(`${fmtValue(tick)}${xUnit}`, px(tick), size.h - PAD.bottom + 8)
     }
     ctx.strokeStyle = BASELINE
     ctx.beginPath()
@@ -397,7 +400,7 @@ export function RunChart({
         ctx.stroke()
       }
     }
-  }, [main, subPane, size, series, sub, allSeries, hover, plotW, v.t0, v.t1])
+  }, [main, subPane, size, series, sub, allSeries, hover, plotW, v.t0, v.t1, xUnit])
 
   const toTime = useCallback(
     (clientX: number): number | null => {

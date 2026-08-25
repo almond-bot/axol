@@ -334,6 +334,34 @@ const TABS: WbTab[] = [
     drivesMotors: true,
   },
   {
+    key: "gravity",
+    label: "Gravity",
+    command: "tune.gravity",
+    description:
+      "Fit one link's real centre of mass from a friction-cancelled torque " +
+      "sweep, correcting the gravity feedforward. This removes the static " +
+      "droop a joint shows under load (parked error = unmodeled torque / " +
+      "kp) — something no kp/kd tuning fixes cleanly. Run distal→proximal " +
+      "(wrist_3 first, shoulder_1 last); check save to write the CoM into " +
+      "this robot's calibration.",
+    presets: { save_run: true },
+    fields: [
+      { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
+      { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
+      { key: "save", label: "save to calibration", type: "boolean" },
+      {
+        key: "velocity",
+        label: "velocity (°/s)",
+        type: "number",
+        placeholder: "18",
+        hint: "sweep speed — keep ≤25 so shoulder torque telemetry stays clean",
+      },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: ["arm", "joint"],
+    drivesMotors: true,
+  },
+  {
     key: "build",
     label: "Build motion",
     command: "motion.build",
@@ -444,6 +472,11 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       if (overrides) out["gain"] = overrides
       break
     }
+    case "gravity":
+      put("arm", meta.side)
+      put("joint", meta.joint)
+      put("velocity", p.velocity_deg_s)
+      break
     default:
       return null
   }
@@ -500,6 +533,10 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     const v = num(m.score)
     return v == null ? null : { label: "score", value: fmtNum(v, 3) }
   }
+  if (meta.kind === "gravity") {
+    const v = num(m.droop_after_deg)
+    return v == null ? null : { label: "droop", value: `${fmtNum(v, 3)}°` }
+  }
   return null
 }
 
@@ -509,6 +546,10 @@ interface JointChart {
   series: RunChartSeries[]
   /** Error lane (reference − output, in degrees) under the position plot. */
   sub: RunChartSeries[]
+  /** Y unit override (default "°") — gravity sweeps chart torque in Nm. */
+  unit?: string
+  /** X unit override (default "s") — gravity sweeps chart against angle. */
+  xUnit?: string
 }
 
 /**
@@ -634,6 +675,44 @@ function pidJointChart(run: TuningRunData): JointChart | null {
   }
 }
 
+/**
+ * The torque-vs-angle chart of a gravity sweep: measured (friction-cancelled)
+ * torque against the model before and after the CoM fit. X is the joint angle
+ * in degrees, Y is Nm. The lane shows the residuals — the "before" trace's
+ * shape is exactly the gravity error the fit removes.
+ */
+function gravityJointChart(run: TuningRunData): JointChart | null {
+  const q = run.series.q
+  const measured = run.series.measured
+  const before = run.series.model_before
+  const after = run.series.model_after
+  if (!q || !measured || !before || !after) return null
+  const x = degSeries(q)
+  const lane = (model: (number | null)[], label: string, color: string): RunChartSeries => ({
+    label,
+    color,
+    x,
+    data: measured.map((v, i) => {
+      const m = model[i]
+      return v == null || m == null ? null : v - m
+    }),
+  })
+  return {
+    joint: run.meta.joint ?? "joint",
+    unit: "Nm",
+    xUnit: "°",
+    series: [
+      { label: "measured", color: ACTUAL_COLOR, x, data: measured },
+      { label: "model (CAD)", color: NOISY_COLOR, x, data: before },
+      { label: "model (fitted)", color: COMMANDED_COLOR, x, data: after },
+    ],
+    sub: [
+      lane(before, "residual before Nm", NOISY_COLOR),
+      lane(after, "residual after Nm", ERROR_COLOR),
+    ],
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Compare mode: overlay two runs of the same kind                     */
 /* ------------------------------------------------------------------ */
@@ -642,7 +721,13 @@ function pidJointChart(run: TuningRunData): JointChart | null {
 function headlineNum(meta: TuningRunMeta): number | null {
   const m = meta.metrics as Record<string, unknown>
   const key =
-    meta.kind === "motion" ? "mean_rms_err" : meta.kind === "filter" ? "mean_rms_lagfree" : "score"
+    meta.kind === "motion"
+      ? "mean_rms_err"
+      : meta.kind === "filter"
+        ? "mean_rms_lagfree"
+        : meta.kind === "gravity"
+          ? "droop_after_deg"
+          : "score"
   const v = m[key]
   return typeof v === "number" && Number.isFinite(v) ? v : null
 }
@@ -699,6 +784,47 @@ function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | nu
         ],
       },
     ]
+  }
+
+  if (kind === "gravity") {
+    // Two sweeps of (usually) the same joint: overlay the residual-after
+    // traces — the shape either fit failed to remove — against angle.
+    const out: JointChart[] = []
+    for (const [tag, run, color] of [
+      ["A", a, ACTUAL_COLOR],
+      ["B", b, B_COLOR],
+    ] as const) {
+      const q = run.series.q
+      const measured = run.series.measured
+      const after = run.series.model_after
+      if (!q || !measured || !after) continue
+      out.push({
+        joint: `${tag}: ${run.meta.joint ?? "joint"}`,
+        unit: "Nm",
+        xUnit: "°",
+        series: [
+          { label: `measured (${tag})`, color, x: degSeries(q), data: measured },
+          {
+            label: `model fitted (${tag})`,
+            color: COMMANDED_COLOR,
+            x: degSeries(q),
+            data: after,
+          },
+        ],
+        sub: [
+          {
+            label: `residual ${tag} Nm`,
+            color: tag === "A" ? ERROR_COLOR : B_ERROR_COLOR,
+            x: degSeries(q),
+            data: measured.map((v, i) => {
+              const m = after[i]
+              return v == null || m == null ? null : v - m
+            }),
+          },
+        ],
+      })
+    }
+    return out
   }
 
   // motion / filter: channels matched across the runs by column name.
@@ -786,6 +912,14 @@ const FILTER_COLS: ScoreCol[] = [
   { key: "accel_peak", label: "peak accel °/s²", deg: true, digits: 0 },
 ]
 
+const GRAVITY_COLS: ScoreCol[] = [
+  { key: "rms_before", label: "residual before Nm", digits: 3 },
+  { key: "rms_after", label: "residual after Nm", digits: 3, warn: 0.15, bad: 0.4 },
+  { key: "droop_before_deg", label: "droop before °", digits: 3 },
+  { key: "droop_after_deg", label: "droop after °", digits: 3, warn: 0.1, bad: 0.3 },
+  { key: "fo", label: "Fo Nm", digits: 3 },
+]
+
 const STEP_COLS: ScoreCol[] = [
   { key: "settling_s", label: "settling s", warn: 0.4, bad: 0.8 },
   { key: "overshoot", label: "overshoot °", deg: true, digits: 3, warn: 1, bad: 3 },
@@ -822,6 +956,13 @@ const SCORE_LEGEND: Record<string, string> = {
     "mode) moved — past ~0.5° the structure was flexing and part of the " +
     "ring came from a neighbour. score folds settling, overshoot, and " +
     "steady-state error — lower is better.",
+  gravity:
+    "residual = friction-cancelled measured torque minus the gravity model, " +
+    "shape only (before) and everything (after the CoM fit, including the " +
+    "refit Fo). droop = the parked position error that torque error causes " +
+    "through the kp spring at this joint's config kp — the number the fix " +
+    "actually buys you. Fo = friction offset refit against the corrected " +
+    "model (saved with the CoM).",
   filter:
     "noise in = error the injected noise put on the input; error out = " +
     "what's left after the stack (raw, includes the stack's delay); " +
@@ -850,9 +991,9 @@ function scoreRows(
     const cols = meta.kind === "motion" ? MOTION_COLS : FILTER_COLS
     return rows.length > 0 ? { cols, rows } : null
   }
-  if (meta.kind === "sine" || meta.kind === "step") {
+  if (meta.kind === "sine" || meta.kind === "step" || meta.kind === "gravity") {
     return {
-      cols: meta.kind === "sine" ? SINE_COLS : STEP_COLS,
+      cols: meta.kind === "sine" ? SINE_COLS : meta.kind === "step" ? STEP_COLS : GRAVITY_COLS,
       rows: [{ joint: meta.joint ?? "joint", values: m }],
     }
   }
@@ -1279,14 +1420,13 @@ export function TuningWorkbench({
     if (run.meta.kind === "filter") {
       return filterJointCharts(run, armed ? arm : null)
     }
-    const single = pidJointChart(run)
+    const single = run.meta.kind === "gravity" ? gravityJointChart(run) : pidJointChart(run)
     return single ? [single] : []
   }, [run, arm, armed])
   const scores = meta ? scoreRows(meta, armed ? arm : null) : null
   const legend = meta ? SCORE_LEGEND[meta.kind] : null
   const perJoint = (meta?.metrics as Record<string, unknown> | undefined)?.per_joint as
-    | Record<string, Record<string, unknown>>
-    | undefined
+    Record<string, Record<string, unknown>> | undefined
 
   /* --- compare mode ------------------------------------------------ */
   const comparing = compareIds.length === 2
@@ -1312,8 +1452,13 @@ export function TuningWorkbench({
     const vb = headlineNum(cmpB.meta)
     if (va == null || vb == null) return null
     const label = headline(cmpA.meta)?.label ?? "score"
-    const isScore = cmpA.meta.kind === "sine" || cmpA.meta.kind === "step"
-    const fmt = (v: number) => (isScore ? fmtNum(v, 3) : `${fmtNum(toDeg(v))}°`)
+    const kind = cmpA.meta.kind
+    const fmt = (v: number) =>
+      kind === "sine" || kind === "step"
+        ? fmtNum(v, 3)
+        : kind === "gravity"
+          ? `${fmtNum(v, 3)}°`
+          : `${fmtNum(toDeg(v))}°`
     if (va === vb)
       return { better: null as string | null, text: `${label}: dead even at ${fmt(va)}` }
     const better = va < vb ? "A" : "B"
@@ -1632,7 +1777,8 @@ export function TuningWorkbench({
                   key={c.joint}
                   id={`cmp-chart-${c.joint}`}
                   title={c.joint}
-                  unit="°"
+                  unit={c.unit ?? "°"}
+                  xUnit={c.xUnit}
                   series={c.series}
                   sub={c.sub}
                   height={cmpCharts.length > 1 ? 260 : 310}
@@ -1777,7 +1923,8 @@ export function TuningWorkbench({
               key={c.joint}
               id={`joint-chart-${c.joint}`}
               title={c.joint}
-              unit="°"
+              unit={c.unit ?? "°"}
+              xUnit={c.xUnit}
               series={c.series}
               sub={c.sub}
               height={jointCharts.length > 1 ? 260 : 310}

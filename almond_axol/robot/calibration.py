@@ -20,11 +20,18 @@ File shape (every level optional)::
           "kd": 3.0,
           "j_eff": 0.0,
           "friction": {"fc": 0.68, "k": 801.3, "fv": 0.87, "fo": -0.25},
+          "com": [-0.0251, 0.0, -0.0712],
           "updated_at": "2026-08-16T01:00:00Z"
         }
       },
       "right": { ... }
     }
+
+``com`` is the fitted centre of mass of the link this joint drives (metres,
+URDF link frame — same convention as ``JointConfig.com``), written by ``axol
+tune.gravity --save``. It overrides the CAD value in the gravity model, which
+is what fixes the static droop a few-percent mass/CoM error causes under
+load (parked error = unmodeled torque / kp).
 
 ``kp`` / ``kd`` are the tuned midpoint (``s=0.5``, the production default)
 of the stiffness blend, exactly like the :class:`JointConfig` defaults they
@@ -121,6 +128,18 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
                         )
                         value /= 10.0
                     clean[field] = value
+            com = entry.get("com")
+            if isinstance(com, (list, tuple)) and len(com) == 3:
+                com_clean = [_coerce_float(v) for v in com]
+                if all(v is not None for v in com_clean):
+                    clean["com"] = com_clean
+                else:
+                    _logger.warning(
+                        "Calibration for %s %s has a non-numeric com entry; "
+                        "ignoring it.",
+                        side,
+                        joint,
+                    )
             friction = entry.get("friction")
             if isinstance(friction, dict):
                 fclean = {f: _coerce_float(friction.get(f)) for f in _FRICTION_FIELDS}
@@ -147,13 +166,15 @@ def update_joint_calibration(
     j_eff: float | None = None,
     kd_host: float | None = None,
     friction: dict[str, float] | None = None,
+    com: tuple[float, float, float] | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
     """Merge new values into one joint's calibration entry and persist.
 
     Only the provided fields are touched — saving PID gains does not clobber
     a previously saved friction fit, and vice versa. ``friction`` must carry
-    all of ``fc`` / ``k`` / ``fv`` / ``fo``. The write is atomic
+    all of ``fc`` / ``k`` / ``fv`` / ``fo``; ``com`` is the link's fitted
+    centre of mass (metres, URDF link frame). The write is atomic
     (tmp + rename), matching the settings store.
     """
     if side not in _SIDES:
@@ -195,6 +216,10 @@ def update_joint_calibration(
             entry[field] = float(value)
     if friction is not None:
         entry["friction"] = {f: float(friction[f]) for f in _FRICTION_FIELDS}
+    if com is not None:
+        if len(com) != 3:
+            raise ValueError(f"com must have 3 components, got {len(com)}")
+        entry["com"] = [float(v) for v in com]
     entry["updated_at"] = (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )

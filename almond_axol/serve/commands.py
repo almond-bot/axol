@@ -461,6 +461,21 @@ COMMANDS: dict[str, CommandDef] = {
         drives_motors=True,
         section="tuning",
     ),
+    "tune.gravity": CommandDef(
+        "tune.gravity",
+        "tune.gravity",
+        "Gravity CoM identification",
+        "Fit one link's real centre of mass from a friction-cancelled torque "
+        "sweep, correcting the gravity feedforward — removes the static "
+        "droop the joint shows under load. Run distal→proximal; --save "
+        "writes the CoM to this robot's calibration.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.gravity"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
     "tune.motion": CommandDef(
         "tune.motion",
         "tune.motion",

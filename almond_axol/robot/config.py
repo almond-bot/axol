@@ -433,6 +433,11 @@ def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     friction = entry.get("friction")
     if friction is not None:
         overrides["friction"] = FrictionParams(**friction)
+    com = entry.get("com")
+    if com is not None:
+        # Fitted by ``axol tune.gravity --save``; already per-side (measured
+        # on this arm), so it replaces the mirrored CAD value as-is.
+        overrides["com"] = tuple(com)
     return replace(jc, **overrides) if overrides else jc
 
 
