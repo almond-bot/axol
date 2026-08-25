@@ -48,8 +48,8 @@ from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
-from ..motor import add_side_and_channel_arguments, resolve_channel
 from ...tuning import JointFrameMotor, joint_frame_motors
+from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
 _RAMP_SPEED = 0.25  # rad/s

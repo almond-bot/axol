@@ -28,6 +28,7 @@ from ..motor import (
 from .base import RobotBase
 from .config import AxolConfig
 from .control import (
+    DAMP_BP_Q,
     DAMP_BP_W0,
     VEL_CUTOFF_FREQ,
     BandPass,
@@ -440,7 +441,19 @@ class AxolArm:
             j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_hz is None
             for j in Joint
         ]
-        self._damp_bp = BandPass(n=n_j, w0=self._damp_w0)
+        # Per-joint band-pass Q: the 0.8 default suits pose-tracked centres
+        # (an estimate deserves a wide net); a joint pinned on a measured
+        # ring can run narrower (higher q) so the damping stops reaching
+        # into the <1.5 Hz intentional-motion band and dragging the final
+        # approach.
+        self._damp_q = [
+            getattr(self._arm_config, j.value).kd_host_q
+            if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_q is not None
+            else DAMP_BP_Q
+            for j in Joint
+        ]
+        self._damp_bp = BandPass(n=n_j, w0=self._damp_w0, q=self._damp_q)
         self._last_q_commanded: np.ndarray | None = None
         self._gc_hold_q: np.ndarray | None = None
         self._gc_hold_free: frozenset[Joint] | None = None
@@ -1515,7 +1528,7 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n)
         self._vel_fast_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n, cutoff=VEL_CUTOFF_FREQ)
-        self._damp_bp = BandPass(n=n, w0=self._damp_w0)
+        self._damp_bp = BandPass(n=n, w0=self._damp_w0, q=self._damp_q)
 
     def torque_residuals(self) -> np.ndarray:
         """Measured minus model-gravity torque per arm joint, shape (7,).

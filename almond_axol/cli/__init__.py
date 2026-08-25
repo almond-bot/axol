@@ -15,6 +15,7 @@ from .gst import install as gst_install
 from .jetson import setup as jetson_setup
 from .lift import goto as lift_goto
 from .lift import home as lift_home
+from .motion import add_parser as motion_add_parser
 from .motor import dump_config as motor_dump_config
 from .motor import flash as motor_flash
 from .motor import health as motor_health
@@ -22,9 +23,8 @@ from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
-from .motion import add_parser as motion_add_parser
-from .tune import friction, pid, repeatability
 from .tune import filter as tune_filter
+from .tune import friction, pid, repeatability
 from .tune import motion as tune_motion
 from .zed import driver as zed_driver
 from .zed import install as zed_install

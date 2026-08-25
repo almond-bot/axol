@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from ..robot.control import (
+    DAMP_BP_Q,
     DAMP_BP_W0,
     VEL_CUTOFF_FREQ,
     BandPass,
@@ -38,6 +39,10 @@ class FeedForward:
     to the joint's resonance band, matching the production per-joint
     ``kd_host_hz``; ``None`` uses the shared shoulder default
     (:data:`~almond_axol.robot.control.DAMP_BP_W0` — 20 rad/s ≈ 3.2 Hz).
+    ``host_kd_q`` sets that band-pass's quality factor (bandwidth =
+    centre/q), matching ``kd_host_q``; ``None`` uses the shared 0.8
+    default. Raise it (≈2-3) when the centre is pinned on a measured ring
+    so the damping stops dragging the slow final approach.
 
     Construct one instance per candidate run: the differentiators are
     stateful low-pass filters and must not leak between runs. For step
@@ -58,6 +63,7 @@ class FeedForward:
         differentiate_target: bool = True,
         host_kd: float = 0.0,
         host_kd_hz: float | None = None,
+        host_kd_q: float | None = None,
     ) -> None:
         self.gravity_fn = gravity_fn
         self._fric = (fc, k, fv, fo)
@@ -73,7 +79,9 @@ class FeedForward:
         self._v_des_fast_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
         self._v_meas_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
         self._damp_bp = BandPass(
-            1, 2 * math.pi * host_kd_hz if host_kd_hz is not None else DAMP_BP_W0
+            1,
+            2 * math.pi * host_kd_hz if host_kd_hz is not None else DAMP_BP_W0,
+            q=host_kd_q if host_kd_q is not None else DAMP_BP_Q,
         )
 
     def compute(

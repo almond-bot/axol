@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -601,7 +600,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         from ..constants import ARM_JOINTS
         from ..robot.config import AxolConfig
-        from ..robot.control import DAMP_BP_W0
+        from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
 
         def _load() -> dict[str, Any]:
             cfg = AxolConfig()
@@ -619,6 +618,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                             jc.kd_host_hz
                             if jc.kd_host_hz is not None
                             else round(DAMP_BP_W0 / (2 * math.pi), 1)
+                        ),
+                        "kd_host_q": (
+                            jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
                         ),
                         "kd_host_max": jc.kd_host_max,
                         "j_eff": jc.j_eff,

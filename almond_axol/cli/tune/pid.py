@@ -48,7 +48,13 @@ from ...motor import CanBus, ControlMode, Joint, Motor
 from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig, JointConfig
-from ...robot.control import DAMP_BP_W0, VEL_CUTOFF_FREQ, BandPass, Differentiator
+from ...robot.control import (
+    DAMP_BP_Q,
+    DAMP_BP_W0,
+    VEL_CUTOFF_FREQ,
+    BandPass,
+    Differentiator,
+)
 from ...robot.gravity import GravityCompensator
 from ...tuning import (
     FF_MODES,
@@ -237,6 +243,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "kd_host_hz. Aim it at the ring frequency the step test reports "
         f"(default: this joint's configured value, falling back to the "
         f"shared {DAMP_BP_W0 / (2 * math.pi):.1f} Hz shoulder default)",
+    )
+    p.add_argument(
+        "--host-kd-q",
+        type=float,
+        default=None,
+        metavar="Q",
+        help="Quality factor of that band-pass (bandwidth = centre/q) — "
+        f"matches the production kd_host_q (default: this joint's configured "
+        f"value, falling back to the shared {DAMP_BP_Q}). At the {DAMP_BP_Q} "
+        "default the band reaches an octave either side of the centre — into "
+        "the <1.5 Hz intentional-motion band when the centre sits low, where "
+        "the damping drags the final approach and the step never settles. "
+        "When --host-kd-hz is pinned on a measured ring, q of 2-3 confines "
+        "the damping to the ring and releases the approach",
     )
     p.add_argument(
         "--stiffness",
@@ -445,6 +465,8 @@ async def _run(args: argparse.Namespace) -> None:
     host_kd_hz_eff = (
         host_kd_hz if host_kd_hz is not None else DAMP_BP_W0 / (2 * math.pi)
     )
+    host_kd_q = args.host_kd_q if args.host_kd_q is not None else jc.kd_host_q
+    host_kd_q_eff = host_kd_q if host_kd_q is not None else DAMP_BP_Q
     # User-facing angles are degrees; everything below the CLI runs radians.
     amp_rad = math.radians(args.amp) if args.amp is not None else None
 
@@ -497,7 +519,10 @@ async def _run(args: argparse.Namespace) -> None:
     if host_kd:
         print(
             f"  host-kd  {host_kd} (host-side damping via t_ff, kd_host) "
-            f"band-passed at {host_kd_hz_eff:.1f} Hz (kd_host_hz)"
+            f"band-passed at {host_kd_hz_eff:.1f} Hz (kd_host_hz), "
+            f"q={host_kd_q_eff:g} (kd_host_q — band "
+            f"{host_kd_hz_eff * (math.sqrt(1 + 1 / (4 * host_kd_q_eff**2)) - 1 / (2 * host_kd_q_eff)):.1f}"
+            f"-{host_kd_hz_eff * (math.sqrt(1 + 1 / (4 * host_kd_q_eff**2)) + 1 / (2 * host_kd_q_eff)):.1f} Hz)"
         )
 
     noise: list[float] | None = None
@@ -539,7 +564,13 @@ async def _run(args: argparse.Namespace) -> None:
             side=side_str,
             joint=joint.value,
             gains=(
-                {"kp": kp, "kd": kd, "kd_host": host_kd, "kd_host_hz": host_kd_hz_eff}
+                {
+                    "kp": kp,
+                    "kd": kd,
+                    "kd_host": host_kd,
+                    "kd_host_hz": host_kd_hz_eff,
+                    "kd_host_q": host_kd_q_eff,
+                }
                 if host_kd
                 else {"kp": kp, "kd": kd, "kd_host": host_kd}
             ),
@@ -602,6 +633,10 @@ async def _run(args: argparse.Namespace) -> None:
                 2 * math.pi * jc_all[j].kd_host_hz
                 if jc_all[j].kd_host_hz is not None
                 else DAMP_BP_W0
+                for j in ARM_JOINTS
+            ],
+            q=[
+                jc_all[j].kd_host_q if jc_all[j].kd_host_q is not None else DAMP_BP_Q
                 for j in ARM_JOINTS
             ],
         )
@@ -765,6 +800,7 @@ async def _run(args: argparse.Namespace) -> None:
                             differentiate_target=False,
                             host_kd=host_kd,
                             host_kd_hz=host_kd_hz,
+                            host_kd_q=host_kd_q,
                         )
                         log, amp = await run_step(
                             motors,
@@ -848,6 +884,7 @@ async def _run(args: argparse.Namespace) -> None:
                     differentiate_target=(args.mode == "sine"),
                     host_kd=host_kd,
                     host_kd_hz=host_kd_hz,
+                    host_kd_q=host_kd_q,
                 )
                 # Verify the POSITION_VELOCITY holds actually stay put while
                 # the test joint shakes the structure — a wobbling holder

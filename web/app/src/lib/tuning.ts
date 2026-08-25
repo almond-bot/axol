@@ -57,13 +57,8 @@ export async function fetchTuningRuns(): Promise<{ runs: TuningRunMeta[] }> {
   return json(await fetch(apiUrl("/api/tuning/runs")))
 }
 
-export async function fetchTuningRun(
-  id: string,
-  maxPoints = 4000
-): Promise<TuningRunData> {
-  return json(
-    await fetch(apiUrl(`/api/tuning/runs/${id}?max_points=${maxPoints}`))
-  )
+export async function fetchTuningRun(id: string, maxPoints = 4000): Promise<TuningRunData> {
+  return json(await fetch(apiUrl(`/api/tuning/runs/${id}?max_points=${maxPoints}`)))
 }
 
 export async function deleteTuningRun(id: string): Promise<{ deleted: string }> {
@@ -81,7 +76,7 @@ export async function fetchTuningMotions(): Promise<{ motions: TuningMotion[] }>
 /**
  * Effective per-joint control gains: `gains[side][joint]` holds the values a
  * tuning run uses when its gain fields are left empty — config defaults with
- * this robot's calibration overlaid (kp, kd, kd_host, kd_host_hz, …).
+ * this robot's calibration overlaid (kp, kd, kd_host, kd_host_hz, kd_host_q, …).
  */
 export type TuningGains = Record<string, Record<string, Record<string, number>>>
 

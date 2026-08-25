@@ -150,6 +150,18 @@ class JointConfig:
                   *structural* rather than the impedance mode (the elbow
                   rings at 6.7 Hz under load where √(kp/J) predicts 2.3 Hz —
                   transmission compliance, not reflected inertia).
+        kd_host_q: Quality factor of that band-pass (bandwidth = centre/q).
+                  ``None`` uses the shared default (``DAMP_BP_Q``, 0.8),
+                  which keeps the band about an octave wide either side —
+                  right for a pose-tracked centre that only *estimates* the
+                  mode. The wide band is also the mechanism behind the
+                  damping↔accuracy trade-off: centred low it reaches into
+                  the <1.5 Hz intentional-motion band and drags the final
+                  approach (measured on shoulder_1 as a step that never
+                  enters the 5% settle band — a 0.2° RMS sub-Hz wander, not
+                  a ring). When ``kd_host_hz`` is pinned on a *measured*
+                  ring frequency, set q ≈ 2-3 to confine the damping to the
+                  ring and release the approach.
     """
 
     kp: float
@@ -161,6 +173,7 @@ class JointConfig:
     kd_host: float = 0.0
     kd_host_max: float = 0.0
     kd_host_hz: float | None = None
+    kd_host_q: float | None = None
 
 
 @dataclass
@@ -413,7 +426,9 @@ _RIGHT_FRICTION = _ArmFriction(
 def _calibrated_joint(jc: JointConfig, entry: dict[str, Any]) -> JointConfig:
     """Overlay one joint's calibration-file entry onto its config."""
     overrides: dict[str, Any] = {
-        f: entry[f] for f in ("kp", "kd", "j_eff", "kd_host") if f in entry
+        f: entry[f]
+        for f in ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
+        if f in entry
     }
     friction = entry.get("friction")
     if friction is not None:

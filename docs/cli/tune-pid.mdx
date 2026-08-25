@@ -19,6 +19,7 @@ During every probe the other joints are held at rest by the motor firmware's own
 | `--ff {full,gravity,friction,none}` | Feedforward during the test (default: `full` — matches production) |
 | `--host-kd KD` | Host-side damping (Nm·s/rad) via `t_ff` — matches the production `kd_host` term (default: the joint's configured `kd_host`) |
 | `--host-kd-hz HZ` | Band-pass centre (Hz) confining the host damping to the joint's resonance band — matches the production `kd_host_hz`; aim it at the ring frequency the step test reports (default: the joint's configured value, else the shared 3.2 Hz) |
+| `--host-kd-q Q` | Quality factor of that band-pass (bandwidth = centre/q) — matches the production `kd_host_q` (default: the joint's configured value, else the shared 0.8). At 0.8 the band is an octave wide either side and, with a low centre, reaches into the <1.5 Hz intentional-motion band where the damping drags the final approach (the step never settles). With the centre on a measured ring, q 2–3 damps the ring only |
 | `--mode {sine,step}` | `sine` = sinusoidal tracking (default); `step` = step response |
 | `--amp DEG` | Motion amplitude in degrees (default: 10°, clamped to joint headroom) |
 | `--freq FLOAT` | [sine] Frequency in Hz (default: 1.0) |

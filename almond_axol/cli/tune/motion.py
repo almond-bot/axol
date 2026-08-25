@@ -49,7 +49,15 @@ from ...tuning.motion import ReferenceMotion, list_motions, load_motion
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
 _PLAN_MIN_DURATION = 1.5  # s
 
-_GAIN_FIELDS = ("kp", "kd", "kd_host", "kd_host_max", "kd_host_hz", "j_eff")
+_GAIN_FIELDS = (
+    "kp",
+    "kd",
+    "kd_host",
+    "kd_host_max",
+    "kd_host_hz",
+    "kd_host_q",
+    "j_eff",
+)
 
 # Column names of a 14-wide motion row: left arm then right arm.
 _COLUMNS = [f"left.{j.value}" for j in ARM_JOINTS] + [

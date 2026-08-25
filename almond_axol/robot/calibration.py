@@ -49,7 +49,7 @@ CALIBRATION_PATH = Path.home() / ".almond" / "calibration.json"
 
 _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
-_SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host")
+_SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
 _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
 
 # A corrupt file must never take the robot down, but silently ignoring it

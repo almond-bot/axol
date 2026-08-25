@@ -121,6 +121,17 @@ const GAIN_FIELDS: WbField[] = [
     slider: { min: 1, max: 19, step: 0.1 },
     hint: "band-pass centre of the host damping — aim it at the ring Hz",
   },
+  {
+    key: "host_kd_q",
+    label: "kd_host_q",
+    type: "number",
+    gainKey: "kd_host_q",
+    slider: { min: 0.4, max: 4, step: 0.1 },
+    hint:
+      "band width = centre/q. 0.8 default is an octave wide and drags the slow " +
+      "final approach when the centre sits low (accuracy slips); q 2-3 with the " +
+      "centre on the measured ring damps the ring only",
+  },
 ]
 
 const TABS: WbTab[] = [
@@ -378,6 +389,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("kd", g.kd)
       put("host_kd", g.kd_host)
       put("host_kd_hz", g.kd_host_hz)
+      put("host_kd_q", g.kd_host_q)
       put("amp", p.amp_deg)
       put("freq", p.freq)
       put("duration", p.duration)
