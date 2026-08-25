@@ -16,6 +16,14 @@ is unrestricted: each arm also carries an always-open, never-transmitting
 motor traffic, so live telemetry keeps streaming into the hub regardless of
 what owns command of the robot.
 
+The pollers also yield to control loops the link doesn't know about (e.g.
+``axol teleop`` launched from a terminal while the link is connected): the
+observer watches the command arbitration IDs, and any joint with fresh
+command traffic is dropped from the ping/sample sweeps — its telemetry comes
+from the passive tap instead — so the link adds zero bus load on a joint
+someone is driving, keeping the full bus budget available to the control
+rate.
+
 The link runs on its own asyncio event loop in a dedicated thread so the CAN
 reader loops and the ping timer never touch uvicorn's loop.
 """
@@ -50,6 +58,16 @@ _SAMPLE_TIMEOUT_S = 0.2
 # from the motors at connect. Best-effort: an unanswered motor keeps the
 # conservative defaults and is retried on the next connect/reacquire.
 _RANGE_SYNC_TIMEOUT_S = 1.0
+
+# How recently a joint must have received a motion command for the link's
+# pollers to treat it as externally driven and go silent on it (data comes
+# from the passive observer instead). Covers control loops the link doesn't
+# know about — e.g. `axol teleop` launched from a terminal while the link is
+# connected — where every polled request/response would steal bus bandwidth
+# from the control rate. Commands only come from a commanding process (the
+# observer can't transmit and the link's polls never use command IDs), so
+# this can't self-suppress off the link's own traffic.
+_EXTERNAL_CMD_FRESH_S = 1.0
 
 # State machine surfaced to the UI.
 #   disconnected -> connecting -> connected
@@ -280,10 +298,42 @@ class _ArmLink:
     async def ping(self) -> dict[str, dict[str, Any]]:
         """Read each motor's status/temperature/voltage; never raises.
 
+        Joints currently driven by another process are not touched — every
+        request/response would steal bus bandwidth from that control loop —
+        and their health entry is synthesized from passively observed data
+        instead (Damiao feedback carries status + temperature; fields the
+        traffic doesn't cover keep their last polled value).
+
         Returns the slow-telemetry sweep keyed by ``arm:JOINT`` for the hub.
         """
         sweep: dict[str, dict[str, Any]] = {}
+        commanded: set[Joint] = set()
+        passive_slow: dict[Joint, dict[str, Any]] = {}
+        if self.observer is not None:
+            commanded = self.observer.commanded_joints(_EXTERNAL_CMD_FRESH_S)
+            passive_slow = self.observer.slow_snapshot()
         for joint, motor in self._motors.items():
+            if joint in commanded:
+                prev = self.health.get(joint.name, {})
+                observed = passive_slow.get(joint, {})
+                self.health[joint.name] = {
+                    # Command traffic (and its feedback) proves the motor is
+                    # alive without asking it anything.
+                    "reachable": True,
+                    "status": observed.get("status") or prev.get("status"),
+                    "temperature": (
+                        observed.get("temperature")
+                        if observed.get("temperature") is not None
+                        else prev.get("temperature")
+                    ),
+                    "voltage": (
+                        observed.get("voltage")
+                        if observed.get("voltage") is not None
+                        else prev.get("voltage")
+                    ),
+                }
+                sweep[motor_key(self.side, joint.name)] = self.health[joint.name]
+                continue
             reachable = True
             status: str | None = None
             temperature: float | None = None
@@ -314,7 +364,23 @@ class _ArmLink:
         return sweep
 
     async def sample(self) -> dict[str, list[float]]:
-        """One fast sweep: position / velocity / torque for every motor."""
+        """One fast sweep: position / velocity / torque for every motor.
+
+        Joints currently driven by another process (e.g. a teleop session
+        launched from a terminal while the link is connected) are not polled
+        — their control traffic already carries everything this sweep would
+        ask for, and the three request/response reads per joint would eat
+        into the bus bandwidth available to the control rate. Their values
+        come from the passive observer's decode of that traffic instead.
+        """
+        commanded: set[Joint] = set()
+        passive: dict[str, list[float]] = {}
+        if self.observer is not None:
+            commanded = self.observer.commanded_joints(_EXTERNAL_CMD_FRESH_S)
+            if commanded:
+                for joint, values in self.observer.fast_snapshot().items():
+                    if joint in commanded:
+                        passive[motor_key(self.side, joint.name)] = list(values)
 
         async def read(joint: Joint, motor: Motor) -> tuple[str, list[float] | None]:
             try:
@@ -333,9 +399,14 @@ class _ArmLink:
             return motor_key(self.side, joint.name), [pos, vel, torque]
 
         results = await asyncio.gather(
-            *(read(joint, motor) for joint, motor in self._motors.items())
+            *(
+                read(joint, motor)
+                for joint, motor in self._motors.items()
+                if joint not in commanded
+            )
         )
-        return {key: values for key, values in results if values is not None}
+        polled = {key: values for key, values in results if values is not None}
+        return {**passive, **polled}
 
 
 class RobotLink:

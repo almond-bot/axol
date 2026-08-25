@@ -21,6 +21,14 @@ What each motor family gives an observer:
   command and every 0xCC feedback request, plus 0x33 register-read replies
   (bus voltage, and the PMAX/VMAX/TMAX scaling registers themselves).
 
+The observer is strictly zero-TX: it has no send path at all, so it adds not
+one frame of bus load — every last bit of bus bandwidth stays available to
+the control loop. It also watches the *command* arbitration IDs (which it
+never sends on, and neither does the serve link's polling), so
+:meth:`BusObserver.commanded_joints` can tell pollers when another process is
+already driving a joint and their request/response reads would be redundant
+traffic.
+
 The fixed-point MIT fields decode against per-motor ranges the observer
 cannot query for itself (it never sends). Defaults are the conservative
 legacy ranges; a process that owns command syncs the true values in via
@@ -53,12 +61,14 @@ from .damiao import (
 from .damiao import _uint_to_float as _dm_uint_to_float
 from .motor import _JOINT_CONFIG, _MotorType
 from .myactuator import (
+    _MA_MC_REQ,
     _MA_MC_RESP,
     _MA_MOTOR_STATUS_2,
     _MA_MULTI_TURN_ANGLE,
     _MA_P_MAX_LEGACY,
     _MA_POS_CONTROL,
     _MA_READ_STATUS1,
+    _MA_REQ,
     _MA_RESP,
     _MA_T_MAX_LEGACY,
     _MA_V_MAX,
@@ -77,6 +87,13 @@ class JointObservation:
     newest frame that updated the fast (position/velocity/torque) and slow
     (temperature/voltage/status) fields — consumers use them to tell live
     data from a joint that simply stopped being commanded.
+
+    ``commanded_ts`` is the timestamp of the newest *motion command* frame
+    addressed to this motor. Commands can only come from a process that owns
+    the bus (never from a passive observer, and never from the serve link's
+    read-only polling), so freshness here is unambiguous proof that some
+    other control loop is driving the joint — the signal pollers use to shut
+    up and keep the bus load down (see :meth:`BusObserver.commanded_joints`).
     """
 
     position: float | None = None
@@ -87,6 +104,7 @@ class JointObservation:
     status: str | None = None
     fast_ts: float = 0.0
     slow_ts: float = 0.0
+    commanded_ts: float = 0.0
 
 
 class _MyActuatorDecoder:
@@ -104,6 +122,20 @@ class _MyActuatorDecoder:
         self.p_max = p_max
         self.t_max = t_max
         self.synced = True
+
+    def on_motion_command(self, data: bytes, ts: float) -> None:
+        """A MIT command on 0x400+id: proof another process is driving this joint."""
+        self.obs.commanded_ts = ts
+
+    def on_standard_request(self, data: bytes, ts: float) -> None:
+        """A request on 0x140+id — only closed-loop control commands count.
+
+        The rest of the 0x140 traffic is telemetry/config reads, including the
+        serve link's own polling; counting those as "commanded" would make the
+        poller suppress itself off its own requests.
+        """
+        if data[0] in (_MA_VELOCITY_CONTROL, _MA_POS_CONTROL):
+            self.obs.commanded_ts = ts
 
     def on_motion_feedback(self, data: bytes, ts: float) -> None:
         """MIT feedback on 0x500+id: fixed-point position/velocity/torque."""
@@ -159,6 +191,15 @@ class _DamiaoDecoder:
         self.v_max = v_max
         self.t_max = t_max
         self.synced = True
+
+    def on_command(self, data: bytes, ts: float) -> None:
+        """A frame on one of this motor's command IDs (MIT, pos-vel, vel, pos-force).
+
+        The serve link's polling only ever sends on 0x7FF (0xCC feedback
+        requests, 0x33 register reads), so anything on the command IDs is
+        another process driving the joint.
+        """
+        self.obs.commanded_ts = ts
 
     def on_feedback(self, data: bytes, ts: float) -> None:
         """A frame on this motor's MST_ID: register traffic or MIT feedback."""
@@ -233,10 +274,19 @@ class BusObserver:
                 ma = _MyActuatorDecoder(obs, kt=cfg.kt)
                 self._handlers[_MA_MC_RESP + cfg.motor_id] = ma.on_motion_feedback
                 self._handlers[_MA_RESP + cfg.motor_id] = ma.on_standard_reply
+                # Command traffic (from whichever process owns the bus), to
+                # know when a joint is externally driven: MIT commands and
+                # the 0xA2/0xA4 closed-loop control requests.
+                self._handlers[_MA_MC_REQ + cfg.motor_id] = ma.on_motion_command
+                self._handlers[_MA_REQ + cfg.motor_id] = ma.on_standard_request
                 self._decoders[joint] = ma
             else:
                 dm = _DamiaoDecoder(obs, motor_id=cfg.motor_id)
                 self._handlers[0x10 + cfg.motor_id] = dm.on_feedback
+                # Command traffic: MIT (bare motor id), position-velocity,
+                # velocity, and position-force command IDs.
+                for offset in (0x000, 0x100, 0x200, 0x300):
+                    self._handlers[offset + cfg.motor_id] = dm.on_command
                 self._decoders[joint] = dm
             self._observations[joint] = obs
         self._bus: CanBus | None = None
@@ -286,6 +336,23 @@ class BusObserver:
         decoder.set_ranges(p_max, v_max, t_max)
 
     # -- snapshots ------------------------------------------------------------
+
+    def commanded_joints(self, max_age_s: float = 1.0) -> set[Joint]:
+        """Joints that received a motion command within ``max_age_s``.
+
+        Commands are sent only by a process actively controlling the robot —
+        never by this observer (which cannot transmit) and never by the serve
+        link's read-only polling — so a fresh command is unambiguous proof of
+        an external control loop. Pollers use this to go silent on those
+        joints and take their data from the passive tap instead, keeping the
+        bus load down for the control loop (higher usable control rates).
+        """
+        now = time.time()
+        return {
+            joint
+            for joint, o in self._observations.items()
+            if now - o.commanded_ts <= max_age_s
+        }
 
     def fast_snapshot(
         self, max_age_s: float = 0.5

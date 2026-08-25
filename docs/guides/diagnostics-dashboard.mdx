@@ -25,6 +25,8 @@ One chart for the selected arm streams continuously while the robot link is conn
 
 Bus access is split into command and observation. Only one process may *command* the motors at a time, but the server also keeps a passive, never-transmitting observer socket on each CAN channel: while a diagnostic, tuning run, or teleop session owns command, the observer decodes that task's own motor traffic and the charts stay live (labeled "live from passive bus tap"). The chart only goes quiet when the running task isn't actually commanding — e.g. while it sits at a prompt.
 
+The observer adds zero bus load (it cannot transmit), and the server's own idle polling automatically goes silent on any joint another process is driving — including control loops started outside the dashboard, like `axol teleop` run from a terminal. Motion-command traffic on a joint's CAN IDs is the signal: those joints are dropped from the poll sweeps and charted from the passive tap instead, so the full bus budget stays available to the control rate.
+
 ## Tests
 
 Each test — [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable), and the [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable) camera-cable check — is a card: click it, set parameters in the dialog, and hit Run. The ROM tests expose a joint checkbox picker so you can soak a subset (e.g. just the wrist joints). The card shows the running state, elapsed time, and the latest output line; completion lands as a notification, and the full log is kept with the run in the history below. The ROM tests hand the CAN bus over for the duration of the run; the camera-only ZED cable check leaves motor telemetry streaming.
