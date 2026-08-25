@@ -110,10 +110,10 @@ class JointConfig:
                   there the mode is fast, the stale host torque arrives out
                   of phase, and un-scheduled kd_host measurably sustains
                   jitter (see ``AxolArm.motion_control``).
-        kd_host_max: Hard ceiling on *total* host-side damping, including
-                  the firmware-kd spillover added when ``kd`` exceeds the
-                  motor's firmware range (see ``_mit_cmd`` in
-                  :mod:`almond_axol.robot.axol`). Host damping runs at the
+        kd_host_max: The highest host-side damping verified stable on this
+                  joint's hardware — the tuner's guardrail, kept next to
+                  ``kd_host``; never raise ``kd_host`` past it without a
+                  hardware step/teleop check. Host damping runs at the
                   command rate on a one-cycle-stale velocity, so it
                   only works on modes well below that rate: the shoulders'
                   ~2.3 Hz resonance damps cleanly up to the
@@ -123,11 +123,13 @@ class JointConfig:
                   sustained a limit cycle on a full-size step. The band-pass
                   (see ``kd_host_w0``) plus the 240 Hz loop halves that lag,
                   but this ceiling must still only hold values verified
-                  stable on hardware; ``0`` (default) allows no
-                  spillover beyond ``kd_host`` itself. The stiffness blend
-                  scales this ceiling with the same ``√kp`` factor as
-                  ``kd_host``, keeping the spill allowance damping-ratio-
-                  consistent at every slider position.
+                  stable on hardware. The stiffness blend scales it with
+                  the same ``√kp`` factor as ``kd_host``, keeping the two
+                  damping-ratio-consistent at every slider position. (A
+                  firmware ``kd`` beyond the motor's 0–5 range used to
+                  spill its excess into host damping capped here; that path
+                  is gone — the encoding clamps it and ``AxolArm`` warns at
+                  construction.)
         kd_host_w0: Centre frequency (rad/s) of the band-pass confining this
                   joint's host damping to its resonance band (see ``BandPass``
                   in :mod:`almond_axol.robot.control`). A damper centred on
@@ -589,9 +591,9 @@ def _blend_joint(
         kd=jc.kd * (kd_end / jc.kd) ** u,
         j_eff=j_eff,
         kd_host=jc.kd_host * host_factor,
-        # The spillover ceiling tracks the same scaling as kd_host, so the
-        # soft half keeps its damping-ratio-consistent cap and the stiff
-        # half keeps the hardware-verified midpoint ceiling.
+        # The verified-ceiling guardrail tracks the same scaling as kd_host,
+        # so the soft half keeps its damping-ratio-consistent cap and the
+        # stiff half keeps the hardware-verified midpoint ceiling.
         kd_host_max=jc.kd_host_max * host_factor,
     )
 

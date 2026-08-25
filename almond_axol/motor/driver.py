@@ -59,8 +59,9 @@ class MotorDriver(ABC):
         request above it is *lost*, not an error. 5 on every motor: Damiao,
         and MyActuator on ALL firmware — the V4.4 changelog claims a widened
         0-50 kd range, but hardware decodes the field against 0-5 regardless
-        of version. Consumers can deliver excess damping host-side instead —
-        see the ``kd_host`` spillover in ``AxolArm.motion_control``.
+        of version. Excess is never converted into host-side damping (the
+        delayed host torque is only phase-safe on slow modes); ``AxolArm``
+        warns at construction when a configured ``kd`` exceeds this.
         """
         return 5.0
 

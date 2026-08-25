@@ -373,6 +373,24 @@ class AxolArm:
             for joint in Joint
             if config.has_gripper or joint != Joint.GRIPPER
         }
+        # The impedance-command encodings clamp kd to the firmware range
+        # silently, and there is no host-side fallback for the excess — an
+        # oversized kd is a config/calibration error, so shout once here
+        # rather than ship less damping than the tuner thinks they have.
+        for joint, motor in self.motors.items():
+            if joint == Joint.GRIPPER:
+                continue
+            jc = getattr(self._arm_config, joint.value)
+            if jc.kd > motor.kd_max:
+                _logger.warning(
+                    "%s %s: configured kd=%.2f exceeds the firmware max %.1f "
+                    "and will be clamped — lower kd, or add damping via "
+                    "kd_host where it is phase-safe",
+                    "left" if is_left else "right",
+                    joint.value,
+                    jc.kd,
+                    motor.kd_max,
+                )
         # q_des → v_des → a_des (commanded), and q_meas → v_meas. v_des feeds
         # the impedance-control velocity FF and the friction model; a_des
         # feeds inertia FF (``j_eff``); v_meas feeds host-side damping
@@ -1323,32 +1341,20 @@ class AxolArm:
         def _mit_cmd(i: int, j: Joint):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
-            motor = self.motors[j]
-            # The firmware silently clamps kd to its supported range (5 on
-            # every motor family and firmware). Tuned kd defaults sit within
-            # the clamp, so this spill is normally zero; it exists so a
-            # deliberately oversized kd (e.g. an experiment) degrades into
-            # host damping instead of being silently lost —
-            # but never beyond ``kd_host_max``: host damping runs at ~100 Hz
-            # on a one-cycle-stale velocity, so on modes anywhere near that
-            # rate the delayed torque arrives out of phase and *excites* the
-            # oscillation instead of damping it (the elbow's ~11 Hz mode
-            # diverged violently under spilled host damping; only the
-            # shoulders' ~2.3 Hz resonance is slow enough to damp host-side).
-            kd_spill = max(gains.kd - motor.kd_max, 0.0)
-            # The pose-dependent host_scale (see above) applies to the spill
-            # too: on legacy firmware the spilled damping has the same
-            # phase-lag stability limit as the tuned kd_host.
-            kd_host_total = float(host_scale[i]) * min(
-                gains.kd_host + kd_spill, max(gains.kd_host_max, gains.kd_host)
-            )
+            # Host damping is exactly the configured kd_host, pose-scheduled.
+            # A kd beyond the firmware's range is clamped by the command
+            # encoding (and warned about at construction) — it is *not*
+            # rerouted into host damping: the delayed host torque is only
+            # phase-safe on the slow shoulder modes, so silently converting
+            # excess firmware damping into it could excite the very
+            # oscillation the oversized kd was meant to kill.
             t_ff = (
                 float(gravity[i])
                 + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
-                + kd_host_total * v_damp[i]
+                + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
-            return motor.set_impedance(
+            return self.motors[j].set_impedance(
                 float(motor_targets[i]),
                 velocities[i],
                 gains.kp,
