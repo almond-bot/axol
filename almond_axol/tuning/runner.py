@@ -36,6 +36,16 @@ RAMP_SPEED = 0.25  # rad/s
 # ``ramp_others_to_zero`` leaves them in place rather than commanding 0.
 BASE_COLLISION_JOINTS = frozenset({Joint.SHOULDER_2, Joint.WRIST_2})
 
+# With the chest cameras mounted, probing these joints with the arm hanging
+# at the rest pose swings the elbow/gripper right past the cameras. The
+# tuning flows hold shoulder_2 out (``camera_clearance_targets``) so the arm
+# runs clear of the torso for their sweeps.
+CAMERA_CLEARANCE_JOINTS = frozenset({Joint.SHOULDER_3, Joint.WRIST_1})
+
+# How far shoulder_2 must stay outboard of its base-collision boundary at 0.
+# Also the clearance angle it is held at while shoulder_3 / wrist_1 probe.
+SHOULDER_2_MARGIN = math.radians(10.0)
+
 
 def safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
     """Step direction that swings away from the robot base, or ``None`` if the
@@ -49,35 +59,120 @@ def safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
     return None
 
 
-def sine_center(joint: Joint, is_left: bool) -> float:
+def base_margin(joint: Joint) -> float:
+    """Distance (rad) the joint must keep outboard of its 0 boundary.
+
+    wrist_2's danger zone starts past 0, so 0 itself is a usable boundary;
+    shoulder_2 must additionally stay 10° out now that the chest cameras sit
+    beside the hanging arm.
+    """
+    return SHOULDER_2_MARGIN if joint == Joint.SHOULDER_2 else 0.0
+
+
+def safe_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
+    """Joint limits with the base-collision boundary applied.
+
+    For unconstrained joints these are just the arm limits; for the
+    base-collision joints the inboard boundary is pinned at the joint's
+    margin from 0, so any motion planned inside these limits stays outboard
+    of the base (and, for shoulder_2, of the cameras).
+    """
     lo, hi = arm_limits(joint, is_left)
+    safe_dir = safe_outboard_direction(joint, is_left)
+    if safe_dir is None:
+        return lo, hi
+    margin = base_margin(joint)
+    if safe_dir > 0:
+        return max(lo, margin), hi
+    return lo, min(hi, -margin)
+
+
+def camera_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, float]:
+    """Hold targets that swing the arm clear of the chest cameras.
+
+    shoulder_3 and wrist_1 sweeps rotate the hanging arm right where the
+    cameras sit; holding shoulder_2 10° outboard moves the whole arm away
+    from the torso for the duration of the probe. Empty for joints whose
+    probes are camera-safe at rest.
+    """
+    if test_joint not in CAMERA_CLEARANCE_JOINTS:
+        return {}
+    direction = safe_outboard_direction(Joint.SHOULDER_2, is_left)
+    assert direction is not None
+    return {Joint.SHOULDER_2: direction * SHOULDER_2_MARGIN}
+
+
+def sweep_safety(
+    joint: Joint, is_left: bool
+) -> tuple[dict[Joint, float], float | None, float | None, list[str]]:
+    """Clearance poses and range caps for a full-range sweep of ``joint``.
+
+    Returns ``(clearance_targets, lo_cap, hi_cap, notes)``: joint-frame hold
+    targets to ramp the *other* joints to before sweeping, optional overrides
+    of the sweep's lower/upper limit, and human-readable notes explaining
+    each measure. Encodes every physical-safety rule the full-range sweeps
+    (friction, gravity) share:
+
+    - wrist_2: elbow raised to its midpoint so the gripper clears the base,
+      and the sweep capped to the outboard half.
+    - shoulder_2: sweep capped 10° outboard of 0 — the base, and now the
+      chest cameras, sit inboard of that.
+    - shoulder_3 / wrist_1: shoulder_2 held 10° outboard so the hanging arm
+      swings clear of the chest cameras.
+    """
+    notes: list[str] = []
+    clearance = dict(camera_clearance_targets(joint, is_left))
+    if clearance:
+        notes.append(
+            f"Holding shoulder_2 at "
+            f"{math.degrees(clearance[Joint.SHOULDER_2]):+.0f}° to clear the "
+            f"chest cameras for the {joint.value} sweep."
+        )
     if joint == Joint.WRIST_2:
-        # wrist_2 midpoint is 0; the inboard half hits the robot base, so
-        # center at the midpoint of the outboard half (side-dependent).
-        return hi / 2.0 if is_left else lo / 2.0
+        elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
+        clearance[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
+        notes.append(
+            f"Moving elbow to {math.degrees(clearance[Joint.ELBOW]):.1f}° "
+            "(midpoint of range) for wrist_2 clearance."
+        )
+    lo_cap: float | None = None
+    hi_cap: float | None = None
+    safe_dir = safe_outboard_direction(joint, is_left)
+    if safe_dir is not None:
+        lo_cap, hi_cap = safe_limits(joint, is_left)
+        boundary = safe_dir * base_margin(joint)
+        notes.append(
+            f"Capping {joint.value} sweep at {math.degrees(boundary):+.0f}° "
+            "to stay clear of the base / cameras."
+        )
+    return clearance, lo_cap, hi_cap, notes
+
+
+def sine_center(joint: Joint, is_left: bool) -> float:
+    # Midpoint of the *safe* range: the full range for most joints, the
+    # outboard region for the base-collision joints.
+    lo, hi = safe_limits(joint, is_left)
     return (lo + hi) / 2.0
 
 
 def check_center(joint: Joint, is_left: bool, center: float) -> tuple[float, float]:
     """Validate an explicit probe centre; returns the effective limits.
 
-    For the base-collision joints the inboard half physically hits the robot
-    base, so the centre must sit outboard and the returned limits pin the
-    inboard boundary at 0 — the swing can then never cross toward the base.
+    For the base-collision joints the inboard side physically hits the robot
+    base (or the cameras, for shoulder_2), so the centre must sit outboard
+    of the safe boundary and the returned limits pin it there — the swing
+    can then never cross toward the base.
     """
-    lo, hi = arm_limits(joint, is_left)
+    lo, hi = safe_limits(joint, is_left)
     safe_dir = safe_outboard_direction(joint, is_left)
-    if safe_dir is not None:
-        if center * safe_dir < 0:
-            side = "positive" if safe_dir > 0 else "negative"
-            raise ValueError(
-                f"{joint.value} center {math.degrees(center):.1f}° is in the "
-                f"inboard half — the robot base is there. Use the {side} half."
-            )
-        if safe_dir > 0:
-            lo = 0.0
-        else:
-            hi = 0.0
+    if safe_dir is not None and center * safe_dir < base_margin(joint):
+        side = "positive" if safe_dir > 0 else "negative"
+        boundary = math.degrees(base_margin(joint))
+        raise ValueError(
+            f"{joint.value} center {math.degrees(center):.1f}° is inboard of "
+            f"the safe boundary ({boundary:.0f}° {side}) — the robot base / "
+            f"cameras are there. Use the {side} side."
+        )
     if not (lo <= center <= hi):
         raise ValueError(
             f"center {math.degrees(center):.1f}° is outside "
@@ -144,6 +239,7 @@ async def ramp_impedance(
 async def ramp_others_to_zero(
     motors: dict[Joint, JointFrameMotor],
     exclude: Joint,
+    is_left: bool,
 ) -> None:
     """Send non-test joints to rest (joint-frame 0) and poll until arrival.
 
@@ -152,10 +248,22 @@ async def ramp_others_to_zero(
     rest of the workflow keeps them safely outboard — ``run_step`` repositions
     before testing, and ``run_sine`` centers them in the safe half. The user is
     responsible for initially posing those joints outside the danger zone.
+
+    For shoulder_3 / wrist_1 probes, shoulder_2 is *commanded* to its 10°
+    outboard clearance instead of skipped in place: with the chest cameras
+    mounted, those joints' probes swing the hanging arm right past them.
     """
     skip = {exclude} | BASE_COLLISION_JOINTS
-    joints = [j for j in ARM_JOINTS if j not in skip]
-    await ramp_joints_to(motors, {j: 0.0 for j in joints})
+    targets = {j: 0.0 for j in ARM_JOINTS if j not in skip}
+    clearance = camera_clearance_targets(exclude, is_left)
+    if clearance:
+        print(
+            "  Holding shoulder_2 at "
+            f"{math.degrees(clearance[Joint.SHOULDER_2]):+.0f}° to clear the "
+            f"chest cameras for the {exclude.value} probe."
+        )
+        targets.update(clearance)
+    await ramp_joints_to(motors, targets)
 
 
 async def ramp_joints_to(
@@ -331,7 +439,7 @@ async def run_sine(
     """
     test_motor = motors[joint]
     if center is None:
-        lo, hi = arm_limits(joint, is_left)
+        lo, hi = safe_limits(joint, is_left)
         center = sine_center(joint, is_left)
     else:
         lo, hi = check_center(joint, is_left, center)
@@ -429,21 +537,23 @@ async def run_step(
 
     safe_dir = safe_outboard_direction(joint, is_left)
     if safe_dir is not None and not relative and center is None:
-        # 0 physically collides with the robot base; frame the whole test in
-        # the safe half so that center *and* step_target stay outboard. amp
-        # goes from 0 → safe-limit/2 (room for a 2× swing).
+        # The inboard side physically collides with the robot base; frame the
+        # whole test in the safe region so that center *and* step_target stay
+        # outboard of the boundary (0 + margin). amp gets half the region
+        # (room for a 2× swing).
         direction = safe_dir
+        margin = base_margin(joint)
         outboard_limit = lo if direction < 0 else hi
-        max_safe_amp = abs(outboard_limit) / 2.0
+        max_safe_amp = (abs(outboard_limit) - margin) / 2.0
         amp = min(
             requested_amp if requested_amp is not None else DEFAULT_AMP_RAD,
             max_safe_amp,
         )
-        center = direction * amp
-        step_target = direction * 2.0 * amp
+        center = direction * (margin + amp)
+        step_target = direction * (margin + 2.0 * amp)
         if requested_amp is not None and amp < requested_amp:
             print(
-                f"  ! requested amp {requested_amp:.4f} rad would push past the safe half; clamped to {amp:.4f} rad"
+                f"  ! requested amp {requested_amp:.4f} rad would push past the safe region; clamped to {amp:.4f} rad"
             )
     else:
         if center is None:

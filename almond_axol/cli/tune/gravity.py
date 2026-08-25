@@ -49,7 +49,6 @@ import numpy as np
 
 from ...constants import ARM_JOINTS
 from ...motor import CanBus, ControlMode, Joint, Motor
-from ...robot.axol import arm_limits
 from ...robot.calibration import (
     CALIBRATION_PATH,
     load_calibration,
@@ -57,7 +56,7 @@ from ...robot.calibration import (
 )
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import joint_frame_motors, save_run
+from ...tuning import joint_frame_motors, save_run, sweep_safety
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
     _home_all,
@@ -331,34 +330,19 @@ async def _run(args: argparse.Namespace) -> None:
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
 
-            # Same clearance / base-collision caps as the friction sweep.
-            other_targets: dict[Joint, float] = {}
-            if joint == Joint.WRIST_2:
-                elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
-                other_targets[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
-                print(
-                    f"  Moving elbow to "
-                    f"{math.degrees(other_targets[Joint.ELBOW]):.1f}° "
-                    "(midpoint) for wrist_2 clearance."
-                )
+            # Shared sweep-safety geometry (see sweep_safety): base-collision
+            # caps for shoulder_2/wrist_2, elbow raised for wrist_2, and
+            # shoulder_2 held outboard for the camera-adjacent joints. The
+            # clearance targets also feed the gravity-model predictions, so
+            # the fit is computed at the pose the sweep actually ran at.
+            other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
+            for note in notes:
+                print(f"  {note}")
+            if other_targets:
                 await _ramp_verified(motors, other_targets)
 
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
-
-            lo_default = hi_default = None
-            if joint == Joint.SHOULDER_2:
-                if is_left:
-                    hi_default = 0.0
-                else:
-                    lo_default = 0.0
-                print("  Capping shoulder_2 sweep at 0° to avoid the base.")
-            elif joint == Joint.WRIST_2:
-                if is_left:
-                    lo_default = 0.0
-                else:
-                    hi_default = 0.0
-                print("  Capping wrist_2 sweep at 0° to avoid the base.")
 
             avg_samples, _halfdiff = await _identify_joint(
                 motors[joint],
@@ -384,7 +368,9 @@ async def _run(args: argparse.Namespace) -> None:
             q_bins, tau_meas = q_bins[order], tau_meas[order]
 
             fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
-            _report_and_save(args, joint, side_str, jc, q_bins, tau_meas, fit)
+            _report_and_save(
+                args, joint, side_str, jc, q_bins, tau_meas, fit, other_targets
+            )
 
         except KeyboardInterrupt:
             print("\n  Interrupted.")
@@ -414,6 +400,7 @@ def _report_and_save(
     q_bins: np.ndarray,
     tau_meas: np.ndarray,
     fit: tuple[tuple[float, float, float], float, np.ndarray, np.ndarray] | None,
+    clearance: dict[Joint, float],
 ) -> None:
     print(f"\n{'─' * 50}")
     if fit is None:
@@ -487,6 +474,9 @@ def _report_and_save(
                 "com_cad": list(jc.com),
                 "com_fit": list(com_fit),
                 "saved": bool(args.save),
+                "clearance_deg": {
+                    j.value: round(math.degrees(v), 1) for j, v in clearance.items()
+                },
             },
             label=args.label,
         )

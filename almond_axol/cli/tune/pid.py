@@ -334,9 +334,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "there (amplitude clamped to the remaining headroom). Gains that "
         "look fine hanging at rest can misbehave under gravity load, so "
         "probe 45, -45, … too. Default: step starts at the joint's current "
-        "position, sine at the joint midpoint. shoulder_2/wrist_2 must stay "
-        "in their outboard (base-free) half. Incompatible with "
-        "--pose-by-hand (the probe runs at the hand-set pose).",
+        "position, sine at the joint midpoint. wrist_2 must stay in its "
+        "outboard (base-free) half; shoulder_2 additionally 10° outboard of "
+        "0 — the base and the chest cameras sit inboard of that. "
+        "Incompatible with --pose-by-hand (the probe runs at the hand-set "
+        "pose).",
     )
     p.add_argument(
         "--freq", type=float, default=1.0, help="[sine] Frequency in Hz (default: 1.0)"
@@ -873,7 +875,7 @@ async def _run(args: argparse.Namespace) -> None:
                 return
 
             print("  ramping other joints to rest (joint-frame 0) ...")
-            await ramp_others_to_zero(motors, joint)
+            await ramp_others_to_zero(motors, joint, is_left)
 
             if pose:
                 desc = ", ".join(

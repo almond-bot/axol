@@ -48,7 +48,7 @@ from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import JointFrameMotor, joint_frame_motors
+from ...tuning import JointFrameMotor, joint_frame_motors, sweep_safety
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
@@ -607,42 +607,17 @@ async def _run(args: argparse.Namespace) -> None:
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
 
-            # wrist_2: elbow at midpoint of its range so wrist_2 can sweep
-            # its outboard half without the gripper hitting the robot base.
-            other_targets: dict[Joint, float] = {}
-            if joint == Joint.WRIST_2:
-                elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
-                other_targets[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
-                print(
-                    f"  Moving elbow to "
-                    f"{math.degrees(other_targets[Joint.ELBOW]):.1f}° "
-                    f"(midpoint of range) for wrist_2 clearance."
-                )
+            # Shared sweep-safety geometry (see sweep_safety): base-collision
+            # caps for shoulder_2/wrist_2, elbow raised for wrist_2, and
+            # shoulder_2 held outboard for the camera-adjacent joints.
+            other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
+            for note in notes:
+                print(f"  {note}")
+            if other_targets:
                 await _ramp_verified(motors, other_targets)
 
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
-
-            # shoulder_2 swings into the robot base on the inboard side; cap
-            # the sweep at 0 so it stays on the safe half of its range.
-            lo_default = hi_default = None
-            if joint == Joint.SHOULDER_2:
-                if is_left:
-                    hi_default = 0.0
-                else:
-                    lo_default = 0.0
-                print("  Capping shoulder_2 sweep at 0° to avoid the base.")
-            elif joint == Joint.WRIST_2:
-                # Even with the elbow raised, wrist_2's inboard half swings
-                # the gripper into the base (observed on hardware) — the same
-                # constraint the PID tuner encodes via _BASE_COLLISION_JOINTS
-                # and _safe_outboard_direction. Sweep only the outboard half:
-                # +π/2 on the left arm, −π/2 on the right.
-                if is_left:
-                    lo_default = 0.0
-                else:
-                    hi_default = 0.0
-                print("  Capping wrist_2 sweep at 0° to avoid the base.")
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
