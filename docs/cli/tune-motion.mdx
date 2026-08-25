@@ -1,0 +1,37 @@
+---
+title: "tune.motion"
+description: "Replay a committed reference motion through the production control path and score tracking accuracy and smoothness per joint."
+---
+
+Replays a [reference motion](/cli/motion-build) through the production `motion_control` path — impedance gains, gravity/friction/inertia feedforward, and host-side damping all come from the same `AxolConfig` production uses — and scores **tracking accuracy** and **smoothness** per joint. Because the motion is identical from run to run and robot to robot, this is the deterministic A/B loop that ad-hoc teleop testing can't give you: override one gain with `--gain`, replay, and compare the numbers (and graphs, in the diagnostics dashboard).
+
+Every run persists a tuning-run artifact (full per-joint time series + metrics) under `~/.almond/diagnostics/tuning/` for charting and side-by-side comparison.
+
+The arm moves to the motion's start and back to rest on collision-aware planned trajectories; a contact watchdog aborts playback if a sustained torque residual says the arm is pushing on something that isn't in the plan.
+
+| Flag | Description |
+|---|---|
+| `--motion NAME` | Committed motion name (`axol motion.list`) or a path to a motion `.npz` (required) |
+| `--gain [SIDE.]JOINT.FIELD=VALUE` | Override one gain for this run, e.g. `left.elbow.kd=4.5` or `shoulder_3.kd_host=8` (no side = both arms). Fields: `kp`, `kd`, `kd_host`, `kd_host_max`, `kd_host_w0`, `j_eff`. Repeatable |
+| `--stiffness S` | Stiffness-slider position in `[0, 1]` for both arms (default: 0.5, the teleop default — gain overrides land exactly at that midpoint) |
+| `--label TEXT` | Free-form note stored on the run artifact |
+| `--torque-threshold NM` | Contact watchdog threshold (default: 8.0; 0 disables) |
+| `--no-save-run` | Don't persist the run artifact (dry run) |
+| `--no-gripper` | Run on the gripperless SKU |
+
+```bash
+axol tune.motion --motion reach-and-place                             # baseline run
+axol tune.motion --motion reach-and-place --gain left.elbow.kd=4.5    # A/B a gain
+axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
+```
+
+## Reading the scorecard
+
+| Column | Meaning |
+|---|---|
+| `RMS °` | Tracking error vs the reference |
+| `lagfree °` | Error after removing the measured command→measurement delay — separates sluggishness from inaccuracy |
+| `lag ms` | That delay (cross-correlation of commanded vs measured velocity) |
+| `jitter °` | 3–15 Hz band RMS of the error — the vibration the operator feels |
+| `amp` | Measured / commanded mid-band motion: > 1 means the arm adds energy (rings), < 1 means it filters |
+| `trq HF` | Cycle-to-cycle torque chatter (Nm RMS) |

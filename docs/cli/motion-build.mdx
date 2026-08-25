@@ -1,0 +1,28 @@
+---
+title: "motion.build / motion.list"
+description: "Build committed reference motions from recorded teleop sessions."
+---
+
+Reference motions are uniform-rate, both-arm joint trajectories committed to the repository (`almond_axol/tuning/motions/`), so the exact same motion can be replayed on any robot — today or on future units — and the tracking metrics compared 1:1 with [`tune.motion`](/cli/tune-motion).
+
+`motion.build` postprocesses a teleop flight-recorder capture into one: the final guarded command stream (`_cmd` stage) is clipped to the engaged span, resampled onto a uniform grid, zero-phase low-pass smoothed (keeping the operator's intent, dropping hand tremor and network jitter), and projected waypoint-by-waypoint through the same collision-aware solver the teleop return-to-rest uses — the stored motion is joint-limit- and self-collision-safe by construction.
+
+| Flag | Description |
+|---|---|
+| `prefix` | Flight-recorder prefix from `axol teleop --teleop.jitter_record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip) |
+| `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz` (required) |
+| `--out PATH` | Write to an explicit path instead of the committed directory |
+| `--rate HZ` | Uniform playback rate (default: 100) |
+| `--cutoff HZ` | Zero-phase low-pass cutoff (default: 6.0) |
+| `--time-scale X` | Stretch playback time (2.0 = half speed; default: 1.0) |
+| `--no-project` | Skip the collision-aware waypoint projection |
+| `--notes TEXT` | Free-form provenance note stored in the motion metadata |
+
+```bash
+axol teleop --teleop.jitter_record /tmp/rec      # record a session first
+axol motion.build /tmp/rec --name reach-and-place
+axol motion.build /tmp/rec --name reach-slow --time-scale 2.0
+axol motion.list                                 # what's committed
+```
+
+Commit the generated `.npz` so every robot can replay the identical motion.

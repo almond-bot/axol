@@ -22,7 +22,9 @@ from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
+from .motion import add_parser as motion_add_parser
 from .tune import friction, pid, repeatability
+from .tune import motion as tune_motion
 from .zed import driver as zed_driver
 from .zed import install as zed_install
 
@@ -123,6 +125,8 @@ def main() -> None:
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
     repeatability.add_parser(subparsers)
+    tune_motion.add_parser(subparsers)
+    motion_add_parser(subparsers)
     serve_cmd.add_parser(subparsers)
 
     # Register the draccus + diagnostics commands as bare subparsers purely so

@@ -89,6 +89,8 @@
               "cli/jetson-setup",
               "cli/tune-pid",
               "cli/tune-friction",
+              "cli/tune-motion",
+              "cli/motion-build",
               "cli/tune-repeatability",
               "cli/gravity-comp",
               "cli/waypoints"
