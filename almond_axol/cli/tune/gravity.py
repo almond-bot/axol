@@ -70,9 +70,16 @@ from .friction import (
 # torque is exactly linear in the CoM, so any small step gives the exact
 # Jacobian up to float noise; 5 mm keeps the difference well above it.
 _FD_STEP = 0.005
-# Reject fits that move the CoM implausibly far — a shift beyond this is a
-# bad sweep (collision, telemetry glitch), not a real build difference.
-_MAX_SHIFT = 0.030  # m
+# Reject fits whose gravity-torque effect is implausibly large. The bound is
+# torque, not millimetres: a CoM shift only matters through m·g·δ, so the
+# same physical error needs a big shift on a light link and a small one on a
+# heavy link — and a proximal sweep fitted before its distal links lumps the
+# *whole chain's* error into this one link, legitimately needing tens of mm
+# on e.g. the 1.8 kg shoulder_1 body. Anything above this many Nm, though,
+# is a bad sweep (collision, dropped feedback), not a build difference.
+_MAX_CORRECTION_NM = 2.5
+# Floor in metres so heavy links still get room for genuinely small shifts.
+_MIN_SHIFT_BOUND = 0.030  # m
 # Below this much torque variation across the sweep the CoM is unobservable
 # (axis parallel to gravity at this pose) and the fit would chase noise.
 _MIN_SIGNAL = 0.05  # Nm std
@@ -173,12 +180,14 @@ def fit_com(
 
     delta = solution[:3]
     shift = float(np.linalg.norm(delta))
-    if shift > _MAX_SHIFT:
+    bound = max(_MIN_SHIFT_BOUND, _MAX_CORRECTION_NM / (jc.mass * 9.81))
+    if shift > bound:
         raise RuntimeError(
-            f"fitted CoM shift {shift * 1000:.0f} mm exceeds the "
-            f"{_MAX_SHIFT * 1000:.0f} mm plausibility bound — the sweep data "
-            "is suspect (collision, dropped feedback, wrong joint held); "
-            "not applying it"
+            f"fitted CoM shift {shift * 1000:.0f} mm on a {jc.mass:g} kg link "
+            f"is {shift * jc.mass * 9.81:.1f} Nm of gravity correction — "
+            f"beyond the {_MAX_CORRECTION_NM:g} Nm plausibility bound. The "
+            "sweep data is suspect (collision, dropped feedback, wrong "
+            "joint held); not applying it"
         )
     com_fit = tuple(float(v) for v in com0 + delta)
     offset = float(solution[3])
@@ -284,9 +293,27 @@ async def _run(args: argparse.Namespace) -> None:
 
     print(f"\nAxol gravity identification — {side_str} {joint.value}")
     print(f"  Sweep velocity: {args.velocity:g} deg/s   Kp={kp}  Kd={kd}")
-    cal = load_calibration()[side_str].get(joint.value, {})
+    cal_side = load_calibration()[side_str]
+    cal = cal_side.get(joint.value, {})
     if "com" in cal:
         print(f"  Current CoM is already calibrated: {cal['com']} (refining it)")
+    # A proximal sweep rotates every distal link with it, so distal CoM
+    # errors are indistinguishable from this link's and get lumped into it.
+    # Fine at the rest pose the sweep runs at, but wrong once the elbow /
+    # wrists bend away from it — hence the distal→proximal order.
+    distal_uncal = [
+        j.value
+        for j in ARM_JOINTS[ARM_JOINTS.index(joint) + 1 :]
+        if "com" not in cal_side.get(j.value, {})
+    ]
+    if distal_uncal:
+        print(
+            f"  ! Distal links not yet gravity-calibrated: "
+            f"{', '.join(distal_uncal)}. Their errors will be lumped into "
+            f"{joint.value}'s CoM — exact at the sweep pose, approximate "
+            "once those joints bend. For clean attribution run them first "
+            "(distal → proximal)."
+        )
 
     channel = resolve_channel(args)
 
@@ -428,6 +455,13 @@ def _report_and_save(
         f"  Worst parked droop at kp={jc.kp:g}: "
         f"{droop_before:.3f}° → {droop_after:.3f}°"
     )
+    if rms_before > 0.1 and rms_after > 0.6 * rms_before:
+        print(
+            "  ! The fit explains less than half the residual shape — a CoM "
+            "error can't produce this profile. Suspect torque telemetry or "
+            "something touching the arm during the sweep; treat the values "
+            "with caution."
+        )
 
     if args.save_run:
         run_id = save_run(
