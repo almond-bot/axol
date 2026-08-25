@@ -1191,6 +1191,37 @@ export function TuningWorkbench({
   )
   const tabValues = useMemo(() => values[tab.key] ?? {}, [values, tab.key])
 
+  // Sine and step probe the same joint with the same gains, so their shared
+  // fields (arm, joint, kp/kd/kd_host/…, amp, rate, …) behave as one set:
+  // switching between the two tabs carries the current values across —
+  // including cleared boxes — while tab-specific fields (freq/duration vs
+  // hold) keep their own state.
+  const switchTab = useCallback(
+    (next: string) => {
+      const prev = tabKey
+      const paired = new Set(["sine", "step"])
+      if (prev !== next && paired.has(prev) && paired.has(next)) {
+        const prevTab = TABS.find((t) => t.key === prev)
+        const nextTab = TABS.find((t) => t.key === next)
+        if (prevTab && nextTab) {
+          const nextKeys = new Set(nextTab.fields.map((f) => f.key))
+          setValues((v) => {
+            const src = v[prev] ?? {}
+            const dst = { ...(v[next] ?? {}) }
+            for (const f of prevTab.fields) {
+              if (!nextKeys.has(f.key)) continue
+              if (src[f.key] !== undefined) dst[f.key] = src[f.key]
+              else delete dst[f.key]
+            }
+            return { ...v, [next]: dst }
+          })
+        }
+      }
+      setTabKey(next)
+    },
+    [tabKey]
+  )
+
   function handleRun() {
     const miss = tab.required.filter((k) => !(tabValues[k] ?? "").trim())
     setMissing(miss)
@@ -1334,7 +1365,7 @@ export function TuningWorkbench({
                 key={t.key}
                 type="button"
                 onClick={() => {
-                  setTabKey(t.key)
+                  switchTab(t.key)
                   setMissing([])
                 }}
                 className={cn(
