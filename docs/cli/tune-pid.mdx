@@ -16,9 +16,9 @@ The feedforward path defaults to exactly what the production control loop applie
 | `--kd KD [KD ...]` | Derivative gain candidate(s) (default: the joint's configured kd) |
 | `--ff {full,gravity,friction,none}` | Feedforward during the test (default: `full` — matches production) |
 | `--host-kd KD` | Host-side damping (Nm·s/rad) via `t_ff` — matches the production `kd_host` term (default: the joint's configured `kd_host`) |
-| `--host-kd-w0 W0` | Band-pass centre (rad/s) confining the host damping to the joint's resonance band — matches the production `kd_host_w0` (default: the joint's configured value, else the shared 20 rad/s ≈ 3.2 Hz) |
+| `--host-kd-hz HZ` | Band-pass centre (Hz) confining the host damping to the joint's resonance band — matches the production `kd_host_hz`; aim it at the ring frequency the step test reports (default: the joint's configured value, else the shared 3.2 Hz) |
 | `--mode {sine,step}` | `sine` = sinusoidal tracking (default); `step` = step response |
-| `--amp FLOAT` | Motion amplitude in rad (default: auto safe value) |
+| `--amp DEG` | Motion amplitude in degrees (default: 10°, clamped to joint headroom) |
 | `--freq FLOAT` | [sine] Frequency in Hz (default: 1.0) |
 | `--duration FLOAT` | [sine] Duration in seconds (default: 5.0) |
 | `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) |

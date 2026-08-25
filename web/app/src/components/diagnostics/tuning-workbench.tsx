@@ -58,7 +58,7 @@ interface WbField {
   width?: string
   /**
    * Key into the fetched per-joint gains (`kp` | `kd` | `kd_host` |
-   * `kd_host_w0`): the field shows the selected joint's current config value
+   * `kd_host_hz`): the field shows the selected joint's current config value
    * and an empty box means "run with config".
    */
   gainKey?: string
@@ -111,12 +111,12 @@ const GAIN_FIELDS: WbField[] = [
     hint: "host-side damping via t_ff",
   },
   {
-    key: "host_kd_w0",
-    label: "kd_host_w0 (rad/s)",
+    key: "host_kd_hz",
+    label: "kd_host_hz (Hz)",
     type: "number",
-    gainKey: "kd_host_w0",
-    slider: { min: 5, max: 120, step: 1 },
-    hint: "band-pass centre of the host damping",
+    gainKey: "kd_host_hz",
+    slider: { min: 1, max: 19, step: 0.1 },
+    hint: "band-pass centre of the host damping — aim it at the ring Hz",
   },
 ]
 
@@ -135,7 +135,7 @@ const TABS: WbTab[] = [
       { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
-      { key: "amp", label: "amp (rad)", type: "number", placeholder: "0.175" },
+      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
       {
@@ -147,7 +147,7 @@ const TABS: WbTab[] = [
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "—" },
       {
         key: "target_noise",
-        label: "target noise (rad)",
+        label: "target noise (°)",
         type: "number",
         placeholder: "off",
       },
@@ -169,7 +169,7 @@ const TABS: WbTab[] = [
       { key: "arm", label: "arm", type: "select", options: ["left", "right"] },
       { key: "joint", label: "joint", type: "select", options: ARM_JOINT_OPTIONS },
       ...GAIN_FIELDS,
-      { key: "amp", label: "amp (rad)", type: "number", placeholder: "0.175" },
+      { key: "amp", label: "amp (°)", type: "number", placeholder: "10" },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
       {
         key: "ff",
@@ -199,16 +199,16 @@ const TABS: WbTab[] = [
     fields: [
       { key: "noise", label: "noise", type: "select", options: ["combined", "network", "ik"] },
       { key: "motion", label: "motion", type: "select", options: [] },
-      { key: "amp", label: "sine amp (rad)", type: "number", placeholder: "0.3" },
+      { key: "amp", label: "sine amp (°)", type: "number", placeholder: "15" },
       { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.5" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "10" },
-      { key: "jitter", label: "net jitter (rad RMS)", type: "number", placeholder: "0.005" },
-      { key: "outlier_amp", label: "net outlier (rad)", type: "number", placeholder: "0.2" },
+      { key: "jitter", label: "net jitter (° RMS)", type: "number", placeholder: "0.3" },
+      { key: "outlier_amp", label: "net outlier (°)", type: "number", placeholder: "10" },
       { key: "outlier_rate", label: "net outliers /s", type: "number", placeholder: "0.5" },
       { key: "stall_ms", label: "net stall (ms)", type: "number", placeholder: "150" },
       { key: "stall_rate", label: "net stalls /s", type: "number", placeholder: "0.5" },
-      { key: "ik_churn", label: "ik churn (rad RMS)", type: "number", placeholder: "0.003" },
-      { key: "ik_jump_amp", label: "ik jump (rad)", type: "number", placeholder: "0.05" },
+      { key: "ik_churn", label: "ik churn (° RMS)", type: "number", placeholder: "0.2" },
+      { key: "ik_jump_amp", label: "ik jump (°)", type: "number", placeholder: "3" },
       { key: "ik_jump_rate", label: "ik jumps /s", type: "number", placeholder: "0.2" },
       { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config" },
       { key: "seed", label: "seed", type: "number", placeholder: "0" },
@@ -264,9 +264,9 @@ const TABS: WbTab[] = [
       { key: "save", label: "save to calibration", type: "boolean" },
       {
         key: "velocities",
-        label: "velocities (rad/s)",
+        label: "velocities (°/s)",
         type: "text",
-        placeholder: "0.1 0.3 0.6 0.9 1.3",
+        placeholder: "7.2 18 36 54 72",
         width: "w-44",
       },
       {
@@ -322,6 +322,11 @@ const TABS: WbTab[] = [
 
 function toDeg(v: number): number {
   return (v * 180) / Math.PI
+}
+
+/** Radian series → degrees for display (nulls pass through). */
+function degSeries(data: (number | null)[]): (number | null)[] {
+  return data.map((v) => (v == null ? null : toDeg(v)))
 }
 
 function fmtNum(v: unknown, digits = 2): string {
@@ -422,8 +427,8 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
     out.push({
       joint: name.slice(arm.length + 1),
       series: [
-        { label: "commanded", color: COMMANDED_COLOR, x: t, data: commanded },
-        { label: "actual", color: ACTUAL_COLOR, x: t, data: actual },
+        { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
+        { label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) },
       ],
       sub: errorLane(t, commanded, actual),
     })
@@ -458,10 +463,12 @@ function filterJointCharts(run: TuningRunData, arm: string | null): JointChart[]
       if (max - min < 0.017) continue
     }
     const series: RunChartSeries[] = [
-      { label: "clean", color: COMMANDED_COLOR, x: t, data: clean },
+      { label: "clean", color: COMMANDED_COLOR, x: t, data: degSeries(clean) },
     ]
-    if (noisy) series.push({ label: "noisy input", color: NOISY_COLOR, x: t, data: noisy })
-    series.push({ label: "filtered", color: ACTUAL_COLOR, x: t, data: filtered })
+    if (noisy) {
+      series.push({ label: "noisy input", color: NOISY_COLOR, x: t, data: degSeries(noisy) })
+    }
+    series.push({ label: "filtered", color: ACTUAL_COLOR, x: t, data: degSeries(filtered) })
     out.push({
       joint: arm != null ? name.slice(arm.length + 1) : name,
       series,
@@ -491,8 +498,8 @@ function pidJointChart(run: TuningRunData): JointChart | null {
   return {
     joint: run.meta.joint ?? "joint",
     series: [
-      { label: "commanded", color: COMMANDED_COLOR, x: t, data: commanded },
-      { label: "actual", color: ACTUAL_COLOR, x: t, data: actual },
+      { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
+      { label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) },
     ],
     sub: errorLane(t, commanded, actual),
   }
@@ -537,7 +544,7 @@ const FILTER_COLS: ScoreCol[] = [
   { key: "lag_ms", label: "lag ms", digits: 0, warn: 60, bad: 120 },
   { key: "jitter_passed", label: "jitter passed ×", warn: 0.7, bad: 1.0 },
   { key: "peak_err", label: "peak err °", deg: true, digits: 3 },
-  { key: "accel_peak", label: "peak accel rad/s²", digits: 1 },
+  { key: "accel_peak", label: "peak accel °/s²", deg: true, digits: 0 },
 ]
 
 const STEP_COLS: ScoreCol[] = [
@@ -764,7 +771,7 @@ function FailureMap({
  * The tuning workbench: pick what to run (sine / step / filter noise test /
  * recorded motion), set the numbers inline, hit Run — and the result lands
  * straight on the graphs below. Every parameter is always visible (no
- * advanced fold), and gain fields (kp / kd / kd_host / kd_host_w0) show the
+ * advanced fold), and gain fields (kp / kd / kd_host / kd_host_hz) show the
  * selected joint's current config value with a slider seeded there — leave
  * the box empty to run with config. Everything is joint space and built to
  * localize failures visually: a failure map shows both arms' per-joint error
@@ -1210,7 +1217,7 @@ export function TuningWorkbench({
               key={c.joint}
               id={`joint-chart-${c.joint}`}
               title={c.joint}
-              unit="rad"
+              unit="°"
               series={c.series}
               sub={c.sub}
               height={jointCharts.length > 1 ? 260 : 310}

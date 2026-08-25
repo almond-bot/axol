@@ -594,9 +594,11 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         Shipping defaults from ``config.py`` with this robot's calibration
         file overlaid — exactly what a tuning run uses when a gain field is
         left empty. The workbench shows these as the slider baselines.
-        ``kd_host_w0`` is resolved to the shared default where a joint
+        ``kd_host_hz`` is resolved to the shared default where a joint
         doesn't set its own band centre.
         """
+        import math
+
         from ..constants import ARM_JOINTS
         from ..robot.config import AxolConfig
         from ..robot.control import DAMP_BP_W0
@@ -613,8 +615,10 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "kp": jc.kp,
                         "kd": jc.kd,
                         "kd_host": jc.kd_host,
-                        "kd_host_w0": (
-                            jc.kd_host_w0 if jc.kd_host_w0 is not None else DAMP_BP_W0
+                        "kd_host_hz": (
+                            jc.kd_host_hz
+                            if jc.kd_host_hz is not None
+                            else round(DAMP_BP_W0 / (2 * math.pi), 1)
                         ),
                         "kd_host_max": jc.kd_host_max,
                         "j_eff": jc.j_eff,

@@ -81,7 +81,7 @@ export async function fetchTuningMotions(): Promise<{ motions: TuningMotion[] }>
 /**
  * Effective per-joint control gains: `gains[side][joint]` holds the values a
  * tuning run uses when its gain fields are left empty — config defaults with
- * this robot's calibration overlaid (kp, kd, kd_host, kd_host_w0, …).
+ * this robot's calibration overlaid (kp, kd, kd_host, kd_host_hz, …).
  */
 export type TuningGains = Record<string, Record<string, Record<string, number>>>
 

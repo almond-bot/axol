@@ -93,7 +93,7 @@ class JointConfig:
                   (tuned as "35" under the old 0-50 encoding) alone left a
                   62%-overshoot ring; kd_host=30 on top damped it
                   critically. The elbow needs its own dose for the same
-                  reason, band-passed at its own mode (see ``kd_host_w0``).
+                  reason, band-passed at its own mode (see ``kd_host_hz``).
                   Leave at 0 for joints whose firmware kd works (the wrists)
                   — and beware the failure mode that took shoulder_3's and
                   wrist_2's dampers away: past ~90 deg of loop phase lag the
@@ -121,7 +121,7 @@ class JointConfig:
                   old 120 Hz rate *fed* the elbow's ~11 Hz mode (~45° phase
                   lag) — host-kd 39 there diverged violently and even 10
                   sustained a limit cycle on a full-size step. The band-pass
-                  (see ``kd_host_w0``) plus the 240 Hz loop halves that lag,
+                  (see ``kd_host_hz``) plus the 240 Hz loop halves that lag,
                   but this ceiling must still only hold values verified
                   stable on hardware. The stiffness blend scales it with
                   the same ``√kp`` factor as ``kd_host``, keeping the two
@@ -130,25 +130,26 @@ class JointConfig:
                   spill its excess into host damping capped here; that path
                   is gone — the encoding clamps it and ``AxolArm`` warns at
                   construction.)
-        kd_host_w0: Centre frequency (rad/s) of the band-pass confining this
+        kd_host_hz: Centre frequency (Hz) of the band-pass confining this
                   joint's host damping to its resonance band (see ``BandPass``
-                  in :mod:`almond_axol.robot.control`). A damper centred on
-                  the wrong mode is rolled off and phase-shifted exactly
-                  where the joint needs it: with a fixed centre at the
-                  shoulders' 3.2 Hz *rest* resonance, teleop bursts at
-                  4.3-8.6 Hz (jit14/15 surveys) saw only ~14% of the damping
-                  (-47° band-pass phase, -23° differentiator, -12° loop
-                  delay). ``None`` (the default) makes the centre *track the
-                  pose*: the shoulders' mode is the impedance mode
-                  ωn = √(kp/J(q)) — validated against hardware (2.2 Hz
-                  predicted at rest vs ~2-3 measured; 5.4 Hz raised to the
-                  side vs the 4.3-8.6 Hz burst band) — so motion_control
-                  scales the hardware-anchored rest centre (``DAMP_BP_W0``)
-                  by √(J_rest/J(q)) each cycle. Set an explicit value for
-                  joints whose ringing is *structural* rather than the
-                  impedance mode (the elbow rings at 6.7 Hz under load where
-                  √(kp/J) predicts 2.3 Hz — transmission compliance, not
-                  reflected inertia).
+                  in :mod:`almond_axol.robot.control`; the control math
+                  works in rad/s internally — converted once at arm
+                  construction). A damper centred on the wrong mode is
+                  rolled off and phase-shifted exactly where the joint needs
+                  it: with a fixed centre at the shoulders' 3.2 Hz *rest*
+                  resonance, teleop bursts at 4.3-8.6 Hz (jit14/15 surveys)
+                  saw only ~14% of the damping (-47° band-pass phase, -23°
+                  differentiator, -12° loop delay). ``None`` (the default)
+                  makes the centre *track the pose*: the shoulders' mode is
+                  the impedance mode ωn = √(kp/J(q)) — validated against
+                  hardware (2.2 Hz predicted at rest vs ~2-3 measured;
+                  5.4 Hz raised to the side vs the 4.3-8.6 Hz burst band) —
+                  so motion_control scales the hardware-anchored rest centre
+                  (``DAMP_BP_W0``, 3.2 Hz) by √(J_rest/J(q)) each cycle.
+                  Set an explicit value for joints whose ringing is
+                  *structural* rather than the impedance mode (the elbow
+                  rings at 6.7 Hz under load where √(kp/J) predicts 2.3 Hz —
+                  transmission compliance, not reflected inertia).
     """
 
     kp: float
@@ -159,7 +160,7 @@ class JointConfig:
     j_eff: float = 0.0
     kd_host: float = 0.0
     kd_host_max: float = 0.0
-    kd_host_w0: float | None = None
+    kd_host_hz: float | None = None
 
 
 @dataclass
@@ -287,7 +288,7 @@ class ArmConfig:
             # step/teleop check.
             kd_host=8.0,
             kd_host_max=8.0,
-            kd_host_w0=60.0,  # rad/s ≈ 9.5 Hz, covering the 6.7-12.5 Hz range
+            kd_host_hz=9.5,  # covering the 6.7-12.5 Hz structural range
         )
     )
     wrist_1: JointConfig = field(

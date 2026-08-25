@@ -38,7 +38,7 @@ Examples:
     axol tune.filter --noise ik --save-run
     axol tune.filter --save-run                          # combined
     axol tune.filter --noise network --stall-ms 300 --save-run
-    axol tune.filter --noise ik --ik-churn 0.01 --save-run
+    axol tune.filter --noise ik --ik-churn 0.6 --save-run
     axol tune.filter --motion reach-and-place --save-run
     axol tune.filter --cutoff 1.5 --label "half cutoff" --save-run
 """
@@ -76,8 +76,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--amp",
         type=float,
-        default=0.3,
-        help="Sine mode: amplitude in rad (default: 0.3)",
+        default=15.0,
+        metavar="DEG",
+        help="Sine mode: amplitude in degrees (default: 15)",
     )
     p.add_argument(
         "--freq",
@@ -96,9 +97,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--jitter",
         type=float,
-        default=0.005,
-        help="Network: white-noise jitter RMS in rad added to every sample "
-        "(default: 0.005 ≈ 0.3°; 0 disables)",
+        default=0.3,
+        metavar="DEG",
+        help="Network: white-noise jitter RMS in degrees added to every "
+        "sample (default: 0.3; 0 disables)",
     )
     p.add_argument(
         "--outlier-rate",
@@ -109,9 +111,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--outlier-amp",
         type=float,
-        default=0.2,
-        help="Outlier magnitude in rad — how far a glitched sample teleports "
-        "(default: 0.2 ≈ 11°)",
+        default=10.0,
+        metavar="DEG",
+        help="Outlier magnitude in degrees — how far a glitched sample "
+        "teleports (default: 10)",
     )
     p.add_argument(
         "--stall-rate",
@@ -129,9 +132,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--ik-churn",
         type=float,
-        default=0.003,
-        help="IK: band-limited (3-20 Hz) solver churn RMS in rad per joint "
-        "(default: 0.003 ≈ 0.17°, the scale diag.offline kinematics measures "
+        default=0.2,
+        metavar="DEG",
+        help="IK: band-limited (3-20 Hz) solver churn RMS in degrees per "
+        "joint (default: 0.2, the scale diag.offline kinematics measures "
         "on a healthy solve; 0 disables)",
     )
     p.add_argument(
@@ -144,8 +148,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--ik-jump-amp",
         type=float,
-        default=0.05,
-        help="IK: solution-jump magnitude in rad (default: 0.05 ≈ 3°)",
+        default=3.0,
+        metavar="DEG",
+        help="IK: solution-jump magnitude in degrees (default: 3)",
     )
     p.add_argument(
         "--cutoff",
@@ -182,14 +187,16 @@ def _print_report(metrics: dict, params: dict) -> None:
     parts = []
     if params["noise"] in ("network", "combined"):
         parts.append(
-            f"network: jitter {params['jitter_rms'] * 1000:.1f} mrad RMS, "
-            f"{metrics['outliers']} outliers × {params['outlier_amp']:.2f} rad, "
+            f"network: jitter {math.degrees(params['jitter_rms']):.2f}° RMS, "
+            f"{metrics['outliers']} outliers × "
+            f"{math.degrees(params['outlier_amp']):.1f}°, "
             f"{metrics['stalls']} stalls × {params['stall_ms']:.0f} ms"
         )
     if params["noise"] in ("ik", "combined"):
         parts.append(
-            f"ik: churn {params['ik_churn'] * 1000:.1f} mrad RMS, "
-            f"{metrics['ik_jumps']} jumps × {params['ik_jump_amp']:.2f} rad"
+            f"ik: churn {math.degrees(params['ik_churn']):.2f}° RMS, "
+            f"{metrics['ik_jumps']} jumps × "
+            f"{math.degrees(params['ik_jump_amp']):.1f}°"
         )
     print(
         f"\nInjected [{params['noise']}]: " + "; ".join(parts) + " "
@@ -207,7 +214,8 @@ def _print_report(metrics: dict, params: dict) -> None:
             f"  {name:<18} {math.degrees(m['input_rms']):>8.3f} "
             f"{math.degrees(m['rms_err']):>9.3f} "
             f"{math.degrees(m['rms_err_lagfree']):>9.3f} {lag:>7} {jp:>8} "
-            f"{math.degrees(m['peak_err']):>7.3f} {m['accel_peak']:>7.1f}"
+            f"{math.degrees(m['peak_err']):>7.3f} "
+            f"{math.degrees(m['accel_peak']):>7.0f}"
         )
     print(f"{'═' * 78}")
     print(
@@ -215,7 +223,7 @@ def _print_report(metrics: dict, params: dict) -> None:
         "  lagfree = out RMS after removing the stack's delay (the residual\n"
         "  the noise actually left); jitter × = 3-15 Hz error passed through\n"
         "  (<1 = cleaned); peak = worst excursion; accel = peak output accel\n"
-        f"  in rad/s² (must stay under the {metrics['accel_limit']:.1f} "
+        f"  in °/s² (must stay under the {math.degrees(metrics['accel_limit']):.0f} "
         "teleop limit — outliers and\n"
         "  stall catch-ups can't slam the arm). Error during a stall is\n"
         "  missing data, not filter failure — the filter owns the catch-up."
@@ -225,20 +233,22 @@ def _print_report(metrics: dict, params: dict) -> None:
 def run(args: argparse.Namespace) -> None:
     """Run the noise-injection filter test and print the cleanup scorecard."""
     try:
+        # The CLI speaks degrees; the analysis library (like the rest of the
+        # pipeline it replays) works in radians.
         series, metrics, params = filter_noise_analysis(
             motion=args.motion,
             duration=args.duration,
-            amp=args.amp,
+            amp=math.radians(args.amp),
             freq=args.freq,
             noise=args.noise,
-            jitter_rms=args.jitter,
+            jitter_rms=math.radians(args.jitter),
             outlier_rate=args.outlier_rate,
-            outlier_amp=args.outlier_amp,
+            outlier_amp=math.radians(args.outlier_amp),
             stall_rate=args.stall_rate,
             stall_ms=args.stall_ms,
-            ik_churn=args.ik_churn,
+            ik_churn=math.radians(args.ik_churn),
             ik_jump_rate=args.ik_jump_rate,
-            ik_jump_amp=args.ik_jump_amp,
+            ik_jump_amp=math.radians(args.ik_jump_amp),
             cutoff=args.cutoff,
             seed=args.seed,
         )

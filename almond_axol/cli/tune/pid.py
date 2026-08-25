@@ -30,7 +30,7 @@ Examples:
     axol tune.pid --l --joint elbow --kp 20 30 45 --kd 0.5 1.0   # 6-way sweep
     axol tune.pid --r --joint shoulder_1 --mode step --ff none
     axol tune.pid --l --joint wrist_1 --kp 12 --kd 0.4 --save
-    axol tune.pid --l --joint shoulder_1 --mode step --amp 0.05 --pose-by-hand
+    axol tune.pid --l --joint shoulder_1 --mode step --amp 3 --pose-by-hand
 """
 
 import argparse
@@ -84,8 +84,8 @@ def _print_stats_sine(m: dict, n: int, kp: float, kd: float) -> None:
     print(f"\n{'─' * 40}")
     print(f"  Kp={kp}  Kd={kd}")
     print(f"  Samples:    {n}  ({m['hz']:.1f} Hz actual)")
-    print(f"  RMS error:  {m['rms']:.5f} rad  ({math.degrees(m['rms']):.3f}°)")
-    print(f"  Max error:  {m['max']:.5f} rad  ({math.degrees(m['max']):.3f}°)")
+    print(f"  RMS error:  {math.degrees(m['rms']):.3f}°")
+    print(f"  Max error:  {math.degrees(m['max']):.3f}°")
     _print_chatter(m)
     print(f"{'─' * 40}")
 
@@ -104,7 +104,7 @@ def _print_stats_step(m: dict, n: int, kp: float, kd: float) -> None:
         f"  Overshoot:  {math.degrees(m['overshoot']):.3f}°  "
         f"({m['overshoot_frac'] * 100:.1f}% of step)"
     )
-    print(f"  SS RMS:     {m['ss_rms']:.5f} rad  ({math.degrees(m['ss_rms']):.3f}°)")
+    print(f"  SS RMS:     {math.degrees(m['ss_rms']):.3f}°")
     if m.get("ring_hz") is not None:
         print(f"  Ring:       {m['ring_hz']:.1f} Hz dominant oscillation")
     _print_chatter(m)
@@ -206,15 +206,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "kd_host)",
     )
     p.add_argument(
-        "--host-kd-w0",
+        "--host-kd-hz",
         type=float,
         default=None,
-        metavar="W0",
-        help="Centre frequency (rad/s) of the band-pass confining the host "
+        metavar="HZ",
+        help="Centre frequency (Hz) of the band-pass confining the host "
         "damping to the joint's resonance band — matches the production "
-        "kd_host_w0 (default: this joint's configured value, falling back "
-        f"to the shared {DAMP_BP_W0:.0f} rad/s ≈ "
-        f"{DAMP_BP_W0 / (2 * math.pi):.1f} Hz shoulder default)",
+        "kd_host_hz. Aim it at the ring frequency the step test reports "
+        f"(default: this joint's configured value, falling back to the "
+        f"shared {DAMP_BP_W0 / (2 * math.pi):.1f} Hz shoulder default)",
     )
     p.add_argument(
         "--stiffness",
@@ -268,18 +268,19 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--target-noise",
         type=float,
         default=None,
-        metavar="RAD",
+        metavar="DEG",
         help="[sine] Add band-limited (~8 Hz) noise of this RMS amplitude "
-        "(rad) to the reference, simulating teleop hand-tracking jitter — "
-        "stresses the differentiated feedforward terms (v_des, a_des, "
+        "(degrees) to the reference, simulating teleop hand-tracking jitter "
+        "— stresses the differentiated feedforward terms (v_des, a_des, "
         "kd_host) the way production inputs do. Error is still measured "
-        "against the clean underlying sine. Try 0.002-0.005.",
+        "against the clean underlying sine. Try 0.1-0.3.",
     )
     p.add_argument(
         "--amp",
         type=float,
         default=None,
-        help="Motion amplitude in rad (default: 0.175 rad ≈ 10°, clamped to joint headroom)",
+        metavar="DEG",
+        help="Motion amplitude in degrees (default: 10°, clamped to joint headroom)",
     )
     p.add_argument(
         "--freq", type=float, default=1.0, help="[sine] Frequency in Hz (default: 1.0)"
@@ -416,8 +417,12 @@ async def _run(args: argparse.Namespace) -> None:
     fric = (f.fc, f.k, f.fv, f.fo) if use_friction else (0.0, 0.0, 0.0, 0.0)
     j_eff = jc.j_eff if args.ff == "full" else 0.0
     host_kd = args.host_kd if args.host_kd is not None else jc.kd_host
-    host_kd_w0 = args.host_kd_w0 if args.host_kd_w0 is not None else jc.kd_host_w0
-    host_kd_w0_eff = host_kd_w0 if host_kd_w0 is not None else DAMP_BP_W0
+    host_kd_hz = args.host_kd_hz if args.host_kd_hz is not None else jc.kd_host_hz
+    host_kd_hz_eff = (
+        host_kd_hz if host_kd_hz is not None else DAMP_BP_W0 / (2 * math.pi)
+    )
+    # User-facing angles are degrees; everything below the CLI runs radians.
+    amp_rad = math.radians(args.amp) if args.amp is not None else None
 
     gravity_comp = GravityCompensator() if use_gravity else None
     test_idx = ARM_JOINTS.index(joint)
@@ -439,7 +444,8 @@ async def _run(args: argparse.Namespace) -> None:
         dump_csv.parent.mkdir(parents=True, exist_ok=True)
 
     print(
-        f"\nAxol PID tuner — {side_str} {joint.value}  limits=[{lo:.4f}, {hi:.4f}] rad"
+        f"\nAxol PID tuner — {side_str} {joint.value}  "
+        f"limits=[{math.degrees(lo):.1f}, {math.degrees(hi):.1f}]°"
     )
     print(f"  mode={args.mode}  ff={args.ff}  candidates={len(candidates)}")
     if args.stiffness is not None:
@@ -467,17 +473,18 @@ async def _run(args: argparse.Namespace) -> None:
     if host_kd:
         print(
             f"  host-kd  {host_kd} (host-side damping via t_ff, kd_host) "
-            f"band-passed at {host_kd_w0_eff:.0f} rad/s "
-            f"≈ {host_kd_w0_eff / (2 * math.pi):.1f} Hz (kd_host_w0)"
+            f"band-passed at {host_kd_hz_eff:.1f} Hz (kd_host_hz)"
         )
 
     noise: list[float] | None = None
     if args.target_noise is not None:
         if args.mode != "sine":
             raise SystemExit("--target-noise only applies to --mode sine")
-        noise = make_target_noise(args.target_noise, args.rate, args.duration)
+        noise = make_target_noise(
+            math.radians(args.target_noise), args.rate, args.duration
+        )
         print(
-            f"  target-noise  {args.target_noise} rad RMS band-limited "
+            f"  target-noise  {args.target_noise}° RMS band-limited "
             f"(~8 Hz) on the reference — teleop-jitter emulation"
         )
 
@@ -508,20 +515,20 @@ async def _run(args: argparse.Namespace) -> None:
             side=side_str,
             joint=joint.value,
             gains=(
-                {"kp": kp, "kd": kd, "kd_host": host_kd, "kd_host_w0": host_kd_w0_eff}
+                {"kp": kp, "kd": kd, "kd_host": host_kd, "kd_host_hz": host_kd_hz_eff}
                 if host_kd
                 else {"kp": kp, "kd": kd, "kd_host": host_kd}
             ),
             params={
                 "mode": mode_label,
                 "ff": args.ff,
-                "amp": args.amp,
+                "amp_deg": args.amp,
                 "freq": args.freq,
                 "duration": args.duration,
                 "hold": args.hold,
                 "rate": args.rate,
                 "stiffness": args.stiffness,
-                "target_noise": args.target_noise,
+                "target_noise_deg": args.target_noise,
             },
             label=args.label,
             group=run_group,
@@ -568,7 +575,9 @@ async def _run(args: argparse.Namespace) -> None:
         hand_bp = BandPass(
             len(ARM_JOINTS),
             [
-                jc_all[j].kd_host_w0 if jc_all[j].kd_host_w0 is not None else DAMP_BP_W0
+                2 * math.pi * jc_all[j].kd_host_hz
+                if jc_all[j].kd_host_hz is not None
+                else DAMP_BP_W0
                 for j in ARM_JOINTS
             ],
         )
@@ -731,14 +740,14 @@ async def _run(args: argparse.Namespace) -> None:
                             j_eff=j_eff,
                             differentiate_target=False,
                             host_kd=host_kd,
-                            host_kd_w0=host_kd_w0,
+                            host_kd_hz=host_kd_hz,
                         )
                         log, amp = await run_step(
                             motors,
                             joint,
                             kp,
                             kd,
-                            args.amp,
+                            amp_rad,
                             args.hold,
                             args.rate,
                             is_left,
@@ -814,7 +823,7 @@ async def _run(args: argparse.Namespace) -> None:
                     j_eff=j_eff,
                     differentiate_target=(args.mode == "sine"),
                     host_kd=host_kd,
-                    host_kd_w0=host_kd_w0,
+                    host_kd_hz=host_kd_hz,
                 )
                 if args.mode == "sine":
                     log, amp = await run_sine(
@@ -823,7 +832,7 @@ async def _run(args: argparse.Namespace) -> None:
                         kp,
                         kd,
                         args.freq,
-                        args.amp,
+                        amp_rad,
                         args.duration,
                         args.rate,
                         is_left,
@@ -838,7 +847,7 @@ async def _run(args: argparse.Namespace) -> None:
                         joint,
                         kp,
                         kd,
-                        args.amp,
+                        amp_rad,
                         args.hold,
                         args.rate,
                         is_left,

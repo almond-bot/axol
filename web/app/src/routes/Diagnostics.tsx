@@ -74,16 +74,20 @@ const WINDOWS: { label: string; seconds: number }[] = [
 
 /** The live chart's selectable metrics. `slow` charts the 1 Hz sweep buffer
  * (temperature) instead of the 10 Hz fast frames. */
+const RAD2DEG = 180 / Math.PI
+
 const METRICS: {
   key: string
   label: string
   title: string
   unit: string
   metric: number
+  /** Display multiplier — the stream carries radians, humans read degrees. */
+  scale?: number
   slow?: boolean
 }[] = [
-  { key: "pos", label: "Position", title: "Position", unit: "rad", metric: 0 },
-  { key: "vel", label: "Velocity", title: "Velocity", unit: "rad/s", metric: 1 },
+  { key: "pos", label: "Position", title: "Position", unit: "°", metric: 0, scale: RAD2DEG },
+  { key: "vel", label: "Velocity", title: "Velocity", unit: "°/s", metric: 1, scale: RAD2DEG },
   { key: "torque", label: "Torque", title: "Torque", unit: "Nm", metric: 2 },
   {
     key: "temp",
@@ -861,6 +865,7 @@ export default function Diagnostics() {
             frames={chartFrames}
             version={stream.version}
             metric={metric.metric}
+            scale={metric.scale}
             view={view}
             onViewChange={setPinnedView}
             quietReason={quietReason}

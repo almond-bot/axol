@@ -411,7 +411,7 @@ class AxolArm:
         # j_eff FF) keep the slow pole. The host damping term instead gets
         # its own chain — fast differentiators on both commanded and measured
         # positions feeding a band-pass centred on each joint's own
-        # structural mode (``kd_host_w0``: ~3 Hz shoulders, ~8 Hz elbow) —
+        # structural mode (``kd_host_hz``: ~3 Hz shoulders, 9.5 Hz elbow) —
         # so kd_host arrives in phase at the mode it must damp without
         # passing the delayed, anti-phase gain that excites 25-35 Hz
         # structural modes (see the BandPass docstring in .control for the
@@ -421,21 +421,23 @@ class AxolArm:
         self._accel_diff = Differentiator(n=n_j)
         self._vel_fast_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
         self._meas_vel_diff = Differentiator(n=n_j, cutoff=VEL_CUTOFF_FREQ)
-        # Host-damping band-pass centres: joints with an explicit kd_host_w0
-        # (structural modes — the elbow, shoulder_3) keep it fixed; joints
-        # with None get pose-tracked centres each cycle (see motion_control:
-        # the shoulders' impedance mode ωn = √(kp/J(q)) moves 2.2 → 5.4 Hz
-        # between rest and raised-to-the-side, and a fixed rest centre
-        # delivered only ~14% of the damping in the 4.3-8.6 Hz teleop burst
-        # band).
+        # Host-damping band-pass centres: joints with an explicit kd_host_hz
+        # (structural modes — the elbow) keep it fixed; joints with None get
+        # pose-tracked centres each cycle (see motion_control: the shoulders'
+        # impedance mode ωn = √(kp/J(q)) moves 2.2 → 5.4 Hz between rest and
+        # raised-to-the-side, and a fixed rest centre delivered only ~14% of
+        # the damping in the 4.3-8.6 Hz teleop burst band). Config carries
+        # Hz (the operator-facing unit); the control math wants rad/s, so
+        # convert exactly once here.
         self._damp_w0 = [
-            getattr(self._arm_config, j.value).kd_host_w0 or DAMP_BP_W0
+            2 * math.pi * getattr(self._arm_config, j.value).kd_host_hz
             if j != Joint.GRIPPER
+            and getattr(self._arm_config, j.value).kd_host_hz is not None
             else DAMP_BP_W0
             for j in Joint
         ]
         self._damp_w0_tracked = [
-            j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_w0 is None
+            j != Joint.GRIPPER and getattr(self._arm_config, j.value).kd_host_hz is None
             for j in Joint
         ]
         self._damp_bp = BandPass(n=n_j, w0=self._damp_w0)

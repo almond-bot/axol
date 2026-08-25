@@ -24,12 +24,12 @@ The output is scored **against the clean reference**, per joint: the stack shoul
 |---|---|
 | `--noise MODE` | `network`, `ik`, or `combined` (default: combined). Network knobs are ignored in `ik` mode and vice versa |
 | `--motion NAME` | Use a committed reference motion as the clean signal (all 14 joints); default is a synthetic sine |
-| `--duration S` / `--amp RAD` / `--freq HZ` | Sine mode: signal length, amplitude, and frequency (defaults: 10 s, 0.3 rad, 0.5 Hz) |
-| `--jitter RAD` | Network: white-noise RMS added to every sample (default: 0.005 ≈ 0.3°; 0 disables) |
-| `--outlier-rate /S` / `--outlier-amp RAD` | Network: outlier injection rate and teleport magnitude (defaults: 0.5/s, 0.2 rad ≈ 11°) |
+| `--duration S` / `--amp DEG` / `--freq HZ` | Sine mode: signal length, amplitude, and frequency (defaults: 10 s, 15°, 0.5 Hz) |
+| `--jitter DEG` | Network: white-noise RMS added to every sample (default: 0.3°; 0 disables) |
+| `--outlier-rate /S` / `--outlier-amp DEG` | Network: outlier injection rate and teleport magnitude (defaults: 0.5/s, 10°) |
 | `--stall-rate /S` / `--stall-ms MS` | Network: stall injection rate and length (defaults: 0.5/s, 150 ms) |
-| `--ik-churn RAD` | IK: band-limited (3–20 Hz) solver churn RMS per joint (default: 0.003 ≈ 0.17°; 0 disables) |
-| `--ik-jump-rate /S` / `--ik-jump-amp RAD` | IK: solution-jump rate and magnitude (defaults: 0.2/s, 0.05 rad ≈ 3°) |
+| `--ik-churn DEG` | IK: band-limited (3–20 Hz) solver churn RMS per joint (default: 0.2°; 0 disables) |
+| `--ik-jump-rate /S` / `--ik-jump-amp DEG` | IK: solution-jump rate and magnitude (defaults: 0.2/s, 3°) |
 | `--cutoff HZ` | Pose low-pass pole frequency (default: the production `pose_cutoff`) |
 | `--seed N` | Noise RNG seed — identical seed, identical corrupted stream (default: 0) |
 | `--label TEXT` | Free-form note stored on the run artifact |
@@ -55,6 +55,6 @@ axol tune.filter --cutoff 1.5 --label "half cutoff" --save-run
 | `lag ms` | The stack's command→output delay |
 | `jitter ×` | 3–15 Hz error passed through, out over in — well below 1 means the felt-jitter band was cleaned |
 | `peak °` | Worst excursion from the clean reference (how much of an outlier leaked through) |
-| `accel` | Peak output acceleration (rad/s²) — must stay at or under teleop's configured limit, proving outliers and stall catch-ups can never slam the arm |
+| `accel` | Peak output acceleration (°/s²) — must stay at or under teleop's configured limit, proving outliers and stall catch-ups can never slam the arm |
 
 One caveat when reading: while the stream is stalled the clean reference keeps moving, so error during a stall is *missing information*, not filter failure. What the filter owns is the catch-up — resuming without overshoot or an acceleration spike.

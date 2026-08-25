@@ -29,7 +29,7 @@ joint, per arm, on every robot you build.
 Examples:
     axol tune.friction --l --joint shoulder_1 --kp 30 --kd 0.8
     axol tune.friction --r --joint elbow --kp 20 --kd 0.6 --save
-    axol tune.friction --l --joint wrist_1 --velocities 0.2 0.6 1.0
+    axol tune.friction --l --joint wrist_1 --velocities 12 35 60
 """
 
 import argparse
@@ -59,8 +59,9 @@ _WARMUP_FRACTION = 0.15  # skip first 15% of each pass for motor settling
 _RATE_HZ = 100.0
 _N_BINS = 40  # position bins for matching fwd/bwd samples
 
-# Default velocity sweep in rad/s (~0.02, 0.05, 0.1, 0.15, 0.2 rev/s)
-DEFAULT_VELOCITIES = [v * _TAU for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
+# Default velocity sweep in deg/s (0.02, 0.05, 0.1, 0.15, 0.2 rev/s exactly).
+# The CLI speaks deg/s; the sweep internals run rad/s.
+DEFAULT_VELOCITIES_DEG = [v * 360.0 for v in [0.02, 0.05, 0.1, 0.15, 0.2]]
 
 
 async def _ramp_to(
@@ -137,7 +138,8 @@ async def _ramp_verified(
             if all(abs(pos - targets[j]) < 0.05 for j, pos in zip(joints, positions)):
                 return
     stragglers = ", ".join(
-        f"{j.value} at {pos:+.3f} rad (target {targets[j]:+.3f})"
+        f"{j.value} at {math.degrees(pos):+.1f}° "
+        f"(target {math.degrees(targets[j]):+.1f}°)"
         for j, pos in zip(joints, positions)
         if abs(pos - targets[j]) >= 0.05
     )
@@ -387,8 +389,10 @@ async def _identify_joint(
     sweep_lo = lo + _SWEEP_MARGIN
     sweep_hi = hi - _SWEEP_MARGIN
 
-    print(f"\n  Joint limits: [{lo:.4f}, {hi:.4f}] rad")
-    print(f"  Sweep range:  [{sweep_lo:.4f}, {sweep_hi:.4f}] rad")
+    print(f"\n  Joint limits: [{math.degrees(lo):.1f}, {math.degrees(hi):.1f}]°")
+    print(
+        f"  Sweep range:  [{math.degrees(sweep_lo):.1f}, {math.degrees(sweep_hi):.1f}]°"
+    )
     print(f"  Kp={kp}  Kd={kd}")
 
     if sweep_hi - sweep_lo < 0.1:
@@ -419,7 +423,7 @@ async def _identify_joint(
 
     try:
         for v in velocities:
-            print(f"\n  v = {v:.3f} rad/s ...")
+            print(f"\n  v = {math.degrees(v):.1f} deg/s ...")
 
             # Ramp to sweep start with time proportional to distance
             cur = await motor.get_position()
@@ -503,23 +507,23 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "--velocities",
         type=float,
         nargs="+",
-        default=DEFAULT_VELOCITIES,
-        metavar="V",
-        help="Velocity setpoints in rad/s (default: ~0.1 0.3 0.6 0.9 1.3 rad/s)",
+        default=DEFAULT_VELOCITIES_DEG,
+        metavar="DEG_S",
+        help="Velocity setpoints in deg/s (default: 7.2 18 36 54 72)",
     )
     p.add_argument(
         "--lo",
         type=float,
         default=None,
-        metavar="RAD",
-        help="Override lower joint limit for the sweep (rad)",
+        metavar="DEG",
+        help="Override lower joint limit for the sweep (degrees)",
     )
     p.add_argument(
         "--hi",
         type=float,
         default=None,
-        metavar="RAD",
-        help="Override upper joint limit for the sweep (rad)",
+        metavar="DEG",
+        help="Override upper joint limit for the sweep (degrees)",
     )
     p.add_argument(
         "--dump-csv",
@@ -570,8 +574,10 @@ async def _run(args: argparse.Namespace) -> None:
     if dump_csv is not None:
         dump_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    velocities_rad = [math.radians(v) for v in args.velocities]
+
     print(f"\nAxol friction identification — {side_str} {joint.value}")
-    print(f"  Velocity sweep: {[round(v, 3) for v in args.velocities]} rad/s")
+    print(f"  Velocity sweep: {[round(v, 1) for v in args.velocities]} deg/s")
     print(f"  Kp={kp}  Kd={kd}")
 
     channel = resolve_channel(args)
@@ -608,7 +614,9 @@ async def _run(args: argparse.Namespace) -> None:
                 elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
                 other_targets[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
                 print(
-                    f"  Moving elbow to {other_targets[Joint.ELBOW]:.3f} rad (midpoint of range) for wrist_2 clearance."
+                    f"  Moving elbow to "
+                    f"{math.degrees(other_targets[Joint.ELBOW]):.1f}° "
+                    f"(midpoint of range) for wrist_2 clearance."
                 )
                 await _ramp_verified(motors, other_targets)
 
@@ -623,7 +631,7 @@ async def _run(args: argparse.Namespace) -> None:
                     hi_default = 0.0
                 else:
                     lo_default = 0.0
-                print("  Capping shoulder_2 sweep at 0 rad to avoid the base.")
+                print("  Capping shoulder_2 sweep at 0° to avoid the base.")
             elif joint == Joint.WRIST_2:
                 # Even with the elbow raised, wrist_2's inboard half swings
                 # the gripper into the base (observed on hardware) — the same
@@ -634,7 +642,7 @@ async def _run(args: argparse.Namespace) -> None:
                     lo_default = 0.0
                 else:
                     hi_default = 0.0
-                print("  Capping wrist_2 sweep at 0 rad to avoid the base.")
+                print("  Capping wrist_2 sweep at 0° to avoid the base.")
 
             avg_samples, halfdiff_samples = await _identify_joint(
                 motors[joint],
@@ -642,9 +650,13 @@ async def _run(args: argparse.Namespace) -> None:
                 kp,
                 kd,
                 is_left,
-                args.velocities,
-                lo_override=args.lo if args.lo is not None else lo_default,
-                hi_override=args.hi if args.hi is not None else hi_default,
+                velocities_rad,
+                lo_override=math.radians(args.lo)
+                if args.lo is not None
+                else lo_default,
+                hi_override=math.radians(args.hi)
+                if args.hi is not None
+                else hi_default,
                 dump_csv=dump_csv,
             )
 
