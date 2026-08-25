@@ -251,14 +251,28 @@ class ArmConfig:
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=250.0,
-            kd=3.5,
+            # Step/sine-validated on hardware (2026-08, tuning workbench):
+            # same kp/kd as shoulder_1 with the host damping pinned on this
+            # joint's own measured ~3.5 Hz impedance ring (an octave above
+            # shoulder_1's — lighter link) and narrowed to it (kd_host_q
+            # 1.5). kd_host 45 is the phase-lag ceiling: 60 re-sustained the
+            # ring, so the guardrail sits at the validated value. Result:
+            # step ring dead in ~2 swings with 0.016° RMS parking at rest,
+            # and at -80° under full gravity load 0.32° RMS sine tracking
+            # (matching shoulder_1) with 0.07° droop. The ~12% amplitude
+            # gain on a 1 Hz sine is the resonance's below-band tail —
+            # damping can't shrink it, and the teleop trapezoid rate-limits
+            # what reaches it.
+            kp=350.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=35.0,
-            kd_host_max=40.0,
+            kd_host=45.0,
+            kd_host_max=45.0,
+            kd_host_hz=3.5,
+            kd_host_q=1.5,
         )
     )
     shoulder_3: JointConfig = field(
