@@ -334,9 +334,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "there (amplitude clamped to the remaining headroom). Gains that "
         "look fine hanging at rest can misbehave under gravity load, so "
         "probe 45, -45, … too. Default: step starts at the joint's current "
-        "position, sine at the joint midpoint. wrist_2 must stay in its "
-        "outboard (base-free) half; shoulder_2 additionally 10° outboard of "
-        "0 — the base and the chest cameras sit inboard of that. "
+        "position, sine at the joint midpoint. shoulder_2/wrist_2 may start "
+        "at 0 but must swing outboard — the robot base is inboard. "
         "Incompatible with --pose-by-hand (the probe runs at the hand-set "
         "pose).",
     )
