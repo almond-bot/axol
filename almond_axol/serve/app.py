@@ -325,9 +325,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- host power ----------------------------------------------------------
 
-    @app.post("/api/host/shutdown")
-    async def host_shutdown() -> JSONResponse:
-        """Power off the serve host (``shutdown -h now``).
+    async def _host_power(flag: str, verb: str) -> JSONResponse:
+        """Run ``shutdown <flag> now`` on the serve host.
 
         Refused while an operation or session is running — cutting power mid-
         run would drop the arms. The hosted install runs as root; a dev serve
@@ -340,8 +339,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
 
-        def _halt() -> tuple[bool, str]:
-            cmd = ["shutdown", "-h", "now"]
+        def _run() -> tuple[bool, str]:
+            cmd = ["shutdown", flag, "now"]
             if os.geteuid() != 0:
                 if not prime_sudo():
                     return False, "root required (no passwordless sudo)"
@@ -349,13 +348,23 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             proc = subprocess.run(cmd, capture_output=True, text=True)
             return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
-        ok, detail = await asyncio.to_thread(_halt)
+        ok, detail = await asyncio.to_thread(_run)
         if not ok:
             return JSONResponse(
-                {"error": f"shutdown failed: {detail or 'unknown error'}"},
+                {"error": f"{verb} failed: {detail or 'unknown error'}"},
                 status_code=500,
             )
         return JSONResponse({"ok": True})
+
+    @app.post("/api/host/shutdown")
+    async def host_shutdown() -> JSONResponse:
+        """Power off the serve host (``shutdown -h now``)."""
+        return await _host_power("-h", "shutdown")
+
+    @app.post("/api/host/restart")
+    async def host_restart() -> JSONResponse:
+        """Reboot the serve host (``shutdown -r now``)."""
+        return await _host_power("-r", "restart")
 
     # -- robot connection (detached CAN + 1 Hz motor ping) ------------------
 

@@ -41,7 +41,15 @@ The top of the panel is a pair of tiles — **Axol Host** and **Axol** — each 
 
 ### Axol Host
 
-The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed); if the host can't be reached the attempt gives up after a couple of seconds with a *can't reach the host* message instead of leaving the tile stuck on *Connecting…*. When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot. Pressing the power button disconnects **this browser only** — a client-side drop that leaves the server, the robot link, and any running operation untouched, so another operator driving the same host isn't affected. Teleop and gravity comp need only this connection.
+The **Axol Host** is the machine running `axol serve` — the computer wired to the robot, with the ZED cameras attached. Press **Connect** on the tile to open the host dialog and enter its address (just the IP — port `8001` is assumed); if the host can't be reached the attempt gives up after a couple of seconds with a *can't reach the host* message instead of leaving the tile stuck on *Connecting…*. When connected, the tile shows the host's name, its installed release version (e.g. `axol v0.1.2`), and a green dot. Teleop and gravity comp need only this connection.
+
+A connected tile carries three buttons:
+
+- **Restart** reboots the robot host (`shutdown -r now`) behind a confirmation dialog. The panel loses its connection while the host reboots — reconnect once it's back up, typically under a minute.
+- **Shut down** powers the host off (`shutdown -h now`), also behind a confirmation. Turning the robot back on requires physical access to it.
+- **Disconnect** (the unplug button) drops **this browser only** — a client-side disconnect that leaves the server, the robot link, and any running operation untouched, so another operator driving the same host isn't affected.
+
+Restart and shut down are **refused while any operation or session is running** — cutting power mid-run would drop the arms — so stop what's in flight first; the confirm button stays disabled until the host is idle. (The one-command install runs as root and powers off directly; a development `axol serve` escalates with `sudo -n`, so a host with no passwordless sudo reports that it couldn't and stays up.)
 
 #### Updates
 

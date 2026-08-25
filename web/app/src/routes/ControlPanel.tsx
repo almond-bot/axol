@@ -804,6 +804,7 @@ export default function ControlPanel() {
           version={update?.version ?? hostInfo?.version ?? null}
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
+          opRunning={isLive}
           robot={robot}
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}
