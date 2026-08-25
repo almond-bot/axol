@@ -1,7 +1,18 @@
 import { useMemo, useRef, useState } from "react"
-import { ChevronDown, Download, Loader2, Plug, RotateCcw, Search, Upload } from "lucide-react"
+import {
+  ChevronDown,
+  Download,
+  Eye,
+  EyeOff,
+  Loader2,
+  Plug,
+  RotateCcw,
+  Search,
+  Upload,
+} from "lucide-react"
 import {
   flattenFields,
+  setQuestProximityDisabled,
   type AdvancedSection,
   type CameraDevice,
   type CameraSpec,
@@ -371,7 +382,9 @@ function UpdateRequired({ error }: { error: string }) {
   )
 }
 
-/** The Quest-over-USB pose link: live status + connect, from the old tile. */
+/** The Quest-over-USB pose link: live status + connect, from the old tile —
+ * plus the headless "keep awake" proximity-sensor override over the same
+ * cable, so nobody has to type adb commands. */
 function UsbPanel({
   usb,
   usbBusy,
@@ -381,6 +394,27 @@ function UsbPanel({
   usbBusy: boolean
   onUsbConnect: () => void
 }) {
+  const toast = useToast()
+  // Which proximity action is in flight ("off" = disabling the sensor).
+  const [proxBusy, setProxBusy] = useState<"off" | "on" | null>(null)
+  const setProximity = async (disabled: boolean) => {
+    setProxBusy(disabled ? "off" : "on")
+    try {
+      await setQuestProximityDisabled(disabled)
+      toast.success(
+        disabled
+          ? "Proximity sensor disabled — the headset stays awake until it reboots."
+          : "Proximity sensor restored."
+      )
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setProxBusy(null)
+    }
+  }
+  // The broadcast needs an attached, authorized headset — same bar as the
+  // pose tunnel's Connect.
+  const proxReady = usb?.state === "device"
   const dotClass = !usb
     ? "bg-white/30"
     : !usb.installed
@@ -441,6 +475,38 @@ function UsbPanel({
           </Button>
         </div>
         <p className="max-w-prose text-xs text-white/35">{hint}</p>
+      </div>
+      <div className="flex max-w-xl flex-col gap-1.5">
+        <div className="flex items-center justify-between gap-4">
+          <Label>Keep awake (headless)</Label>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setProximity(true)}
+              disabled={!proxReady || proxBusy != null}
+              title="Disable the proximity sensor (adb) so the headset stays awake with nobody wearing it."
+            >
+              {proxBusy === "off" ? <Loader2 className="animate-spin" /> : <EyeOff />}
+              Keep awake
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setProximity(false)}
+              disabled={!proxReady || proxBusy != null}
+              title="Restore normal proximity-sensor behavior (the headset sleeps when taken off)."
+            >
+              {proxBusy === "on" ? <Loader2 className="animate-spin" /> : <Eye />}
+              Restore
+            </Button>
+          </div>
+        </div>
+        <p className="max-w-prose text-xs text-white/35">
+          Disables the headset's proximity sensor so it keeps running when set down — for sessions
+          driven from this panel with nobody wearing it. Resets when the headset reboots; battery
+          drains at full rate, so keep it charging. Needs the headset plugged in and authorized.
+        </p>
       </div>
     </div>
   )

@@ -1,8 +1,10 @@
-import { Cpu, Loader2, Plug, Server, Power } from "lucide-react"
-import type { ReactNode } from "react"
+import { Cpu, Loader2, Plug, Power, RotateCcw, Server, Unplug } from "lucide-react"
+import { useCallback, useState, type ReactNode } from "react"
 import type { ConnState } from "@/components/setup-dialog"
-import type { MotorHealth, RobotStatus } from "@/lib/supervisor"
+import { restartHost, shutdownHost, type MotorHealth, type RobotStatus } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
+import { Card } from "@/components/ui/card"
+import { useToast } from "@/components/ui/toast"
 import { cn } from "@/lib/utils"
 
 type Dot = "ok" | "busy" | "warn" | "err" | "idle"
@@ -58,11 +60,42 @@ function Tile({
   )
 }
 
+/** The two host power actions offered on the connected Axol Host tile. */
+type PowerAction = "shutdown" | "restart"
+
+const POWER_ACTIONS: Record<
+  PowerAction,
+  { title: string; command: string; body: string; button: string; done: string }
+> = {
+  shutdown: {
+    title: "Shut down host",
+    command: "shutdown -h now",
+    body:
+      "This panel loses its connection immediately, and turning the robot " +
+      "back on requires physical access to it.",
+    button: "Shut down",
+    done: "Host is shutting down.",
+  },
+  restart: {
+    title: "Restart host",
+    command: "shutdown -r now",
+    body:
+      "This panel loses its connection while the host reboots — reconnect " +
+      "once it's back up (typically under a minute).",
+    button: "Restart",
+    done: "Host is restarting.",
+  },
+}
+
 /**
  * The two connection tiles: the Axol Host (the machine running `axol serve`)
  * and the Axol robot itself, with live per-motor health and any active motor
  * faults called out (a fault blocks every hardware operation from starting).
  * Cameras and Quest USB live in the Settings tabs below.
+ *
+ * The host tile also carries the host power controls (restart / shut down,
+ * each behind a confirmation) — the Disconnect button only drops this
+ * browser's view and never touches the machine.
  */
 export function ConnectionsBar({
   conn,
@@ -71,6 +104,7 @@ export function ConnectionsBar({
   version,
   onOpenSetup,
   onHostDisconnect,
+  opRunning = false,
   robot,
   robotBusy,
   onRobotConnect,
@@ -83,12 +117,36 @@ export function ConnectionsBar({
   version?: string | null
   onOpenSetup: () => void
   onHostDisconnect: () => void
+  /** An operation or session is in flight — the server would refuse a power
+   *  action (409), so the confirm button is disabled with an explanation. */
+  opRunning?: boolean
   robot: RobotStatus | null
   robotBusy: boolean
   onRobotConnect: () => void
   onRobotDisconnect: () => void
 }) {
+  const toast = useToast()
   const online = conn === "ok"
+
+  // Host power (shutdown -h/-r now), behind a confirmation dialog. The server
+  // refuses while an operation or session is running.
+  const [powerOpen, setPowerOpen] = useState<PowerAction | null>(null)
+  const [powerBusy, setPowerBusy] = useState(false)
+  const confirmPower = useCallback(
+    async (action: PowerAction) => {
+      setPowerBusy(true)
+      try {
+        await (action === "shutdown" ? shutdownHost() : restartHost())
+        setPowerOpen(null)
+        toast.success(POWER_ACTIONS[action].done)
+      } catch (e) {
+        toast.error(String(e))
+      } finally {
+        setPowerBusy(false)
+      }
+    },
+    [toast]
+  )
 
   // -- axol host --
   const wsDot: Dot =
@@ -145,15 +203,38 @@ export function ConnectionsBar({
         }
       >
         {online ? (
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={onHostDisconnect}
-            aria-label="Disconnect Axol Host"
-            className="size-8"
-          >
-            <Power />
-          </Button>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => setPowerOpen("restart")}
+              aria-label="Restart host"
+              title="Reboot the robot host (shutdown -r now)."
+              className="size-8"
+            >
+              <RotateCcw />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => setPowerOpen("shutdown")}
+              aria-label="Shut down host"
+              title="Power off the robot host (shutdown -h now)."
+              className="size-8 text-red-300 hover:bg-red-400/10"
+            >
+              <Power />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={onHostDisconnect}
+              aria-label="Disconnect Axol Host"
+              title="Disconnect this panel from the host. The host keeps running."
+              className="size-8"
+            >
+              <Unplug />
+            </Button>
+          </div>
         ) : (
           <Button variant="outline" size="sm" onClick={onOpenSetup}>
             <Plug />
@@ -181,9 +262,10 @@ export function ConnectionsBar({
             onClick={onRobotDisconnect}
             disabled={robotBusy}
             aria-label="Disconnect Axol"
+            title="Release the robot link (CAN). The robot stays powered."
             className="size-8"
           >
-            <Power />
+            <Unplug />
           </Button>
         ) : (
           <Button
@@ -197,6 +279,55 @@ export function ConnectionsBar({
           </Button>
         )}
       </Tile>
+
+      {/* Host power confirmation (shutdown / restart) */}
+      {powerOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setPowerOpen(null)}
+        >
+          <Card
+            className="w-full max-w-sm gap-4 bg-[#1a1a1a] p-5"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex flex-col gap-1">
+              <h3 className="font-heading text-base font-semibold">
+                {POWER_ACTIONS[powerOpen].title}
+              </h3>
+              <p className="text-sm leading-relaxed text-white/45">
+                {powerOpen === "shutdown" ? "Power off" : "Reboot"} the robot host (
+                <span className="font-mono">{POWER_ACTIONS[powerOpen].command}</span>).{" "}
+                {POWER_ACTIONS[powerOpen].body}
+              </p>
+            </div>
+            {opRunning && (
+              <p className="text-xs text-amber-200/70">
+                A run or operation is in flight — stop it first.
+              </p>
+            )}
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <Button variant="ghost" size="sm" onClick={() => setPowerOpen(null)}>
+                Cancel
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => confirmPower(powerOpen)}
+                disabled={powerBusy || opRunning}
+              >
+                {powerBusy ? (
+                  <Loader2 className="animate-spin" />
+                ) : powerOpen === "shutdown" ? (
+                  <Power />
+                ) : (
+                  <RotateCcw />
+                )}{" "}
+                {POWER_ACTIONS[powerOpen].button}
+              </Button>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   )
 }

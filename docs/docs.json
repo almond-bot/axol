@@ -46,7 +46,8 @@
           "guides/control-panel",
           "guides/diagnostics-dashboard",
           "guides/vr-interface",
-          "guides/quest-over-usb"
+          "guides/quest-over-usb",
+          "guides/quest-headless"
         ]
       },
       {

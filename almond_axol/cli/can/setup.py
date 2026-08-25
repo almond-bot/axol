@@ -204,15 +204,20 @@ def _resolve_hub_serial() -> str | None:
     """Pick the hub serial without prompting (for headless ``ensure_setup``).
 
     A previously configured serial (named ``can_alm_axol_*`` interfaces, or
-    the pinned serial in the udev rules) wins while that adapter is attached,
-    so re-running setup on an already-configured host works no matter how many
-    other candlelight adapters are present — and it is kept when no hub is
-    attached at all, so an unplugged hub's rules stay valid. A configured but
-    *absent* serial with exactly one live hub candidate means the adapter was
-    replaced (or a different Axol was plugged into this host): the live hub
-    wins and gets re-pinned. Several live candidates with no attached
-    configured serial still need the interactive ``axol can.setup`` flow to
-    disambiguate; None means no hub anywhere (the hub is optional).
+    the pinned serial in the udev rules) wins while its adapter is attached —
+    or while no dual-channel candidate is attached at all (an unplugged hub
+    keeps its pin for whenever it returns) — so re-running setup on an
+    already-configured host works no matter how many other candlelight
+    adapters are attached.
+
+    A configured serial that is *absent* while a different hub is attached is
+    stale — this host last ran on another Axol, or the hub was replaced — and
+    must not win: preferring it would re-pin the missing adapter and leave the
+    attached hub unnamed on ``canX``, which is exactly what the control
+    panel's Connect used to trip over. The attached hub is registered instead
+    (when it's unambiguous), matching what the interactive ``axol can.setup``
+    picks in the same situation. Several attached candidates still raise,
+    since that needs the interactive flow to disambiguate.
     """
     configured = _configured_serial()
     attached = _detect_serials()

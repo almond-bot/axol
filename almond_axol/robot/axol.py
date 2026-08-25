@@ -198,7 +198,9 @@ def end_stop_offset_from_position(joint: Joint, motor_pos: float) -> float:
 
     Raises:
         MotorError: If the reading is too close to 0 (parked at the
-            calibration stop — ambiguous) or outside the joint's physical
+            calibration stop — ambiguous), too close to the far stop (a
+            single-turn boot reading past ±180° wraps by 360° and mimics the
+            other side — also ambiguous), or outside the joint's physical
             travel (the encoder zero is not at either stop; re-zero).
     """
     if joint not in EITHER_STOP_JOINTS:
@@ -218,23 +220,46 @@ def end_stop_offset_from_position(joint: Joint, motor_pos: float) -> float:
             f"frame — outside its physical travel, so its encoder zero is not "
             f"at an end stop. Re-run `axol motor.set-zero-pos --guided`."
         )
+    # These joints span exactly 180° of travel, and after a power cycle the
+    # single-turn encoder re-reads position within ±180° of zero — so a
+    # joint pressed slightly PAST the far stop wraps by 360° and reads like a
+    # small excursion past the OPPOSITE stop, flipping the detected side.
+    # Readings within the stop-placement slack of the far stop are therefore
+    # genuinely ambiguous and must not be trusted.
+    if abs(motor_pos) > travel - _STOP_SIDE_RANGE_SLACK_RAD:
+        raise MotorError(
+            f"Cannot tell which end stop {joint.name} was zeroed at: the "
+            f"joint is at/near the far end stop (motor frame "
+            f"{math.degrees(motor_pos):+.1f}°), where a reading can also be "
+            f"a 360° single-turn wrap from just past the opposite stop. Move "
+            f"it away from the end stops and retry."
+        )
     return hi if motor_pos < 0 else lo
 
 
-def check_fixed_stop_position(joint: Joint, is_left: bool, motor_pos: float) -> None:
-    """Raise unless a fixed-stop joint's reading is plausible for a set zero.
+def fixed_stop_wrap_correction(joint: Joint, is_left: bool, motor_pos: float) -> float:
+    """Return the ±2π unwrap a fixed-stop joint's reading needs (0.0 if none).
 
     Joints outside :data:`EITHER_STOP_JOINTS` are always zeroed at
     :func:`closer_end_stop`, so the encoder zero coincides with that stop and
-    every reachable motor-frame reading lies between the two stops:
-    ``lo - offset`` to ``hi - offset`` (one of which is 0).  A reading outside
-    that band (plus stop-placement slack) means the encoder zero is not at
-    the calibration stop — it was never set, or is stale — and every
-    joint-frame value derived from it would be garbage.
+    every reachable motor-frame position lies between the two stops:
+    ``lo - offset`` to ``hi - offset`` (one of which is 0).
+
+    Both motor families track multi-turn position only in RAM; the persistent
+    zero lives in a single-turn absolute encoder on the output shaft.  After a
+    power cycle — or a MyActuator 0x76 reset, issued by ``set_control_mode``
+    and ``set_zero_position`` — the position is re-read within ±180° of the
+    stored zero, so a joint parked more than 180° from its calibration stop
+    comes back reading exactly 360° off.  Every fixed-stop joint's travel plus
+    slack is under 360° (the widest is 270° + 2·15°), so at most one of
+    ``{reading, reading ± 360°}`` lands in the expected band: that candidate
+    is the true position, and the returned correction folds into the joint's
+    motor→joint offset (``joint = motor + offset + correction``; commands
+    apply the inverse) so the wrapped motor frame is handled transparently.
 
     The check is necessarily one-sided: an unset zero that happens to land
-    inside the band cannot be told apart from a valid calibration by a
-    position read alone.
+    inside the band (directly or after unwrapping) cannot be told apart from
+    a valid calibration by a position read alone.
 
     Args:
         joint:     Joint to check; must not be in :data:`EITHER_STOP_JOINTS`
@@ -242,27 +267,32 @@ def check_fixed_stop_position(joint: Joint, is_left: bool, motor_pos: float) -> 
         is_left:   Which arm the joint is on (limits are mirrored).
         motor_pos: Current motor-frame position (rad).
 
+    Returns:
+        The wrap correction in radians: ``0.0``, ``+2π``, or ``-2π``.
+
     Raises:
-        MotorError: If the reading is outside the joint's physical travel
-            measured from its calibration end stop.
+        MotorError: If neither the reading nor a ±360° unwrap of it falls
+            inside the joint's physical travel measured from its calibration
+            end stop — the zero was never set, or is stale.
     """
     if joint in EITHER_STOP_JOINTS or joint == Joint.GRIPPER:
         raise ValueError(f"{joint} is not zeroed at a fixed end stop")
     offset, _ = closer_end_stop(joint, is_left)
     lo, hi = arm_limits(joint, is_left)
-    if not (
-        lo - offset - _STOP_SIDE_RANGE_SLACK_RAD
-        <= motor_pos
-        <= hi - offset + _STOP_SIDE_RANGE_SLACK_RAD
-    ):
-        raise MotorError(
-            f"{joint.name} reads {math.degrees(motor_pos):+.1f}° in the motor "
-            f"frame — outside the [{math.degrees(lo - offset):+.1f}°, "
-            f"{math.degrees(hi - offset):+.1f}°] band expected when its "
-            f"encoder zero is at the calibration end stop, so the zero has "
-            f"not been set (or is stale). "
-            f"Re-run `axol motor.set-zero-pos --guided`."
-        )
+    band_lo = lo - offset - _STOP_SIDE_RANGE_SLACK_RAD
+    band_hi = hi - offset + _STOP_SIDE_RANGE_SLACK_RAD
+    for correction in (0.0, math.tau, -math.tau):
+        if band_lo <= motor_pos + correction <= band_hi:
+            return correction
+    raise MotorError(
+        f"{joint.name} reads {math.degrees(motor_pos):+.1f}° in the motor "
+        f"frame — neither it nor a ±360° single-turn wrap of it falls in "
+        f"the [{math.degrees(lo - offset):+.1f}°, "
+        f"{math.degrees(hi - offset):+.1f}°] band expected when its "
+        f"encoder zero is at the calibration end stop, so the zero has "
+        f"not been set (or is stale). "
+        f"Re-run `axol motor.set-zero-pos --guided`."
+    )
 
 
 def closer_end_stop(joint: Joint, is_left: bool) -> tuple[float, int]:
@@ -473,9 +503,12 @@ class AxolArm:
         # joints are always zeroed at closer_end_stop(); EITHER_STOP_JOINTS
         # (wrist_2/wrist_3) may be zeroed at either stop, so their offsets
         # start as NaN and are detected from the first encoder reading by
-        # resolve_joint_offsets().  The gripper offset is 0 because the
-        # gripper uses its own [0, 1] normalisation and is calibrated against
-        # torque, not an end stop.
+        # resolve_joint_offsets().  Fixed-stop offsets may additionally gain
+        # a ±2π term when the motor booted with a single-turn wrap (parked
+        # >180° from zero at power-up/reset — see
+        # fixed_stop_wrap_correction), applied during zero verification.
+        # The gripper offset is 0 because the gripper uses its own [0, 1]
+        # normalisation and is calibrated against torque, not an end stop.
         self._joint_offsets = np.array(
             [
                 0.0
@@ -491,7 +524,8 @@ class AxolArm:
         # Fixed-stop joints whose encoder zero has not been sanity-checked
         # yet.  resolve_joint_offsets() verifies each one's reading is
         # plausible for a zero at its calibration stop (an unset zero would
-        # make every joint-frame value garbage) and removes it from the set.
+        # make every joint-frame value garbage), folds any ±360° single-turn
+        # boot wrap into the joint's offset, and removes it from the set.
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
 
@@ -520,9 +554,11 @@ class AxolArm:
           sign of the reading (see :func:`end_stop_offset_from_position`),
           which also rejects readings outside the joint's physical travel.
         - Every other arm joint: verify the reading is plausible for an
-          encoder zero at the calibration stop
-          (:func:`check_fixed_stop_position`) — an unset zero would make
-          every joint-frame value garbage, so it must fail bring-up.
+          encoder zero at the calibration stop and detect a ±360°
+          single-turn boot wrap (:func:`fixed_stop_wrap_correction`) — the
+          wrap is folded into the joint's offset so positions and commands
+          stay correct, while an unset zero (nothing lands in the band)
+          fails bring-up.
 
         Idempotent and near-free once resolved/verified, so every ``AxolArm``
         entry point that uses joint-frame values calls it; diagnostics that
@@ -569,8 +605,20 @@ class AxolArm:
                     offset,
                 )
             for joint in pending_verify:
-                await self._verify_fixed_stop_zero(joint, side)
+                correction = await self._verify_fixed_stop_zero(joint, side)
+                self._joint_offsets[joint_index[joint]] = (
+                    closer_end_stop(joint, self._is_left)[0] + correction
+                )
                 self._unverified_zeros.discard(joint)
+                if correction:
+                    _logger.warning(
+                        "%s %s reads 360° off its zero (single-turn encoder "
+                        "wrap after a power cycle/reset) — compensating with "
+                        "a %+.0f° offset",
+                        side,
+                        joint.name,
+                        math.degrees(correction),
+                    )
 
     async def _read_motor_position(self, joint: Joint, use_cache: bool) -> float:
         """Read one joint's motor-frame position, telemetry-aware.
@@ -617,12 +665,14 @@ class AxolArm:
                 last_exc = exc
         raise MotorError(f"{side} arm: {last_exc}") from last_exc
 
-    async def _verify_fixed_stop_zero(self, joint: Joint, side: str) -> None:
-        """Reject one fixed-stop joint whose reading implies an unset zero.
+    async def _verify_fixed_stop_zero(self, joint: Joint, side: str) -> float:
+        """Verify one fixed-stop joint's zero; return its ±2π wrap correction.
 
-        Same retry rationale as :meth:`_detect_stop_side`: the check is a
-        one-shot gate at bring-up, and a single poisoned frame must not fail
-        the whole enable when a fresh read settles it.
+        Rejects a joint whose reading implies an unset zero (see
+        :func:`fixed_stop_wrap_correction`).  Same retry rationale as
+        :meth:`_detect_stop_side`: the check is a one-shot gate at bring-up,
+        and a single poisoned frame must not fail the whole enable when a
+        fresh read settles it.
         """
         last_exc: MotorError | None = None
         for attempt in range(2):
@@ -636,8 +686,7 @@ class AxolArm:
                     f"encoder zero: {exc}"
                 ) from exc
             try:
-                check_fixed_stop_position(joint, self._is_left, pos)
-                return
+                return fixed_stop_wrap_correction(joint, self._is_left, pos)
             except MotorError as exc:
                 last_exc = exc
         raise MotorError(f"{side} arm: {last_exc}") from last_exc
@@ -835,6 +884,19 @@ class AxolArm:
             *[self.motors[j].set_control_mode(ControlMode.IMPEDANCE) for j in cold]
         )
 
+        # The mode switch reboots MyActuator motors, which re-derive their
+        # multi-turn position from the single-turn absolute encoder (within
+        # ±180° of zero) — a joint parked past 180° from its calibration stop
+        # comes back reading 360° off, invalidating the wrap correction
+        # detected by the resolve above.  Re-verify the freshly brought-up
+        # fixed-stop joints against the post-reset frame.  (Either-stop
+        # joints are Damiao, whose mode switch is a register write — no
+        # reboot, no re-detection needed.)
+        recheck = set(cold) & (set(ARM_JOINTS) - EITHER_STOP_JOINTS)
+        if recheck:
+            self._unverified_zeros |= recheck
+            await self.resolve_joint_offsets(recheck)
+
         if self._has_gripper:
             if Joint.GRIPPER in held:
                 await self._restore_gripper_calibration()
@@ -906,6 +968,12 @@ class AxolArm:
             mode: Desired control mode.
         """
         await asyncio.gather(*[m.set_control_mode(mode) for m in self.motors.values()])
+        # The reboot re-derives each MyActuator's multi-turn position from
+        # its single-turn absolute encoder (within ±180° of zero), so any
+        # ±360° wrap correction detected earlier may be stale.  Mark the
+        # fixed-stop joints (all MyActuator) for re-verification; the next
+        # joint-frame entry point resolves them.
+        self._unverified_zeros |= set(ARM_JOINTS) - EITHER_STOP_JOINTS
 
     # ------------------------------------------------------------------ #
     # Getters                                                              #

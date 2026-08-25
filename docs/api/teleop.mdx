@@ -65,5 +65,5 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 | `rest_pose_left` / `rest_pose_right` | near-zero | Reset target for each arm, shape `(7,)` in `ARM_JOINTS` order |
 
 <Note>
-  **Engage toggle behaviour.** Grip is a toggle, not a hold. Press both grip buttons together to enable arm movement; press either grip alone to freeze the arms. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.
+  **Engage behaviour.** From rest, both grip buttons together engage both arms. Once engaged, each grip acts **per arm** — a click toggles that arm between tracking and frozen (a frozen arm holds its pose and grasp while the other keeps tracking). Set `hold_to_engage` for a dead-man scheme instead: hold both grips to start, release one to freeze that arm, hold on to keep it going. A rising edge on the reset button triggers a collision-aware trajectory back to the rest pose.
 </Note>

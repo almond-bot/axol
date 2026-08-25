@@ -30,7 +30,14 @@ _logger = logging.getLogger(__name__)
 
 # ``VR_PORT`` (the port we forward the headset's loopback copy of) is owned by
 # ``utils.ports`` so the tunnel target and the VR server's bind can't drift.
-__all__ = ["VR_PORT", "AdbStatus", "install", "status", "connect"]
+__all__ = [
+    "VR_PORT",
+    "AdbStatus",
+    "install",
+    "status",
+    "connect",
+    "set_proximity_disabled",
+]
 
 # Meta/Oculus USB vendor id. The udev rule lets a non-root user open the
 # headset for interactive ``adb`` (the root ``axol serve`` process opens it
@@ -224,6 +231,33 @@ def status(port: int = VR_PORT) -> AdbStatus:
         state=state,
         reverse_active=_reverse_active(port),
     )
+
+
+# The headset's power manager listens for these broadcasts (Meta's scriptable
+# testing services): ``prox_close`` fakes a continuously-covered proximity
+# sensor so the headset stays awake with nobody wearing it; ``automation_
+# disable`` restores normal sensor behavior. The override holds until it's
+# restored or the headset reboots.
+_PROX_DISABLE_ACTION = "com.oculus.vrpowermanager.prox_close"
+_PROX_RESTORE_ACTION = "com.oculus.vrpowermanager.automation_disable"
+
+
+def set_proximity_disabled(disabled: bool) -> tuple[bool, str | None]:
+    """Disable or restore the headset's proximity sensor over adb.
+
+    Disabling keeps the headset awake without being worn (headless teleop /
+    data-collection sessions driven from the control panel). Returns
+    ``(ok, error)`` — a broadcast needs an attached, authorized headset, so
+    the error passes adb's own complaint through for the panel to surface.
+    """
+    action = _PROX_DISABLE_ACTION if disabled else _PROX_RESTORE_ACTION
+    proc = _run(["shell", "am", "broadcast", "-a", action])
+    if proc is None:
+        return False, "adb is not installed on the host"
+    if proc.returncode != 0 or "Broadcast completed" not in proc.stdout:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        return False, detail[-1].strip() if detail else "adb broadcast failed"
+    return True, None
 
 
 def connect(port: int = VR_PORT) -> AdbStatus:

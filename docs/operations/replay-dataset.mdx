@@ -8,13 +8,17 @@ Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight
 No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.
 
 <Warning>
-  Replay drives the arms **open-loop** from the recorded actions — it does not watch the scene. Make sure the workspace is clear and roughly matches what the episode was recorded in before starting, and keep **Stop** (or `Ctrl+C`) within reach. Match the stiffness used at collection time so the arm tracks the same way it did when recorded.
+  Replay drives the arms **open-loop** from the recorded actions — it does not watch the scene (though an opt-in contact stop, below, can halt playback if a joint pushes hard against something unexpected). Make sure the workspace is clear and roughly matches what the episode was recorded in before starting, and keep **Stop** (or `Ctrl+C`) within reach. Match the stiffness used at collection time so the arm tracks the same way it did when recorded.
 </Warning>
+
+<Note>
+  **Contact stop (opt-in).** Off by default. Set the **Teleop contact stop** in the control panel's Robot settings (`--teleop_torque_threshold` on the CLI; the panel suggests `16` Nm) and a sustained torque past the threshold **stops playback** and drops the arms into a limp gravity-comp hold until you stop the run — replay has no interactive retry. The between-takes return to rest is always guarded separately.
+</Note>
 
 ## Before you start
 
 - **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
-- **A recorded dataset** to replay — either local under `--root` (`$HF_LEROBOT_HOME` by default) or pullable from the HuggingFace Hub by its `repo_id`. See [Data Collection](/operations/data-collection) to record one.
+- **A recorded dataset** to replay — a local one under `--root` (`$HF_LEROBOT_HOME` by default), a **filesystem path** to a dataset directory anywhere on disk, or one pullable from the HuggingFace Hub by its `repo_id`. See [Data Collection](/operations/data-collection) to record one.
 
 ## Run it
 
@@ -26,7 +30,7 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
       </Step>
 
       <Step title="Select Replay Dataset and fill the fields">
-        Pick **Replay Dataset**. Set the dataset **repo&nbsp;id** (e.g. `myorg/pick-place`), the **episode** index (0-indexed), the **loop** toggle, and optionally **interpolate** (smooths playback by upsampling the recorded actions to ~120&nbsp;Hz commands; timing is unchanged) — the per-run inputs. Playback fps and stiffness live in the [Settings](/guides/control-panel#settings) tabs.
+        Pick **Replay Dataset**. Set the dataset **repo&nbsp;id** — pick one from the dropdown of datasets found on the host (each shown with its episode count), or type a repo id or a filesystem path — the **episode** index (0-indexed), the **loop** toggle, and optionally **interpolate** (smooths playback by upsampling the recorded actions to ~120&nbsp;Hz commands; timing is unchanged) — the per-run inputs. Playback fps and stiffness live in the [Settings](/guides/control-panel#settings) tabs.
       </Step>
 
       <Step title="Start">
@@ -43,7 +47,7 @@ No VR, cameras, or policy server are involved — replay only drives the arms, s
     axol replay-dataset --repo_id myorg/pick-place --episode 0 --loop true   # loop until Ctrl+C
     ```
 
-    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. Press `Ctrl+C` to stop — the arm returns to rest before exiting. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
+    `--fps 0` (default) replays at the dataset's recorded fps, reproducing the original timing; set a positive value to override it. Match the stiffness used at collection time with `--robot_config.axol_config.left_stiffness` / `right_stiffness` so the arm tracks the recorded actions the same way. `--repo_id` also accepts a filesystem path to a dataset directory, and lists the datasets it can find if the one you name isn't there. Press `Ctrl+C` to stop — the arm returns to rest before exiting. See [`replay-dataset`](/cli/replay-dataset) for the full field list and [Command configuration](/cli/configuration) for the override syntax.
   </Tab>
 </Tabs>
 
