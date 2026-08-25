@@ -57,6 +57,8 @@ export interface CommandSpec {
   robotFreeFlags?: string[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
+  /** Diagnostics-dashboard grouping: "helper" | "test" | "tuning". */
+  section?: string | null
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */

@@ -25,7 +25,7 @@ import {
   type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
-import { TuningPanel } from "@/components/diagnostics/tuning-panel"
+import { TuningWorkbench } from "@/components/diagnostics/tuning-workbench"
 import {
   TelemetryChart,
   type ChartSeries,
@@ -416,6 +416,17 @@ export default function Diagnostics() {
   const diagCommands = useMemo(
     () => commands.filter((c) => c.category === "Diagnostics"),
     [commands]
+  )
+  // The Diagnostics category splits into three dashboard sections. A host
+  // that predates the section field sends none — everything then lands under
+  // Tests, which matches the old single-section layout.
+  const testCommands = useMemo(
+    () => diagCommands.filter((c) => (c.section ?? "test") === "test"),
+    [diagCommands]
+  )
+  const helperCommands = useMemo(
+    () => diagCommands.filter((c) => c.section === "helper"),
+    [diagCommands]
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
@@ -828,25 +839,53 @@ export default function Diagnostics() {
           </div>
         </section>
 
-        {/* Diagnostics actions */}
-        <section className="flex flex-col gap-3">
-          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
-          <DiagnosticActions
-            commands={diagCommands}
-            activeCommand={activeRun?.command ?? null}
-            activeSince={activeRun?.session.startedAt ?? null}
-            busy={launchBusy}
-            disabled={!serverOk || busyElsewhere}
-            hiddenKeys={configHiddenKeys}
-            pickerJoints={joints}
-            onLaunch={launch}
-            onStop={stopActive}
-          />
-        </section>
+        {/* Tests: pass/fail checks (ROM soaks, camera cable). */}
+        {testCommands.length > 0 && (
+          <section className="flex flex-col gap-3">
+            <h2 className="font-heading text-base font-semibold">Tests</h2>
+            <DiagnosticActions
+              commands={testCommands}
+              activeCommand={activeRun?.command ?? null}
+              activeSince={activeRun?.session.startedAt ?? null}
+              busy={launchBusy}
+              disabled={!serverOk || busyElsewhere}
+              hiddenKeys={configHiddenKeys}
+              pickerJoints={joints}
+              onLaunch={launch}
+              onStop={stopActive}
+            />
+          </section>
+        )}
 
-        {/* Tuning runs: saved sine/step/motion/offline experiments with
-            scorecards, charts, and A/B compare. */}
-        <TuningPanel enabled={serverOk} />
+        {/* Helpers: utility moves (lift homing / height). */}
+        {helperCommands.length > 0 && (
+          <section className="flex flex-col gap-3">
+            <h2 className="font-heading text-base font-semibold">Helpers</h2>
+            <DiagnosticActions
+              commands={helperCommands}
+              activeCommand={activeRun?.command ?? null}
+              activeSince={activeRun?.session.startedAt ?? null}
+              busy={launchBusy}
+              disabled={!serverOk || busyElsewhere}
+              hiddenKeys={configHiddenKeys}
+              pickerJoints={joints}
+              onLaunch={launch}
+              onStop={stopActive}
+            />
+          </section>
+        )}
+
+        {/* Tuning workbench: inline sine/step/motion/analysis launches with
+            the resulting graphs, scorecards, and A/B compare in place. */}
+        <TuningWorkbench
+          enabled={serverOk}
+          commands={commands}
+          activeCommand={activeRun?.command ?? null}
+          busy={launchBusy}
+          disabled={busyElsewhere}
+          onLaunch={launch}
+          onStop={stopActive}
+        />
 
         {/* Run history */}
         <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />

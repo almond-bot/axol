@@ -84,6 +84,7 @@ class CommandDef:
         per_run_fields: tuple[str, ...] = (),
         settings_like: str | None = None,
         module: str = "almond_axol",
+        section: str | None = None,
     ) -> None:
         self.id = id
         self.cli = cli
@@ -148,6 +149,10 @@ class CommandDef:
         # ``python -m <module>`` target for the subprocess path, so a command
         # registered by a downstream package runs out of that package's CLI.
         self.module = module
+        # Dashboard grouping within the Diagnostics category:
+        # "helper" (utility moves like the lift), "test" (pass/fail checks
+        # like the ROM soak), or "tuning" (the tuning workbench's suites).
+        self.section = section
         self._loader = loader
 
     @property
@@ -401,6 +406,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.enable"),
         requires_hardware=True,
         drives_motors=True,
+        section="test",
     ),
     "diag.rom-disable": CommandDef(
         "diag.rom-disable",
@@ -412,6 +418,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.rom.disable"),
         requires_hardware=True,
         drives_motors=True,
+        section="test",
     ),
     "diag.zed-cable": CommandDef(
         "diag.zed-cable",
@@ -424,6 +431,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..diagnostics.zed.cable"),
         requires_hardware=True,
         uses_can_bus=False,
+        section="test",
     ),
     "tune.pid": CommandDef(
         "tune.pid",
@@ -437,6 +445,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.pid"),
         requires_hardware=True,
         drives_motors=True,
+        section="tuning",
     ),
     "tune.friction": CommandDef(
         "tune.friction",
@@ -450,6 +459,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.friction"),
         requires_hardware=True,
         drives_motors=True,
+        section="tuning",
     ),
     "tune.motion": CommandDef(
         "tune.motion",
@@ -464,6 +474,7 @@ COMMANDS: dict[str, CommandDef] = {
         _argparse_loader("..cli.tune.motion"),
         requires_hardware=True,
         drives_motors=True,
+        section="tuning",
     ),
     "motion.build": CommandDef(
         "motion.build",
@@ -476,6 +487,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.motion"),
         uses_can_bus=False,
+        section="tuning",
     ),
     "diag.offline": CommandDef(
         "diag.offline",
@@ -488,6 +500,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..diagnostics.offline_suites"),
         uses_can_bus=False,
+        section="tuning",
     ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
@@ -506,6 +519,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.home"),
         requires_hardware=True,
+        section="helper",
     ),
     "lift.goto": CommandDef(
         "lift.goto",
@@ -517,6 +531,7 @@ COMMANDS: dict[str, CommandDef] = {
         "argparse",
         _argparse_loader("..cli.lift.goto"),
         requires_hardware=True,
+        section="helper",
     ),
     # -- Calibrate ----------------------------------------------------------
     "motor.set-zero-pos": CommandDef(
@@ -661,6 +676,7 @@ def command_specs() -> list[dict[str, Any]]:
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
             "usesHeadset": cmd.uses_headset,
+            "section": cmd.section,
         }
         try:
             schema = get_schema(cmd.id)

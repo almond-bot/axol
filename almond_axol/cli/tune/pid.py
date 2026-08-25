@@ -303,6 +303,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "and A/B comparison in the diagnostics UI",
     )
     p.add_argument(
+        "--label",
+        default=None,
+        help="Free-form note stored on each saved run artifact (shows up in "
+        "listings and the diagnostics UI)",
+    )
+    p.add_argument(
         "--dump-csv",
         nargs="?",
         const="__auto__",
@@ -496,6 +502,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "stiffness": args.stiffness,
                 "target_noise": args.target_noise,
             },
+            label=args.label,
             group=run_group,
         )
         print(f"  saved tuning run {run_id}")
