@@ -22,8 +22,8 @@ from __future__ import annotations
 
 import math
 
-from ...motor import ControlMode, Joint, Motor
-from ...robot.axol import (
+from ..motor import ControlMode, Joint, Motor
+from ..robot.axol import (
     EITHER_STOP_JOINTS,
     closer_end_stop,
     end_stop_offset_from_position,

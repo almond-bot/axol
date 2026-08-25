@@ -23,6 +23,7 @@ The feedforward path defaults to exactly what the production control loop applie
 | `--hold FLOAT` | [step] Hold time per phase in seconds (default: 2.0) |
 | `--rate FLOAT` | Command rate in Hz (default: 100.0) |
 | `--save` | Save the best candidate's Kp/Kd to `~/.almond/calibration.json` |
+| `--save-run` | Persist each candidate's full time series and metrics as a tuning-run artifact (`~/.almond/diagnostics/tuning/`) for charting and A/B comparison in the diagnostics UI |
 | `--dump-csv [PATH]` | Write per-sample `(kp, kd, t, target, actual, error)` rows to a CSV for offline plotting. Pass without a value to auto-name as `logs/pid_<side>_<joint>_<timestamp>.csv` |
 
 ```bash

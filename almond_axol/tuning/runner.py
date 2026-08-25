@@ -1,0 +1,376 @@
+"""Hardware tuning runners: sine / step references on a single joint.
+
+Extracted from the ``tune.pid`` CLI so the serve backend and the
+reference-motion replay share the same runners, safety geometry, and ramp
+helpers. Everything here speaks the **joint frame** (0 = rest) through
+:class:`~almond_axol.tuning.joint_frame.JointFrameMotor`.
+
+Progress lines go to stdout: these runners narrate an operator-triggered
+hardware session, and the serve session manager streams stdout to the UI.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+
+import numpy as np
+
+from ..constants import ARM_JOINTS
+from ..motor import Joint, MotorError
+from ..robot.axol import arm_limits
+from .feedforward import FeedForward
+from .joint_frame import JointFrameMotor
+
+# Default sine amplitude / step size (rad). 0.175 rad ≈ 10° — well above
+# the encoder noise floor and the ``5%`` settling threshold (≈0.5°), well
+# clear of the friction-stiction breakaway condition (``kp · amp > Fc``)
+# at all typical PID-tuning gains, and small enough to avoid hitting joint
+# limits or driving any joint into its high-velocity saturation regime.
+DEFAULT_AMP_RAD = 0.175
+RAMP_SPEED = 0.25  # rad/s
+
+# Joints whose 0 position physically collides with the robot base. ``run_step``
+# frames the test entirely in the safe (outboard) half for these, and
+# ``ramp_others_to_zero`` leaves them in place rather than commanding 0.
+BASE_COLLISION_JOINTS = frozenset({Joint.SHOULDER_2, Joint.WRIST_2})
+
+
+def safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
+    """Step direction that swings away from the robot base, or ``None`` if the
+    joint has no base-collision constraint."""
+    if joint == Joint.SHOULDER_2:
+        return -1 if is_left else 1
+    if joint == Joint.WRIST_2:
+        # mirrored across arms: the outboard (base-free) half is +π/2 on the
+        # left arm and −π/2 on the right.
+        return 1 if is_left else -1
+    return None
+
+
+def sine_center(joint: Joint, is_left: bool) -> float:
+    lo, hi = arm_limits(joint, is_left)
+    if joint == Joint.WRIST_2:
+        # wrist_2 midpoint is 0; the inboard half hits the robot base, so
+        # center at the midpoint of the outboard half (side-dependent).
+        return hi / 2.0 if is_left else lo / 2.0
+    return (lo + hi) / 2.0
+
+
+def safe_amplitude(
+    joint: Joint, is_left: bool, center: float, requested: float | None
+) -> float:
+    lo, hi = arm_limits(joint, is_left)
+    if not (lo <= center <= hi):
+        raise ValueError(
+            f"Current position {center:.4f} rad is outside [{lo:.4f}, {hi:.4f}] for {joint.value}"
+        )
+    headroom = min(center - lo, hi - center)
+    if headroom < 0.03:  # ~1.7°
+        raise ValueError(
+            f"{joint.value} center {center:.4f} rad is too close to a limit [{lo:.4f}, {hi:.4f}]. "
+            f"Sine test centers on the joint midpoint ({sine_center(joint, is_left):.4f} rad) — "
+            f"move there first, or use --mode step."
+        )
+    if requested is not None:
+        amp = min(requested, headroom)
+        if amp < requested:
+            print(
+                f"  ! requested amp {requested:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+            )
+    else:
+        amp = min(DEFAULT_AMP_RAD, headroom)
+    return amp
+
+
+async def ramp_impedance(
+    motor: JointFrameMotor,
+    kp: float,
+    kd: float,
+    target: float,
+    gravity_fn,
+    rate_hz: float = 100.0,
+    speed: float = RAMP_SPEED,
+) -> None:
+    """Ramp one impedance-mode joint to ``target`` (joint frame) at ``speed``, with gravity FF."""
+    start = await motor.get_position()
+    duration = max(abs(target - start) / speed, 0.5)
+    dt = 1.0 / rate_hz
+    t0 = time.monotonic()
+    while True:
+        t = time.monotonic() - t0
+        alpha = min(t / duration, 1.0)
+        q = start + alpha * (target - start)
+        await motor.set_impedance(q, 0.0, kp, kd, gravity_fn(q))
+        if alpha >= 1.0:
+            break
+        await asyncio.sleep(dt)
+
+
+async def ramp_others_to_zero(
+    motors: dict[Joint, JointFrameMotor],
+    exclude: Joint,
+) -> None:
+    """Send non-test joints to rest (joint-frame 0) and poll until arrival.
+
+    Joints listed in ``BASE_COLLISION_JOINTS`` are also skipped: 0 physically
+    collides with the robot base (the URDF limits don't capture this), and the
+    rest of the workflow keeps them safely outboard — ``run_step`` repositions
+    before testing, and ``run_sine`` centers them in the safe half. The user is
+    responsible for initially posing those joints outside the danger zone.
+    """
+    skip = {exclude} | BASE_COLLISION_JOINTS
+    joints = [j for j in ARM_JOINTS if j not in skip]
+    await ramp_joints_to(motors, {j: 0.0 for j in joints})
+
+
+async def ramp_joints_to(
+    motors: dict[Joint, JointFrameMotor],
+    targets: dict[Joint, float],
+) -> None:
+    """Ramp POSITION_VELOCITY-mode joints to joint-frame targets, poll until arrival."""
+    joints = list(targets)
+    if not joints:
+        return
+    pos_vals = await asyncio.gather(*[motors[j].get_position() for j in joints])
+    max_dist = max((abs(p - targets[j]) for j, p in zip(joints, pos_vals)), default=0.0)
+    await asyncio.gather(
+        *[motors[j].set_position_velocity(targets[j], RAMP_SPEED) for j in joints]
+    )
+    timeout = max_dist / RAMP_SPEED + 2.0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        await asyncio.sleep(0.1)
+        positions = await asyncio.gather(*[motors[j].get_position() for j in joints])
+        if all(abs(p - targets[j]) < 0.05 for j, p in zip(joints, positions)):
+            break
+
+
+def cached_torque(motor: JointFrameMotor) -> float:
+    """Torque cached by the last impedance response (Nm), or NaN if absent."""
+    try:
+        return motor.torque
+    except MotorError:
+        return float("nan")
+
+
+def cached_meas(motor: JointFrameMotor) -> tuple[float, float] | None:
+    """(position, frame timestamp) from the last impedance response, if any."""
+    try:
+        return motor.position, motor.feedback_ts
+    except MotorError:
+        return None
+
+
+def make_target_noise(
+    rms: float, rate_hz: float, duration: float, cutoff_hz: float = 8.0
+) -> list[float]:
+    """Band-limited reference noise emulating teleop hand-tracking jitter.
+
+    White noise through a one-pole low-pass at ``cutoff_hz`` (hand tremor +
+    IK output sits mostly below ~10 Hz), normalized to the requested RMS.
+    Fixed seed so A/B runs see the identical disturbance sequence.
+    """
+    rng = np.random.default_rng(0)
+    n = int(duration * rate_hz) + 64
+    alpha = 1.0 / (1.0 + rate_hz / (2.0 * math.pi * cutoff_hz))
+    y = np.empty(n)
+    acc = 0.0
+    for i, w in enumerate(rng.standard_normal(n)):
+        acc += alpha * (w - acc)
+        y[i] = acc
+    y -= y.mean()
+    y *= rms / max(float(np.sqrt(np.mean(y**2))), 1e-12)
+    return y.tolist()
+
+
+async def run_sine(
+    motors: dict[Joint, JointFrameMotor],
+    joint: Joint,
+    kp: float,
+    kd: float,
+    freq: float,
+    requested_amp: float | None,
+    duration: float,
+    rate_hz: float,
+    is_left: bool,
+    ff: FeedForward,
+    noise: list[float] | None = None,
+) -> tuple[list[dict], float]:
+    """Track a sine reference on ``joint`` and log target/actual error.
+
+    ``noise`` (optional, pre-generated band-limited samples) is added to
+    the commanded reference to emulate teleop hand-tracking jitter; the
+    logged target/error stay relative to the clean sine — the operator's
+    "intent" — so noise-induced motion and torque chatter show up as
+    error rather than being normalized away.
+
+    Returns the per-sample log and the amplitude actually used (clamped
+    to the joint's headroom).
+    """
+    test_motor = motors[joint]
+    lo, hi = arm_limits(joint, is_left)
+    center = sine_center(joint, is_left)
+    amp = safe_amplitude(joint, is_left, center, requested_amp)
+    print(
+        f"  limits=[{lo:.4f}, {hi:.4f}] rad  center={center:.4f} rad  "
+        f"amp=±{amp:.4f} rad  freq={freq:.2f} Hz"
+    )
+
+    print("  moving to center ...")
+    await ramp_impedance(test_motor, kp, kd, center, ff.gravity_fn, rate_hz)
+    await asyncio.sleep(1.0)
+
+    print(f"  running {duration:.1f} s at {rate_hz:.0f} Hz ...")
+    dt = 1.0 / rate_hz
+    log: list[dict] = []
+    start = time.monotonic()
+    k = 0
+
+    while True:
+        t = time.monotonic() - start
+        if t >= duration:
+            break
+        loop_start = time.monotonic()
+
+        target = center + amp * math.sin(2 * math.pi * freq * t)
+        if noise is not None:
+            target += noise[k % len(noise)]
+        k += 1
+        v_des, t_ff = ff.compute(target, cached_meas(test_motor))
+        await test_motor.set_impedance(target, v_des, kp, kd, t_ff)
+        actual = await test_motor.get_position()
+        t_read = time.monotonic() - start
+        target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
+        log.append(
+            {
+                "t": round(t_read, 5),
+                "target": target_at_read,
+                "actual": actual,
+                "error": actual - target_at_read,
+                "torque": cached_torque(test_motor),
+            }
+        )
+
+        spent = time.monotonic() - loop_start
+        if spent < dt:
+            await asyncio.sleep(dt - spent)
+
+    return log, amp
+
+
+async def run_step(
+    motors: dict[Joint, JointFrameMotor],
+    joint: Joint,
+    kp: float,
+    kd: float,
+    requested_amp: float | None,
+    hold: float,
+    rate_hz: float,
+    is_left: bool,
+    ff: FeedForward,
+    relative: bool = False,
+) -> tuple[list[dict], float]:
+    """Drive a step on ``joint`` and log the step-response error.
+
+    With ``relative=True`` the step is framed around the joint's *current*
+    position even for the base-collision joints (stepping in their outboard
+    direction) — used by ``--pose-by-hand``, where the whole point is to
+    probe at the pose the operator set, not at a canned center.
+
+    Returns the per-sample log and the amplitude actually used (clamped
+    to the joint's safe headroom).
+    """
+    test_motor = motors[joint]
+    current = await test_motor.get_position()
+    lo, hi = arm_limits(joint, is_left)
+
+    safe_dir = safe_outboard_direction(joint, is_left)
+    if safe_dir is not None and not relative:
+        # 0 physically collides with the robot base; frame the whole test in
+        # the safe half so that center *and* step_target stay outboard. amp
+        # goes from 0 → safe-limit/2 (room for a 2× swing).
+        direction = safe_dir
+        outboard_limit = lo if direction < 0 else hi
+        max_safe_amp = abs(outboard_limit) / 2.0
+        amp = min(
+            requested_amp if requested_amp is not None else DEFAULT_AMP_RAD,
+            max_safe_amp,
+        )
+        center = direction * amp
+        step_target = direction * 2.0 * amp
+        if requested_amp is not None and amp < requested_amp:
+            print(
+                f"  ! requested amp {requested_amp:.4f} rad would push past the safe half; clamped to {amp:.4f} rad"
+            )
+    else:
+        center = current
+        headroom_up = hi - center
+        headroom_down = center - lo
+        if safe_dir is not None:
+            # relative mode on a base-collision joint: only the outboard
+            # direction is safe, regardless of which side has more headroom.
+            direction = safe_dir
+            headroom = headroom_up if direction > 0 else headroom_down
+            if headroom < 0.03:
+                raise ValueError(
+                    f"{joint.value} at {center:.4f} rad has no outboard headroom "
+                    f"within [{lo:.4f}, {hi:.4f}]."
+                )
+        elif headroom_up < 0.03 and headroom_down < 0.03:
+            raise ValueError(
+                f"{joint.value} at {center:.4f} rad has no headroom within [{lo:.4f}, {hi:.4f}]."
+            )
+        elif headroom_up >= headroom_down:
+            direction, headroom = 1, headroom_up
+        else:
+            direction, headroom = -1, headroom_down
+
+        if requested_amp is not None:
+            amp = min(requested_amp, headroom)
+            if amp < requested_amp:
+                print(
+                    f"  ! requested amp {requested_amp:.4f} rad exceeds headroom; clamped to {amp:.4f} rad"
+                )
+        else:
+            amp = min(DEFAULT_AMP_RAD, headroom)
+        step_target = center + direction * amp
+
+    sign_str = f"+{amp:.4f}" if direction == 1 else f"-{amp:.4f}"
+    print(
+        f"  limits=[{lo:.4f}, {hi:.4f}] rad  center={center:.4f} rad  "
+        f"step={sign_str} rad  hold={hold:.1f} s  rate={rate_hz:.0f} Hz"
+    )
+
+    if abs(current - center) > 0.01:
+        print(f"  moving to step center ({center:.4f} rad) ...")
+        await ramp_impedance(test_motor, kp, kd, center, ff.gravity_fn, rate_hz)
+        await asyncio.sleep(0.5)
+
+    dt = 1.0 / rate_hz
+    log: list[dict] = []
+    start = time.monotonic()
+
+    for phase_target in [step_target, center]:
+        phase_start = time.monotonic()
+        while time.monotonic() - phase_start < hold:
+            loop_start = time.monotonic()
+            t = time.monotonic() - start
+            _, t_ff = ff.compute(phase_target, cached_meas(test_motor))
+            await test_motor.set_impedance(phase_target, 0.0, kp, kd, t_ff)
+            actual = await test_motor.get_position()
+            log.append(
+                {
+                    "t": round(t, 5),
+                    "target": phase_target,
+                    "actual": actual,
+                    "error": actual - phase_target,
+                    "torque": cached_torque(test_motor),
+                }
+            )
+            spent = time.monotonic() - loop_start
+            if spent < dt:
+                await asyncio.sleep(dt - spent)
+
+    return log, amp
