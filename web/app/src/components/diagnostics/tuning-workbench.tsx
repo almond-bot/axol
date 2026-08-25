@@ -302,7 +302,13 @@ const TABS: WbTab[] = [
       "axol teleop --teleop.jitter_record PREFIX first.",
     presets: {},
     fields: [
-      { key: "prefix", label: "recording prefix", type: "text", placeholder: "/tmp/jit17", width: "w-52" },
+      {
+        key: "prefix",
+        label: "recording prefix",
+        type: "text",
+        placeholder: "/tmp/jit17",
+        width: "w-52",
+      },
       { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
       { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "6" },
       { key: "rate", label: "rate (Hz)", type: "number", placeholder: "100" },
@@ -325,6 +331,78 @@ const TABS: WbTab[] = [
 
 function toDeg(v: number): number {
   return (v * 180) / Math.PI
+}
+
+/**
+ * Map a saved run's metadata back onto its launcher tab's form fields, so
+ * clicking a run in the list re-arms the launcher with exactly the settings
+ * that produced it (rerun as-is, or nudge one knob and rerun). Returns the
+ * complete form state for the tab — fields the run didn't set are cleared
+ * back to "command default" — or null for kinds without a launcher tab.
+ *
+ * Angles stored in radians (the filter suite's params) convert to the
+ * degrees the form speaks; tune.pid params are already saved in degrees.
+ */
+function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
+  const p = meta.params ?? {}
+  const g = meta.gains ?? {}
+  const out: Record<string, string> = {}
+  const put = (key: string, v: unknown, opts?: { deg?: boolean }) => {
+    if (typeof v === "number" && Number.isFinite(v)) {
+      const x = opts?.deg ? toDeg(v) : v
+      out[key] = String(Math.round(x * 1000) / 1000)
+    } else if (typeof v === "string" && v) {
+      out[key] = v
+    }
+  }
+  switch (meta.kind) {
+    case "sine":
+    case "step":
+      put("arm", meta.side)
+      put("joint", meta.joint)
+      put("kp", g.kp)
+      put("kd", g.kd)
+      put("host_kd", g.kd_host)
+      put("host_kd_hz", g.kd_host_hz)
+      put("amp", p.amp_deg)
+      put("freq", p.freq)
+      put("duration", p.duration)
+      put("hold", p.hold)
+      put("ff", p.ff)
+      put("stiffness", p.stiffness)
+      put("target_noise", p.target_noise_deg)
+      break
+    case "filter":
+      put("noise", p.noise)
+      if (typeof p.source === "string" && p.source !== "sine") out["motion"] = p.source
+      put("amp", p.amp, { deg: true })
+      put("freq", p.freq)
+      put("duration", p.duration)
+      put("jitter", p.jitter_rms, { deg: true })
+      put("outlier_amp", p.outlier_amp, { deg: true })
+      put("outlier_rate", p.outlier_rate)
+      put("stall_ms", p.stall_ms)
+      put("stall_rate", p.stall_rate)
+      put("ik_churn", p.ik_churn, { deg: true })
+      put("ik_jump_amp", p.ik_jump_amp, { deg: true })
+      put("ik_jump_rate", p.ik_jump_rate)
+      put("cutoff", p.cutoff)
+      put("seed", p.seed)
+      break
+    case "motion": {
+      put("motion", p.motion)
+      put("stiffness", p.stiffness)
+      const overrides = Object.entries(g)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ")
+      if (overrides) out["gain"] = overrides
+      break
+    }
+    default:
+      return null
+  }
+  put("label", meta.label)
+  return out
 }
 
 /** Radian series → degrees for display (nulls pass through). */
@@ -518,11 +596,7 @@ function pidJointChart(run: TuningRunData): JointChart | null {
 function headlineNum(meta: TuningRunMeta): number | null {
   const m = meta.metrics as Record<string, unknown>
   const key =
-    meta.kind === "motion"
-      ? "mean_rms_err"
-      : meta.kind === "filter"
-        ? "mean_rms_lagfree"
-        : "score"
+    meta.kind === "motion" ? "mean_rms_err" : meta.kind === "filter" ? "mean_rms_lagfree" : "score"
   const v = m[key]
   return typeof v === "number" && Number.isFinite(v) ? v : null
 }
@@ -543,11 +617,7 @@ function rebased(data: (number | null)[], base: number): (number | null)[] {
  * Sine/step positions are rebased to each run's starting position so runs
  * probed at different centers still overlay; errors are unaffected.
  */
-function compareJointCharts(
-  a: TuningRunData,
-  b: TuningRunData,
-  arm: string | null
-): JointChart[] {
+function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | null): JointChart[] {
   const kind = a.meta.kind
   const tA = a.series.t ?? []
   const tB = b.series.t ?? []
@@ -815,9 +885,7 @@ function FailureMap({
     if (typeof v !== "number" || !Number.isFinite(v)) return null
     return spec.deg ? toDeg(v) : v
   }
-  const joints = MAP_JOINT_ORDER.filter((j) =>
-    sides.some((s) => `${s}.${j}` in perJoint)
-  )
+  const joints = MAP_JOINT_ORDER.filter((j) => sides.some((s) => `${s}.${j}` in perJoint))
   for (const key of Object.keys(perJoint)) {
     const j = key.split(".").slice(1).join(".")
     if (j && !joints.includes(j)) joints.push(j)
@@ -954,9 +1022,7 @@ export function TuningWorkbench({
   const [compareData, setCompareData] = useState<Record<string, TuningRunData>>({})
   // Which arm's joints to chart for a motion run — mirrors the live
   // telemetry arm toggle (and starts from the same remembered choice).
-  const [arm, setArm] = useState<string>(
-    () => localStorage.getItem("axolDiagArm") ?? "left"
-  )
+  const [arm, setArm] = useState<string>(() => localStorage.getItem("axolDiagArm") ?? "left")
 
   const tuningCommandIds = useMemo(() => new Set(TABS.map((t) => t.command)), [])
   const runningOurs = activeCommand != null && tuningCommandIds.has(activeCommand)
@@ -1000,6 +1066,20 @@ export function TuningWorkbench({
     setSelectedId(id)
     setRun(null)
   }, [])
+
+  // Clicking a run (vs programmatic selection after a launch) also re-arms
+  // the launcher: switch to the run's tab and replace that tab's form with
+  // the settings that produced it, ready to rerun or nudge one knob.
+  const openRun = useCallback(
+    (meta: TuningRunMeta) => {
+      select(meta.id)
+      const form = runFormValues(meta)
+      if (!form) return
+      setTabKey(meta.kind)
+      setValues((prev) => ({ ...prev, [meta.kind]: form }))
+    },
+    [select]
+  )
 
   useEffect(() => {
     if (!selectedId) return
@@ -1133,12 +1213,9 @@ export function TuningWorkbench({
   // The kind of the first pick gates the other rows' checkboxes: comparing
   // a step against a filter run has no meaning.
   const compareKind =
-    compareIds.length > 0
-      ? (runs.find((r) => r.id === compareIds[0])?.kind ?? null)
-      : null
+    compareIds.length > 0 ? (runs.find((r) => r.id === compareIds[0])?.kind ?? null) : null
   const cmpArms = useMemo(
-    () =>
-      cmpReady ? Array.from(new Set([...runArms(cmpA), ...runArms(cmpB)])) : [],
+    () => (cmpReady ? Array.from(new Set([...runArms(cmpA), ...runArms(cmpB)])) : []),
     [cmpReady, cmpA, cmpB]
   )
   const cmpArm = cmpArms.length > 0 ? (cmpArms.includes(arm) ? arm : cmpArms[0]) : null
@@ -1154,7 +1231,8 @@ export function TuningWorkbench({
     const label = headline(cmpA.meta)?.label ?? "score"
     const isScore = cmpA.meta.kind === "sine" || cmpA.meta.kind === "step"
     const fmt = (v: number) => (isScore ? fmtNum(v, 3) : `${fmtNum(toDeg(v))}°`)
-    if (va === vb) return { better: null as string | null, text: `${label}: dead even at ${fmt(va)}` }
+    if (va === vb)
+      return { better: null as string | null, text: `${label}: dead even at ${fmt(va)}` }
     const better = va < vb ? "A" : "B"
     const pct = Math.round((1 - Math.min(va, vb) / Math.max(va, vb)) * 100)
     return {
@@ -1249,98 +1327,92 @@ export function TuningWorkbench({
           {tab.fields.map((f) => {
             const cfg = configValue(f)
             return (
-            <label key={f.key} className="flex flex-col gap-1">
-              <span className="text-[0.65rem] text-white/40">
-                {f.label}
-                {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
-                {cfg != null && (
-                  <span className="text-white/25"> · config {fmtNum(cfg)}</span>
-                )}
-              </span>
-              {f.type === "boolean" ? (
-                <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
-                  <input
-                    type="checkbox"
-                    checked={tabValues[f.key] === "true"}
-                    disabled={runningOurs || busy}
-                    onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
-                    className="accent-[#eff483]"
-                  />
-                  {tabValues[f.key] === "true" ? "on" : "off"}
+              <label key={f.key} className="flex flex-col gap-1">
+                <span className="text-[0.65rem] text-white/40">
+                  {f.label}
+                  {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
+                  {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
                 </span>
-              ) : f.type === "select" ? (
-                <select
-                  value={tabValues[f.key] ?? ""}
-                  onChange={(e) => setValue(f.key, e.target.value)}
-                  disabled={runningOurs || busy}
-                  className={cn(
-                    "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
-                    f.width ?? "w-32"
-                  )}
-                >
-                  <option value="">
-                    {tab.required.includes(f.key) ? "select…" : "default"}
-                  </option>
-                  {(f.key === "motion" ? motions.map((m) => m.name) : (f.options ?? [])).map(
-                    (o) => (
-                      <option key={o} value={o}>
-                        {o}
-                      </option>
+                {f.type === "boolean" ? (
+                  <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
+                    <input
+                      type="checkbox"
+                      checked={tabValues[f.key] === "true"}
+                      disabled={runningOurs || busy}
+                      onChange={(e) => setValue(f.key, e.target.checked ? "true" : "")}
+                      className="accent-[#eff483]"
+                    />
+                    {tabValues[f.key] === "true" ? "on" : "off"}
+                  </span>
+                ) : f.type === "select" ? (
+                  <select
+                    value={tabValues[f.key] ?? ""}
+                    onChange={(e) => setValue(f.key, e.target.value)}
+                    disabled={runningOurs || busy}
+                    className={cn(
+                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/85 outline-none focus:border-[#eff483]/40",
+                      f.width ?? "w-32"
+                    )}
+                  >
+                    <option value="">{tab.required.includes(f.key) ? "select…" : "default"}</option>
+                    {(f.key === "motion" ? motions.map((m) => m.name) : (f.options ?? [])).map(
+                      (o) => (
+                        <option key={o} value={o}>
+                          {o}
+                        </option>
+                      )
+                    )}
+                  </select>
+                ) : f.slider ? (
+                  (() => {
+                    // The slider tracks the typed value (first number of a
+                    // sweep) and starts at the joint's config value; dragging
+                    // it fills the box, an empty box runs with config.
+                    const raw = (tabValues[f.key] ?? "").trim()
+                    const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
+                    const sliderVal = Number.isFinite(first) ? first : (cfg ?? f.slider.min)
+                    return (
+                      <span className="flex h-8 items-center gap-2">
+                        <input
+                          type="range"
+                          min={f.slider.min}
+                          max={f.slider.max}
+                          step={f.slider.step}
+                          value={sliderVal}
+                          onChange={(e) => setValue(f.key, e.target.value)}
+                          disabled={runningOurs || busy || (cfg == null && !raw)}
+                          title={f.hint}
+                          className="w-24 accent-[#eff483] disabled:opacity-40"
+                        />
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={tabValues[f.key] ?? ""}
+                          placeholder={cfg != null ? fmtNum(cfg) : "config"}
+                          title={f.hint}
+                          onChange={(e) => setValue(f.key, e.target.value)}
+                          disabled={runningOurs || busy}
+                          className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+                        />
+                      </span>
                     )
-                  )}
-                </select>
-              ) : f.slider ? (
-                (() => {
-                  // The slider tracks the typed value (first number of a
-                  // sweep) and starts at the joint's config value; dragging
-                  // it fills the box, an empty box runs with config.
-                  const raw = (tabValues[f.key] ?? "").trim()
-                  const first = Number.parseFloat(raw.split(/\s+/)[0] ?? "")
-                  const sliderVal = Number.isFinite(first)
-                    ? first
-                    : (cfg ?? f.slider.min)
-                  return (
-                    <span className="flex h-8 items-center gap-2">
-                      <input
-                        type="range"
-                        min={f.slider.min}
-                        max={f.slider.max}
-                        step={f.slider.step}
-                        value={sliderVal}
-                        onChange={(e) => setValue(f.key, e.target.value)}
-                        disabled={runningOurs || busy || (cfg == null && !raw)}
-                        title={f.hint}
-                        className="w-24 accent-[#eff483] disabled:opacity-40"
-                      />
-                      <input
-                        type="text"
-                        inputMode="decimal"
-                        value={tabValues[f.key] ?? ""}
-                        placeholder={cfg != null ? fmtNum(cfg) : "config"}
-                        title={f.hint}
-                        onChange={(e) => setValue(f.key, e.target.value)}
-                        disabled={runningOurs || busy}
-                        className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
-                      />
-                    </span>
-                  )
-                })()
-              ) : (
-                <input
-                  type="text"
-                  inputMode={f.type === "number" ? "decimal" : undefined}
-                  value={tabValues[f.key] ?? ""}
-                  placeholder={f.placeholder}
-                  title={f.hint}
-                  onChange={(e) => setValue(f.key, e.target.value)}
-                  disabled={runningOurs || busy}
-                  className={cn(
-                    "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
-                    f.width ?? (f.type === "number" ? "w-24" : "w-28")
-                  )}
-                />
-              )}
-            </label>
+                  })()
+                ) : (
+                  <input
+                    type="text"
+                    inputMode={f.type === "number" ? "decimal" : undefined}
+                    value={tabValues[f.key] ?? ""}
+                    placeholder={f.placeholder}
+                    title={f.hint}
+                    onChange={(e) => setValue(f.key, e.target.value)}
+                    disabled={runningOurs || busy}
+                    className={cn(
+                      "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                      f.width ?? (f.type === "number" ? "w-24" : "w-28")
+                    )}
+                  />
+                )}
+              </label>
             )
           })}
           <div className="ml-auto">
@@ -1471,9 +1543,7 @@ export function TuningWorkbench({
 
           {!cmpReady && <p className="text-xs text-white/40">Loading both runs…</p>}
           {cmpReady && cmpCharts.length > 0 && (
-            <div
-              className={cn("grid grid-cols-1 gap-4", cmpCharts.length > 1 && "xl:grid-cols-2")}
-            >
+            <div className={cn("grid grid-cols-1 gap-4", cmpCharts.length > 1 && "xl:grid-cols-2")}>
               {cmpCharts.map((c) => (
                 <RunChart
                   key={c.joint}
@@ -1514,10 +1584,7 @@ export function TuningWorkbench({
                     <tr className="text-left">
                       {cmpScores.cols.map((c) => (
                         <Fragment key={c.key}>
-                          <th
-                            className="py-0.5 pr-2 font-normal"
-                            style={{ color: ACTUAL_COLOR }}
-                          >
+                          <th className="py-0.5 pr-2 font-normal" style={{ color: ACTUAL_COLOR }}>
                             A
                           </th>
                           <th className="py-0.5 pr-4 font-normal" style={{ color: B_COLOR }}>
@@ -1571,9 +1638,9 @@ export function TuningWorkbench({
                 </table>
               </div>
               <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
-                Green marks the better (lower) value of each pair. Sine/step charts are
-                rebased to each run's starting position so runs probed at different
-                centers still overlay; the error lanes are unaffected.
+                Green marks the better (lower) value of each pair. Sine/step charts are rebased to
+                each run's starting position so runs probed at different centers still overlay; the
+                error lanes are unaffected.
               </p>
             </Card>
           )}
@@ -1621,9 +1688,7 @@ export function TuningWorkbench({
 
       {/* Commanded vs actual position + error lane, one chart per joint. */}
       {!comparing && run && jointCharts.length > 0 && (
-        <div
-          className={cn("grid grid-cols-1 gap-4", jointCharts.length > 1 && "xl:grid-cols-2")}
-        >
+        <div className={cn("grid grid-cols-1 gap-4", jointCharts.length > 1 && "xl:grid-cols-2")}>
           {jointCharts.map((c) => (
             <RunChart
               key={c.joint}
@@ -1720,25 +1785,23 @@ export function TuningWorkbench({
               const selected = r.id === selectedId
               const head = headline(r)
               const cmpIdx = compareIds.indexOf(r.id)
-              const cmpBlocked =
-                compareKind != null && r.kind !== compareKind && cmpIdx < 0
+              const cmpBlocked = compareKind != null && r.kind !== compareKind && cmpIdx < 0
               return (
                 <div
                   key={r.id}
                   role="button"
                   tabIndex={0}
-                  onClick={() => select(selected ? null : r.id)}
+                  onClick={() => (selected ? select(null) : openRun(r))}
                   onKeyDown={(e) => {
                     if (e.key === "Enter" || e.key === " ") {
                       e.preventDefault()
-                      select(selected ? null : r.id)
+                      if (selected) select(null)
+                      else openRun(r)
                     }
                   }}
                   className={cn(
                     "flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 rounded-md px-2.5 py-1.5 text-left text-xs transition-colors",
-                    selected
-                      ? "bg-[#eff483]/10 ring-1 ring-[#eff483]/30"
-                      : "hover:bg-white/[0.04]"
+                    selected ? "bg-[#eff483]/10 ring-1 ring-[#eff483]/30" : "hover:bg-white/[0.04]"
                   )}
                 >
                   <input
@@ -1753,7 +1816,11 @@ export function TuningWorkbench({
                     onClick={(e) => e.stopPropagation()}
                     onChange={() => toggleCompare(r.id)}
                     className="accent-[#eff483] disabled:opacity-30"
-                    style={cmpIdx >= 0 ? { accentColor: cmpIdx === 0 ? ACTUAL_COLOR : B_COLOR } : undefined}
+                    style={
+                      cmpIdx >= 0
+                        ? { accentColor: cmpIdx === 0 ? ACTUAL_COLOR : B_COLOR }
+                        : undefined
+                    }
                   />
                   {cmpIdx >= 0 && (
                     <span
