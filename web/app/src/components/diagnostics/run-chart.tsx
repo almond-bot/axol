@@ -3,17 +3,14 @@ import { Card } from "@/components/ui/card"
 import { cn } from "@/lib/utils"
 
 /**
- * One static line on a run chart. Each series carries its own time axis so
- * two runs recorded at different times/rates can overlay (both are shifted
- * to start at 0).
+ * One static line on a run chart. Each series carries its own time axis
+ * (shifted to start at 0), so signals sampled at different rates overlay.
  */
 export interface RunChartSeries {
   label: string
   color: string
   x: (number | null)[]
   data: (number | null)[]
-  /** Dashed stroke — the B run in an A/B overlay. */
-  dashed?: boolean
 }
 
 interface RunChartProps {
@@ -93,19 +90,10 @@ function prepare(series: RunChartSeries[]): Prepared | null {
   return { t1: Math.max(t1, 1e-6), min: min - pad, max: max + pad, points }
 }
 
-function swatchStyle(s: RunChartSeries): React.CSSProperties {
-  return {
-    background: s.dashed
-      ? `repeating-linear-gradient(90deg, ${s.color} 0 4px, transparent 4px 7px)`
-      : s.color,
-  }
-}
-
 /**
  * Static multi-series line chart for saved tuning runs: same visual language
  * as the live telemetry charts (canvas, hairline grid, crosshair tooltip),
- * but over fixed arrays with a relative-seconds time axis. Dashed strokes
- * carry the B run of an A/B overlay.
+ * but over fixed arrays with a relative-seconds time axis.
  */
 export function RunChart({ title, unit, series, height = 240, className }: RunChartProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -211,8 +199,7 @@ export function RunChart({ title, unit, series, height = 240, className }: RunCh
       const pts = data.points[s]
       if (pts.length === 0) continue
       ctx.strokeStyle = series[s].color
-      ctx.lineWidth = series[s].dashed ? 1.5 : 2
-      ctx.setLineDash(series[s].dashed ? [5, 4] : [])
+      ctx.lineWidth = 2
       ctx.beginPath()
       let first = true
       for (const [t, v] of pts) {
@@ -225,7 +212,6 @@ export function RunChart({ title, unit, series, height = 240, className }: RunCh
       }
       ctx.stroke()
     }
-    ctx.setLineDash([])
 
     if (hover) {
       const hx = px(hover.t)
@@ -285,7 +271,10 @@ export function RunChart({ title, unit, series, height = 240, className }: RunCh
             </div>
             {series.map((s, i) => (
               <div key={`${s.label}-${i}`} className="flex items-center gap-2 leading-5">
-                <span className="inline-block h-0.5 w-3 shrink-0 rounded" style={swatchStyle(s)} />
+                <span
+                  className="inline-block h-0.5 w-3 shrink-0 rounded"
+                  style={{ background: s.color }}
+                />
                 <span className="font-mono font-semibold text-white/90 tabular-nums">
                   {hover.values[i] == null ? "–" : fmtValue(hover.values[i]!)}
                 </span>
@@ -298,7 +287,7 @@ export function RunChart({ title, unit, series, height = 240, className }: RunCh
       <div className="flex flex-wrap gap-x-4 gap-y-1">
         {series.map((s, i) => (
           <span key={`${s.label}-${i}`} className="inline-flex items-center gap-1.5 text-xs">
-            <span className="inline-block h-0.5 w-3 rounded" style={swatchStyle(s)} />
+            <span className="inline-block h-0.5 w-3 rounded" style={{ background: s.color }} />
             <span className="text-white/50">{s.label}</span>
           </span>
         ))}

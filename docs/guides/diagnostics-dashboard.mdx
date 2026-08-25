@@ -48,12 +48,11 @@ The tuning workbench runs the deterministic tuning suites inline — no dialogs.
 - **Sine** / **Step** — [`tune.pid`](https://docs.almond.bot/cli/tune-pid) probes on one joint. Leave kp/kd empty to test the configured gains; space-separated values sweep the grid, one saved run per candidate.
 - **Friction** — [`tune.friction`](https://docs.almond.bot/cli/tune-friction) identifies one joint's friction model; check **save to calibration** to write the fit to `~/.almond/calibration.json`.
 - **Recorded motion** — [`tune.motion`](https://docs.almond.bot/cli/tune-motion) replays a committed reference motion through the production control path and scores tracking per joint, with per-run gain overrides (`left.elbow.kd=4.5 shoulder_3.kd_host=0`).
-- **Analyze recording** — [`diag.offline`](https://docs.almond.bot/cli/diag-offline) scores a teleop flight recording's wifi transport, filter stack, or IK output without moving the robot.
 - **Build motion** — [`motion.build`](https://docs.almond.bot/cli/motion-build) turns a teleop flight recording into a reference motion, which then shows up in the Recorded motion picker.
 
-Each completed run auto-selects as **A** and the previous selection slides to **B**, so consecutive gain candidates land dashed-over-solid on the same axes without any clicking around — change a number, run again, and read the difference off the graph. The charts show target vs. actual position, tracking error, and torque (with a joint picker for multi-joint runs; the offline suites chart their own signals), and the **scorecard** underneath lists the tracking-accuracy and smoothness metrics — RMS/max error, lag, 3–15 Hz error band, amplification, torque chatter — for A and B side by side.
+Results are joint space throughout: one graph of **commanded vs. actual position per joint**, with a left/right arm toggle for motion runs (same as live telemetry) so the grid only shows one arm. Under the graphs, the **tracking scores** table carries one row per joint — tracking RMS in degrees (how far the joint sat from the commanded position on average), lag, 3–15 Hz jitter, ringing amplification, torque chatter — and each run's headline tracking number repeats in the **Past runs** list, so comparing two runs is reading two numbers. Offline recording analysis stays on the CLI ([`diag.offline`](https://docs.almond.bot/cli/diag-offline)).
 
-Every run is persisted under `~/.almond/diagnostics/tuning/` on the serve host — the CLI (`--save-run`) and the dashboard share the same store — and the **Past runs** list reselects, pins, or deletes them at any time.
+Every run is persisted under `~/.almond/diagnostics/tuning/` on the serve host — the CLI (`--save-run`) and the dashboard share the same store — and the **Past runs** list reselects or deletes them at any time.
 
 ## Run history
 

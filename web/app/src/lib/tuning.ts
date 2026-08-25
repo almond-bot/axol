@@ -20,7 +20,7 @@ export interface TuningRunMeta {
   /** The run's scorecard; NaN metrics arrive as null. */
   metrics: Record<string, unknown>
   label: string | null
-  /** Shared id linking the runs of one sweep, for A/B sets. */
+  /** Shared id linking the runs of one sweep. */
   group: string | null
   startedAt: number
   seriesKeys: string[]
