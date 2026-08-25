@@ -88,10 +88,15 @@ class JointConfig:
                   too filtered to damp the ~2 Hz closed-loop resonance —
                   measured on left shoulder_2 at kp=250: firmware kd=35
                   alone left a 62%-overshoot ring; kd_host=30 on top damped
-                  it critically. The elbow and shoulder_3 need their own
-                  dose for the same reason, band-passed at their own modes
-                  (see ``kd_host_w0``). Leave at 0 for joints whose
-                  firmware kd works (the wrists).
+                  it critically. The elbow needs its own dose for the same
+                  reason, band-passed at its own mode (see ``kd_host_w0``).
+                  Leave at 0 for joints whose firmware kd works (the wrists)
+                  — and beware the failure mode that took shoulder_3's and
+                  wrist_2's dampers away: past ~90 deg of loop phase lag the
+                  "damping" torque arrives with the motion instead of
+                  against it, and a damper whose band leaks onto a
+                  structural mode above its centre *powers* that mode (see
+                  the shoulder_3 comment below).
                   This value is the *max-inertia-pose* anchor: at runtime
                   the controller scales it by J(q)/J_ref, where J_ref is
                   the per-joint maximum reflected inertia over arm shapes
@@ -235,18 +240,20 @@ class ArmConfig:
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
             j_eff=0.25,
-            # Extension jitter did return once kd_host was removed: a full
-            # teleop survey (jit13, 37 tracking-error bursts) showed
-            # shoulder_3 leading ~20 of them on both arms, ringing at
-            # 3.9-5.9 Hz with the hand out to the side / near the head —
-            # the poses where its reflected inertia peaks (~27× rest) and
-            # its mode drops into the host loop's band. The J(q)/J_ref
-            # schedule zeroes this at rest (J_rest ≈ 3% of max, the pose
-            # where un-scheduled kd_host used to jitter) and delivers
-            # ~0.65× at the measured burst poses.
-            kd_host=12.0,
-            kd_host_max=12.0,
-            kd_host_w0=30.0,  # rad/s ≈ 4.8 Hz, centred on the measured band
+            # No host damping. A kd_host (12, band-passed at 4.8 Hz per the
+            # reference robot's 3.9-5.9 Hz extension-jitter band, jit13)
+            # actively *pumps* an ~11 Hz structural mode on current builds:
+            # torque x velocity measured on two robots showed shoulder_3's
+            # damper injecting energy at 11 Hz (its band-pass still passes
+            # ~55% there, arriving ~120 deg late — past the 90 deg where
+            # damping flips to excitation), lighting up shoulder_2/wrist_2
+            # on BOTH arms via the shared mast. Even kd_host=6 re-ignited it
+            # (jit19); 0 killed it (jit18). Cost: ~150 mdeg RMS of undamped
+            # 3.3 Hz ring during motion. To win that back, damp phase-safely
+            # (firmware kd has no host-loop delay) or notch the structural
+            # mode in the host path first — do not just restore kd_host. The
+            # reference robot's extension jitter, if it returns there, gets a
+            # per-robot calibration override, not a shipping default.
         )
     )
     elbow: JointConfig = field(
@@ -293,18 +300,15 @@ class ArmConfig:
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
-            # wrist_2 led the residual teleop bursts once the shoulders were
-            # damped (jit16: up to 613 mdeg, ringing at 7.8-10 Hz with the
-            # elbow bent ~110-120°, measured ripple 2.5-4x commanded). Its
-            # Damiao firmware clamps kd at 5, leaving no firmware headroom —
-            # and raising kd toward the clamp historically produced contact
-            # chatter against the chassis — so the damping is delivered
-            # host-side, band-passed at the measured mode. At 8.8 Hz the
-            # loop still delivers ~cos(55°) ≈ 0.6 of it in phase; with this
-            # joint's small reflected inertia that adds ζ ≈ 0.3.
-            kd_host=1.5,
-            kd_host_max=1.5,
-            kd_host_w0=55.0,  # rad/s ≈ 8.8 Hz, centred on the measured band
+            # No host damping. A kd_host (1.5, band-passed at 8.8 Hz per the
+            # reference robot's 7.8-10 Hz burst band, jit16) sits nearly on
+            # top of current builds' ~11 Hz structural mode and pumps it
+            # (see shoulder_3 above; wrist_2 rang hardest in that mode as the
+            # lightest joint on the shaking mast). Its Damiao firmware clamps
+            # kd at 5 and raising kd toward the clamp historically produced
+            # contact chatter against the chassis, so if wrist_2 ringing
+            # returns, notch the structural mode in the host path before
+            # restoring any kd_host.
         )
     )
     wrist_3: JointConfig = field(
