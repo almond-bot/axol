@@ -113,8 +113,11 @@ def sweep_safety(
     each measure. Encodes every physical-safety rule the full-range sweeps
     (friction, gravity) share:
 
-    - wrist_2: elbow raised to its midpoint so the gripper clears the base,
-      and the sweep capped to the outboard half.
+    - wrist_2: elbow raised to its midpoint — with the elbow bent the
+      gripper clears the base through wrist_2's *full* range, so the sweep
+      is not capped. (The PID probes keep wrist_2 outboard-only instead:
+      they run with the arm at rest, elbow straight, where the inboard half
+      does hit the base.)
     - shoulder_2: sweep capped 10° outboard of 0 — the base, and now the
       chest cameras, sit inboard of that.
     - shoulder_3 / wrist_1: shoulder_2 held 10° outboard so the hanging arm
@@ -128,18 +131,20 @@ def sweep_safety(
             f"{math.degrees(clearance[Joint.SHOULDER_2]):+.0f}° to clear the "
             f"chest cameras for the {joint.value} sweep."
         )
+    lo_cap: float | None = None
+    hi_cap: float | None = None
     if joint == Joint.WRIST_2:
         elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
         clearance[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
         notes.append(
             f"Moving elbow to {math.degrees(clearance[Joint.ELBOW]):.1f}° "
-            "(midpoint of range) for wrist_2 clearance."
+            "(midpoint of range) — with the elbow bent, wrist_2 sweeps its "
+            "full range clear of the base."
         )
-    lo_cap: float | None = None
-    hi_cap: float | None = None
-    safe_dir = safe_outboard_direction(joint, is_left)
-    if safe_dir is not None:
+    elif joint == Joint.SHOULDER_2:
         lo_cap, hi_cap = safe_limits(joint, is_left)
+        safe_dir = safe_outboard_direction(joint, is_left)
+        assert safe_dir is not None
         boundary = safe_dir * base_margin(joint)
         notes.append(
             f"Capping {joint.value} sweep at {math.degrees(boundary):+.0f}° "

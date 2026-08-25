@@ -7,7 +7,7 @@ Identifies the four friction-model parameters for one joint via a bidirectional 
 
 **Friction model:** `τ = Fc·tanh(0.1·k·v) + Fv·v + Fo`
 
-Sweep safety is built in: shoulder_2 and wrist_2 sweep only their outboard side (shoulder_2 stays 10° out from 0 — the base and the chest cameras sit inboard of that), wrist_2 gets the elbow raised for gripper clearance, and shoulder_3 / wrist_1 sweeps hold shoulder_2 10° outboard so the hanging arm swings clear of the chest cameras.
+Sweep safety is built in: shoulder_2 sweeps only its outboard side, capped 10° out from 0 (the base and the chest cameras sit inboard of that); wrist_2 gets the elbow raised to midpoint, which clears the gripper from the base through its **full** range; and shoulder_3 / wrist_1 sweeps hold shoulder_2 10° outboard so the hanging arm swings clear of the chest cameras.
 
 Friction is motor-specific — the shared defaults in `config.py` were measured on one reference robot. Run this per joint, per arm, on every robot you build, and pass `--save` to persist the fit to that machine's calibration file (`~/.almond/calibration.json`). `AxolConfig` loads the file on construction, so saved values apply to every operation on the robot without a code change; explicit config overrides still win over them.
 
