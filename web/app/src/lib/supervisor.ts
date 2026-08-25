@@ -360,6 +360,21 @@ export async function usbConnect(): Promise<UsbStatus> {
   return json(await fetch(apiUrl("/api/usb/connect"), { method: "POST" }))
 }
 
+/**
+ * Disable (true) or restore (false) the headset's proximity sensor over adb.
+ * Disabled, the Quest stays awake with nobody wearing it — headless sessions
+ * keep their pose stream. Holds until restored or the headset reboots.
+ */
+export async function setQuestProximityDisabled(disabled: boolean): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/usb/proximity"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled }),
+    })
+  )
+}
+
 // ---------------------------------------------------------------------------
 // In-process operations (teleop / gravity-comp / collect-data / run-policy)
 // ---------------------------------------------------------------------------

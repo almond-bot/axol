@@ -112,6 +112,8 @@ The assignments and stream/record selection persist **on the host** with the res
 
 The **Quest USB** tab manages the optional [Quest-over-USB](/guides/quest-over-usb) link, which streams controller poses over a USB cable instead of Wi-Fi for lower latency. When a headset is plugged into the host and authorized (accept the **Allow USB debugging?** prompt the first time), the host sets up the `adb reverse` tunnel **automatically** and turns green (*Controller over USB*); the **Connect** button is a manual fallback / reconnect. Camera video keeps using the LAN — USB carries poses only. The headset sends every pose over both the cable and Wi-Fi, so a dropped cable **fails over to Wi-Fi instantly** with no reconnect, and the cable reclaims the link when it returns.
 
+The tab also carries the [headless](/guides/quest-headless) **Keep awake** / **Restore** buttons: with the headset plugged in and authorized, **Keep awake** disables its proximity sensor over adb so the VR session keeps running with the headset set down, and **Restore** brings normal sleep behavior back (a headset reboot also resets it).
+
 ## Operations
 
 Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy, the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.

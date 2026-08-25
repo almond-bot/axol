@@ -11,19 +11,21 @@ That gets in the way of every headless workflow: driving a [data-collection sess
 
 The headset must be in **Developer Mode** — the same one-time step used for [Quest over USB](/guides/quest-over-usb#one-time-setup): in the **Meta Quest** phone app, go to **Menu → Devices →** your headset **→ Headset Settings → Developer Mode**, toggle it on, and restart the headset.
 
-## Disable the sensor over adb (recommended)
+## Keep awake from the control panel (recommended)
 
-No extra software is needed: the robot host already has `adb` ([`axol provision`](/cli/provision) installs it for the [Quest-over-USB](/guides/quest-over-usb) link). Plug the headset into the robot host with a USB-C cable, accept the **Allow USB debugging?** prompt in the headset if it appears, then run on the host:
+The [control panel](/guides/control-panel#quest-usb)'s **Quest USB** settings tab has a **Keep awake** button that disables the proximity sensor for you — no terminal, no extra software. Plug the headset into the robot host with a USB-C cable, accept the **Allow USB debugging?** prompt in the headset if it appears (the same authorization the pose tunnel uses), and press **Keep awake**.
+
+The headset now behaves as if it were worn continuously — the display stays on and the VR session keeps running with the headset sitting on a desk. You can unplug the cable afterwards; the setting holds until you press **Restore** (or the headset reboots).
+
+## Or over adb directly
+
+The panel buttons run these `adb` broadcasts on the robot host ([`axol provision`](/cli/provision) installs `adb` there), so the same thing works from any shell with the headset plugged in:
 
 ```bash
+# Disable the proximity sensor (keep the headset awake)
 adb shell am broadcast -a com.oculus.vrpowermanager.prox_close
-```
 
-The headset now behaves as if it were worn continuously — the display stays on and the VR session keeps running with the headset sitting on a desk. You can unplug the cable afterwards; the setting holds until you undo it or the headset reboots.
-
-To restore normal proximity behavior:
-
-```bash
+# Restore normal proximity behavior
 adb shell am broadcast -a com.oculus.vrpowermanager.automation_disable
 ```
 
@@ -37,7 +39,7 @@ adb shell am broadcast -a com.oculus.vrpowermanager.automation_disable
 
 ## Alternative: Meta Quest Developer Hub
 
-If you'd rather use a GUI, the [Meta Quest Developer Hub](https://developers.meta.com/horizon/documentation/unity/ts-odh/) (MQDH) desktop app has the same switch: connect the headset over USB, open **Device Manager**, and turn off **Proximity Sensor** (or press `Ctrl+Shift+P`). Note that MQDH re-enables the sensor about 10 minutes after the headset disconnects from it, so the adb command above is the better fit for a headset that stays plugged into the robot instead of a laptop.
+The [Meta Quest Developer Hub](https://developers.meta.com/horizon/documentation/unity/ts-odh/) (MQDH) desktop app has the same switch: connect the headset over USB, open **Device Manager**, and turn off **Proximity Sensor** (or press `Ctrl+Shift+P`). Note that MQDH re-enables the sensor about 10 minutes after the headset disconnects from it — and it means installing an app on a laptop — so the panel button above is the better fit for a headset that plugs into the robot.
 
 ## Running headless
 

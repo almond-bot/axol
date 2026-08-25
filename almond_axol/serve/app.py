@@ -118,6 +118,16 @@ class EpisodeRequest(BaseModel):
     command: str
 
 
+class ProximityRequest(BaseModel):
+    """Disable (default) or restore the headset's proximity sensor over adb.
+
+    Disabling keeps the Quest awake with nobody wearing it, so headless
+    sessions driven from the panel don't die when the headset is set down.
+    """
+
+    disabled: bool = True
+
+
 class SessionInputRequest(BaseModel):
     """A line written to a session's stdin (answers an interactive prompt).
 
@@ -708,6 +718,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         the USB-debugging authorization popup on the device.
         """
         return _usb_status_dict(await asyncio.to_thread(adb.connect))
+
+    @app.post("/api/usb/proximity")
+    async def usb_proximity(req: ProximityRequest) -> JSONResponse:
+        """Disable/restore the headset's proximity sensor (`adb shell am broadcast`).
+
+        Disabled, the headset stays awake with nobody wearing it — headless
+        sessions driven from the panel keep their pose stream and camera relay.
+        The override holds until restored or the headset reboots. Needs an
+        attached, authorized headset (same requirement as the pose tunnel).
+        """
+        ok, error = await asyncio.to_thread(adb.set_proximity_disabled, req.disabled)
+        if not ok:
+            return JSONResponse(
+                {"error": error or "adb broadcast failed"}, status_code=502
+            )
+        return JSONResponse({"ok": True})
 
     # -- in-process operations (teleop / gravity / collect / policy) --------
 
