@@ -480,10 +480,12 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.filter",
         "tune.filter",
         "Filter noise-rejection test",
-        "Inject stalls, outliers, and jitter into a clean motion and replay "
-        "it through the production teleop filter stack — offline, no "
-        "hardware, seeded and reproducible. Scores how much of the injected "
-        "noise the stack removes, per joint.",
+        "Inject network noise (jitter/outliers/stalls, before the pose "
+        "low-pass) or IK noise (solver churn/jumps, after it) — or both — "
+        "into a clean motion and replay through the production teleop "
+        "filter stack, offline, seeded and reproducible. Each source "
+        "enters at its real pipeline point, so they are testable "
+        "independently. Scores how much the stack removes, per joint.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.tune.filter"),

@@ -4,27 +4,41 @@ axol tune.filter
 Test the teleop filter stack by injecting noise into a clean motion — no
 hardware, no VR headset, exactly reproducible.
 
-A clean joint-space signal (a synthetic sine, or a committed reference
-motion via ``--motion``) is corrupted with the artifacts a real VR/wifi
-stream carries — white-noise **jitter**, teleported **outlier** samples, and
-**stalls** where the stream freezes then jumps to catch up — and replayed
-through the production smoothing chain at the production rates: the
-lag-compensated pose low-pass, the IK-output EMA, and the trapezoidal
-velocity/acceleration tracker.
+The production pipeline is::
 
-The output is scored against the *clean* reference, per joint: the filter
+    VR stream -> pose low-pass -> IK solver -> EMA -> trapezoid
+       ^ network noise enters here   ^ IK noise is created here
+
+``--noise`` picks the source under test, and each source is injected at its
+real entry point, which is what lets you test them independently:
+
+* ``network`` — transport artifacts in front of the pose low-pass: white
+  **jitter**, teleported **outlier** samples, and **stalls** where the
+  stream freezes then jumps to catch up. The whole stack gets to clean them.
+* ``ik`` — solver artifacts between the low-pass and the EMA (where the
+  solver sits in production): band-limited 3-20 Hz per-joint **churn** and
+  persistent **jumps** (redundancy flips). Only the EMA and the trapezoid
+  can see these — the pose filter never gets a chance, exactly as on the
+  real robot.
+* ``combined`` (default) — both at once, each at its own injection point.
+
+The output is scored against the *clean* reference, per joint: the stack
 should track the intentional motion (low RMS error and lag) while removing
 what was injected (jitter pass-through well below 1, peak error far below
 the outlier magnitude, and output acceleration always inside teleop's
 configured limit no matter how hard the corrupted input slams).
 
-Everything is deterministic for a given ``--seed``: change a filter
-parameter (e.g. ``--cutoff``), rerun on the identical corrupted stream, and
-compare the scores run to run.
+Everything is deterministic for a given ``--seed``, and the two noise
+streams are seeded independently — the same seed gives the same network
+noise with or without IK noise on top, so mode-to-mode comparisons are
+apples to apples.
 
 Examples:
-    axol tune.filter --save-run
-    axol tune.filter --outlier-amp 0.5 --stall-ms 300 --save-run
+    axol tune.filter --noise network --save-run
+    axol tune.filter --noise ik --save-run
+    axol tune.filter --save-run                          # combined
+    axol tune.filter --noise network --stall-ms 300 --save-run
+    axol tune.filter --noise ik --ik-churn 0.01 --save-run
     axol tune.filter --motion reach-and-place --save-run
     axol tune.filter --cutoff 1.5 --label "half cutoff" --save-run
 """
@@ -72,10 +86,18 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Sine mode: frequency in Hz (default: 0.5)",
     )
     p.add_argument(
+        "--noise",
+        choices=("network", "ik", "combined"),
+        default="combined",
+        help="Noise source under test, injected at its real pipeline entry "
+        "point: 'network' (jitter/outliers/stalls before the pose low-pass), "
+        "'ik' (solver churn/jumps after it), or 'combined' (both; default)",
+    )
+    p.add_argument(
         "--jitter",
         type=float,
         default=0.005,
-        help="White-noise jitter RMS in rad added to every sample "
+        help="Network: white-noise jitter RMS in rad added to every sample "
         "(default: 0.005 ≈ 0.3°; 0 disables)",
     )
     p.add_argument(
@@ -103,6 +125,27 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         default=150.0,
         help="Stall length in ms — the stream freezes on its last sample "
         "for this long, then jumps to catch up (default: 150)",
+    )
+    p.add_argument(
+        "--ik-churn",
+        type=float,
+        default=0.003,
+        help="IK: band-limited (3-20 Hz) solver churn RMS in rad per joint "
+        "(default: 0.003 ≈ 0.17°, the scale diag.offline kinematics measures "
+        "on a healthy solve; 0 disables)",
+    )
+    p.add_argument(
+        "--ik-jump-rate",
+        type=float,
+        default=0.2,
+        help="IK: solution jumps injected per second — one joint steps and "
+        "holds for 0.3-1 s, a redundancy flip (default: 0.2; 0 disables)",
+    )
+    p.add_argument(
+        "--ik-jump-amp",
+        type=float,
+        default=0.05,
+        help="IK: solution-jump magnitude in rad (default: 0.05 ≈ 3°)",
     )
     p.add_argument(
         "--cutoff",
@@ -136,10 +179,20 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 def _print_report(metrics: dict, params: dict) -> None:
     """Cleanup scorecard, one row per scored channel."""
     per_joint: dict[str, dict[str, float]] = metrics["per_joint"]
+    parts = []
+    if params["noise"] in ("network", "combined"):
+        parts.append(
+            f"network: jitter {params['jitter_rms'] * 1000:.1f} mrad RMS, "
+            f"{metrics['outliers']} outliers × {params['outlier_amp']:.2f} rad, "
+            f"{metrics['stalls']} stalls × {params['stall_ms']:.0f} ms"
+        )
+    if params["noise"] in ("ik", "combined"):
+        parts.append(
+            f"ik: churn {params['ik_churn'] * 1000:.1f} mrad RMS, "
+            f"{metrics['ik_jumps']} jumps × {params['ik_jump_amp']:.2f} rad"
+        )
     print(
-        f"\nInjected: jitter {params['jitter_rms'] * 1000:.1f} mrad RMS, "
-        f"{metrics['outliers']} outliers × {params['outlier_amp']:.2f} rad, "
-        f"{metrics['stalls']} stalls × {params['stall_ms']:.0f} ms "
+        f"\nInjected [{params['noise']}]: " + "; ".join(parts) + " "
         f"(seed {params['seed']}, cutoff {params['cutoff']:.2f} Hz)"
     )
     print(f"{'═' * 78}")
@@ -177,11 +230,15 @@ def run(args: argparse.Namespace) -> None:
             duration=args.duration,
             amp=args.amp,
             freq=args.freq,
+            noise=args.noise,
             jitter_rms=args.jitter,
             outlier_rate=args.outlier_rate,
             outlier_amp=args.outlier_amp,
             stall_rate=args.stall_rate,
             stall_ms=args.stall_ms,
+            ik_churn=args.ik_churn,
+            ik_jump_rate=args.ik_jump_rate,
+            ik_jump_amp=args.ik_jump_amp,
             cutoff=args.cutoff,
             seed=args.seed,
         )

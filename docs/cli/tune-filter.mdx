@@ -1,33 +1,46 @@
 ---
 title: "tune.filter"
-description: "Inject stalls, outliers, and jitter into a clean motion and score how much the teleop filter stack removes — offline, no hardware."
+description: "Inject network- or IK-shaped noise into a clean motion — each at its real pipeline entry point — and score how much the teleop filter stack removes. Offline, no hardware."
 ---
 
-Tests the teleop filter stack by feeding it a *known-dirty* stream and checking what comes out — no robot, no VR headset, and exactly reproducible. A clean joint-space signal (a synthetic sine, or a committed [reference motion](/cli/motion-build)) is corrupted with the artifacts a real VR/wifi stream carries, then replayed through the production smoothing chain at the production rates: the lag-compensated pose low-pass, the IK-output EMA, and the trapezoidal velocity/acceleration tracker.
+Tests the teleop filter stack by feeding it a *known-dirty* stream and checking what comes out — no robot, no VR headset, and exactly reproducible. A clean joint-space signal (a synthetic sine, or a committed [reference motion](/cli/motion-build)) is corrupted and replayed through the production smoothing chain at the production rates.
 
-The three artifact types:
+The production pipeline is:
 
-- **Jitter** — white noise added to every sample (hand tremor, sensor noise).
-- **Outliers** — isolated samples teleported by a fixed magnitude (tracking glitches, a bad IK solve).
-- **Stalls** — spans where the stream freezes on its last sample and then jumps to catch up (wifi stalls, dropped frames).
+```
+VR stream ──> pose low-pass ──> IK solver ──> EMA ──> trapezoid
+   ▲ network noise enters here     ▲ IK noise is created here
+```
 
-The output is scored **against the clean reference**, per joint: the stack should track the intentional motion while removing what was injected. Because the noise is seeded, the corrupted stream is identical from run to run — change a filter parameter (e.g. `--cutoff`), rerun, and compare scores on the exact same input.
+`--noise` picks the source under test, and each source is injected **at its real entry point** — which is what makes the two testable independently:
+
+- **`network`** — transport artifacts injected *before* the pose low-pass, so the whole stack gets to clean them: **jitter** (white noise on every sample — hand tremor, sensor noise), **outliers** (isolated teleported samples — tracking glitches), and **stalls** (the stream freezes on its last sample, then jumps to catch up — wifi stalls, dropped frames).
+- **`ik`** — solver artifacts injected *between* the low-pass and the EMA, exactly where the solver sits in production, so only the EMA and the trapezoid can see them (the pose filter never gets a chance, same as on the real robot): band-limited 3–20 Hz per-joint **churn** (a restless null space — the scale [`diag.offline kinematics`](/cli/diag-offline) measures on real recordings) and persistent **jumps** (a redundancy flip: one joint steps to another solution branch for 0.3–1 s, then returns).
+- **`combined`** (default) — both at once, each at its own injection point: the full production insult.
+
+The output is scored **against the clean reference**, per joint: the stack should track the intentional motion while removing what was injected. The noise is seeded, and the network and IK streams are seeded *independently* — the same seed gives the identical network noise with or without IK noise on top, so mode-to-mode comparisons are apples to apples. Change a filter parameter (e.g. `--cutoff`), rerun, and compare scores on the exact same input.
 
 | Flag | Description |
 |---|---|
+| `--noise MODE` | `network`, `ik`, or `combined` (default: combined). Network knobs are ignored in `ik` mode and vice versa |
 | `--motion NAME` | Use a committed reference motion as the clean signal (all 14 joints); default is a synthetic sine |
 | `--duration S` / `--amp RAD` / `--freq HZ` | Sine mode: signal length, amplitude, and frequency (defaults: 10 s, 0.3 rad, 0.5 Hz) |
-| `--jitter RAD` | White-noise RMS added to every sample (default: 0.005 ≈ 0.3°; 0 disables) |
-| `--outlier-rate /S` / `--outlier-amp RAD` | Outlier injection rate and teleport magnitude (defaults: 0.5/s, 0.2 rad ≈ 11°) |
-| `--stall-rate /S` / `--stall-ms MS` | Stall injection rate and length (defaults: 0.5/s, 150 ms) |
+| `--jitter RAD` | Network: white-noise RMS added to every sample (default: 0.005 ≈ 0.3°; 0 disables) |
+| `--outlier-rate /S` / `--outlier-amp RAD` | Network: outlier injection rate and teleport magnitude (defaults: 0.5/s, 0.2 rad ≈ 11°) |
+| `--stall-rate /S` / `--stall-ms MS` | Network: stall injection rate and length (defaults: 0.5/s, 150 ms) |
+| `--ik-churn RAD` | IK: band-limited (3–20 Hz) solver churn RMS per joint (default: 0.003 ≈ 0.17°; 0 disables) |
+| `--ik-jump-rate /S` / `--ik-jump-amp RAD` | IK: solution-jump rate and magnitude (defaults: 0.2/s, 0.05 rad ≈ 3°) |
 | `--cutoff HZ` | Pose low-pass pole frequency (default: the production `pose_cutoff`) |
 | `--seed N` | Noise RNG seed — identical seed, identical corrupted stream (default: 0) |
 | `--label TEXT` | Free-form note stored on the run artifact |
 | `--save-run` | Persist the full time series and scores under `~/.almond/diagnostics/tuning/` for the diagnostics dashboard |
 
 ```bash
-axol tune.filter --save-run                                  # sine + default noise
-axol tune.filter --outlier-amp 0.5 --stall-ms 300 --save-run # harsher stream
+axol tune.filter --noise network --save-run                  # wifi artifacts only
+axol tune.filter --noise ik --save-run                       # solver artifacts only
+axol tune.filter --save-run                                  # both combined
+axol tune.filter --noise network --stall-ms 300 --save-run   # harsher wifi
+axol tune.filter --noise ik --ik-churn 0.01 --save-run       # a very restless solver
 axol tune.filter --motion reach-and-place --save-run         # a real motion, all joints
 axol tune.filter --cutoff 1.5 --label "half cutoff" --save-run
 ```

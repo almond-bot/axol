@@ -10,7 +10,12 @@ access (:mod:`.joint_frame`), and the persisted run-artifact store
 """
 
 from .feedforward import FF_MODES, FeedForward
-from .filtering import filter_noise_analysis, inject_noise, replay_filter_stack
+from .filtering import (
+    filter_noise_analysis,
+    inject_ik_noise,
+    inject_noise,
+    replay_filter_stack,
+)
 from .joint_frame import JointFrameMotor, joint_frame_motors
 from .metrics import (
     BAND_HIGH,
@@ -66,6 +71,7 @@ __all__ = [
     "clear_runs",
     "delete_run",
     "filter_noise_analysis",
+    "inject_ik_noise",
     "inject_noise",
     "joint_frame_motors",
     "list_runs",

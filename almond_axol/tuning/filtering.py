@@ -3,27 +3,41 @@
 The teleop smoothing chain (the lag-compensated pose low-pass, the IK-output
 EMA, and the trapezoidal velocity/acceleration tracker — see
 :mod:`almond_axol.teleop.filter`) exists to clean a dirty target stream.
-This module tests exactly that, with no hardware and no VR headset: take a
-*clean* joint-space motion (a synthetic sine or a committed reference
-motion), corrupt it with the artifacts a real VR/wifi stream carries —
+This module tests exactly that, with no hardware and no VR headset — and it
+respects *where* each real noise source enters the production pipeline,
+which is what makes the sources testable independently:
 
-* **jitter** — additive white noise on every sample (hand tremor, sensor
-  noise),
-* **outliers** — isolated samples teleported by a fixed magnitude (tracking
-  glitches, a bad IK solve),
-* **stalls** — spans where the stream freezes on its last sample and then
-  jumps to catch up (wifi stalls, dropped frames),
+    VR stream ──> pose low-pass ──> IK solver ──> EMA ──> trapezoid
+       ▲ network noise enters here     ▲ IK noise is created here
 
-— replay the corrupted stream through the production filter stack at the
-production rates, and score the output *against the clean reference*. A good
-filter passes the intentional motion (low ``rms_err``, low ``lag_ms``) while
-rejecting the injected garbage (``jitter_passed`` well below 1, ``peak_err``
-far below the outlier magnitude, output acceleration never above teleop's
-configured limit no matter how hard the input slams).
+* ``noise="network"`` — transport artifacts, injected **before** the pose
+  low-pass (the whole stack gets to clean them): white-noise **jitter**
+  (sensor/hand noise), **outliers** (isolated teleported samples — tracking
+  glitches), and **stalls** (the stream freezes on its last sample, then
+  jumps to catch up — wifi stalls, dropped frames).
+* ``noise="ik"`` — solver output artifacts, injected **after** the pose
+  low-pass, exactly where the solver sits in production, so only the EMA
+  and the trapezoid can clean them: band-limited (3–20 Hz) per-joint
+  **churn** (a restless null space) and occasional persistent **jumps** (a
+  redundancy flip: one joint steps to another solution branch for a fraction
+  of a second, then returns).
+* ``noise="combined"`` — both, each at its own injection point: the full
+  production insult.
+
+Take a *clean* joint-space motion (a synthetic sine or a committed reference
+motion), corrupt it per the selected mode, replay through the production
+filter stack at the production rates, and score the output *against the
+clean reference*. A good stack passes the intentional motion (low
+``rms_err``, low ``lag_ms``) while rejecting the injected garbage
+(``jitter_passed`` well below 1, ``peak_err`` far below the outlier
+magnitude, output acceleration never above teleop's configured limit no
+matter how hard the input slams).
 
 Everything is seeded and offline, so a run is exactly reproducible: change a
 filter parameter, rerun on the identical corrupted stream, and compare
-scores run to run.
+scores run to run. The network and IK noise streams are seeded
+independently, so the same seed gives the same network noise whether or not
+IK noise is also enabled.
 
 Stall spans deserve one caveat when reading scores: while the stream is
 frozen the clean reference keeps moving, so error during a stall is
@@ -100,12 +114,67 @@ def inject_noise(
     return noisy, events
 
 
+def inject_ik_noise(
+    t: np.ndarray,
+    n_channels: int,
+    *,
+    churn_rms: float = 0.0,
+    jump_rate: float = 0.0,
+    jump_amp: float = 0.0,
+    seed: int = 0,
+) -> tuple[np.ndarray, dict[str, int]]:
+    """Additive ``(N, J)`` noise shaped like IK solver output artifacts.
+
+    * **churn** — band-limited (3–20 Hz) noise, independent per joint: the
+      restless-null-space wobble ``diag.offline kinematics`` measures on real
+      recordings (~0.1–0.3° RMS per joint on a healthy solve).
+    * **jumps** — one joint steps by ``jump_amp`` and *stays there* for
+      0.3–1 s before returning: a redundancy flip to another solution
+      branch. Unlike a network outlier this is not a single bad sample, so
+      an outlier-rejecting trick alone can't remove it.
+
+    Seeded independently of :func:`inject_noise` (same ``seed``, different
+    stream), so enabling one source never changes the other's realization.
+    """
+    rng = np.random.default_rng([seed, 1])
+    n = len(t)
+    noise = np.zeros((n, n_channels), dtype=float)
+    span = float(t[-1] - t[0])
+    dt = float(np.median(np.diff(t)))
+    events = {"ik_jumps": 0}
+
+    if churn_rms > 0.0 and n > 8:
+        freqs = np.fft.rfftfreq(n, dt)
+        mask = (freqs >= 3.0) & (freqs <= 20.0)
+        for j in range(n_channels):
+            spec = np.fft.rfft(rng.normal(0.0, 1.0, n))
+            spec[~mask] = 0.0
+            band = np.fft.irfft(spec, n)
+            rms = float(np.sqrt(np.mean(band**2)))
+            if rms > 0.0:
+                noise[:, j] += band * (churn_rms / rms)
+
+    if jump_rate > 0.0 and jump_amp > 0.0:
+        count = max(1, round(jump_rate * span))
+        for _ in range(count):
+            ch = int(rng.integers(n_channels))
+            start = float(rng.uniform(float(t[0]), float(t[-1])))
+            dur = float(rng.uniform(0.3, 1.0))
+            sign = float(rng.choice([-1.0, 1.0]))
+            i0 = int(np.searchsorted(t, start))
+            i1 = int(np.searchsorted(t, start + dur))
+            noise[i0:i1, ch] += sign * jump_amp
+        events["ik_jumps"] = count
+    return noise, events
+
+
 def replay_filter_stack(
     t_in: np.ndarray,
     x_in: np.ndarray,
     *,
     cutoff: float | None = None,
     config: VRTeleopConfig | None = None,
+    post_lp_noise: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run an ``(N, J)`` target stream through the production smoothing chain.
 
@@ -116,6 +185,11 @@ def replay_filter_stack(
     :meth:`TeleopCore <almond_axol.teleop.core>` (EMA first, trapezoid last).
     The pose filter is applied in joint space here; it is a linear per-channel
     filter, so its rejection behaves identically regardless of the space.
+
+    ``post_lp_noise`` (``(N, J)``, optional) is added *between* the pose
+    low-pass and the EMA — the point where the IK solver sits in production
+    — so solver-shaped artifacts hit only the stages that can actually see
+    them there.
 
     Returns ``(t_out, filtered, hold_index)`` where ``t_out`` is the control-
     rate grid and ``hold_index[k]`` is the input sample the control tick ``k``
@@ -129,6 +203,8 @@ def replay_filter_stack(
         rate_in, cutoff if cutoff is not None else cfg.pose_cutoff
     )
     pose = np.stack([lp.update(x, float(ts)) for ts, x in zip(t_in, x_in)])
+    if post_lp_noise is not None:
+        pose = pose + np.asarray(post_lp_noise, dtype=float)
 
     dt = 1.0 / cfg.frequency
     # ik_alpha is specified per-tick at the historical 120 Hz rate; convert
@@ -198,11 +274,15 @@ def filter_noise_analysis(
     duration: float = 10.0,
     amp: float = 0.3,
     freq: float = 0.5,
+    noise: str = "combined",
     jitter_rms: float = 0.005,
     outlier_rate: float = 0.5,
     outlier_amp: float = 0.2,
     stall_rate: float = 0.5,
     stall_ms: float = 150.0,
+    ik_churn: float = 0.003,
+    ik_jump_rate: float = 0.2,
+    ik_jump_amp: float = 0.05,
     cutoff: float | None = None,
     seed: int = 0,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any]]:
@@ -210,12 +290,22 @@ def filter_noise_analysis(
 
     ``motion`` selects a committed reference motion as the clean signal (all
     14 joints); ``None`` synthesizes an ``amp``·sin(2π·``freq``·t) sine for
-    ``duration`` seconds at the IK cadence, as a single channel. Returns
-    ``(series, metrics, params)`` in the standard tuning-run shape, with
-    every series resampled onto the control-rate grid: ``clean`` (the
-    reference), ``noisy`` (what the stack was fed, as the control loop saw
-    it), and ``filtered`` (what came out).
+    ``duration`` seconds at the IK cadence, as a single channel.
+
+    ``noise`` selects the source under test and its real injection point
+    (see the module docstring): ``"network"`` puts jitter/outliers/stalls in
+    front of the pose low-pass, ``"ik"`` puts solver churn/jumps between the
+    low-pass and the EMA, ``"combined"`` does both. The network knobs are
+    ignored in ``"ik"`` mode and vice versa.
+
+    Returns ``(series, metrics, params)`` in the standard tuning-run shape,
+    with every series resampled onto the control-rate grid: ``clean`` (the
+    reference), ``noisy`` (the fully corrupted, unfiltered signal — what the
+    arm would be fed with no filtering at all), and ``filtered`` (what came
+    out of the stack).
     """
+    if noise not in ("network", "ik", "combined"):
+        raise ValueError(f"unknown noise mode {noise!r} (network / ik / combined)")
     cfg = VRTeleopConfig()
     if motion is not None:
         ref = load_motion(motion)
@@ -230,23 +320,38 @@ def filter_noise_analysis(
         columns = ["sine"]
         source = "sine"
 
+    with_network = noise in ("network", "combined")
+    with_ik = noise in ("ik", "combined")
     noisy_in, events = inject_noise(
         t_in,
         x,
-        jitter_rms=jitter_rms,
-        outlier_rate=outlier_rate,
-        outlier_amp=outlier_amp,
-        stall_rate=stall_rate,
-        stall_ms=stall_ms,
+        jitter_rms=jitter_rms if with_network else 0.0,
+        outlier_rate=outlier_rate if with_network else 0.0,
+        outlier_amp=outlier_amp if with_network else 0.0,
+        stall_rate=stall_rate if with_network else 0.0,
+        stall_ms=stall_ms if with_network else 0.0,
         seed=seed,
     )
+    ik_noise: np.ndarray | None = None
+    ik_events = {"ik_jumps": 0}
+    if with_ik:
+        ik_noise, ik_events = inject_ik_noise(
+            t_in,
+            x.shape[1],
+            churn_rms=ik_churn,
+            jump_rate=ik_jump_rate,
+            jump_amp=ik_jump_amp,
+            seed=seed,
+        )
     t_out, filtered, hold_index = replay_filter_stack(
-        t_in, noisy_in, cutoff=cutoff, config=cfg
+        t_in, noisy_in, cutoff=cutoff, config=cfg, post_lp_noise=ik_noise
     )
     dt = 1.0 / cfg.frequency
 
     clean = np.stack([np.interp(t_out, t_in, x[:, i]) for i in range(x.shape[1])]).T
     noisy = noisy_in[hold_index]
+    if ik_noise is not None:
+        noisy = noisy + ik_noise[hold_index]
 
     per_joint: dict[str, dict[str, float]] = {}
     for i, name in enumerate(columns):
@@ -272,17 +377,22 @@ def filter_noise_analysis(
         ),
         "accel_limit": float(cfg.teleop_max_accel),
         **events,
+        **ik_events,
     }
     params: dict[str, Any] = {
         "source": source,
+        "noise": noise,
         "duration": float(t_in[-1] - t_in[0]),
         "amp": amp if motion is None else None,
         "freq": freq if motion is None else None,
-        "jitter_rms": jitter_rms,
-        "outlier_rate": outlier_rate,
-        "outlier_amp": outlier_amp,
-        "stall_rate": stall_rate,
-        "stall_ms": stall_ms,
+        "jitter_rms": jitter_rms if with_network else 0.0,
+        "outlier_rate": outlier_rate if with_network else 0.0,
+        "outlier_amp": outlier_amp if with_network else 0.0,
+        "stall_rate": stall_rate if with_network else 0.0,
+        "stall_ms": stall_ms if with_network else 0.0,
+        "ik_churn": ik_churn if with_ik else 0.0,
+        "ik_jump_rate": ik_jump_rate if with_ik else 0.0,
+        "ik_jump_amp": ik_jump_amp if with_ik else 0.0,
         "cutoff": cutoff if cutoff is not None else cfg.pose_cutoff,
         "seed": seed,
         "columns": columns,
