@@ -1,0 +1,28 @@
+---
+title: "diag.offline"
+description: "Offline wifi / filtering / kinematics analysis of a teleop flight-recorder capture."
+---
+
+Analyzes a teleop flight-recorder capture (`axol teleop --teleop.jitter_record PREFIX`) offline — no hardware needed. Each suite isolates one stage of the teleop pipeline and answers one question, so jitter can be attributed deterministically instead of guessed at:
+
+| Suite | Question | What it reports |
+|---|---|---|
+| `wifi` | Is the transport jittery? | VR frame inter-arrival median/p95/p99/max, gaps (> 100 ms) and burst frames — recovered from raw-pose change ticks, so hand motion can't fake them. A quiet IK tick interval alongside gaps points at the network; a noisy one points at the host starving the IK process. |
+| `filtering` | What does the pose filter stack pass through? | 3–15 Hz band RMS per stage (raw VR pose → filtered pose → world EE target) per axis, the pass-through ratio, and the lag each stage adds. Mid-band content that reaches the EE target is what the arm is asked to reproduce — if it's high, tune the filter, not the motors. |
+| `kinematics` | Does the IK add motion the hand didn't make? | EE tracking error (FK of the solved joints vs the world target), per-joint churn (°/min — a restless null space churns without EE motion), and per-joint mid-band jitter with its dominant frequency. |
+
+| Flag | Description |
+|---|---|
+| `suite` | `wifi`, `filtering`, or `kinematics` (required) |
+| `prefix` | Flight-recorder prefix used with `--teleop.jitter_record` (required) |
+| `--save-run` | Persist the analysis as a tuning-run artifact (`~/.almond/diagnostics/tuning/`) for the diagnostics UI |
+| `--label TEXT` | Free-form note stored on the run artifact |
+
+```bash
+axol teleop --teleop.jitter_record /tmp/rec     # record a session first
+axol diag.offline wifi /tmp/rec
+axol diag.offline filtering /tmp/rec --save-run
+axol diag.offline kinematics /tmp/rec --save-run --label "solver v2"
+```
+
+See also [`diag.teleop-jitter`](/cli/diag-teleop-jitter) for the stage-by-stage band breakdown of one capture, and [`tune.motion`](/cli/tune-motion) for the hardware-side counterpart.

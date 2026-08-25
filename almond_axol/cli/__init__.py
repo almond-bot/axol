@@ -57,6 +57,11 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
         "Attribute teleop jitter to a pipeline stage from a flight-recorder "
         "capture (axol teleop --teleop.jitter_record PREFIX).",
     ),
+    "diag.offline": (
+        "almond_axol.diagnostics.offline_suites",
+        "Offline wifi/filtering/kinematics analysis of a flight-recorder "
+        "capture, persisted as tuning runs for the diagnostics UI.",
+    ),
 }
 
 _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
