@@ -215,6 +215,14 @@ export async function shutdownHost(): Promise<{ ok: boolean }> {
   return json(await fetch(apiUrl("/api/host/shutdown"), { method: "POST" }))
 }
 
+/**
+ * Reboot the serve host (`shutdown -r now`). Refused (409) while an
+ * operation or session is running.
+ */
+export async function restartHost(): Promise<{ ok: boolean }> {
+  return json(await fetch(apiUrl("/api/host/restart"), { method: "POST" }))
+}
+
 // ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
@@ -350,6 +358,21 @@ export async function fetchUsbStatus(): Promise<UsbStatus> {
 
 export async function usbConnect(): Promise<UsbStatus> {
   return json(await fetch(apiUrl("/api/usb/connect"), { method: "POST" }))
+}
+
+/**
+ * Disable (true) or restore (false) the headset's proximity sensor over adb.
+ * Disabled, the Quest stays awake with nobody wearing it — headless sessions
+ * keep their pose stream. Holds until restored or the headset reboots.
+ */
+export async function setQuestProximityDisabled(disabled: boolean): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/usb/proximity"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled }),
+    })
+  )
 }
 
 // ---------------------------------------------------------------------------

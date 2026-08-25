@@ -539,13 +539,15 @@ export default function ControlPanel() {
   const selectedLive = isLive && runningOp === opId
   const selectedStopping = isStopping && runningOp === opId
 
-  // Whether an update is currently unsafe to apply. `isLive` is the immediate,
-  // local signal (reacts the instant an op starts/stops) so the banner blocks
-  // without waiting for the slow status poll; the server's `update.idle` is the
-  // backstop for any other non-idle reason (and the server guards the request
-  // regardless). Mirrors the server's _is_idle: only a running operation blocks
-  // a restart (a connected robot is fine).
-  const updateBlocked = isLive || !(update?.idle ?? true)
+  // Whether the host is currently unsafe to restart / power off / update.
+  // `isLive` is the immediate, local signal (reacts the instant an op starts/
+  // stops) so the UI blocks without waiting for the slow status poll; the
+  // server's `update.idle` is the backstop for any other non-idle reason —
+  // e.g. a diagnostics run launched from another page or browser — (and the
+  // server guards each request regardless). Mirrors the server's _is_idle:
+  // only a running operation/session blocks (a connected robot is fine).
+  // Shared by the update banner and the host tile's power confirmations.
+  const hostBusy = isLive || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
 
@@ -787,7 +789,7 @@ export default function ControlPanel() {
             update={update}
             updating={updating}
             phase={updatePhase}
-            blocked={updateBlocked}
+            blocked={hostBusy}
             busyReason={updateBusyReason}
             onUpdate={handleUpdate}
           />
@@ -804,6 +806,7 @@ export default function ControlPanel() {
           version={update?.version ?? hostInfo?.version ?? null}
           onOpenSetup={() => setSetupOpen(true)}
           onHostDisconnect={hostDisconnectClick}
+          opRunning={hostBusy}
           robot={robot}
           robotBusy={robotBusy}
           onRobotConnect={() => robotConnectClick()}

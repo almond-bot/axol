@@ -5,7 +5,6 @@ import {
   Crosshair,
   ClipboardList,
   Loader2,
-  Power,
   Radio,
   SlidersHorizontal,
   Tag,
@@ -14,7 +13,6 @@ import {
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card } from "@/components/ui/card"
 import { SiteNav } from "@/components/site-nav"
 import { useToast } from "@/components/ui/toast"
 import { MotorGrid } from "@/components/diagnostics/motor-grid"
@@ -41,7 +39,6 @@ import {
   robotConnect,
   sendSessionInput,
   setServerBase,
-  shutdownHost,
   stopSession,
   useSessionLogs,
   type CommandSpec,
@@ -333,23 +330,6 @@ export default function Diagnostics() {
       setLaunchBusy(false)
     }
   }, [activeRun, toast])
-
-  // Host power-off (shutdown -h now), behind a confirmation dialog. The
-  // server refuses while an operation or session is running.
-  const [shutdownOpen, setShutdownOpen] = useState(false)
-  const [shutdownBusy, setShutdownBusy] = useState(false)
-  const confirmShutdown = useCallback(async () => {
-    setShutdownBusy(true)
-    try {
-      await shutdownHost()
-      setShutdownOpen(false)
-      toast.success("Host is shutting down.")
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setShutdownBusy(false)
-    }
-  }, [toast])
 
   const connectRobot = useCallback(async () => {
     setRobotBusy(true)
@@ -849,19 +829,7 @@ export default function Diagnostics() {
 
         {/* Diagnostics actions */}
         <section className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-3">
-            <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto text-red-300 hover:bg-red-400/10"
-              title="Power off the robot host (shutdown -h now)."
-              disabled={!serverOk}
-              onClick={() => setShutdownOpen(true)}
-            >
-              <Power /> Shut down host
-            </Button>
-          </div>
+          <h2 className="font-heading text-base font-semibold">Diagnostics</h2>
           <DiagnosticActions
             commands={diagCommands}
             activeCommand={activeRun?.command ?? null}
@@ -907,46 +875,6 @@ export default function Diagnostics() {
           onStop={stopActive}
           onClose={() => setMotorTool(null)}
         />
-      )}
-
-      {/* Host shutdown confirmation */}
-      {shutdownOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-          onClick={() => setShutdownOpen(false)}
-        >
-          <Card
-            className="w-full max-w-sm gap-4 bg-[#1a1a1a] p-5"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex flex-col gap-1">
-              <h3 className="font-heading text-base font-semibold">Shut down host</h3>
-              <p className="text-sm leading-relaxed text-white/45">
-                Power off the robot host (<span className="font-mono">shutdown -h now</span>).
-                This panel loses its connection immediately, and turning the robot back on
-                requires physical access to it.
-              </p>
-            </div>
-            {(activeRun != null || busyElsewhere) && (
-              <p className="text-xs text-amber-200/70">
-                A run or operation is in flight — stop it before shutting down.
-              </p>
-            )}
-            <div className="flex items-center justify-end gap-2 pt-1">
-              <Button variant="ghost" size="sm" onClick={() => setShutdownOpen(false)}>
-                Cancel
-              </Button>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={confirmShutdown}
-                disabled={shutdownBusy || activeRun != null || busyElsewhere}
-              >
-                {shutdownBusy ? <Loader2 className="animate-spin" /> : <Power />} Shut down
-              </Button>
-            </div>
-          </Card>
-        </div>
       )}
 
       {/* Manual CAN interface selection (non-Axol-hub adapters) */}
