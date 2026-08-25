@@ -29,6 +29,10 @@ import {
 const COMMANDED_COLOR = "rgba(255,255,255,0.45)"
 const ACTUAL_COLOR = "#eff483"
 const NOISY_COLOR = "rgba(230,103,103,0.5)"
+const ERROR_COLOR = "#e6906b"
+const MAP_GOOD = "#79c98c"
+const MAP_WARN = "#e6c067"
+const MAP_BAD = "#e66767"
 
 const ARM_JOINT_OPTIONS = [
   "shoulder_1",
@@ -145,22 +149,28 @@ const TABS: WbTab[] = [
     label: "Filter",
     command: "tune.filter",
     description:
-      "Test the teleop filter stack without moving the robot: inject stalls, " +
-      "outliers, and jitter into a clean motion (a synthetic sine, or a " +
-      "committed reference motion) and replay it through the production " +
-      "smoothing chain. The output is scored against the clean signal — same " +
-      "seed, same corrupted stream, so runs compare exactly.",
+      "Test the teleop filter stack without moving the robot, one noise " +
+      "source at a time: network noise (jitter, outliers, stalls) is " +
+      "injected before the pose low-pass, IK noise (solver churn, solution " +
+      "jumps) after it — each at its real entry point in the pipeline — or " +
+      "both combined. The corrupted stream replays through the production " +
+      "smoothing chain and is scored against the clean signal; same seed, " +
+      "same corrupted stream, so runs compare exactly.",
     presets: { save_run: true },
     fields: [
+      { key: "noise", label: "noise", type: "select", options: ["combined", "network", "ik"] },
       { key: "motion", label: "motion", type: "select", options: [] },
       { key: "amp", label: "sine amp (rad)", type: "number", placeholder: "0.3" },
       { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.5" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "10" },
-      { key: "jitter", label: "jitter (rad RMS)", type: "number", placeholder: "0.005" },
-      { key: "outlier_amp", label: "outlier (rad)", type: "number", placeholder: "0.2" },
-      { key: "outlier_rate", label: "outliers /s", type: "number", placeholder: "0.5" },
-      { key: "stall_ms", label: "stall (ms)", type: "number", placeholder: "150" },
-      { key: "stall_rate", label: "stalls /s", type: "number", placeholder: "0.5" },
+      { key: "jitter", label: "net jitter (rad RMS)", type: "number", placeholder: "0.005" },
+      { key: "outlier_amp", label: "net outlier (rad)", type: "number", placeholder: "0.2" },
+      { key: "outlier_rate", label: "net outliers /s", type: "number", placeholder: "0.5" },
+      { key: "stall_ms", label: "net stall (ms)", type: "number", placeholder: "150" },
+      { key: "stall_rate", label: "net stalls /s", type: "number", placeholder: "0.5" },
+      { key: "ik_churn", label: "ik churn (rad RMS)", type: "number", placeholder: "0.003", advanced: true },
+      { key: "ik_jump_amp", label: "ik jump (rad)", type: "number", placeholder: "0.05", advanced: true },
+      { key: "ik_jump_rate", label: "ik jumps /s", type: "number", placeholder: "0.2", advanced: true },
       { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config", advanced: true },
       { key: "seed", label: "seed", type: "number", placeholder: "0", advanced: true },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
@@ -317,6 +327,28 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
 interface JointChart {
   joint: string
   series: RunChartSeries[]
+  /** Error lane (reference − output, in degrees) under the position plot. */
+  sub: RunChartSeries[]
+}
+
+/**
+ * The error trace for a chart's lane, in degrees. Position traces overlap
+ * whenever tracking is halfway decent — the error at its own scale is where
+ * a failure actually shows.
+ */
+function errorLane(
+  t: (number | null)[],
+  reference: (number | null)[],
+  output: (number | null)[]
+): RunChartSeries[] {
+  const n = Math.min(reference.length, output.length)
+  const err: (number | null)[] = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const r = reference[i]
+    const o = output[i]
+    err[i] = r == null || o == null ? null : toDeg(o - r)
+  }
+  return [{ label: "error °", color: ERROR_COLOR, x: t, data: err }]
 }
 
 /** Commanded-vs-actual charts for every joint of `arm` that actually moved. */
@@ -345,6 +377,7 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
         { label: "commanded", color: COMMANDED_COLOR, x: t, data: commanded },
         { label: "actual", color: ACTUAL_COLOR, x: t, data: actual },
       ],
+      sub: errorLane(t, commanded, actual),
     })
   }
   return out
@@ -381,7 +414,11 @@ function filterJointCharts(run: TuningRunData, arm: string | null): JointChart[]
     ]
     if (noisy) series.push({ label: "noisy input", color: NOISY_COLOR, x: t, data: noisy })
     series.push({ label: "filtered", color: ACTUAL_COLOR, x: t, data: filtered })
-    out.push({ joint: arm != null ? name.slice(arm.length + 1) : name, series })
+    out.push({
+      joint: arm != null ? name.slice(arm.length + 1) : name,
+      series,
+      sub: errorLane(t, clean, filtered),
+    })
   }
   return out
 }
@@ -409,6 +446,7 @@ function pidJointChart(run: TuningRunData): JointChart | null {
       { label: "commanded", color: COMMANDED_COLOR, x: t, data: commanded },
       { label: "actual", color: ACTUAL_COLOR, x: t, data: actual },
     ],
+    sub: errorLane(t, commanded, actual),
   }
 }
 
@@ -419,19 +457,26 @@ interface ScoreCol {
   /** Convert radians to degrees for display. */
   deg?: boolean
   digits?: number
+  /**
+   * Coloring thresholds in display units, lower-is-better: at or above
+   * `warn` the cell turns amber, at or above `bad` red — so a failing joint
+   * is visible without reading every number.
+   */
+  warn?: number
+  bad?: number
 }
 
 const MOTION_COLS: ScoreCol[] = [
-  { key: "rms_err", label: "tracking RMS °", deg: true, digits: 3 },
-  { key: "lag_ms", label: "lag ms", digits: 0 },
-  { key: "err_band_mid", label: "jitter °", deg: true, digits: 3 },
-  { key: "amplification", label: "ringing ×" },
+  { key: "rms_err", label: "tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "lag_ms", label: "lag ms", digits: 0, warn: 40, bad: 80 },
+  { key: "err_band_mid", label: "jitter °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
+  { key: "amplification", label: "ringing ×", warn: 1.15, bad: 1.5 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
 ]
 
 const SINE_COLS: ScoreCol[] = [
-  { key: "rms", label: "tracking RMS °", deg: true, digits: 3 },
-  { key: "max", label: "max err °", deg: true, digits: 3 },
+  { key: "rms", label: "tracking RMS °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "max", label: "max err °", deg: true, digits: 3, warn: 3, bad: 6 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
   { key: "pos_ripple", label: "ripple", digits: 4 },
   { key: "score", label: "score", digits: 3 },
@@ -440,17 +485,17 @@ const SINE_COLS: ScoreCol[] = [
 const FILTER_COLS: ScoreCol[] = [
   { key: "input_rms", label: "noise in °", deg: true, digits: 3 },
   { key: "rms_err", label: "error out °", deg: true, digits: 3 },
-  { key: "rms_err_lagfree", label: "lag-free °", deg: true, digits: 3 },
-  { key: "lag_ms", label: "lag ms", digits: 0 },
-  { key: "jitter_passed", label: "jitter passed ×" },
+  { key: "rms_err_lagfree", label: "lag-free °", deg: true, digits: 3, warn: 1.0, bad: 2.5 },
+  { key: "lag_ms", label: "lag ms", digits: 0, warn: 60, bad: 120 },
+  { key: "jitter_passed", label: "jitter passed ×", warn: 0.7, bad: 1.0 },
   { key: "peak_err", label: "peak err °", deg: true, digits: 3 },
   { key: "accel_peak", label: "peak accel rad/s²", digits: 1 },
 ]
 
 const STEP_COLS: ScoreCol[] = [
-  { key: "settling_s", label: "settling s" },
-  { key: "overshoot", label: "overshoot °", deg: true, digits: 3 },
-  { key: "ss_rms", label: "steady-state RMS °", deg: true, digits: 3 },
+  { key: "settling_s", label: "settling s", warn: 0.4, bad: 0.8 },
+  { key: "overshoot", label: "overshoot °", deg: true, digits: 3, warn: 1, bad: 3 },
+  { key: "ss_rms", label: "steady-state RMS °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
   { key: "ring_hz", label: "ring Hz", digits: 1 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
   { key: "score", label: "score", digits: 3 },
@@ -508,10 +553,159 @@ function scoreRows(
   return null
 }
 
-function fmtScore(values: Record<string, unknown>, col: ScoreCol): string {
+/** Display value in the column's units, or null when absent. */
+function scoreValue(values: Record<string, unknown>, col: ScoreCol): number | null {
   const v = values[col.key]
-  if (typeof v !== "number" || !Number.isFinite(v)) return "–"
-  return fmtNum(col.deg ? toDeg(v) : v, col.digits ?? 2)
+  if (typeof v !== "number" || !Number.isFinite(v)) return null
+  return col.deg ? toDeg(v) : v
+}
+
+/** Text color class for a score cell — amber at warn, red at bad. */
+function scoreClass(v: number | null, col: ScoreCol): string {
+  if (v == null || col.warn == null) return "text-white/85"
+  if (v >= (col.bad ?? Infinity)) return "text-red-300"
+  if (v >= col.warn) return "text-amber-200"
+  return "text-white/85"
+}
+
+/* ------------------------------------------------------------------ */
+/* Failure map: both arms at once, one bar per joint                  */
+/* ------------------------------------------------------------------ */
+
+const MAP_JOINT_ORDER = [...ARM_JOINT_OPTIONS, "gripper"]
+
+/** Which per-joint metric localizes failure for each run kind. */
+const MAP_SPECS: Record<
+  string,
+  { metric: string; deg: boolean; label: string; unit: string; warn: number; bad: number }
+> = {
+  motion: {
+    metric: "rms_err",
+    deg: true,
+    label: "tracking RMS",
+    unit: "°",
+    warn: 1.0,
+    bad: 2.5,
+  },
+  filter: {
+    metric: "rms_err_lagfree",
+    deg: true,
+    label: "lag-free residual",
+    unit: "°",
+    warn: 1.0,
+    bad: 2.5,
+  },
+}
+
+function mapColor(v: number, warn: number, bad: number): string {
+  return v >= bad ? MAP_BAD : v >= warn ? MAP_WARN : MAP_GOOD
+}
+
+/**
+ * The at-a-glance failure map: every joint of both arms in one view, one
+ * horizontal bar per joint sized by its headline error and colored by the
+ * same thresholds as the score table — the failing joint and side jump out
+ * without flipping arm tabs or reading numbers. Clicking a joint switches
+ * the charts to that arm and scrolls to that joint's graph.
+ */
+function FailureMap({
+  perJoint,
+  kind,
+  arm,
+  onPick,
+}: {
+  perJoint: Record<string, Record<string, unknown>>
+  kind: string
+  arm: string
+  onPick: (side: string, joint: string) => void
+}) {
+  const spec = MAP_SPECS[kind]
+  if (!spec) return null
+  const sides = ["left", "right"].filter((s) =>
+    Object.keys(perJoint).some((k) => k.startsWith(`${s}.`))
+  )
+  if (sides.length === 0) return null
+
+  const value = (side: string, joint: string): number | null => {
+    const v = perJoint[`${side}.${joint}`]?.[spec.metric]
+    if (typeof v !== "number" || !Number.isFinite(v)) return null
+    return spec.deg ? toDeg(v) : v
+  }
+  const joints = MAP_JOINT_ORDER.filter((j) =>
+    sides.some((s) => `${s}.${j}` in perJoint)
+  )
+  for (const key of Object.keys(perJoint)) {
+    const j = key.split(".").slice(1).join(".")
+    if (j && !joints.includes(j)) joints.push(j)
+  }
+  let maxV = 0
+  for (const s of sides) {
+    for (const j of joints) {
+      const v = value(s, j)
+      if (v != null && v > maxV) maxV = v
+    }
+  }
+  if (maxV <= 0) return null
+
+  return (
+    <Card className="gap-3 p-4">
+      <div className="flex flex-wrap items-baseline gap-2">
+        <h3 className="font-heading text-sm font-semibold">Failure map</h3>
+        <span className="text-xs text-white/35">
+          {spec.label} per joint, both arms — click a joint to jump to its graph
+        </span>
+      </div>
+      <div className={cn("grid gap-x-8 gap-y-1", sides.length > 1 && "sm:grid-cols-2")}>
+        {sides.map((side) => (
+          <div key={side} className="flex flex-col gap-1">
+            <span
+              className={cn(
+                "text-xs font-semibold capitalize",
+                side === arm ? "text-[#eff483]" : "text-white/45"
+              )}
+            >
+              {side} arm{side === arm ? " · charted" : ""}
+            </span>
+            {joints.map((joint) => {
+              const v = value(side, joint)
+              return (
+                <button
+                  key={joint}
+                  type="button"
+                  onClick={() => onPick(side, joint)}
+                  className="group flex items-center gap-2 rounded px-1 py-0.5 text-left transition-colors hover:bg-white/[0.05]"
+                >
+                  <span className="w-24 shrink-0 truncate text-xs text-white/55 group-hover:text-white/85">
+                    {joint}
+                  </span>
+                  <span className="relative h-2.5 min-w-0 flex-1 overflow-hidden rounded-sm bg-white/[0.05]">
+                    {v != null && (
+                      <span
+                        className="absolute inset-y-0 left-0 rounded-sm"
+                        style={{
+                          width: `${Math.max(2, (v / maxV) * 100)}%`,
+                          background: mapColor(v, spec.warn, spec.bad),
+                        }}
+                      />
+                    )}
+                  </span>
+                  <span className="w-14 shrink-0 text-right font-mono text-xs text-white/70 tabular-nums">
+                    {v == null ? "–" : `${fmtNum(v)}${spec.unit}`}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+        ))}
+      </div>
+      <p className="text-[0.65rem] text-white/35">
+        <span style={{ color: MAP_GOOD }}>green</span> under {spec.warn}
+        {spec.unit} · <span style={{ color: MAP_WARN }}>amber</span> worth a look ·{" "}
+        <span style={{ color: MAP_BAD }}>red</span> at or over {spec.bad}
+        {spec.unit} — bar length is relative to the worst joint in this run.
+      </p>
+    </Card>
+  )
 }
 
 /* ------------------------------------------------------------------ */
@@ -521,11 +715,13 @@ function fmtScore(values: Record<string, unknown>, col: ScoreCol): string {
 /**
  * The tuning workbench: pick what to run (sine / step / filter noise test /
  * recorded motion), type the numbers inline, hit Run — and the result lands
- * straight on the graphs below. Everything is joint space: per joint, one
- * chart of commanded vs actual position (clean vs noisy vs filtered for
- * filter runs), split into left/right arm tabs when a run covers both arms,
- * and one score row per joint. Runs are compared by their headline tracking
- * score in the run list.
+ * straight on the graphs below. Everything is joint space and built to
+ * localize failures visually: a failure map shows both arms' per-joint error
+ * at once (click a joint to jump to its graph), each joint gets a commanded
+ * vs actual chart (clean vs noisy vs filtered for filter runs) with an
+ * error lane underneath at the error's own scale, and the score table
+ * colors cells amber/red past the same thresholds. Runs are compared by
+ * their headline tracking score in the run list.
  */
 export function TuningWorkbench({
   enabled,
@@ -683,6 +879,20 @@ export function TuningWorkbench({
   }, [run, arm, armed])
   const scores = meta ? scoreRows(meta, armed ? arm : null) : null
   const legend = meta ? SCORE_LEGEND[meta.kind] : null
+  const perJoint = (meta?.metrics as Record<string, unknown> | undefined)?.per_joint as
+    | Record<string, Record<string, unknown>>
+    | undefined
+
+  // Failure-map click: chart that arm, then scroll to that joint's graph
+  // (after the arm switch has re-rendered the chart grid).
+  const pickJoint = useCallback((side: string, joint: string) => {
+    setArm(side)
+    setTimeout(() => {
+      document
+        .getElementById(`joint-chart-${joint}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center" })
+    }, 60)
+  }, [])
 
   const remove = useCallback(
     async (id: string) => {
@@ -852,6 +1062,7 @@ export function TuningWorkbench({
             {meta.joint ? `${meta.side} ${meta.joint}` : ""}
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
             {meta.params.source ? `${meta.params.source as string}` : ""}
+            {meta.params.noise ? ` · ${meta.params.noise as string} noise` : ""}
             {Object.keys(meta.gains).length > 0 ? ` · ${gainsSummary(meta.gains)}` : ""}
             {meta.label ? ` · ${meta.label}` : ""}
           </span>
@@ -877,7 +1088,12 @@ export function TuningWorkbench({
         </div>
       )}
 
-      {/* Commanded vs actual position, one chart per joint. */}
+      {/* Both arms at a glance: where the tracking error concentrates. */}
+      {meta && perJoint && (
+        <FailureMap perJoint={perJoint} kind={meta.kind} arm={arm} onPick={pickJoint} />
+      )}
+
+      {/* Commanded vs actual position + error lane, one chart per joint. */}
       {run && jointCharts.length > 0 && (
         <div
           className={cn("grid grid-cols-1 gap-4", jointCharts.length > 1 && "xl:grid-cols-2")}
@@ -885,10 +1101,12 @@ export function TuningWorkbench({
           {jointCharts.map((c) => (
             <RunChart
               key={c.joint}
+              id={`joint-chart-${c.joint}`}
               title={c.joint}
               unit="rad"
               series={c.series}
-              height={jointCharts.length > 1 ? 190 : 240}
+              sub={c.sub}
+              height={jointCharts.length > 1 ? 260 : 310}
             />
           ))}
         </div>
@@ -921,18 +1139,23 @@ export function TuningWorkbench({
                 {scores.rows.map((row) => (
                   <tr key={row.joint} className="border-t border-white/[0.06]">
                     <td className="py-1 pr-4 font-sans text-white/55">{row.joint}</td>
-                    {scores.cols.map((c) => (
-                      <td key={c.key} className="py-1 pr-4 text-white/85">
-                        {fmtScore(row.values, c)}
-                      </td>
-                    ))}
+                    {scores.cols.map((c) => {
+                      const v = scoreValue(row.values, c)
+                      return (
+                        <td key={c.key} className={cn("py-1 pr-4", scoreClass(v, c))}>
+                          {v == null ? "–" : fmtNum(v, c.digits ?? 2)}
+                        </td>
+                      )
+                    })}
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
           {legend && (
-            <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">{legend}</p>
+            <p className="max-w-3xl text-[0.65rem] leading-relaxed text-white/35">
+              {legend} Amber cells are worth a look, red cells are failing.
+            </p>
           )}
         </Card>
       )}
@@ -996,6 +1219,7 @@ export function TuningWorkbench({
                       r.joint,
                       (r.params.motion as string) ?? null,
                       (r.params.source as string) ?? null,
+                      r.params.noise ? `${r.params.noise as string} noise` : null,
                     ]
                       .filter(Boolean)
                       .join(" · ") || "—"}
