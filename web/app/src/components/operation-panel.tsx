@@ -646,8 +646,8 @@ function EpisodeControls({
 /**
  * A server-driven episode control rendered as a text field + submit button
  * (`input: true` on the spec): submitting posts `${command} ${text}` to
- * /api/op/episode — e.g. axol-pi's post-episode notes, where the op attaches
- * the text to the just-saved episode. The field starts from the spec's
+ * /api/op/episode — e.g. a downstream op's post-episode notes, where the op
+ * attaches the text to the just-saved episode. The field starts from the spec's
  * `value` (the current server-side text), so an earlier submission survives
  * phase changes and can be edited; submit is disabled while the text matches
  * what the server already has.
