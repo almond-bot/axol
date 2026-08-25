@@ -482,7 +482,15 @@ def _make_action_field(
         return node, key, {"t": "pos"}, required
 
     flag = action.option_strings[0]
-    spec = {"t": "optlist", "flag": flag} if is_list else {"t": "opt", "flag": flag}
+    if isinstance(action, argparse._AppendAction):
+        # Repeatable option (action="append", e.g. tune.motion's --gain):
+        # one text field whose whitespace-separated tokens each become their
+        # own ``--flag token`` pair.
+        spec = {"t": "optmany", "flag": flag}
+    elif is_list:
+        spec = {"t": "optlist", "flag": flag}
+    else:
+        spec = {"t": "opt", "flag": flag}
     node = _field(key, label, ftype, default, options, required, help_text)
     return node, key, spec, required
 

@@ -25,6 +25,7 @@ import {
   type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
+import { TuningPanel } from "@/components/diagnostics/tuning-panel"
 import {
   TelemetryChart,
   type ChartSeries,
@@ -842,6 +843,10 @@ export default function Diagnostics() {
             onStop={stopActive}
           />
         </section>
+
+        {/* Tuning runs: saved sine/step/motion/offline experiments with
+            scorecards, charts, and A/B compare. */}
+        <TuningPanel enabled={serverOk} />
 
         {/* Run history */}
         <RunHistory runs={runs} loading={runsLoading} onRefresh={refreshRuns} onClear={clearRuns} />

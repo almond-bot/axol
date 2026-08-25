@@ -8,11 +8,14 @@ is available it is served too, with SPA-style fallback to ``index.html``.
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import socket
 import subprocess
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -569,6 +572,92 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         if data is None:
             return JSONResponse({"error": "unknown run"}, status_code=404)
         return JSONResponse(data)
+
+    # -- tuning runs (sine/step probes, motion replays, offline suites) -------
+    #
+    # These are the artifacts the tuning library persists under
+    # ~/.almond/diagnostics/tuning/ (see almond_axol.tuning.runs). Distinct
+    # from the diagnostics run *history* above: a tuning run is a scored
+    # experiment with full time series, made for charting and A/B comparison.
+
+    @app.get("/api/tuning/runs")
+    async def tuning_runs() -> dict[str, Any]:
+        from ..tuning import list_runs
+
+        return {"runs": await asyncio.to_thread(list_runs)}
+
+    @app.delete("/api/tuning/runs")
+    async def tuning_runs_clear() -> dict[str, Any]:
+        from ..tuning import clear_runs
+
+        return {"removed": await asyncio.to_thread(clear_runs)}
+
+    @app.get("/api/tuning/runs/{run_id}")
+    async def tuning_run_data(run_id: str, max_points: int = 4000) -> JSONResponse:
+        """One run's metadata plus its time series, decimated for charting.
+
+        ``max_points`` caps each series' length (stride decimation — plenty
+        for on-screen charts; the full-resolution NPZ stays on disk for
+        offline analysis). NaN samples become null in the JSON.
+        """
+        from ..tuning import load_run
+
+        loaded = await asyncio.to_thread(load_run, run_id)
+        if loaded is None:
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        meta, series = loaded
+
+        def _decimate() -> dict[str, list[float | None]]:
+            def to_json(col: np.ndarray, stride: int) -> list[float | None]:
+                return [float(v) if math.isfinite(v) else None for v in col[::stride]]
+
+            out: dict[str, list[float | None]] = {}
+            for key, arr in series.items():
+                a = np.asarray(arr, dtype=float)
+                if a.ndim == 0 or len(a) == 0:
+                    continue
+                stride = max(1, len(a) // max(max_points, 2))
+                if a.ndim == 1:
+                    out[key] = to_json(a, stride)
+                else:
+                    # Multi-column series (e.g. a motion run's N×14 joint
+                    # matrix) become one flat key per column, "<key>/<i>";
+                    # column names live in meta.params (e.g. "columns").
+                    cols = a.reshape(len(a), -1)
+                    for i in range(cols.shape[1]):
+                        out[f"{key}/{i}"] = to_json(cols[:, i], stride)
+            return out
+
+        return JSONResponse(
+            {"meta": meta, "series": await asyncio.to_thread(_decimate)}
+        )
+
+    @app.delete("/api/tuning/runs/{run_id}")
+    async def tuning_run_delete(run_id: str) -> JSONResponse:
+        from ..tuning import delete_run
+
+        if not await asyncio.to_thread(delete_run, run_id):
+            return JSONResponse({"error": "unknown run"}, status_code=404)
+        return JSONResponse({"deleted": run_id})
+
+    @app.get("/api/tuning/motions")
+    async def tuning_motions() -> dict[str, Any]:
+        """The committed reference motions available for tune.motion replays."""
+        from ..tuning.motion import list_motions
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": m.name,
+                    "rate": m.rate,
+                    "samples": len(m.q),
+                    "durationS": len(m.q) / m.rate if m.rate else 0.0,
+                    "meta": m.meta,
+                }
+                for m in list_motions()
+            ]
+
+        return {"motions": await asyncio.to_thread(_list)}
 
     # -- local ZED cameras ---------------------------------------------------
 

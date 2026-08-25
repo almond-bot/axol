@@ -451,6 +451,44 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         drives_motors=True,
     ),
+    "tune.motion": CommandDef(
+        "tune.motion",
+        "tune.motion",
+        "Reference-motion replay",
+        "Replay a committed reference motion through the production control "
+        "path and score tracking accuracy and smoothness per joint. Override "
+        "gains per run to A/B-compare on the identical motion; every run is "
+        "saved for the Tuning charts.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.motion"),
+        requires_hardware=True,
+        drives_motors=True,
+    ),
+    "motion.build": CommandDef(
+        "motion.build",
+        "motion.build",
+        "Build reference motion",
+        "Postprocess a teleop flight-recorder capture (teleop's "
+        "jitter_record) into a reference motion: clip to the engaged span, "
+        "resample, smooth, and project through the collision-aware solver.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.motion"),
+        uses_can_bus=False,
+    ),
+    "diag.offline": CommandDef(
+        "diag.offline",
+        "diag.offline",
+        "Offline pipeline analysis",
+        "Analyze a teleop flight-recorder capture without hardware: wifi "
+        "transport jitter, filter-stack pass-through and lag, or IK-injected "
+        "motion. Results save as tuning runs for the charts.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.offline_suites"),
+        uses_can_bus=False,
+    ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
     # motion is never launched concurrently with teleop or another
@@ -670,7 +708,9 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
     emit = get_schema(command_id).emit
 
     options: list[str] = []
-    positionals: list[str] = []
+    # key -> token; ordered by the schema below, not by the submitted dict,
+    # so commands with several positionals get them in declaration order.
+    positional_by_key: dict[str, str] = {}
     # ``root`` -> nested value tree assembled from its submitted leaves.
     dict_values: dict[str, dict[str, Any]] = {}
     for key, raw in args.items():
@@ -692,10 +732,13 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
             text = str(raw).strip()
             if text:
                 options.extend([spec["flag"], *text.split()])
+        elif kind == "optmany":
+            for token in str(raw).split():
+                options.extend([spec["flag"], token])
         elif kind == "pos":
             token = _format_value(raw)
             if token is not None:
-                positionals.append(token)
+                positional_by_key[key] = token
         elif kind == "dictleaf":
             if raw is None or (isinstance(raw, str) and raw.strip() == ""):
                 continue
@@ -712,4 +755,5 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
         # JSON is valid YAML, so draccus's value parser loads it as a dict and
         # deep-merges it over the dict field's defaults.
         options.extend([f"--{root}", json.dumps(tree)])
+    positionals = [positional_by_key[key] for key in emit if key in positional_by_key]
     return [*options, *positionals]

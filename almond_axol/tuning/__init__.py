@@ -37,7 +37,15 @@ from .runner import (
     safe_outboard_direction,
     sine_center,
 )
-from .runs import TUNING_RUNS_DIR, list_runs, load_run, log_to_series, save_run
+from .runs import (
+    TUNING_RUNS_DIR,
+    clear_runs,
+    delete_run,
+    list_runs,
+    load_run,
+    log_to_series,
+    save_run,
+)
 
 __all__ = [
     "BAND_HIGH",
@@ -53,6 +61,8 @@ __all__ = [
     "cached_meas",
     "cached_torque",
     "chatter_metrics",
+    "clear_runs",
+    "delete_run",
     "joint_frame_motors",
     "list_runs",
     "load_run",

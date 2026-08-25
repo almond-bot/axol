@@ -30,12 +30,7 @@ from __future__ import annotations
 import argparse
 
 
-def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser(
-        prog="axol diag.offline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=__doc__,
-    )
+def _add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument(
         "suite",
         choices=["wifi", "filtering", "kinematics"],
@@ -56,8 +51,38 @@ def main(argv: list[str] | None = None) -> None:
         default=None,
         help="Free-form note stored on the run artifact",
     )
-    args = ap.parse_args(argv)
 
+
+def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[type-arg]
+    """Register ``diag.offline`` on a subparser tree (serve-UI introspection).
+
+    The ``axol`` CLI dispatches this command lazily via ``_DIAG_COMMANDS``
+    (so the heavy imports stay off the common path); this registrar exists
+    for the serve layer's argparse schema introspection.
+    """
+    p = subparsers.add_parser(
+        "diag.offline",
+        help="Offline wifi/filtering/kinematics analysis of a recording.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(p)
+    p.set_defaults(func=lambda args: main_args(args))
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(
+        prog="axol diag.offline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=__doc__,
+    )
+    _add_arguments(ap)
+    args = ap.parse_args(argv)
+    main_args(args)
+
+
+def main_args(args: argparse.Namespace) -> None:
+    """Run the selected suite over the capture and print its report."""
     from ..tuning import save_run
     from ..tuning.offline import (
         filtering_analysis,

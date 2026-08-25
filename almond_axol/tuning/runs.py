@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -124,6 +125,27 @@ def load_run(
         with np.load(npz_path) as data:
             series = {k: data[k] for k in data.files}
     return meta, series
+
+
+def delete_run(run_id: str, runs_dir: Path = TUNING_RUNS_DIR) -> bool:
+    """Remove one run's directory; returns whether anything was deleted."""
+    run_dir = runs_dir / run_id
+    # Refuse ids that escape the store (e.g. "../..") — the id is a path leaf.
+    if run_dir.parent != runs_dir or not run_dir.is_dir():
+        return False
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return True
+
+
+def clear_runs(runs_dir: Path = TUNING_RUNS_DIR) -> int:
+    """Delete every stored run; returns how many were removed."""
+    if not runs_dir.is_dir():
+        return 0
+    removed = 0
+    for meta_path in runs_dir.glob("*/meta.json"):
+        shutil.rmtree(meta_path.parent, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def log_to_series(log: list[dict]) -> dict[str, np.ndarray]:
