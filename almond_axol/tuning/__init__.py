@@ -25,6 +25,7 @@ from .metrics import (
     ring_frequency,
     sine_metrics,
     step_metrics,
+    sustained_buzz,
     tracking_lag_ms,
     tracking_metrics,
 )
@@ -105,6 +106,7 @@ __all__ = [
     "sweep_safety",
     "sine_metrics",
     "step_metrics",
+    "sustained_buzz",
     "tracking_lag_ms",
     "tracking_metrics",
 ]

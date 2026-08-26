@@ -42,3 +42,4 @@ With `--noise` and/or `--filter` the run is still scored against the *clean* ref
 | `jitter °` | 3–15 Hz band RMS of the error — the vibration the operator feels |
 | `amp` | Measured / commanded mid-band motion: > 1 means the arm adds energy (rings), < 1 means it filters |
 | `trq HF` | Cycle-to-cycle torque chatter (Nm RMS) |
+| `buzz °` / `@Hz` | Sustained ≥ 20 Hz motion — what you *hear*. Median over 0.5 s windows of the high-band RMS, so a limit cycle that buzzes through the run stands out while one-off reversal transients wash out; `@Hz` is where the loud windows agree. Healthy joints sit near 0.005°; an audible limit cycle (e.g. wrist_2 near its firmware kd clamp, ~110 Hz) reads 2–5× that |

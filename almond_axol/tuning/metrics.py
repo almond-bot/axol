@@ -25,6 +25,12 @@ import numpy as np
 BAND_LOW = 3.0
 BAND_HIGH = 15.0
 
+# Everything above BUZZ_LOW is treated as buzz: sustained content there is
+# inaudible-motor territory (limit cycles, near-clamp kd instability, gear
+# chatter) rather than commanded motion, which the 6 Hz-cutoff references
+# and the trapezoid keep far below it.
+BUZZ_LOW = 20.0
+
 
 # --------------------------------------------------------------------- #
 # Array-based metrics (uniform or timestamped series)                    #
@@ -82,6 +88,55 @@ def band_rms(t: np.ndarray, x: np.ndarray) -> dict[str, float]:
     return out
 
 
+def sustained_buzz(
+    t: np.ndarray, x: np.ndarray, win_s: float = 0.5
+) -> tuple[float, float]:
+    """Sustained high-frequency (≥ :data:`BUZZ_LOW` Hz) content of a signal.
+
+    Returns ``(buzz, buzz_hz)``: ``buzz`` is the *median* over short windows
+    of the ≥20 Hz RMS (input units); ``buzz_hz`` is the median in-band peak
+    frequency of the *loud* half of the windows.
+
+    The median-over-windows is the audibility discriminator the whole-run
+    numbers miss: a motion transient spikes one window and vanishes from the
+    median, while an audible limit cycle (e.g. wrist_2 near its firmware kd
+    clamp, measured buzzing at ~116 Hz through an entire replay) holds every
+    window up. Whole-run band RMS dilutes that same buzz below the level of
+    ordinary reversal transients, and a whole-run FFT hides its line among
+    broadband leakage. The per-window peak-frequency vote survives what a
+    per-bin median spectrum does not: real limit cycles *wander* in
+    frequency, never landing twice in the same FFT bin, but their loud
+    windows still agree to within a few Hz — a healthy joint's loud windows
+    are reversal transients that spread broadband instead, and its ``buzz``
+    magnitude stays at the floor, which is what to read first.
+    """
+    mask = np.isfinite(x)
+    if mask.sum() < 64:
+        return math.nan, math.nan
+    fs, xr = _resample_uniform(np.asarray(t)[mask], np.asarray(x)[mask])
+    n = int(win_s * fs)
+    if n < 16 or len(xr) < 2 * n:
+        return math.nan, math.nan
+    win = np.hanning(n)
+    freqs = np.fft.rfftfreq(n, 1.0 / fs)
+    band = freqs >= BUZZ_LOW
+    if not band.any():
+        return math.nan, math.nan
+    rms: list[float] = []
+    peaks: list[float] = []
+    for k in range(0, len(xr) - n + 1, n // 2):
+        seg = xr[k : k + n]
+        seg = seg - seg.mean()
+        power = (np.abs(np.fft.rfft(seg * win)) ** 2) / (win**2).sum() * 2.0 / n
+        rms.append(float(np.sqrt(power[band].sum())))
+        peaks.append(float(freqs[band][int(np.argmax(power[band]))]))
+    rms_arr = np.asarray(rms)
+    loud = rms_arr >= np.median(rms_arr)
+    buzz = float(np.median(rms_arr))
+    buzz_hz = float(np.median(np.asarray(peaks)[loud])) if loud.any() else math.nan
+    return buzz, buzz_hz
+
+
 def tracking_lag_ms(
     t: np.ndarray, target: np.ndarray, actual: np.ndarray, max_lag_s: float = 0.25
 ) -> float:
@@ -136,6 +191,11 @@ def tracking_metrics(
     <1 means it filters), ``pos_ripple`` (second-difference RMS), and
     ``torque_hf`` (cycle-to-cycle torque chatter, Nm) when torque is given.
     ``peak_hz`` flags a dominant resonance line if one stands out.
+
+    Audibility: ``buzz`` / ``buzz_hz`` (see :func:`sustained_buzz`) — the
+    sustained ≥20 Hz content of the *measured* motion. This is the number
+    that catches a joint audibly vibrating through a run, which the band
+    and ripple metrics dilute into the whole-run averages.
     """
     t = np.asarray(t, dtype=float)
     target = np.asarray(target, dtype=float)
@@ -169,6 +229,7 @@ def tracking_metrics(
         out["pos_ripple"] = float(np.sqrt(np.mean(dd**2)))
     else:
         out["pos_ripple"] = math.nan
+    out["buzz"], out["buzz_hz"] = sustained_buzz(t, actual)
     if torque is not None:
         tau = np.asarray(torque, dtype=float)
         tau = tau[np.isfinite(tau)]

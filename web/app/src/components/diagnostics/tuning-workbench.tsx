@@ -1484,6 +1484,8 @@ const MOTION_COLS: ScoreCol[] = [
   { key: "err_band_mid", label: "jitter °", deg: true, digits: 3, warn: 0.3, bad: 0.8 },
   { key: "amplification", label: "ringing ×", warn: 1.15, bad: 1.5 },
   { key: "torque_hf", label: "torque chatter Nm", digits: 3 },
+  { key: "buzz", label: "buzz °", deg: true, digits: 3, warn: 0.01, bad: 0.02 },
+  { key: "buzz_hz", label: "buzz Hz", digits: 0 },
 ]
 
 const SINE_COLS: ScoreCol[] = [
@@ -1546,7 +1548,9 @@ const SCORE_LEGEND: Record<string, string> = {
     "(lower is better; the run-list number is the all-joint mean). lag = " +
     "command→measurement delay. jitter = 3–15 Hz vibration in the error — " +
     "what the operator feels. ringing ×>1 = the joint oscillates more than " +
-    "commanded. torque chatter = cycle-to-cycle torque noise.",
+    "commanded. torque chatter = cycle-to-cycle torque noise. buzz = " +
+    "sustained ≥20 Hz motion — what you hear: healthy joints sit near " +
+    "0.005°, an audible limit cycle reads 2–5× that at its frequency.",
   sine:
     "tracking RMS = average distance from the commanded sine (lower is " +
     "better). score = RMS + 0.2 × worst excursion, the number to compare " +

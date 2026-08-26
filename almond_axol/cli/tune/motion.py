@@ -202,23 +202,30 @@ def _print_metrics_table(per_joint: dict[str, dict[str, float]]) -> None:
     print(f"\n{'═' * 78}")
     print(
         f"  {'joint':<18} {'RMS °':>7} {'lagfree °':>9} {'lag ms':>7} "
-        f"{'jitter °':>8} {'amp':>5} {'trq HF':>7}"
+        f"{'jitter °':>8} {'amp':>5} {'trq HF':>7} {'buzz °':>7} {'@Hz':>4}"
     )
     for name, m in per_joint.items():
         amp = f"{m['amplification']:.2f}" if math.isfinite(m["amplification"]) else "-"
         lag = f"{m['lag_ms']:.0f}" if math.isfinite(m["lag_ms"]) else "-"
+        buzz_hz = (
+            f"{m['buzz_hz']:.0f}" if math.isfinite(m.get("buzz_hz", math.nan)) else "-"
+        )
+        buzz = m.get("buzz", math.nan)
+        buzz_s = f"{math.degrees(buzz):.3f}" if math.isfinite(buzz) else "-"
         print(
             f"  {name:<18} {math.degrees(m['rms_err']):>7.3f} "
             f"{math.degrees(m['rms_err_lagfree']):>9.3f} {lag:>7} "
             f"{math.degrees(m['err_band_mid']):>8.3f} {amp:>5} "
-            f"{m['torque_hf']:>7.3f}"
+            f"{m['torque_hf']:>7.3f} {buzz_s:>7} {buzz_hz:>4}"
         )
     print(f"{'═' * 78}")
     print(
         "  RMS = tracking error vs the reference; lagfree = after removing\n"
         "  the measured command->measurement delay; jitter = 3-15 Hz band of\n"
         "  the error (what the operator feels); amp = measured/commanded\n"
-        "  mid-band motion (>1 rings, <1 filters); trq HF = torque chatter (Nm)."
+        "  mid-band motion (>1 rings, <1 filters); trq HF = torque chatter (Nm);\n"
+        "  buzz = sustained >=20 Hz motion (what you hear) at its frequency —\n"
+        "  healthy joints sit near 0.005 deg, an audible limit cycle 2-5x that."
     )
 
 
