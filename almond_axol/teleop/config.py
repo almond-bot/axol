@@ -150,12 +150,15 @@ class VRTeleopConfig:
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
         jitter_record: File prefix for the jitter flight recorder (see
-            :mod:`almond_axol.teleop.recorder`), e.g. ``/tmp/jit``.  When
-            set, every stage of the teleop pipeline — raw VR pose, filtered
-            pose, IK output, smoothed command, measured joints — is captured
-            to ``<prefix>_{ik,cmd,meas}.npz`` on exit, for offline analysis
-            with ``axol diag.teleop-jitter <prefix>``.  ``None`` (the
-            default) disables recording entirely.
+            :mod:`almond_axol.teleop.recorder`).  A bare name (``rec1``)
+            records into ``~/.almond/recordings/``, where ``axol
+            motion.build`` finds it; a path prefix (``/tmp/jit``) is used
+            verbatim.  When set, every stage of the teleop pipeline — raw
+            VR pose, filtered pose, IK output, smoothed command, measured
+            joints — is captured to ``<prefix>_{ik,cmd,meas}.npz`` on exit
+            (last ~5 minutes; the same prefix overwrites on the next run),
+            for ``axol motion.build`` or ``axol diag.teleop-jitter``.
+            ``None`` (the default) disables recording entirely.
     """
 
     rest_pose_left: np.ndarray = field(
