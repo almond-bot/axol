@@ -112,6 +112,15 @@ _MA_FW_V44_VERSION = 2026042402
 
 # Unchanged across firmware versions.
 _MA_V_MAX = 45.0  # rad/s
+# kp decodes against 0-500 on ALL firmware. The V4.4 manual claims the MIT
+# kp range is 0-1000, but hardware behavior says otherwise (same story as
+# kd below): step-response torque measured on fleet motors matches
+# kp x error for kp encoded against 0-500 exactly — e.g. a 3° step at
+# kp=180 produced the predicted 6.9 Nm spring torque, where a 0-1000
+# decode would have delivered double. The torque scale itself is
+# independently validated by gravity calibration (t_ff in physical Nm
+# holds the arm to within millidegrees), so the kp fit is not a
+# torque-range artifact.
 _MA_KP_MAX = 500.0
 # kd decodes against 0-5 on ALL firmware. The V4.4 changelog claims the MIT
 # kd range widened to 0-50, but hardware behavior says otherwise: encoding
