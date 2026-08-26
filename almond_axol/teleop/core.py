@@ -189,7 +189,7 @@ class VRTeleopCore:
         # holding perfectly still, so staleness must be measured at ingest.
         self._last_frame_time: float | None = None
 
-        # Jitter flight recorder (--teleop.record, see .recorder):
+        # Teleop flight recorder (--teleop.record, see .recorder):
         # taps the smoothing stages this class owns per control tick — the
         # segment-rendered raw target, the EMA output, and the final guarded
         # command (7 left + 7 right arm joints each).

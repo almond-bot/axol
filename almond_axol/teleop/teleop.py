@@ -141,7 +141,7 @@ class VRTeleop:
         # broadcast tracking-state changes to the headset.
         self._vr_loop: asyncio.AbstractEventLoop | None = None
 
-        # Jitter flight recorder (--teleop.record, see .recorder):
+        # Teleop flight recorder (--teleop.record, see .recorder):
         # taps the measured side per control tick — cached joint positions
         # and torques (8 left + 8 right), refreshed by the impedance feedback
         # frames so reading them costs no CAN traffic.
@@ -600,7 +600,7 @@ class VRTeleop:
         return out[:8], out[8:]
 
     def _record_measured(self) -> None:
-        """Append one measured-side row to the jitter recorder (hardware only).
+        """Append one measured-side row to the teleop recorder (hardware only).
 
         Reads the cached positions/torques the impedance feedback frames
         refresh every cycle — no CAN traffic. Arms that don't expose the

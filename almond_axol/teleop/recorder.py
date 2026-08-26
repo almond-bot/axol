@@ -18,7 +18,7 @@ All rows are stamped with ``time.monotonic()``, which shares one epoch
 across processes on Linux, so the files can be merged on time.
 
 Recording covers **engaged segments only**: each tap gates its recorder on
-its process's engage state (:meth:`JitterRecorder.set_engaged`), so the
+its process's engage state (:meth:`TeleopRecorder.set_engaged`), so the
 capture starts at engagement and there is no leading stretch of rest-pose
 rows. Disengaging writes the files immediately (in a background thread, so
 the control loop never blocks on compression) — which also survives a
@@ -92,7 +92,7 @@ def resolve_or_latest(prefix: str | None, stage: str = "cmd") -> str:
     return str(newest)[: -len(suffix)]
 
 
-class JitterRecorder:
+class TeleopRecorder:
     """Fixed-capacity ring buffer of timestamped float32 rows.
 
     Starts *disengaged*: :meth:`record` is a no-op until the owning stage
@@ -190,7 +190,7 @@ class JitterRecorder:
             return
         self._join_writer()
         self._writer = threading.Thread(
-            target=self._write, args=(data,), daemon=True, name="jitter-rec-dump"
+            target=self._write, args=(data,), daemon=True, name="teleop-rec-dump"
         )
         self._writer.start()
 
@@ -209,17 +209,17 @@ def make(
     stage: str,
     fields: dict[str, int],
     capacity: int = _DEFAULT_CAPACITY,
-) -> JitterRecorder | None:
+) -> TeleopRecorder | None:
     """Build a recorder for ``stage`` if ``prefix`` is set, else ``None``.
 
     ``<prefix>_<stage>.npz`` is written at every disengage (see
-    :meth:`JitterRecorder.set_engaged`); the :mod:`atexit` registration is a
+    :meth:`TeleopRecorder.set_engaged`); the :mod:`atexit` registration is a
     fallback for a session that ends while still engaged.
     """
     if not prefix:
         return None
     prefix = resolve_prefix(prefix)
-    rec = JitterRecorder(f"{prefix}_{stage}.npz", fields, capacity)
+    rec = TeleopRecorder(f"{prefix}_{stage}.npz", fields, capacity)
     atexit.register(rec.dump)
     _logger.info("Flight recorder active: stage %r -> %s_%s.npz", stage, prefix, stage)
     return rec
