@@ -270,6 +270,24 @@ def build_motion(
         print(f"  projecting {len(q_s)} waypoints through the collision solver ...")
         q_s = _project_waypoints(q_s, rate)
 
+    # Hard-clamp to the joint limits motion_control enforces at replay. The
+    # collision projection's limit term is a soft cost traded against staying
+    # on the recorded waypoint (and the smoothing after it can re-cross the
+    # boundary), and gravity-comp captures record *measured* positions, which
+    # read slightly past a calibrated end stop when the joint rests against
+    # it (zeroing tolerance + flex). Left unclamped, motion_control silently
+    # clips those samples at replay and every tuning run scores the clip as
+    # phantom tracking error on that joint.
+    lo, hi = _motion_limits()
+    past = np.count_nonzero((q_s < lo) | (q_s > hi))
+    if past:
+        worst = float(np.max(np.maximum(lo - q_s, q_s - hi)))
+        q_s = np.clip(q_s, lo, hi)
+        print(
+            f"  clamped {past} past-limit samples to the joint limits "
+            f"(worst excursion {math.degrees(worst):.2f}°)"
+        )
+
     motion = ReferenceMotion(
         name=name,
         rate=rate,
@@ -298,6 +316,25 @@ def build_motion(
         )
     raw = {"t": (t - t[0]) * time_scale, "q": q.astype(np.float32)}
     return motion, raw
+
+
+def _motion_limits() -> tuple[np.ndarray, np.ndarray]:
+    """Per-column joint limits of a motion row, shape ``(14,)`` each.
+
+    The same :func:`~almond_axol.robot.axol.arm_limits` bounds that
+    ``motion_control`` clips commands to at replay — left 7 then right 7 in
+    ``ARM_JOINTS`` order. Imported lazily: the robot stack is not needed to
+    load or replay an already-built motion.
+    """
+    from ..constants import ARM_JOINTS
+    from ..robot.axol import arm_limits
+
+    lo = np.empty(MOTION_WIDTH)
+    hi = np.empty(MOTION_WIDTH)
+    for offset, is_left in ((0, True), (7, False)):
+        for i, j in enumerate(ARM_JOINTS):
+            lo[offset + i], hi[offset + i] = arm_limits(j, is_left)
+    return lo, hi
 
 
 def _project_waypoints(q: np.ndarray, rate: float) -> np.ndarray:
