@@ -62,7 +62,7 @@ from ...tuning import (
     HolderMonitor,
     cached_meas,
     cached_torque,
-    camera_clearance_targets,
+    probe_clearance_targets,
     joint_frame_motors,
     log_to_series,
     make_target_noise,
@@ -335,10 +335,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "there (amplitude clamped to the remaining headroom). Gains that "
         "look fine hanging at rest can misbehave under gravity load, so "
         "probe 45, -45, … too. Default: step starts at the joint's current "
-        "position, sine at the joint midpoint. shoulder_2/wrist_2 may start "
-        "at 0 but must swing outboard — the robot base is inboard. "
-        "Incompatible with --pose-by-hand (the probe runs at the hand-set "
-        "pose).",
+        "position, sine at the joint midpoint. shoulder_2 may start at 0 "
+        "but must swing outboard — the robot base is inboard. wrist_2 runs "
+        "with the elbow raised to its midpoint, which clears the base "
+        "through its full range. Incompatible with --pose-by-hand (the "
+        "probe runs at the hand-set pose).",
     )
     p.add_argument(
         "--freq", type=float, default=1.0, help="[sine] Frequency in Hz (default: 1.0)"
@@ -875,12 +876,12 @@ async def _run(args: argparse.Namespace) -> None:
                 return
 
             print("  ramping other joints to rest (joint-frame 0) ...")
-            # The camera-clearance move (shoulder_2 held 10° outboard for the
-            # shoulder_3 / wrist_1 probes) happens inside ramp_others_to_zero;
-            # record where those joints were first so the teardown ramps them
-            # back instead of letting the arm fall from the clearance pose at
-            # the final disable.
-            clearance = camera_clearance_targets(joint, is_left)
+            # The clearance moves (shoulder_2 held 10° outboard for the
+            # shoulder_3 / wrist_1 probes, the elbow raised for wrist_2)
+            # happen inside ramp_others_to_zero; record where those joints
+            # were first so the teardown ramps them back instead of letting
+            # the arm fall from the clearance pose at the final disable.
+            clearance = probe_clearance_targets(joint, is_left)
             if clearance:
                 vals = await asyncio.gather(
                     *[motors[j].get_position() for j in clearance]

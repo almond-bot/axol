@@ -33,14 +33,17 @@ from .joint_frame import JointFrameMotor
 DEFAULT_AMP_RAD = 0.175
 RAMP_SPEED = 0.25  # rad/s
 
-# Joints whose 0 position physically collides with the robot base. ``run_step``
-# frames the test entirely in the safe (outboard) half for these, and
-# ``ramp_others_to_zero`` leaves them in place rather than commanding 0.
+# Joints whose motion can meet the robot base and are therefore never blindly
+# commanded to 0 by ``ramp_others_to_zero`` (they are left in place, or moved
+# by an explicit clearance target). shoulder_2's inboard half collides with
+# the elbow straight; wrist_2's inboard half does too, *unless* the elbow is
+# raised — which every wrist_2 probe/sweep now does (see
+# ``probe_clearance_targets``), giving wrist_2 its full range.
 BASE_COLLISION_JOINTS = frozenset({Joint.SHOULDER_2, Joint.WRIST_2})
 
 # With the chest cameras mounted, probing these joints with the arm hanging
 # at the rest pose swings the elbow/gripper right past the cameras. The
-# tuning flows hold shoulder_2 out (``camera_clearance_targets``) so the arm
+# tuning flows hold shoulder_2 out (``probe_clearance_targets``) so the arm
 # runs clear of the torso for their sweeps.
 CAMERA_CLEARANCE_JOINTS = frozenset({Joint.SHOULDER_3, Joint.WRIST_1})
 
@@ -54,13 +57,14 @@ SHOULDER_2_CLEARANCE = math.radians(10.0)
 
 def safe_outboard_direction(joint: Joint, is_left: bool) -> int | None:
     """Step direction that swings away from the robot base, or ``None`` if the
-    joint has no base-collision constraint."""
+    joint has no base-collision constraint.
+
+    Only shoulder_2 remains constrained: wrist_2's probes and sweeps all run
+    with the elbow raised (``probe_clearance_targets``), which keeps the
+    gripper clear of the base through wrist_2's full range.
+    """
     if joint == Joint.SHOULDER_2:
         return -1 if is_left else 1
-    if joint == Joint.WRIST_2:
-        # mirrored across arms: the outboard (base-free) half is +π/2 on the
-        # left arm and −π/2 on the right.
-        return 1 if is_left else -1
     return None
 
 
@@ -81,19 +85,24 @@ def safe_limits(joint: Joint, is_left: bool) -> tuple[float, float]:
     return lo, min(hi, 0.0)
 
 
-def camera_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, float]:
-    """Hold targets that swing the arm clear of the chest cameras.
+def probe_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, float]:
+    """Hold targets the *other* joints take so ``test_joint`` can run safely.
 
-    shoulder_3 and wrist_1 sweeps rotate the hanging arm right where the
-    cameras sit; holding shoulder_2 10° outboard moves the whole arm away
-    from the torso for the duration of the probe. Empty for joints whose
-    probes are camera-safe at rest.
+    - shoulder_3 / wrist_1: shoulder_2 held 10° outboard — their probes
+      rotate the hanging arm right where the chest cameras sit.
+    - wrist_2: elbow raised to its midpoint — with the elbow bent the
+      gripper clears the base through wrist_2's *full* range (with the
+      elbow straight, the inboard half collides).
+
+    Empty for joints whose probes are safe at rest.
     """
-    if test_joint not in CAMERA_CLEARANCE_JOINTS:
-        return {}
-    direction = safe_outboard_direction(Joint.SHOULDER_2, is_left)
-    assert direction is not None
-    return {Joint.SHOULDER_2: direction * SHOULDER_2_CLEARANCE}
+    if test_joint in CAMERA_CLEARANCE_JOINTS:
+        direction = -1 if is_left else 1  # shoulder_2's outboard side
+        return {Joint.SHOULDER_2: direction * SHOULDER_2_CLEARANCE}
+    if test_joint == Joint.WRIST_2:
+        elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
+        return {Joint.ELBOW: (elbow_lo + elbow_hi) / 2.0}
+    return {}
 
 
 def sweep_safety(
@@ -109,33 +118,30 @@ def sweep_safety(
 
     - wrist_2: elbow raised to its midpoint — with the elbow bent the
       gripper clears the base through wrist_2's *full* range, so the sweep
-      is not capped. (The PID probes keep wrist_2 outboard-only instead:
-      they run with the arm at rest, elbow straight, where the inboard half
-      does hit the base.)
+      is not capped. (The PID probes share this via
+      ``probe_clearance_targets``.)
     - shoulder_2: sweep capped at 0 — starting at the rest pose is fine,
       but travel past it swings into the base.
     - shoulder_3 / wrist_1: shoulder_2 held 10° outboard so the hanging arm
       swings clear of the chest cameras.
     """
     notes: list[str] = []
-    clearance = dict(camera_clearance_targets(joint, is_left))
-    if clearance:
+    clearance = dict(probe_clearance_targets(joint, is_left))
+    if Joint.SHOULDER_2 in clearance:
         notes.append(
             f"Holding shoulder_2 at "
             f"{math.degrees(clearance[Joint.SHOULDER_2]):+.0f}° to clear the "
             f"chest cameras for the {joint.value} sweep."
         )
-    lo_cap: float | None = None
-    hi_cap: float | None = None
-    if joint == Joint.WRIST_2:
-        elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
-        clearance[Joint.ELBOW] = (elbow_lo + elbow_hi) / 2.0
+    if Joint.ELBOW in clearance:
         notes.append(
             f"Moving elbow to {math.degrees(clearance[Joint.ELBOW]):.1f}° "
             "(midpoint of range) — with the elbow bent, wrist_2 sweeps its "
             "full range clear of the base."
         )
-    elif joint == Joint.SHOULDER_2:
+    lo_cap: float | None = None
+    hi_cap: float | None = None
+    if joint == Joint.SHOULDER_2:
         lo_cap, hi_cap = safe_limits(joint, is_left)
         notes.append(
             f"Capping {joint.value} sweep at 0° — outboard travel only, "
@@ -238,26 +244,24 @@ async def ramp_others_to_zero(
 ) -> None:
     """Send non-test joints to rest (joint-frame 0) and poll until arrival.
 
-    Joints listed in ``BASE_COLLISION_JOINTS`` are also skipped: 0 physically
-    collides with the robot base (the URDF limits don't capture this), and the
-    rest of the workflow keeps them safely outboard — ``run_step`` repositions
-    before testing, and ``run_sine`` centers them in the safe half. The user is
-    responsible for initially posing those joints outside the danger zone.
+    Joints listed in ``BASE_COLLISION_JOINTS`` are also skipped: their inboard
+    half can meet the robot base (the URDF limits don't capture this), so they
+    are left where the operator posed them rather than blindly commanded.
 
-    For shoulder_3 / wrist_1 probes, shoulder_2 is *commanded* to its 10°
-    outboard clearance instead of skipped in place: with the chest cameras
-    mounted, those joints' probes swing the hanging arm right past them.
+    Probe clearances override the skip/zero defaults per test joint (see
+    ``probe_clearance_targets``): shoulder_3 / wrist_1 hold shoulder_2 10°
+    outboard to clear the chest cameras, and wrist_2 gets the elbow raised to
+    its midpoint so its full range clears the base.
     """
     skip = {exclude} | BASE_COLLISION_JOINTS
     targets = {j: 0.0 for j in ARM_JOINTS if j not in skip}
-    clearance = camera_clearance_targets(exclude, is_left)
-    if clearance:
+    clearance = probe_clearance_targets(exclude, is_left)
+    for j, v in clearance.items():
         print(
-            "  Holding shoulder_2 at "
-            f"{math.degrees(clearance[Joint.SHOULDER_2]):+.0f}° to clear the "
-            f"chest cameras for the {exclude.value} probe."
+            f"  Holding {j.value} at {math.degrees(v):+.0f}° for the "
+            f"{exclude.value} probe (base/camera clearance)."
         )
-        targets.update(clearance)
+    targets.update(clearance)
     await ramp_joints_to(motors, targets)
 
 
@@ -578,6 +582,19 @@ async def run_step(
         lo, hi = arm_limits(joint, is_left)
 
     safe_dir = safe_outboard_direction(joint, is_left)
+    if joint == Joint.WRIST_2 and relative:
+        # The standard flow raises the elbow before a wrist_2 probe
+        # (``probe_clearance_targets``), freeing its full range — but the
+        # hand-posed path probes wherever the operator left the arm. With
+        # the elbow near straight, wrist_2's inboard half still meets the
+        # base, so keep the old outboard-only rule in that case.
+        elbow_pos = await motors[Joint.ELBOW].get_position()
+        if abs(elbow_pos) < math.radians(30.0):
+            safe_dir = 1 if is_left else -1
+            print(
+                "  elbow is near straight — stepping wrist_2 outboard only "
+                "(the base is inboard)."
+            )
     if safe_dir is not None and not relative and center is None:
         # The inboard side physically collides with the robot base; frame the
         # whole test in the safe half so that center *and* step_target stay
