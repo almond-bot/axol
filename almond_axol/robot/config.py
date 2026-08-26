@@ -331,8 +331,19 @@ class ArmConfig:
     )
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=180.0,
-            kd=1.7,
+            # Step/sine-validated on hardware (2026-08, tuning workbench):
+            # kp 250 / kd 2 settles a 10° step in 0.03 s with a single
+            # 0.34° peak (3.4%, no ring — one decaying crest) and parks
+            # ~10x closer than kp 180 (9 vs 97 mdeg): wrist_1's error is
+            # stiction-dominated (its axis is usually near-parallel to
+            # gravity, so it runs unloaded), and the stiffer spring drags
+            # through the sticking band. 1 Hz / 10° sine RMS 0.57° vs
+            # 0.67° at kp 180, with tracking lag down 15 → 10 ms. kd 1.7
+            # rang with visible overshoot at both kp; kd ≥ 2.5 killed the
+            # peak but doubled settling. No kd_host: no structural mode
+            # ever showed in wrist_1's band, there is nothing to damp.
+            kp=250.0,
+            kd=2.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
