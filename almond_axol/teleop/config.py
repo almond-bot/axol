@@ -7,6 +7,24 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+# Default per-joint trapezoid velocity caps (rad/s), ARM_JOINTS order
+# (shoulder_1..3, elbow, wrist_1..3), same for both arms. Chosen as a hard
+# per-tick command-step budget at the 240 Hz control rate — 0.25° per tick
+# for the shoulders, 0.5° for the elbow, 0.75° for the wrists — so an
+# upstream discontinuity (solver jump, outlier, stall recovery) can never
+# move a heavy joint faster than these, while the lighter distal joints
+# keep their responsiveness. A module constant (not just the field default)
+# so scalar consumers can reference it without a config instance.
+TELEOP_MAX_VEL_DEFAULT: tuple[float, ...] = (
+    math.radians(60.0),
+    math.radians(60.0),
+    math.radians(60.0),
+    math.radians(120.0),
+    math.radians(180.0),
+    math.radians(180.0),
+    math.radians(180.0),
+)
+
 
 @dataclass
 class VRTeleopConfig:
@@ -93,9 +111,18 @@ class VRTeleopConfig:
             ``engage_max_vel`` to ``teleop_max_vel`` after the post-rest
             engage rising edge.
         teleop_max_vel: Maximum joint velocity (rad/s) enforced by the
-            trapezoidal filter during normal teleoperation.  Limits how fast
-            any single joint can move toward a new IK target.  Defaults to
-            1.0 rev/s (~360 °/s).
+            trapezoidal filter during normal teleoperation, shape (7,) in
+            ARM_JOINTS order (both arms share it). This is the per-tick
+            command-step budget — at 240 Hz the defaults
+            (:data:`TELEOP_MAX_VEL_DEFAULT`) are 0.25°/tick for the
+            shoulders, 0.5° for the elbow and 0.75° for the wrists — and
+            therefore the ceiling on how fast an upstream discontinuity
+            (solver jump, network outlier, stall recovery) can physically
+            move each joint. The old scalar 1.0 rev/s (1.5°/tick) let a 3°
+            injected solver jump execute as a ~160°/s lurch in a
+            combined-noise hardware replay; the per-joint budget bounds
+            that at the joints where it is violent (shoulders swing the
+            whole arm) without throttling wrist agility.
         teleop_max_accel: Maximum joint acceleration (rad/s²) enforced by the
             trapezoidal filter.  Defaults to 3.5 rev/s² (~1260 °/s²).  Since
             the filter became a critically damped linear tracker, smoothness
@@ -207,7 +234,9 @@ class VRTeleopConfig:
     hold_to_engage: bool = False
     engage_max_vel: float = 0.1 * 2 * math.pi
     engage_duration: float = 1.0
-    teleop_max_vel: float = 1.0 * 2 * math.pi
+    teleop_max_vel: np.ndarray = field(
+        default_factory=lambda: np.asarray(TELEOP_MAX_VEL_DEFAULT, dtype=np.float32)
+    )
     teleop_max_accel: float = 3.5 * 2 * math.pi
     ik_alpha: float = 0.3
     pose_cutoff: float = 2.5

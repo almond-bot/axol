@@ -36,7 +36,8 @@ class TrapezoidalFilter:
       bounded by ``max_accel·dt²/2`` (~0.01° per event), which is invisible.
 
     Args:
-        max_vel:   Maximum joint velocity in rad/s.
+        max_vel:   Maximum joint velocity in rad/s — a scalar, or per-joint
+                   values with the same shape as the target vector.
         max_accel: Maximum joint acceleration in rad/s².
         dt:        Control step duration in seconds (``1 / frequency``).
     """
@@ -76,15 +77,18 @@ class TrapezoidalFilter:
     # step by 26°. Don't reintroduce it without a real lookahead planner.)
     _BRAKE_MARGIN = 0.8
 
-    def __init__(self, max_vel: float, max_accel: float, dt: float) -> None:
+    def __init__(
+        self, max_vel: float | np.ndarray, max_accel: float, dt: float
+    ) -> None:
         """Initialize the filter.
 
         Args:
-            max_vel:   Maximum joint velocity in rad/s.
+            max_vel:   Maximum joint velocity in rad/s — scalar or per-joint
+                       (same shape as the target vector).
             max_accel: Maximum joint acceleration in rad/s².
             dt:        Control step duration in seconds (``1 / frequency``).
         """
-        self.max_vel = max_vel
+        self.max_vel = np.asarray(max_vel, dtype=np.float32)
         self.max_accel = max_accel
         self.dt = dt
         self._pos: np.ndarray | None = None

@@ -211,7 +211,19 @@ def replay_filter_stack(
     # exactly like TeleopCore so the EMA time constant matches production.
     alpha = 1.0 - (1.0 - cfg.ik_alpha) ** (120.0 * dt)
     ema = AlphaSmoothFilter(alpha)
-    trap = TrapezoidalFilter(cfg.teleop_max_vel, cfg.teleop_max_accel, dt)
+    # The per-joint velocity caps are (7,) in ARM_JOINTS order; a 14-wide
+    # stream is left arm then right arm on the same caps. Any other width
+    # (e.g. tune.filter's synthetic single-channel sine) is joint-agnostic,
+    # so it gets the least restrictive cap — rejection results stay a lower
+    # bound for every real joint.
+    caps = np.asarray(cfg.teleop_max_vel, dtype=float)
+    width = x_in.shape[1]
+    if caps.ndim == 1:
+        if width == 2 * len(caps):
+            caps = np.concatenate([caps, caps])
+        elif width != len(caps):
+            caps = float(caps.max())
+    trap = TrapezoidalFilter(caps, cfg.teleop_max_accel, dt)
 
     n_out = int((t_in[-1] - t_in[0]) / dt) + 1
     t_out = t_in[0] + dt * np.arange(n_out)
