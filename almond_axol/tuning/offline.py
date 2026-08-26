@@ -267,8 +267,11 @@ def kinematics_analysis(prefix: str) -> tuple[dict, dict, dict]:
     stride = max(1, len(t) // _FK_MAX_ROWS)
     idx = np.arange(0, len(t), stride)
     ee_err = {"l": np.empty(len(idx)), "r": np.empty(len(idx))}
+    fk_pos = {"l": np.empty((len(idx), 3)), "r": np.empty((len(idx), 3))}
     for k, i in enumerate(idx):
         (lp, _), (rp, _) = solver.fk(q[i].astype(np.float32))
+        fk_pos["l"][k] = lp
+        fk_pos["r"][k] = rp
         ee_err["l"][k] = float(np.linalg.norm(lp - ik["tgt_l"][m][i]))
         ee_err["r"][k] = float(np.linalg.norm(rp - ik["tgt_r"][m][i]))
 
@@ -304,14 +307,31 @@ def kinematics_analysis(prefix: str) -> tuple[dict, dict, dict]:
         "worst_churn_joint": max(
             per_joint, key=lambda k: per_joint[k]["churn_deg_min"]
         ),
+        "ik_rate_hz": float((len(t) - 1) / duration),
     }
     series = {
         "t": t[idx],
         "ee_err_l": ee_err["l"],
         "ee_err_r": ee_err["r"],
+        # EE pose set (world target given to the solver) vs actual (FK of
+        # the solved joints), per axis — the pair the UI charts.
+        "ee_tgt_l": np.asarray(ik["tgt_l"], dtype=float)[m][idx],
+        "ee_tgt_r": np.asarray(ik["tgt_r"], dtype=float)[m][idx],
+        "ee_fk_l": fk_pos["l"],
+        "ee_fk_r": fk_pos["r"],
         "q_t": t,
         "q": q,
     }
+    # Solve time (per-tick solver duration) — captures made before the field
+    # existed simply don't have it.
+    if "solve_ms" in ik:
+        solve = np.asarray(ik["solve_ms"], dtype=float)[m].reshape(-1)
+        finite = solve[np.isfinite(solve)]
+        if len(finite) > 0:
+            series["solve_ms"] = solve
+            metrics["solve_median_ms"] = float(np.median(finite))
+            metrics["solve_p95_ms"] = float(np.percentile(finite, 95))
+            metrics["solve_max_ms"] = float(finite.max())
     return metrics, series, {"prefix": str(prefix), "fk_stride": int(stride)}
 
 
@@ -324,6 +344,12 @@ def print_kinematics_report(metrics: dict) -> None:
                 f"  {label} EE tracking: {metrics['ee_rms_mm'][side]:.1f} mm RMS  "
                 f"(max {metrics['ee_max_mm'][side]:.1f} mm)"
             )
+    if "solve_median_ms" in metrics:
+        print(
+            f"  solve time: median {metrics['solve_median_ms']:.1f} ms  "
+            f"p95 {metrics['solve_p95_ms']:.1f}  max {metrics['solve_max_ms']:.1f}  "
+            f"(dispatch {metrics['ik_rate_hz']:.0f} Hz)"
+        )
     print(f"\n  {'joint':<18} {'churn °/min':>11} {'3-15 Hz °':>10} {'peak Hz':>8}")
     for name, row in metrics["per_joint"].items():
         peak = f"{row['peak_hz']:.1f}" if math.isfinite(row["peak_hz"]) else "-"

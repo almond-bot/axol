@@ -131,6 +131,31 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "at that midpoint)",
     )
     p.add_argument(
+        "--noise",
+        choices=("none", "network", "ik", "combined"),
+        default="none",
+        help="Corrupt the motion before streaming it, at the noise source's "
+        "real pipeline entry point (see tune.filter): 'network' = "
+        "jitter/outliers/stalls, 'ik' = solver churn/jumps, 'combined' = "
+        "both. Deterministic per --seed. Default: none (clean playback).",
+    )
+    p.add_argument(
+        "--filter",
+        action="store_true",
+        help="Replay the (possibly noise-corrupted) command stream through "
+        "the production teleop filter stack (pose low-pass -> EMA -> "
+        "trapezoid) before streaming — the hardware version of tune.filter: "
+        "the arm physically shows what the stack removes and what it costs "
+        "in lag. Off: the stream is sent as-is.",
+    )
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="RNG seed for --noise — identical seed, identical corrupted "
+        "stream (default: 0)",
+    )
+    p.add_argument(
         "--label",
         default=None,
         help="Free-form note stored on the run artifact (shows up in "
@@ -198,6 +223,78 @@ def _print_metrics_table(per_joint: dict[str, dict[str, float]]) -> None:
     )
 
 
+def _prepare_stream(
+    args: argparse.Namespace, motion: ReferenceMotion
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """The stream actually sent to the arms: motion -> noise? -> filter?.
+
+    Returns ``(t, sent, ref, info)`` on one uniform grid at the motion's
+    rate: ``sent`` is what gets streamed, ``ref`` is the clean reference the
+    run is scored against (identical to ``sent`` for a clean playback), and
+    ``info`` records what was injected/filtered for the run artifact.
+    """
+    t_ref = motion.times()
+    clean = np.asarray(motion.q, dtype=float)
+    info: dict = {"noise": args.noise, "filter": bool(args.filter), "seed": args.seed}
+    if args.noise == "none" and not args.filter:
+        return t_ref, clean, clean, info
+
+    from ...tuning.filtering import inject_ik_noise, inject_noise, replay_filter_stack
+
+    with_network = args.noise in ("network", "combined")
+    with_ik = args.noise in ("ik", "combined")
+    # tune.filter's offline defaults — the same insult, now on hardware.
+    noisy, events = inject_noise(
+        t_ref,
+        clean,
+        jitter_rms=math.radians(0.3) if with_network else 0.0,
+        outlier_rate=0.5 if with_network else 0.0,
+        outlier_amp=math.radians(10.0),
+        stall_rate=0.5 if with_network else 0.0,
+        stall_ms=150.0,
+        seed=args.seed,
+    )
+    ik_noise = None
+    ik_events = {"ik_jumps": 0}
+    if with_ik:
+        ik_noise, ik_events = inject_ik_noise(
+            t_ref,
+            clean.shape[1],
+            churn_rms=math.radians(0.2),
+            jump_rate=0.2,
+            jump_amp=math.radians(3.0),
+            seed=args.seed,
+        )
+    info.update(events)
+    info.update(ik_events)
+
+    if args.filter:
+        from ...teleop.config import VRTeleopConfig
+
+        # The stack's control-rate stages run on the playback grid itself
+        # (frequency = the motion's rate), so the output streams 1:1.
+        t_out, sent, _ = replay_filter_stack(
+            t_ref,
+            noisy,
+            config=VRTeleopConfig(frequency=motion.rate),
+            post_lp_noise=ik_noise,
+        )
+        ref = np.stack(
+            [np.interp(t_out, t_ref, clean[:, i]) for i in range(clean.shape[1])],
+            axis=1,
+        )
+        return t_out, sent, ref, info
+
+    sent = noisy if ik_noise is None else noisy + ik_noise
+    if args.noise != "none":
+        print(
+            "  ! streaming raw noise with the filter stack OFF — outlier "
+            "teleports go to the arms unsoftened (the contact watchdog "
+            "stays active). Compare against a --filter run."
+        )
+    return t_ref, sent, clean, info
+
+
 async def _run(args: argparse.Namespace) -> None:
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
@@ -206,6 +303,14 @@ async def _run(args: argparse.Namespace) -> None:
         f"Reference motion {motion.name!r}: {len(motion.q)} waypoints, "
         f"{motion.duration:.1f} s at {motion.rate:.0f} Hz"
     )
+    _, sent, ref, stream_info = _prepare_stream(args, motion)
+    stream_differs = args.noise != "none" or args.filter
+    if stream_differs:
+        print(
+            f"  stream: noise={args.noise}, "
+            f"filter={'on' if args.filter else 'off'} (seed {args.seed}) — "
+            "scored against the clean reference"
+        )
 
     if not 0.0 <= args.stiffness <= 1.0:
         raise SystemExit("--stiffness must be in [0, 1]")
@@ -257,25 +362,32 @@ async def _run(args: argparse.Namespace) -> None:
     watchdog = ContactWatchdog(args.torque_threshold)
     log_t: list[float] = []
     log_target: list[np.ndarray] = []
+    log_sent: list[np.ndarray] = []
     log_actual: list[np.ndarray] = []
     log_torque: list[np.ndarray] = []
 
     async def execute(
-        axol: Axol, waypoints: list[np.ndarray] | np.ndarray, record: bool = False
+        axol: Axol,
+        waypoints: list[np.ndarray] | np.ndarray,
+        record: bool = False,
+        refs: np.ndarray | None = None,
     ) -> tuple[str, float] | None:
         """Stream full-N waypoints at the motion rate with deadline pacing.
 
         Absolute deadlines: a late wakeup is corrected on the next cycle
         instead of stretching the command interval — interval jitter would
         otherwise land in motion_control's differentiated feedforward as
-        torque jitter. Returns the watchdog trip, or ``None``.
+        torque jitter. ``refs`` (``(N, 14)``, optional) is the clean
+        reference logged as the scoring target when the streamed waypoints
+        are a corrupted/filtered version of it; the streamed rows are then
+        logged separately as ``sent``. Returns the watchdog trip or ``None``.
         """
         period = 1.0 / motion.rate
         left = np.zeros(8, dtype=np.float32)
         right = np.zeros(8, dtype=np.float32)
         t0 = time.perf_counter()
         deadline = t0
-        for q in waypoints:
+        for k, q in enumerate(waypoints):
             deadline += period
             left[:7] = q[solver.left_indices]
             right[:7] = q[solver.right_indices]
@@ -293,11 +405,14 @@ async def _run(args: argparse.Namespace) -> None:
                     row_a[7:] = axol.right.positions[:7]
                     row_tq[7:] = axol.right.torques[:7]
                 log_t.append(time.perf_counter() - t0)
-                log_target.append(
-                    np.concatenate(
-                        [q[solver.left_indices], q[solver.right_indices]]
-                    ).astype(np.float32)
-                )
+                row_cmd = np.concatenate(
+                    [q[solver.left_indices], q[solver.right_indices]]
+                ).astype(np.float32)
+                if refs is not None:
+                    log_target.append(refs[k].astype(np.float32))
+                    log_sent.append(row_cmd)
+                else:
+                    log_target.append(row_cmd)
                 log_actual.append(row_a)
                 log_torque.append(row_tq)
             tripped = watchdog.update(
@@ -312,8 +427,8 @@ async def _run(args: argparse.Namespace) -> None:
         return None
 
     print("Planning approach and return trajectories ...")
-    q_start = to_full(motion.q[0])
-    traj_playback = [to_full(row) for row in motion.q]
+    q_start = to_full(sent[0])
+    traj_playback = [to_full(row) for row in sent]
 
     async with Axol(config=config) as axol:
         await axol.start_telemetry(500)
@@ -330,7 +445,12 @@ async def _run(args: argparse.Namespace) -> None:
                 await asyncio.sleep(0.5)
 
             print(f"Replaying {motion.duration:.1f} s of motion ...")
-            contact = await execute(axol, traj_playback, record=True)
+            contact = await execute(
+                axol,
+                traj_playback,
+                record=True,
+                refs=ref if stream_differs else None,
+            )
             if contact is not None:
                 raise _Contact(contact)
         except _Contact as exc:
@@ -391,13 +511,16 @@ async def _run(args: argparse.Namespace) -> None:
         "worst_joint": worst[0],
         "mean_rms_err": float(np.mean([m["rms_err"] for m in per_joint.values()])),
         "mean_jitter": float(np.mean([m["err_band_mid"] for m in per_joint.values()])),
-        "completed": bool(len(log_t) >= len(motion.q)),
+        "completed": bool(len(log_t) >= len(sent)),
     }
 
     if not args.no_save_run:
+        series = {"t": t, "target": target, "actual": actual, "torque": torque}
+        if log_sent:
+            series["sent"] = np.stack(log_sent)
         run_id = save_run(
             "motion",
-            {"t": t, "target": target, "actual": actual, "torque": torque},
+            series,
             summary,
             gains={f"{s}.{j}.{f}": v for (s, j, f), v in overrides.items()},
             params={
@@ -405,6 +528,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": motion.rate,
                 "stiffness": args.stiffness,
                 "columns": _COLUMNS,
+                **stream_info,
             },
             label=args.label,
         )

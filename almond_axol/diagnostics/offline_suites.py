@@ -38,7 +38,11 @@ def _add_arguments(ap: argparse.ArgumentParser) -> None:
     )
     ap.add_argument(
         "prefix",
-        help="Flight-recorder prefix used with --teleop.record",
+        nargs="?",
+        default=None,
+        help="Flight-recorder prefix used with --teleop.record. A bare name "
+        "resolves in the recordings directory (~/.almond/recordings/); "
+        "omit it entirely to analyze the newest recording there.",
     )
     ap.add_argument(
         "--save-run",
@@ -93,14 +97,17 @@ def main_args(args: argparse.Namespace) -> None:
         wifi_analysis,
     )
 
+    from ..teleop.recorder import resolve_or_latest
+
     analyze, report = {
         "wifi": (wifi_analysis, print_wifi_report),
         "filtering": (filtering_analysis, print_filtering_report),
         "kinematics": (kinematics_analysis, print_kinematics_report),
     }[args.suite]
 
-    print(f"Analyzing {args.suite} from {args.prefix} ...")
-    metrics, series, params = analyze(args.prefix)
+    prefix = resolve_or_latest(args.prefix, stage="ik")
+    print(f"Analyzing {args.suite} from {prefix} ...")
+    metrics, series, params = analyze(prefix)
     report(metrics)
 
     if args.save_run:

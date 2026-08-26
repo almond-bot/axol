@@ -42,8 +42,9 @@ const ARM_JOINT_OPTIONS = [
 ]
 
 // Run kinds this workbench presents. Anything else in the store (e.g. old
-// offline-analysis artifacts) is hidden rather than half-rendered.
-const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter"])
+// offline-analysis artifacts) is hidden rather than half-rendered. "filter"
+// artifacts (the retired offline-only tab) still render for old runs.
+const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter", "build", "kinematics"])
 
 /* ------------------------------------------------------------------ */
 /* Inline launcher: what to run, its parameters, and the Run button   */
@@ -248,40 +249,6 @@ const TABS: WbTab[] = [
     drivesMotors: true,
   },
   {
-    key: "filter",
-    label: "Filter",
-    command: "tune.filter",
-    description:
-      "Test the teleop filter stack without moving the robot, one noise " +
-      "source at a time: network noise (jitter, outliers, stalls) is " +
-      "injected before the pose low-pass, IK noise (solver churn, solution " +
-      "jumps) after it — each at its real entry point in the pipeline — or " +
-      "both combined. The corrupted stream replays through the production " +
-      "smoothing chain and is scored against the clean signal; same seed, " +
-      "same corrupted stream, so runs compare exactly.",
-    presets: { save_run: true },
-    fields: [
-      { key: "noise", label: "noise", type: "select", options: ["combined", "network", "ik"] },
-      { key: "motion", label: "motion", type: "select", options: [] },
-      { key: "amp", label: "sine amp (°)", type: "number", placeholder: "15" },
-      { key: "freq", label: "sine freq (Hz)", type: "number", placeholder: "0.5" },
-      { key: "duration", label: "duration (s)", type: "number", placeholder: "10" },
-      { key: "jitter", label: "net jitter (° RMS)", type: "number", placeholder: "0.3" },
-      { key: "outlier_amp", label: "net outlier (°)", type: "number", placeholder: "10" },
-      { key: "outlier_rate", label: "net outliers /s", type: "number", placeholder: "0.5" },
-      { key: "stall_ms", label: "net stall (ms)", type: "number", placeholder: "150" },
-      { key: "stall_rate", label: "net stalls /s", type: "number", placeholder: "0.5" },
-      { key: "ik_churn", label: "ik churn (° RMS)", type: "number", placeholder: "0.2" },
-      { key: "ik_jump_amp", label: "ik jump (°)", type: "number", placeholder: "3" },
-      { key: "ik_jump_rate", label: "ik jumps /s", type: "number", placeholder: "0.2" },
-      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "config" },
-      { key: "seed", label: "seed", type: "number", placeholder: "0" },
-      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
-    ],
-    required: [],
-    drivesMotors: false,
-  },
-  {
     key: "motion",
     label: "Recorded motion",
     command: "tune.motion",
@@ -289,12 +256,37 @@ const TABS: WbTab[] = [
       "Replay a committed reference motion through the production control " +
       "path and score joint-space tracking per joint. Gain overrides apply " +
       "for this run only — run once plain, once with overrides, and compare " +
-      "the scores in the run list.",
+      "the scores in the run list. To test the teleop filter stack on real " +
+      "hardware, inject noise (network jitter/outliers/stalls and/or IK " +
+      "churn/jumps, deterministic per seed) and toggle the filter stack: " +
+      "the arm physically shows what the filters remove and what they cost " +
+      "in lag — the charts overlay the clean reference, the stream actually " +
+      "sent, and the measured position.",
     presets: {},
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "0.5" },
       { key: "gain", label: "gain overrides", type: "overrides" },
+      {
+        key: "noise",
+        label: "inject noise",
+        type: "select",
+        options: ["none", "network", "ik", "combined"],
+        hint:
+          "corrupt the motion before streaming, at each source's real " +
+          "pipeline entry point: network = jitter/outliers/stalls, ik = " +
+          "solver churn/jumps — same seed, same corrupted stream",
+      },
+      {
+        key: "filter",
+        label: "filter stack",
+        type: "boolean",
+        hint:
+          "replay the (possibly corrupted) stream through the production " +
+          "teleop filters (pose low-pass → EMA → trapezoid) before sending " +
+          "— off streams it raw, so noise hits the arm unsoftened",
+      },
+      { key: "seed", label: "seed", type: "number", placeholder: "0" },
       {
         key: "torque_threshold",
         label: "contact Nm",
@@ -467,7 +459,45 @@ const TABS: WbTab[] = [
     required: ["name"],
     drivesMotors: false,
   },
+  {
+    key: "ik",
+    label: "IK",
+    command: "diag.offline",
+    description:
+      "Analyze the IK solver over a teleop recording (offline, no " +
+      "hardware): the world EE target the solver was asked to reach vs the " +
+      "FK of what it solved, per axis — plus per-tick solve time and " +
+      "per-joint churn (a restless null space adds joint motion the hand " +
+      "never made). Record a session first with axol teleop --teleop.record " +
+      "NAME; leave the recording box empty to analyze the newest one.",
+    presets: { suite: "kinematics", save_run: true },
+    fields: [
+      {
+        key: "prefix",
+        label: "recording",
+        type: "text",
+        placeholder: "newest recording",
+        width: "w-44",
+        hint:
+          "which teleop recording to analyze — a bare --teleop.record name, " +
+          "or a full path prefix; empty uses the newest in ~/.almond/recordings/",
+      },
+      { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
+    ],
+    required: [],
+    drivesMotors: false,
+  },
 ]
+
+/** Run kinds → the launcher tab that produces them (for re-arming on click). */
+const KIND_TABS: Record<string, string> = {
+  sine: "sine",
+  step: "step",
+  motion: "motion",
+  gravity: "gravity",
+  build: "build",
+  kinematics: "ik",
+}
 
 /* ------------------------------------------------------------------ */
 /* Gain-override editor (Recorded motion tab)                          */
@@ -779,26 +809,12 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("stiffness", p.stiffness)
       put("target_noise", p.target_noise_deg)
       break
-    case "filter":
-      put("noise", p.noise)
-      if (typeof p.source === "string" && p.source !== "sine") out["motion"] = p.source
-      put("amp", p.amp, { deg: true })
-      put("freq", p.freq)
-      put("duration", p.duration)
-      put("jitter", p.jitter_rms, { deg: true })
-      put("outlier_amp", p.outlier_amp, { deg: true })
-      put("outlier_rate", p.outlier_rate)
-      put("stall_ms", p.stall_ms)
-      put("stall_rate", p.stall_rate)
-      put("ik_churn", p.ik_churn, { deg: true })
-      put("ik_jump_amp", p.ik_jump_amp, { deg: true })
-      put("ik_jump_rate", p.ik_jump_rate)
-      put("cutoff", p.cutoff)
-      put("seed", p.seed)
-      break
     case "motion": {
       put("motion", p.motion)
       put("stiffness", p.stiffness)
+      put("noise", p.noise)
+      if (p.filter === true) out["filter"] = "true"
+      put("seed", p.seed)
       const overrides = Object.entries(g)
         .map(([k, v]) => `${k}=${v}`)
         .join(" ")
@@ -809,6 +825,17 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("arm", meta.side)
       put("joint", meta.joint)
       put("velocity", p.velocity_deg_s)
+      break
+    case "build":
+      put("name", p.name)
+      put("prefix", p.prefix)
+      put("rate", p.rate)
+      put("cutoff", p.cutoff)
+      put("time_scale", p.time_scale)
+      put("notes", meta.label)
+      break
+    case "kinematics":
+      put("prefix", p.prefix)
       break
     default:
       return null
@@ -912,6 +939,16 @@ function headline(meta: TuningRunMeta): { label: string; value: string } | null 
     const v = num(m.droop_after_deg)
     return v == null ? null : { label: "droop", value: `${fmtNum(v, 3)}°` }
   }
+  if (meta.kind === "build") {
+    const v = num(m.dev_max_deg)
+    return v == null ? null : { label: "max change", value: `${fmtNum(v)}°` }
+  }
+  if (meta.kind === "kinematics") {
+    const ee = m.ee_rms_mm as Record<string, unknown> | undefined
+    const vals = ee ? Object.values(ee).filter((v): v is number => typeof v === "number") : []
+    if (vals.length === 0) return null
+    return { label: "EE RMS", value: `${fmtNum(Math.max(...vals))} mm` }
+  }
   return null
 }
 
@@ -959,6 +996,7 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
     if (!name?.startsWith(`${arm}.`)) continue
     const commanded = run.series[`target/${i}`]
     const actual = run.series[`actual/${i}`]
+    const sent = run.series[`sent/${i}`]
     if (!commanded || !actual || !actual.some((v) => v != null)) continue
     // Only joints that were actually commanded to move (> ~1° of travel).
     let min = Infinity
@@ -969,12 +1007,18 @@ function motionJointCharts(run: TuningRunData, arm: string): JointChart[] {
       if (v > max) max = v
     }
     if (max - min < 0.017) continue
+    const series: RunChartSeries[] = [
+      { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
+    ]
+    if (sent) {
+      // Noise/filter runs: the stream actually sent to the arm, between the
+      // clean reference and what the joint measured.
+      series.push({ label: "sent", color: NOISY_COLOR, x: t, data: degSeries(sent) })
+    }
+    series.push({ label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) })
     out.push({
       joint: name.slice(arm.length + 1),
-      series: [
-        { label: "commanded", color: COMMANDED_COLOR, x: t, data: degSeries(commanded) },
-        { label: "actual", color: ACTUAL_COLOR, x: t, data: degSeries(actual) },
-      ],
+      series,
       sub: errorLane(t, commanded, actual),
     })
   }
@@ -1023,6 +1067,129 @@ function filterJointCharts(run: TuningRunData, arm: string | null): JointChart[]
   return out
 }
 
+/** Linear interpolation of a (possibly gappy) series onto another x grid. */
+function interpOnto(
+  xSrc: (number | null)[],
+  ySrc: (number | null)[],
+  xDst: (number | null)[]
+): (number | null)[] {
+  const xs: number[] = []
+  const ys: number[] = []
+  const n = Math.min(xSrc.length, ySrc.length)
+  for (let i = 0; i < n; i++) {
+    const x = xSrc[i]
+    const y = ySrc[i]
+    if (x != null && y != null) {
+      xs.push(x)
+      ys.push(y)
+    }
+  }
+  if (xs.length < 2) return xDst.map(() => null)
+  let j = 0
+  return xDst.map((x) => {
+    if (x == null) return null
+    if (x <= xs[0]) return ys[0]
+    if (x >= xs[xs.length - 1]) return ys[ys.length - 1]
+    while (j < xs.length - 2 && xs[j + 1] < x) j++
+    const f = (x - xs[j]) / (xs[j + 1] - xs[j])
+    return ys[j] + f * (ys[j + 1] - ys[j])
+  })
+}
+
+/**
+ * Before/after charts for a motion.build run: the clipped raw command
+ * recording vs the built motion (resampled + smoothed + collision-projected),
+ * per joint of `arm`. The lane shows built − recorded — exactly what the
+ * postprocessing changed.
+ */
+function buildJointCharts(run: TuningRunData, arm: string): JointChart[] {
+  const columns = (run.meta.params.columns as string[] | undefined) ?? []
+  const tRaw = run.series.t_raw ?? []
+  const tBuilt = run.series.t ?? []
+  const out: JointChart[] = []
+  for (let i = 0; i < columns.length; i++) {
+    const name = columns[i]
+    if (!name?.startsWith(`${arm}.`)) continue
+    const raw = run.series[`raw/${i}`]
+    const built = run.series[`built/${i}`]
+    if (!raw || !built) continue
+    let min = Infinity
+    let max = -Infinity
+    for (const v of raw) {
+      if (v == null) continue
+      if (v < min) min = v
+      if (v > max) max = v
+    }
+    if (max - min < 0.017) continue
+    const builtAtRaw = interpOnto(tBuilt, built, tRaw)
+    out.push({
+      joint: name.slice(arm.length + 1),
+      series: [
+        { label: "recorded", color: NOISY_COLOR, x: tRaw, data: degSeries(raw) },
+        { label: "built", color: ACTUAL_COLOR, x: tBuilt, data: degSeries(built) },
+      ],
+      sub: errorLane(tRaw, raw, builtAtRaw, "built − recorded °"),
+    })
+  }
+  return out
+}
+
+const EE_AXES = ["x", "y", "z"] as const
+
+/** Series in meters → millimeters for display (nulls pass through). */
+function mmSeries(data: (number | null)[]): (number | null)[] {
+  return data.map((v) => (v == null ? null : v * 1000))
+}
+
+/**
+ * Charts for an IK (kinematics) run: EE pose set vs actual per axis for one
+ * arm — the world target the solver was asked to reach vs the FK of what it
+ * solved — plus the per-tick solve time. Everything else the solver did
+ * wrong shows in the per-joint churn score table.
+ */
+function kinematicsCharts(run: TuningRunData, arm: string): JointChart[] {
+  const s = arm === "left" ? "l" : "r"
+  const t = run.series.t ?? []
+  const out: JointChart[] = []
+  for (let ax = 0; ax < 3; ax++) {
+    const set = run.series[`ee_tgt_${s}/${ax}`]
+    const actual = run.series[`ee_fk_${s}/${ax}`]
+    if (!set || !actual || !set.some((v) => v != null)) continue
+    const setMm = mmSeries(set)
+    const actMm = mmSeries(actual)
+    out.push({
+      joint: `EE ${EE_AXES[ax]}`,
+      unit: "mm",
+      series: [
+        { label: "set (target)", color: COMMANDED_COLOR, x: t, data: setMm },
+        { label: "actual (FK)", color: ACTUAL_COLOR, x: t, data: actMm },
+      ],
+      sub: [
+        {
+          label: "error mm",
+          color: ERROR_COLOR,
+          x: t,
+          data: setMm.map((v, i) => {
+            const a = actMm[i]
+            return v == null || a == null ? null : a - v
+          }),
+        },
+      ],
+    })
+  }
+  const solve = run.series.solve_ms
+  const solveT = run.series.q_t
+  if (solve && solveT && out.length > 0) {
+    out.push({
+      joint: "solve time",
+      unit: "ms",
+      series: [{ label: "solve ms", color: ACTUAL_COLOR, x: solveT, data: solve }],
+      sub: [],
+    })
+  }
+  return out
+}
+
 /** The arms a run has chartable per-joint data for (single-arm rigs chart one). */
 function runArms(run: TuningRunData): string[] {
   if (run.meta.kind === "motion") {
@@ -1030,6 +1197,12 @@ function runArms(run: TuningRunData): string[] {
   }
   if (run.meta.kind === "filter") {
     return ["left", "right"].filter((arm) => filterJointCharts(run, arm).length > 0)
+  }
+  if (run.meta.kind === "build") {
+    return ["left", "right"].filter((arm) => buildJointCharts(run, arm).length > 0)
+  }
+  if (run.meta.kind === "kinematics") {
+    return ["left", "right"].filter((arm) => kinematicsCharts(run, arm).length > 0)
   }
   return []
 }
@@ -1125,6 +1298,8 @@ function rebased(data: (number | null)[], base: number): (number | null)[] {
  */
 function compareJointCharts(a: TuningRunData, b: TuningRunData, arm: string | null): JointChart[] {
   const kind = a.meta.kind
+  // build / kinematics runs have no overlay story — compare their scores.
+  if (kind === "build" || kind === "kinematics") return []
   const tA = a.series.t ?? []
   const tB = b.series.t ?? []
 
@@ -1287,6 +1462,21 @@ const FILTER_COLS: ScoreCol[] = [
   { key: "accel_peak", label: "peak accel °/s²", deg: true, digits: 0 },
 ]
 
+// motion.build before/after: values are already in display units (degrees).
+const BUILD_COLS: ScoreCol[] = [
+  { key: "dev_rms_deg", label: "change RMS °", digits: 3 },
+  { key: "dev_max_deg", label: "change max °", digits: 2, warn: 3, bad: 8 },
+  { key: "peak_vel_raw_dps", label: "peak vel in °/s", digits: 0 },
+  { key: "peak_vel_built_dps", label: "peak vel out °/s", digits: 0, warn: 120, bad: 180 },
+]
+
+// IK per-joint churn (values already in degrees / Hz).
+const KIN_COLS: ScoreCol[] = [
+  { key: "churn_deg_min", label: "churn °/min", digits: 0, warn: 200, bad: 600 },
+  { key: "mid_band_deg", label: "3–15 Hz °", digits: 3, warn: 0.15, bad: 0.4 },
+  { key: "peak_hz", label: "peak Hz", digits: 1 },
+]
+
 const GRAVITY_COLS: ScoreCol[] = [
   { key: "rms_before", label: "residual before Nm", digits: 3 },
   { key: "rms_after", label: "residual after Nm", digits: 3, warn: 0.15, bad: 0.4 },
@@ -1346,6 +1536,20 @@ const SCORE_LEGEND: Record<string, string> = {
     "stay under the teleop limit, so outliers and stall catch-ups can " +
     "never slam the arm. Error during a stall is missing data, not filter " +
     "failure — the filter owns the smooth catch-up.",
+  build:
+    "change = built minus recorded, evaluated on the recording's own " +
+    "timestamps — how much the resample + smoothing + collision projection " +
+    "moved the motion. A few degrees is the smoothing doing its job on " +
+    "jittery capture; tens of degrees means the projection slid waypoints " +
+    "off a limit or the torso — check that region of the graph. peak vel " +
+    "out is what tune.motion will actually command.",
+  kinematics:
+    "churn = total joint travel per minute — a restless null space shows " +
+    "up as churn without EE motion (an IK settings problem, not a motor " +
+    "problem). 3–15 Hz = mid-band jitter this joint carries; if it's in a " +
+    "joint but not in the EE target charts above, the solver is injecting " +
+    "it. Solve time spikes (chart above) show up as teleop lurches — the " +
+    "target falls behind the hand and catches up.",
 }
 
 /** Per-joint score rows for one run, in display units. */
@@ -1354,7 +1558,13 @@ function scoreRows(
   arm: string | null
 ): { cols: ScoreCol[]; rows: { joint: string; values: Record<string, unknown> }[] } | null {
   const m = meta.metrics as Record<string, unknown>
-  if (meta.kind === "motion" || meta.kind === "filter") {
+  const perJointKinds: Record<string, ScoreCol[]> = {
+    motion: MOTION_COLS,
+    filter: FILTER_COLS,
+    build: BUILD_COLS,
+    kinematics: KIN_COLS,
+  }
+  if (meta.kind in perJointKinds) {
     const perJoint = m.per_joint as Record<string, Record<string, unknown>> | undefined
     if (!perJoint) return null
     const rows = Object.entries(perJoint)
@@ -1363,8 +1573,7 @@ function scoreRows(
         joint: arm == null ? name : name.slice(arm.length + 1),
         values,
       }))
-    const cols = meta.kind === "motion" ? MOTION_COLS : FILTER_COLS
-    return rows.length > 0 ? { cols, rows } : null
+    return rows.length > 0 ? { cols: perJointKinds[meta.kind], rows } : null
   }
   if (meta.kind === "sine" || meta.kind === "step" || meta.kind === "gravity") {
     return {
@@ -1416,6 +1625,22 @@ const MAP_SPECS: Record<
     unit: "°",
     warn: 1.0,
     bad: 2.5,
+  },
+  build: {
+    metric: "dev_max_deg",
+    deg: false,
+    label: "built − recorded max",
+    unit: "°",
+    warn: 3,
+    bad: 8,
+  },
+  kinematics: {
+    metric: "mid_band_deg",
+    deg: false,
+    label: "solver 3–15 Hz jitter",
+    unit: "°",
+    warn: 0.15,
+    bad: 0.4,
   },
 }
 
@@ -1533,8 +1758,9 @@ function FailureMap({
 /* ------------------------------------------------------------------ */
 
 /**
- * The tuning workbench: pick what to run (sine / step / filter noise test /
- * recorded motion), set the numbers inline, hit Run — and the result lands
+ * The tuning workbench: pick what to run (sine / step / recorded motion —
+ * optionally with injected noise and the teleop filter stack — motion
+ * building, IK analysis), set the numbers inline, hit Run — and the result lands
  * straight on the graphs below. Every parameter is always visible (no
  * advanced fold), and gain fields (kp / kd / kd_host / kd_host_hz) show the
  * selected joint's current config value with a slider seeded there — leave
@@ -1651,9 +1877,10 @@ export function TuningWorkbench({
     (meta: TuningRunMeta) => {
       select(meta.id)
       const form = runFormValues(meta)
-      if (!form) return
-      setTabKey(meta.kind)
-      setValues((prev) => ({ ...prev, [meta.kind]: form }))
+      const tabFor = KIND_TABS[meta.kind]
+      if (!form || !tabFor) return
+      setTabKey(tabFor)
+      setValues((prev) => ({ ...prev, [tabFor]: form }))
     },
     [select]
   )
@@ -1804,6 +2031,8 @@ export function TuningWorkbench({
     if (run.meta.kind === "filter") {
       return filterJointCharts(run, armed ? arm : null)
     }
+    if (run.meta.kind === "build") return buildJointCharts(run, arm)
+    if (run.meta.kind === "kinematics") return kinematicsCharts(run, arm)
     const single = run.meta.kind === "gravity" ? gravityJointChart(run) : pidJointChart(run)
     return single ? [single] : []
   }, [run, arm, armed])
@@ -2117,8 +2346,12 @@ export function TuningWorkbench({
                       r.side,
                       r.joint,
                       (r.params.motion as string) ?? null,
+                      (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
-                      r.params.noise ? `${r.params.noise as string} noise` : null,
+                      r.params.noise && r.params.noise !== "none"
+                        ? `${r.params.noise as string} noise`
+                        : null,
+                      r.params.filter === true ? "filtered" : null,
                     ]
                       .filter(Boolean)
                       .join(" · ") || "—"}
@@ -2298,7 +2531,11 @@ export function TuningWorkbench({
             {meta.joint ? `${meta.side} ${meta.joint}` : ""}
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
             {meta.params.source ? `${meta.params.source as string}` : ""}
-            {meta.params.noise ? ` · ${meta.params.noise as string} noise` : ""}
+            {meta.params.name ? `${meta.params.name as string}` : ""}
+            {meta.params.noise && meta.params.noise !== "none"
+              ? ` · ${meta.params.noise as string} noise`
+              : ""}
+            {meta.params.filter === true ? " · filtered" : ""}
             {Object.keys(meta.gains).length > 0 ? ` · ${gainsSummary(meta.gains)}` : ""}
             {meta.label ? ` · ${meta.label}` : ""}
           </span>
@@ -2480,8 +2717,12 @@ export function TuningWorkbench({
                       r.side,
                       r.joint,
                       (r.params.motion as string) ?? null,
+                      (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
-                      r.params.noise ? `${r.params.noise as string} noise` : null,
+                      r.params.noise && r.params.noise !== "none"
+                        ? `${r.params.noise as string} noise`
+                        : null,
+                      r.params.filter === true ? "filtered" : null,
                     ]
                       .filter(Boolean)
                       .join(" · ") || "—"}

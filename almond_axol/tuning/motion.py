@@ -178,7 +178,7 @@ def build_motion(
     time_scale: float = 1.0,
     collision_project: bool = True,
     notes: str = "",
-) -> ReferenceMotion:
+) -> tuple[ReferenceMotion, dict[str, np.ndarray]]:
     """Postprocess a flight-recorder capture into a reference motion.
 
     Args:
@@ -196,6 +196,12 @@ def build_motion(
                            solver (requires the kinematics stack; slow on
                            first call due to JIT).
         notes:             Free-form provenance stored in the metadata.
+
+    Returns:
+        ``(motion, raw)`` — the built motion, plus the clipped raw command
+        stream it was built from (``{"t": (N,), "q": (N, 14)}``, rebased to
+        the motion's timeline including ``time_scale``) so the caller can
+        chart the before/after of the smoothing + projection passes.
     """
     cmd_path = Path(f"{prefix}_cmd.npz")
     if not cmd_path.is_file():
@@ -262,7 +268,8 @@ def build_motion(
             "  ! peak velocity is high — consider --time-scale to slow the "
             "playback down"
         )
-    return motion
+    raw = {"t": (t - t[0]) * time_scale, "q": q.astype(np.float32)}
+    return motion, raw
 
 
 def _project_waypoints(q: np.ndarray, rate: float) -> np.ndarray:

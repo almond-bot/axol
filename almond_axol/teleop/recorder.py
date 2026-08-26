@@ -57,6 +57,30 @@ def resolve_prefix(prefix: str) -> str:
     return str(RECORDINGS_DIR / prefix)
 
 
+def resolve_or_latest(prefix: str | None, stage: str = "cmd") -> str:
+    """Resolve a recording prefix, or default to the newest recording.
+
+    ``None`` picks the recording whose ``_<stage>.npz`` in
+    :data:`RECORDINGS_DIR` is newest; a bare name resolves there; a path
+    prefix is used verbatim. Raises ``SystemExit`` with an actionable
+    message when the default is requested but nothing has been recorded.
+    """
+    if prefix is not None:
+        return resolve_prefix(prefix)
+    suffix = f"_{stage}.npz"
+    newest = max(
+        RECORDINGS_DIR.glob(f"*{suffix}"),
+        key=lambda p: p.stat().st_mtime,
+        default=None,
+    )
+    if newest is None:
+        raise SystemExit(
+            f"No recordings in {RECORDINGS_DIR} — record one first with "
+            "`axol teleop --teleop.record NAME`, or pass a prefix."
+        )
+    return str(newest)[: -len(suffix)]
+
+
 class JitterRecorder:
     """Fixed-capacity ring buffer of timestamped float32 rows.
 

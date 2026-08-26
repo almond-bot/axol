@@ -274,6 +274,7 @@ class IKWorker:
                 "tgt_r": 3,
                 "q": n,
                 "engaged": 2,
+                "solve_ms": 1,
             },
         )
 
@@ -529,6 +530,7 @@ class IKWorker:
             delta_scale = float(np.clip(elapsed * self._config.ik_frequency, 1.0, 4.0))
         self._last_solve_t = now
 
+        solve_t0 = time.perf_counter()
         q_new = self._solver.ik(
             q_current,
             left_pose=(tl_pos, tl_rot),
@@ -537,6 +539,7 @@ class IKWorker:
             right_elbow_pos=elbow_r,
             delta_scale=delta_scale,
         )
+        solve_ms = (time.perf_counter() - solve_t0) * 1000.0
         # A frozen arm must not move at all: the hold-pose target keeps the
         # solve consistent (collision terms see the true pose), but the
         # joints themselves are pinned to the seed.
@@ -576,6 +579,7 @@ class IKWorker:
                 engaged=np.array(
                     [float(self._active["left"]), float(self._active["right"])]
                 ),
+                solve_ms=solve_ms,
             )
         return q_new
 

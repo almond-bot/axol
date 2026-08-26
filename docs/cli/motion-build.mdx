@@ -26,3 +26,5 @@ axol motion.list                                 # what's committed
 ```
 
 Commit the generated `.npz` so every robot can replay the identical motion.
+
+Every build also saves a **before/after tuning-run artifact** (`kind=build`, `~/.almond/diagnostics/tuning/`): the clipped raw command recording and the built motion side by side per joint, with per-joint change RMS/max and peak velocities. The diagnostics dashboard charts it like any other tuning run (zoom / fullscreen), so the effect of the smoothing pass and the collision projection is directly visible before the motion is ever replayed.

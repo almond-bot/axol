@@ -5,6 +5,8 @@ description: "Inject network- or IK-shaped noise into a clean motion — each at
 
 Tests the teleop filter stack by feeding it a *known-dirty* stream and checking what comes out — no robot, no VR headset, and exactly reproducible. A clean joint-space signal (a synthetic sine, or a committed [reference motion](/cli/motion-build)) is corrupted and replayed through the production smoothing chain at the production rates.
 
+For the hardware version — the same noise injection and filter stack, but actually driving the arms and scoring the measured positions — use [`tune.motion --noise/--filter`](/cli/tune-motion), which is also where the diagnostics dashboard runs it.
+
 The production pipeline is:
 
 ```

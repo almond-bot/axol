@@ -100,27 +100,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def _resolve_prefix(prefix: str | None) -> str:
-    """Resolve the recording prefix: verbatim path, bare name, or newest.
+    """Resolve the recording prefix: verbatim path, bare name, or newest."""
+    from ..teleop.recorder import resolve_or_latest
 
-    A bare name (no path separator) resolves in the recordings directory
-    (where ``--teleop.record`` writes bare names); ``None`` picks the
-    newest recording there.
-    """
-    from ..teleop.recorder import RECORDINGS_DIR, resolve_prefix
-
-    if prefix is not None:
-        return resolve_prefix(prefix)
-    newest = max(
-        RECORDINGS_DIR.glob("*_cmd.npz"),
-        key=lambda p: p.stat().st_mtime,
-        default=None,
-    )
-    if newest is None:
-        raise SystemExit(
-            f"No recordings in {RECORDINGS_DIR} — record one first with "
-            "`axol teleop --teleop.record NAME`, or pass a prefix."
-        )
-    return str(newest)[: -len("_cmd.npz")]
+    return resolve_or_latest(prefix, stage="cmd")
 
 
 def run_build(args: argparse.Namespace) -> None:
@@ -131,7 +114,7 @@ def run_build(args: argparse.Namespace) -> None:
 
     prefix = _resolve_prefix(args.prefix)
     print(f"Building reference motion {args.name!r} from {prefix} ...")
-    motion = build_motion(
+    motion, raw = build_motion(
         prefix,
         args.name,
         rate=args.rate,
@@ -144,6 +127,82 @@ def run_build(args: argparse.Namespace) -> None:
     print(f"Wrote {path}")
     if args.out is None:
         print("Commit it so every robot can replay the identical motion.")
+    _save_build_run(args, prefix, motion, raw)
+
+
+def _save_build_run(args: argparse.Namespace, prefix: str, motion, raw) -> None:
+    """Persist a before/after tuning-run artifact for the diagnostics UI.
+
+    The recorded (clipped raw command) stream and the built motion are stored
+    side by side per joint so the smoothing + projection passes can be judged
+    visually — the same per-joint charts (zoom / fullscreen) the other tuning
+    runs get.
+    """
+    import math as _math
+
+    import numpy as np
+
+    from ..constants import ARM_JOINTS
+    from ..tuning import save_run
+
+    columns = [f"left.{j.value}" for j in ARM_JOINTS] + [
+        f"right.{j.value}" for j in ARM_JOINTS
+    ]
+    t_built = motion.times()
+    t_raw = np.asarray(raw["t"], dtype=float)
+    q_raw = np.asarray(raw["q"], dtype=float)
+
+    # Deviation of the built motion from the recording, evaluated on the raw
+    # timestamps — what the smoothing + projection actually changed.
+    per_joint: dict[str, dict[str, float]] = {}
+    for i, name in enumerate(columns):
+        if float(np.ptp(q_raw[:, i])) < _math.radians(1.0):
+            continue
+        built_at_raw = np.interp(t_raw, t_built, motion.q[:, i])
+        dev = built_at_raw - q_raw[:, i]
+        vel_raw = np.abs(np.diff(q_raw[:, i]) / np.maximum(np.diff(t_raw), 1e-9))
+        vel_built = np.abs(np.diff(motion.q[:, i])) * motion.rate
+        per_joint[name] = {
+            "dev_rms_deg": _math.degrees(float(np.sqrt(np.mean(dev**2)))),
+            "dev_max_deg": _math.degrees(float(np.max(np.abs(dev)))),
+            "peak_vel_raw_dps": _math.degrees(float(vel_raw.max(initial=0.0))),
+            "peak_vel_built_dps": _math.degrees(float(vel_built.max(initial=0.0))),
+        }
+    metrics = {
+        "per_joint": per_joint,
+        "waypoints": int(len(motion.q)),
+        "duration_s": float(motion.duration),
+        "peak_vel_built_dps": _math.degrees(float(motion.peak_velocity().max())),
+        # The headline number: the largest single change the postprocessing
+        # made to any moving joint.
+        "dev_max_deg": max(
+            (m["dev_max_deg"] for m in per_joint.values()), default=None
+        ),
+        "worst_joint": max(
+            per_joint, key=lambda k: per_joint[k]["dev_max_deg"], default=None
+        ),
+    }
+    run_id = save_run(
+        "build",
+        {
+            "t": t_built,
+            "built": np.asarray(motion.q, dtype=np.float32),
+            "t_raw": t_raw,
+            "raw": q_raw.astype(np.float32),
+        },
+        metrics,
+        params={
+            "name": motion.name,
+            "prefix": str(prefix),
+            "rate": float(motion.rate),
+            "cutoff": float(args.cutoff),
+            "time_scale": float(args.time_scale),
+            "projected": not args.no_project,
+            "columns": columns,
+        },
+        label=args.notes or None,
+    )
+    print(f"Saved tuning run {run_id} (kind=build) — before/after in the UI.")
 
 
 def run_list(args: argparse.Namespace) -> None:
