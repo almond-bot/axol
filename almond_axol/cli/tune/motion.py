@@ -198,25 +198,31 @@ def run(args: argparse.Namespace) -> None:
 
 
 def _print_metrics_table(per_joint: dict[str, dict[str, float]]) -> None:
-    """Tracking/smoothness scorecard, one row per joint that actually moved."""
+    """Tracking/smoothness scorecard, one row per scored joint.
+
+    Joints that stayed parked show "-" in the tracking columns (they track
+    trivially well) but still carry buzz / chatter, which are meaningful —
+    and matter — at rest.
+    """
+
+    def fmt(m: dict[str, float], key: str, digits: int, deg: bool = False) -> str:
+        v = m.get(key, math.nan)
+        if not math.isfinite(v):
+            return "-"
+        return f"{math.degrees(v) if deg else v:.{digits}f}"
+
     print(f"\n{'═' * 78}")
     print(
         f"  {'joint':<18} {'RMS °':>7} {'lagfree °':>9} {'lag ms':>7} "
         f"{'jitter °':>8} {'amp':>5} {'trq HF':>7} {'buzz °':>7} {'@Hz':>4}"
     )
     for name, m in per_joint.items():
-        amp = f"{m['amplification']:.2f}" if math.isfinite(m["amplification"]) else "-"
-        lag = f"{m['lag_ms']:.0f}" if math.isfinite(m["lag_ms"]) else "-"
-        buzz_hz = (
-            f"{m['buzz_hz']:.0f}" if math.isfinite(m.get("buzz_hz", math.nan)) else "-"
-        )
-        buzz = m.get("buzz", math.nan)
-        buzz_s = f"{math.degrees(buzz):.3f}" if math.isfinite(buzz) else "-"
         print(
-            f"  {name:<18} {math.degrees(m['rms_err']):>7.3f} "
-            f"{math.degrees(m['rms_err_lagfree']):>9.3f} {lag:>7} "
-            f"{math.degrees(m['err_band_mid']):>8.3f} {amp:>5} "
-            f"{m['torque_hf']:>7.3f} {buzz_s:>7} {buzz_hz:>4}"
+            f"  {name:<18} {fmt(m, 'rms_err', 3, deg=True):>7} "
+            f"{fmt(m, 'rms_err_lagfree', 3, deg=True):>9} {fmt(m, 'lag_ms', 0):>7} "
+            f"{fmt(m, 'err_band_mid', 3, deg=True):>8} {fmt(m, 'amplification', 2):>5} "
+            f"{fmt(m, 'torque_hf', 3):>7} {fmt(m, 'buzz', 3, deg=True):>7} "
+            f"{fmt(m, 'buzz_hz', 0):>4}"
         )
     print(f"{'═' * 78}")
     print(
@@ -225,7 +231,8 @@ def _print_metrics_table(per_joint: dict[str, dict[str, float]]) -> None:
         "  the error (what the operator feels); amp = measured/commanded\n"
         "  mid-band motion (>1 rings, <1 filters); trq HF = torque chatter (Nm);\n"
         "  buzz = sustained >=20 Hz motion (what you hear) at its frequency —\n"
-        "  healthy joints sit near 0.005 deg, an audible limit cycle 2-5x that."
+        "  healthy joints sit near 0.005 deg, an audible limit cycle 2-5x that;\n"
+        "  parked joints show '-' tracking but are still scored for buzz/chatter."
     )
 
 
@@ -495,28 +502,44 @@ async def _run(args: argparse.Namespace) -> None:
     actual = np.stack(log_actual)
     torque = np.stack(log_torque)
 
-    # Score only joints that actually moved (> ~1° of commanded travel) —
-    # a joint parked at rest scores meaninglessly well.
+    # Tracking quality is only scored for joints that actually moved (> ~1°
+    # of commanded travel) — a joint parked at rest tracks meaninglessly
+    # well. But a parked joint can still buzz or chatter at hold (that's how
+    # the wrist limit cycle presents), so stationary joints keep their row
+    # with only the rest-meaningful columns; the tracking numbers go NaN and
+    # render as "–".
+    _TRACKING_KEYS = (
+        "rms_err",
+        "rms_err_lagfree",
+        "lag_ms",
+        "err_band_mid",
+        "peak_hz",
+        "amplification",
+    )
     per_joint: dict[str, dict[str, float]] = {}
+    moved: dict[str, dict[str, float]] = {}
     for i, name in enumerate(_COLUMNS):
         if np.isnan(actual[:, i]).all():
             continue
-        travel = float(np.ptp(target[:, i]))
-        if travel < math.radians(1.0):
-            continue
-        per_joint[name] = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
-    if not per_joint:
+        m = tracking_metrics(t, target[:, i], actual[:, i], torque[:, i])
+        if float(np.ptp(target[:, i])) >= math.radians(1.0):
+            moved[name] = m
+        else:
+            for key in _TRACKING_KEYS:
+                m[key] = math.nan
+        per_joint[name] = m
+    if not moved:
         print("No joint moved more than 1° — nothing to score.")
         return
 
     _print_metrics_table(per_joint)
 
-    worst = max(per_joint.items(), key=lambda kv: kv[1]["rms_err"])
+    worst = max(moved.items(), key=lambda kv: kv[1]["rms_err"])
     summary = {
         "per_joint": per_joint,
         "worst_joint": worst[0],
-        "mean_rms_err": float(np.mean([m["rms_err"] for m in per_joint.values()])),
-        "mean_jitter": float(np.mean([m["err_band_mid"] for m in per_joint.values()])),
+        "mean_rms_err": float(np.mean([m["rms_err"] for m in moved.values()])),
+        "mean_jitter": float(np.mean([m["err_band_mid"] for m in moved.values()])),
         "completed": bool(len(log_t) >= len(sent)),
     }
 
