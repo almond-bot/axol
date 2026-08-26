@@ -12,10 +12,12 @@ import {
   deleteTuningRun,
   fetchTuningGains,
   fetchTuningMotions,
+  fetchTuningRecordings,
   fetchTuningRun,
   fetchTuningRuns,
   type TuningGains,
   type TuningMotion,
+  type TuningRecording,
   type TuningRunData,
   type TuningRunMeta,
 } from "@/lib/tuning"
@@ -417,21 +419,21 @@ const TABS: WbTab[] = [
       "--teleop.record NAME) or by hand-guiding the arms in gravity comp " +
       "(set the recording name on its operation panel, or axol " +
       "gravity-comp --record NAME); bare names land in " +
-      "~/.almond/recordings/. Leave the recording box empty to build from " +
-      "the newest one.",
+      "~/.almond/recordings/. Leave the recording picker on newest to " +
+      "build from the most recent one.",
     presets: {},
     fields: [
       { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
       {
         key: "prefix",
         label: "recording",
-        type: "text",
+        type: "select",
         placeholder: "newest recording",
-        width: "w-44",
+        width: "w-56",
         hint:
-          "which recording to convert — a bare teleop --teleop.record / " +
-          "gravity-comp --record name, or a full path prefix; empty uses " +
-          "the newest in ~/.almond/recordings/",
+          "which recording to convert — captured via teleop " +
+          "(--teleop.record) or hand-guided in gravity comp (--record); " +
+          "leave on newest to build from the most recent one",
       },
       {
         key: "cutoff",
@@ -1807,6 +1809,9 @@ export function TuningWorkbench({
   const [values, setValues] = useState<Record<string, Record<string, string>>>({})
   const [missing, setMissing] = useState<string[]>([])
   const [motions, setMotions] = useState<TuningMotion[]>([])
+  // Buildable flight recordings (teleop _cmd / gravity-comp _gc), newest
+  // first — the Build-motion recording picker's options.
+  const [recordings, setRecordings] = useState<TuningRecording[]>([])
   // Effective per-joint config gains (defaults + calibration): the slider
   // baselines and "config N" labels on the gain fields.
   const [gains, setGains] = useState<TuningGains | null>(null)
@@ -1840,6 +1845,19 @@ export function TuningWorkbench({
       .catch(() => {})
   }, [])
 
+  const refreshRecordings = useCallback(() => {
+    fetchTuningRecordings()
+      .then(({ recordings }) => setRecordings(recordings))
+      .catch(() => {})
+  }, [])
+
+  // Recordings are made by the teleop / gravity-comp operations, outside
+  // this workbench — refetch whenever the Build tab is opened so a session
+  // recorded since the page loaded shows up in the picker.
+  useEffect(() => {
+    if (enabled && tabKey === "build") refreshRecordings()
+  }, [enabled, tabKey, refreshRecordings])
+
   const refreshGains = useCallback(() => {
     fetchTuningGains()
       .then(({ gains }) => setGains(gains))
@@ -1863,8 +1881,9 @@ export function TuningWorkbench({
     // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch on connect
     refreshRuns()
     refreshMotions()
+    refreshRecordings()
     refreshGains()
-  }, [enabled, refreshRuns, refreshMotions, refreshGains])
+  }, [enabled, refreshRuns, refreshMotions, refreshRecordings, refreshGains])
 
   // The selection setter clears loaded data immediately so a stale chart
   // never shows under a new selection; the effect below only fetches.
@@ -2164,6 +2183,11 @@ export function TuningWorkbench({
               no reference motions yet — build one from a recording first
             </span>
           )}
+          {tab.key === "build" && recordings.length === 0 && (
+            <span className="text-xs text-amber-200/70">
+              no recordings yet — record via teleop or hand-guide in gravity comp first
+            </span>
+          )}
         </div>
         <p className="max-w-3xl text-xs leading-relaxed text-white/45">{tab.description}</p>
 
@@ -2211,14 +2235,25 @@ export function TuningWorkbench({
                       f.width ?? "w-32"
                     )}
                   >
-                    <option value="">{tab.required.includes(f.key) ? "select…" : "default"}</option>
-                    {(f.key === "motion" ? motions.map((m) => m.name) : (f.options ?? [])).map(
-                      (o) => (
-                        <option key={o} value={o}>
-                          {o}
-                        </option>
-                      )
-                    )}
+                    <option value="">
+                      {tab.required.includes(f.key) ? "select…" : (f.placeholder ?? "default")}
+                    </option>
+                    {(f.key === "motion"
+                      ? motions.map((m) => ({ value: m.name, label: m.name }))
+                      : f.key === "prefix" && tab.key === "build"
+                        ? recordings.map((r) => ({
+                            value: r.name,
+                            label:
+                              `${r.name} — ` +
+                              (r.kind === "gravity-comp" ? "hand-guided" : "teleop") +
+                              (r.durationS != null ? ` · ${Math.round(r.durationS)}s` : ""),
+                          }))
+                        : (f.options ?? []).map((o) => ({ value: o, label: o }))
+                    ).map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
                   </select>
                 ) : f.slider ? (
                   (() => {

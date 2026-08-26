@@ -709,6 +709,29 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
         return {"motions": await asyncio.to_thread(_list)}
 
+    @app.get("/api/tuning/recordings")
+    async def tuning_recordings() -> dict[str, Any]:
+        """The flight recordings motion.build can consume, newest first.
+
+        From either recorder: a teleop session (``--teleop.record``) or a
+        hand-guided gravity-comp one (``--record``). Feeds the workbench's
+        Build-motion recording picker.
+        """
+        from ..teleop.recorder import list_recordings
+
+        def _list() -> list[dict[str, Any]]:
+            return [
+                {
+                    "name": r["name"],
+                    "kind": r["kind"],
+                    "modifiedAt": r["modified_at"],
+                    "durationS": r["duration_s"],
+                }
+                for r in list_recordings()
+            ]
+
+        return {"recordings": await asyncio.to_thread(_list)}
+
     # -- local ZED cameras ---------------------------------------------------
 
     @app.get("/api/cameras/detect")

@@ -97,6 +97,44 @@ def resolve_or_latest(prefix: str | None, stage: str | tuple[str, ...] = "cmd") 
     return str(path)[: -len(suffix)]
 
 
+def list_recordings() -> list[dict[str, object]]:
+    """The buildable recordings in :data:`RECORDINGS_DIR`, newest first.
+
+    One entry per prefix that has a motion-source stage — teleop's ``_cmd``
+    or gravity comp's ``_gc`` (``_cmd`` wins when both exist, matching
+    ``build_motion``). ``duration_s`` spans the capture's timestamps
+    (teleop: the engaged segment; gravity comp: the whole session) and is
+    ``None`` for a file that can't be read.
+    """
+    if not RECORDINGS_DIR.is_dir():
+        return []
+    by_name: dict[str, dict[str, object]] = {}
+    for stage, kind in (("cmd", "teleop"), ("gc", "gravity-comp")):
+        suffix = f"_{stage}.npz"
+        for path in RECORDINGS_DIR.glob(f"*{suffix}"):
+            name = path.name[: -len(suffix)]
+            if name in by_name:
+                continue
+            duration: float | None
+            try:
+                with np.load(path) as data:
+                    t = data["t"]
+                    duration = float(t[-1] - t[0]) if len(t) > 1 else 0.0
+            except Exception:  # noqa: BLE001 - a corrupt file still gets listed
+                duration = None
+            by_name[name] = {
+                "name": name,
+                "kind": kind,
+                "modified_at": path.stat().st_mtime,
+                "duration_s": duration,
+            }
+    return sorted(
+        by_name.values(),
+        key=lambda r: r["modified_at"],  # type: ignore[arg-type,return-value]
+        reverse=True,
+    )
+
+
 class TeleopRecorder:
     """Fixed-capacity ring buffer of timestamped float32 rows.
 

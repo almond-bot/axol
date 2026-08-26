@@ -73,6 +73,22 @@ export async function fetchTuningMotions(): Promise<{ motions: TuningMotion[] }>
   return json(await fetch(apiUrl("/api/tuning/motions")))
 }
 
+/** One flight recording motion.build can consume (newest first). */
+export interface TuningRecording {
+  /** Bare prefix in ~/.almond/recordings/ — what motion.build takes. */
+  name: string
+  /** Which recorder captured it: "teleop" | "gravity-comp". */
+  kind: string
+  /** Epoch seconds the recording file was written. */
+  modifiedAt: number
+  /** Capture length in seconds (null for an unreadable file). */
+  durationS: number | null
+}
+
+export async function fetchTuningRecordings(): Promise<{ recordings: TuningRecording[] }> {
+  return json(await fetch(apiUrl("/api/tuning/recordings")))
+}
+
 /**
  * Effective per-joint control gains: `gains[side][joint]` holds the values a
  * tuning run uses when its gain fields are left empty — config defaults with
