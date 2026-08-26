@@ -52,7 +52,7 @@ const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter"])
 interface WbField {
   key: string
   label: string
-  type: "number" | "text" | "select" | "boolean" | "overrides"
+  type: "number" | "text" | "select" | "boolean" | "overrides" | "pose"
   options?: string[]
   /** Placeholder shown when empty; empty means "command default". */
   placeholder?: string
@@ -161,14 +161,12 @@ const TABS: WbTab[] = [
       },
       {
         key: "pose",
-        label: "pose",
-        type: "text",
-        placeholder: "joint=deg …",
-        width: "w-52",
+        label: "pose — hold other joints (°)",
+        type: "pose",
         hint:
-          "hold other joints during the test (space-separated joint-frame " +
-          "degrees, e.g. elbow=90 wrist_1=45) — reflected inertia and gravity " +
-          "load change with pose, so probe the worst case; ramped back after",
+          "hold other joints at an angle during the test — reflected inertia " +
+          "and gravity load change with pose, so probe the worst case; " +
+          "ramped back afterwards",
       },
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
@@ -222,14 +220,12 @@ const TABS: WbTab[] = [
       },
       {
         key: "pose",
-        label: "pose",
-        type: "text",
-        placeholder: "joint=deg …",
-        width: "w-52",
+        label: "pose — hold other joints (°)",
+        type: "pose",
         hint:
-          "hold other joints during the test (space-separated joint-frame " +
-          "degrees, e.g. elbow=90 wrist_1=45) — reflected inertia and gravity " +
-          "load change with pose, so probe the worst case; ramped back after",
+          "hold other joints at an angle during the test — reflected inertia " +
+          "and gravity load change with pose, so probe the worst case; " +
+          "ramped back afterwards",
       },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
       {
@@ -616,6 +612,117 @@ function GainOverrideEditor({
         className="h-8 w-fit rounded-md border border-dashed border-white/15 px-2 text-xs text-white/45 transition-colors hover:border-[#eff483]/40 hover:text-[#eff483]"
       >
         + override
+      </button>
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* Pose editor (sine/step tabs)                                        */
+/* ------------------------------------------------------------------ */
+
+interface PoseRow {
+  joint: string
+  deg: string
+}
+
+/** Parse the CLI's `joint=deg` tokens into editor rows. */
+function parsePose(text: string): PoseRow[] {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((tok) => {
+      const [joint = "", deg = ""] = tok.split("=")
+      return { joint, deg }
+    })
+}
+
+/** Serialize complete rows back to `joint=deg` tokens (incomplete rows stay editor-local). */
+function serializePose(rows: PoseRow[]): string {
+  return rows
+    .filter((r) => r.joint && r.deg.trim() !== "")
+    .map((r) => `${r.joint}=${r.deg.trim()}`)
+    .join(" ")
+}
+
+/**
+ * Structured editor for the sine/step tests' hold pose: rows of joint +
+ * angle instead of hand-typed `elbow=90` tokens. Serializes to exactly
+ * those tokens (each becomes its own --pose flag), so the launch path and
+ * run-metadata re-arming are unchanged. The joint under test is excluded
+ * from the options — the CLI rejects posing it.
+ */
+function PoseEditor({
+  value,
+  onChange,
+  disabled,
+  excludeJoint,
+}: {
+  value: string
+  onChange: (v: string) => void
+  disabled: boolean
+  excludeJoint: string
+}) {
+  const [rows, setRows] = useState<PoseRow[]>(() => parsePose(value))
+  // Resync only on external changes (re-arm from a clicked run) — while the
+  // operator is mid-edit, incomplete rows must survive serialization.
+  useEffect(() => {
+    setRows((prev) => (value === serializePose(prev) ? prev : parsePose(value)))
+  }, [value])
+  const update = (next: PoseRow[]) => {
+    setRows(next)
+    onChange(serializePose(next))
+  }
+  return (
+    <div className="flex flex-col gap-1.5">
+      {rows.map((row, i) => (
+        <div key={i} className="flex items-center gap-1.5">
+          <select
+            value={row.joint}
+            onChange={(e) =>
+              update(rows.map((r, j) => (j === i ? { ...r, joint: e.target.value } : r)))
+            }
+            disabled={disabled}
+            className="h-8 w-28 rounded-md border border-white/10 bg-[#1c1c1c] px-1.5 text-xs text-white/85 outline-none focus:border-[#eff483]/40"
+          >
+            <option value="">joint…</option>
+            {ARM_JOINT_OPTIONS.filter((o) => o !== excludeJoint || o === row.joint).map(
+              (o) => (
+                <option key={o} value={o}>
+                  {o}
+                </option>
+              )
+            )}
+          </select>
+          <input
+            type="text"
+            inputMode="decimal"
+            value={row.deg}
+            placeholder="deg"
+            onChange={(e) =>
+              update(rows.map((r, j) => (j === i ? { ...r, deg: e.target.value } : r)))
+            }
+            disabled={disabled}
+            className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+          />
+          <button
+            type="button"
+            onClick={() => update(rows.filter((_, j) => j !== i))}
+            disabled={disabled}
+            className="text-white/30 transition-colors hover:text-red-300"
+            title="remove pose hold"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => update([...rows, { joint: "", deg: "" }])}
+        disabled={disabled}
+        className="h-8 w-fit rounded-md border border-dashed border-white/15 px-2 text-xs text-white/45 transition-colors hover:border-[#eff483]/40 hover:text-[#eff483]"
+      >
+        + hold joint
       </button>
     </div>
   )
@@ -1843,6 +1950,13 @@ export function TuningWorkbench({
                     value={tabValues[f.key] ?? ""}
                     onChange={(v) => setValue(f.key, v)}
                     disabled={runningOurs || busy}
+                  />
+                ) : f.type === "pose" ? (
+                  <PoseEditor
+                    value={tabValues[f.key] ?? ""}
+                    onChange={(v) => setValue(f.key, v)}
+                    disabled={runningOurs || busy}
+                    excludeJoint={tabValues["joint"] ?? ""}
                   />
                 ) : f.type === "boolean" ? (
                   <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
