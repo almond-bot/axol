@@ -351,8 +351,19 @@ class ArmConfig:
     )
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=130.0,
-            kd=3.5,
+            # Step/sine-validated on hardware (2026-08, tuning workbench,
+            # elbow-raised pose so the joint ran under gravity load): kp 200 /
+            # kd 5 settles a 10° step in 0.07 s with a single smooth 0.33°
+            # crest, no ring, 27 mdeg steady-state (vs 114 ms / 0.51° / 49
+            # mdeg at the old kp 130 / kd 3.5) and tracks a 1 Hz / 10° sine
+            # at 0.67° RMS at the production 240 Hz loop. kd 4 halved its
+            # damping margin: a two-crest ~7 Hz ring at 0.59° reappeared for
+            # only a 0.06° sine gain. kd 5 is the Damiao firmware clamp
+            # (kd decodes against 0-5); the contact chatter historically
+            # seen near the clamp did not reproduce — torque HF was the
+            # lowest of the sweep.
+            kp=200.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
@@ -360,9 +371,7 @@ class ArmConfig:
             # reference robot's 7.8-10 Hz burst band, jit16) sits nearly on
             # top of current builds' ~11 Hz structural mode and pumps it
             # (see shoulder_3 above; wrist_2 rang hardest in that mode as the
-            # lightest joint on the shaking mast). Its Damiao firmware clamps
-            # kd at 5 and raising kd toward the clamp historically produced
-            # contact chatter against the chassis, so if wrist_2 ringing
+            # lightest joint on the shaking mast). If wrist_2 ringing
             # returns, notch the structural mode in the host path before
             # restoring any kd_host.
         )
