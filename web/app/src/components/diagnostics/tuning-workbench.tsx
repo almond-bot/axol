@@ -270,6 +270,17 @@ const TABS: WbTab[] = [
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
+        key: "ik",
+        label: "run as IK",
+        type: "boolean",
+        hint:
+          "drive the run through the IK solver: the motion's cartesian " +
+          "end-effector path (FK of the reference, with elbow hints) is " +
+          "re-solved to joints like teleop's pose→joints loop and the arms " +
+          "execute the solver's output — still scored against the clean " +
+          "reference, so IK reconstruction error and tracking show together",
+      },
+      {
         key: "noise",
         label: "inject noise",
         type: "select",
@@ -857,6 +868,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("motion", p.motion)
       put("stiffness", p.stiffness)
       put("noise", p.noise)
+      if (p.ik === true) out["ik"] = "true"
       if (p.filter === true) out["filter"] = "true"
       put("seed", p.seed)
       const overrides = Object.entries(g)
@@ -2430,6 +2442,7 @@ export function TuningWorkbench({
                       (r.params.motion as string) ?? null,
                       (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
+                      r.params.ik === true ? "IK" : null,
                       r.params.noise && r.params.noise !== "none"
                         ? `${r.params.noise as string} noise`
                         : null,
@@ -2614,6 +2627,7 @@ export function TuningWorkbench({
             {meta.params.motion ? `${meta.params.motion as string}` : ""}
             {meta.params.source ? `${meta.params.source as string}` : ""}
             {meta.params.name ? `${meta.params.name as string}` : ""}
+            {meta.params.ik === true ? " · IK" : ""}
             {meta.params.noise && meta.params.noise !== "none"
               ? ` · ${meta.params.noise as string} noise`
               : ""}
@@ -2801,6 +2815,7 @@ export function TuningWorkbench({
                       (r.params.motion as string) ?? null,
                       (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
+                      r.params.ik === true ? "IK" : null,
                       r.params.noise && r.params.noise !== "none"
                         ? `${r.params.noise as string} noise`
                         : null,

@@ -513,7 +513,9 @@ COMMANDS: dict[str, CommandDef] = {
         "tune.motion",
         "Reference-motion replay",
         "Replay a committed reference motion through the production control "
-        "path and score tracking accuracy and smoothness per joint. Override "
+        "path and score tracking accuracy and smoothness per joint — or run "
+        "it as IK, where the motion's Cartesian end-effector path is "
+        "re-solved live and the arms execute the solver's output. Override "
         "gains per run to A/B-compare on the identical motion; every run is "
         "saved for the Tuning charts.",
         "Diagnostics",

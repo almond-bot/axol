@@ -13,6 +13,14 @@ Override individual gains per run with ``--gain`` and compare runs on the
 identical motion — the deterministic A/B loop that ad-hoc teleop testing
 can't give you.
 
+With ``--ik`` the run exercises the full Cartesian pipeline instead of raw
+joint replay: every waypoint is converted to its two end-effector poses
+(plus elbow hints) by FK, and the IK solver re-solves the chain exactly
+like teleop's pose->joints loop — the arms execute the *solver's* output,
+scored against the clean reference, so IK reconstruction error and
+controller tracking show up together (the charts overlay reference, solved,
+and measured).
+
 Every run is persisted as a tuning-run artifact (full per-joint time series
 + metrics, ``~/.almond/diagnostics/tuning/``) for charting and side-by-side
 comparison in the diagnostics UI; ``--no-save-run`` disables that.
@@ -27,6 +35,7 @@ Examples:
     axol tune.motion --motion reach-and-place --gain left.elbow.kd=4.5
     axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
     axol tune.motion --motion reach-and-place --stiffness 0.8
+    axol tune.motion --motion reach-and-place --ik   # drive through the IK solver
 """
 
 from __future__ import annotations
@@ -146,6 +155,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "trapezoid) before streaming — the hardware version of tune.filter: "
         "the arm physically shows what the stack removes and what it costs "
         "in lag. Off: the stream is sent as-is.",
+    )
+    p.add_argument(
+        "--ik",
+        action="store_true",
+        help="Drive the run through the IK solver: each waypoint's "
+        "end-effector poses (FK of the reference, with elbow hints) are "
+        "re-solved to joints exactly like teleop's pose->joints loop, and "
+        "the arms execute the solver's output — still scored against the "
+        "clean reference, so IK reconstruction error and tracking error "
+        "show up together. Composes after --noise/--filter.",
     )
     p.add_argument(
         "--seed",
@@ -308,6 +327,65 @@ def _prepare_stream(
     return t_ref, sent, clean, info
 
 
+def _ik_stream(solver, sent: np.ndarray, to_full, info: dict) -> np.ndarray:
+    """Re-solve a joint stream through the IK solver, like teleop does.
+
+    Each 14-wide row is converted to its two end-effector poses and elbow
+    positions by FK, then handed to :meth:`KinematicsSolver.ik`
+    warm-started from the previous solution — the same Cartesian
+    pose->joints chain teleop runs, so the arms execute what the solver
+    produces rather than the recorded joints. The chain is solved before
+    playback starts (the pose path is fully known in advance), so a slow
+    solve can't stretch the command interval and corrupt the tracking
+    scores with pacing jitter; per-solve wall times are still measured and
+    stored on the run (``ik_solve_ms_*``) so solver latency stays visible.
+    """
+    n = len(sent)
+    out = np.empty_like(sent)
+    solve_ms = np.empty(n)
+    q_full = to_full(sent[0])
+    t_note = time.perf_counter()
+    for k in range(n):
+        q_ref = to_full(sent[k])
+        left_pose, right_pose = solver.fk(q_ref)
+        left_elbow, right_elbow = solver.elbow_positions(q_ref)
+        t0 = time.perf_counter()
+        q_full = solver.ik(
+            q_full,
+            left_pose=left_pose,
+            right_pose=right_pose,
+            left_elbow_pos=left_elbow,
+            right_elbow_pos=right_elbow,
+        )
+        solve_ms[k] = (time.perf_counter() - t0) * 1e3
+        out[k] = np.concatenate(
+            [q_full[solver.left_indices], q_full[solver.right_indices]]
+        )
+        if time.perf_counter() - t_note > 5.0:
+            print(f"  ... {k + 1}/{n} waypoints solved")
+            t_note = time.perf_counter()
+    dev = out - sent
+    # The first solve absorbs the JIT trace of this call signature (the
+    # planner's warm-up doesn't cover the elbow-hint variant) — seconds, not
+    # milliseconds — so it would swamp the mean of an otherwise steady chain.
+    steady = solve_ms[1:] if n > 1 else solve_ms
+    info.update(
+        ik=True,
+        ik_solve_ms_mean=float(steady.mean()),
+        ik_solve_ms_p99=float(np.percentile(steady, 99)),
+        ik_dev_rms_deg=float(math.degrees(np.sqrt(np.mean(dev**2)))),
+        ik_dev_max_deg=float(math.degrees(np.max(np.abs(dev)))),
+    )
+    print(
+        f"  IK re-solve: solve {info['ik_solve_ms_mean']:.2f} ms mean / "
+        f"{info['ik_solve_ms_p99']:.2f} ms p99; solved joints deviate from "
+        f"the reference by {info['ik_dev_rms_deg']:.3f}° RMS "
+        f"({info['ik_dev_max_deg']:.2f}° max) — that deviation is part of "
+        "what the run scores"
+    )
+    return out
+
+
 async def _run(args: argparse.Namespace) -> None:
     motion = _load_motion_or_exit(args.motion)
     overrides = _parse_gain_overrides(args.gain or [])
@@ -371,6 +449,11 @@ async def _run(args: argparse.Namespace) -> None:
         if axol.right is not None:
             q[solver.right_indices] = axol.right.positions[:7]
         return q
+
+    if args.ik:
+        print(f"Re-solving {len(sent)} waypoints through the IK solver ...")
+        sent = _ik_stream(solver, sent, to_full, stream_info)
+        stream_differs = True
 
     watchdog = ContactWatchdog(args.torque_threshold)
     log_t: list[float] = []

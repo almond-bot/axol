@@ -14,6 +14,7 @@ The arm moves to the motion's start and back to rest on collision-aware planned 
 | `--motion NAME` | Committed motion name (`axol motion.list`) or a path to a motion `.npz` (required) |
 | `--gain [SIDE.]JOINT.FIELD=VALUE` | Override one gain for this run, e.g. `left.elbow.kd=4.5` or `shoulder_3.kd_host=8` (no side = both arms). Fields: `kp`, `kd`, `kd_host`, `kd_host_hz`, `kd_host_q`, `j_eff`. Repeatable |
 | `--stiffness S` | Stiffness-slider position in `[0, 1]` for both arms (default: 1.0, the production default — the tuned gains, where gain overrides land exactly; lower only adds compliance) |
+| `--ik` | Drive the run through the IK solver: each waypoint's end-effector poses (FK of the reference, with elbow hints) are re-solved to joints exactly like teleop's pose→joints loop, and the arms execute the *solver's* output — still scored against the clean reference, so IK reconstruction error and tracking error show up together. Per-solve times and the solved-vs-reference deviation are stored on the run (`ik_solve_ms_*`, `ik_dev_*`) |
 | `--noise MODE` | Corrupt the motion before streaming it, at the noise source's real pipeline entry point: `network` (jitter/outliers/stalls), `ik` (solver churn/jumps), `combined`, or `none` (default). Deterministic per `--seed` |
 | `--filter` | Replay the (possibly corrupted) stream through the production teleop filter stack (pose low-pass → EMA → trapezoid) before streaming — the hardware version of [`tune.filter`](/cli/tune-filter): the arm physically shows what the stack removes and what it costs in lag. Off streams it raw |
 | `--seed N` | RNG seed for `--noise` — identical seed, identical corrupted stream (default: 0) |
@@ -28,9 +29,10 @@ axol tune.motion --motion reach-and-place --gain left.elbow.kd=4.5    # A/B a ga
 axol tune.motion --motion reach-and-place --gain shoulder_3.kd_host=8 --label "s3 damp"
 axol tune.motion --motion reach-and-place --noise network             # raw noise, no filters
 axol tune.motion --motion reach-and-place --noise network --filter    # same noise, stack on
+axol tune.motion --motion reach-and-place --ik                        # IK solver in the loop
 ```
 
-With `--noise` and/or `--filter` the run is still scored against the *clean* reference, and the artifact stores the stream actually sent alongside it — the dashboard charts overlay commanded (clean), sent, and actual per joint, so the filters' cleanup (and their lag) is directly visible on hardware.
+With `--noise`, `--filter`, and/or `--ik` the run is still scored against the *clean* reference, and the artifact stores the stream actually sent alongside it — the dashboard charts overlay commanded (clean), sent, and actual per joint, so the filters' cleanup (and their lag) — or the IK solver's reconstruction of the Cartesian path — is directly visible on hardware. `--ik` re-solves the whole chain (warm-started, like teleop) before playback starts, so a slow solve can't stretch the command pacing; solve-time stats land on the run artifact instead.
 
 ## Reading the scorecard
 
