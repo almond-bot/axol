@@ -228,122 +228,82 @@ class ArmConfig:
     # response (<2% overshoot, minimal settling), j_eff from minimizing
     # sine RMS at fixed gains. ``axol tune.pid --save`` / ``axol
     # tune.friction --save`` store per-robot values that override these.
+    # Values below are the 2026-08-23 teleop-survey gains (jit13-jit16 era,
+    # commit d011110), restored by operator preference over the later
+    # workbench step/sine winners. That tuning predates the kd-range fix:
+    # its MyActuator kd values assumed a 0-50 firmware range, so they are
+    # rescaled here (÷10) to the 0-5 MIT encoding actually on the wire
+    # (Damiao joints — wrist_2, wrist_3 — were always 0-5 and carry over
+    # unchanged). kd_host_w0 centres (rad/s) became kd_host_hz (Hz).
     shoulder_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step/sine-validated on hardware (2026-08, tuning workbench):
-            # kp 350 / kd 5 with the host damping pinned on the measured
-            # ~2 Hz impedance ring (kd_host_hz) and narrowed to it
-            # (kd_host_q 1.5 — the shared 0.8 band reaches into the <1.5 Hz
-            # intentional-motion band and drags the final approach). Result
-            # at 80° under full gravity load: no ring, 0.15° lag-free sine
-            # tracking, parked error at the stiction floor.
-            kp=350.0,
-            kd=5.0,
+            kp=250.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.8,
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
-            kd_host=45.0,
+            # Pose-tracked band-pass centre (kd_host_hz None): the shoulder
+            # mode is the impedance mode, moving with reflected inertia.
+            kd_host=40.0,
             kd_host_max=45.0,
-            kd_host_hz=2.0,
-            kd_host_q=1.5,
         )
     )
     shoulder_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step/sine-validated on hardware (2026-08, tuning workbench):
-            # same kp/kd as shoulder_1 with the host damping pinned on this
-            # joint's own measured ~3.5 Hz impedance ring (an octave above
-            # shoulder_1's — lighter link) and narrowed to it (kd_host_q
-            # 1.5). kd_host 45 is the phase-lag ceiling: 60 re-sustained the
-            # ring, so the guardrail sits at the validated value. Result:
-            # step ring dead in ~2 swings with 0.016° RMS parking at rest,
-            # and at -80° under full gravity load 0.32° RMS sine tracking
-            # (matching shoulder_1) with 0.07° droop. The ~12% amplitude
-            # gain on a 1 Hz sine is the resonance's below-band tail —
-            # damping can't shrink it, and the teleop trapezoid rate-limits
-            # what reaches it.
-            kp=350.0,
-            kd=5.0,
+            kp=250.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=1.0,
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
-            kd_host=45.0,
-            kd_host_max=45.0,
-            kd_host_hz=3.5,
-            kd_host_q=1.5,
+            kd_host=35.0,
+            kd_host_max=40.0,
         )
     )
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step-validated on hardware (2026-08, tuning workbench): kp 250 /
-            # kd 3 settles a 3° step in 0.07 s with zero overshoot, no
-            # detectable ring, and ~0.001° steady-state RMS — all with
-            # kd_host 0 (see below). kd 2 at the same kp reintroduced
-            # overshoot; kp 200 settled 6x slower.
-            kp=250.0,
-            kd=3.0,
+            kp=180.0,
+            kd=2.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
             j_eff=0.25,
-            # No host damping. A kd_host (12, band-passed at 4.8 Hz per the
-            # reference robot's 3.9-5.9 Hz extension-jitter band, jit13)
-            # actively *pumps* an ~11 Hz structural mode on current builds:
-            # torque x velocity measured on two robots showed shoulder_3's
-            # damper injecting energy at 11 Hz (its band-pass still passes
-            # ~55% there, arriving ~120 deg late — past the 90 deg where
-            # damping flips to excitation), lighting up shoulder_2/wrist_2
-            # on BOTH arms via the shared mast. Even kd_host=6 re-ignited it
-            # (jit19); 0 killed it (jit18). Cost: ~150 mdeg RMS of undamped
-            # 3.3 Hz ring during motion. To win that back, damp phase-safely
-            # (firmware kd has no host-loop delay) or notch the structural
-            # mode in the host path first — do not just restore kd_host. The
-            # reference robot's extension jitter, if it returns there, gets a
-            # per-robot calibration override, not a shipping default.
+            # Damps the reference robot's 3.9-5.9 Hz extension-jitter band
+            # (jit13: shoulder_3 led ~20 of 37 tracking-error bursts with
+            # the hand out to the side, where its reflected inertia peaks
+            # ~27x rest). The J(q)/J_ref schedule zeroes this at rest.
+            # CAUTION (jit18/19, 2026-08): on some builds this damper's
+            # band leaks onto an ~11 Hz structural mast mode and pumps it
+            # (ringing shoulder_2/wrist_2 on both arms); kd_host=0 killed
+            # that. If mast ringing appears, zero this per-robot via
+            # calibration override.
+            kd_host=12.0,
+            kd_host_max=12.0,
+            kd_host_hz=4.77,  # 30 rad/s, centred on the measured band
         )
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step/sine-validated on hardware (2026-08, tuning workbench):
-            # kp 200 / kd 5 under full gravity load at 80° settles a 10°
-            # step in 0.07 s (0.8° overshoot, one ~2.5 Hz impedance-mode
-            # swing that decays in a cycle) and tracks a 1 Hz sine at
-            # 0.19° RMS. No host damping: the elbow settles so fast that
-            # its intentional transient occupies the same 2-3 Hz band as
-            # its ring — a band-passed kd_host cannot separate them, and
-            # every magnitude/centre tried (8 @ 9.5 Hz shipped, 6-20
-            # broadband, 6 @ 2.8 Hz narrow) tripled the overshoot and
-            # slowed settling with no ring to kill. The historical 6.7 Hz
-            # loaded structural shudder (jit16, ~5° p2p during fast
-            # reversals) did not reproduce at kd 5 — loaded step and sine
-            # both show <7% error energy in the 5-15 Hz band. If it
-            # returns on a build, damp it there per-robot (calibration
-            # override), not here.
-            kp=200.0,
-            kd=5.0,
+            kp=130.0,
+            kd=4.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
+            # The elbow's ring is structural (transmission compliance) and
+            # moves with load: 6.7 Hz loaded (jit16, ~5° p2p shudder during
+            # fast reversals) up to 12.5 Hz light. Centre near the geometric
+            # mean covers the whole range in phase.
+            kd_host=8.0,
+            kd_host_max=8.0,
+            kd_host_hz=9.55,  # 60 rad/s, covering the 6.7-12.5 Hz range
         )
     )
     wrist_1: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step/sine-validated on hardware (2026-08, tuning workbench):
-            # kp 250 / kd 2 settles a 10° step in 0.03 s with a single
-            # 0.34° peak (3.4%, no ring — one decaying crest) and parks
-            # ~10x closer than kp 180 (9 vs 97 mdeg): wrist_1's error is
-            # stiction-dominated (its axis is usually near-parallel to
-            # gravity, so it runs unloaded), and the stiffer spring drags
-            # through the sticking band. 1 Hz / 10° sine RMS 0.57° vs
-            # 0.67° at kp 180, with tracking lag down 15 → 10 ms. kd 1.7
-            # rang with visible overshoot at both kp; kd ≥ 2.5 killed the
-            # peak but doubled settling. No kd_host: no structural mode
-            # ever showed in wrist_1's band, there is nothing to damp.
-            kp=250.0,
-            kd=2.0,
+            kp=180.0,
+            kd=1.7,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(0.0, 0.0, -0.0614121),
@@ -351,35 +311,24 @@ class ArmConfig:
     )
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
-            # Step/sine-validated on hardware (2026-08, tuning workbench,
-            # elbow-raised pose so the joint ran under gravity load): kp 200 /
-            # kd 5 settles a 10° step in 0.07 s with a single smooth 0.33°
-            # crest, no ring, 27 mdeg steady-state (vs 114 ms / 0.51° / 49
-            # mdeg at the old kp 130 / kd 3.5) and tracks a 1 Hz / 10° sine
-            # at 0.67° RMS at the production 240 Hz loop. kd 4 halved its
-            # damping margin: a two-crest ~7 Hz ring at 0.59° reappeared for
-            # only a 0.06° sine gain. kd 5 is the Damiao firmware clamp
-            # (kd decodes against 0-5); the contact chatter historically
-            # seen near the clamp did not reproduce — torque HF was the
-            # lowest of the sweep.
-            kp=200.0,
-            kd=5.0,
+            kp=130.0,
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
-            # No host damping. A kd_host (1.5, band-passed at 8.8 Hz per the
-            # reference robot's 7.8-10 Hz burst band, jit16) sits nearly on
-            # top of current builds' ~11 Hz structural mode and pumps it
-            # (see shoulder_3 above; wrist_2 rang hardest in that mode as the
-            # lightest joint on the shaking mast). If wrist_2 ringing
-            # returns, notch the structural mode in the host path before
-            # restoring any kd_host.
+            # Damps the 7.8-10 Hz burst band wrist_2 led once the shoulders
+            # were damped (jit16, elbow bent ~110-120°). Damiao firmware
+            # clamps kd at 5 and raising kd toward the clamp historically
+            # produced contact chatter, so the damping is host-side.
+            kd_host=1.5,
+            kd_host_max=1.5,
+            kd_host_hz=8.75,  # 55 rad/s, centred on the measured band
         )
     )
     wrist_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=3.0,
+            kd=2.0,
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
