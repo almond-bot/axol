@@ -19,12 +19,12 @@ already-corrected distal links — the ordering ``tune.gravity`` asks the
 operator to keep by hand, kept automatically here.
 
 Results land in ``~/.almond/calibration.json`` (this machine uses them
-immediately) and, when Supabase credentials are configured
-(``AXOL_SUPABASE_URL`` / ``AXOL_SUPABASE_KEY`` in the environment or a
-``.env``), the same document is upserted to the ``axol_calibrations`` table
-keyed by the hub adapter serial — any later machine fetches it with ``axol
-calibration.pull``. Without credentials the upload is skipped and the local
-calibration still happens.
+immediately) and, when the Supabase write key is configured
+(``AXOL_SUPABASE_KEY`` in the environment or a ``.env``), the same document
+is upserted to the public ``axol-calibrations`` storage bucket keyed by the
+hub adapter serial — any later machine fetches it keylessly with ``axol
+calibration.pull`` (or automatically during ``axol can.setup``). Without
+the key the upload is skipped and the local calibration still happens.
 
 Examples:
     axol tune.factory                       # both arms, default velocities
@@ -308,8 +308,9 @@ async def _run(args: argparse.Namespace) -> None:
     print(f"  Robot id (hub serial): {serial or 'not detected'}")
     if creds is None:
         print(
-            "  Supabase: not configured (AXOL_SUPABASE_URL / AXOL_SUPABASE_KEY)"
-            " — results will be saved locally only."
+            "  Supabase: no write key (AXOL_SUPABASE_KEY, plus "
+            "AXOL_SUPABASE_URL if not baked in) — results will be saved "
+            "locally only."
         )
 
     document: dict[str, Any] = {"version": 1}
@@ -342,7 +343,7 @@ async def _run(args: argparse.Namespace) -> None:
     # Merge over what the cloud already has, so a one-arm run doesn't wipe
     # the other arm's stored data.
     try:
-        existing = fetch_calibration(creds, serial) or {}
+        existing = fetch_calibration(serial) or {}
         merged: dict[str, Any] = {"version": 1}
         for s in ("left", "right"):
             old = existing.get(s)

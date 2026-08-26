@@ -1044,6 +1044,34 @@ def _find_single_serials(
     return wheels, chest
 
 
+def _pull_factory_calibration(serial: str) -> None:
+    """Best-effort fetch of this robot's factory calibration (public bucket).
+
+    Setup is the natural moment: the hub serial was just identified, and the
+    machine may be brand new to this robot. Keyless (the bucket is public)
+    and never fatal — an offline setup just keeps whatever cache exists.
+    """
+    from ...robot.calibration import (
+        FACTORY_CALIBRATION_PATH,
+        save_factory_calibration,
+    )
+    from ...robot.calibration_cloud import fetch_calibration
+
+    try:
+        document = fetch_calibration(serial)
+    except RuntimeError as exc:
+        print(f"  Factory calibration: not fetched ({exc})")
+        return
+    if document is None:
+        print(
+            f"  Factory calibration: none stored for hub {serial} "
+            "(run axol tune.factory at the factory)"
+        )
+        return
+    save_factory_calibration(document)
+    print(f"  Factory calibration: fetched into {FACTORY_CALIBRATION_PATH}")
+
+
 def run(_args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
     driver.ensure_driver()
@@ -1055,6 +1083,9 @@ def run(_args: object = None) -> None:
             "wheel-bus, or chest adapter and re-run."
         )
     _apply_setup(hub_serial, wheels_serial, chest_serial)
+
+    if hub_serial:
+        _pull_factory_calibration(hub_serial)
 
     print()
     print("Setup complete.")

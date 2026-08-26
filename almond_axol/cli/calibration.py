@@ -15,8 +15,8 @@ between the coded defaults and the local calibration file:
 so anything you later tune locally (``tune.friction --save``, ``tune.pid
 --save``, ...) still wins over the factory values.
 
-Needs ``AXOL_SUPABASE_URL`` and ``AXOL_SUPABASE_KEY`` in the environment or
-a ``.env`` (the read-only anon key suffices for fetching).
+No credentials needed — the calibration objects live in a public bucket
+(``axol can.setup`` also runs this pull automatically at the end of setup).
 
 Examples:
     axol calibration.pull
@@ -28,7 +28,7 @@ from typing import Any
 
 from ..constants import ARM_JOINTS
 from ..robot.calibration import save_factory_calibration
-from ..robot.calibration_cloud import fetch_calibration, supabase_credentials
+from ..robot.calibration_cloud import fetch_calibration
 from .can.setup import hub_serial
 
 
@@ -70,12 +70,6 @@ def _summarize(document: dict[str, Any]) -> None:
 
 def run(args: argparse.Namespace) -> None:
     """Fetch and cache the factory calibration for this robot."""
-    creds = supabase_credentials()
-    if creds is None:
-        raise SystemExit(
-            "Supabase is not configured — set AXOL_SUPABASE_URL and "
-            "AXOL_SUPABASE_KEY (environment or .env) and retry."
-        )
     serial = args.hub_serial or hub_serial()
     if serial is None:
         raise SystemExit(
@@ -85,7 +79,10 @@ def run(args: argparse.Namespace) -> None:
         )
 
     print(f"Fetching factory calibration for hub {serial} ...")
-    document = fetch_calibration(creds, serial)
+    try:
+        document = fetch_calibration(serial)
+    except RuntimeError as exc:
+        raise SystemExit(f"ERROR: {exc}")
     if document is None:
         raise SystemExit(
             f"No factory calibration stored for hub {serial} — run "

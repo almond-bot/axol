@@ -23,6 +23,10 @@ The Axol Hub (dual-channel USB CAN adapter) is told apart from the single-channe
 </Note>
 
 <Info>
+  At the end of setup, when an arm hub was identified, `can.setup` also fetches this robot's **factory calibration** (friction + gravity, keyed by the hub serial) from the public calibration bucket into `~/.almond/factory_calibration.json` — see [`tune.factory`](/cli/tune-factory). Keyless and best-effort: an offline setup just keeps whatever cache exists.
+</Info>
+
+<Info>
   After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
 </Info>
 
