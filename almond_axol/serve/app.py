@@ -622,7 +622,6 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                         "kd_host_q": (
                             jc.kd_host_q if jc.kd_host_q is not None else DAMP_BP_Q
                         ),
-                        "kd_host_max": jc.kd_host_max,
                         "j_eff": jc.j_eff,
                     }
                 out[side] = joints

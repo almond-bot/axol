@@ -53,7 +53,6 @@ _GAIN_FIELDS = (
     "kp",
     "kd",
     "kd_host",
-    "kd_host_max",
     "kd_host_hz",
     "kd_host_q",
     "j_eff",

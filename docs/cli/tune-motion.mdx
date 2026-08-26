@@ -12,7 +12,7 @@ The arm moves to the motion's start and back to rest on collision-aware planned 
 | Flag | Description |
 |---|---|
 | `--motion NAME` | Committed motion name (`axol motion.list`) or a path to a motion `.npz` (required) |
-| `--gain [SIDE.]JOINT.FIELD=VALUE` | Override one gain for this run, e.g. `left.elbow.kd=4.5` or `shoulder_3.kd_host=8` (no side = both arms). Fields: `kp`, `kd`, `kd_host`, `kd_host_max`, `kd_host_hz`, `j_eff`. Repeatable |
+| `--gain [SIDE.]JOINT.FIELD=VALUE` | Override one gain for this run, e.g. `left.elbow.kd=4.5` or `shoulder_3.kd_host=8` (no side = both arms). Fields: `kp`, `kd`, `kd_host`, `kd_host_hz`, `kd_host_q`, `j_eff`. Repeatable |
 | `--stiffness S` | Stiffness-slider position in `[0, 1]` for both arms (default: 0.5, the teleop default — gain overrides land exactly at that midpoint) |
 | `--noise MODE` | Corrupt the motion before streaming it, at the noise source's real pipeline entry point: `network` (jitter/outliers/stalls), `ik` (solver churn/jumps), `combined`, or `none` (default). Deterministic per `--seed` |
 | `--filter` | Replay the (possibly corrupted) stream through the production teleop filter stack (pose low-pass → EMA → trapezoid) before streaming — the hardware version of [`tune.filter`](/cli/tune-filter): the arm physically shows what the stack removes and what it costs in lag. Off streams it raw |

@@ -110,26 +110,15 @@ class JointConfig:
                   there the mode is fast, the stale host torque arrives out
                   of phase, and un-scheduled kd_host measurably sustains
                   jitter (see ``AxolArm.motion_control``).
-        kd_host_max: The highest host-side damping verified stable on this
-                  joint's hardware — the tuner's guardrail, kept next to
-                  ``kd_host``; never raise ``kd_host`` past it without a
-                  hardware step/teleop check. Host damping runs at the
-                  command rate on a one-cycle-stale velocity, so it
-                  only works on modes well below that rate: the shoulders'
-                  ~2.3 Hz resonance damps cleanly up to the
-                  hardware-verified 40–45, but broadband host damping at the
-                  old 120 Hz rate *fed* the elbow's ~11 Hz mode (~45° phase
-                  lag) — host-kd 39 there diverged violently and even 10
-                  sustained a limit cycle on a full-size step. The band-pass
-                  (see ``kd_host_hz``) plus the 240 Hz loop halves that lag,
-                  but this ceiling must still only hold values verified
-                  stable on hardware. The stiffness blend scales it with
-                  the same ``√kp`` factor as ``kd_host``, keeping the two
-                  damping-ratio-consistent at every slider position. (A
-                  firmware ``kd`` beyond the motor's 0–5 range used to
-                  spill its excess into host damping capped here; that path
-                  is gone — the encoding clamps it and ``AxolArm`` warns at
-                  construction.)
+                  Never raise a joint's value past the highest verified
+                  stable on its hardware without a step/teleop check —
+                  the shipped shoulder 45s *are* that ceiling (60
+                  re-sustained shoulder_2's ring): host damping runs at
+                  the command rate on a one-cycle-stale velocity, so it
+                  only works on modes well below that rate, and broadband
+                  host damping at the old 120 Hz rate *fed* the elbow's
+                  ~11 Hz mode (host-kd 39 there diverged violently; even
+                  10 sustained a limit cycle on a full-size step).
         kd_host_hz: Centre frequency (Hz) of the band-pass confining this
                   joint's host damping to its resonance band (see ``BandPass``
                   in :mod:`almond_axol.robot.control`; the control math
@@ -171,7 +160,6 @@ class JointConfig:
     com: tuple[float, float, float]
     j_eff: float = 0.0
     kd_host: float = 0.0
-    kd_host_max: float = 0.0
     kd_host_hz: float | None = None
     kd_host_q: float | None = None
 
@@ -244,7 +232,6 @@ class ArmConfig:
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
             kd_host=45.0,
-            kd_host_max=45.0,
             kd_host_hz=2.0,
             kd_host_q=1.5,
         )
@@ -270,7 +257,6 @@ class ArmConfig:
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
             kd_host=45.0,
-            kd_host_max=45.0,
             kd_host_hz=3.5,
             kd_host_q=1.5,
         )
@@ -665,10 +651,6 @@ def _blend_joint(
         kd=jc.kd * (kd_end / jc.kd) ** u,
         j_eff=j_eff,
         kd_host=jc.kd_host * host_factor,
-        # The verified-ceiling guardrail tracks the same scaling as kd_host,
-        # so the soft half keeps its damping-ratio-consistent cap and the
-        # stiff half keeps the hardware-verified midpoint ceiling.
-        kd_host_max=jc.kd_host_max * host_factor,
     )
 
 
