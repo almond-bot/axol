@@ -125,9 +125,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 label="Left arm stiffness",
                 type="number",
                 help=(
-                    "Compliance ↔ stiffness blend in [0, 1] for the left arm. "
-                    "Match the value used at data-collection time when running "
-                    "a policy."
+                    "Compliance blend in [0, 1] for the left arm: 1 (default) "
+                    "runs the tuned gains, lower only adds compliance. Match "
+                    "the value used at data-collection time when running a "
+                    "policy."
                 ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
                 targets={
@@ -142,7 +143,10 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 key="robot.right_stiffness",
                 label="Right arm stiffness",
                 type="number",
-                help=("Compliance ↔ stiffness blend in [0, 1] for the right arm."),
+                help=(
+                    "Compliance blend in [0, 1] for the right arm: 1 (default) "
+                    "runs the tuned gains, lower only adds compliance."
+                ),
                 ui={"widget": "slider", "min": 0, "max": 1, "step": 0.05},
                 targets={
                     "teleop": ("axol.right_stiffness",),

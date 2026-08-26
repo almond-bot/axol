@@ -267,7 +267,7 @@ const TABS: WbTab[] = [
     presets: {},
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
-      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "0.5" },
+      { key: "stiffness", label: "stiffness s", type: "number", placeholder: "1" },
       { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
         key: "noise",

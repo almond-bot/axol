@@ -16,7 +16,7 @@ converted to joint frame internally via :func:`closer_end_stop`.
 The motion is a pure joint-space interpolation between the poses — no
 per-waypoint IK — so the playback is smooth and perfectly repeatable. The
 right arm is left untouched throughout; only the left arm actuates. The arm
-runs at ``--stiffness`` (default 0.5).
+runs at ``--stiffness`` (default 1.0, the tuned production gains).
 
 Examples:
     axol tune.repeatability               # bounce A↔B forever
@@ -252,10 +252,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     p.add_argument(
         "--stiffness",
         type=float,
-        default=0.5,
+        default=1.0,
         help=(
             "Arm stiffness scale (0-1). Lower softens the motors and reduces "
-            "tracking jitter. Default 0.5."
+            "tracking jitter. Default 1.0 (the tuned production gains)."
         ),
     )
     p.add_argument(

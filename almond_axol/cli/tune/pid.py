@@ -266,10 +266,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         metavar="S",
         help="Test the production gains at stiffness-slider position S in "
         "[0, 1] (kp/kd/j_eff/kd_host all taken from the blended config, "
-        "exactly as the robot runs them — e.g. 1.0 matches diag.rom-enable, "
-        "0.5 the teleop default). Explicit --kp/--kd/--host-kd still "
-        "override. Incompatible with --save (saved gains must be midpoint "
-        "anchors).",
+        "exactly as the robot runs them — 1.0 is the production default, "
+        "the tuned gains; lower only adds compliance). Explicit "
+        "--kp/--kd/--host-kd still override. Incompatible with --save "
+        "(saved gains must be s=1 anchors).",
     )
     p.add_argument(
         "--pose",
@@ -419,7 +419,7 @@ async def _run(args: argparse.Namespace) -> None:
         if args.save:
             raise SystemExit(
                 "--save cannot be combined with --stiffness: calibration "
-                "stores the tuned s=0.5 midpoint anchors, not blended values."
+                "stores the tuned s=1 anchors, not softened blends."
             )
         if not 0.0 <= args.stiffness <= 1.0:
             raise SystemExit("--stiffness must be in [0, 1]")
@@ -550,16 +550,11 @@ async def _run(args: argparse.Namespace) -> None:
             f"j_eff={jc.j_eff:.3f}"
         )
     else:
-        # The configured kp/kd are the tuned midpoint (s=0.5, the production
-        # default); the stiffness slider softens/stiffens around them. Print
-        # both so the operator knows what the tested values relate to.
-        resolved_jc: JointConfig = getattr(
-            AxolConfig().resolved().left if is_left else AxolConfig().resolved().right,
-            joint.value,
-        )
+        # The configured kp/kd are the tuned gains — the top of the
+        # stiffness slider (s=1) and the production default, so what this
+        # probe tests is exactly what the robot runs.
         print(
-            f"  config kp={jc.kp:.1f} kd={jc.kd:.2f} (tuned midpoint)  |  "
-            f"production at default stiffness: kp={resolved_jc.kp:.1f} kd={resolved_jc.kd:.2f}"
+            f"  config kp={jc.kp:.1f} kd={jc.kd:.2f} (tuned s=1, the production default)"
         )
     if use_friction:
         print(f"  friction  Fc={f.fc}  k={f.k}  Fv={f.fv}  Fo={f.fo}")
@@ -1045,8 +1040,8 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"\n  Saved {saved} to {path}")
                 print(
                     "  (loaded automatically by AxolConfig on this machine; "
-                    "these are the tuned s=0.5 midpoint of the stiffness "
-                    "blend, like the shared defaults they replace)"
+                    "these are the tuned s=1 top of the stiffness blend, "
+                    "like the shared defaults they replace)"
                 )
 
         except (KeyboardInterrupt, asyncio.CancelledError):

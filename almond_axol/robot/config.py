@@ -202,11 +202,12 @@ class ArmConfig:
     values because Onshape often over-assigns aluminum-class densities to
     parts that are hollow / 3D-printed.
 
-    These ``kp`` / ``kd`` are the tuned **midpoint** (``s=0.5``, the
-    production default) of the :attr:`AxolConfig.left_stiffness` /
-    :attr:`AxolConfig.right_stiffness` blend — the slider softens them
-    toward :data:`_SOFT_GAINS` below 0.5 and stiffens them toward
-    :data:`_STIFF_GAINS` above.
+    These ``kp`` / ``kd`` are the **top** of the
+    :attr:`AxolConfig.left_stiffness` / :attr:`AxolConfig.right_stiffness`
+    blend (``s=1.0``, the production default) — they are hardware-tuned
+    optima that are also measured ceilings, so the slider only *adds
+    compliance*, softening toward :data:`_SOFT_GAINS` as ``s`` drops
+    toward 0.
     """
 
     # Gains below were identified on the reference robot (both arms, which
@@ -573,61 +574,37 @@ class _ArmGains:
     wrist_3: tuple[float, float]
 
 
-# High-``kp`` "industrial robot" gains used as the ``s=1.0`` endpoint of
-# :attr:`AxolConfig.left_stiffness` and :attr:`AxolConfig.right_stiffness`.
+# There is deliberately no "stiffer than tuned" endpoint: the tuned
+# :class:`JointConfig` gains ARE the ``s=1.0`` top of the stiffness slider
+# (2026-08-26; the previous scale put them at ``s=0.5`` with a higher-kp
+# "industrial" endpoint above). The headroom above them was measured to be
+# illusory, joint by joint:
 #
-# ``kd`` here stays damping-ratio-consistent with the tuned compliant
-# endpoint — ``kd_stiff = kd * sqrt(kp_stiff / kp)``, both taken at the
-# compliant (``s=0``) values — and the
-# geometric blend in :func:`_blend_joint` then holds the damping ratio at
-# every ``s``, so intermediate slider positions stay as well damped as the
-# tuned endpoint (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10°
-# step, the consistent 100/1.6 overshot 0.5%). ``kp_stiff`` is capped where
-# the required ``kd`` would exceed the firmware range, which is [0, 5] on
-# every motor family and firmware (Damiao wrist_2: 250 → kd 4.9; MyActuator
-# elbow: 200 → kd 4.96 — MyActuator kd values here are on the true 0-5
-# wire scale, see ``JointConfig.kd``).
-#
-# The shoulders are capped at 350 by measured torque chatter, not firmware:
-# at kp=500 each shoulder injected ~1.5 Nm RMS of cycle-to-cycle torque
-# noise (vs 0.96 at the kp=250 midpoint) — with both arms driven that
-# excited a structural torso vibration in the full-robot ROM test — while
-# settling only marginally faster than kp=350 (466 vs 544 ms on a 3° step,
-# both 0% overshoot). kp=350 holds chatter near the midpoint level (1.08).
-#
-# wrist_2 is capped at 160 by a measured stability margin, not the damping
-# ratio: with Damiao kd hardware-clamped at 5, kp=250 sat at the edge of a
-# bistable ~35 Hz limit cycle (±0.55°, ±1.4 Nm sustained, triggered by load
-# shifts and latching even at rest — observed on one unit whose wrist_2 had
-# less mechanical margin, while its twin stayed quiet). Host-side damping
-# can't reach a 35 Hz mode, so the stiff endpoint keeps the loop bandwidth
-# (∝ √kp) safely below the phase-lagged region instead.
-#
-# wrist_1 is capped at 200 by an in-motion structural buzz: sweeping the
-# wrist with the elbow at 90° (the loaded ROM pose) excites a ~27 Hz forearm
-# mode whose amplitude scales with kp, not kd (kp=300: 0.24–0.27 Nm RMS on
-# both arms; lowering kd made it worse, so firmware damping was already
-# helping). kp=200/kd=18 cuts the buzz ~35% with identical gravity-hold
-# accuracy (0.165° vs 0.159° mean error at the ±135° waypoint), so the
-# extra kp bought no stiffness in practice — a gripped payload would lower
-# the mode's frequency and amplify it further.
-_STIFF_GAINS = _ArmGains(
-    shoulder_1=(350.0, 4.14),
-    shoulder_2=(350.0, 4.14),
-    shoulder_3=(250.0, 2.36),
-    # Ratio-consistent elbow kd at kp=200 is 4.96, just inside the
-    # universal firmware clamp of 5.
-    elbow=(200.0, 4.96),
-    wrist_1=(200.0, 1.8),
-    wrist_2=(160.0, 3.9),
-    wrist_3=(250.0, 2.8),
-)
+# - Shoulders: kp past 350 buys torque chatter, not speed — at kp=500 each
+#   shoulder injected ~1.5 Nm RMS of cycle-to-cycle torque noise (vs 0.96
+#   at kp=250); with both arms driven that excited a structural torso
+#   vibration in the full-robot ROM test, while settling only marginally
+#   faster than 350 (466 vs 544 ms on a 3° step, both 0% overshoot).
+# - wrist_2: with Damiao kd hardware-clamped at 5, kp=250 sat at the edge
+#   of a bistable ~35 Hz limit cycle (±0.55°, ±1.4 Nm sustained, latching
+#   even at rest on the unit with less mechanical margin). Host damping
+#   can't reach a 35 Hz mode; staying at the tuned kp keeps the loop
+#   bandwidth (∝ √kp) below the phase-lagged region.
+# - wrist_1: kp past ~200 pumps a ~27 Hz forearm mode whose amplitude
+#   scales with kp, not kd (kp=300: 0.24–0.27 Nm RMS on both arms) with
+#   identical gravity-hold accuracy — no stiffness actually gained, and a
+#   gripped payload would lower the mode's frequency and amplify it.
+# - Universal: firmware kd decodes against [0, 5] on every motor family,
+#   so damping-ratio-consistent kd for higher kp simply doesn't exist
+#   (elbow at kp 200 already needs 4.96).
 
 # Soft "hand-guidable" gains used as the ``s=0.0`` endpoint of the blend.
 # ``kp`` values are the pre-retune compliant defaults (the soft feel users
 # know from earlier releases); ``kd`` is damping-ratio-consistent with the
-# tuned midpoint (``kd_soft = kd · sqrt(kp_soft / kp)``, tuned values), same
-# rule as :data:`_STIFF_GAINS` above.
+# tuned gains (``kd_soft = kd · sqrt(kp_soft / kp)``, tuned values), so the
+# geometric blend in :func:`_blend_joint` holds the damping ratio at every
+# ``s`` (verified on left wrist_3: 100/0.8 overshot 23.8% on a 10° step,
+# the consistent 100/1.6 overshot 0.5%).
 _SOFT_GAINS = _ArmGains(
     shoulder_1=(40.0, 1.4),
     shoulder_2=(50.0, 1.57),
@@ -643,48 +620,30 @@ def _blend_joint(
     jc: JointConfig,
     kp_soft: float,
     kd_soft: float,
-    kp_stiff: float,
-    kd_stiff: float,
     s: float,
 ) -> JointConfig:
-    """Blend one joint's gains along the soft ↔ tuned ↔ stiff slider.
+    """Blend one joint's gains along the soft ↔ tuned slider.
 
-    The joint's own ``kp`` / ``kd`` (the hardware-tuned optimum) anchor the
-    **midpoint** ``s=0.5`` — the production default. The lower half blends
-    toward the soft hand-guidable endpoint (:data:`_SOFT_GAINS`), the upper
-    half toward the industrial stiff endpoint (:data:`_STIFF_GAINS`).
+    The joint's own ``kp`` / ``kd`` (the hardware-tuned optimum, also the
+    measured ceiling — see the retired-stiff-endpoint note above
+    :data:`_SOFT_GAINS`) sit at ``s=1.0``, the production default; lower
+    ``s`` only *adds compliance*, blending toward the soft hand-guidable
+    endpoint (:data:`_SOFT_GAINS`) at ``s=0``.
 
     ``kp`` and ``kd`` interpolate geometrically (log-space — matches how
-    stiffness is perceived); with damping-ratio-consistent endpoints the
-    blend then holds the damping ratio at every ``s``. On the **soft half**
-    ``kd_host`` scales down with ``√(kp(s)/kp)`` — critical damping grows
-    with the square root of stiffness. On the **stiff half** it stays at
-    the midpoint value: hardware step tests at the stiff endpoint showed
-    host-kd 40 and the √kp-scaled 56.6 damp identically (5.4% vs 1.6%
-    overshoot, equal torque chatter), and the midpoint values are the
-    hardware-verified stability ceilings — scaling past them buys nothing
-    and risks the out-of-phase host-damping instability on faster modes.
-    ``j_eff`` stays constant on the soft half (it compensates real inertia,
-    which matters most at low ``kp``) and scales linearly to 0 at ``s=1``.
+    stiffness is perceived); with a damping-ratio-consistent soft endpoint
+    the blend then holds the damping ratio at every ``s``. ``kd_host``
+    scales down with ``√(kp(s)/kp)`` — critical damping grows with the
+    square root of stiffness. ``j_eff`` stays constant: it compensates
+    real inertia, which matters most at low ``kp``.
     """
-    if s <= 0.5:
-        u = 1.0 - 2.0 * s  # 1 at the soft endpoint, 0 at the tuned midpoint
-        kp_end, kd_end = kp_soft, kd_soft
-        j_eff = jc.j_eff
-        stiff_half = False
-    else:
-        u = 2.0 * s - 1.0  # 0 at the tuned midpoint, 1 at the stiff endpoint
-        kp_end, kd_end = kp_stiff, kd_stiff
-        j_eff = jc.j_eff * (1.0 - u)
-        stiff_half = True
-    kp_factor = (kp_end / jc.kp) ** u
-    host_factor = 1.0 if stiff_half else math.sqrt(kp_factor)
+    u = 1.0 - s  # 1 at the soft endpoint, 0 at the tuned top
+    kp_factor = (kp_soft / jc.kp) ** u
     return replace(
         jc,
         kp=jc.kp * kp_factor,
-        kd=jc.kd * (kd_end / jc.kd) ** u,
-        j_eff=j_eff,
-        kd_host=jc.kd_host * host_factor,
+        kd=jc.kd * (kd_soft / jc.kd) ** u,
+        kd_host=jc.kd_host * math.sqrt(kp_factor),
     )
 
 
@@ -713,16 +672,16 @@ def _normalize_stiffness(s: float | Sequence[float]) -> tuple[float, ...]:
 
 
 def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
-    """Blend each of ``arm``'s 7 joints along the soft ↔ tuned ↔ stiff slider.
+    """Blend each of ``arm``'s 7 joints along the soft ↔ tuned slider.
 
     ``s`` is either a scalar or a 7-tuple in
     :data:`almond_axol.constants.ARM_JOINTS` order (see
-    :func:`_normalize_stiffness`). ``0.5`` is the tuned midpoint and returns
-    ``arm`` unchanged; lower values blend toward :data:`_SOFT_GAINS`, higher
-    toward :data:`_STIFF_GAINS` (see :func:`_blend_joint`).
+    :func:`_normalize_stiffness`). ``1.0`` is the tuned gains and returns
+    ``arm`` unchanged; lower values blend toward :data:`_SOFT_GAINS` (see
+    :func:`_blend_joint`).
     """
     factors = _normalize_stiffness(s)
-    if all(f == 0.5 for f in factors):
+    if all(f == 1.0 for f in factors):
         return arm
     return replace(
         arm,
@@ -730,7 +689,6 @@ def _apply_stiffness(arm: ArmConfig, s: float | Sequence[float]) -> ArmConfig:
             j.value: _blend_joint(
                 getattr(arm, j.value),
                 *getattr(_SOFT_GAINS, j.value),
-                *getattr(_STIFF_GAINS, j.value),
                 factors[i],
             )
             for i, j in enumerate(ARM_JOINTS)
@@ -762,19 +720,21 @@ class AxolConfig:
                          between consecutive ``motion_control`` calls.
                          Commands that exceed this are dropped and a warning
                          is logged. Set to ``float('inf')`` to disable.
-        left_stiffness:  Compliance ↔ stiffness blend for the **left** arm
-                         in ``[0, 1]``. Either a scalar (applied to every
+        left_stiffness:  Compliance blend for the **left** arm in
+                         ``[0, 1]``. Either a scalar (applied to every
                          joint) or 7 values in
                          :data:`almond_axol.constants.ARM_JOINTS` order
-                         (gripper excluded). ``0.5`` (default) runs the
-                         hardware-tuned per-joint gains; ``0`` softens to
-                         the hand-guidable :data:`_SOFT_GAINS`; ``1``
-                         stiffens to the industrial :data:`_STIFF_GAINS`.
-                         ``kp`` / ``kd`` interpolate geometrically
-                         (log-space) in each half; ``j_eff`` holds on the
-                         soft half and scales linearly to 0 at ``s=1``. The
-                         blend is baked into the ``left`` / ``right`` gains
-                         by :meth:`resolved`, which is called once at the
+                         (gripper excluded). ``1.0`` (default) runs the
+                         hardware-tuned per-joint gains — the stiffest the
+                         hardware was measured to support (see the
+                         retired-stiff-endpoint note above
+                         :data:`_SOFT_GAINS`); lower values only *add
+                         compliance*, down to the hand-guidable
+                         :data:`_SOFT_GAINS` at ``0``. ``kp`` / ``kd``
+                         interpolate geometrically (log-space); ``j_eff``
+                         is unchanged by the blend. The blend is baked
+                         into the ``left`` / ``right`` gains by
+                         :meth:`resolved`, which is called once at the
                          robot-construction boundary (``Axol.__init__``).
                          The stiffness fields are left untouched on the
                          config itself, so a serialized :class:`AxolConfig`
@@ -791,16 +751,16 @@ class AxolConfig:
     )
     has_gripper: bool = True
     max_step_rad: float = 0.5
-    left_stiffness: float | list[float] = 0.5
-    right_stiffness: float | list[float] = 0.5
+    left_stiffness: float | list[float] = 1.0
+    right_stiffness: float | list[float] = 1.0
 
     def resolved(self) -> "AxolConfig":
         """Return a copy with stiffness baked into the ``left``/``right`` gains.
 
-        Blends each arm along the soft ↔ tuned ↔ stiff slider by its
-        stiffness factor (see :func:`_apply_stiffness`) and resets
-        ``left_stiffness`` / ``right_stiffness`` to ``0.5`` — the tuned
-        midpoint, where the blend is the identity — so the result is
+        Blends each arm along the soft ↔ tuned slider by its stiffness
+        factor (see :func:`_apply_stiffness`) and resets
+        ``left_stiffness`` / ``right_stiffness`` to ``1.0`` — the tuned
+        gains, where the blend is the identity — so the result is
         **idempotent**: calling :meth:`resolved` again is a no-op. This is
         applied once at the single robot-construction boundary
         (``Axol.__init__``) so every consumer sees consistent gains while
@@ -810,6 +770,6 @@ class AxolConfig:
             self,
             left=_apply_stiffness(self.left, self.left_stiffness),
             right=_apply_stiffness(self.right, self.right_stiffness),
-            left_stiffness=0.5,
-            right_stiffness=0.5,
+            left_stiffness=1.0,
+            right_stiffness=1.0,
         )

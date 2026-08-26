@@ -33,9 +33,9 @@ tune.gravity --save``. It overrides the CAD value in the gravity model, which
 is what fixes the static droop a few-percent mass/CoM error causes under
 load (parked error = unmodeled torque / kp).
 
-``kp`` / ``kd`` are the tuned midpoint (``s=0.5``, the production default)
-of the stiffness blend, exactly like the :class:`JointConfig` defaults they
-replace.
+``kp`` / ``kd`` are the tuned gains — the top of the stiffness blend
+(``s=1.0``, the production default) — exactly like the :class:`JointConfig`
+defaults they replace.
 
 This module is deliberately I/O-only (no imports from ``config``) so
 ``config.py`` can consume it without an import cycle.

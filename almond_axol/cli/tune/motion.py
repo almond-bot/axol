@@ -119,15 +119,15 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         help="Override one gain for this run, e.g. left.elbow.kd=4.5 or "
         "shoulder_3.kd_host=8 (no side = both arms). Fields: "
         f"{', '.join(_GAIN_FIELDS)}. Repeatable. Overrides are the tuned "
-        "s=0.5 midpoint anchors, like the config defaults they replace.",
+        "s=1 anchors, like the config defaults they replace.",
     )
     p.add_argument(
         "--stiffness",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Stiffness-slider position in [0, 1] applied to both arms "
-        "(default: 0.5, the teleop default — gain overrides land exactly "
-        "at that midpoint)",
+        "(default: 1.0, the production default — the tuned gains, where "
+        "gain overrides land exactly; lower only adds compliance)",
     )
     p.add_argument(
         "--noise",

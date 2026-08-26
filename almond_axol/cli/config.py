@@ -292,12 +292,14 @@ _INCLUDE_HELP_PREFIX = "Config file for "
 # so we override them outright.
 _FIELD_HELP: dict[str, str] = {
     "left_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "right_stiffness": (
-        "Compliance<->stiffness blend in [0, 1]: a scalar (all arm joints) "
-        "or a 7-element list, one per joint."
+        "Compliance blend in [0, 1]: 1 (default) runs the tuned gains, lower "
+        "only adds compliance. A scalar (all arm joints) or a 7-element "
+        "list, one per joint."
     ),
     "max_step_rad": "Max change (rad) in any arm joint between consecutive commands.",
     "has_gripper": (

@@ -207,14 +207,14 @@ Gravity feedforward is computed centrally from the URDF — see [Gravity compens
 |---|---|---|
 | `has_gripper` | `True` | Whether this robot is the gripper-equipped SKU. Set `False` for the gripperless SKU: the gripper motors are never constructed, enabled, or calibrated; the gripper element of every `(8,)` joint array is ignored on write and reported as `0.0` on read (array shapes are unchanged). LeRobot datasets recorded on a gripperless robot carry 7 channels per arm instead of 8. |
 | `max_step_rad` | `0.5` | Maximum allowed change in any arm joint (rad) between consecutive `motion_control` calls. Commands that exceed this are dropped and a warning is logged. Set to `float("inf")` to disable. At 30 Hz, 0.5 rad/step ≈ 15 rad/s — roughly 2.5× the teleop velocity ceiling. |
-| `left_stiffness` | `0.5` | Compliance ↔ stiffness blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `0.5` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=250`); `0` softens to the hand-guidable `_SOFT_GAINS` (`shoulder_1` `kp=40`); `1` stiffens to the industrial `_STIFF_GAINS` (`shoulder_1` `kp=500`). `kp` / `kd` interpolate geometrically in each half (log-space — matches perceived stiffness), with damping-ratio-consistent endpoints so every slider position stays as well damped as the tuned midpoint; `j_eff` holds on the soft half and scales linearly to 0 at `s=1`; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
-| `right_stiffness` | `0.5` | Same, for the **right** arm. |
+| `left_stiffness` | `1.0` | Compliance blend for the **left** arm. Either a scalar in `[0, 1]` (applied to every joint) or a 7-tuple of per-joint factors (order: `shoulder_1`, `shoulder_2`, `shoulder_3`, `elbow`, `wrist_1`, `wrist_2`, `wrist_3` — gripper excluded). The default `1.0` runs the hardware-tuned per-joint gains (e.g. `shoulder_1` `kp=350`) — the stiffest the hardware was measured to support, so lower values only *add compliance*, down to the hand-guidable `_SOFT_GAINS` at `0` (`shoulder_1` `kp=40`). `kp` / `kd` interpolate geometrically (log-space — matches perceived stiffness), with a damping-ratio-consistent soft endpoint so every slider position stays as well damped as the tuned gains; `j_eff` is unchanged by the blend; `kd_host` scales with `√(kp(s)/kp)`. The blend is baked into the `left` / `right` gains by `AxolConfig.resolved()`, called once at the robot-construction boundary (`Axol.__init__`); the stiffness fields themselves are left untouched so a serialized config round-trips cleanly. |
+| `right_stiffness` | `1.0` | Same, for the **right** arm. |
 
 ```python
-config = AxolConfig(left_stiffness=1.0, right_stiffness=1.0)   # both arms, stiff industrial feel
-config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 141
+config = AxolConfig()                                          # tuned gains (s=1, default)
+config = AxolConfig(left_stiffness=0.5, right_stiffness=0.5)   # geometric mean: shoulder_1 kp ≈ 118
 config = AxolConfig(                                           # per-joint, left only
-    left_stiffness=[0.8, 0.8, 0.5, 0.5, 0.2, 0.2, 0.0],
+    left_stiffness=[1.0, 1.0, 0.8, 0.8, 0.5, 0.5, 0.2],
 )
 ```
 
