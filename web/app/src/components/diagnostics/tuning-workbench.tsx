@@ -674,25 +674,19 @@ function GainOverrideEditor({
           ))}
         </tbody>
       </table>
-      <div className="flex items-center gap-3">
-        <span className="text-[0.65rem] text-white/35">
-          this robot's config values — edit a cell to override it for this run (both arms);
-          highlighted cells are the overrides sent; clear a cell to reset it to config
-        </span>
-        {dirtyCount > 0 && (
-          <button
-            type="button"
-            onClick={() => {
-              setCells(build(""))
-              onChange("")
-            }}
-            disabled={disabled}
-            className="flex items-center gap-1 text-[0.65rem] text-white/40 transition-colors hover:text-red-300"
-          >
-            <X className="h-3 w-3" /> reset {dirtyCount} override{dirtyCount > 1 ? "s" : ""}
-          </button>
-        )}
-      </div>
+      {dirtyCount > 0 && (
+        <button
+          type="button"
+          onClick={() => {
+            setCells(build(""))
+            onChange("")
+          }}
+          disabled={disabled}
+          className="flex items-center gap-1 self-start text-[0.65rem] text-white/40 transition-colors hover:text-red-300"
+        >
+          <X className="h-3 w-3" /> reset {dirtyCount} override{dirtyCount > 1 ? "s" : ""}
+        </button>
+      )}
     </div>
   )
 }
