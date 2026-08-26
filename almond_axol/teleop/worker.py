@@ -312,6 +312,11 @@ class IKWorker:
         l_lock = bool(frame.l_lock)
         r_lock = bool(frame.r_lock)
 
+        # Flight recorder covers engaged segments only: the falling edge
+        # writes the _ik file, the rising edge starts a fresh segment.
+        if self._rec is not None:
+            self._rec.set_engaged(l_lock or r_lock)
+
         # Filter raw VR poses on *every* frame — engaged or not — so the
         # filters are always warm. They used to run only while engaged and be
         # reset on the engage rising edge, which fixed stale-state sweeps but
@@ -612,6 +617,10 @@ class IKWorker:
         self._hold_fk = {}
         self._hold_elbow_fk = {}
         self._clear_freeze()
+        # A forced disengage (reset, stale stream) may never deliver another
+        # lock-less frame to step() — close the recording segment here too.
+        if self._rec is not None:
+            self._rec.set_engaged(False)
         self._snap_ctrl = {}
         self._snap_fk = {}
         self._snap_elbow_ctrl = {}

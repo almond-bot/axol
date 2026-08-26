@@ -461,6 +461,9 @@ class VRTeleop:
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
+                    # Segment gate: record only while engaged; the disengage
+                    # edge writes the _meas file (see recorder.set_engaged).
+                    self._rec.set_engaged(self._core.teleop_enabled)
                     self._record_measured()
 
                 if track_watchdog is not None and left is not None:

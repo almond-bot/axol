@@ -155,10 +155,13 @@ class VRTeleopConfig:
             motion.build`` finds it; a path prefix (``/tmp/jit``) is used
             verbatim.  When set, every stage of the teleop pipeline — raw
             VR pose, filtered pose, IK output, smoothed command, measured
-            joints — is captured to ``<prefix>_{ik,cmd,meas}.npz`` on exit
-            (last ~5 minutes; the same prefix overwrites on the next run),
-            for ``axol motion.build`` or ``axol diag.teleop-jitter``.
-            ``None`` (the default) disables recording entirely.
+            joints — is captured to ``<prefix>_{ik,cmd,meas}.npz``.  The
+            capture covers the **latest engage→disengage segment** (last
+            ~5 minutes of it): recording starts at engagement, disengaging
+            writes the files, and re-engaging starts the segment over.  The
+            same prefix overwrites on the next run.  For ``axol
+            motion.build`` or ``axol diag.offline``.  ``None`` (the
+            default) disables recording entirely.
     """
 
     rest_pose_left: np.ndarray = field(

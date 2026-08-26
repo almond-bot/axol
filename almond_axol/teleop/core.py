@@ -529,6 +529,12 @@ class VRTeleopCore:
         rate the setpoint stair-cases and the velocity feedforward turns each
         jump into a torque spike (jerk).
         """
+        # Flight recorder covers engaged segments only: gate before any early
+        # return so the disengage edge writes the _cmd file even while no
+        # target exists yet or a reset trajectory is playing.
+        if self._rec is not None:
+            self._rec.set_engaged(self.teleop_enabled)
+
         # Post-engage velocity ramp: smoothstep the cap from engage_max_vel to
         # teleop_max_vel across engage_duration. The old behaviour held the
         # low cap for the whole window and then stepped to full speed — error

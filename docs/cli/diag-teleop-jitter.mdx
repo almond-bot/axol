@@ -7,11 +7,11 @@ Analyzes a teleop flight-recorder capture and reports where in the pipeline the 
 
 ```bash
 axol teleop --teleop.record /tmp/jit
-# reproduce the jitter, then exit teleop
+# engage, reproduce the jitter, disengage — the files are written at disengage
 axol diag.teleop-jitter /tmp/jit
 ```
 
-The recorder writes three time-synchronized files (`_ik`, `_cmd`, `_meas` — raw VR pose through filtered pose, IK output, smoothed command, and measured joints). The analyzer clips to the longest engaged stretch, splits every signal into three bands — below 3 Hz (intentional motion), 3-15 Hz (the **JITTER** column, the band the arm's structure responds to), above 15 Hz (noise the mechanics filter out) — and prints band-RMS tables at every stage boundary, flagging any dominant spectral line with its frequency.
+The recorder writes three time-synchronized files (`_ik`, `_cmd`, `_meas` — raw VR pose through filtered pose, IK output, smoothed command, and measured joints). Recording covers the **latest engage→disengage segment**: it starts at engagement (no rest-pose lead-in), disengaging writes the files immediately (no need to exit teleop), and re-engaging starts the segment over. The analyzer clips to the longest engaged stretch, splits every signal into three bands — below 3 Hz (intentional motion), 3-15 Hz (the **JITTER** column, the band the arm's structure responds to), above 15 Hz (noise the mechanics filter out) — and prints band-RMS tables at every stage boundary, flagging any dominant spectral line with its frequency.
 
 To read the output, walk each joint down its stage list and find the first stage where the JITTER column jumps well above the previous stage:
 
