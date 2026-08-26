@@ -8,13 +8,18 @@ Run it next to ``axol teleop --umi`` / ``collect-data --umi`` (or against
 backend, composes VRFrames at 120 Hz, and connects to the VR WebSocket
 server exactly like a headset would — nothing downstream changes.
 
+With ``--backend static`` it needs no tracker hardware at all: the arms
+hold a fixed pose and the rig's CAN trigger node is the only live input,
+which is the quickest way to bring up or debug a Mantis UMI gripper.
+
 Backend + left/right binding come from ``~/.almond/tracker/config.json``
 (written by ``axol tracker.identify``); every field can be overridden on
-the command line. When a rig's CAN trigger node is configured
-(``--trigger-can-left`` / ``--trigger-can-right``), its binary trigger
-switch drives the grip command (pressed = close, released = open);
-engage/reset stay on stdin (Enter toggles engage, ``r`` resets, ``q``
-quits) until the button PCB exists.
+the command line. The rig's CAN trigger nodes default to the Mantis UMI
+gripper buses (override with ``--trigger-can-left`` /
+``--trigger-can-right``), and their analog trigger position drives the
+grip command proportionally (squeeze = close, release = open); engage/
+reset stay on stdin (Enter toggles engage, ``r`` resets, ``q`` quits)
+until the button PCB exists.
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ import asyncio
 import logging
 
 from ..utils.ports import VR_PORT
+
+_logger = logging.getLogger(__name__)
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -33,9 +40,11 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     )
     parser.add_argument(
         "--backend",
-        choices=("survive", "ultimate", "synthetic"),
+        choices=("survive", "ultimate", "synthetic", "static"),
         default=None,
-        help="Tracker backend (default: the saved config, else survive).",
+        help="Tracker backend (default: the saved config, else survive). "
+        "Use static for gripper-only UMI teleop with no tracker hardware: "
+        "the arms hold still and only the trigger node drives the gripper.",
     )
     parser.add_argument(
         "--left",
@@ -68,14 +77,14 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--trigger-can-left",
         default=None,
-        help="SocketCAN interface of the left rig's trigger node "
-        "(e.g. can_alm_umi_l); overrides the saved config.",
+        help="SocketCAN interface of the left rig's trigger node; overrides "
+        "the saved config, which defaults to the Mantis UMI gripper bus.",
     )
     parser.add_argument(
         "--trigger-can-right",
         default=None,
-        help="SocketCAN interface of the right rig's trigger node; "
-        "overrides the saved config.",
+        help="SocketCAN interface of the right rig's trigger node; overrides "
+        "the saved config, which defaults to the Mantis UMI gripper bus.",
     )
     parser.add_argument(
         "--allow-single-side",
@@ -90,9 +99,8 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 def run(args) -> None:  # type: ignore[no-untyped-def]
     """Open the tracker backend (and trigger PCBs) and stream frames until quit."""
-    from ..tracker import create_source, load_tracker_config
+    from ..tracker import HARDWARE_FREE_BINDINGS, create_source, load_tracker_config
     from ..tracker.bridge import TrackerBridge
-    from ..tracker.synthetic import LEFT_KEY, RIGHT_KEY
     from ..tracker.trigger import TriggerReader
 
     logging.basicConfig(level=logging.INFO, force=True)
@@ -102,8 +110,9 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
         config.backend = args.backend
     left = args.left if args.left is not None else config.left
     right = args.right if args.right is not None else config.right
-    if config.backend == "synthetic" and left is None and right is None:
-        left, right = LEFT_KEY, RIGHT_KEY
+    binding = HARDWARE_FREE_BINDINGS.get(config.backend)
+    if binding is not None and left is None and right is None:
+        left, right = binding
 
     if args.trigger_can_left is not None:
         config.trigger_can_left = args.trigger_can_left
@@ -119,8 +128,21 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             ("left", config.trigger_can_left),
             ("right", config.trigger_can_right),
         ):
-            if channel:
+            if not channel:
+                continue
+            try:
                 triggers[side] = TriggerReader(channel)
+            except Exception:
+                # No trigger node reachable on this host (sim dry run, a rig
+                # without the PCB, or the CAN bus not brought up). That side
+                # streams fully open rather than failing the whole session.
+                _logger.warning(
+                    "%s trigger node on %s could not be opened — that side's "
+                    "gripper will stream fully open",
+                    side,
+                    channel,
+                    exc_info=True,
+                )
         bridge = TrackerBridge(
             source,
             left=left,

@@ -9,13 +9,16 @@ open socket, so :class:`TriggerReader` opens its own filtered bus and
 coexists with the gripper driver's socket on the same interface without
 stealing its frames.
 
-The trigger is a **binary switch**: at rest the gripper is commanded
-open, pressed it is commanded closed. There is nothing to calibrate and
-no intermediate positions exist.
+The trigger is a **continuous analog squeeze**, not a switch: the rig's
+trigger drives a potentiometer, and the node publishes a normalised
+position so the gripper tracks the operator's hand proportionally. The
+node self-calibrates (auto-zeroed rest at power-on, closing direction
+latched from the first real pull), so there is nothing to calibrate
+host-side.
 
 Firmware contract (node → host only; the host never transmits to it —
-source of truth: ``designs/axol_umi/firmware/firmware.c`` in the
-circuits-tsx repo, protocol table in the adjacent README):
+source of truth: ``designs/mantis/firmware/firmware.c`` in the
+circuits-py repo, protocol table in the adjacent README):
 
   - Classic CAN 2.0 data frame, **standard 11-bit arbitration ID
     0x009** (0x008 is reserved for the gripper motor itself, whose
@@ -26,19 +29,19 @@ circuits-tsx repo, protocol table in the adjacent README):
     =======  ===========================================================
     byte(s)  content
     =======  ===========================================================
-    0-3      float32 trigger state — exactly 0.0 (at rest → gripper
-             open) or 1.0 (pressed → gripper closed); no intermediate
-             values are ever sent
-    4-5      uint16 raw debounced switch level (0 or 1), for debug
+    0-3      float32 trigger position, continuous over [0.0, 1.0] —
+             0.0 fully released (gripper open), 1.0 fully squeezed
+             (gripper closed). The node already clamps to this range
+    4-5      uint16 raw 12-bit ADC reading, for calibration/debug
              only — ignore in production
     =======  ===========================================================
 
-  - The device debounces the switch on its end (30 ms); no host-side
-    debounce is needed.
+  - The node oversamples the pot 16x per published sample, so no
+    host-side filtering or debounce is needed.
 
-The switch maps to the VRFrame grip convention (0.0 = fully closed …
-1.0 = fully open) by :func:`pressed_to_grip`: at rest grip 1.0 (open),
-pressed grip 0.0 (closed).
+The position maps to the VRFrame grip convention (0.0 = fully closed …
+1.0 = fully open) by :func:`position_to_grip`, which simply inverts it:
+released grip 1.0 (open), fully squeezed grip 0.0 (closed).
 
 Staleness policy: no frame for :data:`STALE_AFTER_S` (~25 missed frames
 at 100 Hz — device unplugged or powered off) marks the node stale, and
@@ -84,13 +87,14 @@ class TriggerFrame:
     """One decoded trigger-node frame.
 
     Attributes:
-        pressed: True when the trigger is pressed (gripper closed), False
-            at rest (gripper open). Debounced on the device.
-        raw:     Raw debounced switch level (0 or 1), for debug only —
+        position: Normalised trigger position, clamped to [0.0, 1.0] —
+            0.0 fully released (gripper open), 1.0 fully squeezed
+            (gripper closed).
+        raw:      Raw 12-bit ADC reading, for calibration/debug only —
             ignore it in production code.
     """
 
-    pressed: bool
+    position: float
     raw: int
 
 
@@ -99,38 +103,41 @@ def parse_trigger_frame(data: bytes) -> TriggerFrame | None:
 
     Pure function of the payload bytes (no CAN dependency) so it is unit
     testable and doubles as the reference decoder for the firmware
-    contract in the module docstring. The device only ever sends exactly
-    0.0 or 1.0; thresholding at 0.5 (after rejecting non-finite floats)
-    keeps a corrupted frame from ever commanding the gripper anything
-    but a plain open or close.
+    contract in the module docstring. The node already clamps to
+    [0.0, 1.0]; clamping again here (after rejecting non-finite floats)
+    keeps a corrupted frame from ever commanding the gripper past its
+    travel.
     """
     if len(data) != _FRAME_LEN:
         return None
     trigger, raw = struct.unpack(_FRAME_FMT, data)
     if not math.isfinite(trigger):
         return None
-    return TriggerFrame(pressed=trigger >= 0.5, raw=raw)
+    return TriggerFrame(position=min(max(trigger, 0.0), 1.0), raw=raw)
 
 
-def encode_trigger_frame(pressed: bool, raw: int | None = None) -> bytes:
+def encode_trigger_frame(position: float, raw: int | None = None) -> bytes:
     """Encode one trigger-node payload (reference encoder, mirrors firmware).
 
     The inverse of :func:`parse_trigger_frame`; used by tests and as
-    executable documentation for the firmware author. ``raw`` defaults
-    to the switch level implied by ``pressed``.
+    executable documentation for the firmware author. ``raw`` defaults to
+    a mid-scale-ish ADC count consistent with ``position``, which only
+    matters for debug readouts.
     """
     if raw is None:
-        raw = 1 if pressed else 0
-    return struct.pack(_FRAME_FMT, 1.0 if pressed else 0.0, raw)
+        raw = int(round(position * 4095))
+    return struct.pack(_FRAME_FMT, position, raw)
 
 
-def pressed_to_grip(pressed: bool) -> float:
-    """Map the trigger switch to the VRFrame grip command.
+def position_to_grip(position: float) -> float:
+    """Map the trigger position to the VRFrame grip command.
 
-    VRFrame grip is 0.0 = fully closed … 1.0 = fully open, so a pressed
-    trigger commands 0.0 (close) and a released one 1.0 (open).
+    VRFrame grip is 0.0 = fully closed … 1.0 = fully open, the inverse of
+    the node's 0.0 = released … 1.0 = squeezed, so this is just
+    ``1 - position``. Proportional throughout: a half-squeezed trigger
+    commands a half-closed gripper.
     """
-    return 0.0 if pressed else 1.0
+    return 1.0 - min(max(position, 0.0), 1.0)
 
 
 def is_stale(last_rx: float | None, now: float, timeout: float = STALE_AFTER_S) -> bool:
@@ -235,7 +242,7 @@ class TriggerReader:
             frame = parse_trigger_frame(bytes(msg.data))
             if frame is None:
                 continue
-            grip = pressed_to_grip(frame.pressed)
+            grip = position_to_grip(frame.position)
             now = time.monotonic()
             with self._lock:
                 self._grip = grip
