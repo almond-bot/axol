@@ -379,7 +379,7 @@ class ArmConfig:
     wrist_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=2.0,
+            kd=3.0,
             friction=_ZERO_FRICTION,
             mass=0.75,
             com=(-0.0285, 0.0, -0.089453),
