@@ -51,10 +51,9 @@ _ENV_KEY = "AXOL_SUPABASE_KEY"
 _TIMEOUT_S = 15.0
 
 # The project URL is public by design (it's in every fetch URL), so it is
-# baked in — fetching then needs zero setup on user machines. Fill in once
-# the Supabase project exists; the AXOL_SUPABASE_URL environment variable
-# overrides it either way.
-PUBLIC_SUPABASE_URL = ""
+# baked in — fetching then needs zero setup on user machines. The
+# AXOL_SUPABASE_URL environment variable overrides it either way.
+PUBLIC_SUPABASE_URL = "https://ywizlbkohziyzcesnzou.supabase.co"
 
 
 def supabase_url() -> str | None:
