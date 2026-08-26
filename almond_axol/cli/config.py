@@ -557,12 +557,25 @@ class GravityCompCmdConfig:
     the impedance gains used to hold non-free joints both come from the
     nested ``axol`` config — override them via e.g.
     ``--axol.left.elbow.kp 60`` or ``--axol.left_stiffness 0.8``.
+
+    ``record`` captures the hand-guided session with the same flight
+    recorder teleop uses (see :mod:`almond_axol.teleop.recorder`): the
+    measured arm-joint positions and torques are written to
+    ``<prefix>_gc.npz`` when the session ends. A bare name records into
+    ``~/.almond/recordings/``, where ``axol motion.build`` finds it — so a
+    reference motion can be built from a hand-guided demonstration instead
+    of a teleoperated one. The capture keeps the last ~5 minutes; the
+    still lead-in/lead-out is trimmed at build time.
     """
 
     axol: AxolConfig = field(default_factory=AxolConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None
+    record: str | None = None
+    """Recording name for the hand-guided session — the measured joints are
+    captured so axol motion.build can turn them into a reference motion. A
+    bare name lands in ~/.almond/recordings/; empty disables recording."""
     # 0.5 (was 0.25): residual gravity-model error away from the calibration
     # pose shows as slow creep on low-friction joints (wrist_2) once kp=0 —
     # creep speed is roughly error/kd, so doubling kd halves it without

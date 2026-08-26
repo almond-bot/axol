@@ -5,15 +5,22 @@ small ``.npz`` in :data:`MOTIONS_DIR` (inside the package, committed to git),
 so the exact same motion can be replayed on any robot, today or years from
 now, and the tracking metrics compared 1:1.
 
-Motions are *built* from recorded teleop sessions (``axol teleop
---teleop.record PREFIX`` writes the flight-recorder capture;
-``axol motion.build PREFIX --name N`` postprocesses it): the final guarded
-command stream (``_cmd`` stage, ``out`` field) is clipped to the engaged
-span, resampled onto a uniform grid, zero-phase low-pass smoothed (removing
-hand tremor and network jitter — the *intent* is what we want to replay),
-and finally projected waypoint-by-waypoint through the same collision-aware
-solver the teleop return-to-rest uses, so the stored motion is joint-limit-
-and self-collision-safe by construction.
+Motions are *built* from recorded sessions (``axol motion.build PREFIX
+--name N`` postprocesses the flight-recorder capture), from either source:
+
+* **Teleop** (``axol teleop --teleop.record PREFIX``): the final guarded
+  command stream (``_cmd`` stage, ``out`` field), clipped to the engaged
+  span.
+* **Gravity comp** (``axol gravity-comp --record PREFIX``): the measured
+  arm-joint positions of the hand-guided session (``_gc`` stage, ``qm``
+  field); there is no engage state, so the still lead-in/lead-out is
+  trimmed instead.
+
+Either way the stream is resampled onto a uniform grid, zero-phase low-pass
+smoothed (removing hand tremor and network jitter — the *intent* is what we
+want to replay), and finally projected waypoint-by-waypoint through the same
+collision-aware solver the teleop return-to-rest uses, so the stored motion
+is joint-limit- and self-collision-safe by construction.
 
 File format (``<name>.npz``):
 
@@ -182,10 +189,14 @@ def build_motion(
     """Postprocess a flight-recorder capture into a reference motion.
 
     Args:
-        prefix:            The ``--teleop.record`` prefix; reads
-                           ``<prefix>_cmd.npz`` (required, the guarded command
-                           stream) and ``<prefix>_ik.npz`` (optional, for the
-                           engaged-span clip).
+        prefix:            The recording prefix. A teleop capture
+                           (``--teleop.record``) reads ``<prefix>_cmd.npz``
+                           (the guarded command stream) and
+                           ``<prefix>_ik.npz`` (optional, for the
+                           engaged-span clip); a gravity-comp capture
+                           (``--record``) reads ``<prefix>_gc.npz`` (the
+                           hand-guided measured joints). ``_cmd`` wins when
+                           both exist.
         name:              Motion name (file stem in the motions directory).
         rate:              Uniform playback rate (Hz).
         smooth_cutoff_hz:  Zero-phase low-pass cutoff. ~6 Hz keeps deliberate
@@ -204,16 +215,32 @@ def build_motion(
         chart the before/after of the smoothing + projection passes.
     """
     cmd_path = Path(f"{prefix}_cmd.npz")
-    if not cmd_path.is_file():
+    gc_path = Path(f"{prefix}_gc.npz")
+    if cmd_path.is_file():
+        source_kind = "teleop"
+        cmd = dict(np.load(cmd_path))
+        t = np.asarray(cmd["t"], dtype=float)
+        q = np.asarray(cmd["out"], dtype=float)  # final guarded command, (N, 14)
+    elif gc_path.is_file():
+        source_kind = "gravity-comp"
+        gc = dict(np.load(gc_path))
+        t = np.asarray(gc["t"], dtype=float)
+        q = np.asarray(gc["qm"], dtype=float)  # hand-guided measured, (N, 14)
+        print("  gravity-comp capture (hand-guided measured joints)")
+    else:
         raise FileNotFoundError(
-            f"{cmd_path} not found — record a session with "
-            "`axol teleop --teleop.record <prefix>` first."
+            f"neither {cmd_path} nor {gc_path} found — record a session with "
+            "`axol teleop --teleop.record <prefix>` or "
+            "`axol gravity-comp --record <prefix>` first."
         )
-    cmd = dict(np.load(cmd_path))
-    t = np.asarray(cmd["t"], dtype=float)
-    q = np.asarray(cmd["out"], dtype=float)  # final guarded command, (N, 14)
     if q.shape[1] != MOTION_WIDTH:
         raise ValueError(f"expected {MOTION_WIDTH}-wide command rows, got {q.shape}")
+    if np.isnan(q).any():
+        raise ValueError(
+            "capture has gaps (NaN rows) — an arm was disabled or its "
+            "telemetry never came up during the recording. Motions carry "
+            "both arms; record with both connected."
+        )
 
     ik_path = Path(f"{prefix}_ik.npz")
     span = None
@@ -224,7 +251,7 @@ def build_motion(
         if m.sum() >= 3:
             t, q = t[m], q[m]
         print(f"  engaged span: {span[1] - span[0]:.1f} s")
-    else:
+    elif source_kind == "teleop":
         print("  no engaged span found — trimming still lead-in/out instead")
     t, q = _trim_still_ends(t, q)
     if len(t) < 3:
@@ -249,6 +276,7 @@ def build_motion(
         q=q_s.astype(np.float32),
         meta={
             "source": str(prefix),
+            "source_kind": source_kind,
             "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "smooth_cutoff_hz": smooth_cutoff_hz,
             "time_scale": time_scale,

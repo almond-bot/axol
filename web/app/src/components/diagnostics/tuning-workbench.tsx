@@ -408,13 +408,16 @@ const TABS: WbTab[] = [
     label: "Build motion",
     command: "motion.build",
     description:
-      "Turn a teleop flight recording into a reference motion: clip to the " +
-      "engaged span, resample, smooth, and project through the collision " +
-      "solver. The motion saves into the package's committed motions " +
-      "directory and becomes selectable under Recorded motion — commit it " +
-      "to git to run it on other robots. Record first with " +
-      "axol teleop --teleop.record NAME (bare names land in " +
-      "~/.almond/recordings/); leave the recording box empty to build from " +
+      "Turn a recorded session into a reference motion: clip to the " +
+      "engaged span (teleop) or trim the still ends (gravity comp), " +
+      "resample, smooth, and project through the collision solver. The " +
+      "motion saves into the package's committed motions directory and " +
+      "becomes selectable under Recorded motion — commit it to git to run " +
+      "it on other robots. Record first via teleop (axol teleop " +
+      "--teleop.record NAME) or by hand-guiding the arms in gravity comp " +
+      "(set the recording name on its operation panel, or axol " +
+      "gravity-comp --record NAME); bare names land in " +
+      "~/.almond/recordings/. Leave the recording box empty to build from " +
       "the newest one.",
     presets: {},
     fields: [
@@ -426,9 +429,9 @@ const TABS: WbTab[] = [
         placeholder: "newest recording",
         width: "w-44",
         hint:
-          "which teleop recording to convert — a bare --teleop.record " +
-          "name, or a full path prefix; empty uses the newest in " +
-          "~/.almond/recordings/",
+          "which recording to convert — a bare teleop --teleop.record / " +
+          "gravity-comp --record name, or a full path prefix; empty uses " +
+          "the newest in ~/.almond/recordings/",
       },
       {
         key: "cutoff",

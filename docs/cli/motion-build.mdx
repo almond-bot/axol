@@ -1,15 +1,20 @@
 ---
 title: "motion.build / motion.list"
-description: "Build committed reference motions from recorded teleop sessions."
+description: "Build committed reference motions from recorded sessions — teleoperated or hand-guided."
 ---
 
 Reference motions are uniform-rate, both-arm joint trajectories committed to the repository (`almond_axol/tuning/motions/`), so the exact same motion can be replayed on any robot — today or on future units — and the tracking metrics compared 1:1 with [`tune.motion`](/cli/tune-motion).
 
-`motion.build` postprocesses a teleop flight-recorder capture into one: the final guarded command stream (`_cmd` stage) is clipped to the engaged span, resampled onto a uniform grid, zero-phase low-pass smoothed (keeping the operator's intent, dropping hand tremor and network jitter), and projected waypoint-by-waypoint through the same collision-aware solver the teleop return-to-rest uses — the stored motion is joint-limit- and self-collision-safe by construction.
+`motion.build` postprocesses a flight-recorder capture into one, from either recorder:
+
+- **Teleop** (`axol teleop --teleop.record PREFIX`): the final guarded command stream (`_cmd` stage), clipped to the engaged span.
+- **Gravity comp** (`axol gravity-comp --record PREFIX`): the measured arm-joint positions of the hand-guided session (`_gc` stage). There is no engage state, so the still lead-in/lead-out is trimmed instead — start and end the demonstration with the arms briefly at rest.
+
+Either way, the stream is resampled onto a uniform grid, zero-phase low-pass smoothed (keeping the operator's intent, dropping hand tremor and network jitter), and projected waypoint-by-waypoint through the same collision-aware solver the teleop return-to-rest uses — the stored motion is joint-limit- and self-collision-safe by construction.
 
 | Flag | Description |
 |---|---|
-| `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare `--teleop.record` names are written. **Optional**: omitted, the newest recording in that directory is used |
+| `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip) or `axol gravity-comp --record PREFIX` (reads `<prefix>_gc.npz`). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare recording names are written. **Optional**: omitted, the newest recording in that directory is used |
 | `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz` (required) |
 | `--out PATH` | Write to an explicit path instead of the committed directory |
 | `--rate HZ` | Uniform playback rate (default: 240 — the production control rate; `tune.motion` replays at the motion's stored rate) |
@@ -19,7 +24,8 @@ Reference motions are uniform-rate, both-arm joint trajectories committed to the
 | `--notes TEXT` | Free-form provenance note stored in the motion metadata |
 
 ```bash
-axol teleop --teleop.record rec1          # record a session first
+axol teleop --teleop.record rec1          # record via teleop, or ...
+axol gravity-comp --record rec1           # ... by hand-guiding the arms
 axol motion.build --name reach-and-place         # newest recording
 axol motion.build rec1 --name reach-slow --time-scale 2.0
 axol motion.list                                 # what's committed

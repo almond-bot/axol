@@ -316,14 +316,16 @@ COMMANDS: dict[str, CommandDef] = {
         "gravity-comp",
         "gravity-comp",
         "Gravity compensation",
-        "Hold the arms in gravity-comp so they can be moved by hand.",
+        "Hold the arms in gravity-comp so they can be moved by hand. Set a "
+        "recording name to capture the hand-guided motion for Build motion "
+        "in the tuning workbench.",
         "Operate",
         "draccus",
         _gravity_comp,
         requires_hardware=True,
         entrypoint=_gravity_comp_run,
         execution="async",
-        per_run_fields=("free_joints",),
+        per_run_fields=("free_joints", "record"),
     ),
     "waypoints": CommandDef(
         "waypoints",
@@ -541,9 +543,10 @@ COMMANDS: dict[str, CommandDef] = {
         "motion.build",
         "motion.build",
         "Build reference motion",
-        "Postprocess a teleop flight-recorder capture (teleop's "
-        "record option) into a reference motion: clip to the engaged span, "
-        "resample, smooth, and project through the collision-aware solver.",
+        "Postprocess a recorded session (teleop's record option, or "
+        "gravity-comp's for a hand-guided one) into a reference motion: "
+        "clip to the engaged span / trim the still ends, resample, smooth, "
+        "and project through the collision-aware solver.",
         "Diagnostics",
         "argparse",
         _argparse_loader("..cli.motion"),

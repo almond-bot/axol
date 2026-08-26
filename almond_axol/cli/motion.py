@@ -4,9 +4,12 @@ axol motion.build / motion.list
 Build and inspect the committed reference motions used by ``axol
 tune.motion``.
 
-``motion.build`` postprocesses a teleop flight-recorder capture (``axol
-teleop --teleop.record PREFIX``) into a reference motion: the final
-guarded command stream is clipped to the engaged span, resampled onto a
+``motion.build`` postprocesses a flight-recorder capture into a reference
+motion. The capture comes from either recorder: a teleoperated session
+(``axol teleop --teleop.record PREFIX``, whose guarded command stream is
+clipped to the engaged span) or a hand-guided gravity-comp session (``axol
+gravity-comp --record PREFIX``, whose measured joint stream is trimmed of
+its still lead-in/lead-out). Either way the stream is resampled onto a
 uniform grid, zero-phase smoothed (keeping the operator's intent, dropping
 tremor and network jitter), and projected waypoint-by-waypoint through the
 collision-aware solver so the stored motion is joint-limit- and
@@ -15,7 +18,8 @@ self-collision-safe by construction. The result lands in the package's
 replay the identical motion.
 
 Examples:
-    axol teleop --teleop.record rec1        # record a session first
+    axol teleop --teleop.record rec1        # record via teleop, or ...
+    axol gravity-comp --record rec1         # ... by hand-guiding the arms
     axol motion.build --name reach-and-place       # newest recording
     axol motion.build rec1 --name reach-slow --time-scale 2.0
     axol motion.list
@@ -31,7 +35,8 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     """Register the ``motion.build`` and ``motion.list`` subcommands."""
     b = subparsers.add_parser(
         "motion.build",
-        help="Build a committed reference motion from a teleop flight recording.",
+        help="Build a committed reference motion from a recorded session "
+        "(teleop or gravity-comp).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
@@ -39,8 +44,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "prefix",
         nargs="?",
         default=None,
-        help="Flight-recorder prefix used with --teleop.record "
-        "(reads <prefix>_cmd.npz). A bare name resolves in the recordings "
+        help="Flight-recorder prefix used with teleop's --teleop.record "
+        "(reads <prefix>_cmd.npz) or gravity-comp's --record (reads "
+        "<prefix>_gc.npz). A bare name resolves in the recordings "
         "directory (~/.almond/recordings/); omit it entirely to build from "
         "the newest recording there.",
     )
@@ -100,10 +106,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
 
 
 def _resolve_prefix(prefix: str | None) -> str:
-    """Resolve the recording prefix: verbatim path, bare name, or newest."""
+    """Resolve the recording prefix: verbatim path, bare name, or newest.
+
+    The newest recording may be from either recorder — teleop (``_cmd``)
+    or gravity comp (``_gc``).
+    """
     from ..teleop.recorder import resolve_or_latest
 
-    return resolve_or_latest(prefix, stage="cmd")
+    return resolve_or_latest(prefix, stage=("cmd", "gc"))
 
 
 def run_build(args: argparse.Namespace) -> None:
@@ -194,6 +204,7 @@ def _save_build_run(args: argparse.Namespace, prefix: str, motion, raw) -> None:
         params={
             "name": motion.name,
             "prefix": str(prefix),
+            "source_kind": motion.meta.get("source_kind"),
             "rate": float(motion.rate),
             "cutoff": float(args.cutoff),
             "time_scale": float(args.time_scale),
