@@ -277,8 +277,13 @@ class ArmConfig:
     )
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=180.0,
-            kd=2.0,
+            # Step-validated on hardware (2026-08, tuning workbench): kp 250 /
+            # kd 3 settles a 3° step in 0.07 s with zero overshoot, no
+            # detectable ring, and ~0.001° steady-state RMS — all with
+            # kd_host 0 (see below). kd 2 at the same kp reintroduced
+            # overshoot; kp 200 settled 6x slower.
+            kp=250.0,
+            kd=3.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
