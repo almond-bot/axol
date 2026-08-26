@@ -268,7 +268,7 @@ const TABS: WbTab[] = [
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "0.5" },
-      { key: "gain", label: "gain overrides", type: "overrides" },
+      { key: "gain", label: "gains — edit a cell to override it for this run", type: "overrides" },
       {
         key: "noise",
         label: "inject noise",
@@ -527,135 +527,166 @@ const OVERRIDE_FIELDS = [
   "j_eff",
 ]
 
-interface OverrideRow {
-  side: string // "both" | "left" | "right"
-  joint: string
-  field: string
-  value: string
-}
-
-/** Parse the CLI's `[side.]joint.field=value` tokens into editor rows. */
-function parseOverrides(text: string): OverrideRow[] {
-  return text
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((tok) => {
-      const [path = "", value = ""] = tok.split("=")
-      const parts = path.split(".")
-      return parts.length === 3
-        ? { side: parts[0] ?? "both", joint: parts[1] ?? "", field: parts[2] ?? "", value }
-        : { side: "both", joint: parts[0] ?? "", field: parts[1] ?? "", value }
-    })
-}
-
-/** Serialize complete rows back to the CLI token string (incomplete rows are held in the editor only). */
-function serializeOverrides(rows: OverrideRow[]): string {
-  return rows
-    .filter((r) => r.joint && r.field && r.value.trim() !== "")
-    .map(
-      (r) =>
-        `${r.side === "both" ? "" : `${r.side}.`}${r.joint}.${r.field}=${r.value.trim()}`
-    )
-    .join(" ")
+/** Format a config gain for seeding/comparison (trims float32 noise). */
+function fmtGain(v: unknown): string {
+  if (typeof v !== "number" || !Number.isFinite(v)) return ""
+  return String(Number(v.toFixed(3)))
 }
 
 /**
- * Structured editor for tune.motion's per-run gain overrides: rows of
- * side / joint / field / value selects instead of hand-typed
- * `left.elbow.kd=4.5` tokens. Serializes to exactly that token string, so
- * the launch path and run-metadata re-arming are unchanged.
+ * Full gain table for tune.motion's per-run overrides: one row per joint,
+ * one column per gain field, every cell pre-filled with this robot's
+ * current config value (defaults + calibration). Overrides always apply to
+ * **both arms**: edit a cell and it is sent as a `joint.field=value` token
+ * (highlighted); a cell left at (or retyped to) its config value sends
+ * nothing. Serializes to the same token string the CLI takes, so the
+ * launch path and run-metadata re-arming are unchanged — sided tokens from
+ * a re-armed older run collapse onto the shared cell.
  */
 function GainOverrideEditor({
   value,
   onChange,
   disabled,
+  gains,
 }: {
   value: string
   onChange: (v: string) => void
   disabled: boolean
+  gains: TuningGains | null
 }) {
-  const [rows, setRows] = useState<OverrideRow[]>(() => parseOverrides(value))
-  // Resync only on external changes (re-arm from a clicked run) — while the
-  // operator is mid-edit, incomplete rows must survive serialization.
+  // Config seed per cell. When the two arms' configs disagree the cell
+  // seeds empty with a "left|right" placeholder — typing any value there
+  // overrides both arms to it.
+  const seeds = useMemo(() => {
+    const out: Record<string, { text: string; placeholder: string }> = {}
+    for (const joint of ARM_JOINT_OPTIONS) {
+      for (const field of OVERRIDE_FIELDS) {
+        const l = fmtGain(gains?.["left"]?.[joint]?.[field])
+        const r = fmtGain(gains?.["right"]?.[joint]?.[field])
+        out[`${joint}.${field}`] =
+          l === r ? { text: l, placeholder: "" } : { text: "", placeholder: `${l}|${r}` }
+      }
+    }
+    return out
+  }, [gains])
+
+  const build = useCallback(
+    (tokens: string) => {
+      const cells: Record<string, string> = {}
+      for (const key of Object.keys(seeds)) cells[key] = seeds[key].text
+      for (const tok of tokens.split(/\s+/).filter(Boolean)) {
+        const [path = "", v = ""] = tok.split("=")
+        const parts = path.split(".")
+        const key = parts.length === 3 ? `${parts[1]}.${parts[2]}` : path
+        if (key in cells) cells[key] = v
+      }
+      return cells
+    },
+    [seeds]
+  )
+
+  const serialize = useCallback(
+    (cells: Record<string, string>) => {
+      const toks: string[] = []
+      for (const joint of ARM_JOINT_OPTIONS) {
+        for (const field of OVERRIDE_FIELDS) {
+          const key = `${joint}.${field}`
+          const text = (cells[key] ?? "").trim()
+          if (text !== "" && text !== seeds[key].text) toks.push(`${key}=${text}`)
+        }
+      }
+      return toks.join(" ")
+    },
+    [seeds]
+  )
+
+  const [cells, setCells] = useState<Record<string, string>>(() => build(value))
+  // Reseed when the config gains arrive/refresh (overrides are re-applied
+  // from `value`, so nothing typed is lost).
   useEffect(() => {
-    setRows((prev) => (value === serializeOverrides(prev) ? prev : parseOverrides(value)))
-  }, [value])
-  const update = (next: OverrideRow[]) => {
-    setRows(next)
-    onChange(serializeOverrides(next))
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- reseed on gains load
+    setCells(build(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reseed only when the seeds change
+  }, [seeds])
+  // Resync on external changes (re-arm from a clicked run) — while the
+  // operator is mid-edit, in-progress cells must survive serialization.
+  useEffect(() => {
+    setCells((prev) => (serialize(prev) === value ? prev : build(value)))
+  }, [value, build, serialize])
+
+  const edit = (key: string, text: string) => {
+    const next = { ...cells, [key]: text }
+    setCells(next)
+    onChange(serialize(next))
   }
-  const sel =
-    "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-1.5 text-xs text-white/85 outline-none focus:border-[#eff483]/40"
+
+  const dirtyCount = value.split(/\s+/).filter(Boolean).length
   return (
-    <div className="flex flex-col gap-1.5">
-      {rows.map((row, i) => (
-        <div key={i} className="flex items-center gap-1.5">
-          <select
-            value={row.side}
-            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, side: e.target.value } : r)))}
-            disabled={disabled}
-            className={cn(sel, "w-20")}
-          >
-            {["both", "left", "right"].map((o) => (
-              <option key={o} value={o}>
-                {o}
-              </option>
+    <div className="flex flex-col gap-1.5 overflow-x-auto">
+      <table className="w-fit border-separate border-spacing-0">
+        <thead>
+          <tr>
+            <th />
+            {OVERRIDE_FIELDS.map((f) => (
+              <th
+                key={f}
+                className="px-1 pb-1 text-left text-[0.65rem] font-normal text-white/40"
+              >
+                {f}
+              </th>
             ))}
-          </select>
-          <select
-            value={row.joint}
-            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, joint: e.target.value } : r)))}
-            disabled={disabled}
-            className={cn(sel, "w-28")}
-          >
-            <option value="">joint…</option>
-            {ARM_JOINT_OPTIONS.map((o) => (
-              <option key={o} value={o}>
-                {o}
-              </option>
-            ))}
-          </select>
-          <select
-            value={row.field}
-            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, field: e.target.value } : r)))}
-            disabled={disabled}
-            className={cn(sel, "w-28")}
-          >
-            <option value="">gain…</option>
-            {OVERRIDE_FIELDS.map((o) => (
-              <option key={o} value={o}>
-                {o}
-              </option>
-            ))}
-          </select>
-          <input
-            type="text"
-            inputMode="decimal"
-            value={row.value}
-            placeholder="value"
-            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))}
-            disabled={disabled}
-            className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
-          />
+          </tr>
+        </thead>
+        <tbody>
+          {ARM_JOINT_OPTIONS.map((joint) => (
+            <tr key={joint}>
+              <td className="pr-2 text-xs text-white/55">{joint}</td>
+              {OVERRIDE_FIELDS.map((field) => {
+                const key = `${joint}.${field}`
+                const text = (cells[key] ?? "").trim()
+                const dirty = text !== "" && text !== seeds[key].text
+                return (
+                  <td key={field} className="p-0.5">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={cells[key] ?? ""}
+                      placeholder={seeds[key].placeholder}
+                      onChange={(e) => edit(key, e.target.value)}
+                      disabled={disabled}
+                      className={cn(
+                        "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
+                        dirty
+                          ? "border-[#eff483]/50 text-[#eff483]"
+                          : "border-white/10 text-white/60"
+                      )}
+                    />
+                  </td>
+                )
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="flex items-center gap-3">
+        <span className="text-[0.65rem] text-white/35">
+          this robot's config values — edit a cell to override it for this run (both arms);
+          highlighted cells are the overrides sent
+        </span>
+        {dirtyCount > 0 && (
           <button
             type="button"
-            onClick={() => update(rows.filter((_, j) => j !== i))}
+            onClick={() => {
+              setCells(build(""))
+              onChange("")
+            }}
             disabled={disabled}
-            className="text-white/30 transition-colors hover:text-red-300"
-            title="remove override"
+            className="flex items-center gap-1 text-[0.65rem] text-white/40 transition-colors hover:text-red-300"
           >
-            <X className="h-3.5 w-3.5" />
+            <X className="h-3 w-3" /> reset {dirtyCount} override{dirtyCount > 1 ? "s" : ""}
           </button>
-        </div>
-      ))}
-      <button
-        type="button"
-        onClick={() => update([...rows, { side: "both", joint: "", field: "", value: "" }])}
-        disabled={disabled}
-        className="h-8 w-fit rounded-md border border-dashed border-white/15 px-2 text-xs text-white/45 transition-colors hover:border-[#eff483]/40 hover:text-[#eff483]"
-      >
-        + override
-      </button>
+        )}
+      </div>
     </div>
   )
 }
@@ -2214,6 +2245,7 @@ export function TuningWorkbench({
                     value={tabValues[f.key] ?? ""}
                     onChange={(v) => setValue(f.key, v)}
                     disabled={runningOurs || busy}
+                    gains={gains}
                   />
                 ) : f.type === "pose" ? (
                   <PoseEditor
