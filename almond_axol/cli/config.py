@@ -563,7 +563,11 @@ class GravityCompCmdConfig:
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     free_joints: list[str] | None = None
-    kd: float = 0.25
+    # 0.5 (was 0.25): residual gravity-model error away from the calibration
+    # pose shows as slow creep on low-friction joints (wrist_2) once kp=0 —
+    # creep speed is roughly error/kd, so doubling kd halves it without
+    # making hand-guiding feel heavy.
+    kd: float = 0.5
     rate_hz: float = 250.0
     telemetry_hz: float = 500.0
     log_level: LogLevel = "INFO"

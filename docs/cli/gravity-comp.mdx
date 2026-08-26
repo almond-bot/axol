@@ -11,7 +11,7 @@ This command is configured via draccus — see [Command configuration](/cli/conf
 |---|---|
 | `--left_channel <ch\|null>` / `--right_channel <ch\|null>` | CAN channel per arm; `null` disables that arm. |
 | `--free_joints [J1,J2,...]` | List of joints to gravity-compensate (e.g. `[WRIST_3]` or `[SHOULDER_1,ELBOW]`). Other arm joints are held in place. Default `null` = all 7 joints free. |
-| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy. Default 0.25 |
+| `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy, and slows the creep a residual gravity-model error can cause on low-friction joints. Default 0.5 |
 | `--rate_hz FLOAT` | Control loop rate in Hz (default: 250) |
 | `--telemetry_hz FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
