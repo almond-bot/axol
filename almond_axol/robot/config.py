@@ -306,30 +306,27 @@ class ArmConfig:
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
-            kp=130.0,
-            kd=4.0,
+            # Step/sine-validated on hardware (2026-08, tuning workbench):
+            # kp 200 / kd 5 under full gravity load at 80° settles a 10°
+            # step in 0.07 s (0.8° overshoot, one ~2.5 Hz impedance-mode
+            # swing that decays in a cycle) and tracks a 1 Hz sine at
+            # 0.19° RMS. No host damping: the elbow settles so fast that
+            # its intentional transient occupies the same 2-3 Hz band as
+            # its ring — a band-passed kd_host cannot separate them, and
+            # every magnitude/centre tried (8 @ 9.5 Hz shipped, 6-20
+            # broadband, 6 @ 2.8 Hz narrow) tripled the overshoot and
+            # slowed settling with no ring to kill. The historical 6.7 Hz
+            # loaded structural shudder (jit16, ~5° p2p during fast
+            # reversals) did not reproduce at kd 5 — loaded step and sine
+            # both show <7% error energy in the 5-15 Hz band. If it
+            # returns on a build, damp it there per-robot (calibration
+            # override), not here.
+            kp=200.0,
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # The elbow's ring is structural (transmission compliance, not
-            # the impedance mode — √(kp/J) predicts 2.3 Hz) and its
-            # frequency moves with load: 6.7 Hz under load (~5° p2p / 34 Nm
-            # p2p shudder during fast reversals, ζ≈0.09) up to 12.5 Hz
-            # light. Firmware kd is as blind to it as to the shoulder
-            # resonance, so damping is host-side and band-passed. The centre
-            # must cover the whole measured 6.7-12.5 Hz range: at the old
-            # 50 rad/s the 10-12.5 Hz bursts (jit16, elbow bent, light
-            # load) sat at ~-106° total phase — mild *anti*-damping. 60
-            # rad/s is near the geometric mean: in phase at 6.7 Hz
-            # (band-pass lead cancels the loop lags), +0.44 effective at
-            # 10 Hz, neutral at 12.5. The historical "host-kd 39 diverged
-            # at 11 Hz" was measured *broadband* at the 120 Hz loop (~45°
-            # delay alone); still, raise the magnitude only with a hardware
-            # step/teleop check.
-            kd_host=8.0,
-            kd_host_max=8.0,
-            kd_host_hz=9.5,  # covering the 6.7-12.5 Hz structural range
         )
     )
     wrist_1: JointConfig = field(
