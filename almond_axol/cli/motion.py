@@ -15,9 +15,9 @@ self-collision-safe by construction. The result lands in the package's
 replay the identical motion.
 
 Examples:
-    axol teleop --teleop.jitter_record /tmp/rec     # record a session first
-    axol motion.build /tmp/rec --name reach-and-place
-    axol motion.build /tmp/rec --name reach-slow --time-scale 2.0
+    axol teleop --teleop.jitter_record rec1        # record a session first
+    axol motion.build --name reach-and-place       # newest recording
+    axol motion.build rec1 --name reach-slow --time-scale 2.0
     axol motion.list
 """
 
@@ -37,8 +37,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     b.add_argument(
         "prefix",
+        nargs="?",
+        default=None,
         help="Flight-recorder prefix used with --teleop.jitter_record "
-        "(reads <prefix>_cmd.npz and, if present, <prefix>_ik.npz)",
+        "(reads <prefix>_cmd.npz). A bare name resolves in the recordings "
+        "directory (~/.almond/recordings/); omit it entirely to build from "
+        "the newest recording there.",
     )
     b.add_argument(
         "--name",
@@ -56,8 +60,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     b.add_argument(
         "--rate",
         type=float,
-        default=100.0,
-        help="Uniform playback rate in Hz (default: 100)",
+        default=240.0,
+        help="Uniform playback rate in Hz (default: 240 — the production "
+        "control rate; tune.motion replays at the motion's stored rate)",
     )
     b.add_argument(
         "--cutoff",
@@ -94,15 +99,40 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     ls.set_defaults(func=run_list)
 
 
+def _resolve_prefix(prefix: str | None) -> str:
+    """Resolve the recording prefix: verbatim path, bare name, or newest.
+
+    A bare name (no path separator) resolves in the recordings directory
+    (where ``--teleop.jitter_record`` writes bare names); ``None`` picks the
+    newest recording there.
+    """
+    from ..teleop.recorder import RECORDINGS_DIR, resolve_prefix
+
+    if prefix is not None:
+        return resolve_prefix(prefix)
+    newest = max(
+        RECORDINGS_DIR.glob("*_cmd.npz"),
+        key=lambda p: p.stat().st_mtime,
+        default=None,
+    )
+    if newest is None:
+        raise SystemExit(
+            f"No recordings in {RECORDINGS_DIR} — record one first with "
+            "`axol teleop --teleop.jitter_record NAME`, or pass a prefix."
+        )
+    return str(newest)[: -len("_cmd.npz")]
+
+
 def run_build(args: argparse.Namespace) -> None:
     """Build a reference motion from a flight-recorder capture."""
     from pathlib import Path
 
     from ..tuning.motion import build_motion, save_motion
 
-    print(f"Building reference motion {args.name!r} from {args.prefix} ...")
+    prefix = _resolve_prefix(args.prefix)
+    print(f"Building reference motion {args.name!r} from {prefix} ...")
     motion = build_motion(
-        args.prefix,
+        prefix,
         args.name,
         rate=args.rate,
         smooth_cutoff_hz=args.cutoff,

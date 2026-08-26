@@ -26,7 +26,9 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -36,6 +38,21 @@ _logger = logging.getLogger(__name__)
 # a long session keeps its *last* 5 minutes — end the session shortly after
 # reproducing the jitter.
 _DEFAULT_CAPACITY = 36_000
+
+# Where bare recording names land. ``--teleop.jitter_record demo1`` writes
+# ``~/.almond/recordings/demo1_*.npz``; ``axol motion.build`` resolves bare
+# prefixes against the same directory (and defaults to its newest recording),
+# so record → build needs no paths at all. A prefix containing a path
+# separator is used verbatim, as before.
+RECORDINGS_DIR = Path.home() / ".almond" / "recordings"
+
+
+def resolve_prefix(prefix: str) -> str:
+    """A bare recording name becomes a path in :data:`RECORDINGS_DIR`."""
+    if os.sep in prefix or (os.altsep and os.altsep in prefix):
+        return prefix
+    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+    return str(RECORDINGS_DIR / prefix)
 
 
 class JitterRecorder:
@@ -101,6 +118,7 @@ def make(
     """
     if not prefix:
         return None
+    prefix = resolve_prefix(prefix)
     rec = JitterRecorder(f"{prefix}_{stage}.npz", fields, capacity)
     atexit.register(rec.dump)
     _logger.info("Jitter recorder active: stage %r -> %s_%s.npz", stage, prefix, stage)

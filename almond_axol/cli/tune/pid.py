@@ -359,7 +359,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "arrival/gain-change ringing dies out before anything is measured.",
     )
     p.add_argument(
-        "--rate", type=float, default=100.0, help="Command rate in Hz (default: 100)"
+        "--rate",
+        type=float,
+        default=240.0,
+        help="Command rate in Hz (default: 240 — the production control "
+        "rate, so gains see the same host-damping transport delay teleop "
+        "gives them)",
     )
     p.add_argument(
         "--save",

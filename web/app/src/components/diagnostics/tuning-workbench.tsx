@@ -52,7 +52,7 @@ const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter"])
 interface WbField {
   key: string
   label: string
-  type: "number" | "text" | "select" | "boolean"
+  type: "number" | "text" | "select" | "boolean" | "overrides"
   options?: string[]
   /** Placeholder shown when empty; empty means "command default". */
   placeholder?: string
@@ -176,8 +176,8 @@ const TABS: WbTab[] = [
         key: "rate",
         label: "rate (Hz)",
         type: "number",
-        placeholder: "100",
-        hint: "command-loop rate — production teleop runs 240; the loop Hz score shows what was actually sustained",
+        placeholder: "240",
+        hint: "command-loop rate — 240 is the production control rate; the loop Hz score shows what was actually sustained",
       },
       {
         key: "ff",
@@ -236,8 +236,8 @@ const TABS: WbTab[] = [
         key: "rate",
         label: "rate (Hz)",
         type: "number",
-        placeholder: "100",
-        hint: "command-loop rate — production teleop runs 240; the loop Hz score shows what was actually sustained",
+        placeholder: "240",
+        hint: "command-loop rate — 240 is the production control rate; the loop Hz score shows what was actually sustained",
       },
       {
         key: "ff",
@@ -291,26 +291,23 @@ const TABS: WbTab[] = [
     command: "tune.motion",
     description:
       "Replay a committed reference motion through the production control " +
-      "path and score joint-space tracking per joint. Gain overrides (e.g. " +
-      "left.elbow.kd=4.5 shoulder_3.kd_host=0, space-separated) apply for " +
-      "this run only — run once plain, once with overrides, and compare the " +
-      "scores in the run list.",
+      "path and score joint-space tracking per joint. Gain overrides apply " +
+      "for this run only — run once plain, once with overrides, and compare " +
+      "the scores in the run list.",
     presets: {},
     fields: [
       { key: "motion", label: "motion", type: "select", options: [] },
       { key: "stiffness", label: "stiffness s", type: "number", placeholder: "0.5" },
-      {
-        key: "gain",
-        label: "gain overrides",
-        type: "text",
-        placeholder: "left.elbow.kd=4.5 …",
-        width: "w-64",
-      },
+      { key: "gain", label: "gain overrides", type: "overrides" },
       {
         key: "torque_threshold",
         label: "contact Nm",
         type: "number",
         placeholder: "8",
+        hint:
+          "contact watchdog: a sustained joint torque residual (measured minus " +
+          "modeled gravity) above this aborts playback — the arm is pushing on " +
+          "something that isn't in the plan; 0 disables",
       },
       { key: "label", label: "label", type: "text", placeholder: "note", width: "w-40" },
     ],
@@ -425,21 +422,44 @@ const TABS: WbTab[] = [
     description:
       "Turn a teleop flight recording into a reference motion: clip to the " +
       "engaged span, resample, smooth, and project through the collision " +
-      "solver. The motion is then selectable under Recorded motion (commit " +
-      "it to git to run it on other robots). Record with " +
-      "axol teleop --teleop.jitter_record PREFIX first.",
+      "solver. The motion saves into the package's committed motions " +
+      "directory and becomes selectable under Recorded motion — commit it " +
+      "to git to run it on other robots. Record first with " +
+      "axol teleop --teleop.jitter_record NAME (bare names land in " +
+      "~/.almond/recordings/); leave the recording box empty to build from " +
+      "the newest one.",
     presets: {},
     fields: [
+      { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
       {
         key: "prefix",
-        label: "recording prefix",
+        label: "recording",
         type: "text",
-        placeholder: "/tmp/jit17",
-        width: "w-52",
+        placeholder: "newest recording",
+        width: "w-44",
+        hint:
+          "which teleop recording to convert — a bare --teleop.jitter_record " +
+          "name, or a full path prefix; empty uses the newest in " +
+          "~/.almond/recordings/",
       },
-      { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
-      { key: "cutoff", label: "cutoff (Hz)", type: "number", placeholder: "6" },
-      { key: "rate", label: "rate (Hz)", type: "number", placeholder: "100" },
+      {
+        key: "cutoff",
+        label: "cutoff (Hz)",
+        type: "number",
+        placeholder: "6",
+        hint:
+          "zero-phase low-pass for the smoothing pass — keeps the operator's " +
+          "deliberate motion, drops hand tremor and network jitter above it",
+      },
+      {
+        key: "rate",
+        label: "rate (Hz)",
+        type: "number",
+        placeholder: "240",
+        hint:
+          "the motion's uniform sample rate — replay commands at this rate, " +
+          "so 240 matches the production control loop",
+      },
       {
         key: "time_scale",
         label: "time scale",
@@ -448,10 +468,158 @@ const TABS: WbTab[] = [
       },
       { key: "notes", label: "notes", type: "text", placeholder: "provenance", width: "w-40" },
     ],
-    required: ["prefix", "name"],
+    required: ["name"],
     drivesMotors: false,
   },
 ]
+
+/* ------------------------------------------------------------------ */
+/* Gain-override editor (Recorded motion tab)                          */
+/* ------------------------------------------------------------------ */
+
+// Matches tune.motion's --gain fields (see _GAIN_FIELDS there).
+const OVERRIDE_FIELDS = [
+  "kp",
+  "kd",
+  "kd_host",
+  "kd_host_max",
+  "kd_host_hz",
+  "kd_host_q",
+  "j_eff",
+]
+
+interface OverrideRow {
+  side: string // "both" | "left" | "right"
+  joint: string
+  field: string
+  value: string
+}
+
+/** Parse the CLI's `[side.]joint.field=value` tokens into editor rows. */
+function parseOverrides(text: string): OverrideRow[] {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((tok) => {
+      const [path = "", value = ""] = tok.split("=")
+      const parts = path.split(".")
+      return parts.length === 3
+        ? { side: parts[0] ?? "both", joint: parts[1] ?? "", field: parts[2] ?? "", value }
+        : { side: "both", joint: parts[0] ?? "", field: parts[1] ?? "", value }
+    })
+}
+
+/** Serialize complete rows back to the CLI token string (incomplete rows are held in the editor only). */
+function serializeOverrides(rows: OverrideRow[]): string {
+  return rows
+    .filter((r) => r.joint && r.field && r.value.trim() !== "")
+    .map(
+      (r) =>
+        `${r.side === "both" ? "" : `${r.side}.`}${r.joint}.${r.field}=${r.value.trim()}`
+    )
+    .join(" ")
+}
+
+/**
+ * Structured editor for tune.motion's per-run gain overrides: rows of
+ * side / joint / field / value selects instead of hand-typed
+ * `left.elbow.kd=4.5` tokens. Serializes to exactly that token string, so
+ * the launch path and run-metadata re-arming are unchanged.
+ */
+function GainOverrideEditor({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string
+  onChange: (v: string) => void
+  disabled: boolean
+}) {
+  const [rows, setRows] = useState<OverrideRow[]>(() => parseOverrides(value))
+  // Resync only on external changes (re-arm from a clicked run) — while the
+  // operator is mid-edit, incomplete rows must survive serialization.
+  useEffect(() => {
+    setRows((prev) => (value === serializeOverrides(prev) ? prev : parseOverrides(value)))
+  }, [value])
+  const update = (next: OverrideRow[]) => {
+    setRows(next)
+    onChange(serializeOverrides(next))
+  }
+  const sel =
+    "h-8 rounded-md border border-white/10 bg-[#1c1c1c] px-1.5 text-xs text-white/85 outline-none focus:border-[#eff483]/40"
+  return (
+    <div className="flex flex-col gap-1.5">
+      {rows.map((row, i) => (
+        <div key={i} className="flex items-center gap-1.5">
+          <select
+            value={row.side}
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, side: e.target.value } : r)))}
+            disabled={disabled}
+            className={cn(sel, "w-20")}
+          >
+            {["both", "left", "right"].map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </select>
+          <select
+            value={row.joint}
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, joint: e.target.value } : r)))}
+            disabled={disabled}
+            className={cn(sel, "w-28")}
+          >
+            <option value="">joint…</option>
+            {ARM_JOINT_OPTIONS.map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </select>
+          <select
+            value={row.field}
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, field: e.target.value } : r)))}
+            disabled={disabled}
+            className={cn(sel, "w-28")}
+          >
+            <option value="">gain…</option>
+            {OVERRIDE_FIELDS.map((o) => (
+              <option key={o} value={o}>
+                {o}
+              </option>
+            ))}
+          </select>
+          <input
+            type="text"
+            inputMode="decimal"
+            value={row.value}
+            placeholder="value"
+            onChange={(e) => update(rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))}
+            disabled={disabled}
+            className="h-8 w-16 rounded-md border border-white/10 bg-[#1c1c1c] px-2 font-mono text-xs text-white/85 outline-none placeholder:text-white/25 focus:border-[#eff483]/40"
+          />
+          <button
+            type="button"
+            onClick={() => update(rows.filter((_, j) => j !== i))}
+            disabled={disabled}
+            className="text-white/30 transition-colors hover:text-red-300"
+            title="remove override"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      ))}
+      <button
+        type="button"
+        onClick={() => update([...rows, { side: "both", joint: "", field: "", value: "" }])}
+        disabled={disabled}
+        className="h-8 w-fit rounded-md border border-dashed border-white/15 px-2 text-xs text-white/45 transition-colors hover:border-[#eff483]/40 hover:text-[#eff483]"
+      >
+        + override
+      </button>
+    </div>
+  )
+}
 
 /* ------------------------------------------------------------------ */
 /* Run presentation helpers (list rows, per-joint charts and scores)  */
@@ -1670,7 +1838,13 @@ export function TuningWorkbench({
                   {tab.required.includes(f.key) && <span className="text-[#eff483]/70"> *</span>}
                   {cfg != null && <span className="text-white/25"> · config {fmtNum(cfg)}</span>}
                 </span>
-                {f.type === "boolean" ? (
+                {f.type === "overrides" ? (
+                  <GainOverrideEditor
+                    value={tabValues[f.key] ?? ""}
+                    onChange={(v) => setValue(f.key, v)}
+                    disabled={runningOurs || busy}
+                  />
+                ) : f.type === "boolean" ? (
                   <span className="flex h-8 cursor-pointer items-center gap-2 rounded-md border border-white/10 bg-[#1c1c1c] px-2 text-xs text-white/70">
                     <input
                       type="checkbox"
