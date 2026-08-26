@@ -398,6 +398,16 @@ export interface EpisodeControlSpec {
   /** Arm on first click and require a second, confirming click — the panel's
    *  stand-in for the headset's double-press save/discard confirmation. */
   confirm?: boolean
+  /** Render as a text field + submit button instead of a plain button;
+   *  submitting posts `${command} ${text}` (e.g. a downstream op's
+   *  post-episode notes). */
+  input?: boolean
+  /** The input's placeholder — doubles as the operator instruction (e.g.
+   *  which episode the text attaches to). */
+  placeholder?: string
+  /** The current server-side text, prefilled whenever the input (re)appears
+   *  so a submitted value survives phase changes and can be edited. */
+  value?: string
 }
 
 export interface PolicyState {
