@@ -653,6 +653,13 @@ function GainOverrideEditor({
                       value={cells[key] ?? ""}
                       placeholder={seeds[key].placeholder}
                       onChange={(e) => edit(key, e.target.value)}
+                      onBlur={() => {
+                        // An emptied cell means "no override" — snap it back
+                        // to the config value so the table never shows blanks.
+                        if (text === "" && seeds[key].text !== "") {
+                          setCells((prev) => ({ ...prev, [key]: seeds[key].text }))
+                        }
+                      }}
                       disabled={disabled}
                       className={cn(
                         "h-7 w-16 rounded border bg-[#1c1c1c] px-1.5 font-mono text-xs outline-none placeholder:text-white/25 focus:border-[#eff483]/40",
@@ -671,7 +678,7 @@ function GainOverrideEditor({
       <div className="flex items-center gap-3">
         <span className="text-[0.65rem] text-white/35">
           this robot's config values — edit a cell to override it for this run (both arms);
-          highlighted cells are the overrides sent
+          highlighted cells are the overrides sent; clear a cell to reset it to config
         </span>
         {dirtyCount > 0 && (
           <button
