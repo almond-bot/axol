@@ -453,6 +453,27 @@ async def _run(args: argparse.Namespace) -> None:
             )
         pose[pj] = rad
 
+    # Poses that swing into the robot base. shoulder_2's inboard half always
+    # collides; wrist_2's does too unless the elbow is bent well clear.
+    s2 = pose.get(Joint.SHOULDER_2)
+    s2_out = -1.0 if is_left else 1.0
+    if s2 is not None and s2 * s2_out < 0:
+        raise SystemExit(
+            f"--pose: shoulder_2 must stay outboard "
+            f"({'negative' if s2_out < 0 else 'positive'} on the {side_str} "
+            "arm) — the robot base is inboard"
+        )
+    w2 = pose.get(Joint.WRIST_2)
+    w2_out = 1.0 if is_left else -1.0
+    if w2 is not None and w2 * w2_out < 0:
+        elbow_pose = pose.get(Joint.ELBOW)
+        if elbow_pose is None or abs(elbow_pose) < math.radians(30.0):
+            raise SystemExit(
+                "--pose: wrist_2 posed in its inboard half meets the base "
+                "with the elbow straight — pose the elbow bent too, e.g. "
+                "--pose elbow=75"
+            )
+
     if args.pose_by_hand:
         if args.mode != "step":
             raise SystemExit(
@@ -608,6 +629,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": args.rate,
                 "stiffness": args.stiffness,
                 "target_noise_deg": args.target_noise,
+                "pose": args.pose or None,
             },
             label=args.label,
             group=run_group,
@@ -899,7 +921,17 @@ async def _run(args: argparse.Namespace) -> None:
                     # A clearance joint's true origin was captured above —
                     # here it would read the clearance pose instead.
                     pre_pose.setdefault(j, v)
-                await ramp_joints_to(motors, pose)
+                # A posed elbow ramps first: simultaneous ramps could sweep a
+                # co-posed wrist_2 into its inboard half before the elbow has
+                # bent clear of the base.
+                if Joint.ELBOW in pose and len(pose) > 1:
+                    await ramp_joints_to(motors, {Joint.ELBOW: pose[Joint.ELBOW]})
+                    await ramp_joints_to(
+                        motors,
+                        {j: v for j, v in pose.items() if j is not Joint.ELBOW},
+                    )
+                else:
+                    await ramp_joints_to(motors, pose)
 
             # Fill the gravity pose with the *measured* positions of the
             # other joints: base-collision joints (shoulder_2, wrist_2) are
@@ -1048,9 +1080,20 @@ async def _run(args: argparse.Namespace) -> None:
                 if pre_pose:
                     # Lower posed joints back to where they started (a safe
                     # hang) before the final disable lets everything go limp.
+                    # The elbow lowers last, mirroring the setup order: it
+                    # must stay bent until a co-posed wrist_2 has left the
+                    # inboard half.
                     print("  returning posed joints ...")
                     try:
-                        await ramp_joints_to(motors, pre_pose)
+                        rest = {
+                            j: v for j, v in pre_pose.items() if j is not Joint.ELBOW
+                        }
+                        if rest:
+                            await ramp_joints_to(motors, rest)
+                        if Joint.ELBOW in pre_pose:
+                            await ramp_joints_to(
+                                motors, {Joint.ELBOW: pre_pose[Joint.ELBOW]}
+                            )
                     except Exception:
                         pass
                 await asyncio.gather(

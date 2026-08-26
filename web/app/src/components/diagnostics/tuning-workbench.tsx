@@ -159,6 +159,17 @@ const TABS: WbTab[] = [
           "joint-frame start angle (0 = rest, empty = joint midpoint) — probe " +
           "under gravity load too, e.g. 45 / -45",
       },
+      {
+        key: "pose",
+        label: "pose",
+        type: "text",
+        placeholder: "joint=deg …",
+        width: "w-52",
+        hint:
+          "hold other joints during the test (space-separated joint-frame " +
+          "degrees, e.g. elbow=90 wrist_1=45) — reflected inertia and gravity " +
+          "load change with pose, so probe the worst case; ramped back after",
+      },
       { key: "freq", label: "freq (Hz)", type: "number", placeholder: "1.0" },
       { key: "duration", label: "duration (s)", type: "number", placeholder: "5" },
       {
@@ -208,6 +219,17 @@ const TABS: WbTab[] = [
         hint:
           "joint-frame start angle the step is framed around (0 = rest, " +
           "empty = current position) — probe under gravity load too, e.g. 45 / -45",
+      },
+      {
+        key: "pose",
+        label: "pose",
+        type: "text",
+        placeholder: "joint=deg …",
+        width: "w-52",
+        hint:
+          "hold other joints during the test (space-separated joint-frame " +
+          "degrees, e.g. elbow=90 wrist_1=45) — reflected inertia and gravity " +
+          "load change with pose, so probe the worst case; ramped back after",
       },
       { key: "hold", label: "hold (s)", type: "number", placeholder: "2" },
       {
@@ -473,6 +495,7 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("host_kd_q", g.kd_host_q)
       put("amp", p.amp_deg)
       put("center", p.center_deg)
+      if (Array.isArray(p.pose) && p.pose.length > 0) out["pose"] = p.pose.join(" ")
       put("freq", p.freq)
       put("duration", p.duration)
       put("hold", p.hold)
