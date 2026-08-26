@@ -257,13 +257,13 @@ class IKWorker:
         self._rest_pose_right = q_settled[self._solver.right_indices].astype(np.float32)
         self._solver.set_posture_pose(self.get_rest_q())
 
-        # Jitter flight recorder (--teleop.jitter_record, arriving here via
+        # Jitter flight recorder (--teleop.record, arriving here via
         # the pickled config, see .recorder): taps the solve path at every
         # stage boundary this process owns — raw VR pose, filtered pose,
         # world EE target, IK output.
         n = self._solver.num_joints
         self._rec = _recorder_make(
-            config.jitter_record,
+            config.record,
             "ik",
             {
                 "raw_l": 3,

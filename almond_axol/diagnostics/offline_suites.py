@@ -2,7 +2,7 @@
 axol diag.offline
 
 Offline analysis suites over a teleop flight-recorder capture (``axol
-teleop --teleop.jitter_record PREFIX``). Each suite isolates one stage of
+teleop --teleop.record PREFIX``). Each suite isolates one stage of
 the teleop pipeline and answers one question from the recording alone —
 no hardware needed:
 
@@ -19,7 +19,7 @@ Results print as a report and (with ``--save-run``) persist as tuning-run
 artifacts for charting and comparison in the diagnostics UI.
 
 Examples:
-    axol teleop --teleop.jitter_record /tmp/rec    # record a session first
+    axol teleop --teleop.record /tmp/rec    # record a session first
     axol diag.offline wifi /tmp/rec
     axol diag.offline filtering /tmp/rec --save-run
     axol diag.offline kinematics /tmp/rec --save-run --label "solver v2"
@@ -38,7 +38,7 @@ def _add_arguments(ap: argparse.ArgumentParser) -> None:
     )
     ap.add_argument(
         "prefix",
-        help="Flight-recorder prefix used with --teleop.jitter_record",
+        help="Flight-recorder prefix used with --teleop.record",
     )
     ap.add_argument(
         "--save-run",

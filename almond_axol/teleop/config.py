@@ -149,7 +149,7 @@ class VRTeleopConfig:
             reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
-        jitter_record: File prefix for the jitter flight recorder (see
+        record: File prefix for the teleop flight recorder (see
             :mod:`almond_axol.teleop.recorder`).  A bare name (``rec1``)
             records into ``~/.almond/recordings/``, where ``axol
             motion.build`` finds it; a path prefix (``/tmp/jit``) is used
@@ -211,4 +211,4 @@ class VRTeleopConfig:
     position_multiplier: float = 1.0
     rotation_multiplier: float = 1.0
     disengage_timeout: float = 0.5
-    jitter_record: str | None = None
+    record: str | None = None

@@ -421,7 +421,7 @@ const TABS: WbTab[] = [
       "solver. The motion saves into the package's committed motions " +
       "directory and becomes selectable under Recorded motion — commit it " +
       "to git to run it on other robots. Record first with " +
-      "axol teleop --teleop.jitter_record NAME (bare names land in " +
+      "axol teleop --teleop.record NAME (bare names land in " +
       "~/.almond/recordings/); leave the recording box empty to build from " +
       "the newest one.",
     presets: {},
@@ -434,7 +434,7 @@ const TABS: WbTab[] = [
         placeholder: "newest recording",
         width: "w-44",
         hint:
-          "which teleop recording to convert — a bare --teleop.jitter_record " +
+          "which teleop recording to convert — a bare --teleop.record " +
           "name, or a full path prefix; empty uses the newest in " +
           "~/.almond/recordings/",
       },

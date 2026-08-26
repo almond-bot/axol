@@ -5,10 +5,10 @@ pose, EE target, IK output, smoothed command, measured joints — as
 timestamped rows in fixed-size ring buffers, so one jittery session can be
 attributed offline stage by stage (``axol diag.teleop-jitter``).
 
-Activation is by the ``jitter_record`` field on
+Activation is by the ``record`` field on
 :class:`~almond_axol.teleop.config.VRTeleopConfig`::
 
-    axol teleop --teleop.jitter_record /tmp/jit
+    axol teleop --teleop.record /tmp/jit
 
 Every tap site holds that config — including the IK worker, which receives
 it pickled through the subprocess spawn — so the prefix needs no other
@@ -34,12 +34,14 @@ import numpy as np
 
 _logger = logging.getLogger(__name__)
 
-# Default ring capacity: 5 minutes at 120 Hz. Older rows are overwritten, so
+# Default ring capacity: 5 minutes at the production 240 Hz control rate
+# (the cmd/meas taps run once per control tick, so this is the sizing rate;
+# the IK tap at 120 Hz keeps twice as long). Older rows are overwritten, so
 # a long session keeps its *last* 5 minutes — end the session shortly after
-# reproducing the jitter.
-_DEFAULT_CAPACITY = 36_000
+# the moment you want captured.
+_DEFAULT_CAPACITY = 72_000
 
-# Where bare recording names land. ``--teleop.jitter_record demo1`` writes
+# Where bare recording names land. ``--teleop.record demo1`` writes
 # ``~/.almond/recordings/demo1_*.npz``; ``axol motion.build`` resolves bare
 # prefixes against the same directory (and defaults to its newest recording),
 # so record → build needs no paths at all. A prefix containing a path

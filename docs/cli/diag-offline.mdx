@@ -3,7 +3,7 @@ title: "diag.offline"
 description: "Offline wifi / filtering / kinematics analysis of a teleop flight-recorder capture."
 ---
 
-Analyzes a teleop flight-recorder capture (`axol teleop --teleop.jitter_record PREFIX`) offline — no hardware needed. Each suite isolates one stage of the teleop pipeline and answers one question, so jitter can be attributed deterministically instead of guessed at:
+Analyzes a teleop flight-recorder capture (`axol teleop --teleop.record PREFIX`) offline — no hardware needed. Each suite isolates one stage of the teleop pipeline and answers one question, so jitter can be attributed deterministically instead of guessed at:
 
 | Suite | Question | What it reports |
 |---|---|---|
@@ -14,12 +14,12 @@ Analyzes a teleop flight-recorder capture (`axol teleop --teleop.jitter_record P
 | Flag | Description |
 |---|---|
 | `suite` | `wifi`, `filtering`, or `kinematics` (required) |
-| `prefix` | Flight-recorder prefix used with `--teleop.jitter_record` (required) |
+| `prefix` | Flight-recorder prefix used with `--teleop.record` (required) |
 | `--save-run` | Persist the analysis as a tuning-run artifact (`~/.almond/diagnostics/tuning/`) for the diagnostics UI |
 | `--label TEXT` | Free-form note stored on the run artifact |
 
 ```bash
-axol teleop --teleop.jitter_record /tmp/rec     # record a session first
+axol teleop --teleop.record /tmp/rec     # record a session first
 axol diag.offline wifi /tmp/rec
 axol diag.offline filtering /tmp/rec --save-run
 axol diag.offline kinematics /tmp/rec --save-run --label "solver v2"

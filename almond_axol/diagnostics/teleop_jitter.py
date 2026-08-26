@@ -2,7 +2,7 @@
 
 Record one jittery session first::
 
-    axol teleop --teleop.jitter_record /tmp/jit
+    axol teleop --teleop.record /tmp/jit
     # reproduce the jitter, then exit teleop
     axol diag.teleop-jitter /tmp/jit
 
@@ -153,9 +153,7 @@ def _clip(data: dict[str, np.ndarray], span: tuple[float, float]) -> dict:
 
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="axol diag.teleop-jitter")
-    ap.add_argument(
-        "prefix", help="the --teleop.jitter_record prefix used during capture"
-    )
+    ap.add_argument("prefix", help="the --teleop.record prefix used during capture")
     ap.add_argument(
         "--full",
         action="store_true",

@@ -542,7 +542,7 @@ COMMANDS: dict[str, CommandDef] = {
         "motion.build",
         "Build reference motion",
         "Postprocess a teleop flight-recorder capture (teleop's "
-        "jitter_record) into a reference motion: clip to the engaged span, "
+        "record option) into a reference motion: clip to the engaged span, "
         "resample, smooth, and project through the collision-aware solver.",
         "Diagnostics",
         "argparse",

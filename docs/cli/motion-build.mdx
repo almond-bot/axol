@@ -9,7 +9,7 @@ Reference motions are uniform-rate, both-arm joint trajectories committed to the
 
 | Flag | Description |
 |---|---|
-| `prefix` | Flight-recorder prefix from `axol teleop --teleop.jitter_record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare `--teleop.jitter_record` names are written. **Optional**: omitted, the newest recording in that directory is used |
+| `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare `--teleop.record` names are written. **Optional**: omitted, the newest recording in that directory is used |
 | `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz` (required) |
 | `--out PATH` | Write to an explicit path instead of the committed directory |
 | `--rate HZ` | Uniform playback rate (default: 240 — the production control rate; `tune.motion` replays at the motion's stored rate) |
@@ -19,7 +19,7 @@ Reference motions are uniform-rate, both-arm joint trajectories committed to the
 | `--notes TEXT` | Free-form provenance note stored in the motion metadata |
 
 ```bash
-axol teleop --teleop.jitter_record rec1          # record a session first
+axol teleop --teleop.record rec1          # record a session first
 axol motion.build --name reach-and-place         # newest recording
 axol motion.build rec1 --name reach-slow --time-scale 2.0
 axol motion.list                                 # what's committed

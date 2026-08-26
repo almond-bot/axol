@@ -5,7 +5,7 @@ Build and inspect the committed reference motions used by ``axol
 tune.motion``.
 
 ``motion.build`` postprocesses a teleop flight-recorder capture (``axol
-teleop --teleop.jitter_record PREFIX``) into a reference motion: the final
+teleop --teleop.record PREFIX``) into a reference motion: the final
 guarded command stream is clipped to the engaged span, resampled onto a
 uniform grid, zero-phase smoothed (keeping the operator's intent, dropping
 tremor and network jitter), and projected waypoint-by-waypoint through the
@@ -15,7 +15,7 @@ self-collision-safe by construction. The result lands in the package's
 replay the identical motion.
 
 Examples:
-    axol teleop --teleop.jitter_record rec1        # record a session first
+    axol teleop --teleop.record rec1        # record a session first
     axol motion.build --name reach-and-place       # newest recording
     axol motion.build rec1 --name reach-slow --time-scale 2.0
     axol motion.list
@@ -39,7 +39,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "prefix",
         nargs="?",
         default=None,
-        help="Flight-recorder prefix used with --teleop.jitter_record "
+        help="Flight-recorder prefix used with --teleop.record "
         "(reads <prefix>_cmd.npz). A bare name resolves in the recordings "
         "directory (~/.almond/recordings/); omit it entirely to build from "
         "the newest recording there.",
@@ -103,7 +103,7 @@ def _resolve_prefix(prefix: str | None) -> str:
     """Resolve the recording prefix: verbatim path, bare name, or newest.
 
     A bare name (no path separator) resolves in the recordings directory
-    (where ``--teleop.jitter_record`` writes bare names); ``None`` picks the
+    (where ``--teleop.record`` writes bare names); ``None`` picks the
     newest recording there.
     """
     from ..teleop.recorder import RECORDINGS_DIR, resolve_prefix
@@ -118,7 +118,7 @@ def _resolve_prefix(prefix: str | None) -> str:
     if newest is None:
         raise SystemExit(
             f"No recordings in {RECORDINGS_DIR} — record one first with "
-            "`axol teleop --teleop.jitter_record NAME`, or pass a prefix."
+            "`axol teleop --teleop.record NAME`, or pass a prefix."
         )
     return str(newest)[: -len("_cmd.npz")]
 

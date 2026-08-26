@@ -6,7 +6,7 @@ so the exact same motion can be replayed on any robot, today or years from
 now, and the tracking metrics compared 1:1.
 
 Motions are *built* from recorded teleop sessions (``axol teleop
---teleop.jitter_record PREFIX`` writes the flight-recorder capture;
+--teleop.record PREFIX`` writes the flight-recorder capture;
 ``axol motion.build PREFIX --name N`` postprocesses it): the final guarded
 command stream (``_cmd`` stage, ``out`` field) is clipped to the engaged
 span, resampled onto a uniform grid, zero-phase low-pass smoothed (removing
@@ -182,7 +182,7 @@ def build_motion(
     """Postprocess a flight-recorder capture into a reference motion.
 
     Args:
-        prefix:            The ``--teleop.jitter_record`` prefix; reads
+        prefix:            The ``--teleop.record`` prefix; reads
                            ``<prefix>_cmd.npz`` (required, the guarded command
                            stream) and ``<prefix>_ik.npz`` (optional, for the
                            engaged-span clip).
@@ -201,7 +201,7 @@ def build_motion(
     if not cmd_path.is_file():
         raise FileNotFoundError(
             f"{cmd_path} not found — record a session with "
-            "`axol teleop --teleop.jitter_record <prefix>` first."
+            "`axol teleop --teleop.record <prefix>` first."
         )
     cmd = dict(np.load(cmd_path))
     t = np.asarray(cmd["t"], dtype=float)

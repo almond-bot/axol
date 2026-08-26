@@ -13,7 +13,7 @@ question from a recording alone (no hardware):
   target), per-joint churn, and how much mid-band jitter each joint carries
   relative to the EE target.
 
-All three consume the ``--teleop.jitter_record`` capture
+All three consume the ``--teleop.record`` capture
 (``<prefix>_ik.npz`` / ``<prefix>_cmd.npz``) and return ``(metrics,
 series, params)`` in the standard tuning-run shape, so results persist via
 :func:`~almond_axol.tuning.runs.save_run` and chart in the diagnostics UI
@@ -43,7 +43,7 @@ def load_stage(prefix: str, stage: str) -> dict[str, np.ndarray]:
     if not path.is_file():
         raise FileNotFoundError(
             f"{path} not found — record a session with "
-            "`axol teleop --teleop.jitter_record <prefix>` first."
+            "`axol teleop --teleop.record <prefix>` first."
         )
     return dict(np.load(path))
 
