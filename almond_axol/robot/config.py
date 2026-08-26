@@ -220,11 +220,19 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             # Step/sine-validated on hardware (2026-08, tuning workbench):
             # kp 350 / kd 5 with the host damping pinned on the measured
-            # ~2 Hz impedance ring (kd_host_hz) and narrowed to it
+            # impedance ring (kd_host_hz) and narrowed to it
             # (kd_host_q 1.5 — the shared 0.8 band reaches into the <1.5 Hz
             # intentional-motion band and drags the final approach). Result
             # at 80° under full gravity load: no ring, 0.15° lag-free sine
             # tracking, parked error at the stiction floor.
+            # kd_host_hz re-aimed 2.0 -> 3.2 (2026-08-26, motion replays):
+            # every replay measured the in-motion ring at 3.1-3.3 Hz, where
+            # a 2.0-centred q-1.5 band has already rolled off (the 2 Hz was
+            # a parked-step measurement; in motion the reflected inertia is
+            # lower and the mode sits higher). Replay A/B on two motions,
+            # both arms: mid-band jitter 60->34 / 45->27 mdeg on the wrist
+            # swing, ringing amplification ~2.6 -> ~1.8, torque chatter and
+            # step behaviour unchanged.
             kp=350.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
@@ -232,7 +240,7 @@ class ArmConfig:
             com=(0.0652231, 0.0, 0.0),
             j_eff=1.27,
             kd_host=45.0,
-            kd_host_hz=2.0,
+            kd_host_hz=3.2,
             kd_host_q=1.5,
         )
     )
@@ -240,7 +248,7 @@ class ArmConfig:
         default_factory=lambda: JointConfig(
             # Step/sine-validated on hardware (2026-08, tuning workbench):
             # same kp/kd as shoulder_1 with the host damping pinned on this
-            # joint's own measured ~3.5 Hz impedance ring (an octave above
+            # joint's own measured impedance ring (an octave above
             # shoulder_1's — lighter link) and narrowed to it (kd_host_q
             # 1.5). kd_host 45 is the phase-lag ceiling: 60 re-sustained the
             # ring, so the guardrail sits at the validated value. Result:
@@ -250,6 +258,12 @@ class ArmConfig:
             # gain on a 1 Hz sine is the resonance's below-band tail —
             # damping can't shrink it, and the teleop trapezoid rate-limits
             # what reaches it.
+            # kd_host_hz re-aimed 3.5 -> 4.0 (2026-08-26, motion replays):
+            # in-motion ring measured at 3.9-4.2 Hz across replays. Smaller
+            # win than shoulder_1's re-aim (amplification 1.8 -> 1.5 on the
+            # right, left flat); the left side showed a small torque-chatter
+            # uptick (0.29 -> 0.34 Nm) in both A/Bs — watch it if the left
+            # shoulder ever gets audibly rough.
             kp=350.0,
             kd=5.0,
             friction=_ZERO_FRICTION,
@@ -257,7 +271,7 @@ class ArmConfig:
             com=(0.0, 0.0115864, -0.0302711),
             j_eff=1.1,
             kd_host=45.0,
-            kd_host_hz=3.5,
+            kd_host_hz=4.0,
             kd_host_q=1.5,
         )
     )
@@ -268,8 +282,15 @@ class ArmConfig:
             # detectable ring, and ~0.001° steady-state RMS — all with
             # kd_host 0 (see below). kd 2 at the same kp reintroduced
             # overshoot; kp 200 settled 6x slower.
+            # kd 3 -> 4 (2026-08-26, motion replays): firmware damping is
+            # the only phase-safe lever on this joint's undamped in-motion
+            # ring (see the kd_host story below). Replay A/B: right-arm
+            # ringing amplification 2.6 -> 2.1, left flat — a modest win,
+            # and safe: no mast-mode reignition (wrist buzz stayed at the
+            # floor, no ~11 Hz line) and torque chatter unchanged. Headroom
+            # to the universal firmware clamp of 5.
             kp=250.0,
-            kd=3.0,
+            kd=4.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
@@ -348,8 +369,21 @@ class ArmConfig:
             # (kd decodes against 0-5); the contact chatter historically
             # seen near the clamp did not reproduce — torque HF was the
             # lowest of the sweep.
+            # kd 5 -> 3 (2026-08-26, motion replays): at the clamp, one
+            # unit's right wrist_2 sustained an *audible* ~110 Hz limit
+            # cycle through entire replays (26 mdeg / 0.13 Nm continuous —
+            # the scorecard's buzz metric; its twin stayed quiet, same
+            # unit-to-unit margin spread as the kp-250 35 Hz story below).
+            # kd 3 kills it, halves that wrist's replay RMS (0.062 ->
+            # 0.034°), and dragged its wrist_1/shoulder_3 neighbours' buzz
+            # down with it; kd 3.5 was also verified clean. A default whose
+            # failure mode is an audible limit cycle on an ordinary unit
+            # loses the step-damping argument above — but kd 3 gives back
+            # some step margin (the 7 Hz two-crest ring at kd 4 above was
+            # measured against kd 5), so step-probe wrist_2 on the next
+            # bench pass and prefer 3.5 if a ring shows.
             kp=200.0,
-            kd=5.0,
+            kd=3.0,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
