@@ -54,6 +54,13 @@ _logger = logging.getLogger(__name__)
 
 CALIBRATION_PATH = Path.home() / ".almond" / "calibration.json"
 
+# This robot's factory calibration as fetched from the cloud (``axol
+# calibration.pull`` — see :mod:`.calibration_cloud`). Same file shape as
+# ``calibration.json``. It sits *between* the coded defaults and the local
+# file in the override order: coded config ← factory data ← calibration.json
+# — a value tuned locally always wins over the factory's.
+FACTORY_CALIBRATION_PATH = Path.home() / ".almond" / "factory_calibration.json"
+
 _SIDES = ("left", "right")
 # ``kd_soft`` entries written by older versions are silently dropped on load.
 _SCALAR_FIELDS = ("kp", "kd", "j_eff", "kd_host", "kd_host_hz", "kd_host_q")
@@ -155,6 +162,22 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
             if clean:
                 out[side][str(joint)] = clean
     return out
+
+
+def load_factory_calibration() -> dict[str, dict[str, Any]]:
+    """The fetched factory calibration, sanitized like the local file."""
+    return load_calibration(path=FACTORY_CALIBRATION_PATH)
+
+
+def save_factory_calibration(
+    document: dict[str, Any], path: Path = FACTORY_CALIBRATION_PATH
+) -> Path:
+    """Persist a fetched factory-calibration document (atomic write)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+    return path
 
 
 def update_joint_calibration(

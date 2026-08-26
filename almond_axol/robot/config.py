@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..constants import ARM_JOINTS
-from .calibration import load_calibration
+from .calibration import load_calibration, load_factory_calibration
 
 
 @dataclass
@@ -493,17 +493,25 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
         wrist_2=replace(arm.wrist_2, friction=replace(friction.wrist_2)),
         wrist_3=replace(arm.wrist_3, friction=replace(friction.wrist_3)),
     )
-    calibrated = load_calibration()["left" if is_left else "right"]
-    if not calibrated:
+    # Override order: coded defaults ← this robot's factory calibration
+    # (fetched from the cloud by ``axol calibration.pull``) ← the local
+    # calibration file. A joint present in both merges field-by-field with
+    # local values winning, so a locally retuned friction fit shadows the
+    # factory's while the factory's com (say) still applies.
+    side = "left" if is_left else "right"
+    factory = load_factory_calibration()[side]
+    local = load_calibration()[side]
+    if not factory and not local:
         return arm
     return replace(
         arm,
         **{
             joint.value: _calibrated_joint(
-                getattr(arm, joint.value), calibrated[joint.value]
+                getattr(arm, joint.value),
+                {**factory.get(joint.value, {}), **local.get(joint.value, {})},
             )
             for joint in ARM_JOINTS
-            if joint.value in calibrated
+            if joint.value in factory or joint.value in local
         },
     )
 

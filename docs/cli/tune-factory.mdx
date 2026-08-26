@@ -1,0 +1,60 @@
+---
+title: "tune.factory"
+description: "Factory calibration: friction + gravity for all 14 joints in one run, uploaded to the cloud by hub adapter serial."
+---
+
+Full-robot factory calibration: identifies friction ([`tune.friction`](/cli/tune-friction)) and gravity CoM ([`tune.gravity`](/cli/tune-gravity)) for **all 14 joints** (both arms × 7) in one command. Also available from the diagnostics dashboard's Tuning workbench (`axol serve`).
+
+One bidirectional multi-velocity sweep per joint yields both fits — the half-difference of forward/backward torque gives the friction model (`Fc`, `k`, `Fv`), the average gives the gravity curve the CoM is fit to, with the friction offset `Fo` refit against the corrected model. Each arm runs **distal → proximal** (`wrist_3` → … → `shoulder_1`) and every joint's fit is saved before the next joint sweeps, so proximal sweeps see already-corrected distal links — the ordering `tune.gravity` asks the operator to keep by hand happens automatically here. Sweep safety (base-collision caps, elbow raised for `wrist_2`, camera clearance) matches the individual tools.
+
+Results are saved to `~/.almond/calibration.json` (this machine uses them immediately) **and** uploaded to Supabase keyed by the robot's identity — the Axol hub adapter's USB serial, which travels with the arms across compute-host swaps. Other machines fetch them with [`calibration.pull`](#calibration-pull).
+
+The upload only happens when Supabase credentials are configured; without them the run calibrates locally and says so:
+
+```bash
+# .env (or .env.local / real environment)
+AXOL_SUPABASE_URL=https://<project>.supabase.co
+AXOL_SUPABASE_KEY=<key with write access to axol_calibrations>
+```
+
+Expected table:
+
+```sql
+create table axol_calibrations (
+  hub_serial text primary key,
+  calibration jsonb not null,
+  updated_at timestamptz not null default now()
+);
+```
+
+The upload merges over what the cloud already stores, so a one-arm re-run never wipes the other arm's data. An interrupted run keeps (and uploads) every joint that completed.
+
+| Flag | Description |
+|---|---|
+| `--arms {both,left,right}` | Which arm(s) to calibrate (default: both) |
+| `--left-channel IFACE` / `--right-channel IFACE` | CAN interface overrides (default: the Axol hub's persistent names) |
+| `--velocities DEG_S …` | Friction velocity sweep in deg/s (default: `7.2 18 36 54 72`). Fewer velocities = quicker run, coarser friction fit |
+| `--hub-serial SERIAL` | Robot identity for the upload (default: the attached hub adapter's USB serial) |
+
+```bash
+axol tune.factory                     # both arms, upload if credentials exist
+axol tune.factory --arms left
+axol tune.factory --velocities 18 36  # quicker sweep
+```
+
+## calibration.pull
+
+Fetches a robot's factory calibration from the cloud into the local cache (`~/.almond/factory_calibration.json`). Run it once on any machine the robot is plugged into — the read-only anon key suffices:
+
+```bash
+axol calibration.pull                 # identity from the attached hub adapter
+axol calibration.pull --hub-serial 004800345542501420373234
+```
+
+Every `AxolConfig` then overlays the fetched values **between** the coded defaults and the local calibration file:
+
+```
+coded config  ←  factory calibration (cloud cache)  ←  ~/.almond/calibration.json
+```
+
+so anything tuned locally afterwards (`tune.friction --save`, `tune.pid --save`, `tune.gravity --save`) still wins over the factory values, and the coded defaults remain the fallback for joints neither layer covers.

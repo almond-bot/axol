@@ -5,6 +5,7 @@ import importlib
 import sys
 
 from ..utils.dotenv import load_local_env
+from . import calibration as calibration_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
 from .can import driver as can_driver
@@ -23,6 +24,7 @@ from .motor import info as motor_info
 from .motor import restore_config as motor_restore_config
 from .motor import set_can_id, set_zero_pos
 from .motor import set_config as motor_set_config
+from .tune import factory as tune_factory
 from .tune import filter as tune_filter
 from .tune import friction, pid, repeatability
 from .tune import gravity as tune_gravity
@@ -132,6 +134,8 @@ def main() -> None:
     pid.add_parser(subparsers)
     friction.add_parser(subparsers)
     tune_gravity.add_parser(subparsers)
+    tune_factory.add_parser(subparsers)
+    calibration_cmd.add_parser(subparsers)
     repeatability.add_parser(subparsers)
     tune_motion.add_parser(subparsers)
     tune_filter.add_parser(subparsers)

@@ -91,6 +91,7 @@
               "cli/tune-pid",
               "cli/tune-friction",
               "cli/tune-gravity",
+              "cli/tune-factory",
               "cli/tune-motion",
               "cli/tune-filter",
               "cli/motion-build",

@@ -362,6 +362,41 @@ const TABS: WbTab[] = [
     drivesMotors: true,
   },
   {
+    key: "factory",
+    label: "Factory",
+    command: "tune.factory",
+    description:
+      "Full-robot factory calibration: friction + gravity for all 14 joints " +
+      "(both arms, distal→proximal) in one run. Every fit is saved to this " +
+      "robot's calibration as it lands, and the whole document is uploaded " +
+      "to the cloud keyed by the hub adapter serial — when Supabase " +
+      "credentials are configured (AXOL_SUPABASE_URL / AXOL_SUPABASE_KEY); " +
+      "without them the run calibrates locally only. Expect it to take a " +
+      "while — 7 joints per arm, several sweep velocities each.",
+    presets: {},
+    fields: [
+      { key: "arms", label: "arms", type: "select", options: ["both", "left", "right"] },
+      {
+        key: "velocities",
+        label: "velocities (°/s)",
+        type: "text",
+        placeholder: "7.2 18 36 54 72",
+        width: "w-44",
+        hint: "fewer velocities = quicker run, coarser friction fit",
+      },
+      {
+        key: "hub_serial",
+        label: "hub serial",
+        type: "text",
+        placeholder: "auto-detect",
+        width: "w-52",
+        hint: "robot id for the cloud upload — leave empty to use the attached hub adapter's",
+      },
+    ],
+    required: [],
+    drivesMotors: true,
+  },
+  {
     key: "build",
     label: "Build motion",
     command: "motion.build",

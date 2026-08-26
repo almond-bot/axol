@@ -188,6 +188,22 @@ def _configured_serial() -> str | None:
     return _rules_serial_for(_CAN_L) or _rules_serial_for(_CAN_R)
 
 
+def hub_serial() -> str | None:
+    """The Axol hub adapter's USB serial — this robot's identity.
+
+    The hub travels with the arms, so its serial keys the robot's factory
+    calibration in the cloud (see :mod:`almond_axol.robot.calibration_cloud`)
+    across compute-host swaps. Prefers the serial pinned by a previous
+    ``can.setup`` (unambiguous with several candlelight devices attached);
+    falls back to a live scan when exactly one dual-channel hub is present.
+    """
+    serial = _configured_serial()
+    if serial:
+        return serial
+    detected = _detect_serials()
+    return detected[0] if len(detected) == 1 else None
+
+
 def _configured_named_serial(name: str) -> str | None:
     """A single-channel adapter's serial as pinned by a previous setup.
 

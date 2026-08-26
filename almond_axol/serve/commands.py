@@ -476,6 +476,36 @@ COMMANDS: dict[str, CommandDef] = {
         drives_motors=True,
         section="tuning",
     ),
+    "tune.factory": CommandDef(
+        "tune.factory",
+        "tune.factory",
+        "Factory calibration (all joints)",
+        "Friction + gravity identification for all 14 joints (both arms, "
+        "distal→proximal) in one run — saved to this robot's calibration "
+        "and uploaded to the cloud keyed by the hub adapter serial when "
+        "Supabase credentials are configured.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..cli.tune.factory"),
+        requires_hardware=True,
+        drives_motors=True,
+        section="tuning",
+    ),
+    "calibration.pull": CommandDef(
+        "calibration.pull",
+        "calibration.pull",
+        "Fetch factory calibration",
+        "Download this robot's factory calibration (friction + gravity, by "
+        "hub adapter serial) from the cloud into the local cache; every "
+        "config then overlays it under the local calibration file.",
+        "Calibrate",
+        "argparse",
+        _argparse_loader("..cli.calibration"),
+        requires_hardware=False,
+        uses_can_bus=False,
+        drives_motors=False,
+        section="helper",
+    ),
     "tune.motion": CommandDef(
         "tune.motion",
         "tune.motion",
