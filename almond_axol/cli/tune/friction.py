@@ -48,7 +48,12 @@ from ...robot.axol import arm_limits
 from ...robot.calibration import CALIBRATION_PATH, update_joint_calibration
 from ...robot.config import ArmConfig, AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import JointFrameMotor, joint_frame_motors, sweep_safety
+from ...tuning import (
+    JointFrameMotor,
+    joint_frame_motors,
+    ramp_stages,
+    sweep_safety,
+)
 from ..motor import add_side_and_channel_arguments, resolve_channel
 
 _TAU = 2 * math.pi
@@ -608,13 +613,13 @@ async def _run(args: argparse.Namespace) -> None:
             await _home_all(motors)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
-            # caps for shoulder_2/wrist_2, elbow raised for wrist_2, and
-            # shoulder_2 held outboard for the camera-adjacent joints.
+            # caps, camera clearance, and gravity-load poses. Staged ramps:
+            # proximal joints settle before the wrists rotate to their holds.
             other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
             for note in notes:
                 print(f"  {note}")
-            if other_targets:
-                await _ramp_verified(motors, other_targets)
+            for stage in ramp_stages(other_targets):
+                await _ramp_verified(motors, stage)
 
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)

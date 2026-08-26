@@ -105,16 +105,35 @@ def probe_clearance_targets(test_joint: Joint, is_left: bool) -> dict[Joint, flo
     return {}
 
 
+# Load poses for the friction/gravity sweeps. Gravity identification needs the
+# test joint *loaded*: gravity has zero moment about a vertical axis no matter
+# where the mass sits, so a joint whose axis hangs vertical at rest carries no
+# CoM signal — its fit would chase torque-sensor noise (the failure that once
+# moved a wrist CoM 90 mm and poisoned the elbow fit computed on top of it).
+# Three joints hang axis-vertical and need other joints posed to tilt them.
+# Clearances below were verified against the torso collision model; signal
+# figures are the CAD gravity model's torque variation over the sweep.
+SHOULDER_1_LOAD = math.radians(90.0)  # humerus horizontal for shoulder_3
+WRIST_2_LOAD = math.radians(85.0)  # hand off wrist_1's axis (85°: limit is 90)
+WRIST_1_LOAD = math.radians(90.0)  # hand off wrist_2's axis
+# shoulder_3 / wrist_1 sweep cap at their loaded poses: ±90° keeps the bent
+# forearm ≥ +60 mm clear of the torso capsules (≥ +199 mm for shoulder_3).
+LOADED_SWEEP_CAP = math.radians(90.0)
+
+
 def sweep_safety(
     joint: Joint, is_left: bool
 ) -> tuple[dict[Joint, float], float | None, float | None, list[str]]:
-    """Clearance poses and range caps for a full-range sweep of ``joint``.
+    """Clearance + load poses and range caps for a full-range sweep of ``joint``.
 
     Returns ``(clearance_targets, lo_cap, hi_cap, notes)``: joint-frame hold
     targets to ramp the *other* joints to before sweeping, optional overrides
     of the sweep's lower/upper limit, and human-readable notes explaining
-    each measure. Encodes every physical-safety rule the full-range sweeps
-    (friction, gravity) share:
+    each measure. Shared by ``tune.friction``, ``tune.gravity`` and
+    ``tune.factory`` (which derives both fits from one sweep, so the pose
+    must serve both). Two kinds of rule are encoded:
+
+    Physical safety:
 
     - wrist_2: elbow raised to its midpoint — with the elbow bent the
       gripper clears the base through wrist_2's *full* range, so the sweep
@@ -122,8 +141,23 @@ def sweep_safety(
       ``probe_clearance_targets``.)
     - shoulder_2: sweep capped at 0 — starting at the rest pose is fine,
       but travel past it swings into the base.
-    - shoulder_3 / wrist_1: shoulder_2 held 10° outboard so the hanging arm
+    - shoulder_3 / wrist_1: shoulder_2 held 10° outboard so the arm
       swings clear of the chest cameras.
+
+    Gravity load (see the module constants above): joints whose axis hangs
+    vertical at rest are posed so gravity actually loads them —
+
+    - shoulder_3: shoulder_1 raised 90° + elbow bent to midpoint; its axis
+      goes horizontal with the bent forearm as the off-axis load (~2.9 Nm
+      of sweep signal, ≥ +199 mm torso clearance over the ±90° sweep).
+    - wrist_1: elbow bent + wrist_2 rotated 85° (~0.4 Nm, ≥ +60 mm).
+    - wrist_2: elbow bent (base clearance, as before) + wrist_1 at 90°,
+      restoring the load the elbow raise removed (~0.45 vs 0.23 Nm).
+
+    Ramp the returned targets with :func:`ramp_stages` — proximal group
+    first. Ramping everything at once from rest can rotate a wrist to its
+    hold while the elbow is still straight, which is exactly the geometry
+    that sweeps the gripper through the base.
     """
     notes: list[str] = []
     clearance = dict(probe_clearance_targets(joint, is_left))
@@ -141,13 +175,62 @@ def sweep_safety(
         )
     lo_cap: float | None = None
     hi_cap: float | None = None
+    elbow_lo, elbow_hi = arm_limits(Joint.ELBOW, is_left)
+    elbow_mid = (elbow_lo + elbow_hi) / 2.0
     if joint == Joint.SHOULDER_2:
         lo_cap, hi_cap = safe_limits(joint, is_left)
         notes.append(
             f"Capping {joint.value} sweep at 0° — outboard travel only, "
             "the base is inboard."
         )
+    elif joint == Joint.SHOULDER_3:
+        clearance[Joint.SHOULDER_1] = SHOULDER_1_LOAD
+        clearance[Joint.ELBOW] = elbow_mid
+        lo_cap, hi_cap = -LOADED_SWEEP_CAP, LOADED_SWEEP_CAP
+        notes.append(
+            "Raising shoulder_1 to 90° and bending the elbow so gravity "
+            "loads shoulder_3 (its axis is vertical at rest — zero gravity "
+            "moment there); sweep capped at ±90° to stay clear of the torso."
+        )
+    elif joint == Joint.WRIST_1:
+        clearance[Joint.ELBOW] = elbow_mid
+        clearance[Joint.WRIST_2] = WRIST_2_LOAD
+        lo_cap, hi_cap = -LOADED_SWEEP_CAP, LOADED_SWEEP_CAP
+        notes.append(
+            "Bending the elbow and rotating wrist_2 to 85° so gravity "
+            "loads wrist_1 (its axis is vertical at rest); sweep capped "
+            "at ±90°."
+        )
+    elif joint == Joint.WRIST_2:
+        clearance[Joint.WRIST_1] = WRIST_1_LOAD
+        notes.append(
+            "Rotating wrist_1 to 90° so gravity loads wrist_2 with the "
+            "elbow raised (the raise alone leaves it barely loaded)."
+        )
     return clearance, lo_cap, hi_cap, notes
+
+
+# Proximal group ramped first by ramp_stages. Shoulders and elbow reshape the
+# arm's gross geometry; the wrists only spin mass near the gripper, which is
+# safe *after* the elbow raise but not necessarily before it.
+_PROXIMAL_JOINTS = frozenset(
+    {Joint.SHOULDER_1, Joint.SHOULDER_2, Joint.SHOULDER_3, Joint.ELBOW}
+)
+
+
+def ramp_stages(targets: dict[Joint, float]) -> list[dict[Joint, float]]:
+    """Split hold targets into safely ordered ramp groups (proximal first).
+
+    Ramping every target simultaneously from rest can rotate wrist_2 toward
+    its hold while the elbow is still straight — the exact inboard geometry
+    that once swept the gripper into the base. Shoulders + elbow settle
+    first (their combined path from rest was verified clear against the
+    collision model), then the wrists rotate with the elbow already bent.
+    The reverse order is the existing distal-first homing.
+    """
+    proximal = {j: v for j, v in targets.items() if j in _PROXIMAL_JOINTS}
+    distal = {j: v for j, v in targets.items() if j not in _PROXIMAL_JOINTS}
+    return [stage for stage in (proximal, distal) if stage]
 
 
 def sine_center(joint: Joint, is_left: bool) -> float:

@@ -16,16 +16,24 @@ How: the same bidirectional constant-velocity sweep as ``tune.friction`` —
 averaging the forward and backward torque at the same position cancels
 friction exactly, leaving ``gravity(q) + Fo``. The residual against the
 current gravity model is then fit to a shift of this link's centre of mass
-(numeric least squares straight through the MuJoCo gravity model, so the
-correction generalizes to every arm pose, not just the sweep's). Mass stays
-at CAD: gravity torque only depends on the first moment m·c, so a CoM shift
-with fixed mass spans every identifiable error.
+(ridge-regularized least squares straight through the MuJoCo gravity model,
+so the correction generalizes to every arm pose, not just the sweep's).
+Mass stays at CAD: gravity torque only depends on the first moment m·c, so
+a CoM shift with fixed mass spans every identifiable error. The ridge pulls
+directions the sweep barely observes toward the current value — a
+single-joint sweep is a 1-D pose slice and can never see all three CoM
+components equally — and a shift beyond the plausibility cap is rejected
+as bad data.
+
+The sweep runs at a *loaded* pose: gravity has zero moment about a vertical
+axis, so joints that hang axis-vertical at rest (shoulder_3, wrist_1, and
+wrist_2 once the elbow is raised for base clearance) are swept with other
+joints posed to tilt/load them (see ``sweep_safety``). A sweep the model
+says is still unloaded is refused as unobservable rather than fit to noise.
 
 Run distal→proximal (wrist_3 → … → shoulder_1): a proximal joint's sweep
-carries every distal link, so distal CoMs should be corrected first. Joints
-whose sweep sees no gravity variation (axis parallel to gravity at the rest
-pose, e.g. shoulder_3/wrist_3 hanging) are reported as unobservable and left
-at CAD — they contribute nothing to gravity there either.
+carries every distal link, so distal CoMs must be corrected first — a bad
+or missing distal calibration lumps into the proximal fit.
 
 ``--save`` writes the fitted CoM to this robot's calibration file
 (``~/.almond/calibration.json``), where ``AxolConfig`` overlays it like
@@ -56,7 +64,7 @@ from ...robot.calibration import (
 )
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
-from ...tuning import joint_frame_motors, save_run, sweep_safety
+from ...tuning import joint_frame_motors, ramp_stages, save_run, sweep_safety
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
     _home_all,
@@ -69,19 +77,24 @@ from .friction import (
 # torque is exactly linear in the CoM, so any small step gives the exact
 # Jacobian up to float noise; 5 mm keeps the difference well above it.
 _FD_STEP = 0.005
-# Reject fits whose gravity-torque effect is implausibly large. The bound is
-# torque, not millimetres: a CoM shift only matters through m·g·δ, so the
-# same physical error needs a big shift on a light link and a small one on a
-# heavy link — and a proximal sweep fitted before its distal links lumps the
-# *whole chain's* error into this one link, legitimately needing tens of mm
-# on e.g. the 1.8 kg shoulder_1 body. Anything above this many Nm, though,
-# is a bad sweep (collision, dropped feedback), not a build difference.
-_MAX_CORRECTION_NM = 2.5
-# Floor in metres so heavy links still get room for genuinely small shifts.
-_MIN_SHIFT_BOUND = 0.030  # m
-# Below this much torque variation across the sweep the CoM is unobservable
-# (axis parallel to gravity at this pose) and the fit would chase noise.
-_MIN_SIGNAL = 0.05  # Nm std
+# Per-bin torque noise scale (Nm): MIT-feedback quantization plus the
+# residual imbalance the fwd/bwd average leaves. Sets both the ridge weight
+# and the observability gate below.
+_TAU_NOISE_NM = 0.05
+# Prior scale (m) on the CoM correction: genuine CAD-vs-build differences
+# (cables, end-effector variance) are centimetre-scale. The ridge weight
+# (_TAU_NOISE_NM / _COM_PRIOR_M)² keeps directions the sweep barely
+# observes at their current value instead of letting them absorb torque
+# noise with a huge lever arm — a single-joint sweep is a 1-D slice of pose
+# space and always leaves one CoM direction weakly measured or exactly
+# invisible (the unconstrained fit once moved a forearm CoM 240 mm on
+# 0.06 Nm of on-sweep improvement, wrecking the model everywhere else).
+_COM_PRIOR_M = 0.020
+# Hard cap on the fitted shift (m). With the loaded sweep poses and the
+# distal→proximal ordering, a genuine correction never needs more than
+# this; beyond it the sweep data is suspect (collision, something touching
+# the arm, distal links not yet calibrated).
+_MAX_SHIFT_M = 0.060
 _DEFAULT_VELOCITY_DEG = 18.0
 
 
@@ -125,15 +138,23 @@ def fit_com(
     """Fit this link's CoM (and a constant offset) to the measured torques.
 
     Returns ``(com_fit, offset, tau_model_before, tau_model_after)``, or
-    ``None`` when the sweep carries no gravity signal. The offset is the
-    friction ``Fo`` re-estimated against the corrected model.
+    ``None`` when the sweep cannot observe this link's CoM. The offset is
+    the friction ``Fo`` re-estimated against the corrected model.
 
     The design matrix is built by central differences of the full MuJoCo
     gravity model around the current (calibrated) CoM — torque is linear in
-    the CoM, so this is exact. ``lstsq`` with an rcond cut drops directions
-    the sweep cannot see (e.g. the component parallel to the joint axis)
-    instead of letting them blow up; the minimum-norm solution leaves them
-    unchanged.
+    the CoM, so this is exact. Observability is judged from the *model*,
+    not the measurement: gravity has zero moment about a vertical axis no
+    matter where the mass sits, so when every sensitivity column is ~zero
+    (the joint is unloaded at this pose) any measured torque variation is
+    noise by construction and the fit refuses rather than chase it.
+
+    The solve is ridge-regularized toward the current CoM — a Gaussian
+    prior of scale ``_COM_PRIOR_M`` on the shift, given ``_TAU_NOISE_NM``
+    of per-bin noise — so directions the sweep barely observes stay put
+    instead of soaking up sensor junk with a giant lever arm. The constant
+    (Fo) column is never penalized. A fit still beyond ``_MAX_SHIFT_M``
+    raises: with the loaded sweep poses that is bad data, not build spread.
     """
     cfg = AxolConfig()
     jc = getattr(cfg.left if is_left else cfg.right, joint.value)
@@ -141,11 +162,6 @@ def fit_com(
 
     tau_before = _model_torques(cfg, joint, is_left, q_bins, other_targets)
     residual = tau_meas - tau_before
-    if (
-        float(np.std(tau_meas)) < _MIN_SIGNAL
-        and float(np.std(tau_before)) < _MIN_SIGNAL
-    ):
-        return None
 
     # Columns: dτ/d(com_x,y,z) at every bin, plus a constant (→ Fo).
     cols = []
@@ -167,26 +183,34 @@ def fit_com(
             other_targets,
         )
         cols.append((hi - lo) / (2 * _FD_STEP))
+
+    # Observability gate: the smallest CoM shift that would rise above one
+    # sigma of torque noise anywhere in the sweep. If even a cap-sized
+    # shift could not, the pose leaves this CoM invisible.
+    max_sens = max(float(np.linalg.norm(c)) for c in cols)
+    if max_sens == 0.0 or _TAU_NOISE_NM / max_sens > _MAX_SHIFT_M:
+        return None
+
     cols.append(np.ones(len(q_bins)))
     design = np.column_stack(cols)
 
-    # Normalize columns so the rcond cut compares physical observability,
-    # not units (Nm/m columns dwarf the dimensionless constant column).
-    norms = np.linalg.norm(design, axis=0)
-    norms[norms == 0] = 1.0
-    solution, *_ = np.linalg.lstsq(design / norms, residual, rcond=1e-3)
-    solution /= norms
+    # Ridge solve: (AᵀA + λI₃)x = Aᵀr with λ = (noise/prior)², identity on
+    # the CoM block only. Exactly-unobservable directions (zero columns)
+    # come out as exactly zero shift; weak ones shrink toward the prior.
+    lam = (_TAU_NOISE_NM / _COM_PRIOR_M) ** 2
+    reg = np.zeros((4, 4))
+    reg[:3, :3] = lam * np.eye(3)
+    solution = np.linalg.solve(design.T @ design + reg, design.T @ residual)
 
     delta = solution[:3]
     shift = float(np.linalg.norm(delta))
-    bound = max(_MIN_SHIFT_BOUND, _MAX_CORRECTION_NM / (jc.mass * 9.81))
-    if shift > bound:
+    if shift > _MAX_SHIFT_M:
         raise RuntimeError(
-            f"fitted CoM shift {shift * 1000:.0f} mm on a {jc.mass:g} kg link "
-            f"is {shift * jc.mass * 9.81:.1f} Nm of gravity correction — "
-            f"beyond the {_MAX_CORRECTION_NM:g} Nm plausibility bound. The "
-            "sweep data is suspect (collision, dropped feedback, wrong "
-            "joint held); not applying it"
+            f"fitted CoM shift {shift * 1000:.0f} mm exceeds the "
+            f"{_MAX_SHIFT_M * 1000:.0f} mm plausibility cap. The sweep data "
+            "is suspect (collision, something touching the arm, dropped "
+            "feedback, or distal links not yet calibrated — run distal → "
+            "proximal); not applying it"
         )
     com_fit = tuple(float(v) for v in com0 + delta)
     offset = float(solution[3])
@@ -331,15 +355,17 @@ async def _run(args: argparse.Namespace) -> None:
             await _home_all(motors)
 
             # Shared sweep-safety geometry (see sweep_safety): base-collision
-            # caps for shoulder_2/wrist_2, elbow raised for wrist_2, and
-            # shoulder_2 held outboard for the camera-adjacent joints. The
-            # clearance targets also feed the gravity-model predictions, so
-            # the fit is computed at the pose the sweep actually ran at.
+            # caps, camera clearance, and the gravity-load poses that tilt
+            # axis-vertical joints so their sweep actually carries a CoM
+            # signal. The clearance targets also feed the gravity-model
+            # predictions, so the fit is computed at the pose the sweep
+            # actually ran at. Staged ramps: proximal joints settle before
+            # the wrists rotate to their holds.
             other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
             for note in notes:
                 print(f"  {note}")
-            if other_targets:
-                await _ramp_verified(motors, other_targets)
+            for stage in ramp_stages(other_targets):
+                await _ramp_verified(motors, stage)
 
             await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
             await asyncio.sleep(1.0)
@@ -367,7 +393,11 @@ async def _run(args: argparse.Namespace) -> None:
             order = np.argsort(q_bins)
             q_bins, tau_meas = q_bins[order], tau_meas[order]
 
-            fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+            try:
+                fit = fit_com(q_bins, tau_meas, joint, is_left, other_targets)
+            except RuntimeError as exc:
+                print(f"\n  ! Gravity fit rejected: {exc}")
+                return
             _report_and_save(
                 args, joint, side_str, jc, q_bins, tau_meas, fit, other_targets
             )
@@ -405,11 +435,12 @@ def _report_and_save(
     print(f"\n{'─' * 50}")
     if fit is None:
         print(
-            f"  No gravity signal on {joint.value} at this pose (torque "
-            f"varies < {_MIN_SIGNAL} Nm across the sweep) — the joint axis "
-            "is parallel to gravity here, so its CoM is unobservable and "
-            "also irrelevant to gravity feedforward at this pose. CAD value "
-            "kept."
+            f"  No gravity observability on {joint.value} at this pose — "
+            "the joint axis is (near-)parallel to gravity here, which "
+            "produces zero gravity moment for *any* mass placement, so the "
+            "sweep cannot see the CoM and any measured torque variation is "
+            "noise. Current value kept. (The loaded sweep poses should "
+            "prevent this; check the clearance ramps completed.)"
         )
         return
 

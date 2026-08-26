@@ -48,7 +48,12 @@ from ...robot.calibration_cloud import (
     supabase_credentials,
 )
 from ...robot.config import AxolConfig
-from ...tuning import JointFrameMotor, joint_frame_motors, sweep_safety
+from ...tuning import (
+    JointFrameMotor,
+    joint_frame_motors,
+    ramp_stages,
+    sweep_safety,
+)
 from ..can.setup import hub_serial
 from .friction import (
     DEFAULT_VELOCITIES_DEG,
@@ -146,15 +151,16 @@ async def _calibrate_joint(
     print(f"  {side_str} {joint.value}  (Kp={kp:g}  Kd={kd:g})")
     print(f"{'=' * 60}")
 
-    # Shared sweep-safety geometry: base-collision caps for shoulder_2 /
-    # wrist_2, elbow raised for wrist_2, shoulder_2 held outboard for the
-    # camera-adjacent joints. The clearance pose also feeds the gravity
-    # model so the fit matches the pose the sweep ran at.
+    # Shared sweep-safety geometry: base-collision caps, camera clearance,
+    # and gravity-load poses (joints whose axis hangs vertical are posed so
+    # gravity actually loads them). The clearance pose also feeds the
+    # gravity model so the fit matches the pose the sweep ran at. Staged
+    # ramps: proximal joints settle before the wrists rotate to their holds.
     other_targets, lo_default, hi_default, notes = sweep_safety(joint, is_left)
     for note in notes:
         print(f"  {note}")
-    if other_targets:
-        await _ramp_verified(motors, other_targets)
+    for stage in ramp_stages(other_targets):
+        await _ramp_verified(motors, stage)
 
     await motors[joint].set_control_mode(ControlMode.IMPEDANCE)
     await asyncio.sleep(1.0)
