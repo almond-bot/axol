@@ -20,7 +20,7 @@ replay the identical motion.
 Examples:
     axol teleop --teleop.record rec1        # record via teleop, or ...
     axol gravity-comp --record rec1         # ... by hand-guiding the arms
-    axol motion.build --name reach-and-place       # newest recording
+    axol motion.build                       # newest recording, named after it
     axol motion.build rec1 --name reach-slow --time-scale 2.0
     axol motion.list
 """
@@ -52,9 +52,10 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
     )
     b.add_argument(
         "--name",
-        required=True,
+        default=None,
         help="Motion name; the file is written to the package's committed "
-        "motions directory as <name>.npz (use --out for another location)",
+        "motions directory as <name>.npz (use --out for another location). "
+        "Defaults to the recording's name.",
     )
     b.add_argument(
         "--out",
@@ -123,10 +124,13 @@ def run_build(args: argparse.Namespace) -> None:
     from ..tuning.motion import build_motion, save_motion
 
     prefix = _resolve_prefix(args.prefix)
-    print(f"Building reference motion {args.name!r} from {prefix} ...")
+    # The motion inherits the recording's name unless --name says otherwise,
+    # so record -> build needs no naming step at all.
+    name = args.name or Path(prefix).name
+    print(f"Building reference motion {name!r} from {prefix} ...")
     motion, raw = build_motion(
         prefix,
-        args.name,
+        name,
         rate=args.rate,
         smooth_cutoff_hz=args.cutoff,
         time_scale=args.time_scale,

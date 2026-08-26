@@ -15,7 +15,7 @@ Either way, the stream is resampled onto a uniform grid, zero-phase low-pass smo
 | Flag | Description |
 |---|---|
 | `prefix` | Flight-recorder prefix from `axol teleop --teleop.record PREFIX` (reads `<prefix>_cmd.npz`, and `<prefix>_ik.npz` for the engaged-span clip) or `axol gravity-comp --record PREFIX` (reads `<prefix>_gc.npz`). A bare name (no `/`) resolves in the recordings directory `~/.almond/recordings/` — where bare recording names are written. **Optional**: omitted, the newest recording in that directory is used |
-| `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz` (required) |
+| `--name NAME` | Motion name; written to the package's committed motions directory as `<name>.npz`. **Optional**: defaults to the recording's name |
 | `--out PATH` | Write to an explicit path instead of the committed directory |
 | `--rate HZ` | Uniform playback rate (default: 240 — the production control rate; `tune.motion` replays at the motion's stored rate) |
 | `--cutoff HZ` | Zero-phase low-pass cutoff (default: 6.0 — keeps deliberate motion, drops hand tremor and network jitter) |
@@ -26,7 +26,7 @@ Either way, the stream is resampled onto a uniform grid, zero-phase low-pass smo
 ```bash
 axol teleop --teleop.record rec1          # record via teleop, or ...
 axol gravity-comp --record rec1           # ... by hand-guiding the arms
-axol motion.build --name reach-and-place         # newest recording
+axol motion.build                                # newest recording, named after it
 axol motion.build rec1 --name reach-slow --time-scale 2.0
 axol motion.list                                 # what's committed
 ```

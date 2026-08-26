@@ -24,7 +24,7 @@ axol gravity-comp --right_channel null            # left arm only, all joints fr
 axol gravity-comp --kd 1.0                        # heavier damping
 axol gravity-comp --free_joints [WRIST_3]         # only WRIST_3 free; everything else held rigid
 axol gravity-comp --right_channel null --free_joints [SHOULDER_1,WRIST_3]   # one-arm, two-joint isolation
-axol gravity-comp --record demo1                  # hand-guide a motion, then: axol motion.build --name demo1
+axol gravity-comp --record demo1                  # hand-guide a motion, then: axol motion.build
 ```
 
 Use `--free_joints` to test gravity comp on a single joint at a time: only the named joints float freely, while the rest of the arm holds its pose so you can isolate the effect.

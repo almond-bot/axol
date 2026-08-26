@@ -423,7 +423,15 @@ const TABS: WbTab[] = [
       "build from the most recent one.",
     presets: {},
     fields: [
-      { key: "name", label: "motion name", type: "text", placeholder: "reach_and_place" },
+      {
+        key: "name",
+        label: "motion name",
+        type: "text",
+        placeholder: "same as recording",
+        hint:
+          "what the motion is saved (and picked under Recorded motion) as — " +
+          "empty names it after the recording",
+      },
       {
         key: "prefix",
         label: "recording",
@@ -461,7 +469,7 @@ const TABS: WbTab[] = [
       },
       { key: "notes", label: "notes", type: "text", placeholder: "provenance", width: "w-40" },
     ],
-    required: ["name"],
+    required: [],
     drivesMotors: false,
   },
   {
