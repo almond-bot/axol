@@ -23,7 +23,8 @@ The browser UIs live under `web/` (a Vite + React monorepo: the WebXR `/vr` tele
 
 ### Testing
 
-- No automated test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
+- No automated Python test suite exists in this repository. Validate changes by importing the package and exercising the `Sim`-based code paths.
+- The Rust realtime core (`rust/axol-rt`, the `axol teleop --rt` backend) has a `cargo test` suite: golden filter vectors pinned to the Python originals, wire-protocol round trips, and a damping dissipated-power comparison. `uv run python rust/axol-rt/tools/rt_proto_check.py` exercises the built binary's Unix-socket protocol without CAN. `cargo test stall_detection_live -- --ignored` needs the CAN interfaces up with motors unpowered.
 
 ### Dependency extras
 
