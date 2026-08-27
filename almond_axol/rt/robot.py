@@ -20,11 +20,19 @@ CAN buses are owned by the ``axol-rt`` subprocess:
   enable/calibrate or attach/restore flow — it needs the quiet bus), then
   driven by the core: ``motion_control``'s slot-7 tuple carries its
   POSITION_FORCE command (motor-frame target, speed limit, torque limit).
+- Host damping runs *in the core*: ``motion_control`` ships the
+  pose-scheduled coefficients (effective kd_host, band-pass centre, q) with
+  every target and the core applies band-passed velocity damping each
+  240 Hz tick against same-tick feedback. Computing the torque in Python
+  put it ~14 ms behind the motion — past 90° of loop phase in the shoulder
+  burst band, where a damper pumps instead of damps (the rt-teleop shaking
+  of 2026-08-27; see rust/axol-rt/src/filter.rs).
 
-The guarded-return extras (``torque_residuals`` / ``gravity_compensate`` /
-``reset_command_state``) are deliberately not exposed: those paths send CAN
-directly, so in rt mode resets play through the plain ``motion_control``
-path, exactly as they do against ``Sim``.
+Guarded return works exactly as in classic mode: ``torque_residuals`` and
+``reset_command_state`` only touch the passively filled caches and local
+state, and ``gravity_compensate`` streams its tuples through the same
+command sink, so the contact watchdog, the limp contact hold, and the
+replanned reset all run against the core.
 """
 
 from __future__ import annotations
@@ -142,11 +150,13 @@ class RtAxol:
         await self._link.arm()
         await self._wait_for_caches()
         # Prime one full hold target at the measured pose: the core's own
-        # bring-up hold has no gravity feedforward (t_ff = 0), so a
-        # gravity-loaded joint would sag by ~gravity/kp until the caller's
-        # first command — which for teleop is minutes away (JAX compile) —
-        # and then clunk back up. One motion_control at the measured pose
-        # ships the full gravity/friction terms; the watchdog then holds it.
+        # bring-up hold has no gravity feedforward (t_ff = 0) and no damping
+        # coefficients, so a gravity-loaded joint would sag by ~gravity/kp —
+        # and ring on firmware kd alone if disturbed — until the caller's
+        # first command, which for teleop is minutes away (JAX compile).
+        # One motion_control at the measured pose ships the gravity/friction
+        # terms plus the pose-scheduled damping coefficients; the watchdog
+        # then holds it, damping included.
         pos_l, pos_r = await self.get_positions()
         await self.motion_control(left=pos_l, right=pos_r)
         _logger.info(
@@ -194,7 +204,9 @@ class RtAxol:
             await asyncio.sleep(0.02)
 
     def _make_sink(self, side: int):
-        def sink(cmds: list[tuple[float, float, float, float, float]]) -> None:
+        def sink(
+            cmds: list[tuple[float, float, float, float, float, float, float, float]],
+        ) -> None:
             self._seq += 1
             self._link.send_target(side, self._seq, cmds)
 
@@ -211,6 +223,37 @@ class RtAxol:
             tasks.append(self._robot.right.motion_control(right))
         if tasks:
             await asyncio.gather(*tasks)
+
+    async def gravity_compensate(
+        self,
+        kd: float = 0.5,
+        free_joints: set[Joint] | None = None,
+        gripper_targets: tuple[float | None, float | None] | None = None,
+    ) -> None:
+        """One gravity-comp cycle, streamed through the core's command sink.
+
+        Backs the guarded-return contact hold (limp arms, gravity held by
+        feedforward). With the sinks installed, ``AxolArm.gravity_compensate``
+        ships its tuples to the core instead of the bus — Python never
+        touches the wire. Same signature as :meth:`Axol.gravity_compensate`.
+        """
+        await self._robot.gravity_compensate(kd, free_joints, gripper_targets)
+
+    def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """Per-arm measured-minus-gravity torques from the passive caches.
+
+        The core's own MIT stream refreshes measured torque every tick, so
+        this needs no CAN traffic — same contract as ``Axol``.
+        """
+        return self._robot.torque_residuals()
+
+    def reset_command_state(self) -> None:
+        """Clear command history on both arms (pure Python state)."""
+        self._robot.reset_command_state()
+
+    def reset_gravity_hold(self) -> None:
+        """Re-snapshot the gravity-comp hold setpoint (pure Python state)."""
+        self._robot.reset_gravity_hold()
 
     async def get_positions(
         self,

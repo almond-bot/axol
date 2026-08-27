@@ -17,6 +17,7 @@
 mod bench;
 mod bringup;
 mod can;
+mod filter;
 mod hold;
 mod proto;
 mod scan;

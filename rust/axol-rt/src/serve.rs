@@ -1,13 +1,29 @@
 //! The realtime core: own the CAN buses and run the control loop, driven by
 //! impedance targets streamed from Python over a Unix socket.
 //!
-//! Python keeps everything smart — VR, IK, MuJoCo gravity/inertia, host
-//! damping, friction feedforward (all of `AxolArm.motion_control`) — and
-//! ships the *final* per-joint MIT tuples `(p_des, v_des, kp, kd, t_ff)` at
-//! its own rate (~120 Hz). This loop owns the wire: it paces a hard
-//! `loop_hz` tick, linearly interpolates `p_des`/`t_ff` between successive
-//! targets (one sender period of added latency, in exchange for no steps on
-//! the bus), and holds the last played position when targets stop arriving.
+//! Python keeps the slow model math — VR, IK, MuJoCo gravity/inertia,
+//! friction feedforward, damper *scheduling* (all of
+//! `AxolArm.motion_control`) — and ships per-joint tuples at its own rate
+//! (~120 Hz). This loop owns the wire and the *fast* physics: it paces a
+//! hard `loop_hz` tick, linearly interpolates `p_des`/`t_ff` between
+//! successive targets (one sender period of added latency, in exchange for
+//! no steps on the bus), computes the host-damping torque **in-core** each
+//! tick — band-passed velocity damping from same-tick feedback, using the
+//! pose-scheduled coefficients streamed with each target — and holds the
+//! last played position when targets stop arriving.
+//!
+//! Damping lives here, not in Python, because damping is a phase race: the
+//! remote chain (Python's 120 Hz sample → socket → adoption wait → a
+//! stretched interpolation segment) added ~14 ms between measuring a
+//! velocity and the counter-torque reaching the wire. On top of the loop's
+//! intrinsic lags that pushed the shoulder burst band (4-9 Hz) past 90° —
+//! where a damper stops damping and *pumps* the mode. That was measured on
+//! hardware as violent shaking in rt teleop (2026-08-27; see the
+//! dissipated-power test in `filter.rs`). In-core the torque applies within
+//! one 240 Hz tick of the feedback it acts on. It also keeps damping active
+//! through every core-owned hold (watchdog starvation, orphaned client) —
+//! frozen-`t_ff` holds used to leave the shoulders with firmware kd only,
+//! which is a 62%-overshoot ring at their tuned kp.
 //!
 //! ## Protocol (length-prefixed messages: u32 LE size, then payload)
 //!
@@ -23,10 +39,16 @@
 //! - `A`               arm: bring-up, enable, hold current pose (the
 //!                     gripper must already be enabled + calibrated in
 //!                     POSITION_FORCE mode by the Python side)
-//! - `T` + binary      target: side u8, seq u32 LE, 8 x 5 f64 LE — slots
-//!                     0-6 are arm-joint MIT tuples (p_des, v_des, kp, kd,
-//!                     t_ff); slot 7 is the gripper (p_des motor-frame,
-//!                     max_speed rad/s, max_torque Nm, 0, 0)
+//! - `T` + binary      target: side u8, seq u32 LE, 8 x 8 f64 LE — slots
+//!                     0-6 are arm-joint tuples (p_des, v_des, kp, kd,
+//!                     t_ff, kd_host, damp_w0, damp_q) where t_ff carries
+//!                     the *model* feedforward (gravity + friction +
+//!                     inertia, no damping) and the last three are the
+//!                     pose-scheduled damping coefficients (effective
+//!                     kd_host in Nm·s/rad, band-pass centre rad/s, and
+//!                     quality factor); slot 7 is the gripper (p_des
+//!                     motor-frame, max_speed rad/s, max_torque Nm, then
+//!                     five zeros)
 //! - `D`               disarm: disable motors, threads exit
 //!
 //! Rust -> Python (text): `S` + state/fault message, `L` + log line.
@@ -56,8 +78,14 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
+use crate::filter::{BandPass, LpDiff};
 use crate::hold::sleep_until;
 use crate::proto;
+
+/// Pole (rad/s) of the damping chain's differentiators — `VEL_CUTOFF_FREQ`
+/// in `almond_axol.robot.control`: well above the shoulder resonance so the
+/// damping arrives in phase; the band-pass supplies the high-side rolloff.
+const VEL_CUTOFF: f64 = 80.0;
 
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
@@ -75,7 +103,14 @@ pub struct JointCmd {
     pub v_des: f64,
     pub kp: f64,
     pub kd: f64,
+    /// Model feedforward only (gravity + friction + inertia) — the damping
+    /// torque is computed in-core each tick and added on top.
     pub t_ff: f64,
+    /// Effective (pose-scheduled) host damping gain, Nm·s/rad.
+    pub kd_host: f64,
+    /// Damping band-pass centre (rad/s) and quality factor.
+    pub damp_w0: f64,
+    pub damp_q: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -182,8 +217,8 @@ fn parse_config(text: &str) -> io::Result<Config> {
 }
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
-    // side u8, seq u32, 7 x 5 f64
-    let expected = 1 + 4 + N_SLOTS * 5 * 8;
+    // side u8, seq u32, 8 slots x 8 f64
+    let expected = 1 + 4 + N_SLOTS * 8 * 8;
     if payload.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -195,7 +230,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     let mut cmds = [JointCmd::default(); N_SLOTS];
     let mut off = 5;
     for cmd in &mut cmds {
-        let mut vals = [0.0f64; 5];
+        let mut vals = [0.0f64; 8];
         for v in &mut vals {
             *v = f64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
             off += 8;
@@ -206,6 +241,9 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
             kp: vals[2],
             kd: vals[3],
             t_ff: vals[4],
+            kd_host: vals[5],
+            damp_w0: vals[6],
+            damp_q: vals[7],
         };
     }
     Ok((
@@ -216,6 +254,54 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
             arrival: Instant::now(),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
+    /// 8 slots x 8 f64 LE.
+    #[test]
+    fn parse_target_roundtrip() {
+        let mut payload = vec![1u8];
+        payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        for slot in 0..N_SLOTS {
+            for field in 0..8 {
+                let v = slot as f64 * 10.0 + field as f64;
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let (side, t) = parse_target(&payload).unwrap();
+        assert_eq!(side, 1);
+        assert_eq!(t.seq, 0xDEADBEEF);
+        let c = &t.cmds[2];
+        assert_eq!(
+            (c.p_des, c.v_des, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q),
+            (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0)
+        );
+        // Wrong size (the old 5-field layout) must be rejected, not
+        // misparsed — a version-skewed client fails loudly.
+        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 5 * 8]).is_err());
+    }
+
+    #[test]
+    fn parse_config_assigns_slots() {
+        let cfg = parse_config(
+            "loop_hz 240\n\
+             joint 0 canL shoulder_1 1 250 3.5\n\
+             joint 0 canL shoulder_2 2 250 3.5\n\
+             gripper 0 canL 8\n\
+             joint 0 canL shoulder_3 3 180 2.0\n",
+        )
+        .unwrap();
+        let specs = &cfg.buses[0].2;
+        assert_eq!(
+            specs.iter().map(|s| s.slot).collect::<Vec<_>>(),
+            vec![0, 1, GRIPPER_SLOT, 2]
+        );
+        assert!(specs[2].gripper);
+    }
 }
 
 fn read_msg(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
@@ -279,11 +365,22 @@ pub fn run(socket_path: &str) -> io::Result<()> {
     let fault = Arc::new(AtomicU8::new(0));
     let mut bus_threads: Vec<std::thread::JoinHandle<io::Result<()>>> = Vec::new();
 
+    // Errors below `break` out (never early-return): the cleanup after the
+    // loop must always run so the bus threads stop and disable the motors —
+    // an early `?` here would leave them energized with no owner.
+    let mut loop_err: Option<io::Error> = None;
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             break;
         }
-        let Some(payload) = read_msg(&mut stream)? else {
+        let payload = match read_msg(&mut stream) {
+            Ok(p) => p,
+            Err(err) => {
+                loop_err = Some(err);
+                break;
+            }
+        };
+        let Some(payload) = payload else {
             if bus_threads.is_empty() {
                 // Clean exit: disarmed (or never armed) before disconnecting.
                 println!("axol-rt serve: client disconnected");
@@ -308,10 +405,19 @@ pub fn run(socket_path: &str) -> io::Result<()> {
         let (tag, body) = (payload[0], &payload[1..]);
         match tag {
             b'C' => {
-                let text = std::str::from_utf8(body)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                config = Some(Arc::new(parse_config(text)?));
-                send_text(&out_tx, b'S', "config-ok");
+                let parsed = std::str::from_utf8(body)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+                    .and_then(parse_config);
+                match parsed {
+                    Ok(cfg) => {
+                        config = Some(Arc::new(cfg));
+                        send_text(&out_tx, b'S', "config-ok");
+                    }
+                    Err(err) => {
+                        loop_err = Some(err);
+                        break;
+                    }
+                }
             }
             b'P' => {
                 let Some(cfg) = &config else {
@@ -320,8 +426,9 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 };
                 let mut ok = true;
                 for (_, iface, specs) in &cfg.buses {
-                    let sock = CanSock::open(iface)?;
-                    if let Err(err) = bringup::prep(&sock, specs) {
+                    let step = CanSock::open(iface)
+                        .and_then(|sock| bringup::prep(&sock, specs));
+                    if let Err(err) = step {
                         send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
                         ok = false;
                         break;
@@ -376,12 +483,17 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     send_text(&out_tx, b'S', "armed");
                 }
             }
-            b'T' => {
-                let (side, target) = parse_target(body)?;
-                if side <= 1 {
-                    targets[side as usize].lock().unwrap().target = Some(target);
+            b'T' => match parse_target(body) {
+                Ok((side, target)) => {
+                    if side <= 1 {
+                        targets[side as usize].lock().unwrap().target = Some(target);
+                    }
                 }
-            }
+                Err(err) => {
+                    loop_err = Some(err);
+                    break;
+                }
+            },
             b'D' => {
                 stop.store(true, Ordering::SeqCst);
                 for handle in bus_threads.drain(..) {
@@ -397,7 +509,8 @@ pub fn run(socket_path: &str) -> io::Result<()> {
         }
     }
 
-    // Signal or peer loss: stop and disable everything before exit.
+    // Signal, peer loss, or protocol error: stop and disable everything
+    // before exit.
     stop.store(true, Ordering::SeqCst);
     for handle in bus_threads {
         let _ = handle.join();
@@ -405,7 +518,10 @@ pub fn run(socket_path: &str) -> io::Result<()> {
     drop(out_tx);
     let _ = writer.join();
     let _ = std::fs::remove_file(socket_path);
-    Ok(())
+    match loop_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// One bus: bring-up, hold, then play streamed targets at `loop_hz`.
@@ -444,7 +560,11 @@ fn bus_loop(
 
     // Play state, indexed by target slot: start by holding the measured
     // pose with config gains. The gripper slot's hold values are never sent
-    // (it isn't commanded until the first target arrives).
+    // (it isn't commanded until the first target arrives). kd_host starts
+    // at 0 — matching classic mode, where enable() holds on firmware gains
+    // until the first motion_control; the first streamed target brings the
+    // pose-scheduled coefficients, and from then on damping stays live
+    // through every hold (watchdog, orphaned client).
     let mut play: [JointCmd; N_SLOTS] = [JointCmd::default(); N_SLOTS];
     for m in &motors {
         play[m.slot] = JointCmd {
@@ -453,8 +573,32 @@ fn bus_loop(
             kp: m.kp,
             kd: m.kd,
             t_ff: 0.0,
+            kd_host: 0.0,
+            damp_w0: 20.0,
+            damp_q: 0.8,
         };
     }
+    // In-core host damping, per slot: v_des from the played target, v_meas
+    // from this loop's own feedback frames (fresh within one tick), band-
+    // passed at the streamed centre. See the module docstring for why this
+    // must live here and not in Python.
+    struct Damp {
+        v_des: LpDiff,
+        v_meas: LpDiff,
+        bp: BandPass,
+        vel_meas: f64,
+        last_fb: Option<Instant>,
+    }
+    let mut damp: Vec<Damp> = (0..N_SLOTS)
+        .map(|_| Damp {
+            v_des: LpDiff::new(VEL_CUTOFF),
+            v_meas: LpDiff::new(VEL_CUTOFF),
+            bp: BandPass::new(),
+            vel_meas: 0.0,
+            last_fb: None,
+        })
+        .collect();
+    let mut prev_tick: Option<Instant> = None;
     // Interpolation segment: from -> the pending target over `dur`.
     let mut seg_from: [JointCmd; N_SLOTS] = play;
     let mut seg_target: Option<Target> = None;
@@ -561,9 +705,17 @@ fn bus_loop(
                         v_des: to.v_des,
                         kp: to.kp,
                         kd: to.kd,
+                        kd_host: to.kd_host,
+                        damp_w0: to.damp_w0,
+                        damp_q: to.damp_q,
                     };
                 }
             }
+
+            // Tick spacing for the damping chain (measured, not nominal —
+            // a late tick then damps over the interval it actually covers).
+            let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
+            prev_tick = Some(began);
 
             // Send all commands back-to-back.
             let mut sent = 0usize;
@@ -581,8 +733,14 @@ fn bus_loop(
                         proto::dm_pos_force_encode(c.p_des, c.v_des, c.kp / m.ranges.t_max);
                     sock.send(proto::DM_POS_FORCE_ARB_BASE + m.id as u16, &frame)?;
                 } else {
-                    let frame =
-                        proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, c.t_ff, &m.ranges);
+                    // In-core host damping: band-passed (v_des − v_meas)
+                    // scaled by the streamed pose-scheduled gain, applied
+                    // the same tick the feedback it acts on arrived.
+                    let d = &mut damp[m.slot];
+                    let v_des = d.v_des.update(c.p_des, tick_dt);
+                    let v_damp = d.bp.update(v_des - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
+                    let t_ff = c.t_ff + c.kd_host * v_damp;
+                    let frame = proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, t_ff, &m.ranges);
                     match m.vendor {
                         Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.id as u16, &frame)?,
                         Vendor::Damiao => sock.send(m.id as u16, &frame)?,
@@ -635,6 +793,16 @@ fn bus_loop(
                 // object (or a jaw span the target overshoots) is normal.
                 if motors[idx].gripper {
                     continue;
+                }
+                // Feed the damping chain's measured velocity from the
+                // frame's own receive spacing (the CAN reply cadence is the
+                // loop cadence; arrival jitter within a tick is µs-scale).
+                {
+                    let now = Instant::now();
+                    let d = &mut damp[motors[idx].slot];
+                    let dt = d.last_fb.map_or(0.0, |p| now.duration_since(p).as_secs_f64());
+                    d.last_fb = Some(now);
+                    d.vel_meas = d.v_meas.update(pos, dt);
                 }
                 let e = (pos - play[motors[idx].slot].p_des).abs();
                 if e > abort_rad {

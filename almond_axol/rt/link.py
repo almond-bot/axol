@@ -151,12 +151,17 @@ class RtLink:
         await self._await_state("disarmed", 5.0)
 
     def send_target(
-        self, side: int, seq: int, cmds: list[tuple[float, float, float, float, float]]
+        self,
+        side: int,
+        seq: int,
+        cmds: list[tuple[float, float, float, float, float, float, float, float]],
     ) -> None:
-        """Ship one arm's 7 MIT tuples (p_des, v_des, kp, kd, t_ff). Sync —
-        safe to call from the event loop; the write is buffered."""
+        """Ship one arm's 8 slot tuples (p_des, v_des, kp, kd, model t_ff,
+        kd_host, damp_w0, damp_q; the gripper slot repurposes the first
+        three as target/speed/torque). Sync — safe to call from the event
+        loop; the write is buffered."""
         payload = struct.pack("<cBI", b"T", side, seq & 0xFFFFFFFF) + b"".join(
-            struct.pack("<5d", *cmd) for cmd in cmds
+            struct.pack("<8d", *cmd) for cmd in cmds
         )
         self._send(payload)
 

@@ -47,27 +47,45 @@ full round-robin at ~430 Hz. 240 Hz leaves ~45% bus headroom.
 
 ## The hybrid split (as built)
 
-Python keeps **all** of the control math: `AxolArm.motion_control` runs
-unchanged — gravity + reflected inertia (MuJoCo), pose-scheduled host
-damping, friction feedforward, joint limits, the max-step gate. In rt mode
-a command sink hands its fully computed per-joint MIT tuples
-`(p_des, v_des, kp, kd, t_ff)` to `almond_axol.rt.RtAxol`, which ships
-them to this core (~120 Hz) instead of sending CAN from Python.
+Python keeps the **slow model math**: `AxolArm.motion_control` still runs
+gravity + reflected inertia (MuJoCo), friction feedforward, joint limits,
+the max-step gate, and the *scheduling* of host damping (pose-scaled gain,
+pose-tracked band-pass centre). In rt mode a command sink hands per-joint
+8-float tuples `(p_des, v_des, kp, kd, t_ff, kd_host, damp_w0, damp_q)` to
+`almond_axol.rt.RtAxol`, which ships them to this core (~120 Hz) instead
+of sending CAN from Python. `t_ff` is the model feedforward only.
 
-The core owns the wire:
+The core owns the wire and the **fast physics**:
 
 - Hard 240 Hz pacing (spin-assisted `sleep_until`, zero-late in practice).
+- **In-core host damping**: band-passed `(v_des − v_meas)` scaled by the
+  streamed pose-scheduled gain, computed every tick from same-tick
+  feedback. The filter chain (`src/filter.rs`) is ported from
+  `almond_axol.robot.control` and golden-tested against it. Damping is a
+  phase race — computing the torque in Python put it ~14 ms behind the
+  velocity it acts on (120 Hz sample + socket + interpolation segment),
+  which pushed the shoulder burst band (4-9 Hz) past 90° of loop phase,
+  where a damper *pumps* the mode: that was the violent rt-teleop shaking
+  of 2026-08-27. In-core, the torque lands within one tick, and damping
+  stays live through every core-owned hold (watchdog, orphaned client) —
+  frozen-`t_ff` holds used to leave the shoulders ringing on firmware kd
+  alone. `cargo test` includes a dissipated-power comparison of the two
+  chains.
 - Linear interpolation of `p_des` / `t_ff` between successive targets over
   one estimated sender period — no steps on the bus when Python's rate
   wobbles (this costs one sender period, ~8 ms, of added latency).
 - Watchdog: targets stop arriving → the in-flight segment completes and
-  the arms hold there (matching what the firmware itself does if a host
-  dies mid-command). Client disconnect while armed → hold 10 s, then
-  disable and exit, so an orphaned core never stays energized.
+  the arms hold there, damping active (matching what the firmware itself
+  does if a host dies mid-command, plus the damper). Client disconnect
+  while armed → hold 10 s, then disable and exit, so an orphaned core
+  never stays energized.
 - Deviation abort: any joint more than `abort_deg` (default 25°) from its
   played target disables both buses.
 - Max-step gate on incoming targets (corruption defense; Python's gate is
   the real per-command limit).
+- Any protocol error (e.g. a version-skewed target size) stops the bus
+  threads and disables the motors before the process exits — never an
+  energized orphan.
 
 The gripper rides the same target packets in slot 7 as a POSITION_FORCE
 command (motor-frame target, speed limit, torque limit). It is exempt
@@ -78,9 +96,9 @@ holding jaw — stays in Python, run on the quiet bus before the core arms.
 
 Measured feedback flows back to Python for free: SocketCAN broadcasts
 every frame to every open socket, so Python's passive `Motor` caches keep
-filling from the core's own MIT and POSITION_FORCE replies —
-`motion_control`'s measured-velocity damping path works unchanged, with
-real CAN timestamps.
+filling from the core's own MIT and POSITION_FORCE replies — positions
+and torques stay fresh for `get_positions`, recording, and the contact
+watchdog, with real CAN timestamps.
 
 Bring-up is split so Python's calibration stays authoritative: the core
 resets the arm motors first (`prep`, gripper untouched), then Python
@@ -90,8 +108,10 @@ and holds (`arm`). The socket protocol lives in `src/serve.rs` (Rust) and
 `almond_axol/rt/link.py` (Python) — length-prefixed frames, text control
 messages, packed-binary targets.
 
-Not core-driven yet: the guarded return-to-rest paths (they play through
-plain position streaming, as in sim).
+Guarded return works exactly as in classic mode: `torque_residuals` and
+`reset_command_state` are cache/state-only, and `gravity_compensate`
+streams its tuples through the same command sink — the contact watchdog,
+the limp contact hold, and the replanned reset all run against the core.
 
 ## Safety
 
@@ -121,5 +141,3 @@ via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 1. Port the TX-stall (e-stop) purge logic from `motor/bus.py`.
 2. Telemetry packets (tick stats already stream as log lines; positions
    currently ride the passive CAN broadcast).
-3. Optionally move the per-tick control math (differentiators, band-pass
-   damping) into the core so damping acts on 240 Hz-fresh measurements.
