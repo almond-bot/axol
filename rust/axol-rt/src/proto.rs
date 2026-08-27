@@ -169,7 +169,9 @@ pub const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD]
 pub const DM_CLEAR_ERRORS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB];
 
 /// Damiao feedback status nibbles (frame byte 0, high nibble).
+#[allow(dead_code)] // staged for status verification
 pub const DM_STATUS_DISABLED: u8 = 0x0;
+#[allow(dead_code)] // staged for status verification
 pub const DM_STATUS_ENABLED: u8 = 0x1;
 
 /// True when `data` is a register-read reply for (`motor_id`, `rid`).

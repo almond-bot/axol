@@ -11,12 +11,16 @@
 //!
 //!   axol-rt hold --params FILE [--secs N] [--hz N] [--abort-deg N] [--yes]
 //!                                                 enable + hold current pose
+//!   axol-rt serve --socket PATH                   realtime core driven over a
+//!                                                 Unix socket (see serve.rs)
 
 mod bench;
+mod bringup;
 mod can;
 mod hold;
 mod proto;
 mod scan;
+mod serve;
 mod txn;
 
 const DEFAULT_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
@@ -80,6 +84,24 @@ fn main() {
                 std::process::exit(2);
             };
             hold::run(&params, secs, hz, abort_deg, yes)
+        }
+        "serve" => {
+            let mut socket: Option<String> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--socket" => socket = iter.next().cloned(),
+                    other => {
+                        eprintln!("serve: unknown argument {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let Some(socket) = socket else {
+                eprintln!("serve: --socket PATH is required");
+                std::process::exit(2);
+            };
+            serve::run(&socket)
         }
         other => {
             eprintln!("unknown command: {other}");

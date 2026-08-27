@@ -12,6 +12,7 @@ import logging
 import math
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 
@@ -561,6 +562,13 @@ class AxolArm:
         # boot wrap into the joint's offset, and removes it from the set.
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
+        # Realtime-core hook (axol teleop --rt): when set, motion_control
+        # hands its fully computed per-joint MIT tuples
+        # (p_des motor-frame, v_des, kp, kd, t_ff) to this callable instead
+        # of sending them on the CAN bus — the Rust core owns the wire.
+        self._command_sink: (
+            Callable[[list[tuple[float, float, float, float, float]]], None] | None
+        ) = None
 
     def _pad_gripper(self, values: list) -> list:
         """Insert a ``0.0`` placeholder in the gripper slot when absent.
@@ -1353,7 +1361,8 @@ class AxolArm:
         # offset is 0, so its raw motor value is unchanged.
         motor_targets = clipped - self._joint_offsets
 
-        def _mit_cmd(i: int, j: Joint):
+        arm_cmds: list[tuple[float, float, float, float, float]] = []
+        for i, j in enumerate(ARM_JOINTS):
             gains = getattr(self._arm_config, j.value)
             f = gains.friction
             # Host damping is exactly the configured kd_host, pose-scheduled.
@@ -1369,24 +1378,31 @@ class AxolArm:
                 + gains.j_eff * float(j_scale[i]) * accelerations[i]
                 + float(host_scale[i]) * gains.kd_host * v_damp[i]
             )
-            return self.motors[j].set_impedance(
-                float(motor_targets[i]),
-                velocities[i],
-                gains.kp,
-                gains.kd,
-                t_ff,
+            arm_cmds.append(
+                (float(motor_targets[i]), velocities[i], gains.kp, gains.kd, t_ff)
             )
 
-        tasks = [_mit_cmd(i, j) for i, j in enumerate(Joint) if j != Joint.GRIPPER]
-        if self._has_gripper:
-            tasks.append(
-                self.motors[Joint.GRIPPER].set_position_force(
-                    float(motor_targets[gripper_i]),
-                    self._arm_config.gripper.max_speed,
-                    self._arm_config.gripper.torque_limit,
+        if self._command_sink is not None:
+            # Realtime-core mode (axol teleop --rt): the fully computed MIT
+            # tuples go to the sink — which ships them to the Rust core that
+            # owns the CAN bus — instead of onto the wire from here. The
+            # gripper is not driven by the rt core yet, so its command is
+            # dropped.
+            self._command_sink(arm_cmds)
+        else:
+            tasks = [
+                self.motors[j].set_impedance(*arm_cmds[i])
+                for i, j in enumerate(ARM_JOINTS)
+            ]
+            if self._has_gripper:
+                tasks.append(
+                    self.motors[Joint.GRIPPER].set_position_force(
+                        float(motor_targets[gripper_i]),
+                        self._arm_config.gripper.max_speed,
+                        self._arm_config.gripper.torque_limit,
+                    )
                 )
-            )
-        await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
         self._last_q_commanded = clipped
 
     async def gravity_compensate(
