@@ -118,6 +118,8 @@ The tab also carries the [headless](/guides/quest-headless) **Keep awake** / **R
 
 Pick an operation from the selector. Each panel asks only for its **per-run inputs** — the dataset repo id and task for collect data, the policy path/type for run policy, the episode to replay — plus **Start**/**Stop**. Everything reusable lives in [Settings](#settings). Hover the **ⓘ** next to a field for its description, pulled from the CLI's own help.
 
+Every arm-motion operation also carries an **rt** toggle (`robot config → rt` on the LeRobot-based ones): it drives the wire through the [`axol-rt` Rust realtime core](/cli/rt-install) instead of the Python control loop — the core owns CAN at 240 Hz while the operation streams targets. Experimental; same switch as [`teleop --rt`](/cli/teleop).
+
 | Operation | Needs | Notes |
 |---|---|---|
 | **Teleoperation** | Axol, sim, or cart-only | Drive the arms from the VR headset. Toggle **sim** to use the browser visualizer with no hardware. If the robot has the [powered cart](/guides/vr-interface#powered-cart), the **Powered cart** setting (Robot tab) also lets the thumbsticks drive it; tick **Cart only** to drive *just* the cart with the arms untouched — no Axol connection or motor check needed. If camera slots are assigned, the feeds are relayed to the headset automatically — see [Camera views](/guides/vr-interface#camera-views) — and mirrored in the panel's [operator view](#operator-view). |
