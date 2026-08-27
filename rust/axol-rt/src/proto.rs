@@ -16,8 +16,76 @@ pub const MA_MC_RESP: u16 = 0x500;
 
 pub const MA_READ_STATUS1: u8 = 0x9A;
 pub const MA_READ_VERSION: u8 = 0xB2;
+pub const MA_READ_MODEL: u8 = 0xB5;
 pub const MA_MULTI_TURN_ANGLE: u8 = 0x92;
 pub const MA_MOTOR_STATUS_2: u8 = 0x9C;
+pub const MA_RELEASE_BRAKE: u8 = 0x77;
+pub const MA_SHUTDOWN: u8 = 0x80;
+/// System reset — no response; the motor reboots (~1.1 s, allow 2+).
+pub const MA_RESET: u8 = 0x76;
+
+/// Firmware VersionDate at which protocol V4.4 widened the MIT ranges.
+pub const MA_FW_V44: u32 = 2026042402;
+pub const MA_V_MAX: f64 = 45.0;
+pub const MA_KP_MAX: f64 = 500.0;
+/// kd decodes against 0-5 on ALL firmware (see the Python driver: the V4.4
+/// changelog's 0-50 claim is contradicted by measured hardware behavior).
+pub const MA_KD_MAX: f64 = 5.0;
+pub const MA_P_MAX_LEGACY: f64 = 12.5;
+pub const MA_T_MAX_LEGACY: f64 = 24.0;
+pub const MA_P_MAX_V44: f64 = 12.566;
+
+/// `(p_max, t_max)` this firmware scales MIT command/feedback against —
+/// mirrors `mit_ranges` in the Python driver. V4.4 widens `p_max` and uses
+/// the motor's rated max torque (from the 0xB5 model's X-series token).
+pub fn ma_mit_ranges(version: Option<u32>, model: Option<&str>) -> (f64, f64) {
+    if version.is_some_and(|v| v >= MA_FW_V44) {
+        let t_max = match model.and_then(model_series) {
+            Some(6) => 60.0,
+            Some(8) => 129.0,
+            _ => MA_T_MAX_LEGACY,
+        };
+        (MA_P_MAX_V44, t_max)
+    } else {
+        (MA_P_MAX_LEGACY, MA_T_MAX_LEGACY)
+    }
+}
+
+/// Extract the X-series number from a model string like `"RMD-X8-P20"`.
+fn model_series(model: &str) -> Option<u32> {
+    let upper = model.to_uppercase();
+    let bytes = upper.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'X' {
+            let digits: String = upper[i + 1..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if !digits.is_empty() {
+                return digits.parse().ok();
+            }
+        }
+    }
+    None
+}
+
+/// Decode one 5-char block of a 0xB5 model reply (bytes 3-7).
+pub fn ma_decode_model_block(data: &[u8; 8]) -> [u8; 5] {
+    [data[3], data[4], data[5], data[6], data[7]]
+}
+
+/// Decode a MyActuator MIT feedback frame (0x500+id): (pos rad, vel rad/s,
+/// torque Nm), scaled against the firmware's ranges. Motor frame.
+pub fn ma_decode_mit_feedback(data: &[u8; 8], p_max: f64, t_max: f64) -> (f64, f64, f64) {
+    let pos_int = ((data[1] as u32) << 8) | data[2] as u32;
+    let vel_int = ((data[3] as u32) << 4) | ((data[4] as u32) >> 4);
+    let torq_int = (((data[4] & 0x0F) as u32) << 8) | data[5] as u32;
+    (
+        uint_to_float(pos_int, -p_max, p_max, 16),
+        uint_to_float(vel_int, -MA_V_MAX, MA_V_MAX, 12),
+        uint_to_float(torq_int, -t_max, t_max, 12),
+    )
+}
 
 /// Damiao register access + feedback requests all go to this arbitration ID.
 pub const DM_REG_ARB: u16 = 0x7FF;
@@ -94,6 +162,15 @@ pub fn dm_request_feedback(motor_id: u16) -> [u8; 8] {
     let (lo, hi) = ((motor_id & 0xFF) as u8, (motor_id >> 8) as u8);
     [lo, hi, 0xCC, 0, 0, 0, 0, 0]
 }
+
+/// Damiao magic command frames, sent to the motor's ESC_ID.
+pub const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
+pub const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
+pub const DM_CLEAR_ERRORS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB];
+
+/// Damiao feedback status nibbles (frame byte 0, high nibble).
+pub const DM_STATUS_DISABLED: u8 = 0x0;
+pub const DM_STATUS_ENABLED: u8 = 0x1;
 
 /// True when `data` is a register-read reply for (`motor_id`, `rid`).
 pub fn dm_is_register_reply(data: &[u8; 8], motor_id: u16, rid: u8) -> bool {

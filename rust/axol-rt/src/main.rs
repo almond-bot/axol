@@ -6,9 +6,15 @@
 //!   axol-rt scan  [ifaces...]                     identity + state of every motor
 //!   axol-rt bench [--hz N] [--secs N] [--serial] [ifaces...]
 //!                                                 paced full-bus telemetry loop
+//!
+//! Motion (requires a params file from tools/gen_hold_params.py, and --yes):
+//!
+//!   axol-rt hold --params FILE [--secs N] [--hz N] [--abort-deg N] [--yes]
+//!                                                 enable + hold current pose
 
 mod bench;
 mod can;
+mod hold;
 mod proto;
 mod scan;
 mod txn;
@@ -48,6 +54,32 @@ fn main() {
                 ifaces = DEFAULT_IFACES.iter().map(|s| s.to_string()).collect();
             }
             bench::run(&ifaces, hz, secs, mode)
+        }
+        "hold" => {
+            let mut params: Option<String> = None;
+            let mut secs = 5.0;
+            let mut hz = 240.0;
+            let mut abort_deg = 10.0;
+            let mut yes = false;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--params" => params = iter.next().cloned(),
+                    "--secs" => secs = expect_f64(iter.next(), "--secs"),
+                    "--hz" => hz = expect_f64(iter.next(), "--hz"),
+                    "--abort-deg" => abort_deg = expect_f64(iter.next(), "--abort-deg"),
+                    "--yes" => yes = true,
+                    other => {
+                        eprintln!("hold: unknown argument {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let Some(params) = params else {
+                eprintln!("hold: --params FILE is required (see tools/gen_hold_params.py)");
+                std::process::exit(2);
+            };
+            hold::run(&params, secs, hz, abort_deg, yes)
         }
         other => {
             eprintln!("unknown command: {other}");
