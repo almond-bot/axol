@@ -140,7 +140,7 @@ class VRTeleopConfig:
             reset.  The headset streams poses at 72+ Hz while presenting,
             so anything beyond a few hundred ms is a real gap, not jitter.
             ``0`` disables the timeout.  Defaults to ``0.5`` s.
-        absolute_mode: Mantis UMI mapping. Instead of re-applying
+        absolute_mode: Mantis mapping. Instead of re-applying
             controller *deltas* onto the robot's engage-time FK pose (normal
             teleop), the engage rising edge solves a world-anchored robot
             **base transform** — gravity-aligned, positioned/oriented so the
@@ -242,7 +242,7 @@ class VRTeleopConfig:
 
 
 def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
-    """Force the Mantis UMI mapping/faithfulness profile in place.
+    """Force the Mantis mapping/faithfulness profile in place.
 
     Shared by ``collect-data --umi`` and ``teleop --umi`` so the two flows
     behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
@@ -293,7 +293,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
             if key in entries:
                 setattr(config, attr, entries[key])
                 _logger.info(
-                    "UMI %s: loaded tracker→gripper calibration for tracker %r (%s).",
+                    "Mantis %s: loaded tracker→gripper calibration for tracker %r (%s).",
                     side,
                     key,
                     reason,
@@ -301,7 +301,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
             elif design is not None:
                 setattr(config, attr, design)
                 _logger.info(
-                    "UMI %s: using the rig's factory tracker→gripper transform "
+                    "Mantis %s: using the rig's factory tracker→gripper transform "
                     "for tracker %r (%s) — a design constant of the standard "
                     "mount. A per-unit entry in %s overrides it.",
                     side,
@@ -312,7 +312,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
             elif LEGACY_TRACKER_KEY in entries:
                 setattr(config, attr, entries[LEGACY_TRACKER_KEY])
                 _logger.warning(
-                    "UMI %s: no transform for the active tracker %r (%s) — "
+                    "Mantis %s: no transform for the active tracker %r (%s) — "
                     "falling back to a LEGACY entry measured with an unknown "
                     "tracker. If the tracker changed since, this transform "
                     "is wrong; re-key or delete the entry in %s.",
@@ -323,7 +323,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                 )
             else:
                 _logger.warning(
-                    "UMI %s: NO tracker→gripper transform for the active "
+                    "Mantis %s: NO tracker→gripper transform for the active "
                     "tracker %r (%s) — no factory design constant covers this "
                     "tracker family and %s has no entry for it. Absolute mode "
                     "will absorb the whole controller→gripper offset into the "

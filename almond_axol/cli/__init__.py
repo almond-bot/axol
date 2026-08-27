@@ -73,7 +73,7 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
     "run-policy": ("run_policy", "Run a trained policy on the robot."),
     "umi.train": (
         "umi_train",
-        "lerobot-train with UMI chunk-relative EE actions (any policy type).",
+        "lerobot-train with Mantis chunk-relative EE actions (any policy type).",
     ),
     "inference-server": (
         "inference_server",

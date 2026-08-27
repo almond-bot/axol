@@ -35,13 +35,13 @@ controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
 the disconnects at their source; the hotplug bring-up covers whatever still
 gets through.
 
-``axol can.setup --umi`` configures the Mantis UMI handheld data-collection rig
+``axol can.setup --umi`` configures the Mantis handheld data-collection rig
 instead. The rig uses the **same dual-channel board** as the arm hub (one
 USB device, keyed by its serial), with one gripper bus per channel:
   channel 0 (dev_id 0x0) -> can_alm_umi_l  (left gripper: motor + trigger)
   channel 1 (dev_id 0x1) -> can_alm_umi_r  (right gripper)
 The two profiles use separate udev rule files, startup scripts, and hotplug
-units, so a machine can have both the robot and the Mantis UMI configured at
+units, so a machine can have both the robot and the Mantis configured at
 once — serials claimed by one profile's rules are excluded when scanning
 for the other's adapter.
 """
@@ -122,7 +122,7 @@ _AXOL_PROFILE = _Profile(
 )
 
 _UMI_PROFILE = _Profile(
-    label="Almond Mantis UMI",
+    label="Almond Mantis",
     left=CAN_UMI_LEFT,
     right=CAN_UMI_RIGHT,
     rules_file=Path("/etc/udev/rules.d/91-can-umi.rules"),
@@ -157,7 +157,7 @@ def _udev_attr(info: str, attr: str) -> str:
 def _scan_adapters() -> dict[str, dict]:
     """Every attached gs_usb CAN adapter: serial -> {vid, pid, dev_ids}.
 
-    Dual-channel boards (the Axol arm hub, the Mantis UMI) show up as one
+    Dual-channel boards (the Axol arm hub, the Mantis) show up as one
     serial with dev_ids {0, 1}; a single-channel adapter (the cart's
     wheel-bus CANable) as one serial with {0}. Matched on the gs_usb driver
     rather than a VID/PID so CANable firmware variants that don't use the
@@ -190,7 +190,7 @@ def _scan_adapters() -> dict[str, dict]:
 def _detect_serials() -> list[str]:
     """Serials of every attached *dual-channel* Axol adapter.
 
-    Candidates for the arm hub or the Mantis UMI (same board — the caller
+    Candidates for the arm hub or the Mantis (same board — the caller
     disambiguates via the other profile's claimed serials). Single-channel
     devices (the cart's wheel-bus adapter) share the generic VID/PID but can
     never be either, so they are excluded rather than left to make the scan
@@ -256,7 +256,7 @@ def _rules_serial_for(name: str, rules_file: Path | None = None) -> str | None:
 def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
     """A profile's adapter serial as pinned by a *previous* setup, if any.
 
-    Preferred over live adapter detection: the arm hub and the Mantis UMI use
+    Preferred over live adapter detection: the arm hub and the Mantis use
     the same dual-channel board (same VID/PID), so a host with both attached
     is ambiguous to a fresh scan — but not to a machine that has already
     named the profile's interfaces or written its udev rules.
@@ -297,7 +297,7 @@ def _resolve_hub_serial() -> str | None:
     attached hub unnamed on ``canX``, which is exactly what the control
     panel's Connect used to trip over. The attached hub is registered instead
     (when it's unambiguous), matching what the interactive ``axol can.setup``
-    picks in the same situation. Serials the Mantis UMI's rules already claim
+    picks in the same situation. Serials the Mantis rig's rules already claim
     are excluded from live detection — the rig uses the same dual-channel
     board as the hub (1d50:606f), so with the rig plugged in it would
     otherwise make the robot's adapter ambiguous. Several attached candidates
@@ -327,7 +327,7 @@ def _find_serial(profile: _Profile) -> str | None:
 
     unique = _detect_serials()
 
-    # The arm hub and the Mantis UMI use the same dual-channel board, so hide
+    # The arm hub and the Mantis use the same dual-channel board, so hide
     # serials the *other* profile's rules already claim — the obvious
     # single-adapter case then stays promptless even with both attached.
     other = _UMI_PROFILE if profile is _AXOL_PROFILE else _AXOL_PROFILE
@@ -722,7 +722,7 @@ def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
     (see :func:`_write_udev_rules`), so every (re-)enumeration — boot or a
     mid-session USB drop — runs the startup script and the interfaces come
     back configured and up within a second, no operator action needed. The
-    Mantis UMI rig gets its own unit: the handheld is unplugged far more often
+    Mantis rig gets its own unit: the handheld is unplugged far more often
     than the arm hub.
     """
     print(
@@ -824,12 +824,12 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser = subparsers.add_parser(
         "can.setup",
         help="Configure CAN interfaces (arm hub, wheel bus, chest bus; "
-        "or the Mantis UMI with --umi).",
+        "or the Mantis with --umi).",
     )
     parser.add_argument(
         "--umi",
         action="store_true",
-        help="Configure the Mantis UMI's dual-channel adapter "
+        help="Configure the Mantis rig's dual-channel adapter "
         f"(channel 0 -> {CAN_UMI_LEFT}, channel 1 -> {CAN_UMI_RIGHT}).",
     )
     parser.set_defaults(func=run)
@@ -843,7 +843,7 @@ def rx_alive_per_arm(profile: _Profile = _AXOL_PROFILE) -> tuple[bool, bool]:
     where TX still works but no received frame is ever delivered (kernel-side
     everything looks healthy — UP, ERROR-ACTIVE, correct bitrate). Probes the
     profile's ``probe_joint`` — the shoulder on the robot arm, the gripper on
-    the Mantis UMI (its buses carry nothing else).
+    the Mantis (its buses carry nothing else).
 
     Per-side results matter because one healthy side must not mask the other:
     a bus with no responding motors (arm powered off, harness fault, dead
@@ -1004,7 +1004,7 @@ def _apply_setup(
 
 
 def _configure_umi(serial: str) -> None:
-    """Write the Mantis UMI's persistent config and bring its buses up.
+    """Write the Mantis rig's persistent config and bring its buses up.
 
     Same dual-channel board as the arm hub: channel 0 -> left gripper,
     channel 1 -> right. No wheel/chest/RP1 handling on the rig profile.
@@ -1030,7 +1030,7 @@ def ensure_setup(
     The wheel-bus and chest adapters are only ever *re*-pinned here (from a
     previous setup's rules or a live interface); identifying a new one needs
     the interactive flow's probing — see :func:`_identify_adapter`. Configures
-    the robot-arm profile only; the Mantis UMI is configured explicitly via
+    the robot-arm profile only; the Mantis is configured explicitly via
     ``axol can.setup --umi``.
     """
     driver.ensure_driver()
@@ -1049,7 +1049,7 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
     attached single-channel adapter is identified by probing its bus (see
     :func:`_identify_adapter`); one where nothing answers — devices
     unpowered, or unrelated hardware — is offered to the operator instead of
-    guessed at. Serials the Mantis UMI's rules already claim are excluded
+    guessed at. Serials the Mantis rig's rules already claim are excluded
     outright (a belt-and-braces guard; the rig's board is dual-channel, so it
     should never appear here).
 

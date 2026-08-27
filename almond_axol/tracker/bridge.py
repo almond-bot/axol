@@ -7,7 +7,7 @@ rate from the latest tracker poses, stamps ``t`` (monotonic ms, for the
 server's pose interpolator) and ``seq``, and ships it over WSS (the
 server's self-signed certificate is not verified).
 
-Grip comes from the Mantis UMI trigger node's CAN messages when one is
+Grip comes from the Mantis trigger node's CAN messages when one is
 configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
 the binary trigger switch drives ``l_grip``/``r_grip`` (pressed = close,
 released = open). Engage/reset come

@@ -351,7 +351,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         return
 
     if cfg.umi:
-        # Mantis UMI bench mode: the Quest triggers drive the two real
+        # Mantis bench mode: the Quest triggers drive the two real
         # grippers; the arms exist only as the headset's URDF overlay. Force
         # the same absolute-mapping profile collect-data --umi uses so the
         # bench test exercises exactly what collection will.

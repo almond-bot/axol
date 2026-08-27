@@ -26,8 +26,8 @@ from typing import Any
 
 import numpy as np
 import torch
+from lerobot.lerobot_types import TransitionKey
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
-from lerobot.types import TransitionKey
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .processor import UMIAbsoluteEEStep, UMIRelativeEEStep, ee_pose_groups
@@ -192,25 +192,27 @@ def _insert_steps(preprocessor, postprocessor, relative_step: UMIRelativeEEStep)
 
 
 def install(train_module) -> None:
-    """Patch ``make_dataset`` / ``make_pre_post_processors`` in ``train_module``.
+    """Patch the dataset factory / ``make_pre_post_processors`` in ``train_module``.
 
     ``train_module`` is ``lerobot.scripts.lerobot_train``; its ``train()``
-    creates the dataset first and the processors right after, so the wrapped
-    dataset factory captures the dataset object the stats computation needs.
+    creates the dataset(s) first and the processors right after, so the
+    wrapped dataset factory captures the train dataset object the stats
+    computation needs. The factory seam is ``make_train_eval_datasets``
+    (lerobot >= 0.6.1).
     """
-    original_make_dataset = train_module.make_dataset
+    original_make_datasets = train_module.make_train_eval_datasets
     original_make_processors = train_module.make_pre_post_processors
     captured: dict[str, Any] = {}
 
-    def patched_make_dataset(cfg):
+    def patched_make_datasets(cfg):
         if getattr(cfg.dataset, "streaming", False):
             raise ValueError(
                 "umi.train computes relative-action stats from the on-disk "
                 "dataset and does not support --dataset.streaming."
             )
-        dataset = original_make_dataset(cfg)
+        dataset, eval_dataset = original_make_datasets(cfg)
         captured["dataset"] = dataset
-        return dataset
+        return dataset, eval_dataset
 
     def patched_make_processors(policy_cfg, pretrained_path=None, **kwargs):
         dataset = captured.get("dataset")
@@ -274,5 +276,5 @@ def install(train_module) -> None:
             _logger.info("umi.train: injected relative-EE processor steps.")
         return preprocessor, postprocessor
 
-    train_module.make_dataset = patched_make_dataset
+    train_module.make_train_eval_datasets = patched_make_datasets
     train_module.make_pre_post_processors = patched_make_processors

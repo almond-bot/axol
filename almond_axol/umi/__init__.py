@@ -1,6 +1,6 @@
-"""Mantis UMI calibration and data-pipeline utilities.
+"""Mantis calibration and data-pipeline utilities.
 
-The Mantis UMI is a handheld gripper with a 6-DoF tracker (Quest controller or
+The Mantis is a handheld gripper with a 6-DoF tracker (Quest controller or
 Vive tracker) rigidly mounted to it. Everything that ties the rig's tracked
 poses to the robot lives here:
 

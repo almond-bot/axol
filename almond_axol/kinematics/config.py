@@ -158,7 +158,7 @@ class KinematicsConfig:
     elbow_fade_band: float = 0.15
 
 
-# Solver values the Mantis UMI profile forces (see
+# Solver values the Mantis profile forces (see
 # :func:`apply_umi_kinematics_profile`). Tuned with ``scripts/umi_ik_bench.py``
 # against the feasibility floor of a near-unconstrained solve: within the
 # reachable workspace this tracks the hand with ~2 mm mean / <6 mm p95 excess
@@ -195,7 +195,7 @@ UMI_KINEMATICS_OVERRIDES: dict[str, float | int] = {
 
 
 def apply_umi_kinematics_profile(config: KinematicsConfig) -> None:
-    """Apply the Mantis UMI solver profile in place.
+    """Apply the Mantis solver profile in place.
 
     Shared by ``teleop --umi`` and ``collect-data --umi`` (the same way
     :func:`almond_axol.teleop.config.apply_umi_teleop_profile` is). Each

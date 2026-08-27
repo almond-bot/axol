@@ -6,7 +6,7 @@ every configured bus the host has: the arm hub pair (can_alm_axol_l/r), the
 cart wheel bus (can_alm_axol_b), and the chest bus (can_alm_axol_c), each
 skipped when its adapter isn't attached. Requires can.setup to have been run
 at least once to generate the script.
-``--umi`` brings up the Mantis UMI's interfaces instead of the arm's.
+``--umi`` brings up the Mantis rig's interfaces instead of the arm's.
 
 For setups without the Axol-named adapters, pass ``--channels`` to bring up
 other SocketCAN interfaces directly instead (no startup script needed):
@@ -29,7 +29,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     parser.add_argument(
         "--umi",
         action="store_true",
-        help="Bring up the Mantis UMI interfaces instead of the arm's.",
+        help="Bring up the Mantis interfaces instead of the arm's.",
     )
     parser.add_argument(
         "--channels",
@@ -47,7 +47,7 @@ def run(args: argparse.Namespace | None = None) -> None:
     """Bring up the CAN interfaces.
 
     Default: the Axol hub's saved startup script (with its RX-wedge recovery);
-    ``--umi`` selects the Mantis UMI's script instead. With ``--channels``: plain
+    ``--umi`` selects the Mantis rig's script instead. With ``--channels``: plain
     per-interface bring-up of the named interfaces.
     """
     channels = getattr(args, "channels", None)

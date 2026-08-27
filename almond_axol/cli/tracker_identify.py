@@ -1,7 +1,7 @@
 """
 axol tracker.identify
 
-Bind discovered Vive trackers to the left/right Mantis UMI rig sides.
+Bind discovered Vive trackers to the left/right Mantis rig sides.
 
 Trackers report under backend-native keys (a libsurvive codename like
 ``T20``, an Ultimate tracker MAC) that say nothing about which rig they
@@ -29,7 +29,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``tracker.identify`` subcommand."""
     parser = subparsers.add_parser(
         "tracker.identify",
-        help="Bind Vive trackers to the left/right Mantis UMI rig sides.",
+        help="Bind Vive trackers to the left/right Mantis rig sides.",
     )
     parser.add_argument(
         "--backend",

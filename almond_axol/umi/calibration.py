@@ -1,4 +1,4 @@
-"""The Mantis UMI's tracker→TCP transforms: factory design constants + overrides.
+"""The Mantis rig's tracker→TCP transforms: factory design constants + overrides.
 
 The rig's tracker mounts are a fixed design, so the rigid tracker→gripper
 transform is a **design constant** per tracker family, shipped in
@@ -50,7 +50,7 @@ UMI_TCP_TRANSFORM_FILE = Path.home() / ".almond" / "umi" / "tcp_transform.json"
 # format surface on load. Never produced by a fresh calibration.
 LEGACY_TRACKER_KEY = "legacy"
 
-# Factory (CAD-derived) tracker→gripper transforms for the Mantis UMI's
+# Factory (CAD-derived) tracker→gripper transforms for the Mantis rig's
 # standard tracker mounts, keyed by tracker backend family — the part of a
 # tracker key before the ":" (``"survive:T20"`` → ``"survive"``). These are
 # design constants of the rig, identical for every unit up to manufacturing
@@ -66,6 +66,24 @@ LEGACY_TRACKER_KEY = "legacy"
 # ([0, 0.7071068, 0.7071068, 0]); the shipped choice is pending the one-time
 # URDF-overlay bench check — flip here if the overlay shows the virtual
 # gripper rolled half a turn.
+#
+# Each entry is ``[x, y, z, qx, qy, qz, qw]``: the gripper TCP frame
+# expressed in that tracker's device-local frame as the bridge/headset
+# reports it — the TCP origin in metres plus the rotation taking tracker
+# axes to gripper axes, straight from the mount CAD.
+#
+# quest (Quest 3 controller in the rig's controller cradle): NOT YET
+# MEASURED. Needed from the cradle CAD: the TCP origin in the controller's
+# WebXR grip frame (x right, y up, z toward the wrist when held) and the
+# grip→gripper rotation. Until it ships, the engage snapshot absorbs the
+# whole offset (recorded TCP poses are mount-dependent; a loud warning is
+# logged at session start).
+#
+# ultimate (Vive Ultimate Tracker, standard mount): NOT YET MEASURED.
+# Needed from the mount CAD: the TCP origin in the tracker's device frame as
+# pyvut reports it (verify quat order / up axis first — see
+# docs/cli/tracker.mdx) and the tracker→gripper rotation. Same fallback as
+# quest until it ships.
 DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],

@@ -61,7 +61,7 @@ def default_tracking_ik_config() -> "KinematicsConfig":
     the 10 cm collision standoff shove commanded poses ~9 mm off target. A
     policy replays absolute end-effector poses from its training data, so
     deployment needs the accurate-tracking weights instead. Those are exactly
-    the Mantis UMI overrides (pos_weight=200, ori_weight=120,
+    the Mantis overrides (pos_weight=200, ori_weight=120,
     margin=0.02, ... — see ``UMI_KINEMATICS_OVERRIDES`` and its rationale in
     :mod:`almond_axol.kinematics.config`), applied here via
     :func:`apply_umi_kinematics_profile` so the two stay in lock-step.
@@ -369,7 +369,7 @@ class AxolRobot(Robot):
         _logger.info("AxolRobot connected.")
 
     def _build_hardware(self) -> Axol:
-        """Construct the hardware driver. Overridden by the Mantis UMI subclass."""
+        """Construct the hardware driver. Overridden by the Mantis subclass."""
         return Axol(
             self.config.axol_config,
             left_channel=self.config.left_channel,

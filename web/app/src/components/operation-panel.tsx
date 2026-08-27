@@ -130,7 +130,7 @@ export function OperationPanel({
 
   const isSim = isSimRun(meta, settings)
   // Sim, or a run that never touches the arms (teleop's cart-only mode, or
-  // the Mantis UMI on its own CAN buses): either way the
+  // the Mantis on its own CAN buses): either way the
   // arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
@@ -156,6 +156,14 @@ export function OperationPanel({
       const v = settings[f.key]
       if (v === undefined || String(v).trim() === "") blockers.push(`Set ${f.label}`)
     }
+  }
+  // Teleop's run modes are mutually exclusive (the server refuses the start
+  // too); catch the combination before the Start button instead of after.
+  const modeFlags = ["sim", "umi", "cart_only"].filter(
+    (f) => meta.fields.includes(f) && Boolean(settings[f])
+  )
+  if (modeFlags.length > 1) {
+    blockers.push("Sim, Mantis, and Cart only are mutually exclusive — enable only one")
   }
 
   const editedCount = Object.keys(settings).length

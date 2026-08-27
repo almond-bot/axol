@@ -1,6 +1,6 @@
-"""Hardware control for the Mantis UMI handheld data-collection rig.
+"""Hardware control for the Mantis handheld data-collection rig.
 
-The Mantis UMI is a pair of handheld devices — a Quest controller rigidly mounted
+The Mantis is a pair of handheld devices — a Quest controller rigidly mounted
 to the same Damiao gripper the robot uses — held by a human demonstrator. Each
 gripper sits alone on its own CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``)
 at the production gripper CAN ID (0x08).
@@ -79,7 +79,7 @@ class UmiGripperArm:
         while not self._motor.has_position:
             if loop.time() >= deadline:
                 raise TimeoutError(
-                    "No feedback from the UMI gripper — check power and CAN wiring"
+                    "No feedback from the Mantis gripper — check power and CAN wiring"
                 )
             await asyncio.sleep(0.01)
 
@@ -131,7 +131,7 @@ class UmiGripperArm:
 
 
 class Umi(RobotBase):
-    """The Mantis UMI's dual handheld grippers behind the ``Axol`` control surface.
+    """The Mantis rig's dual handheld grippers behind the ``Axol`` control surface.
 
     Args:
         config:        Reused for the per-side gripper POSITION_FORCE tuning
@@ -182,7 +182,7 @@ class Umi(RobotBase):
                 *[a.disable() for a in arms],
             )
         except Exception:
-            _logger.exception("UMI gripper disable failed")
+            _logger.exception("Mantis gripper disable failed")
         finally:
             await asyncio.gather(
                 *[b.close() for b in (self._left_bus, self._right_bus) if b is not None]
@@ -236,7 +236,7 @@ class Umi(RobotBase):
     # -- Axol-surface stubs -----------------------------------------------------
 
     async def gravity_compensate(self, *args: object, **kwargs: object) -> None:
-        raise NotImplementedError("The Mantis UMI has no arm to gravity-compensate.")
+        raise NotImplementedError("The Mantis has no arm to gravity-compensate.")
 
     def reset_command_state(self) -> None:
         """No command history to clear — the arms are virtual."""

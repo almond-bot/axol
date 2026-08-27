@@ -550,7 +550,7 @@ class IKWorker:
         return q_new
 
     def _step_absolute(self, frame: VRFrame, q_current: np.ndarray) -> np.ndarray:
-        """Mantis UMI step: absolute world-anchored targets, no deltas.
+        """Mantis step: absolute world-anchored targets, no deltas.
 
         The engage rising edge solves the base transform + per-controller TCP
         offsets (:meth:`_engage_absolute`); every later frame maps each

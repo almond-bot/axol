@@ -72,8 +72,17 @@ class Schema:
         self.emit = emit
 
 
+# Field keys whose label is a product name rather than the humanized key.
+# ``umi`` stays the flag/config name for compatibility; the panel shows the
+# rig's product name, Mantis (almond.bot/mantis-umi).
+_PRODUCT_LABELS = {
+    "umi": "Mantis",
+    "umi_smooth_hz": "Mantis smoothing Hz",
+}
+
+
 def _humanize(key: str) -> str:
-    return key.replace("_", " ")
+    return _PRODUCT_LABELS.get(key, key.replace("_", " "))
 
 
 _SECTION_HEADERS = {"attributes", "args", "arguments", "parameters"}

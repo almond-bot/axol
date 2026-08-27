@@ -1,4 +1,4 @@
-"""The Mantis UMI as a LeRobot Robot.
+"""The Mantis as a LeRobot Robot.
 
 Same synchronous Robot surface as :class:`AxolRobot` — observations, actions,
 cameras, event loop — but the hardware is :class:`~almond_axol.robot.umi.Umi`:
@@ -20,7 +20,7 @@ _logger = logging.getLogger(__name__)
 
 
 class UmiRobot(AxolRobot):
-    """LeRobot Robot wrapping the Mantis UMI.
+    """LeRobot Robot wrapping the Mantis.
 
     Observation state is 16 joint positions like the robot's: the 14 arm
     values echo the commanded IK solution (there is no physical arm to

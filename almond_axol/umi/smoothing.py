@@ -1,6 +1,6 @@
 """Zero-phase smoothing of tracked EE pose tracks at episode-save time.
 
-The Mantis UMI's poses come from a VR tracker, whose broadband measurement noise
+The Mantis rig's poses come from a VR tracker, whose broadband measurement noise
 (~mm scale) is comparable in magnitude to the true frame-to-frame hand motion.
 Intentional hand motion lives well below ~10 Hz, so once the full episode is
 buffered we can low-pass the pose track *acausally* (``scipy.signal.filtfilt``

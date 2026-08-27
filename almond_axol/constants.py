@@ -41,7 +41,7 @@ CAN_CHEST = "can_alm_axol_c"
 # after an e-stop (see almond_axol/motor/bus.py).
 CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
 
-# Mantis UMI handheld data-collection rig: one dual-channel adapter, each channel
+# Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
 CAN_UMI_LEFT = "can_alm_umi_l"
 CAN_UMI_RIGHT = "can_alm_umi_r"
