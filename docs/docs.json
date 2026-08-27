@@ -77,6 +77,7 @@
               "cli/motor-flash",
               "cli/teleop",
               "cli/collect-data",
+              "cli/migrate-dataset",
               "cli/replay-dataset",
               "cli/run-policy",
               "cli/inference-server",

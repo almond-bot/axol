@@ -5,6 +5,13 @@ description: "Replay a recorded LeRobot dataset episode on the arms — from the
 
 Replay plays one episode of an existing [LeRobot](/api/lerobot) dataset straight back onto the arms: the episode's recorded `action` column is streamed to the motors frame by frame, then the robot returns to its rest pose. It's the inverse of [data collection](/operations/data-collection) — instead of recording teleop actions it reproduces an already-recorded take on the hardware. You can launch it from the **web control panel** or the **CLI** (`axol replay-dataset`).
 
+<Warning>
+  Cartesian datasets recorded with axol v0.1.31 or earlier use the world frame
+  from the old URDF and replay about 90° off on current releases. Run
+  [`axol migrate-dataset`](/cli/migrate-dataset) once before replaying them.
+  Joint-space datasets are unaffected.
+</Warning>
+
 No VR, cameras, or policy server are involved — replay only drives the arms, so the robot config carries no cameras. The arm is first moved to the rest pose (the same collision-aware return-to-rest [run-policy](/operations/run-policy) uses) so it starts where every recorded episode does: episodes are recorded from rest, so the first replayed action is ~rest and there's no jump.
 
 <Warning>
