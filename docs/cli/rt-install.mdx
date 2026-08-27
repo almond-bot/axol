@@ -1,0 +1,22 @@
+---
+title: "rt.install"
+description: "Build and install the axol-rt realtime core binary, so --rt mode needs no manual setup."
+---
+
+Builds and installs the `axol-rt` Rust realtime core — the binary behind [`teleop --rt`](/cli/teleop) and the `--rt` / `robot_config.rt` switch on every other arm-motion command. Runs automatically as a step of [`provision`](/cli/provision); run it by hand to (re)build on demand:
+
+```bash
+axol rt.install
+```
+
+Three concerns, each idempotent and self-gating:
+
+- **Toolchain** — if `cargo` is missing (PATH or `~/.cargo/bin`), a minimal stable Rust toolchain is installed via rustup (no sudo; lands in `~/.cargo`).
+- **Sources** — a dev checkout builds the in-repo crate (`rust/axol-rt`). Tool installs have no sources on disk, so the crate is fetched into `~/.almond/axol-rt-src` at the exact ref matching the installed package: the git commit for `uv tool install git+...` installs, or the `v<version>` release tag for PyPI installs.
+- **Binary** — dev checkouts leave it in `rust/axol-rt/target/release/` (where the rt link already looks, and where a manual `cargo build` stays authoritative). Tool installs copy it to `~/.local/bin/axol-rt` — on PATH — and stamp the built ref, so re-running `provision` at the same version skips the build.
+
+The binary lookup order at runtime is `AXOL_RT_BIN` (env override), then `axol-rt` on PATH, then the repo build — so a manual build or an explicit override always wins over the provisioned copy.
+
+<Note>
+  The step is best-effort inside `provision` (a failed rustup download or fetch logs a warning and the rest of provisioning continues), but running `axol rt.install` directly surfaces the full error.
+</Note>

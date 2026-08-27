@@ -161,6 +161,11 @@ fault, signal, client loss) runs the disable sequence.
 
 ## Build / run
 
+`axol provision` (or `axol rt.install` standalone) builds and installs the
+binary automatically — rustup toolchain included, and on uv-tool installs
+(no repo checkout) it fetches these sources at the installed package's
+exact ref. Manual path:
+
 ```sh
 cargo build --release           # needs no cross-compile: built on the Jetson
 ./target/release/axol-rt scan   # identity + state of every motor

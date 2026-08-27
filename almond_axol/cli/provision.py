@@ -19,6 +19,10 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``gyro.install``  — group access to the carrier board's BMI088 sampling
                       timer, the cart heading hold's yaw reference (see
                       :mod:`almond_axol.robot.gyro`).
+* ``rt.install``    — the ``axol-rt`` realtime core binary (Rust toolchain
+                      via rustup if needed; sources fetched at the installed
+                      package's ref for tool installs), so ``--rt`` mode
+                      needs no manual setup (see :mod:`almond_axol.rt`).
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -38,6 +42,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..robot import gyro
+from ..rt import install as rt_install
 from ..utils import adb
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
@@ -98,3 +103,8 @@ def run(_args: object = None) -> None:
     _step("GStreamer + PyGObject (gst.install)", gst_install.run)
     if have_sdk:
         _step("patched zed-gstreamer plugins (gst.build-zed)", gst_build_zed.run)
+    # The axol-rt realtime core (`--rt` mode): rustup toolchain if needed,
+    # then build from the in-repo crate (dev checkout) or from the sources
+    # at the installed package's exact ref (tool installs). Self-gates on
+    # network/toolchain availability like every other step.
+    _step("axol-rt realtime core (rt.install)", rt_install.run)

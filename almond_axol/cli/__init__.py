@@ -4,6 +4,7 @@ import argparse
 import importlib
 import sys
 
+from ..rt import install as rt_install
 from ..utils.dotenv import load_local_env
 from . import calibration as calibration_cmd
 from . import provision as provision_cmd
@@ -129,6 +130,7 @@ def main() -> None:
     zed_driver.add_parser(subparsers)
     gst_install.add_parser(subparsers)
     gst_build_zed.add_parser(subparsers)
+    rt_install.add_parser(subparsers)
     provision_cmd.add_parser(subparsers)
     jetson_setup.add_parser(subparsers)
     pid.add_parser(subparsers)

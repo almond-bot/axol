@@ -11,6 +11,7 @@ Installs and refreshes the pieces `uv tool install` can't manage on its own:
 - [`zed.install`](/cli/zed-install) — the **pyzed** bindings (not on PyPI; needs the ZED SDK).
 - [`gst.install`](/cli/gst-install) — the **GStreamer + PyGObject** `appsink` stack (PyGObject builds against the system gobject-introspection and is dropped whenever the tool environment is rebuilt, e.g. by a release upgrade).
 - [`gst.build-zed`](/cli/gst-build-zed) — the patched **`zedxonesrc` / `zedsrc`** plugins (sensor-accurate PTS so collected images line up with joint samples).
+- [`rt.install`](/cli/rt-install) — the **`axol-rt` realtime core** binary for [`--rt` mode](/cli/teleop) (Rust toolchain via rustup if needed; sources fetched at the installed package's exact ref on tool installs). Self-gates on network/toolchain availability.
 
 ```bash
 axol provision
