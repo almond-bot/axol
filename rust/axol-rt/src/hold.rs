@@ -63,6 +63,8 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
                     motor_id: fields.get(2)?.parse().ok()?,
                     kp: fields.get(3)?.parse().ok()?,
                     kd: fields.get(4)?.parse().ok()?,
+                    gripper: false, // hold never touches the gripper
+                    slot: 0,        // unused: hold has no target stream
                 },
                 t_ff: fields.get(5)?.parse().ok()?,
             })

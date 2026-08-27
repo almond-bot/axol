@@ -36,8 +36,9 @@ Measured on the robot (2026-08-27):
 | test | result |
 |------|--------|
 | bench 240 Hz telemetry | tick lateness p99 0.014 ms, 0/9600 replies lost |
-| serve, teleop headless | 6000 ticks @ 240 Hz, 0-0.08% late, watchdog + disarm clean |
-| serve, wrist_3 ±8° sinusoid | worst tracking error 0.42° (moving), ≤0.09° (holding) |
+| serve, teleop headless | 30000 ticks @ 240 Hz, 0.03% late, watchdog + disarm clean |
+| serve, wrist_3 ±8° sinusoid + gripper cycle | worst tracking error 0.42° (moving), ≤0.11° (holding); gripper swept 1.00→0.66→1.00 as commanded |
+| serve, Python killed while armed | core held 10 s, disabled everything, exited clean |
 
 For comparison, the Python control loop under teleop measured 30-57% of
 ticks late. 500 Hz full-bus telemetry is a *wire* limit, not a host limit:
@@ -68,21 +69,29 @@ The core owns the wire:
 - Max-step gate on incoming targets (corruption defense; Python's gate is
   the real per-command limit).
 
+The gripper rides the same target packets in slot 7 as a POSITION_FORCE
+command (motor-frame target, speed limit, torque limit). It is exempt
+from the max-step gate and the deviation abort (stalling against an
+object is its job), is never commanded until the first target arrives,
+and its bring-up — enable, open-stop calibration or attach/restore of a
+holding jaw — stays in Python, run on the quiet bus before the core arms.
+
 Measured feedback flows back to Python for free: SocketCAN broadcasts
 every frame to every open socket, so Python's passive `Motor` caches keep
-filling from the core's own MIT replies — `motion_control`'s
-measured-velocity damping path works unchanged, with real CAN timestamps.
+filling from the core's own MIT and POSITION_FORCE replies —
+`motion_control`'s measured-velocity damping path works unchanged, with
+real CAN timestamps.
 
 Bring-up is split so Python's calibration stays authoritative: the core
-resets the motors first (`prep`), then Python resolves joint offsets and
-MyActuator decode ranges against the post-reset wrap state, then the core
-enables and holds (`arm`). The socket protocol lives in `src/serve.rs`
-(Rust) and `almond_axol/rt/link.py` (Python) — length-prefixed frames,
-text control messages, packed-binary targets.
+resets the arm motors first (`prep`, gripper untouched), then Python
+resolves joint offsets and MyActuator decode ranges against the
+post-reset wrap state and brings up the gripper, then the core enables
+and holds (`arm`). The socket protocol lives in `src/serve.rs` (Rust) and
+`almond_axol/rt/link.py` (Python) — length-prefixed frames, text control
+messages, packed-binary targets.
 
-Not driven by the core yet: the gripper (its commands are dropped in rt
-mode) and the guarded return-to-rest paths (they play through plain
-position streaming, as in sim).
+Not core-driven yet: the guarded return-to-rest paths (they play through
+plain position streaming, as in sim).
 
 ## Safety
 
@@ -109,10 +118,8 @@ via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 
 ## Roadmap
 
-1. Gripper support in the core (POSITION_FORCE stream + calibration
-   handshake).
-2. Port the TX-stall (e-stop) purge logic from `motor/bus.py`.
-3. Telemetry packets (tick stats already stream as log lines; positions
+1. Port the TX-stall (e-stop) purge logic from `motor/bus.py`.
+2. Telemetry packets (tick stats already stream as log lines; positions
    currently ride the passive CAN broadcast).
-4. Optionally move the per-tick control math (differentiators, band-pass
+3. Optionally move the per-tick control math (differentiators, band-pass
    damping) into the core so damping acts on 240 Hz-fresh measurements.

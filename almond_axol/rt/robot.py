@@ -16,10 +16,15 @@ CAN buses are owned by the ``axol-rt`` subprocess:
   a command sink ships the resulting MIT tuples to the core instead of
   sending CAN from Python.
 
+- The gripper is brought up by Python before the core arms (the classic
+  enable/calibrate or attach/restore flow — it needs the quiet bus), then
+  driven by the core: ``motion_control``'s slot-7 tuple carries its
+  POSITION_FORCE command (motor-frame target, speed limit, torque limit).
+
 The guarded-return extras (``torque_residuals`` / ``gravity_compensate`` /
 ``reset_command_state``) are deliberately not exposed: those paths send CAN
 directly, so in rt mode resets play through the plain ``motion_control``
-path, exactly as they do against ``Sim``. The gripper is not driven yet.
+path, exactly as they do against ``Sim``.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import time
 import numpy as np
 
 from ..constants import ARM_JOINTS
+from ..motor import ControlMode, Joint
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import Axol, AxolArm
 from .link import RtLink
@@ -56,9 +62,6 @@ class RtAxol:
         self._abort_deg = abort_deg
         self._link = RtLink()
         self._seq = 0
-        # Gripper positions captured before the core starts streaming; the
-        # grippers stay disabled in rt mode, so these stay exact.
-        self._gripper_norm: dict[int, float] = {}
 
     @property
     def left(self) -> AxolArm | None:
@@ -96,6 +99,10 @@ class RtAxol:
                 lines.append(
                     f"joint {side} {iface} {j.value} {motor_id} {gains.kp} {gains.kd}"
                 )
+            if arm._has_gripper:
+                lines.append(
+                    f"gripper {side} {iface} {_JOINT_CONFIG[Joint.GRIPPER].motor_id}"
+                )
         return "\n".join(lines) + "\n"
 
     async def enable(self) -> None:
@@ -118,14 +125,16 @@ class RtAxol:
                 if _JOINT_CONFIG[j].motor_id <= 5:
                     await arm.motors[j]._driver._detect_capabilities()
 
-        # Direct position reads while the bus is still quiet: primes the
-        # Damiao caches (gripper included) and captures the gripper values
-        # that stay frozen for the session.
-        pos_l, pos_r = await self._robot.get_positions()
-        if pos_l is not None:
-            self._gripper_norm[0] = float(pos_l[7])
-        if pos_r is not None:
-            self._gripper_norm[1] = float(pos_r[7])
+        # Gripper bring-up runs from Python while the bus is still quiet —
+        # the exact classic flow (enable/calibrate or attach/restore) the
+        # core can't do. The core then streams its POSITION_FORCE commands.
+        for _side, arm in self._arms():
+            await self._bring_up_gripper(arm)
+
+        # Direct position reads before the core starts streaming: primes
+        # every feedback cache (the gripper norm now uses the freshly
+        # calibrated limits).
+        await self._robot.get_positions()
 
         for side, arm in self._arms():
             arm._command_sink = self._make_sink(side)
@@ -136,6 +145,27 @@ class RtAxol:
             "rt: armed — axol-rt owns the bus at %.0f Hz; Python streams targets",
             self._loop_hz,
         )
+
+    async def _bring_up_gripper(self, arm: AxolArm) -> None:
+        """The classic gripper bring-up (see ``AxolArm.enable``), standalone.
+
+        Cold gripper: enable, calibrate the open stop in IMPEDANCE mode
+        (torque-seek sweep), then switch to POSITION_FORCE. A gripper still
+        holding from a previous session: attach without disturbing torque and
+        restore the persisted calibration (re-measuring would drop whatever
+        it grips). Must run before the core arms — this sends CAN.
+        """
+        if not arm._has_gripper:
+            return
+        motor = arm.motors[Joint.GRIPPER]
+        if await motor.is_holding():
+            await motor.attach(ControlMode.POSITION_FORCE)
+            await arm._restore_gripper_calibration()
+        else:
+            await motor.enable()
+            await motor.set_control_mode(ControlMode.IMPEDANCE)
+            await arm._calibrate_gripper()
+            await motor.set_control_mode(ControlMode.POSITION_FORCE)
 
     async def _wait_for_caches(self) -> None:
         """Block until the core's MIT stream has filled every arm-joint cache."""
@@ -177,22 +207,19 @@ class RtAxol:
     async def get_positions(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Measured positions from the passively filled caches (no CAN sent)."""
+        """Measured positions from the passively filled caches (no CAN sent).
 
-        def arm_positions(side: int, arm: AxolArm | None) -> np.ndarray | None:
-            if arm is None:
-                return None
-            values = arm.positions.copy()
-            # The cached gripper value stops updating once the core owns the
-            # bus (the gripper isn't in its stream); report the frozen
-            # pre-arm capture instead of a decaying cache.
-            if side in self._gripper_norm:
-                values[7] = self._gripper_norm[side]
-            return values
+        Every joint — gripper included — refreshes from the core's own
+        stream once armed (the gripper's POSITION_FORCE replies land in the
+        same passive caches).
+        """
+
+        def arm_positions(arm: AxolArm | None) -> np.ndarray | None:
+            return arm.positions.copy() if arm is not None else None
 
         return (
-            arm_positions(0, self._robot.left),
-            arm_positions(1, self._robot.right),
+            arm_positions(self._robot.left),
+            arm_positions(self._robot.right),
         )
 
     async def disable(self) -> None:

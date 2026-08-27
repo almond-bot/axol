@@ -1385,9 +1385,22 @@ class AxolArm:
         if self._command_sink is not None:
             # Realtime-core mode (axol teleop --rt): the fully computed MIT
             # tuples go to the sink — which ships them to the Rust core that
-            # owns the CAN bus — instead of onto the wire from here. The
-            # gripper is not driven by the rt core yet, so its command is
-            # dropped.
+            # owns the CAN bus — instead of onto the wire from here. Slot 7
+            # carries the gripper's POSITION_FORCE command (motor-frame
+            # target, speed limit, torque limit); zeros on the gripperless
+            # SKU (the core has no gripper configured and ignores the slot).
+            if self._has_gripper:
+                arm_cmds.append(
+                    (
+                        float(motor_targets[gripper_i]),
+                        self._arm_config.gripper.max_speed,
+                        self._arm_config.gripper.torque_limit,
+                        0.0,
+                        0.0,
+                    )
+                )
+            else:
+                arm_cmds.append((0.0, 0.0, 0.0, 0.0, 0.0))
             self._command_sink(arm_cmds)
         else:
             tasks = [

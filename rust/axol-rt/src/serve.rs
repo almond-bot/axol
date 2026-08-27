@@ -13,14 +13,20 @@
 //!
 //! Python -> Rust:
 //! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`/
-//!                     `abort_deg` keys and one `joint <side> <iface>
-//!                     <name> <motor_id> <kp> <kd>` line per joint
+//!                     `abort_deg` keys, one `joint <side> <iface> <name>
+//!                     <motor_id> <kp> <kd>` line per arm joint, and an
+//!                     optional `gripper <side> <iface> <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors (torque-neutral; run *before* Python
 //!                     resolves joint offsets, so the wrap state it verifies
-//!                     is the post-reset one)
-//! - `A`               arm: bring-up, enable, hold current pose
-//! - `T` + binary      target: side u8, seq u32 LE, 7 x 5 f64 LE
+//!                     is the post-reset one; the gripper is never touched)
+//! - `A`               arm: bring-up, enable, hold current pose (the
+//!                     gripper must already be enabled + calibrated in
+//!                     POSITION_FORCE mode by the Python side)
+//! - `T` + binary      target: side u8, seq u32 LE, 8 x 5 f64 LE — slots
+//!                     0-6 are arm-joint MIT tuples (p_des, v_des, kp, kd,
+//!                     t_ff); slot 7 is the gripper (p_des motor-frame,
+//!                     max_speed rad/s, max_torque Nm, 0, 0)
 //! - `D`               disarm: disable motors, threads exit
 //!
 //! Rust -> Python (text): `S` + state/fault message, `L` + log line.
@@ -28,9 +34,13 @@
 //! ## Safety
 //! - Targets stepping more than `max_step_rad` from the currently played
 //!   position are rejected (counted, reported) — corruption defense; the
-//!   Python side has its own max-step gate.
+//!   Python side has its own max-step gate. The gripper slot is exempt
+//!   (its targets legitimately jump, matching the Python gate).
 //! - A joint deviating more than `abort_deg` from its played target disables
-//!   both buses (e.g. a collision or a runaway).
+//!   both buses (e.g. a collision or a runaway). The gripper is exempt —
+//!   stalling against an object is its normal operation.
+//! - The gripper is not commanded at all until the first target arrives
+//!   (matching classic mode, where it sits idle until motion_control).
 //! - Watchdog: no target for `watchdog_ms` freezes the played position
 //!   (finishing the in-flight interpolation segment). The arms keep holding
 //!   — matching what the firmware itself does if the host dies — until a
@@ -49,7 +59,9 @@ use crate::can::CanSock;
 use crate::hold::sleep_until;
 use crate::proto;
 
-const N_JOINTS: usize = 7;
+/// Target-tuple slots per arm: 7 arm joints + the gripper.
+const N_SLOTS: usize = 8;
+const GRIPPER_SLOT: usize = 7;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -68,7 +80,7 @@ pub struct JointCmd {
 
 #[derive(Clone, Copy)]
 struct Target {
-    cmds: [JointCmd; N_JOINTS],
+    cmds: [JointCmd; N_SLOTS],
     seq: u32,
     arrival: Instant,
 }
@@ -116,20 +128,43 @@ fn parse_config(text: &str) -> io::Result<Config> {
             "abort_deg" => {
                 abort_deg = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?
             }
-            "joint" => {
+            "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
+                // gripper <side 0|1> <iface> <motor_id>
+                let gripper = f[0] == "gripper";
                 let side: u8 = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?;
                 let iface = f.get(2).ok_or_else(|| bad(line))?.to_string();
-                let spec = MotorSpec {
-                    joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
-                    motor_id: f.get(4).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
-                    kp: f.get(5).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
-                    kd: f.get(6).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                let bus = match buses.iter_mut().find(|(s, i, _)| *s == side && *i == iface) {
+                    Some(bus) => bus,
+                    None => {
+                        buses.push((side, iface.clone(), Vec::new()));
+                        buses.last_mut().unwrap()
+                    }
                 };
-                match buses.iter_mut().find(|(s, i, _)| *s == side && *i == iface) {
-                    Some((_, _, specs)) => specs.push(spec),
-                    None => buses.push((side, iface, vec![spec])),
+                let spec = if gripper {
+                    MotorSpec {
+                        joint: "gripper".to_string(),
+                        motor_id: f.get(3).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        kp: 0.0,
+                        kd: 0.0,
+                        gripper: true,
+                        slot: GRIPPER_SLOT,
+                    }
+                } else {
+                    MotorSpec {
+                        joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
+                        motor_id: f.get(4).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        kp: f.get(5).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        kd: f.get(6).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        gripper: false,
+                        // Arm joints arrive in Joint enum order per bus.
+                        slot: bus.2.iter().filter(|s| !s.gripper).count(),
+                    }
+                };
+                if spec.slot >= N_SLOTS {
+                    return Err(bad(line));
                 }
+                bus.2.push(spec);
             }
             _ => return Err(bad(line)),
         }
@@ -148,7 +183,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     // side u8, seq u32, 7 x 5 f64
-    let expected = 1 + 4 + N_JOINTS * 5 * 8;
+    let expected = 1 + 4 + N_SLOTS * 5 * 8;
     if payload.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -157,7 +192,7 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     }
     let side = payload[0];
     let seq = u32::from_le_bytes(payload[1..5].try_into().unwrap());
-    let mut cmds = [JointCmd::default(); N_JOINTS];
+    let mut cmds = [JointCmd::default(); N_SLOTS];
     let mut off = 5;
     for cmd in &mut cmds {
         let mut vals = [0.0f64; 5];
@@ -407,16 +442,21 @@ fn bus_loop(
     }
     let _ = ready_tx.send(Ok(()));
 
-    // Play state: start by holding the measured pose with config gains.
-    let mut play: [JointCmd; N_JOINTS] = std::array::from_fn(|i| JointCmd {
-        p_des: motors[i].hold_pos,
-        v_des: 0.0,
-        kp: motors[i].kp,
-        kd: motors[i].kd,
-        t_ff: 0.0,
-    });
+    // Play state, indexed by target slot: start by holding the measured
+    // pose with config gains. The gripper slot's hold values are never sent
+    // (it isn't commanded until the first target arrives).
+    let mut play: [JointCmd; N_SLOTS] = [JointCmd::default(); N_SLOTS];
+    for m in &motors {
+        play[m.slot] = JointCmd {
+            p_des: m.hold_pos,
+            v_des: 0.0,
+            kp: m.kp,
+            kd: m.kd,
+            t_ff: 0.0,
+        };
+    }
     // Interpolation segment: from -> the pending target over `dur`.
-    let mut seg_from: [JointCmd; N_JOINTS] = play;
+    let mut seg_from: [JointCmd; N_SLOTS] = play;
     let mut seg_target: Option<Target> = None;
     let mut seg_started = Instant::now();
     let mut last_seq: Option<u32> = None;
@@ -459,8 +499,9 @@ fn bus_loop(
                                 );
                             }
                         }
-                        let step_ok = t
-                            .cmds
+                        // Gripper slot exempt: its targets legitimately jump
+                        // (the Python max-step gate excludes it too).
+                        let step_ok = t.cmds[..GRIPPER_SLOT]
                             .iter()
                             .zip(play.iter())
                             .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
@@ -498,7 +539,7 @@ fn bus_loop(
                 let dur = period_est.clamp(Duration::from_millis(2), Duration::from_millis(50));
                 let alpha =
                     (began.duration_since(seg_started).as_secs_f64() / dur.as_secs_f64()).min(1.0);
-                for i in 0..N_JOINTS {
+                for i in 0..N_SLOTS {
                     let (from, to) = (&seg_from[i], &t.cmds[i]);
                     play[i] = JointCmd {
                         p_des: from.p_des + (to.p_des - from.p_des) * alpha,
@@ -512,18 +553,34 @@ fn bus_loop(
             }
 
             // Send all commands back-to-back.
-            for (i, m) in motors.iter().enumerate() {
-                let c = &play[i];
-                let frame = proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, c.t_ff, &m.ranges);
-                match m.vendor {
-                    Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.id as u16, &frame)?,
-                    Vendor::Damiao => sock.send(m.id as u16, &frame)?,
+            let mut sent = 0usize;
+            for m in motors.iter() {
+                let c = &play[m.slot];
+                if m.gripper {
+                    // Idle until the first target (classic mode leaves the
+                    // gripper uncommanded until motion_control too). Slot
+                    // layout: v_des carries max_speed, kp carries max_torque;
+                    // the wire wants current as a fraction of rated (t_max).
+                    if seg_target.is_none() {
+                        continue;
+                    }
+                    let frame =
+                        proto::dm_pos_force_encode(c.p_des, c.v_des, c.kp / m.ranges.t_max);
+                    sock.send(proto::DM_POS_FORCE_ARB_BASE + m.id as u16, &frame)?;
+                } else {
+                    let frame =
+                        proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, c.t_ff, &m.ranges);
+                    match m.vendor {
+                        Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.id as u16, &frame)?,
+                        Vendor::Damiao => sock.send(m.id as u16, &frame)?,
+                    }
                 }
+                sent += 1;
             }
 
             // Collect replies; deviation abort against the played target.
             let reply_deadline = deadline + Duration::from_secs_f64(period.as_secs_f64() * 0.8);
-            let mut pending = motors.len();
+            let mut pending = sent;
             while pending > 0 {
                 let now = Instant::now();
                 if now >= reply_deadline {
@@ -544,7 +601,7 @@ fn bus_loop(
                         );
                         (idx, pos)
                     }
-                    id if (0x16..=0x17).contains(&id) => {
+                    id if (0x16..=0x18).contains(&id) => {
                         let motor_id = (id - 0x10) as u8;
                         let Some(idx) = motors.iter().position(|m| m.id == motor_id) else {
                             continue;
@@ -560,8 +617,13 @@ fn bus_loop(
                     }
                     _ => continue,
                 };
-                pending -= 1;
-                let e = (pos - play[idx].p_des).abs();
+                pending = pending.saturating_sub(1);
+                // No deviation abort for the gripper: stalling against an
+                // object (or a jaw span the target overshoots) is normal.
+                if motors[idx].gripper {
+                    continue;
+                }
+                let e = (pos - play[motors[idx].slot].p_des).abs();
                 if e > abort_rad {
                     fault.store(1, Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);

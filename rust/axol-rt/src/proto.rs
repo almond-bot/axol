@@ -168,6 +168,22 @@ pub const DM_ENABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC];
 pub const DM_DISABLE: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD];
 pub const DM_CLEAR_ERRORS: [u8; 8] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFB];
 
+/// Damiao POSITION_FORCE command arbitration base (`0x300 + motor_id`).
+pub const DM_POS_FORCE_ARB_BASE: u16 = 0x300;
+
+/// Encode a Damiao POSITION_FORCE command (`<fHH>`): raw f32 target position,
+/// speed limit scaled x100 (clamped 0-100 rad/s), current limit as a [0, 1]
+/// fraction of rated scaled x10000. Mirrors `damiao.py _send_cmd`.
+pub fn dm_pos_force_encode(position: f64, max_speed: f64, current_limit: f64) -> [u8; 8] {
+    let v_scaled = (max_speed.clamp(0.0, 100.0) * 100.0) as u16;
+    let i_scaled = (current_limit.clamp(0.0, 1.0) * 10000.0) as u16;
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&(position as f32).to_le_bytes());
+    out[4..6].copy_from_slice(&v_scaled.to_le_bytes());
+    out[6..8].copy_from_slice(&i_scaled.to_le_bytes());
+    out
+}
+
 /// Damiao feedback status nibbles (frame byte 0, high nibble).
 #[allow(dead_code)] // staged for status verification
 pub const DM_STATUS_DISABLED: u8 = 0x0;

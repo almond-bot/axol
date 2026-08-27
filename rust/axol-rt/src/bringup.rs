@@ -20,6 +20,13 @@ pub struct MotorSpec {
     /// Gains for the initial hold phase (production config values).
     pub kp: f64,
     pub kd: f64,
+    /// The gripper is special-cased throughout: POSITION_FORCE mode instead
+    /// of MIT, brought up (enabled + calibrated) by the Python side before
+    /// the core arms, exempt from the deviation abort (contact is its job).
+    pub gripper: bool,
+    /// Target-tuple index this motor plays (arm joints 0-6, gripper 7);
+    /// decouples the wire layout from bring-up iteration order.
+    pub slot: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +46,8 @@ pub struct ReadyMotor {
     pub hold_pos: f64,
     pub kp: f64,
     pub kd: f64,
+    pub gripper: bool,
+    pub slot: usize,
 }
 
 /// Phase 1 of a cold bring-up: MyActuator 0x76 system reset (all motors at
@@ -48,6 +57,11 @@ pub struct ReadyMotor {
 pub fn prep(sock: &CanSock, specs: &[MotorSpec]) -> io::Result<()> {
     let mut any_ma = false;
     for spec in specs {
+        if spec.gripper {
+            // The gripper's bring-up (enable, calibration, mode switch) is
+            // Python's, and it may be holding an object — never touched here.
+            continue;
+        }
         if spec.motor_id <= 5 {
             sock.send(
                 proto::MA_REQ + spec.motor_id as u16,
@@ -109,15 +123,20 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             hold_pos: proto::ma_decode_position(&pos_frame),
             kp: spec.kp,
             kd: spec.kd,
+            gripper: false,
+            slot: spec.slot,
         });
     }
 
     for spec in specs.iter().filter(|s| s.motor_id >= 6) {
         let id = spec.motor_id as u16;
         let mode = read_dm_register(sock, id, proto::DM_REG_CTRL_MODE)?;
-        if mode != 1.0 {
+        // Wrists run MIT (1); the gripper must already be in POSITION_FORCE
+        // (4), set by the Python side's calibration flow before arming.
+        let expected = if spec.gripper { 4.0 } else { 1.0 };
+        if mode != expected {
             return Err(err(format!(
-                "{} (0x{id:02X}): control mode {mode} is not MIT — not enabling",
+                "{} (0x{id:02X}): control mode {mode} (expected {expected}) — not enabling",
                 spec.joint
             )));
         }
@@ -143,6 +162,8 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             hold_pos: decoded.position,
             kp: spec.kp,
             kd: spec.kd,
+            gripper: spec.gripper,
+            slot: spec.slot,
         });
     }
     Ok(motors)
@@ -175,6 +196,9 @@ pub fn read_dm_register(sock: &CanSock, motor_id: u16, rid: u8) -> io::Result<f6
 
 pub fn enable(sock: &CanSock, motors: &[ReadyMotor]) -> io::Result<()> {
     for m in motors {
+        if m.gripper {
+            continue; // enabled by the Python side's calibration flow
+        }
         match m.vendor {
             Vendor::MyActuator => {
                 if txn::ma_request(sock, m.id, proto::ma_cmd(proto::MA_RELEASE_BRAKE), TIMEOUT)?
