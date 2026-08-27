@@ -508,7 +508,14 @@ fn bus_loop(
                         if step_ok {
                             seg_from = play;
                             seg_target = Some(t);
-                            seg_started = t.arrival;
+                            // Anchor at the adoption *tick*, not the packet
+                            // arrival: anchoring at arrival makes the first
+                            // tick jump partway through the segment by an
+                            // amount that varies with the sender's
+                            // scheduling jitter — measured as broadband
+                            // velocity noise proportional to motion speed.
+                            // From here alpha starts at exactly 0.
+                            seg_started = began;
                         } else {
                             rejected += 1;
                         }
@@ -534,9 +541,15 @@ fn bus_loop(
                 send_text(out_tx, b'L', &format!("{iface}: target stream resumed"));
             }
 
-            // Interpolate toward the current target over one sender period.
+            // Interpolate toward the current target over slightly more than
+            // one sender period: successive segments then overlap (the next
+            // target is adopted mid-flight, re-aiming from the current play
+            // state) instead of finishing early and freezing for a tick —
+            // the other half of the stop-go velocity ripple. Costs ~2 ms of
+            // extra command latency.
             if let Some(t) = &seg_target {
-                let dur = period_est.clamp(Duration::from_millis(2), Duration::from_millis(50));
+                let dur = (period_est.mul_f64(1.25))
+                    .clamp(Duration::from_millis(4), Duration::from_millis(60));
                 let alpha =
                     (began.duration_since(seg_started).as_secs_f64() / dur.as_secs_f64()).min(1.0);
                 for i in 0..N_SLOTS {

@@ -141,6 +141,14 @@ class RtAxol:
 
         await self._link.arm()
         await self._wait_for_caches()
+        # Prime one full hold target at the measured pose: the core's own
+        # bring-up hold has no gravity feedforward (t_ff = 0), so a
+        # gravity-loaded joint would sag by ~gravity/kp until the caller's
+        # first command — which for teleop is minutes away (JAX compile) —
+        # and then clunk back up. One motion_control at the measured pose
+        # ships the full gravity/friction terms; the watchdog then holds it.
+        pos_l, pos_r = await self.get_positions()
+        await self.motion_control(left=pos_l, right=pos_r)
         _logger.info(
             "rt: armed — axol-rt owns the bus at %.0f Hz; Python streams targets",
             self._loop_hz,
