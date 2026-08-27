@@ -17,8 +17,8 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
 """
 
 import asyncio
+import contextlib
 import logging
-import os
 import socket
 from typing import TYPE_CHECKING, Any
 
@@ -49,42 +49,13 @@ def main(argv: list[str]) -> None:
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
-    # Pin the control process to its dedicated cores before any threads or
-    # subprocesses exist (the control loop, VR server, and IK-dispatch threads
-    # inherit the mask; the IK worker and video relay re-pin themselves to
-    # their own groups). Without this the control thread roams every core at
-    # default priority while the IK worker solves at nice(-10) on its core —
-    # whenever the scheduler parks the loop there (or on the relay cores), a
-    # 7-8 ms solve preempts a 4.2 ms tick. A recorded hardware session showed
-    # 57% of control ticks late (median 5.4 ms, p99 9.3), 80%+ late inside
-    # solve windows, and the interval jitter lands straight in
-    # motion_control's differentiated feedforward as felt roughness;
-    # collect-data has pinned for the same reason all along. Restored in the
-    # finally so a long-lived launcher isn't left pinned; skipped in sim
-    # (dev machines render in-process and have no realtime loop worth
-    # isolating). No-op where affinity isn't available.
-    orig_affinity: set[int] | None = None
-    if not cfg.sim:
-        try:
-            orig_affinity = os.sched_getaffinity(0)
-        except (AttributeError, OSError):
-            orig_affinity = None
-        affinity.pin_realtime()
-
     hostname = socket.gethostname()
     local_ip = _get_local_ip()
     print("Connect the VR app (https://axol.almond.bot) to this machine:")
     print(f"  Hostname : {hostname}.local")
     print(f"  IP       : {local_ip}")
 
-    try:
-        asyncio.run(_run(cfg))
-    finally:
-        if orig_affinity is not None:
-            try:
-                os.sched_setaffinity(0, orig_affinity)
-            except (AttributeError, OSError):
-                pass
+    asyncio.run(_run(cfg))
 
 
 def _stereo_serials_for(cfg: TeleopCmdConfig) -> set[int]:
@@ -361,9 +332,6 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
-    from ..robot import Axol, Sim
-    from ..teleop import VRTeleop
-
     if cfg.cart_only:
         if cfg.sim:
             raise ValueError(
@@ -372,6 +340,24 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             )
         await _run_cart_only(cfg)
         return
+
+    # Hardware sessions get realtime scheduling for the whole run — core
+    # pinning plus a short GIL switch interval (see
+    # :func:`affinity.realtime_session`). This matters most when serve runs
+    # teleop in-process: there the 240 Hz control loop shares the interpreter
+    # with the web UI's handlers, and a recorded session measured 50-57% of
+    # control ticks arriving late (median 5.4 ms vs 4.17 nominal), which
+    # lands in motion_control's differentiated feedforward as felt
+    # roughness. Sim skips it: dev machines render in-process and have no
+    # realtime loop worth isolating.
+    session = contextlib.nullcontext() if cfg.sim else affinity.realtime_session()
+    with session:
+        await _run_robot(cfg)
+
+
+async def _run_robot(cfg: TeleopCmdConfig) -> None:
+    from ..robot import Axol, Sim
+    from ..teleop import VRTeleop
 
     if cfg.sim:
         robot = Sim()
