@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import errno
 import logging
+import socket
+import struct
 import time
 from pathlib import Path
 from typing import Callable
@@ -15,6 +17,11 @@ from ..constants import CAN_BRINGUP_SCRIPT
 from ..utils.sudo import run_root
 
 _logger = logging.getLogger(__name__)
+
+# CAN_RAW socket option constants (missing from the socket module on some
+# Python builds; values are stable Linux ABI).
+_SOL_CAN_RAW = getattr(socket, "SOL_CAN_RAW", 101)
+_CAN_RAW_FILTER = getattr(socket, "CAN_RAW_FILTER", 1)
 
 # Socket failures with these errnos mean the interface went away or lost its
 # link mid-session. On the Axol hub that's a USB disconnect — EMI from the
@@ -209,6 +216,28 @@ class CanBus:
 
     async def __aexit__(self, *_) -> None:
         await self.close()
+
+    def mute_rx(self) -> None:
+        """Stop receiving frames at the kernel: zero-length CAN_RAW_FILTER.
+
+        Used by the rt path once the Rust core owns the bus: SocketCAN
+        broadcasts every frame to every open socket, so at 240 Hz Python
+        would otherwise dispatch ~7,700 frames/s through python-can and
+        asyncio just to fill caches it now gets from the core's telemetry
+        packets. With zero filters the kernel delivers nothing — the reader
+        task stays parked with no per-frame work. TX is unaffected.
+        Reversed by :meth:`unmute_rx` (needed before any request/reply
+        exchange, e.g. the belt-and-braces disable).
+        """
+        if self._bus is not None:
+            self._bus.socket.setsockopt(_SOL_CAN_RAW, _CAN_RAW_FILTER, b"")
+
+    def unmute_rx(self) -> None:
+        """Restore the match-everything CAN_RAW_FILTER after :meth:`mute_rx`."""
+        if self._bus is not None:
+            self._bus.socket.setsockopt(
+                _SOL_CAN_RAW, _CAN_RAW_FILTER, struct.pack("=II", 0, 0)
+            )
 
     def _add_listener(self, listener: Callable[[can.Message], None]) -> None:
         self._listeners.append(listener)

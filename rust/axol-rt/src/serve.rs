@@ -51,7 +51,15 @@
 //!                     five zeros)
 //! - `D`               disarm: disable motors, threads exit
 //!
-//! Rust -> Python (text): `S` + state/fault message, `L` + log line.
+//! Rust -> Python:
+//! - `S` + text        state/fault message
+//! - `L` + text        log line
+//! - `F` + binary      telemetry, one per bus per tick while armed: side
+//!                     u8, valid-mask u8, then 8 x (pos f64, vel f64, tau
+//!                     f64, age_us u32) — the latest decoded feedback per
+//!                     slot. Python fills its Motor caches from these (see
+//!                     `build_feedback`); it does not read CAN while the
+//!                     core is armed.
 //!
 //! ## Safety
 //! - Targets stepping more than `max_step_rad` from the currently played
@@ -449,6 +457,30 @@ mod tests {
         assert!(start.elapsed() >= STALL_DETECT);
     }
 
+    /// Layout contract with `RtLink._parse_feedback`: F-packets are
+    /// side u8, mask u8, then 8 x (pos f64, vel f64, tau f64, age_us u32),
+    /// all little-endian.
+    #[test]
+    fn feedback_packet_layout() {
+        let now = Instant::now();
+        let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
+        latest[0] = Some((1.5, -0.25, 3.0, now - Duration::from_micros(1200)));
+        latest[7] = Some((0.5, 0.0, 0.1, now));
+        let msg = build_feedback(1, &latest, now);
+        assert_eq!(msg.len(), 3 + N_SLOTS * 28);
+        assert_eq!(msg[0], b'F');
+        assert_eq!(msg[1], 1);
+        assert_eq!(msg[2], 0b1000_0001);
+        let pos0 = f64::from_le_bytes(msg[3..11].try_into().unwrap());
+        let vel0 = f64::from_le_bytes(msg[11..19].try_into().unwrap());
+        let tau0 = f64::from_le_bytes(msg[19..27].try_into().unwrap());
+        let age0 = u32::from_le_bytes(msg[27..31].try_into().unwrap());
+        assert_eq!((pos0, vel0, tau0, age0), (1.5, -0.25, 3.0, 1200));
+        let slot7 = 3 + 7 * 28;
+        let pos7 = f64::from_le_bytes(msg[slot7..slot7 + 8].try_into().unwrap());
+        assert_eq!(pos7, 0.5);
+    }
+
     #[test]
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
@@ -501,6 +533,37 @@ fn send_text(tx: &mpsc::Sender<Vec<u8>>, tag: u8, text: &str) {
     msg.push(tag);
     msg.extend_from_slice(text.as_bytes());
     let _ = tx.send(msg);
+}
+
+/// Latest decoded feedback for one slot: (position, velocity, torque,
+/// receive time).
+type SlotFeedback = Option<(f64, f64, f64, Instant)>;
+
+/// Build one telemetry packet: `F`, side u8, valid-mask u8 (bit i = slot i
+/// has been seen), then per slot: pos f64, vel f64, tau f64 (all LE) and
+/// age_us u32 — microseconds between the frame's CAN receive and this
+/// packet, so the Python side can reconstruct per-slot receive timestamps
+/// on its own clock. Mirrored by `RtLink._parse_feedback`.
+fn build_feedback(side: u8, latest: &[SlotFeedback; N_SLOTS], now: Instant) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(3 + N_SLOTS * 28);
+    msg.push(b'F');
+    msg.push(side);
+    let mut mask = 0u8;
+    for (i, slot) in latest.iter().enumerate() {
+        if slot.is_some() {
+            mask |= 1 << i;
+        }
+    }
+    msg.push(mask);
+    for slot in latest {
+        let (pos, vel, tau, ts) = slot.unwrap_or((0.0, 0.0, 0.0, now));
+        msg.extend_from_slice(&pos.to_le_bytes());
+        msg.extend_from_slice(&vel.to_le_bytes());
+        msg.extend_from_slice(&tau.to_le_bytes());
+        let age_us = now.duration_since(ts).as_micros().min(u32::MAX as u128) as u32;
+        msg.extend_from_slice(&age_us.to_le_bytes());
+    }
+    msg
 }
 
 pub fn run(socket_path: &str) -> io::Result<()> {
@@ -763,6 +826,10 @@ fn bus_loop(
         })
         .collect();
     let mut prev_tick: Option<Instant> = None;
+    // Latest decoded feedback per slot, shipped to Python once per tick as
+    // an `F` packet — the core is the only CAN consumer; Python fills its
+    // Motor caches from these instead of passively reading the bus.
+    let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
     // Interpolation segment: from -> the pending target over `dur`.
     let mut seg_from: [JointCmd; N_SLOTS] = play;
     let mut seg_target: Option<Target> = None;
@@ -961,18 +1028,18 @@ fn bus_loop(
                 }
                 sock.set_recv_timeout(reply_deadline - now)?;
                 let Some(frame) = sock.recv()? else { break };
-                let (idx, pos) = match frame.id {
+                let (idx, pos, vel, tau) = match frame.id {
                     id if (0x501..=0x505).contains(&id) => {
                         let motor_id = (id - 0x500) as u8;
                         let Some(idx) = motors.iter().position(|m| m.id == motor_id) else {
                             continue;
                         };
-                        let (pos, _, _) = proto::ma_decode_mit_feedback(
+                        let (pos, vel, tau) = proto::ma_decode_mit_feedback(
                             &frame.data,
                             motors[idx].ranges.p_max,
                             motors[idx].ranges.t_max,
                         );
-                        (idx, pos)
+                        (idx, pos, vel, tau)
                     }
                     id if (0x16..=0x18).contains(&id) => {
                         let motor_id = (id - 0x10) as u8;
@@ -986,11 +1053,13 @@ fn bus_loop(
                             m.ranges.v_max,
                             m.ranges.t_max,
                         );
-                        (idx, fb.position)
+                        (idx, fb.position, fb.velocity, fb.torque)
                     }
                     _ => continue,
                 };
                 pending = pending.saturating_sub(1);
+                let recv_time = Instant::now();
+                latest[motors[idx].slot] = Some((pos, vel, tau, recv_time));
                 // No deviation abort for the gripper: stalling against an
                 // object (or a jaw span the target overshoots) is normal.
                 if motors[idx].gripper {
@@ -1000,10 +1069,11 @@ fn bus_loop(
                 // frame's own receive spacing (the CAN reply cadence is the
                 // loop cadence; arrival jitter within a tick is µs-scale).
                 {
-                    let now = Instant::now();
                     let d = &mut damp[motors[idx].slot];
-                    let dt = d.last_fb.map_or(0.0, |p| now.duration_since(p).as_secs_f64());
-                    d.last_fb = Some(now);
+                    let dt = d
+                        .last_fb
+                        .map_or(0.0, |p| recv_time.duration_since(p).as_secs_f64());
+                    d.last_fb = Some(recv_time);
                     d.vel_meas = d.v_meas.update(pos, dt);
                 }
                 let e = (pos - play[motors[idx].slot].p_des).abs();
@@ -1017,6 +1087,13 @@ fn bus_loop(
                         cfg.abort_deg,
                     )));
                 }
+            }
+
+            // Ship this tick's telemetry to Python (non-blocking mpsc; the
+            // writer thread does the socket I/O). Skipped until the first
+            // reply so an all-empty packet never races the bring-up reads.
+            if latest.iter().any(|s| s.is_some()) {
+                let _ = out_tx.send(build_feedback(side, &latest, Instant::now()));
             }
 
             if began >= next_stats {

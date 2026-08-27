@@ -13,9 +13,20 @@ import os
 import shutil
 import struct
 import subprocess
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 _logger = logging.getLogger(__name__)
+
+# One telemetry entry per slot: pos (rad), vel (rad/s), tau (Nm), age_us.
+_FEEDBACK_SLOTS = 8
+_FEEDBACK_FMT = struct.Struct("<BB" + "3dI" * _FEEDBACK_SLOTS)
+
+#: One parsed telemetry slot: (position, velocity, torque, receive_ts) —
+#: receive_ts is the frame's CAN receive time reconstructed on this host's
+#: ``time.time()`` clock from the packet's per-slot age.
+FeedbackSlot = tuple[float, float, float, float]
 
 _CONNECT_TIMEOUT_S = 5.0
 # PREP includes the MyActuator reset settle (~2.2 s per bus, run serially).
@@ -63,6 +74,8 @@ class RtLink:
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._states: asyncio.Queue[str] = asyncio.Queue()
+        # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
+        self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
 
     async def start(self) -> None:
         """Launch the core and connect. The core is idle until configured."""
@@ -97,7 +110,13 @@ class RtLink:
                 header = await self._reader.readexactly(4)
                 (size,) = struct.unpack("<I", header)
                 payload = await self._reader.readexactly(size)
-                tag, body = payload[:1], payload[1:].decode("utf-8", errors="replace")
+                tag = payload[:1]
+                if tag == b"F":
+                    if self.on_feedback is not None:
+                        side, slots = self._parse_feedback(payload)
+                        self.on_feedback(side, slots)
+                    continue
+                body = payload[1:].decode("utf-8", errors="replace")
                 if tag == b"S":
                     _logger.info("axol-rt: %s", body)
                     self._states.put_nowait(body)
@@ -109,6 +128,28 @@ class RtLink:
             _logger.info("axol-rt: connection closed")
         except asyncio.CancelledError:
             raise
+
+    @staticmethod
+    def _parse_feedback(payload: bytes) -> tuple[int, dict[int, FeedbackSlot]]:
+        """Decode one `F` telemetry packet (layout: see ``build_feedback``
+        in ``serve.rs`` and its ``feedback_packet_layout`` test).
+
+        Per-slot receive timestamps are reconstructed from the packet's
+        age_us fields against ``time.time()`` now — within socket transit
+        (~0.1 ms) of the frames' true CAN receive times, and mutually
+        consistent across slots, which is all downstream differentiation
+        needs.
+        """
+        vals = _FEEDBACK_FMT.unpack(payload[1:])
+        side, mask = vals[0], vals[1]
+        now = time.time()
+        slots: dict[int, FeedbackSlot] = {}
+        for i in range(_FEEDBACK_SLOTS):
+            if not mask & (1 << i):
+                continue
+            pos, vel, tau, age_us = vals[2 + i * 4 : 6 + i * 4]
+            slots[i] = (pos, vel, tau, now - age_us / 1e6)
+        return side, slots
 
     def _send(self, payload: bytes) -> None:
         if self._writer is None or self._writer.is_closing():

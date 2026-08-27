@@ -104,11 +104,15 @@ object is its job), is never commanded until the first target arrives,
 and its bring-up — enable, open-stop calibration or attach/restore of a
 holding jaw — stays in Python, run on the quiet bus before the core arms.
 
-Measured feedback flows back to Python for free: SocketCAN broadcasts
-every frame to every open socket, so Python's passive `Motor` caches keep
-filling from the core's own MIT and POSITION_FORCE replies — positions
-and torques stay fresh for `get_positions`, recording, and the contact
-watchdog, with real CAN timestamps.
+Measured feedback flows back to Python as telemetry: once per bus per
+tick the core ships an `F` packet (per-slot position, velocity, torque,
+and frame age) over the socket, and Python fills its `Motor` caches from
+it — positions and torques stay fresh for `get_positions`, recording, and
+the contact watchdog, with receive timestamps reconstructed to within
+socket transit. Python's own CAN receive path is muted at the kernel
+(zero-length CAN_RAW_FILTER) while the core is armed, so the ~7,700
+frames/s SocketCAN would otherwise broadcast into python-can cost Python
+nothing; ~480 tiny packet decodes/s replace them.
 
 Bring-up is split so Python's calibration stays authoritative: the core
 resets the arm motors first (`prep`, gripper untouched), then Python
@@ -148,5 +152,6 @@ via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 
 ## Roadmap
 
-1. Telemetry packets (tick stats already stream as log lines; positions
-   currently ride the passive CAN broadcast).
+Nothing pending — the split described above is fully built: the core owns
+the wire in both directions (commands out, telemetry packets back), and
+Python is CAN-silent from arm to disarm.

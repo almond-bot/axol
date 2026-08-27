@@ -6,11 +6,12 @@ CAN buses are owned by the ``axol-rt`` subprocess:
 
 - ``enable()`` runs the split bring-up: the core resets the motors (prep),
   then Python resolves joint offsets and MyActuator decode ranges against the
-  post-reset state over its own (passive) bus sockets, then the core enables
-  and holds. SocketCAN broadcasts every frame to every open socket, so
-  Python's ``Motor`` feedback caches keep filling from the core's own 240 Hz
-  MIT stream — measured positions, velocities, and torques stay available to
-  ``motion_control``'s host-damping path with no extra traffic.
+  post-reset state over its own bus sockets, then the core enables and holds.
+  Once armed, the core is the *only* CAN consumer: Python's receive path is
+  muted at the kernel (zero-length CAN_RAW_FILTER) and the ``Motor`` caches
+  fill from the core's per-tick telemetry packets instead — ~480 packet
+  decodes/s replacing ~7,700 python-can frame dispatches/s on this
+  CPU-starved Jetson.
 - ``motion_control()`` runs the full production computation in
   ``AxolArm.motion_control`` (gravity, inertia, friction, host damping), but
   a command sink ships the resulting MIT tuples to the core instead of
@@ -29,7 +30,7 @@ CAN buses are owned by the ``axol-rt`` subprocess:
   of 2026-08-27; see rust/axol-rt/src/filter.rs).
 
 Guarded return works exactly as in classic mode: ``torque_residuals`` and
-``reset_command_state`` only touch the passively filled caches and local
+``reset_command_state`` only touch the telemetry-filled caches and local
 state, and ``gravity_compensate`` streams its tuples through the same
 command sink, so the contact watchdog, the limp contact hold, and the
 replanned reset all run against the core.
@@ -45,9 +46,10 @@ import numpy as np
 
 from ..constants import ARM_JOINTS
 from ..motor import ControlMode, Joint
+from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import Axol, AxolArm
-from .link import RtLink
+from .link import FeedbackSlot, RtLink
 
 _logger = logging.getLogger(__name__)
 
@@ -70,6 +72,8 @@ class RtAxol:
         self._abort_deg = abort_deg
         self._link = RtLink()
         self._seq = 0
+        # Telemetry packets received per side since arm.
+        self._fb_packets = [0, 0]
 
     @property
     def left(self) -> AxolArm | None:
@@ -115,6 +119,7 @@ class RtAxol:
 
     async def enable(self) -> None:
         """Full rt bring-up: prep (core resets) -> Python reads -> arm."""
+        self._fb_packets = [0, 0]
         await self._link.start()
         await self._link.configure(self._config_text())
         # The core's prep resets the MyActuator motors (multi-turn wrap state
@@ -146,6 +151,13 @@ class RtAxol:
 
         for side, arm in self._arms():
             arm._command_sink = self._make_sink(side)
+        self._link.on_feedback = self._make_feedback_feed()
+
+        # From here the core owns the wire: silence Python's CAN receive
+        # path at the kernel (zero work per frame) — the caches now fill
+        # from the core's telemetry packets instead of passive listening.
+        for bus in self._buses():
+            bus.mute_rx()
 
         await self._link.arm()
         await self._wait_for_caches()
@@ -185,21 +197,61 @@ class RtAxol:
             await arm._calibrate_gripper()
             await motor.set_control_mode(ControlMode.POSITION_FORCE)
 
+    def _buses(self) -> list[CanBus]:
+        out = []
+        for side, _arm in self._arms():
+            bus = self._robot._left_bus if side == 0 else self._robot._right_bus
+            if bus is not None:
+                out.append(bus)
+        return out
+
+    def _make_feedback_feed(self):
+        """Build the telemetry handler that fills the Motor caches.
+
+        Writes the same four fields the passive listener path caches
+        (position, velocity, torque, receive timestamp), in the same motor
+        frame — the core's decode is a bit-for-bit port of the drivers' —
+        so every downstream consumer (``arm.positions``, ``torque_residuals``,
+        the recorder) is source-agnostic.
+        """
+        arms = dict(self._arms())
+        joints = list(ARM_JOINTS)
+
+        def feed(side: int, slots: dict[int, FeedbackSlot]) -> None:
+            arm = arms.get(side)
+            if arm is None:
+                return
+            self._fb_packets[side] += 1
+            for i, (pos, vel, tau, ts) in slots.items():
+                if i < _N_ARM:
+                    motor = arm.motors[joints[i]]
+                elif arm._has_gripper:
+                    motor = arm.motors[Joint.GRIPPER]
+                else:
+                    continue
+                motor._position = pos
+                motor._velocity = vel
+                motor._torque = tau
+                motor._feedback_ts = ts
+
+        return feed
+
     async def _wait_for_caches(self) -> None:
-        """Block until the core's MIT stream has filled every arm-joint cache."""
+        """Block until the core's telemetry stream is flowing for every arm.
+
+        The caches were already primed by the pre-arm direct reads; this
+        confirms the core's own feedback path (MIT replies -> `F` packets)
+        is live before the caller starts streaming against it.
+        """
         deadline = time.monotonic() + 2.0
+        sides = [side for side, _arm in self._arms()]
         while True:
-            ready = all(
-                arm.motors[j].has_position
-                for _side, arm in self._arms()
-                for j in ARM_JOINTS
-            )
-            if ready:
+            if all(self._fb_packets[s] > 0 for s in sides):
                 return
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    "rt: armed, but the core's feedback stream did not fill "
-                    "the position caches within 2 s"
+                    "rt: armed, but no telemetry packet arrived from the "
+                    "core within 2 s"
                 )
             await asyncio.sleep(0.02)
 
@@ -240,10 +292,10 @@ class RtAxol:
         await self._robot.gravity_compensate(kd, free_joints, gripper_targets)
 
     def torque_residuals(self) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Per-arm measured-minus-gravity torques from the passive caches.
+        """Per-arm measured-minus-gravity torques from the telemetry caches.
 
-        The core's own MIT stream refreshes measured torque every tick, so
-        this needs no CAN traffic — same contract as ``Axol``.
+        The core's telemetry refreshes measured torque every tick, so this
+        needs no CAN traffic — same contract as ``Axol``.
         """
         return self._robot.torque_residuals()
 
@@ -258,11 +310,11 @@ class RtAxol:
     async def get_positions(
         self,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """Measured positions from the passively filled caches (no CAN sent).
+        """Measured positions from the telemetry-filled caches (no CAN sent).
 
-        Every joint — gripper included — refreshes from the core's own
-        stream once armed (the gripper's POSITION_FORCE replies land in the
-        same passive caches).
+        Every joint — gripper included — refreshes from the core's per-tick
+        telemetry packets once armed (the gripper's POSITION_FORCE replies
+        land in the same slot stream).
         """
 
         def arm_positions(arm: AxolArm | None) -> np.ndarray | None:
@@ -277,11 +329,16 @@ class RtAxol:
         """Disarm the core, tear the link down, then belt-and-braces disable."""
         for _side, arm in self._arms():
             arm._command_sink = None
+        self._link.on_feedback = None
         try:
             await self._link.disarm()
         except Exception as exc:  # noqa: BLE001 - core may already be gone
             _logger.warning("rt: disarm failed (%s); core teardown continues", exc)
         await self._link.close()
+        # The belt-and-braces disable is a request/reply exchange — restore
+        # Python's CAN receive path first (muted since arm).
+        for bus in self._buses():
+            bus.unmute_rx()
         # The core already disabled the motors on disarm/exit; repeating the
         # shutdown from Python is harmless (the bus is free again) and covers
         # a core that died mid-session. Also closes the Python buses.

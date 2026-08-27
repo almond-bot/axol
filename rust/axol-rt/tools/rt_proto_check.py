@@ -71,6 +71,39 @@ async def skewed(send, recv, w):
     return "sent skewed target"
 
 
+def check_feedback_parse():
+    """Cross-language layout check for `F` telemetry packets.
+
+    Builds the exact byte stream `build_feedback` in serve.rs produces (see
+    its `feedback_packet_layout` unit test) and asserts `RtLink._parse_feedback`
+    recovers the values, including the age -> timestamp reconstruction.
+    """
+    import sys
+    import time
+
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    from almond_axol.rt.link import RtLink
+
+    slots_in = {0: (1.5, -0.25, 3.0, 1200), 7: (0.5, 0.0, 0.1, 0)}
+    payload = b"F" + bytes([1, 0b1000_0001])
+    for i in range(8):
+        pos, vel, tau, age = slots_in.get(i, (0.0, 0.0, 0.0, 0))
+        payload += struct.pack("<3dI", pos, vel, tau, age)
+
+    before = time.time()
+    side, slots = RtLink._parse_feedback(payload)
+    after = time.time()
+    assert side == 1, side
+    assert set(slots) == {0, 7}, slots
+    assert slots[0][:3] == (1.5, -0.25, 3.0), slots[0]
+    assert slots[7][:3] == (0.5, 0.0, 0.1), slots[7]
+    assert before - 1200e-6 <= slots[0][3] <= after - 1200e-6, slots[0]
+    assert before <= slots[7][3] <= after, slots[7]
+    print("feedback parse:   layout + timestamp reconstruction OK")
+
+
+check_feedback_parse()
+
 rc, out, msg = asyncio.run(session("clean", clean))
 print(f"clean disconnect: rc={rc} ({msg})")
 assert rc == 0, out
