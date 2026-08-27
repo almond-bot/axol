@@ -35,7 +35,6 @@ from ..constants import ARM_JOINTS, Joint
 from ..robot import Axol
 from ..teleop.recorder import TeleopRecorder
 from ..teleop.recorder import make as _recorder_make
-from ..utils import affinity
 from .config import GravityCompCmdConfig, parse
 
 
@@ -85,16 +84,6 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
     if cfg.left_channel is None and cfg.right_channel is None:
         raise SystemExit("Both arms disabled — nothing to do.")
 
-    # Same realtime scheduling as a teleop session (core pinning + short GIL
-    # switch interval, both restored on exit): the hold loop drives the arms
-    # at cfg.rate_hz, and when serve runs this op in-process the web UI's
-    # threads otherwise stretch the control ticks (see
-    # affinity.realtime_session).
-    with affinity.realtime_session():
-        await _run_session(cfg)
-
-
-async def _run_session(cfg: GravityCompCmdConfig) -> None:
     free_joints = _resolve_free_joints(cfg.free_joints)
     free_str = (
         "all 7 joints"
