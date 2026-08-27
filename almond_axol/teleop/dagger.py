@@ -195,7 +195,13 @@ class DaggerTeleopCore(VRTeleopCore):
         rising-edge bookkeeping is shared, but every branch differs — either
         grip alone latches a *freeze* instead of being ignored, engaging is
         gated on :attr:`intervention_allowed` and preceded by the robot-pose
-        sync, and the grippers adopt the controller triggers directly.
+        sync, and the grippers adopt the controller triggers directly. The
+        base core's per-arm engage (grips toggle one arm between tracking
+        and frozen, or dead-man with ``hold_to_engage``) is deliberately not
+        adopted: a DAgger takeover is all-or-nothing (the policy either
+        drives or the operator does), so both arms always engage and
+        disengage together and the worker's per-arm freeze is never
+        exercised.
         """
         both = frame.l_lock and frame.r_lock
         either = frame.l_lock or frame.r_lock
