@@ -87,6 +87,136 @@ use crate::proto;
 /// damping arrives in phase; the band-pass supplies the high-side rolloff.
 const VEL_CUTOFF: f64 = 80.0;
 
+/// TX-stall (e-stop) handling, ported from `almond_axol/motor/bus.py`:
+/// a send failing with `ENOBUFS` means the interface TX queue is full. At
+/// 1 Mbit/s a healthy full queue drains in ~65 ms, so overflow persisting
+/// across sends for longer than this means no node is ACKing frames — on
+/// the Axol that's the e-stop cutting motor power mid-stream.
+const STALL_DETECT: Duration = Duration::from_secs(1);
+/// One flush of the bring-up script flaps *every* channel, so when both
+/// arms' buses stall together (they share the e-stop), the second one can
+/// skip the purge.
+const PURGE_DEDUPE: Duration = Duration::from_secs(3);
+static LAST_PURGE: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn is_tx_full(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOBUFS) | Some(libc::EAGAIN))
+        || err.kind() == io::ErrorKind::WouldBlock
+}
+
+enum SendOutcome {
+    Sent,
+    /// TX queue full — frame dropped (transient congestion, like Python's
+    /// classic path: the command simply misses a cycle).
+    Dropped,
+    /// TX overflow has persisted past `STALL_DETECT`: the bus is dead.
+    Stalled,
+}
+
+fn guarded_send(
+    sock: &CanSock,
+    id: u16,
+    data: &[u8],
+    enobufs_since: &mut Option<Instant>,
+) -> io::Result<SendOutcome> {
+    match sock.send(id, data) {
+        Ok(()) => {
+            *enobufs_since = None;
+            Ok(SendOutcome::Sent)
+        }
+        Err(err) if is_tx_full(&err) => {
+            let now = Instant::now();
+            match *enobufs_since {
+                None => {
+                    *enobufs_since = Some(now);
+                    Ok(SendOutcome::Dropped)
+                }
+                Some(t) if now.duration_since(t) >= STALL_DETECT => Ok(SendOutcome::Stalled),
+                Some(_) => Ok(SendOutcome::Dropped),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Run a command as root: directly when already root (hosted installs run
+/// serve as root), otherwise `sudo -n` so a headless core fails fast
+/// instead of hanging on a password prompt it can never answer.
+fn run_root(args: &[&str]) -> io::Result<std::process::ExitStatus> {
+    let mut cmd = if unsafe { libc::geteuid() } == 0 {
+        let mut c = std::process::Command::new(args[0]);
+        c.args(&args[1..]);
+        c
+    } else {
+        let mut c = std::process::Command::new("sudo");
+        c.arg("-n").args(args);
+        c
+    };
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+}
+
+/// Purge the stale frames queued behind a dead (e-stopped) bus.
+///
+/// Closing the socket does not help: frames already handed to the interface
+/// queue survive socket close and transmit the moment a powered-on motor
+/// ACKs again — up to `txqueuelen` stale MIT position commands replaying at
+/// once, snapping the arm to its pre-e-stop pose. Only taking the interface
+/// down drops them. Prefer the `can.setup` bring-up script (flaps both
+/// arm-hub channels together — flapping one at a time can wedge the
+/// adapter's RX path); without it, flap just this channel. Returns whether
+/// the purge succeeded.
+fn purge_tx_queue(iface: &str, out_tx: &mpsc::Sender<Vec<u8>>) -> bool {
+    let mut last = LAST_PURGE.lock().unwrap();
+    let script = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".almond/can/startup.sh"))
+        .ok()
+        .filter(|p| p.exists());
+    if script.is_some()
+        && last.is_some_and(|t| t.elapsed() < PURGE_DEDUPE)
+    {
+        // The other arm's bus just ran the script, which flapped this
+        // channel too — the queue is already empty.
+        return true;
+    }
+    let result = match &script {
+        Some(path) => run_root(&["bash", &path.to_string_lossy()]),
+        None => run_root(&["ip", "link", "set", iface, "down"])
+            .and_then(|st| {
+                if st.success() {
+                    run_root(&["ip", "link", "set", iface, "up"])
+                } else {
+                    Ok(st)
+                }
+            }),
+    };
+    match result {
+        Ok(st) if st.success() => {
+            *last = Some(Instant::now());
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: purged the stale TX queue (bus flapped)"),
+            );
+            true
+        }
+        other => {
+            send_text(
+                out_tx,
+                b'L',
+                &format!(
+                    "{iface}: could not purge the TX queue ({other:?}) — stale \
+                     motion commands will replay when the motors power back on. \
+                     Flap the interface (`axol can.setup`, or `ip link set \
+                     {iface} down/up`) before re-powering the arm."
+                ),
+            );
+            false
+        }
+    }
+}
+
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
@@ -283,6 +413,40 @@ mod tests {
         // Wrong size (the old 5-field layout) must be rejected, not
         // misparsed — a version-skewed client fails loudly.
         assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 5 * 8]).is_err());
+    }
+
+    /// Live stall-detection check against a real interface whose bus has no
+    /// powered nodes (motors off = the e-stop condition). Uses ID 0x7F0 —
+    /// unused by both motor protocols — so the frames left in the TX queue
+    /// are ignored by every motor if they ever transmit. Run explicitly:
+    /// `cargo test stall_detection_live -- --ignored`.
+    #[test]
+    #[ignore = "needs a live CAN interface with unpowered motors"]
+    fn stall_detection_live() {
+        let sock = CanSock::open("can_alm_axol_l").expect("open can_alm_axol_l");
+        sock.set_send_timeout(Duration::from_millis(20)).unwrap();
+        let mut since: Option<Instant> = None;
+        let start = Instant::now();
+        let mut dropped = 0u32;
+        let mut sent = 0u32;
+        loop {
+            match guarded_send(&sock, 0x7F0, &[0u8; 8], &mut since).unwrap() {
+                SendOutcome::Sent => sent += 1,
+                SendOutcome::Dropped => dropped += 1,
+                SendOutcome::Stalled => break,
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "never stalled (sent {sent}, dropped {dropped})"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        println!(
+            "stalled after {:.2}s: {sent} queued, {dropped} dropped",
+            start.elapsed().as_secs_f64()
+        );
+        assert!(dropped > 0, "expected a Dropped phase before the stall");
+        assert!(start.elapsed() >= STALL_DETECT);
     }
 
     #[test]
@@ -615,6 +779,15 @@ fn bus_loop(
     let mut ticks: u64 = 0;
     let mut watchdog_frozen = false;
     let mut next_stats = Instant::now() + Duration::from_secs(5);
+    // TX-stall (e-stop) tracking — see `guarded_send`. A dead bus skips the
+    // motor disable on the way out (nothing is powered to hear it, and the
+    // freshly purged queue should stay empty).
+    let mut enobufs_since: Option<Instant> = None;
+    let mut bus_dead = false;
+    // Belt-and-braces: sends on a dead bus normally fail fast with ENOBUFS,
+    // but if the socket sndbuf fills first a blocking write would hang the
+    // loop; the timeout turns that into EAGAIN (treated as TX-full).
+    let _ = sock.set_send_timeout(Duration::from_millis(20));
 
     let start = Instant::now() + period;
     let result = (|| -> io::Result<()> {
@@ -721,7 +894,7 @@ fn bus_loop(
             let mut sent = 0usize;
             for m in motors.iter() {
                 let c = &play[m.slot];
-                if m.gripper {
+                let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
                     // gripper uncommanded until motion_control too). Slot
                     // layout: v_des carries max_speed, kp carries max_torque;
@@ -729,9 +902,10 @@ fn bus_loop(
                     if seg_target.is_none() {
                         continue;
                     }
-                    let frame =
-                        proto::dm_pos_force_encode(c.p_des, c.v_des, c.kp / m.ranges.t_max);
-                    sock.send(proto::DM_POS_FORCE_ARB_BASE + m.id as u16, &frame)?;
+                    (
+                        proto::DM_POS_FORCE_ARB_BASE + m.id as u16,
+                        proto::dm_pos_force_encode(c.p_des, c.v_des, c.kp / m.ranges.t_max),
+                    )
                 } else {
                     // In-core host damping: band-passed (v_des − v_meas)
                     // scaled by the streamed pose-scheduled gain, applied
@@ -741,12 +915,40 @@ fn bus_loop(
                     let v_damp = d.bp.update(v_des - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
                     let t_ff = c.t_ff + c.kd_host * v_damp;
                     let frame = proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, t_ff, &m.ranges);
-                    match m.vendor {
-                        Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.id as u16, &frame)?,
-                        Vendor::Damiao => sock.send(m.id as u16, &frame)?,
+                    let arb = match m.vendor {
+                        Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
+                        Vendor::Damiao => m.id as u16,
+                    };
+                    (arb, frame)
+                };
+                match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
+                    SendOutcome::Sent => sent += 1,
+                    SendOutcome::Dropped => {}
+                    SendOutcome::Stalled => {
+                        // The e-stop path: nothing has ACKed for >1 s. Stop
+                        // commanding, purge the poisoned TX queue so the
+                        // stale commands can't replay on re-power, and take
+                        // the whole core down as a fault — re-powered motors
+                        // come back disabled, so the session needs a fresh
+                        // bring-up anyway.
+                        bus_dead = true;
+                        fault.store(1, Ordering::SeqCst);
+                        stop.store(true, Ordering::SeqCst);
+                        let purged = purge_tx_queue(iface, out_tx);
+                        return Err(io::Error::other(format!(
+                            "{iface}: TX queue stalled >{}s — no node ACKing \
+                             frames (e-stop / motors unpowered?); commands \
+                             stopped{}",
+                            STALL_DETECT.as_secs(),
+                            if purged {
+                                ", stale queue purged"
+                            } else {
+                                " — QUEUE PURGE FAILED, flap the interface \
+                                 before re-powering"
+                            },
+                        )));
                     }
                 }
-                sent += 1;
             }
 
             // Collect replies; deviation abort against the played target.
@@ -832,7 +1034,9 @@ fn bus_loop(
         }
     })();
 
-    bringup::disable(&sock, &motors);
+    if !bus_dead {
+        bringup::disable(&sock, &motors);
+    }
     if let Err(err) = &result {
         send_text(out_tx, b'S', &format!("fault: {err}"));
     }

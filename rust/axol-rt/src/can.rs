@@ -78,6 +78,19 @@ impl CanSock {
 
     /// Set the blocking-receive timeout (`SO_RCVTIMEO`).
     pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_timeout(libc::SO_RCVTIMEO, timeout)
+    }
+
+    /// Set the blocking-send timeout (`SO_SNDTIMEO`). A dead bus (e-stop —
+    /// nothing ACKs, qdisc full) normally surfaces as an immediate `ENOBUFS`
+    /// write error, but if the socket sndbuf is what fills, a blocking write
+    /// would hang the control loop forever; the timeout turns that into
+    /// `EAGAIN`, which the stall detection treats like `ENOBUFS`.
+    pub fn set_send_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_timeout(libc::SO_SNDTIMEO, timeout)
+    }
+
+    fn set_timeout(&self, opt: libc::c_int, timeout: Duration) -> io::Result<()> {
         let tv = libc::timeval {
             tv_sec: timeout.as_secs() as libc::time_t,
             tv_usec: timeout.subsec_micros() as libc::suseconds_t,
@@ -86,7 +99,7 @@ impl CanSock {
             libc::setsockopt(
                 self.fd,
                 libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
+                opt,
                 &tv as *const libc::timeval as *const libc::c_void,
                 std::mem::size_of::<libc::timeval>() as libc::socklen_t,
             )

@@ -39,6 +39,7 @@ Measured on the robot (2026-08-27):
 | serve, teleop headless | 30000 ticks @ 240 Hz, 0.03% late, watchdog + disarm clean |
 | serve, wrist_3 ±8° sinusoid + gripper cycle | worst tracking error 0.42° (moving), ≤0.11° (holding); gripper swept 1.00→0.66→1.00 as commanded |
 | serve, Python killed while armed | core held 10 s, disabled everything, exited clean |
+| TX-stall detection (unpowered bus, e-stop condition) | 348 frames queued, ENOBUFS drops for 1 s, stall declared at 1.75 s (`cargo test stall_detection_live -- --ignored`) |
 
 For comparison, the Python control loop under teleop measured 30-57% of
 ticks late. 500 Hz full-bus telemetry is a *wire* limit, not a host limit:
@@ -86,6 +87,15 @@ The core owns the wire and the **fast physics**:
 - Any protocol error (e.g. a version-skewed target size) stops the bus
   threads and disables the motors before the process exits — never an
   energized orphan.
+- TX-stall (e-stop) handling, ported from `motor/bus.py`: `ENOBUFS`
+  persisting >1 s across sends means no node is ACKing — the e-stop cut
+  motor power. The core stops commanding, purges the poisoned TX queue
+  (bring-up script or `ip link` flap; direct when root, `sudo -n`
+  otherwise) so up to `txqueuelen` stale MIT commands can't replay and
+  snap the arm when power returns, and takes the session down as a clear
+  fault — re-powered motors come back disabled and need a fresh bring-up
+  anyway. Transient single-frame `ENOBUFS` (host-side congestion) just
+  drops that frame, like the Python path.
 
 The gripper rides the same target packets in slot 7 as a POSITION_FORCE
 command (motor-frame target, speed limit, torque limit). It is exempt
@@ -138,6 +148,5 @@ via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 
 ## Roadmap
 
-1. Port the TX-stall (e-stop) purge logic from `motor/bus.py`.
-2. Telemetry packets (tick stats already stream as log lines; positions
+1. Telemetry packets (tick stats already stream as log lines; positions
    currently ride the passive CAN broadcast).
