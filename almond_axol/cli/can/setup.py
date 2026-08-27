@@ -204,20 +204,28 @@ def _resolve_hub_serial() -> str | None:
     """Pick the hub serial without prompting (for headless ``ensure_setup``).
 
     A previously configured serial (named ``can_alm_axol_*`` interfaces, or
-    the pinned serial in the udev rules) wins outright, so re-running setup on
-    an already-configured host works no matter how many other candlelight
-    adapters are attached. Only a genuinely fresh machine falls back to live
-    detection — returning None when no hub is attached (the hub is optional),
-    and raising when several dual-channel candidates are present, since that
-    needs the interactive ``axol can.setup`` flow to disambiguate.
+    the pinned serial in the udev rules) wins while its adapter is attached —
+    or while no dual-channel candidate is attached at all (an unplugged hub
+    keeps its pin for whenever it returns) — so re-running setup on an
+    already-configured host works no matter how many other candlelight
+    adapters are attached.
+
+    A configured serial that is *absent* while a different hub is attached is
+    stale — this host last ran on another Axol, or the hub was replaced — and
+    must not win: preferring it would re-pin the missing adapter and leave the
+    attached hub unnamed on ``canX``, which is exactly what the control
+    panel's Connect used to trip over. The attached hub is registered instead
+    (when it's unambiguous), matching what the interactive ``axol can.setup``
+    picks in the same situation. Several attached candidates still raise,
+    since that needs the interactive flow to disambiguate.
     """
     configured = _configured_serial()
-    if configured:
+    attached = _detect_serials()
+    if configured and (configured in attached or not attached):
         return configured
-    unique = _detect_serials()
-    if len(unique) == 1:
-        return unique[0]
-    if not unique:
+    if len(attached) == 1:
+        return attached[0]
+    if not attached:
         return None
     raise RuntimeError(
         "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"

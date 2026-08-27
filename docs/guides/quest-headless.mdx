@@ -1,0 +1,61 @@
+---
+title: "Quest Without Wearing It"
+description: "Keep the Quest awake with nobody wearing it — disable the proximity sensor so headless teleop and data-collection sessions keep running."
+---
+
+The Quest's **proximity sensor** (inside the visor, between the lenses) puts the headset to sleep the moment it stops seeing a face. Sleep pauses the WebXR session, which stops the controller pose stream and the camera relay — so a headset set down on a desk kills the teleop link within seconds.
+
+That gets in the way of every headless workflow: driving a [data-collection session from the control panel's episode controls](/guides/control-panel#episode-controls), watching the [mirrored camera feeds](/guides/control-panel#operator-view) while the headset only serves as the pose source, or leaving the VR app connected between takes. **Disabling the proximity sensor keeps the headset awake** as if it were being worn.
+
+## One-time setup
+
+The headset must be in **Developer Mode** — the same one-time step used for [Quest over USB](/guides/quest-over-usb#one-time-setup): in the **Meta Quest** phone app, go to **Menu → Devices →** your headset **→ Headset Settings → Developer Mode**, toggle it on, and restart the headset.
+
+## Keep awake from the control panel (recommended)
+
+The [control panel](/guides/control-panel#quest-usb)'s **Quest USB** settings tab has a **Keep awake** button that disables the proximity sensor for you — no terminal, no extra software. Plug the headset into the robot host with a USB-C cable, accept the **Allow USB debugging?** prompt in the headset if it appears (the same authorization the pose tunnel uses), and press **Keep awake**.
+
+The headset now behaves as if it were worn continuously — the display stays on and the VR session keeps running with the headset sitting on a desk. You can unplug the cable afterwards; the setting holds until you press **Restore** (or the headset reboots).
+
+## Or over adb directly
+
+The panel buttons run these `adb` broadcasts on the robot host ([`axol provision`](/cli/provision) installs `adb` there), so the same thing works from any shell with the headset plugged in:
+
+```bash
+# Disable the proximity sensor (keep the headset awake)
+adb shell am broadcast -a com.oculus.vrpowermanager.prox_close
+
+# Restore normal proximity behavior
+adb shell am broadcast -a com.oculus.vrpowermanager.automation_disable
+```
+
+<Note>
+  The override **does not survive a headset reboot** — after a restart the proximity sensor is back to normal and the command has to be run again.
+</Note>
+
+<Warning>
+  With the sensor disabled the display never sleeps, so the battery drains at full VR rate and the lenses keep projecting. Keep the headset on its charger for long sessions, and re-enable the sensor when you're done.
+</Warning>
+
+## Alternative: Meta Quest Developer Hub
+
+The [Meta Quest Developer Hub](https://developers.meta.com/horizon/documentation/unity/ts-odh/) (MQDH) desktop app has the same switch: connect the headset over USB, open **Device Manager**, and turn off **Proximity Sensor** (or press `Ctrl+Shift+P`). Note that MQDH re-enables the sensor about 10 minutes after the headset disconnects from it — and it means installing an app on a laptop — so the panel button above is the better fit for a headset that plugs into the robot.
+
+## Running headless
+
+With the sensor disabled, set the headset down facing somewhere convenient and drive the session from the [control panel](/guides/control-panel):
+
+1. Open the VR app at [axol.almond.bot](https://axol.almond.bot) in the headset, connect to the robot, and press **Enter VR** as usual.
+2. Set the headset down. The pose stream and camera relay keep running.
+3. Use the panel's [episode controls](/guides/control-panel#episode-controls) to start, save, and discard takes, and the [operator view](/guides/control-panel#operator-view) to watch the camera feeds. The controllers stay live throughout, so an operator can pick them back up at any time.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quest over USB" icon="usb" href="/guides/quest-over-usb">
+    Wire the controller pose link over the same USB cable for lower latency.
+  </Card>
+  <Card title="Web Control Panel" icon="sliders" href="/guides/control-panel">
+    Episode controls and mirrored camera feeds for headset-off sessions.
+  </Card>
+</CardGroup>

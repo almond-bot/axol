@@ -118,6 +118,16 @@ class EpisodeRequest(BaseModel):
     command: str
 
 
+class ProximityRequest(BaseModel):
+    """Disable (default) or restore the headset's proximity sensor over adb.
+
+    Disabling keeps the Quest awake with nobody wearing it, so headless
+    sessions driven from the panel don't die when the headset is set down.
+    """
+
+    disabled: bool = True
+
+
 class SessionInputRequest(BaseModel):
     """A line written to a session's stdin (answers an interactive prompt).
 
@@ -325,9 +335,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     # -- host power ----------------------------------------------------------
 
-    @app.post("/api/host/shutdown")
-    async def host_shutdown() -> JSONResponse:
-        """Power off the serve host (``shutdown -h now``).
+    async def _host_power(flag: str, verb: str) -> JSONResponse:
+        """Run ``shutdown <flag> now`` on the serve host.
 
         Refused while an operation or session is running — cutting power mid-
         run would drop the arms. The hosted install runs as root; a dev serve
@@ -340,8 +349,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 status_code=409,
             )
 
-        def _halt() -> tuple[bool, str]:
-            cmd = ["shutdown", "-h", "now"]
+        def _run() -> tuple[bool, str]:
+            cmd = ["shutdown", flag, "now"]
             if os.geteuid() != 0:
                 if not prime_sudo():
                     return False, "root required (no passwordless sudo)"
@@ -349,13 +358,23 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             proc = subprocess.run(cmd, capture_output=True, text=True)
             return proc.returncode == 0, (proc.stderr or proc.stdout).strip()
 
-        ok, detail = await asyncio.to_thread(_halt)
+        ok, detail = await asyncio.to_thread(_run)
         if not ok:
             return JSONResponse(
-                {"error": f"shutdown failed: {detail or 'unknown error'}"},
+                {"error": f"{verb} failed: {detail or 'unknown error'}"},
                 status_code=500,
             )
         return JSONResponse({"ok": True})
+
+    @app.post("/api/host/shutdown")
+    async def host_shutdown() -> JSONResponse:
+        """Power off the serve host (``shutdown -h now``)."""
+        return await _host_power("-h", "shutdown")
+
+    @app.post("/api/host/restart")
+    async def host_restart() -> JSONResponse:
+        """Reboot the serve host (``shutdown -r now``)."""
+        return await _host_power("-r", "restart")
 
     # -- robot connection (detached CAN + 1 Hz motor ping) ------------------
 
@@ -699,6 +718,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         the USB-debugging authorization popup on the device.
         """
         return _usb_status_dict(await asyncio.to_thread(adb.connect))
+
+    @app.post("/api/usb/proximity")
+    async def usb_proximity(req: ProximityRequest) -> JSONResponse:
+        """Disable/restore the headset's proximity sensor (`adb shell am broadcast`).
+
+        Disabled, the headset stays awake with nobody wearing it — headless
+        sessions driven from the panel keep their pose stream and camera relay.
+        The override holds until restored or the headset reboots. Needs an
+        attached, authorized headset (same requirement as the pose tunnel).
+        """
+        ok, error = await asyncio.to_thread(adb.set_proximity_disabled, req.disabled)
+        if not ok:
+            return JSONResponse(
+                {"error": error or "adb broadcast failed"}, status_code=502
+            )
+        return JSONResponse({"ok": True})
 
     # -- in-process operations (teleop / gravity / collect / policy) --------
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { ChevronRight, History, Loader2 } from "lucide-react"
+import { ChevronLeft, ChevronRight, History, Loader2 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
@@ -45,11 +45,16 @@ function runBadge(meta: DiagnosticsRunMeta): {
   return { variant: "success", text: "ok" }
 }
 
+/** Runs shown per page — telemetry-heavy details load per run on expand, so
+ * the page size only bounds the visible list, not any data transfer. */
+const PAGE_SIZE = 10
+
 /**
  * Past diagnostics runs (ROM test, homing, …) with their captured telemetry
  * re-charted — same joint filter and zoom/pan as the live charts. Captures
  * record position + torque (velocity is not cached by the motor layer during
- * a script's own control loop).
+ * a script's own control loop). Paginated newest-first so a long history
+ * doesn't stretch the page.
  */
 export function RunHistory({
   runs,
@@ -63,6 +68,12 @@ export function RunHistory({
   onClear: () => void
 }) {
   const [openId, setOpenId] = useState<string | null>(null)
+  const [rawPage, setRawPage] = useState(0)
+  // Clamp instead of storing: a shrinking list (Clear, deletions on refresh)
+  // must never leave the view on a page past the end.
+  const pageCount = Math.max(1, Math.ceil(runs.length / PAGE_SIZE))
+  const page = Math.min(rawPage, pageCount - 1)
+  const pageRuns = runs.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
 
   return (
     <Card className="gap-3 p-4">
@@ -99,35 +110,70 @@ export function RunHistory({
           No runs yet — launch a diagnostic above and it will be recorded here.
         </p>
       ) : (
-        <div className="flex flex-col divide-y divide-white/[0.06]">
-          {runs.map((meta) => {
-            const open = openId === meta.id
-            const badge = runBadge(meta)
-            return (
-              <div key={meta.id} className="py-1">
-                <button
-                  type="button"
-                  onClick={() => setOpenId(open ? null : meta.id)}
-                  className="flex w-full items-center gap-3 rounded-md px-1 py-2 text-left hover:bg-white/[0.03]"
+        <>
+          <div className="flex flex-col divide-y divide-white/[0.06]">
+            {pageRuns.map((meta) => {
+              const open = openId === meta.id
+              const badge = runBadge(meta)
+              return (
+                <div key={meta.id} className="py-1">
+                  <button
+                    type="button"
+                    onClick={() => setOpenId(open ? null : meta.id)}
+                    className="flex w-full items-center gap-3 rounded-md px-1 py-2 text-left hover:bg-white/[0.03]"
+                  >
+                    <ChevronRight
+                      className={cn(
+                        "size-4 shrink-0 text-white/40 transition-transform",
+                        open && "rotate-90"
+                      )}
+                    />
+                    <span className="font-mono text-xs text-white/85">{meta.command}</span>
+                    <Badge variant={badge.variant}>{badge.text}</Badge>
+                    <span className="ml-auto hidden text-xs text-white/40 sm:inline">
+                      {fmtDuration(meta)}
+                    </span>
+                    <span className="text-xs text-white/40">{fmtWhen(meta.startedAt)}</span>
+                  </button>
+                  {open && <RunDetail id={meta.id} />}
+                </div>
+              )
+            })}
+          </div>
+          {pageCount > 1 && (
+            <div className="flex items-center justify-between border-t border-white/[0.06] pt-2">
+              <span className="text-xs text-white/40">
+                {page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, runs.length)} of{" "}
+                {runs.length} runs
+              </span>
+              <div className="flex items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-white/50"
+                  onClick={() => setRawPage(page - 1)}
+                  disabled={page === 0}
+                  aria-label="Previous page"
                 >
-                  <ChevronRight
-                    className={cn(
-                      "size-4 shrink-0 text-white/40 transition-transform",
-                      open && "rotate-90"
-                    )}
-                  />
-                  <span className="font-mono text-xs text-white/85">{meta.command}</span>
-                  <Badge variant={badge.variant}>{badge.text}</Badge>
-                  <span className="ml-auto hidden text-xs text-white/40 sm:inline">
-                    {fmtDuration(meta)}
-                  </span>
-                  <span className="text-xs text-white/40">{fmtWhen(meta.startedAt)}</span>
-                </button>
-                {open && <RunDetail id={meta.id} />}
+                  <ChevronLeft /> Prev
+                </Button>
+                <span className="text-xs text-white/40">
+                  {page + 1} / {pageCount}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-white/50"
+                  onClick={() => setRawPage(page + 1)}
+                  disabled={page >= pageCount - 1}
+                  aria-label="Next page"
+                >
+                  Next <ChevronRight />
+                </Button>
               </div>
-            )
-          })}
-        </div>
+            </div>
+          )}
+        </>
       )}
     </Card>
   )

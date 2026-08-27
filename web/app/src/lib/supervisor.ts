@@ -215,6 +215,14 @@ export async function shutdownHost(): Promise<{ ok: boolean }> {
   return json(await fetch(apiUrl("/api/host/shutdown"), { method: "POST" }))
 }
 
+/**
+ * Reboot the serve host (`shutdown -r now`). Refused (409) while an
+ * operation or session is running.
+ */
+export async function restartHost(): Promise<{ ok: boolean }> {
+  return json(await fetch(apiUrl("/api/host/restart"), { method: "POST" }))
+}
+
 // ---------------------------------------------------------------------------
 // Robot connection (detached CAN + 1 Hz motor ping)
 // ---------------------------------------------------------------------------
@@ -352,6 +360,21 @@ export async function usbConnect(): Promise<UsbStatus> {
   return json(await fetch(apiUrl("/api/usb/connect"), { method: "POST" }))
 }
 
+/**
+ * Disable (true) or restore (false) the headset's proximity sensor over adb.
+ * Disabled, the Quest stays awake with nobody wearing it — headless sessions
+ * keep their pose stream. Holds until restored or the headset reboots.
+ */
+export async function setQuestProximityDisabled(disabled: boolean): Promise<{ ok: boolean }> {
+  return json(
+    await fetch(apiUrl("/api/usb/proximity"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disabled }),
+    })
+  )
+}
+
 // ---------------------------------------------------------------------------
 // In-process operations (teleop / gravity-comp / collect-data / run-policy)
 // ---------------------------------------------------------------------------
@@ -375,6 +398,16 @@ export interface EpisodeControlSpec {
   /** Arm on first click and require a second, confirming click — the panel's
    *  stand-in for the headset's double-press save/discard confirmation. */
   confirm?: boolean
+  /** Render as a text field + submit button instead of a plain button;
+   *  submitting posts `${command} ${text}` (e.g. a downstream op's
+   *  post-episode notes). */
+  input?: boolean
+  /** The input's placeholder — doubles as the operator instruction (e.g.
+   *  which episode the text attaches to). */
+  placeholder?: string
+  /** The current server-side text, prefilled whenever the input (re)appears
+   *  so a submitted value survives phase changes and can be edited. */
+  value?: string
 }
 
 export interface PolicyState {
