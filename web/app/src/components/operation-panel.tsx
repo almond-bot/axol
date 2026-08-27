@@ -31,6 +31,7 @@ import { CameraFeeds, type VrHud } from "@/components/camera-feeds"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button, buttonVariants } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
+import { Input } from "@/components/ui/input"
 import { cn } from "@/lib/utils"
 
 /**
@@ -597,6 +598,9 @@ function EpisodeControls({
     onEpisode(control.command)
   }
 
+  const buttons = controls.filter((c) => !c.input)
+  const inputs = controls.filter((c) => c.input)
+
   return (
     <div className="flex flex-col gap-3 rounded-lg border border-[#eff483]/25 bg-[#eff483]/[0.04] p-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -613,9 +617,9 @@ function EpisodeControls({
         </span>
       </div>
       <span className="text-sm text-white/60">{displayStatus}</span>
-      {controls.length > 0 && (
+      {buttons.length > 0 && (
         <div className="flex flex-wrap gap-2">
-          {controls.map((c, i) => (
+          {buttons.map((c, i) => (
             <Button
               key={c.command}
               variant={armed === c.command ? "destructive" : i === 0 ? "default" : "outline"}
@@ -627,6 +631,58 @@ function EpisodeControls({
           ))}
         </div>
       )}
+      {inputs.map((c) => (
+        // Keyed on the placeholder too: a new target (e.g. the next saved
+        // episode) resets the field even though the command stays the same.
+        <EpisodeInputControl
+          key={`${c.command}:${c.placeholder ?? ""}`}
+          control={c}
+          onEpisode={onEpisode}
+        />
+      ))}
+    </div>
+  )
+}
+
+/**
+ * A server-driven episode control rendered as a text field + submit button
+ * (`input: true` on the spec): submitting posts `${command} ${text}` to
+ * /api/op/episode — e.g. a downstream op's post-episode notes, where the op
+ * attaches the text to the just-saved episode. The field starts from the spec's
+ * `value` (the current server-side text), so an earlier submission survives
+ * phase changes and can be edited; submit is disabled while the text matches
+ * what the server already has.
+ */
+function EpisodeInputControl({
+  control,
+  onEpisode,
+}: {
+  control: EpisodeControlSpec
+  onEpisode: (command: string) => void
+}) {
+  const [text, setText] = useState(control.value ?? "")
+  const serverValue = control.value ?? ""
+  const unchanged = text.trim() === serverValue.trim()
+
+  function submit() {
+    if (unchanged || !text.trim()) return
+    onEpisode(`${control.command} ${text.trim()}`)
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        value={text}
+        placeholder={control.placeholder}
+        onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") submit()
+        }}
+        className="h-8 flex-1"
+      />
+      <Button variant="outline" size="sm" disabled={unchanged || !text.trim()} onClick={submit}>
+        {control.label}
+      </Button>
     </div>
   )
 }
