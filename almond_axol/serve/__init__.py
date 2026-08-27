@@ -2,11 +2,10 @@
 
 ``axol serve`` exposes a small FastAPI app that the bundled web UI talks to.
 The core operations (teleop, gravity-comp, collect-data, run-policy,
-replay-dataset) run via :class:`~almond_axol.serve.runner.OperationRunner` —
-the high-rate control ops (teleop, gravity-comp) in their own subprocess so
-their control loops never share the serve interpreter, the rest in-process;
-the remaining setup/calibration commands (``can.*``, ``motor.*``, ``tune.*``,
-…) are spawned as ``axol <command>`` subprocesses by
+replay-dataset) run *in-process* via
+:class:`~almond_axol.serve.runner.OperationRunner`, sharing one persistent
+robot connection; the remaining setup/calibration commands (``can.*``,
+``motor.*``, ``tune.*``, …) are spawned as ``axol <command>`` subprocesses by
 :class:`~almond_axol.serve.manager.SessionManager`. Either way the output
 streams to connected log WebSockets and the run can be stopped.
 

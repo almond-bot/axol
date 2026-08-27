@@ -343,12 +343,13 @@ async def _run(cfg: TeleopCmdConfig) -> None:
 
     # Hardware sessions get realtime scheduling for the whole run — core
     # pinning plus a short GIL switch interval (see
-    # :func:`affinity.realtime_session`). Teleop always owns its process
-    # (serve launches it as a subprocess for exactly this reason), so the
-    # pin keeps the 240 Hz control loop and its VR/IK threads off the IK
-    # worker's dedicated core and the video relay's cores, matching the
-    # collect-data partition. Sim skips it: dev machines render in-process
-    # and have no realtime loop worth isolating.
+    # :func:`affinity.realtime_session`). This matters most when serve runs
+    # teleop in-process: there the 240 Hz control loop shares the interpreter
+    # with the web UI's handlers, and a recorded session measured 50-57% of
+    # control ticks arriving late (median 5.4 ms vs 4.17 nominal), which
+    # lands in motion_control's differentiated feedforward as felt
+    # roughness. Sim skips it: dev machines render in-process and have no
+    # realtime loop worth isolating.
     session = contextlib.nullcontext() if cfg.sim else affinity.realtime_session()
     with session:
         await _run_robot(cfg)

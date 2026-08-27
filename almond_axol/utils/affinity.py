@@ -212,22 +212,26 @@ def isolate_relay_cpu() -> bool:
 def realtime_session() -> Iterator[None]:
     """Realtime scheduling for a hardware control session, restored on exit.
 
-    Applied by teleop / gravity-comp, which always own their process (the
-    CLI runs them directly; ``axol serve`` launches them as subprocesses).
-    Two process-wide knobs, restored on the way out for tidiness:
+    Two process-wide knobs, both restored on the way out because the session
+    often runs *inside* a long-lived host process (``axol serve`` runs
+    teleop / gravity-comp in-process on a worker thread) that must not stay
+    altered:
 
     - **Pin to the realtime cores** (:func:`pin_realtime`): the IK worker
       solves at nice(-10) on its dedicated core and the video relay owns two
       more; an unpinned control thread that wanders onto them is preempted
-      for a whole 7-8 ms solve. Subprocesses spawned inside the session
-      (IK worker, relay) re-pin themselves to their own groups, exactly as
-      under ``collect-data``.
+      for a whole 7-8 ms solve. A recorded teleop session showed 57% of the
+      4.17 ms control ticks late, 80%+ inside solve windows. Subprocesses
+      spawned inside the session (IK worker, relay) re-pin themselves to
+      their own groups, exactly as under ``collect-data``.
     - **Shorten the GIL switch interval** to 1 ms from the 5 ms default:
-      a pure-Python sibling thread (VR ingest, IK dispatch, recording)
-      can hold the GIL for a full switch interval before the interpreter
-      forces a drop — at the default that is more than one whole 240 Hz
-      control period per hold. 1 ms bounds the hold below a quarter
-      period; the extra switching overhead is noise.
+      any pure-Python thread sharing the interpreter (serve's HTTP and
+      websocket handlers, log streaming, telemetry fan-out) can hold the
+      GIL for a full switch interval before the interpreter forces a drop —
+      at the default that is more than one whole control period per hold,
+      which the loop experiences as late wakeups of exactly that magnitude
+      (the recorded sessions' tick stretch was 1-5 ms). 1 ms bounds the
+      hold below a quarter period; the extra switching overhead is noise.
 
     Best-effort like the pins: without ``sched_setaffinity`` only the switch
     interval applies.

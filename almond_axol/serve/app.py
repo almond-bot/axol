@@ -48,7 +48,7 @@ class DiagnosticsRunRequest(BaseModel):
 
 
 class OpStartRequest(BaseModel):
-    """Start one of the core operations.
+    """Start one of the four in-process core operations.
 
     ``cameras`` (optional) carries the local ZED camera setup for teleop /
     collect-data / run-policy, e.g.::
@@ -896,7 +896,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
         return JSONResponse({"ok": True})
 
-    # -- core operations (teleop / gravity / collect / policy) --------------
+    # -- in-process operations (teleop / gravity / collect / policy) --------
 
     @app.get("/api/op/status")
     async def op_status() -> dict[str, Any]:

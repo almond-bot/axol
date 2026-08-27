@@ -85,7 +85,6 @@ class CommandDef:
         settings_like: str | None = None,
         module: str = "almond_axol",
         section: str | None = None,
-        isolated: bool = False,
     ) -> None:
         self.id = id
         self.cli = cli
@@ -154,15 +153,6 @@ class CommandDef:
         # "helper" (utility moves like the lift), "test" (pass/fail checks
         # like the ROM soak), or "tuning" (the tuning workbench's suites).
         self.section = section
-        # Run the operation in its own subprocess rather than on a worker
-        # thread inside serve. High-rate control loops (teleop's 240 Hz,
-        # gravity-comp's 250 Hz) need this: on hardware the CAN round-trip
-        # eats nearly the whole cycle, and sharing the serve interpreter
-        # costs 1-3 ms of GIL holds per tick (HTTP/telemetry/log threads) —
-        # measured as 50-83% late ticks in-process vs on-time in a dedicated
-        # process. The runner keeps the same session/stop semantics; the
-        # built config (cameras included) travels via ``--config_path``.
-        self.isolated = isolated
         self._loader = loader
 
     @property
@@ -321,7 +311,6 @@ COMMANDS: dict[str, CommandDef] = {
         robot_free_flags=("cart_only",),
         uses_headset=True,
         per_run_fields=("sim", "cart_only"),
-        isolated=True,
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -337,7 +326,6 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_gravity_comp_run,
         execution="async",
         per_run_fields=("free_joints", "record"),
-        isolated=True,
     ),
     "waypoints": CommandDef(
         "waypoints",
