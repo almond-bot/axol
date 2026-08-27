@@ -258,7 +258,7 @@ class ArmConfig:
             # (ringing shoulder_2/wrist_2 on both arms); kd_host=0 killed
             # that. If mast ringing appears, zero this per-robot via
             # calibration override.
-            kd_host=12.0,
+            kd_host=6.0,
             kd_host_hz=4.77,  # 30 rad/s, centred on the measured band
         )
     )
@@ -290,16 +290,10 @@ class ArmConfig:
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=3.5,
+            kd=3.0,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
-            # Damps the 7.8-10 Hz burst band wrist_2 led once the shoulders
-            # were damped (jit16, elbow bent ~110-120°). Damiao firmware
-            # clamps kd at 5 and raising kd toward the clamp historically
-            # produced contact chatter, so the damping is host-side.
-            kd_host=1.5,
-            kd_host_hz=8.75,  # 55 rad/s, centred on the measured band
         )
     )
     wrist_3: JointConfig = field(
