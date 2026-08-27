@@ -594,4 +594,9 @@ class GravityCompCmdConfig:
     kd: float = 0.5
     rate_hz: float = 250.0
     telemetry_hz: float = 500.0
+    rt: bool = False
+    """Drive the wire through the Rust realtime core (axol-rt): Python keeps
+    computing the gravity model per cycle, the core owns CAN at 240 Hz and
+    streams telemetry back (telemetry_hz is then ignored). Same flag as
+    ``axol teleop --rt``."""
     log_level: LogLevel = "INFO"

@@ -15,6 +15,7 @@ Every field is reachable from the CLI (draccus-style) or a JSON/YAML file:
     axol gravity-comp --free_joints [WRIST_3]
     axol gravity-comp --right_channel null --free_joints [SHOULDER_1,WRIST_3]
     axol gravity-comp --record demo1
+    axol gravity-comp --rt
     axol gravity-comp --config_path my_gravity.json
 
 ``--record`` captures the hand-guided session (measured arm-joint positions
@@ -28,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -35,7 +37,10 @@ from ..constants import ARM_JOINTS, Joint
 from ..robot import Axol
 from ..teleop.recorder import TeleopRecorder
 from ..teleop.recorder import make as _recorder_make
-from .config import GravityCompCmdConfig, parse
+from .config import GravityCompCmdConfig, normalize_bool_flags, parse
+
+if TYPE_CHECKING:
+    from ..rt import RtAxol
 
 
 def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
@@ -69,7 +74,7 @@ def _resolve_free_joints(names: list[str] | None) -> set[Joint] | None:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run gravity-compensation mode."""
-    cfg = parse(GravityCompCmdConfig, argv)
+    cfg = parse(GravityCompCmdConfig, normalize_bool_flags(argv, "rt"))
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
@@ -105,11 +110,20 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
     # lead-in/lead-out.
     rec = _recorder_make(cfg.record, "gc", {"qm": 14, "tq": 14})
 
-    async with Axol(
+    robot: Axol | RtAxol = Axol(
         config=cfg.axol,
         left_channel=cfg.left_channel,
         right_channel=cfg.right_channel,
-    ) as axol:
+    )
+    if cfg.rt:
+        # The core owns CAN; Python keeps the gravity model and streams
+        # passthrough tuples through the command sink each cycle. Telemetry
+        # arrives per core tick, so start_telemetry below becomes a no-op.
+        from ..rt import RtAxol as _RtAxol
+
+        robot = _RtAxol(robot)
+
+    async with robot as axol:
         # ``enable()`` (called by ``__aenter__``) leaves arm joints in IMPEDANCE
         # and the gripper in POSITION_FORCE — both of which are the modes
         # ``gravity_compensate`` expects, so we don't touch control modes here.
@@ -135,7 +149,7 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
                 rec.set_engaged(False)
 
 
-def _record_measured(rec: TeleopRecorder, axol: Axol) -> None:
+def _record_measured(rec: TeleopRecorder, axol: Axol | RtAxol) -> None:
     """Append one measured-side row (arm joints only) to the recorder.
 
     Reads the cached positions/torques the impedance feedback frames refresh

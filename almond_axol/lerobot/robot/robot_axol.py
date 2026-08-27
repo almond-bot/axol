@@ -47,6 +47,7 @@ from .config_axol import AxolRobotConfig
 if TYPE_CHECKING:
     from ...kinematics.fk import AxolForwardKinematics
     from ...kinematics.solver import KinematicsSolver
+    from ...rt import RtAxol
 
 _logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class AxolRobot(Robot):
         self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
-        self._axol: Axol | None = None
+        self._axol: Axol | RtAxol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
@@ -330,11 +331,26 @@ class AxolRobot(Robot):
         _logger.info("AxolRobot connected.")
 
     async def _connect_async(self) -> None:
-        self._axol = Axol(
+        robot = Axol(
             self.config.axol_config,
             left_channel=self.config.left_channel,
             right_channel=self.config.right_channel,
         )
+        if self.config.rt:
+            # The Rust core owns CAN: it runs the 240 Hz wire loop and
+            # streams telemetry back every tick, so both branches below
+            # (poll loop or reply-driven cache) are unnecessary — enable()
+            # already leaves the caches primed and the stream verified.
+            from ...rt import RtAxol as _RtAxol
+
+            self._axol = _RtAxol(
+                robot,
+                max_vel=VRTeleopConfig.teleop_max_vel,
+                max_accel=VRTeleopConfig.teleop_max_accel,
+            )
+            await self._axol.enable()
+            return
+        self._axol = robot
         await self._axol.enable()
         if self.config.telemetry_hz > 0:
             await self._axol.start_telemetry(

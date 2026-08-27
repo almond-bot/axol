@@ -5,7 +5,15 @@ Realtime CAN control core for the Almond Axol arms, in Rust. This is the
 (JAX), MuJoCo gravity/inertia, and the web/serve stack; Rust owns the CAN
 buses and runs the per-tick control loop with hard, GIL-free timing.
 
-Run it via `axol teleop --rt` — see "The hybrid split" below.
+Run it via `axol teleop --rt` — see "The hybrid split" below. Every other
+arm-motion flow takes the same switch: `axol gravity-comp --rt`,
+`axol waypoints --rt`, `axol tune.motion --rt`, and the LeRobot-based flows
+via `--robot_config.rt true` (`collect-data`, `run-policy`,
+`replay-dataset`). They all drive the robot through `almond_axol.rt.RtAxol`,
+so once armed the core is the only CAN consumer regardless of which command
+is running. (Bench/calibration flows that need direct register access —
+`tune.pid`, `tune.friction`, `motor.*` — stay on the classic Python path by
+design.)
 
 ## Status
 

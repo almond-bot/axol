@@ -43,7 +43,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -55,6 +55,9 @@ from ..teleop.config import VRTeleopConfig
 from ..waypoints import Waypoint, WaypointSet
 from .config import LogLevel, normalize_bool_flags, parse
 from .gravity_comp import _resolve_free_joints
+
+if TYPE_CHECKING:
+    from ..rt import RtAxol
 
 _logger = logging.getLogger(__name__)
 
@@ -151,6 +154,10 @@ class WaypointsCmdConfig:
     telemetry_hz: float = 500.0
     play_only: bool = False
     """Skip teaching and replay ``file`` straight away. Implied by ``sim``."""
+    rt: bool = False
+    """Drive the wire through the Rust realtime core (axol-rt): the core owns
+    CAN at 240 Hz while this process streams targets (telemetry_hz is then
+    ignored). Same switch as ``axol teleop --rt``. Ignored with ``sim``."""
     sim: bool = False
     """Play the path in the browser visualizer instead of on the robot."""
     log_level: LogLevel = "INFO"
@@ -409,7 +416,7 @@ class _Session:
     def __init__(
         self,
         cfg: WaypointsCmdConfig,
-        robot: RobotBase,
+        robot: RobotBase | RtAxol,
         control: Control,
         stop_event: threading.Event,
     ) -> None:
@@ -881,7 +888,9 @@ class _Session:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a teach-and-repeat session."""
-    cfg = parse(WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only"))
+    cfg = parse(
+        WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only", "rt")
+    )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
@@ -932,7 +941,7 @@ async def _session(
     if cfg.sim:
         from ..robot.sim import Sim
 
-        robot: RobotBase = Sim()
+        robot: RobotBase | RtAxol = Sim()
     else:
         from ..robot import Axol
 
@@ -941,6 +950,13 @@ async def _session(
             left_channel=cfg.left_channel,
             right_channel=cfg.right_channel,
         )
+        if cfg.rt:
+            # The core owns CAN; gravity comp (teaching) and playback both
+            # stream through the command sink, and start_telemetry below
+            # becomes a no-op (telemetry arrives every core tick).
+            from ..rt import RtAxol
+
+            robot = RtAxol(robot)
 
     async with robot:
         if not cfg.sim:

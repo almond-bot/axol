@@ -14,7 +14,8 @@ This command is configured via draccus — see [Command configuration](/cli/conf
 | `--record PREFIX` | Capture the hand-guided session (measured arm-joint positions + torques, one row per control tick, last ~5 min) to `PREFIX_gc.npz` for [`motion.build`](/cli/motion-build) — a reference motion from a hand-guided demonstration instead of a teleoperated one. A bare name lands in `~/.almond/recordings/`; the file is written when the session ends. Unset (the default) records nothing. |
 | `--kd FLOAT` | Velocity damping coefficient on *free* joints (Nm·s/rad). Higher = less floppy, and slows the creep a residual gravity-model error can cause on low-friction joints. Default 0.5 |
 | `--rate_hz FLOAT` | Control loop rate in Hz (default: 250) |
-| `--telemetry_hz FLOAT` | Joint telemetry poll rate in Hz (default: 500) |
+| `--telemetry_hz FLOAT` | Joint telemetry poll rate in Hz (default: 500). Ignored with `--rt`. |
+| `--rt` | **Experimental.** Drive the wire through the `axol-rt` Rust realtime core: Python keeps computing the gravity model each cycle and streams the per-joint commands to the core, which owns CAN in both directions and sends telemetry back every tick. Same switch as [`teleop --rt`](/cli/teleop). Requires the `axol-rt` binary. |
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 

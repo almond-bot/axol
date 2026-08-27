@@ -45,6 +45,7 @@ import asyncio
 import logging
 import math
 import time
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -54,6 +55,9 @@ from ...robot.config import AxolConfig
 from ...robot.control import ContactWatchdog
 from ...tuning import save_run, tracking_metrics
 from ...tuning.motion import ReferenceMotion, list_motions, load_motion
+
+if TYPE_CHECKING:
+    from ...rt import RtAxol
 
 _PLAN_SPEED = 0.1 * np.pi  # rad/s — approach/return trajectory speed
 _PLAN_MIN_DURATION = 1.5  # s
@@ -165,6 +169,14 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "the arms execute the solver's output — still scored against the "
         "clean reference, so IK reconstruction error and tracking error "
         "show up together. Composes after --noise/--filter.",
+    )
+    p.add_argument(
+        "--rt",
+        action="store_true",
+        help="Drive the wire through the Rust realtime core (axol-rt): the "
+        "core owns CAN at 240 Hz with in-core tracking, friction/inertia "
+        "feedforward, and velocity damping, while this process streams "
+        "targets — same switch as `axol teleop --rt`",
     )
     p.add_argument(
         "--seed",
@@ -526,7 +538,16 @@ async def _run(args: argparse.Namespace) -> None:
     q_start = to_full(sent[0])
     traj_playback = [to_full(row) for row in sent]
 
-    async with Axol(config=config) as axol:
+    robot: Axol | RtAxol = Axol(config=config)
+    if args.rt:
+        # The core owns CAN; playback streams targets through the command
+        # sink and the caches refresh from per-tick telemetry, so the
+        # start_telemetry/wait_for_telemetry pair below become no-ops.
+        from ...rt import RtAxol as _RtAxol
+
+        robot = _RtAxol(robot)
+
+    async with robot as axol:
         await axol.start_telemetry(500)
         await axol.wait_for_telemetry()
 
@@ -640,6 +661,7 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": motion.rate,
                 "stiffness": args.stiffness,
                 "columns": _COLUMNS,
+                "rt": bool(args.rt),
                 **stream_info,
             },
             label=args.label,

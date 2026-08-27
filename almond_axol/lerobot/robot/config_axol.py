@@ -52,6 +52,13 @@ class AxolRobotConfig(RobotConfig):
                           kinematics in send_action. Default False.
         left_channel:     SocketCAN interface for the left arm.
         right_channel:    SocketCAN interface for the right arm.
+        rt:               Drive the wire through the Rust realtime core
+                          (axol-rt): the core owns CAN at 240 Hz — in-core
+                          trapezoid tracking, friction/inertia feedforward,
+                          and velocity damping — while Python keeps the
+                          model math and streams targets. ``telemetry_hz``
+                          is then ignored (telemetry arrives every core
+                          tick). Same switch as ``axol teleop --rt``.
     """
 
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
@@ -61,6 +68,7 @@ class AxolRobotConfig(RobotConfig):
     observe_cartesian: bool = False
     left_channel: str = CAN_LEFT
     right_channel: str = CAN_RIGHT
+    rt: bool = False
     video_backend: VideoBackend = "auto"
 
     def select_assigned_cameras(self, *, minimum: int = 1) -> None:

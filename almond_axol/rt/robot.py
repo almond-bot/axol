@@ -210,6 +210,48 @@ class RtAxol:
             self._loop_hz,
         )
 
+    async def __aenter__(self) -> RtAxol:
+        """Enter the async context, arming the core via :meth:`enable`."""
+        await self.enable()
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        """Exit the async context, tearing down via :meth:`disable`."""
+        await self.disable()
+
+    async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
+        """No-op: the core already streams full telemetry every tick.
+
+        Positions, velocities, and torques for every slot arrive in the
+        per-tick ``F`` packets regardless of ``hz`` / ``torque`` — a poll
+        loop would need the bus, which the core owns. Kept so classic
+        flows (gravity-comp, waypoints, tune.motion, the LeRobot robot)
+        run unchanged against ``RtAxol``.
+        """
+        _logger.debug(
+            "rt: start_telemetry(%s) ignored — core streams at %.0f Hz",
+            hz,
+            self._loop_hz,
+        )
+
+    async def stop_telemetry(self) -> None:
+        """No-op counterpart of :meth:`start_telemetry`."""
+
+    async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
+        """Block until the core's telemetry stream is flowing for every arm.
+
+        Same contract as :meth:`Axol.wait_for_telemetry`; ``enable`` already
+        waited once, so after a successful bring-up this returns immediately.
+        """
+        deadline = time.monotonic() + timeout
+        sides = [side for side, _arm in self._arms()]
+        while not all(self._fb_packets[s] > 0 for s in sides):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"rt: no telemetry packet from the core within {timeout:.1f} s"
+                )
+            await asyncio.sleep(0.02)
+
     async def _bring_up_gripper(self, arm: AxolArm) -> None:
         """The classic gripper bring-up (see ``AxolArm.enable``), standalone.
 
@@ -277,17 +319,7 @@ class RtAxol:
         confirms the core's own feedback path (MIT replies -> `F` packets)
         is live before the caller starts streaming against it.
         """
-        deadline = time.monotonic() + 2.0
-        sides = [side for side, _arm in self._arms()]
-        while True:
-            if all(self._fb_packets[s] > 0 for s in sides):
-                return
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    "rt: armed, but no telemetry packet arrived from the "
-                    "core within 2 s"
-                )
-            await asyncio.sleep(0.02)
+        await self.wait_for_telemetry(timeout=2.0)
 
     def _make_sink(self, side: int):
         def sink(cmds: list[tuple[float, ...]]) -> None:
