@@ -11,14 +11,20 @@ Backends:
   - ``survive``   — Vive Tracker 3.0 via libsurvive (lighthouse tracking).
   - ``ultimate``  — Vive Ultimate Tracker via the wireless dongle (pyvut).
   - ``synthetic`` — generated motion for end-to-end tests without hardware.
+  - ``static``    — fixed poses, for gripper-only Mantis UMI teleop with no
+    tracker hardware at all (the trigger node is the only live input).
 """
 
+from . import static, synthetic
 from .base import TrackerPose, TrackerSource
 from .config import TRACKER_CONFIG_FILE, TrackerConfig, load_tracker_config
+from .static import StaticSource
 from .synthetic import SyntheticSource
 
 __all__ = [
+    "HARDWARE_FREE_BINDINGS",
     "TRACKER_CONFIG_FILE",
+    "StaticSource",
     "SyntheticSource",
     "TrackerConfig",
     "TrackerPose",
@@ -26,6 +32,14 @@ __all__ = [
     "create_source",
     "load_tracker_config",
 ]
+
+# Backends that fabricate their own devices instead of discovering hardware.
+# The bridge binds both sides from this table, so they need no prior
+# ``axol tracker.identify`` run.
+HARDWARE_FREE_BINDINGS: dict[str, tuple[str, str]] = {
+    "synthetic": (synthetic.LEFT_KEY, synthetic.RIGHT_KEY),
+    "static": (static.LEFT_KEY, static.RIGHT_KEY),
+}
 
 
 def create_source(config: TrackerConfig) -> TrackerSource:
@@ -44,7 +58,9 @@ def create_source(config: TrackerConfig) -> TrackerSource:
         )
     if config.backend == "synthetic":
         return SyntheticSource()
+    if config.backend == "static":
+        return StaticSource()
     raise ValueError(
         f"unknown tracker backend {config.backend!r} "
-        "(expected survive, ultimate, or synthetic)"
+        "(expected survive, ultimate, synthetic, or static)"
     )

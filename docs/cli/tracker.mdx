@@ -5,12 +5,27 @@ description: "Headset-free Mantis teleop and data collection with Vive trackers.
 
 Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --umi`](/cli/teleop) and [`collect-data --umi`](/cli/collect-data) run unchanged.
 
-Two tracker families are supported:
+Two tracker families are supported, plus two hardware-free backends for bring-up:
 
 | Backend | Hardware | Tracking | Extra requirements |
 |---|---|---|---|
 | `survive` | Vive Tracker 3.0 | Lighthouse (outside-in) | 1–2 SteamVR base stations; a libsurvive build on the Jetson |
 | `ultimate` | Vive Ultimate Tracker | Inside-out SLAM (no base stations) | The HTC wireless dongle; the `pyvut` package; a one-time map created with VIVE Hub on Windows |
+| `static` | None | Arms frozen at a fixed pose | None — the gripper's trigger node is the only live input |
+| `synthetic` | None | Generated circular motion | None — for exercising the whole bridge → IK → sim pipeline |
+
+Both hardware-free backends bind their own devices, so they need no `tracker.identify` run.
+
+## Gripper-only bring-up
+
+To bring up or debug a Mantis UMI **gripper** on its own — no trackers, no base stations, no libsurvive — use `--backend static`. The arms hold still and the rig's CAN trigger node is the only thing that can change the commanded state, so a squeeze is unambiguously the cause of any motion you see:
+
+```bash
+axol teleop --umi                     # one terminal
+axol tracker.bridge --backend static  # another
+```
+
+Press **Enter** in the bridge terminal to engage, then squeeze the trigger — the gripper should track your squeeze proportionally. Nothing moves before you engage: a disengaged arm freezes its pose *and* its gripper. Prefer `static` over `synthetic` here, since synthetic's orbiting devices keep the commanded arm state changing and muddy the picture.
 
 The absolute (UMI) IK mode solves the rigid tracker→gripper mount and the world yaw/translation at engage time, so the tracker's own frame conventions never need hand-calibrating — only **gravity alignment and metric scale** must be right, which both tracking systems provide.
 
@@ -28,7 +43,7 @@ axol tracker.bridge
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/umi/tcp_transform.json` overrides it when present. For everything else, the absolute (UMI) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
-Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands come from the rig's CAN trigger node when one is configured (`--trigger-can-left` / `--trigger-can-right`): the binary trigger switch closes the gripper while pressed and opens it at rest. A side with no trigger configured streams fully open.
+Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands come from the rig's CAN trigger node, which defaults to that side's Mantis UMI gripper bus (override with `--trigger-can-left` / `--trigger-can-right`): the analog trigger tracks your squeeze proportionally, closing the gripper as you pull and opening it as you release. A side whose trigger node can't be reached — no such CAN interface, bus not brought up, or `null` in the config — streams fully open and logs a warning.
 
 ## `axol tracker.bridge`
 
@@ -39,7 +54,7 @@ Until the rig's button PCB lands, the bridge's terminal is the control surface: 
 | `--host HOST` | VR server host — the machine running teleop/collect-data. Default: `localhost`. |
 | `--port INT` | VR server port. Default: 8000. |
 | `--hz FLOAT` | Frame streaming rate. Default: 120. |
-| `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | SocketCAN interface of that side's trigger node (e.g. `can_alm_umi_l`); overrides the saved config. The node publishes its binary trigger state at 100 Hz on CAN ID `0x009`. |
+| `--trigger-can-left IFACE` / `--trigger-can-right IFACE` | SocketCAN interface of that side's trigger node; overrides the saved config, which defaults to `can_alm_umi_l` / `can_alm_umi_r`. The node publishes its analog trigger position at 100 Hz on CAN ID `0x009`. |
 
 A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its last good pose and logs a warning rather than feeding IK a glitch; disengage, recover the tracker, and re-engage. A stale trigger node (no frames for ~250 ms — unpowered or disconnected) likewise holds the last grip command rather than jumping, and the bridge logs the dropout.
 

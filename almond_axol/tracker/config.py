@@ -12,6 +12,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from ..constants import CAN_UMI_LEFT, CAN_UMI_RIGHT
+
 TRACKER_CONFIG_FILE = Path.home() / ".almond" / "tracker" / "config.json"
 
 
@@ -34,9 +36,11 @@ class TrackerConfig:
             frame (``"z"`` or ``"y"``). ``"z"`` converts through the z-up →
             y-up basis change; ``"y"`` passes through. Verify at bring-up.
         trigger_can_left:  SocketCAN interface of the left rig's trigger
-            node (e.g. ``"can_alm_umi_l"``), or ``None`` when the rig has
-            no trigger (grip then streams as 1.0 = open). The trigger is
-            a binary switch (open/close) — no calibration fields.
+            node, defaulting to the Mantis UMI's left gripper bus — the
+            only bus a trigger node ever sits on. Set it to ``None`` for a
+            rig with no trigger; grip then streams as 1.0 (open), as it
+            does when the interface is absent. The node self-calibrates,
+            so there are no calibration fields.
         trigger_can_right: SocketCAN interface of the right rig's trigger
             node, or ``None``.
         allow_single_side: Let the bridge run with only one side's
@@ -50,8 +54,8 @@ class TrackerConfig:
     right: str | None = None
     ultimate_quat_order: str = "xyzw"
     ultimate_up_axis: str = "z"
-    trigger_can_left: str | None = None
-    trigger_can_right: str | None = None
+    trigger_can_left: str | None = CAN_UMI_LEFT
+    trigger_can_right: str | None = CAN_UMI_RIGHT
     allow_single_side: bool = False
 
 

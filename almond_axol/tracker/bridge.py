@@ -9,8 +9,8 @@ server's self-signed certificate is not verified).
 
 Grip comes from the Mantis trigger node's CAN messages when one is
 configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
-the binary trigger switch drives ``l_grip``/``r_grip`` (pressed = close,
-released = open). Engage/reset come
+the analog trigger position drives ``l_grip``/``r_grip`` proportionally
+(fully squeezed = closed, released = open). Engage/reset come
 from :class:`StdinControls` (the trigger frame carries no buttons —
 session controls arrive with a later PCB revision): Enter toggles
 tracking engage, ``r`` triggers a reset. The toggle is realised as a
