@@ -51,7 +51,7 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 |---|---|---|
 | `frequency` | `240` Hz | Control loop rate used by `run()` and reset trajectory density |
 | `ik_frequency` | `120` Hz | VR-frame ingest / IK dispatch cadence (decoupled from the faster control loop) |
-| `teleop_max_vel` | `60/60/60/120/180/180/180 °/s` | Per-joint trapezoidal filter velocity caps (ARM_JOINTS order, both arms) — the per-tick command-step budget: 0.25°/tick shoulders, 0.5° elbow, 0.75° wrists at 240 Hz, the ceiling on how fast a solver jump / outlier / stall recovery can move each joint |
+| `teleop_max_vel` | `1.0 rev/s` | Trapezoidal filter velocity cap during normal teleoperation |
 | `teleop_max_accel` | `3.5 rev/s²` | Trapezoidal filter acceleration cap |
 | `engage_max_vel` | `0.1 rev/s` | Starting velocity cap when teleop is first engaged after a reset; smoothsteps up to `teleop_max_vel` over `engage_duration` |
 | `engage_duration` | `1.0` s | Seconds over which the velocity cap ramps (smoothstep) from `engage_max_vel` up to `teleop_max_vel` after engaging |

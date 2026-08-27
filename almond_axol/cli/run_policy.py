@@ -42,7 +42,7 @@ from ..lerobot.rollout import (
 )
 from ..recording import make_episode_durable, restore_dataset_ownership
 from ..robot.control import ContactWatchdog
-from ..teleop.config import TELEOP_MAX_VEL_DEFAULT, VRTeleopConfig
+from ..teleop.config import VRTeleopConfig
 from ..teleop.filter import TrapezoidalFilter
 from .collect_data import check_resume_consistency
 from .config import AggregateFn, LogLevel, PolicyType, parse
@@ -155,18 +155,17 @@ class RunPolicyConfig:
     # still land with a ~1 s time constant; shape corrections (the actual
     # policy behavior) pass through unfaded. 0 disables.
     align_fade_s: float = 1.0
-    # Velocity/acceleration limits for the execution-side TrapezoidalFilter
-    # that shapes every command sent to the arms. The velocity default is
-    # teleop's least restrictive (wrist) cap — teleop's per-joint caps bound
-    # the only command profile the policy ever saw in training, so
-    # legitimate policy motion passes through essentially untouched while
-    # chunk-boundary snaps (which violate the acceleration limit ~10x
-    # regardless of how slow the inference platform is) get spread over the
-    # ticks the physical arm needs anyway. This is what keeps the arm smooth
-    # on any inference hardware: a late chunk decelerates the arm to a hold
-    # and ramps it back out instead of freeze-then-lurch. Set either to 0 to
-    # disable the filter.
-    exec_max_vel: float = max(TELEOP_MAX_VEL_DEFAULT)
+    # Per-joint velocity/acceleration limits for the execution-side
+    # TrapezoidalFilter that shapes every command sent to the arms. The
+    # defaults are teleop's constants — the only command profile the policy
+    # ever saw in training — so legitimate policy motion passes through
+    # essentially untouched while chunk-boundary snaps (which violate the
+    # acceleration limit ~10x regardless of how slow the inference platform
+    # is) get spread over the ticks the physical arm needs anyway. This is
+    # what keeps the arm smooth on any inference hardware: a late chunk
+    # decelerates the arm to a hold and ramps it back out instead of
+    # freeze-then-lurch. Set either to 0 to disable the filter.
+    exec_max_vel: float = VRTeleopConfig.teleop_max_vel
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel
     # Contact watchdog for the between-episode return-to-rest: a joint torque
     # residual (measured minus modeled gravity, Nm) sustained above this
@@ -557,7 +556,7 @@ def _build_axol_robot_client(
     temporal_ensemble_coeff: float = 0.01,
     ensemble_blend_s: float = 0.2,
     align_fade_s: float = 1.0,
-    exec_max_vel: float = max(TELEOP_MAX_VEL_DEFAULT),
+    exec_max_vel: float = VRTeleopConfig.teleop_max_vel,
     exec_max_accel: float = VRTeleopConfig.teleop_max_accel,
     policy_torque_threshold: float = 0.0,
 ) -> Any:

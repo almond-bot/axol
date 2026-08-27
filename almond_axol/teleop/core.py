@@ -133,13 +133,12 @@ class VRTeleopCore:
 
         # Output guard: the hard contract that no two consecutive arm
         # commands differ by more than teleop_max_vel / frequency per joint
-        # (per-joint at defaults: 0.25°/tick shoulders, 0.5° elbow, 0.75°
-        # wrists — beyond any human-driven joint speed, so a larger step is
-        # by definition an upstream bug or bypass). The trapezoid already
-        # enforces this on the tracking path; the guard extends it to
-        # *every* path (reset/startup playback included), spreading an
-        # oversized step across ticks and warning when it had to —
-        # violations become impossible and visible. Cleared at the points
+        # (~52 mrad at defaults — double any human-driven joint speed, so a
+        # larger step is by definition an upstream bug or bypass). The
+        # trapezoid already enforces this on the tracking path; the guard
+        # extends it to *every* path (reset/startup playback included),
+        # spreading an oversized step across ticks and warning when it had to
+        # — violations become impossible and visible. Cleared at the points
         # where the command is legitimately re-adopted to match the measured
         # arm (connect seeding, resync after hand-guiding).
         self._last_cmd: np.ndarray | None = None
@@ -616,13 +615,12 @@ class VRTeleopCore:
     def _guard_output(self, out: np.ndarray) -> np.ndarray:
         """Enforce the per-tick command-step contract on the arm joints.
 
-        Clamps each arm's step from the previous command to the per-joint
-        ``teleop_max_vel / frequency`` budget (whole-vector scaling by the
-        worst joint's excess, so a clamped step keeps its direction and is
-        simply spread over the next ticks). Grippers (normalized units,
-        EMA-bounded) pass through. Warns (rate-limited) whenever it engages:
-        the guard exists to make an upstream discontinuity harmless *and*
-        loud, not to silently absorb it.
+        Clamps each arm's step from the previous command to
+        ``teleop_max_vel / frequency`` per joint (whole-vector scaling, so a
+        clamped step keeps its direction and is simply spread over the next
+        ticks). Grippers (normalized units, EMA-bounded) pass through. Warns
+        (rate-limited) whenever it engages: the guard exists to make an
+        upstream discontinuity harmless *and* loud, not to silently absorb it.
         """
         last = self._last_cmd
         if last is None:
@@ -632,10 +630,10 @@ class VRTeleopCore:
         worst = 0.0
         for sl in (slice(0, 7), slice(8, 15)):
             delta = out[sl] - last[sl]
-            ratio = float(np.max(np.abs(delta) / bound))
-            if ratio > 1.0:
-                out[sl] = last[sl] + delta / ratio
-                worst = max(worst, float(np.max(np.abs(delta))))
+            m = float(np.max(np.abs(delta)))
+            if m > bound:
+                out[sl] = last[sl] + delta * (bound / m)
+                worst = max(worst, m)
         self._last_cmd = out
         if worst > 0.0:
             now = time.perf_counter()
@@ -643,12 +641,10 @@ class VRTeleopCore:
                 self._guard_warn_time = now
                 self._logger.warning(
                     "Output guard clamped a %.1f mrad command step to the "
-                    "per-joint %.1f-%.1f mrad/tick contract — an upstream "
-                    "stage produced a discontinuity (spread over the "
-                    "following ticks)",
+                    "%.1f mrad/tick contract — an upstream stage produced a "
+                    "discontinuity (spread over the following ticks)",
                     1e3 * worst,
-                    1e3 * float(np.min(bound)),
-                    1e3 * float(np.max(bound)),
+                    1e3 * bound,
                 )
         return out
 

@@ -40,7 +40,7 @@ from lerobot.utils.decorators import check_if_already_connected, check_if_not_co
 
 from ...constants import Joint
 from ...robot.axol import Axol
-from ...teleop.config import TELEOP_MAX_VEL_DEFAULT, VRTeleopConfig
+from ...teleop.config import VRTeleopConfig
 from ...teleop.filter import TrapezoidalFilter
 from .config_axol import AxolRobotConfig
 
@@ -659,14 +659,10 @@ class AxolRobot(Robot):
         if self._cart_shapers is None:
             self._cart_shapers = (
                 TrapezoidalFilter(
-                    np.asarray(TELEOP_MAX_VEL_DEFAULT, dtype=np.float32),
-                    VRTeleopConfig.teleop_max_accel,
-                    0.0,
+                    VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
                 ),
                 TrapezoidalFilter(
-                    np.asarray(TELEOP_MAX_VEL_DEFAULT, dtype=np.float32),
-                    VRTeleopConfig.teleop_max_accel,
-                    0.0,
+                    VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
                 ),
             )
             gap = float("inf")
