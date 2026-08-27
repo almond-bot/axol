@@ -1,25 +1,33 @@
-"""In-process runner for the core operations.
+"""Runner for the core operations.
 
 Unlike :class:`~almond_axol.serve.manager.SessionManager` (which spawns the
 generic calibration/setup commands as ``axol <cmd>`` subprocesses), the core
 operations — teleop, gravity-comp, collect-data, run-policy, replay-dataset —
-run *inside* the serve process here, so they share the persistent robot
-connection instead of opening their own from a child process.
+are managed here with full config building (shared settings, camera spec) and
+robot-link handoff.
 
-Only one operation runs at a time. Its ``logging`` output and ``print``s are
-captured into a :class:`~almond_axol.serve.manager.Session` ring buffer (the
-same object the log WebSocket streams), so the UI sees live output exactly as
-it did for subprocesses.
+Only one operation runs at a time. Its output is captured into a
+:class:`~almond_axol.serve.manager.Session` ring buffer (the same object the
+log WebSocket streams), so the UI sees live output either way.
 
 Which operations exist, and how each one runs, comes entirely from the command
 registry (:mod:`.commands`) — nothing here is keyed on an operation's id, so a
 downstream package's registered operation runs on the same paths as the
 built-in five:
 
-- ``execution="async"`` (teleop / gravity-comp) runs ``await _run(cfg)`` on a
-  dedicated event loop in a worker thread, stopped by cancelling the task (both
-  tear down cleanly on ``CancelledError`` via their ``async with`` robot
-  context).
+- ``isolated=True`` (teleop / gravity-comp) runs the op in its own
+  ``axol <cmd> --config_path <tmp.yaml>`` subprocess: their 240-250 Hz
+  hardware control loops can't share the serve interpreter — on hardware the
+  CAN round-trip leaves ~0.5 ms of slack per tick and serve's HTTP/telemetry/
+  log threads hold the GIL for 1-3 ms at a time, which measured as 50-83% of
+  ticks late in-process versus on-time in a dedicated process (matching
+  tune.motion, which paces perfectly as a subprocess). The built config —
+  cameras included, which flat argv can't carry — travels via a temp
+  ``--config_path`` file; stop sends the process group a SIGINT (exactly a
+  terminal Ctrl-C) and escalates to SIGKILL after the grace period.
+- ``execution="async"`` runs ``await _run(cfg)`` on a dedicated event loop in
+  a worker thread, stopped by cancelling the task (tears down cleanly on
+  ``CancelledError`` via the ``async with`` robot context).
 - ``execution="thread"`` (collect-data / run-policy / replay-dataset) runs
   ``_run(cfg, stop_event=...)`` on a worker thread, stopped via the
   ``threading.Event``. An op declaring ``episode_control`` also gets
@@ -36,7 +44,10 @@ import logging
 import multiprocessing
 import os
 import re
+import signal
+import subprocess
 import sys
+import tempfile
 import threading
 from typing import Any
 
@@ -352,6 +363,8 @@ class OperationRunner:
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
+        # Subprocess handle of the live isolated op (teleop / gravity-comp).
+        self._proc: subprocess.Popen[str] | None = None
         # Episode control of the live op (set while an op declaring
         # episode_control runs, e.g. run-policy).
         self._policy_control: Any = None
@@ -461,7 +474,8 @@ class OperationRunner:
         log_level = self._log_level(args)
 
         session.status = "running"
-        session.emit(f"[serve] starting {op_id} (in-process)")
+        mode = "own process" if cmd.isolated else "in-process"
+        session.emit(f"[serve] starting {op_id} ({mode})")
 
         if needs_robot and self._robot_link is not None:
             session.emit("[serve] releasing robot link for task")
@@ -470,7 +484,9 @@ class OperationRunner:
             except Exception as exc:  # noqa: BLE001
                 session.emit(f"[serve] robot release warning: {exc}")
 
-        if cmd.execution == "async":
+        if cmd.isolated:
+            target = self._run_proc
+        elif cmd.execution == "async":
             target = self._run_async
         else:
             target = self._run_thread
@@ -528,6 +544,14 @@ class OperationRunner:
             session.status = "stopping"
         session.emit("[serve] stopping…")
         self._stop_event.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            # Isolated op: a SIGINT to the process group is exactly a terminal
+            # Ctrl-C — the op ramps to rest, flushes recorders, and exits.
+            try:
+                os.killpg(proc.pid, signal.SIGINT)
+            except (OSError, ProcessLookupError):
+                pass
         loop, task = self._async_loop, self._async_task
         if loop is not None and task is not None:
             try:
@@ -546,7 +570,16 @@ class OperationRunner:
         if thread is None:
             return
         thread.join(timeout=_STOP_GRACE_S)
-        if thread.is_alive():
+        if thread.is_alive() and self._proc is not None:
+            # Isolated op still running after the SIGINT grace (e.g. stuck in
+            # a JAX compile that can't be interrupted): kill the whole group.
+            session.emit(
+                f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
+                "force-killing the operation's process group"
+            )
+            self._kill_proc_group(session)
+            thread.join(timeout=_FORCE_GRACE_S)
+        elif thread.is_alive():
             session.emit(
                 f"[serve] still stopping after {_STOP_GRACE_S:.0f}s — "
                 "force-killing the operation's child processes (sparing the "
@@ -868,7 +901,96 @@ class OperationRunner:
         raw = str(args.get("log_level", "INFO")).upper()
         return getattr(logging, raw, logging.INFO)
 
-    # -- async ops (teleop / gravity-comp) ----------------------------------
+    # -- isolated ops (teleop / gravity-comp) --------------------------------
+
+    def _run_proc(
+        self,
+        session: Session,
+        op_id: str,
+        cfg: Any,
+        log_level: int,
+        needs_robot: bool,
+    ) -> None:
+        """Run one op as an ``axol <cmd> --config_path <tmp.yaml>`` subprocess.
+
+        The built config (shared settings and the camera dict already folded
+        in) is dumped to a temp file so nothing is lost to flat-argv limits.
+        The child gets its own session (process group): stop sends the group
+        a SIGINT — indistinguishable from a terminal Ctrl-C, so the op's own
+        teardown (rest ramp, recorder flush, IK worker join) runs as designed.
+        ``log_level`` is already inside ``cfg``; the child formats its own
+        log lines and this thread just pumps them into the session buffer.
+        """
+        import draccus
+
+        from .commands import COMMANDS
+
+        cmd = COMMANDS[op_id]
+        cfg_file = tempfile.NamedTemporaryFile(
+            "w", prefix=f"axol-{op_id}-", suffix=".yaml", delete=False
+        )
+        try:
+            with cfg_file:
+                draccus.dump(cfg, cfg_file)
+            env = dict(os.environ)
+            env.setdefault("PYTHONUNBUFFERED", "1")
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    cmd.module,
+                    cmd.cli,
+                    "--config_path",
+                    cfg_file.name,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env=env,
+            )
+            self._proc = proc
+            session.proc = proc  # the UI reads the pid off the session
+            # A stop that raced the spawn set _stopping before _proc existed
+            # and its SIGINT went nowhere — deliver it now.
+            if self._stopping and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGINT)
+                except (OSError, ProcessLookupError):
+                    pass
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                _forward_line(session.emit, line.rstrip("\n"))
+            rc = proc.wait()
+            if rc != 0 and not self._stopping:
+                session.exit_code = rc
+                self._mark_terminal(session, "error", error=f"exit code {rc}")
+                session.emit(f"[serve] error: {session.error}")
+        except Exception as exc:  # noqa: BLE001
+            self._mark_terminal(session, "error", error=f"{type(exc).__name__}: {exc}")
+            session.emit(f"[serve] error: {session.error}")
+        finally:
+            self._proc = None
+            try:
+                os.unlink(cfg_file.name)
+            except OSError:
+                pass
+        self._finish(session, needs_robot)
+
+    def _kill_proc_group(self, session: Session) -> None:
+        """SIGKILL an isolated op's whole process group (child + IK worker…)."""
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        session.emit(f"[serve] killing operation process group (pid {proc.pid})")
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+
+    # -- async ops (in-process) ----------------------------------------------
 
     def _run_async(
         self,

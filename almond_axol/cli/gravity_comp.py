@@ -87,8 +87,8 @@ async def _run(cfg: GravityCompCmdConfig) -> None:
 
     # Same realtime scheduling as a teleop session (core pinning + short GIL
     # switch interval, both restored on exit): the hold loop drives the arms
-    # at cfg.rate_hz, and when serve runs this op in-process the web UI's
-    # threads otherwise stretch the control ticks (see
+    # at cfg.rate_hz in its own process (serve launches this op as a
+    # subprocess), and the pin keeps it off the cores other work owns (see
     # affinity.realtime_session).
     with affinity.realtime_session():
         await _run_session(cfg)
