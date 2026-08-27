@@ -21,7 +21,7 @@ class VRTeleopConfig:
             :meth:`VRTeleop.run` and as waypoint density for reset
             trajectories. Each cycle sends 8 impedance/position commands per
             arm bus whose replies carry all feedback — ~16 frames ≈ 2.1 ms
-            of bus time — so 240 Hz runs each 1 Mbps arm bus at ~50%
+            of bus time — so 120 Hz runs each 1 Mbps arm bus at ~25%
             utilisation. A higher rate mainly buys the host damping loop
             phase margin (its transport delay is one cycle).
         ik_frequency: IK dispatch rate in Hz — how often VR frames are sent
@@ -192,7 +192,7 @@ class VRTeleopConfig:
             dtype=np.float32,
         )
     )
-    frequency: float = 240.0
+    frequency: float = 120.0
     ik_frequency: float = 120.0
     reset_speed: float = 0.1 * 2 * math.pi
     reset_min_duration: float = 1.5
