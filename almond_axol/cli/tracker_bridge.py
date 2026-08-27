@@ -10,11 +10,11 @@ server exactly like a headset would — nothing downstream changes.
 
 With ``--backend static`` it needs no tracker hardware at all: the arms
 hold a fixed pose and the rig's CAN trigger node is the only live input,
-which is the quickest way to bring up or debug a Mantis UMI gripper.
+which is the quickest way to bring up or debug a Mantis gripper.
 
 Backend + left/right binding come from ``~/.almond/tracker/config.json``
 (written by ``axol tracker.identify``); every field can be overridden on
-the command line. The rig's CAN trigger nodes default to the Mantis UMI
+the command line. The rig's CAN trigger nodes default to the Mantis
 gripper buses (override with ``--trigger-can-left`` /
 ``--trigger-can-right``), and their analog trigger position drives the
 grip command proportionally (squeeze = close, release = open); engage/
@@ -43,7 +43,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         choices=("survive", "ultimate", "synthetic", "static"),
         default=None,
         help="Tracker backend (default: the saved config, else survive). "
-        "Use static for gripper-only UMI teleop with no tracker hardware: "
+        "Use static for gripper-only Mantis teleop with no tracker hardware: "
         "the arms hold still and only the trigger node drives the gripper.",
     )
     parser.add_argument(
@@ -78,13 +78,13 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "--trigger-can-left",
         default=None,
         help="SocketCAN interface of the left rig's trigger node; overrides "
-        "the saved config, which defaults to the Mantis UMI gripper bus.",
+        "the saved config, which defaults to the Mantis gripper bus.",
     )
     parser.add_argument(
         "--trigger-can-right",
         default=None,
         help="SocketCAN interface of the right rig's trigger node; overrides "
-        "the saved config, which defaults to the Mantis UMI gripper bus.",
+        "the saved config, which defaults to the Mantis gripper bus.",
     )
     parser.add_argument(
         "--allow-single-side",

@@ -18,7 +18,7 @@ Both hardware-free backends bind their own devices, so they need no `tracker.ide
 
 ## Gripper-only bring-up
 
-To bring up or debug a Mantis UMI **gripper** on its own — no trackers, no base stations, no libsurvive — use `--backend static`. The arms hold still and the rig's CAN trigger node is the only thing that can change the commanded state, so a squeeze is unambiguously the cause of any motion you see:
+To bring up or debug a Mantis **gripper** on its own — no trackers, no base stations, no libsurvive — use `--backend static`. The arms hold still and the rig's CAN trigger node is the only thing that can change the commanded state, so a squeeze is unambiguously the cause of any motion you see:
 
 ```bash
 axol teleop --umi                     # one terminal
@@ -43,7 +43,7 @@ axol tracker.bridge
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/umi/tcp_transform.json` overrides it when present. For everything else, the absolute (UMI) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
-Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands come from the rig's CAN trigger node, which defaults to that side's Mantis UMI gripper bus (override with `--trigger-can-left` / `--trigger-can-right`): the analog trigger tracks your squeeze proportionally, closing the gripper as you pull and opening it as you release. A side whose trigger node can't be reached — no such CAN interface, bus not brought up, or `null` in the config — streams fully open and logs a warning.
+Until the rig's button PCB lands, the bridge's terminal is the control surface: **Enter** toggles engage (the alignment squeeze of the Quest flow — hold both grippers at the robot's rest pose relative to the scene first), **r** returns to rest, **q** quits. Gripper commands come from the rig's CAN trigger node, which defaults to that side's Mantis gripper bus (override with `--trigger-can-left` / `--trigger-can-right`): the analog trigger tracks your squeeze proportionally, closing the gripper as you pull and opening it as you release. A side whose trigger node can't be reached — no such CAN interface, bus not brought up, or `null` in the config — streams fully open and logs a warning.
 
 ## `axol tracker.bridge`
 

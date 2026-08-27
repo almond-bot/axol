@@ -1,11 +1,11 @@
-"""Fixed-pose tracker source for gripper-only Mantis UMI teleop.
+"""Fixed-pose tracker source for gripper-only Mantis teleop.
 
 Reports two devices (``static-left`` / ``static-right``) parked at a
 constant chest-height pose, so ``axol tracker.bridge`` can run with **no
 tracker hardware at all**: the arms hold still and the only thing that
 moves is the gripper, driven by the rig's CAN trigger node. That is the
 whole rig minus the trackers, which is exactly what you want when
-bringing up or debugging a Mantis UMI gripper::
+bringing up or debugging a Mantis gripper::
 
     axol teleop --umi                     # one terminal
     axol tracker.bridge --backend static  # another; Enter to engage

@@ -36,7 +36,7 @@ class TrackerConfig:
             frame (``"z"`` or ``"y"``). ``"z"`` converts through the z-up →
             y-up basis change; ``"y"`` passes through. Verify at bring-up.
         trigger_can_left:  SocketCAN interface of the left rig's trigger
-            node, defaulting to the Mantis UMI's left gripper bus — the
+            node, defaulting to the Mantis rig's left gripper bus — the
             only bus a trigger node ever sits on. Set it to ``None`` for a
             rig with no trigger; grip then streams as 1.0 (open), as it
             does when the interface is absent. The node self-calibrates,
