@@ -53,7 +53,11 @@ async def session(name, actions):
     return proc.returncode, out.decode(), result
 
 
-cfg = b"C" + b"loop_hz 240\njoint 0 can_alm_axol_l shoulder_1 1 250 3.5\n"
+cfg = (
+    b"C"
+    + b"loop_hz 240\n"
+    + b"joint 0 can_alm_axol_l shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n"
+)
 
 
 async def clean(send, recv, w):
@@ -66,7 +70,8 @@ async def clean(send, recv, w):
 async def skewed(send, recv, w):
     send(cfg)
     await recv()
-    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<5d", *([0.0] * 5)) * 8)
+    # A previous-generation 8-field target against the 9-field core.
+    send(struct.pack("<cBI", b"T", 0, 1) + struct.pack("<8d", *([0.0] * 8)) * 8)
     await asyncio.sleep(0.5)
     return "sent skewed target"
 

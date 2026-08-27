@@ -195,14 +195,15 @@ class RtLink:
         self,
         side: int,
         seq: int,
-        cmds: list[tuple[float, float, float, float, float, float, float, float]],
+        cmds: list[tuple[float, ...]],
     ) -> None:
-        """Ship one arm's 8 slot tuples (p_des, v_des, kp, kd, model t_ff,
-        kd_host, damp_w0, damp_q; the gripper slot repurposes the first
-        three as target/speed/torque). Sync — safe to call from the event
-        loop; the write is buffered."""
+        """Ship one arm's 8 slot tuples (p_des, mode, kp, kd, gravity t_ff,
+        kd_host, damp_w0, damp_q, j_eff; the gripper slot repurposes the
+        first three as target/speed/torque). mode ≥ 0.5 runs the core's
+        tracker + friction/inertia terms, 0 is passthrough (gravity comp).
+        Sync — safe to call from the event loop; the write is buffered."""
         payload = struct.pack("<cBI", b"T", side, seq & 0xFFFFFFFF) + b"".join(
-            struct.pack("<8d", *cmd) for cmd in cmds
+            struct.pack("<9d", *cmd) for cmd in cmds
         )
         self._send(payload)
 

@@ -27,6 +27,16 @@ pub struct MotorSpec {
     /// Target-tuple index this motor plays (arm joints 0-6, gripper 7);
     /// decouples the wire layout from bring-up iteration order.
     pub slot: usize,
+    /// In-core target-tracker limits (rad/s, rad/s²) for tracked-mode
+    /// targets — see `filter::Trapezoid`. Unused by the gripper and `hold`.
+    pub max_vel: f64,
+    pub max_accel: f64,
+    /// Tanh friction-model parameters (`filter::friction`), applied in-core
+    /// against the tracker velocity in tracked mode. Zero for the gripper.
+    pub fc: f64,
+    pub k: f64,
+    pub fv: f64,
+    pub fo: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -48,6 +58,13 @@ pub struct ReadyMotor {
     pub kd: f64,
     pub gripper: bool,
     pub slot: usize,
+    /// Tracker limits + friction params, carried over from the spec.
+    pub max_vel: f64,
+    pub max_accel: f64,
+    pub fc: f64,
+    pub k: f64,
+    pub fv: f64,
+    pub fo: f64,
 }
 
 /// Phase 1 of a cold bring-up: MyActuator 0x76 system reset (all motors at
@@ -125,6 +142,12 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             kd: spec.kd,
             gripper: false,
             slot: spec.slot,
+            max_vel: spec.max_vel,
+            max_accel: spec.max_accel,
+            fc: spec.fc,
+            k: spec.k,
+            fv: spec.fv,
+            fo: spec.fo,
         });
     }
 
@@ -164,6 +187,12 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
             kd: spec.kd,
             gripper: spec.gripper,
             slot: spec.slot,
+            max_vel: spec.max_vel,
+            max_accel: spec.max_accel,
+            fc: spec.fc,
+            k: spec.k,
+            fv: spec.fv,
+            fo: spec.fo,
         });
     }
     Ok(motors)

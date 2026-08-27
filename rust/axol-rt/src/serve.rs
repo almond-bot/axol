@@ -1,16 +1,31 @@
 //! The realtime core: own the CAN buses and run the control loop, driven by
 //! impedance targets streamed from Python over a Unix socket.
 //!
-//! Python keeps the slow model math — VR, IK, MuJoCo gravity/inertia,
-//! friction feedforward, damper *scheduling* (all of
+//! Python keeps the slow model math — VR, IK, target shaping, MuJoCo
+//! gravity/inertia, and the pose *scheduling* of the fast terms (all of
 //! `AxolArm.motion_control`) — and ships per-joint tuples at its own rate
-//! (~120 Hz). This loop owns the wire and the *fast* physics: it paces a
-//! hard `loop_hz` tick, linearly interpolates `p_des`/`t_ff` between
-//! successive targets (one sender period of added latency, in exchange for
-//! no steps on the bus), computes the host-damping torque **in-core** each
-//! tick — band-passed velocity damping from same-tick feedback, using the
-//! pose-scheduled coefficients streamed with each target — and holds the
-//! last played position when targets stop arriving.
+//! (~120 Hz). This loop owns the wire and the *fast* physics, all computed
+//! per tick from its own trajectory and feedback states:
+//!
+//! - a velocity/acceleration-limited tracker (`filter::Trapezoid`, the
+//!   golden-ported `TrapezoidalFilter`) chases the latest streamed target
+//!   at `loop_hz`, replacing linear segment interpolation — its `(pos,
+//!   vel, accel)` states are the wire command, so velocity feedforward is
+//!   continuous instead of frozen between targets;
+//! - friction (`filter::friction`, per-joint params from the config) and
+//!   inertia (`j_eff` streamed pose-scaled per target) feedforwards from
+//!   the tracker's velocity/acceleration — coherent with the trajectory
+//!   actually executed, not with Python's 120 Hz view of it;
+//! - the host-damping torque — band-passed velocity damping from same-tick
+//!   feedback, using the pose-scheduled coefficients streamed with each
+//!   target;
+//! - and the last target is held (tracker converges and stays, damping
+//!   live) when targets stop arriving.
+//!
+//! Targets carry a mode flag: gravity-comp / hold flows stream
+//! *passthrough* targets (`mode 0`) that bypass the tracker and the
+//! friction/inertia terms — a hand-guided limp arm needs `v_des = 0` and
+//! model gravity only.
 //!
 //! Damping lives here, not in Python, because damping is a phase race: the
 //! remote chain (Python's 120 Hz sample → socket → adoption wait → a
@@ -30,8 +45,10 @@
 //! Python -> Rust:
 //! - `C` + text        config: `loop_hz`/`watchdog_ms`/`max_step_rad`/
 //!                     `abort_deg` keys, one `joint <side> <iface> <name>
-//!                     <motor_id> <kp> <kd>` line per arm joint, and an
-//!                     optional `gripper <side> <iface> <motor_id>` line
+//!                     <motor_id> <kp> <kd> <max_vel> <max_accel> <fc> <k>
+//!                     <fv> <fo>` line per arm joint (tracker limits +
+//!                     friction params), and an optional `gripper <side>
+//!                     <iface> <motor_id>` line
 //! - `P`               prep: MyActuator 0x76 reset + settle, Damiao
 //!                     clear-errors (torque-neutral; run *before* Python
 //!                     resolves joint offsets, so the wrap state it verifies
@@ -39,16 +56,18 @@
 //! - `A`               arm: bring-up, enable, hold current pose (the
 //!                     gripper must already be enabled + calibrated in
 //!                     POSITION_FORCE mode by the Python side)
-//! - `T` + binary      target: side u8, seq u32 LE, 8 x 8 f64 LE — slots
-//!                     0-6 are arm-joint tuples (p_des, v_des, kp, kd,
-//!                     t_ff, kd_host, damp_w0, damp_q) where t_ff carries
-//!                     the *model* feedforward (gravity + friction +
-//!                     inertia, no damping) and the last three are the
-//!                     pose-scheduled damping coefficients (effective
-//!                     kd_host in Nm·s/rad, band-pass centre rad/s, and
-//!                     quality factor); slot 7 is the gripper (p_des
-//!                     motor-frame, max_speed rad/s, max_torque Nm, then
-//!                     five zeros)
+//! - `T` + binary      target: side u8, seq u32 LE, 8 x 9 f64 LE — slots
+//!                     0-6 are arm-joint tuples (p_des, mode, kp, kd,
+//!                     t_ff, kd_host, damp_w0, damp_q, j_eff) where mode
+//!                     ≥ 0.5 runs the tracker + friction/inertia terms
+//!                     (teleop) and mode 0 is passthrough (gravity comp);
+//!                     t_ff carries the *slow* model feedforward (gravity
+//!                     only in tracked mode — friction/inertia/damping are
+//!                     computed in-core), kd_host/damp_w0/damp_q are the
+//!                     pose-scheduled damping coefficients, and j_eff is
+//!                     the pose-scaled inertia feedforward gain (Nm·s²/rad);
+//!                     slot 7 is the gripper (p_des motor-frame, max_speed
+//!                     rad/s, max_torque Nm, then six zeros)
 //! - `D`               disarm: disable motors, threads exit
 //!
 //! Rust -> Python:
@@ -62,18 +81,21 @@
 //!                     core is armed.
 //!
 //! ## Safety
-//! - Targets stepping more than `max_step_rad` from the currently played
-//!   position are rejected (counted, reported) — corruption defense; the
-//!   Python side has its own max-step gate. The gripper slot is exempt
-//!   (its targets legitimately jump, matching the Python gate).
-//! - A joint deviating more than `abort_deg` from its played target disables
-//!   both buses (e.g. a collision or a runaway). The gripper is exempt —
-//!   stalling against an object is its normal operation.
+//! - Targets stepping more than `max_step_rad` from the previous target
+//!   are rejected (counted, reported) — corruption defense; the Python
+//!   side has its own max-step gate. The gripper slot is exempt (its
+//!   targets legitimately jump, matching the Python gate). Whatever gets
+//!   through, the tracker's velocity/acceleration limits bound what the
+//!   wire can ever see.
+//! - A joint deviating more than `abort_deg` from its *commanded* position
+//!   (the tracker output) disables both buses (e.g. a collision or a
+//!   runaway). The gripper is exempt — stalling against an object is its
+//!   normal operation.
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
-//! - Watchdog: no target for `watchdog_ms` freezes the played position
-//!   (finishing the in-flight interpolation segment). The arms keep holding
-//!   — matching what the firmware itself does if the host dies — until a
+//! - Watchdog: no target for `watchdog_ms` holds the last target (the
+//!   tracker converges and stays, damping live). The arms keep holding —
+//!   matching what the firmware itself does if the host dies — until a
 //!   disarm or an operator e-stop.
 //! - SIGINT/SIGTERM disable everything before exit.
 
@@ -86,7 +108,7 @@ use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
 use crate::can::CanSock;
-use crate::filter::{BandPass, LpDiff};
+use crate::filter::{self, BandPass, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
 
@@ -238,17 +260,25 @@ extern "C" fn on_signal(_: libc::c_int) {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
     pub p_des: f64,
-    pub v_des: f64,
+    /// ≥ 0.5: tracked mode — the in-core trapezoid chases `p_des` and the
+    /// friction/inertia feedforwards apply. 0: passthrough — `p_des` goes
+    /// to the wire as-is with `v_des = 0` (gravity comp, bring-up hold).
+    /// The gripper slot repurposes this field as its max_speed (rad/s).
+    pub mode: f64,
+    /// The gripper slot repurposes `kp` as its max torque (Nm).
     pub kp: f64,
     pub kd: f64,
-    /// Model feedforward only (gravity + friction + inertia) — the damping
-    /// torque is computed in-core each tick and added on top.
+    /// Slow model feedforward (gravity only in tracked mode) — friction,
+    /// inertia, and damping are computed in-core each tick and added.
     pub t_ff: f64,
     /// Effective (pose-scheduled) host damping gain, Nm·s/rad.
     pub kd_host: f64,
     /// Damping band-pass centre (rad/s) and quality factor.
     pub damp_w0: f64,
     pub damp_q: f64,
+    /// Pose-scaled inertia feedforward gain (Nm·s²/rad), applied to the
+    /// tracker's acceleration in tracked mode.
+    pub j_eff: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +333,7 @@ fn parse_config(text: &str) -> io::Result<Config> {
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
+                //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
                 let side: u8 = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?;
@@ -314,6 +345,9 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         buses.last_mut().unwrap()
                     }
                 };
+                let num = |i: usize| -> io::Result<f64> {
+                    f.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))
+                };
                 let spec = if gripper {
                     MotorSpec {
                         joint: "gripper".to_string(),
@@ -322,16 +356,28 @@ fn parse_config(text: &str) -> io::Result<Config> {
                         kd: 0.0,
                         gripper: true,
                         slot: GRIPPER_SLOT,
+                        max_vel: 0.0,
+                        max_accel: 0.0,
+                        fc: 0.0,
+                        k: 0.0,
+                        fv: 0.0,
+                        fo: 0.0,
                     }
                 } else {
                     MotorSpec {
                         joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
                         motor_id: f.get(4).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
-                        kp: f.get(5).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
-                        kd: f.get(6).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        kp: num(5)?,
+                        kd: num(6)?,
                         gripper: false,
                         // Arm joints arrive in Joint enum order per bus.
                         slot: bus.2.iter().filter(|s| !s.gripper).count(),
+                        max_vel: num(7)?,
+                        max_accel: num(8)?,
+                        fc: num(9)?,
+                        k: num(10)?,
+                        fv: num(11)?,
+                        fo: num(12)?,
                     }
                 };
                 if spec.slot >= N_SLOTS {
@@ -355,8 +401,8 @@ fn parse_config(text: &str) -> io::Result<Config> {
 }
 
 fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
-    // side u8, seq u32, 8 slots x 8 f64
-    let expected = 1 + 4 + N_SLOTS * 8 * 8;
+    // side u8, seq u32, 8 slots x 9 f64
+    let expected = 1 + 4 + N_SLOTS * 9 * 8;
     if payload.len() != expected {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -368,20 +414,21 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     let mut cmds = [JointCmd::default(); N_SLOTS];
     let mut off = 5;
     for cmd in &mut cmds {
-        let mut vals = [0.0f64; 8];
+        let mut vals = [0.0f64; 9];
         for v in &mut vals {
             *v = f64::from_le_bytes(payload[off..off + 8].try_into().unwrap());
             off += 8;
         }
         *cmd = JointCmd {
             p_des: vals[0],
-            v_des: vals[1],
+            mode: vals[1],
             kp: vals[2],
             kd: vals[3],
             t_ff: vals[4],
             kd_host: vals[5],
             damp_w0: vals[6],
             damp_q: vals[7],
+            j_eff: vals[8],
         };
     }
     Ok((
@@ -399,13 +446,13 @@ mod tests {
     use super::*;
 
     /// Mirrors `RtLink.send_target`'s packing: side u8, seq u32 LE, then
-    /// 8 slots x 8 f64 LE.
+    /// 8 slots x 9 f64 LE.
     #[test]
     fn parse_target_roundtrip() {
         let mut payload = vec![1u8];
         payload.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
         for slot in 0..N_SLOTS {
-            for field in 0..8 {
+            for field in 0..9 {
                 let v = slot as f64 * 10.0 + field as f64;
                 payload.extend_from_slice(&v.to_le_bytes());
             }
@@ -415,12 +462,12 @@ mod tests {
         assert_eq!(t.seq, 0xDEADBEEF);
         let c = &t.cmds[2];
         assert_eq!(
-            (c.p_des, c.v_des, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q),
-            (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0)
+            (c.p_des, c.mode, c.kp, c.kd, c.t_ff, c.kd_host, c.damp_w0, c.damp_q, c.j_eff),
+            (20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 26.0, 27.0, 28.0)
         );
-        // Wrong size (the old 5-field layout) must be rejected, not
+        // Wrong size (the previous 8-field layout) must be rejected, not
         // misparsed — a version-skewed client fails loudly.
-        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 5 * 8]).is_err());
+        assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
     }
 
     /// Live stall-detection check against a real interface whose bus has no
@@ -485,10 +532,10 @@ mod tests {
     fn parse_config_assigns_slots() {
         let cfg = parse_config(
             "loop_hz 240\n\
-             joint 0 canL shoulder_1 1 250 3.5\n\
-             joint 0 canL shoulder_2 2 250 3.5\n\
+             joint 0 canL shoulder_1 1 250 3.5 9.4 33.0 0.6 250 0.15 0.02\n\
+             joint 0 canL shoulder_2 2 250 3.5 9.4 33.0 0.5 250 0.10 0.0\n\
              gripper 0 canL 8\n\
-             joint 0 canL shoulder_3 3 180 2.0\n",
+             joint 0 canL shoulder_3 3 180 2.0 9.4 33.0 0.4 250 0.08 0.0\n",
         )
         .unwrap();
         let specs = &cfg.buses[0].2;
@@ -497,6 +544,12 @@ mod tests {
             vec![0, 1, GRIPPER_SLOT, 2]
         );
         assert!(specs[2].gripper);
+        assert_eq!(specs[0].max_vel, 9.4);
+        assert_eq!(specs[0].max_accel, 33.0);
+        assert_eq!((specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo), (0.6, 250.0, 0.15, 0.02));
+        // A joint line missing the tracker/friction params (the previous
+        // 7-field layout) must be rejected, not defaulted.
+        assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
     }
 }
 
@@ -785,32 +838,43 @@ fn bus_loop(
     }
     let _ = ready_tx.send(Ok(()));
 
-    // Play state, indexed by target slot: start by holding the measured
-    // pose with config gains. The gripper slot's hold values are never sent
-    // (it isn't commanded until the first target arrives). kd_host starts
-    // at 0 — matching classic mode, where enable() holds on firmware gains
-    // until the first motion_control; the first streamed target brings the
+    // Play state, indexed by target slot: the latest adopted command per
+    // slot, starting as a passthrough hold of the measured pose with config
+    // gains. The gripper slot's hold values are never sent (it isn't
+    // commanded until the first target arrives). kd_host starts at 0 —
+    // matching classic mode, where enable() holds on firmware gains until
+    // the first motion_control; the first streamed target brings the
     // pose-scheduled coefficients, and from then on damping stays live
     // through every hold (watchdog, orphaned client).
     let mut play: [JointCmd; N_SLOTS] = [JointCmd::default(); N_SLOTS];
     for m in &motors {
         play[m.slot] = JointCmd {
             p_des: m.hold_pos,
-            v_des: 0.0,
+            mode: 0.0,
             kp: m.kp,
             kd: m.kd,
             t_ff: 0.0,
             kd_host: 0.0,
             damp_w0: 20.0,
             damp_q: 0.8,
+            j_eff: 0.0,
         };
     }
-    // In-core host damping, per slot: v_des from the played target, v_meas
-    // from this loop's own feedback frames (fresh within one tick), band-
-    // passed at the streamed centre. See the module docstring for why this
-    // must live here and not in Python.
+    // The in-core target tracker, per slot: chases the latest streamed
+    // target at loop rate under the config vel/accel limits, and its
+    // (pos, vel, accel) states drive the wire command and the
+    // friction/inertia feedforwards. Seeded at the bring-up hold pose so
+    // the first tracked target starts transient-free.
+    let mut trk: Vec<Trapezoid> = (0..N_SLOTS).map(|_| Trapezoid::new(0.0, 0.0)).collect();
+    for m in &motors {
+        trk[m.slot] = Trapezoid::new(m.max_vel, m.max_accel);
+        trk[m.slot].seed(m.hold_pos);
+    }
+    // In-core host damping, per slot: v_des from the tracker, v_meas from
+    // this loop's own feedback frames (fresh within one tick), band-passed
+    // at the streamed centre. See the module docstring for why this must
+    // live here and not in Python.
     struct Damp {
-        v_des: LpDiff,
         v_meas: LpDiff,
         bp: BandPass,
         vel_meas: f64,
@@ -818,7 +882,6 @@ fn bus_loop(
     }
     let mut damp: Vec<Damp> = (0..N_SLOTS)
         .map(|_| Damp {
-            v_des: LpDiff::new(VEL_CUTOFF),
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
             vel_meas: 0.0,
@@ -830,13 +893,15 @@ fn bus_loop(
     // an `F` packet — the core is the only CAN consumer; Python fills its
     // Motor caches from these instead of passively reading the bus.
     let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
-    // Interpolation segment: from -> the pending target over `dur`.
-    let mut seg_from: [JointCmd; N_SLOTS] = play;
-    let mut seg_target: Option<Target> = None;
-    let mut seg_started = Instant::now();
+    // Wire command per slot this tick (tracker output or passthrough) —
+    // the reference the deviation abort measures against.
+    let mut cmd_pos: [f64; N_SLOTS] = [0.0; N_SLOTS];
+    for m in &motors {
+        cmd_pos[m.slot] = m.hold_pos;
+    }
+    let mut have_target = false;
     let mut last_seq: Option<u32> = None;
     let mut last_arrival: Option<Instant> = None;
-    let mut period_est = Duration::from_secs_f64(1.0 / 120.0);
 
     let period = Duration::from_secs_f64(1.0 / cfg.loop_hz);
     let abort_rad = cfg.abort_deg.to_radians();
@@ -870,36 +935,23 @@ fn bus_loop(
             }
             ticks += 1;
 
-            // Adopt a newly arrived target.
+            // Adopt a newly arrived target: latest-wins — the tracker
+            // renders the trajectory toward it at loop rate, so no
+            // interpolation segment is needed.
             {
                 let slot = targets[side as usize].lock().unwrap();
                 if let Some(t) = slot.target {
                     if last_seq != Some(t.seq) {
-                        if let Some(prev) = last_arrival {
-                            let dt = t.arrival.duration_since(prev);
-                            if dt > Duration::from_millis(1) && dt < Duration::from_millis(100) {
-                                period_est = Duration::from_secs_f64(
-                                    0.9 * period_est.as_secs_f64() + 0.1 * dt.as_secs_f64(),
-                                );
-                            }
-                        }
-                        // Gripper slot exempt: its targets legitimately jump
-                        // (the Python max-step gate excludes it too).
+                        // Corruption defense on the raw target step; the
+                        // gripper slot is exempt (its targets legitimately
+                        // jump — the Python max-step gate excludes it too).
                         let step_ok = t.cmds[..GRIPPER_SLOT]
                             .iter()
                             .zip(play.iter())
                             .all(|(c, p)| (c.p_des - p.p_des).abs() <= cfg.max_step_rad);
                         if step_ok {
-                            seg_from = play;
-                            seg_target = Some(t);
-                            // Anchor at the adoption *tick*, not the packet
-                            // arrival: anchoring at arrival makes the first
-                            // tick jump partway through the segment by an
-                            // amount that varies with the sender's
-                            // scheduling jitter — measured as broadband
-                            // velocity noise proportional to motion speed.
-                            // From here alpha starts at exactly 0.
-                            seg_started = began;
+                            play = t.cmds;
+                            have_target = true;
                         } else {
                             rejected += 1;
                         }
@@ -909,8 +961,8 @@ fn bus_loop(
                 }
             }
 
-            // Watchdog: no fresh target — the segment finishes on its own
-            // (alpha reaches 1) and the play state freezes there.
+            // Watchdog: no fresh target — the tracker converges on the last
+            // target and holds there (damping stays live).
             let starved =
                 last_arrival.is_some_and(|a| began.duration_since(a) > watchdog);
             if starved && !watchdog_frozen {
@@ -925,33 +977,6 @@ fn bus_loop(
                 send_text(out_tx, b'L', &format!("{iface}: target stream resumed"));
             }
 
-            // Interpolate toward the current target over slightly more than
-            // one sender period: successive segments then overlap (the next
-            // target is adopted mid-flight, re-aiming from the current play
-            // state) instead of finishing early and freezing for a tick —
-            // the other half of the stop-go velocity ripple. Costs ~2 ms of
-            // extra command latency.
-            if let Some(t) = &seg_target {
-                let dur = (period_est.mul_f64(1.25))
-                    .clamp(Duration::from_millis(4), Duration::from_millis(60));
-                let alpha =
-                    (began.duration_since(seg_started).as_secs_f64() / dur.as_secs_f64()).min(1.0);
-                for i in 0..N_SLOTS {
-                    let (from, to) = (&seg_from[i], &t.cmds[i]);
-                    play[i] = JointCmd {
-                        p_des: from.p_des + (to.p_des - from.p_des) * alpha,
-                        t_ff: from.t_ff + (to.t_ff - from.t_ff) * alpha,
-                        // Already-smooth / slow-varying: step to the new value.
-                        v_des: to.v_des,
-                        kp: to.kp,
-                        kd: to.kd,
-                        kd_host: to.kd_host,
-                        damp_w0: to.damp_w0,
-                        damp_q: to.damp_q,
-                    };
-                }
-            }
-
             // Tick spacing for the damping chain (measured, not nominal —
             // a late tick then damps over the interval it actually covers).
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
@@ -964,24 +989,39 @@ fn bus_loop(
                 let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
                     // gripper uncommanded until motion_control too). Slot
-                    // layout: v_des carries max_speed, kp carries max_torque;
+                    // layout: mode carries max_speed, kp carries max_torque;
                     // the wire wants current as a fraction of rated (t_max).
-                    if seg_target.is_none() {
+                    if !have_target {
                         continue;
                     }
                     (
                         proto::DM_POS_FORCE_ARB_BASE + m.id as u16,
-                        proto::dm_pos_force_encode(c.p_des, c.v_des, c.kp / m.ranges.t_max),
+                        proto::dm_pos_force_encode(c.p_des, c.mode, c.kp / m.ranges.t_max),
                     )
                 } else {
+                    // Tracked mode: the trapezoid renders this tick's
+                    // (pos, vel, accel) toward the latest target, and the
+                    // fast feedforwards — friction on the tracker velocity,
+                    // inertia on its acceleration — are computed here, in
+                    // phase with the trajectory the wire actually carries.
+                    // Passthrough (gravity comp / bring-up hold): p_des
+                    // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
+                    // so a later mode switch starts transient-free.
+                    let (p_cmd, v_cmd, ff) = if c.mode >= 0.5 {
+                        let (p, v, a) = trk[m.slot].update(c.p_des, tick_dt);
+                        (p, v, filter::friction(v, m.fc, m.k, m.fv, m.fo) + c.j_eff * a)
+                    } else {
+                        trk[m.slot].seed(c.p_des);
+                        (c.p_des, 0.0, 0.0)
+                    };
+                    cmd_pos[m.slot] = p_cmd;
                     // In-core host damping: band-passed (v_des − v_meas)
                     // scaled by the streamed pose-scheduled gain, applied
                     // the same tick the feedback it acts on arrived.
                     let d = &mut damp[m.slot];
-                    let v_des = d.v_des.update(c.p_des, tick_dt);
-                    let v_damp = d.bp.update(v_des - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
-                    let t_ff = c.t_ff + c.kd_host * v_damp;
-                    let frame = proto::mit_encode(c.p_des, c.v_des, c.kp, c.kd, t_ff, &m.ranges);
+                    let v_damp = d.bp.update(v_cmd - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
+                    let t_ff = c.t_ff + ff + c.kd_host * v_damp;
+                    let frame = proto::mit_encode(p_cmd, v_cmd, c.kp, c.kd, t_ff, &m.ranges);
                     let arb = match m.vendor {
                         Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
                         Vendor::Damiao => m.id as u16,
@@ -1076,12 +1116,16 @@ fn bus_loop(
                     d.last_fb = Some(recv_time);
                     d.vel_meas = d.v_meas.update(pos, dt);
                 }
-                let e = (pos - play[motors[idx].slot].p_des).abs();
+                // Deviation abort against the *commanded* position (the
+                // tracker output), not the raw target — during a legitimate
+                // catch-up move the target may briefly lead the arm by more
+                // than abort_deg while the command never does.
+                let e = (pos - cmd_pos[motors[idx].slot]).abs();
                 if e > abort_rad {
                     fault.store(1, Ordering::SeqCst);
                     stop.store(true, Ordering::SeqCst);
                     return Err(io::Error::other(format!(
-                        "{iface}: {} deviated {:.2}° from target (abort at {:.0}°)",
+                        "{iface}: {} deviated {:.2}° from command (abort at {:.0}°)",
                         motors[idx].joint,
                         e.to_degrees(),
                         cfg.abort_deg,

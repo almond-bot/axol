@@ -563,14 +563,15 @@ class AxolArm:
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
         # Realtime-core hook (axol teleop --rt): when set, motion_control
-        # and gravity_compensate hand their per-joint 8-float tuples
-        # (p_des motor-frame, v_des, kp, kd, model t_ff, then the
-        # pose-scheduled damping coefficients kd_host/w0/q) to this callable
-        # instead of sending on the CAN bus — the Rust core owns the wire
-        # and computes the damping torque itself each tick.
+        # and gravity_compensate hand their per-joint 9-float tuples
+        # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
+        # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
+        # this callable instead of sending on the CAN bus — the Rust core
+        # owns the wire and computes the velocity/friction/inertia/damping
+        # terms itself each tick from its own tracker and feedback states.
         self._command_sink: (
             Callable[
-                [list[tuple[float, float, float, float, float, float, float, float]]],
+                [list[tuple[float, ...]]],
                 None,
             ]
             | None
@@ -1286,8 +1287,15 @@ class AxolArm:
         # and acceleration feedforward via a second pass for inertia FF (rad/s²).
         # Velocities/accelerations are frame-invariant under a constant offset,
         # so we differentiate the joint-frame ``clipped`` array directly.
-        velocities = self._vel_diff.differentiate(list(clipped))
-        accelerations = self._accel_diff.differentiate(velocities)
+        # Classic mode only: in realtime-core mode the trajectory the wire
+        # carries is rendered by the core's own tracker at 240 Hz, and the
+        # velocity/friction/inertia terms are computed there from its states
+        # (this loop's 120 Hz differentiation of the pre-tracker target
+        # would be out of phase with the executed motion).
+        sink_mode = self._command_sink is not None
+        if not sink_mode:
+            velocities = self._vel_diff.differentiate(list(clipped))
+            accelerations = self._accel_diff.differentiate(velocities)
 
         # Gravity feedforward (Nm) for the seven arm joints, computed from the
         # full URDF chain so child links contribute to each parent joint's load.
@@ -1347,15 +1355,14 @@ class AxolArm:
         #
         # In realtime-core mode the damping *torque* is not computed here at
         # all: damping is a phase race, and this loop's ~120 Hz sample plus
-        # the socket transport and the core's interpolation segment put the
-        # counter-torque ~14 ms behind the velocity it acts on — enough to
-        # push the shoulder burst band past 90° of loop phase, where the
-        # damper pumps the mode instead of damping it (the rt-teleop shaking
-        # of 2026-08-27). The core runs the identical filter chain (see
-        # rust/axol-rt/src/filter.rs, golden-tested against this module) at
-        # 240 Hz on same-tick feedback; this side only *schedules* it,
-        # shipping the pose-scaled gain and band-pass centre/q per command.
-        sink_mode = self._command_sink is not None
+        # the socket transport put the counter-torque ~14 ms behind the
+        # velocity it acts on — enough to push the shoulder burst band past
+        # 90° of loop phase, where the damper pumps the mode instead of
+        # damping it (the rt-teleop shaking of 2026-08-27). The core runs
+        # the identical filter chain (see rust/axol-rt/src/filter.rs,
+        # golden-tested against this module) at 240 Hz on same-tick
+        # feedback; this side only *schedules* it, shipping the pose-scaled
+        # gain and band-pass centre/q per command.
         if not sink_mode:
             v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
             try:
@@ -1381,36 +1388,33 @@ class AxolArm:
         motor_targets = clipped - self._joint_offsets
 
         if sink_mode:
-            # Realtime-core mode (axol teleop --rt): ship 8-float tuples to
+            # Realtime-core mode (axol teleop --rt): ship 9-float tuples to
             # the sink — which streams them to the Rust core that owns the
-            # CAN bus. t_ff carries the *model* feedforward only; the last
-            # three fields are the pose-scheduled damping coefficients the
-            # core applies each tick against its own fresh feedback (see the
-            # sink_mode comment above). Slot 7 carries the gripper's
-            # POSITION_FORCE command (motor-frame target, speed limit,
-            # torque limit); zeros on the gripperless SKU (the core has no
-            # gripper configured and ignores the slot).
-            sink_cmds: list[
-                tuple[float, float, float, float, float, float, float, float]
-            ] = []
+            # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
+            # renders the trajectory toward p_des at 240 Hz and computes the
+            # velocity, friction, and inertia terms from its states — t_ff
+            # here carries *gravity only* (the slow, pose-shaped term this
+            # side owns). The damping coefficients and the pose-scaled
+            # inertia gain are the schedule the core applies each tick
+            # against its own fresh feedback (see the sink_mode comment
+            # above). Slot 7 carries the gripper's POSITION_FORCE command
+            # (motor-frame target, speed limit, torque limit); zeros on the
+            # gripperless SKU (the core has no gripper configured and
+            # ignores the slot).
+            sink_cmds: list[tuple[float, ...]] = []
             for i, j in enumerate(ARM_JOINTS):
                 gains = getattr(self._arm_config, j.value)
-                f = gains.friction
-                t_ff = (
-                    float(gravity[i])
-                    + compute_friction(velocities[i], f.fc, f.k, f.fv, f.fo)
-                    + gains.j_eff * float(j_scale[i]) * accelerations[i]
-                )
                 sink_cmds.append(
                     (
                         float(motor_targets[i]),
-                        velocities[i],
+                        1.0,
                         gains.kp,
                         gains.kd,
-                        t_ff,
+                        float(gravity[i]),
                         float(host_scale[i]) * gains.kd_host,
                         damp_w0[i],
                         self._damp_q[i],
+                        gains.j_eff * float(j_scale[i]),
                     )
                 )
             if self._has_gripper:
@@ -1419,15 +1423,11 @@ class AxolArm:
                         float(motor_targets[gripper_i]),
                         self._arm_config.gripper.max_speed,
                         self._arm_config.gripper.torque_limit,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
-                        0.0,
                     )
+                    + (0.0,) * 6
                 )
             else:
-                sink_cmds.append((0.0,) * 8)
+                sink_cmds.append((0.0,) * 9)
             self._command_sink(sink_cmds)
             self._last_q_commanded = clipped
             return
@@ -1564,12 +1564,15 @@ class AxolArm:
 
         if self._command_sink is not None:
             # Realtime-core mode: the same tuples stream through the core
-            # (which owns the bus) instead of onto the wire from here. No
-            # damping coefficients — classic gravity comp runs firmware
-            # gains only, and a hand-guided limp arm needs no host damper.
-            sink_cmds = [t + (0.0, 0.0, 0.0) for t in arm_tuples]
+            # (which owns the bus) instead of onto the wire from here. The
+            # arm tuples' second field is 0.0 = passthrough mode — p_des
+            # goes to the wire as-is with v_des = 0, no tracker and no
+            # friction/inertia terms (a hand-guided limp arm wants gravity
+            # feedforward only), and no damping coefficients (classic
+            # gravity comp runs firmware gains only).
+            sink_cmds = [t + (0.0,) * 4 for t in arm_tuples]
             sink_cmds.append(
-                gripper_cmd + (0.0,) * 5 if gripper_cmd is not None else (0.0,) * 8
+                gripper_cmd + (0.0,) * 6 if gripper_cmd is not None else (0.0,) * 9
             )
             self._command_sink(sink_cmds)
             return

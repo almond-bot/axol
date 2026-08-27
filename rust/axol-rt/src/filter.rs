@@ -1,8 +1,11 @@
-//! Realtime filters for the in-core host-damping loop, ported exactly from
-//! `almond_axol.robot.control` (`Differentiator` and `BandPass`). The golden
-//! tests at the bottom pin the outputs to the Python implementations
-//! sample-for-sample, so the damping a joint feels is identical whichever
-//! side computes it — only the phase (rate + freshness) differs.
+//! Realtime filters for the in-core control loop, ported exactly from the
+//! Python originals: `Differentiator` and `BandPass` from
+//! `almond_axol.robot.control` (host damping), `TrapezoidalFilter` from
+//! `almond_axol.teleop.filter` (the 240 Hz joint-target tracker), and the
+//! tanh friction model. The golden tests at the bottom pin the outputs to
+//! the Python implementations sample-for-sample, so the physics a joint
+//! feels is identical whichever side computes it — only the rate and
+//! freshness differ.
 
 /// First-order low-pass differentiator: `a = 1/(1 + dt·ω)`,
 /// `v ← a·v + a·ω·(x − x_prev)`. Unity DC gain as a differentiator, single
@@ -69,6 +72,101 @@ impl BandPass {
     }
 }
 
+/// Tanh friction feedforward, ported from
+/// `almond_axol.robot.control.compute_friction`:
+/// `τ = fc·tanh(0.1·min(k, K_MAX)·v) + fv·v + fo`. The cap keeps the
+/// Coulomb term ramping smoothly through zero crossings.
+pub const FRICTION_FF_K_MAX: f64 = 100.0;
+
+pub fn friction(v: f64, fc: f64, k: f64, fv: f64, fo: f64) -> f64 {
+    fc * (0.1 * k.min(FRICTION_FF_K_MAX) * v).tanh() + fv * v + fo
+}
+
+/// Velocity/acceleration-limited target tracker — the per-joint
+/// `TrapezoidalFilter` from `almond_axol.teleop.filter`, ported per-scalar
+/// with a per-step `dt` (the Python original fixes dt at construction).
+///
+/// A critically damped second-order linear loop (position error → velocity
+/// command → acceleration, ζ = 1) under hard velocity and acceleration
+/// clamps, with the time-optimal sqrt braking rule kept only as a velocity
+/// *ceiling* for large catch-up moves. See the Python docstring for the
+/// designs this replaced and why (bang-bang saturation chatter; velocity
+/// feedforward peaking at the arm's structural resonance).
+///
+/// In the core this runs at the full loop rate against the latest streamed
+/// target, replacing linear segment interpolation: its `(pos, vel, accel)`
+/// states drive the MIT command and the friction/inertia feedforwards, so
+/// the wire physics are coherent with the trajectory actually executed.
+pub struct Trapezoid {
+    pub max_vel: f64,
+    pub max_accel: f64,
+    pos: f64,
+    vel: f64,
+    seeded: bool,
+}
+
+impl Trapezoid {
+    const POS_TRACK_GAIN: f64 = 15.7; // 1/s = ωn/2 with ωn = 2π·5 Hz
+    const VEL_TRACK_GAIN: f64 = 62.8; // 1/s = 2·ωn
+    const BRAKE_MARGIN: f64 = 0.8;
+
+    /// Unseeded, matching the Python original: the first `update` adopts
+    /// the target as the output (no transient).
+    pub fn new(max_vel: f64, max_accel: f64) -> Self {
+        Self { max_vel, max_accel, pos: 0.0, vel: 0.0, seeded: false }
+    }
+
+    /// Adopt `pos` as the current output with zero velocity — used at arm
+    /// (hold pose) and each passthrough-mode tick, so a later switch to
+    /// tracked mode starts from the last commanded position transient-free.
+    pub fn seed(&mut self, pos: f64) {
+        self.pos = pos;
+        self.vel = 0.0;
+        self.seeded = true;
+    }
+
+    /// Advance one step toward `target`; returns `(pos, vel, accel)`.
+    pub fn update(&mut self, target: f64, dt: f64) -> (f64, f64, f64) {
+        if !self.seeded {
+            self.seed(target);
+            return (target, 0.0, 0.0);
+        }
+        if dt <= 0.0 {
+            return (self.pos, self.vel, 0.0);
+        }
+        let err = target - self.pos;
+        let dist = err.abs();
+        let adt = self.max_accel * dt;
+
+        // Discrete-time stopping speed (margined): the ceiling for
+        // overshoot-free catch-up on large distances.
+        let a_brake = Self::BRAKE_MARGIN * self.max_accel;
+        let bdt = 0.5 * a_brake * dt;
+        let v_stop = -bdt + (bdt * bdt + 2.0 * a_brake * dist).sqrt();
+
+        let ceiling = self.max_vel.min(v_stop);
+        let desired = (Self::POS_TRACK_GAIN * err).clamp(-ceiling, ceiling);
+
+        let vel_prev = self.vel;
+        let mut vel =
+            vel_prev + (Self::VEL_TRACK_GAIN * (desired - vel_prev) * dt).clamp(-adt, adt);
+
+        // Acceleration-gated arrival (see the Python docstring: an
+        // unconditional snap degenerates into a pass-through).
+        let step = vel * dt;
+        let snap_vel = err / dt;
+        if step.abs() > dist && (snap_vel - vel_prev).abs() <= adt * (1.0 + 1e-6) {
+            self.pos = target;
+            vel = snap_vel;
+        } else {
+            self.pos += step;
+        }
+        let accel = (vel - vel_prev) / dt;
+        self.vel = vel;
+        (self.pos, vel, accel)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +226,98 @@ mod tests {
             assert!(
                 (got - want).abs() < 1e-12,
                 "lpdiff sample {k}: got {got:e}, want {want:e}"
+            );
+        }
+    }
+
+    /// Golden vectors from `almond_axol.teleop.filter.TrapezoidalFilter`
+    /// (max_vel 2π, max_accel 7π, dt 1/240; the Python filter computes in
+    /// float32, hence the 1e-4 tolerance). Two regimes: a sine target the
+    /// tracker chases through its acceleration clamp, and a 0.5 rad step
+    /// covering the full profile — accel ramp, braking-ceiling saturation,
+    /// arrival snap, settle.
+    #[test]
+    fn trapezoid_matches_python() {
+        let sine: [(f64, f64); 16] = [
+            (0.000000000e+00, 0.000000000e+00),
+            (3.817908000e-04, 9.162978828e-02),
+            (1.145372400e-03, 1.832595766e-01),
+            (2.290744800e-03, 2.748893499e-01),
+            (3.817908000e-03, 3.665191531e-01),
+            (5.726862233e-03, 4.581489563e-01),
+            (8.017607033e-03, 5.497787595e-01),
+            (1.069014333e-02, 6.414085627e-01),
+            (1.374446973e-02, 7.330383658e-01),
+            (1.718058810e-02, 8.246681690e-01),
+            (2.099849656e-02, 9.162979722e-01),
+            (2.519819513e-02, 1.007927775e+00),
+            (2.977968566e-02, 1.099557519e+00),
+            (3.474296629e-02, 1.191187263e+00),
+            (4.008803889e-02, 1.282817006e+00),
+            (4.581490159e-02, 1.374446750e+00),
+        ];
+        let (max_vel, max_accel) = (2.0 * std::f64::consts::PI, 7.0 * std::f64::consts::PI);
+        let mut trk = Trapezoid::new(max_vel, max_accel);
+        for (k, (want_pos, want_vel)) in sine.iter().enumerate() {
+            let tgt = 0.8 * (2.0 * std::f64::consts::PI * 2.0 * k as f64 * DT).sin();
+            let (pos, vel, _) = trk.update(tgt, DT);
+            assert!(
+                (pos - want_pos).abs() < 1e-4 && (vel - want_vel).abs() < 1e-4,
+                "trapezoid sine sample {k}: got ({pos:e}, {vel:e}), want ({want_pos:e}, {want_vel:e})"
+            );
+        }
+
+        // (pos, vel) at k = 0, 8, 16, ..., 120 after a 0 -> 0.5 step.
+        let step: [(f64, f64); 16] = [
+            (3.817908000e-04, 9.162978828e-02),
+            (1.718058810e-02, 8.246681690e-01),
+            (5.841399729e-02, 1.557706237e+00),
+            (1.240820140e-01, 2.290744305e+00),
+            (2.140991390e-01, 3.003265142e+00),
+            (3.125206530e-01, 2.787965536e+00),
+            (3.943324685e-01, 2.159180403e+00),
+            (4.525606930e-01, 1.426142454e+00),
+            (4.863543212e-01, 6.931042671e-01),
+            (4.975558519e-01, 1.449353695e-01),
+            (4.996199608e-01, 2.549982630e-02),
+            (4.999670088e-01, 3.898998722e-03),
+            (5.000000000e-01, 0.000000000e+00),
+            (5.000000000e-01, 0.000000000e+00),
+            (5.000000000e-01, 0.000000000e+00),
+            (5.000000000e-01, 0.000000000e+00),
+        ];
+        let mut trk = Trapezoid::new(max_vel, max_accel);
+        trk.update(0.0, DT);
+        for k in 0..=120usize {
+            let (pos, vel, _) = trk.update(0.5, DT);
+            if k % 8 == 0 {
+                let (want_pos, want_vel) = step[k / 8];
+                assert!(
+                    (pos - want_pos).abs() < 1e-4 && (vel - want_vel).abs() < 1e-4,
+                    "trapezoid step sample {k}: got ({pos:e}, {vel:e}), want ({want_pos:e}, {want_vel:e})"
+                );
+            }
+        }
+    }
+
+    /// Golden values from `almond_axol.robot.control.compute_friction`
+    /// with fc=0.6, k=250 (above the cap), fv=0.15, fo=0.02.
+    #[test]
+    fn friction_matches_python() {
+        let golden = [
+            (-1.5, -8.049999999998876e-01),
+            (-0.2, -5.884165480454902e-01),
+            (-0.01, -4.130079677497349e-02),
+            (0.0, 2.000000000000000e-02),
+            (0.01, 8.130079677497350e-02),
+            (0.2, 6.284165480454902e-01),
+            (1.5, 8.449999999998876e-01),
+        ];
+        for (v, want) in golden {
+            let got = friction(v, 0.6, 250.0, 0.15, 0.02);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "friction({v}): got {got:e}, want {want:e}"
             );
         }
     }

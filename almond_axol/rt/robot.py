@@ -12,22 +12,29 @@ CAN buses are owned by the ``axol-rt`` subprocess:
   fill from the core's per-tick telemetry packets instead — ~480 packet
   decodes/s replacing ~7,700 python-can frame dispatches/s on this
   CPU-starved Jetson.
-- ``motion_control()`` runs the full production computation in
-  ``AxolArm.motion_control`` (gravity, inertia, friction, host damping), but
-  a command sink ships the resulting MIT tuples to the core instead of
-  sending CAN from Python.
+- ``motion_control()`` runs the slow model math from
+  ``AxolArm.motion_control`` (limits, gravity, the pose *scheduling* of the
+  fast terms) and a command sink ships per-joint tuples to the core instead
+  of sending CAN from Python.
 
 - The gripper is brought up by Python before the core arms (the classic
   enable/calibrate or attach/restore flow — it needs the quiet bus), then
   driven by the core: ``motion_control``'s slot-7 tuple carries its
   POSITION_FORCE command (motor-frame target, speed limit, torque limit).
-- Host damping runs *in the core*: ``motion_control`` ships the
-  pose-scheduled coefficients (effective kd_host, band-pass centre, q) with
-  every target and the core applies band-passed velocity damping each
-  240 Hz tick against same-tick feedback. Computing the torque in Python
-  put it ~14 ms behind the motion — past 90° of loop phase in the shoulder
-  burst band, where a damper pumps instead of damps (the rt-teleop shaking
-  of 2026-08-27; see rust/axol-rt/src/filter.rs).
+- The *fast* physics all run in the core, per 240 Hz tick, from its own
+  trajectory and feedback states: a golden-ported trapezoid tracker chases
+  the latest target (replacing linear interpolation — continuous velocity
+  feedforward), friction and inertia feedforwards come from the tracker's
+  velocity/acceleration (friction params ride the config; the pose-scaled
+  ``j_eff`` rides each target), and band-passed velocity damping applies
+  the streamed pose-scheduled coefficients against same-tick feedback.
+  Computing the damping torque in Python put it ~14 ms behind the motion —
+  past 90° of loop phase in the shoulder burst band, where a damper pumps
+  instead of damps (the rt-teleop shaking of 2026-08-27; see
+  rust/axol-rt/src/filter.rs). Python's own trapezoid (with the engage
+  velocity ramp and the output guard) still shapes the 120 Hz target
+  stream; the core's tracker re-renders it at wire rate with 1.5x headroom
+  on the limits.
 
 Guarded return works exactly as in classic mode: ``torque_residuals`` and
 ``reset_command_state`` only touch the telemetry-filled caches and local
@@ -40,6 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 
 import numpy as np
@@ -59,17 +67,38 @@ _N_ARM = len(ARM_JOINTS)
 class RtAxol:
     """Axol with the control loop in the Rust realtime core."""
 
+    # The core's tracker limits get headroom over the Python shaper's caps:
+    # the in-core trapezoid exists to render a smooth 240 Hz trajectory and
+    # bound corruption, not to be the binding constraint — Python's
+    # trapezoid (engage ramps included) already enforces the real teleop
+    # limits, so a core tracker at exactly those limits would ride its
+    # ceiling during full-speed moves and add avoidable lag.
+    _TRACKER_HEADROOM = 1.5
+
     def __init__(
         self,
         robot: Axol,
         loop_hz: float = 240.0,
         watchdog_ms: float = 150.0,
         abort_deg: float = 25.0,
+        max_vel: float = 2.0 * math.pi,
+        max_accel: float = 7.0 * math.pi,
     ) -> None:
+        """Wrap ``robot`` for the realtime core.
+
+        Args:
+            max_vel: Teleop joint-velocity cap (rad/s) — the core's tracker
+                runs at ``_TRACKER_HEADROOM`` times this. Defaults match
+                ``VRTeleopConfig.teleop_max_vel``.
+            max_accel: Teleop joint-acceleration cap (rad/s²), same
+                treatment.
+        """
         self._robot = robot
         self._loop_hz = loop_hz
         self._watchdog_ms = watchdog_ms
         self._abort_deg = abort_deg
+        self._max_vel = max_vel
+        self._max_accel = max_accel
         self._link = RtLink()
         self._seq = 0
         # Telemetry packets received per side since arm.
@@ -101,15 +130,20 @@ class RtAxol:
             f"max_step_rad {max_step}",
             f"abort_deg {self._abort_deg}",
         ]
+        trk_vel = self._TRACKER_HEADROOM * self._max_vel
+        trk_acc = self._TRACKER_HEADROOM * self._max_accel
         for side, arm in self._arms():
             # The bus channel lives on the CanBus (same package internals).
             bus = self._robot._left_bus if side == 0 else self._robot._right_bus
             iface = bus._channel
             for j in ARM_JOINTS:
                 gains = getattr(arm._arm_config, j.value)
+                f = gains.friction
                 motor_id = _JOINT_CONFIG[j].motor_id
                 lines.append(
-                    f"joint {side} {iface} {j.value} {motor_id} {gains.kp} {gains.kd}"
+                    f"joint {side} {iface} {j.value} {motor_id} "
+                    f"{gains.kp} {gains.kd} {trk_vel} {trk_acc} "
+                    f"{f.fc} {f.k} {f.fv} {f.fo}"
                 )
             if arm._has_gripper:
                 lines.append(
@@ -256,9 +290,7 @@ class RtAxol:
             await asyncio.sleep(0.02)
 
     def _make_sink(self, side: int):
-        def sink(
-            cmds: list[tuple[float, float, float, float, float, float, float, float]],
-        ) -> None:
+        def sink(cmds: list[tuple[float, ...]]) -> None:
             self._seq += 1
             self._link.send_target(side, self._seq, cmds)
 

@@ -49,41 +49,58 @@ full round-robin at ~430 Hz. 240 Hz leaves ~45% bus headroom.
 ## The hybrid split (as built)
 
 Python keeps the **slow model math**: `AxolArm.motion_control` still runs
-gravity + reflected inertia (MuJoCo), friction feedforward, joint limits,
-the max-step gate, and the *scheduling* of host damping (pose-scaled gain,
-pose-tracked band-pass centre). In rt mode a command sink hands per-joint
-8-float tuples `(p_des, v_des, kp, kd, t_ff, kd_host, damp_w0, damp_q)` to
-`almond_axol.rt.RtAxol`, which ships them to this core (~120 Hz) instead
-of sending CAN from Python. `t_ff` is the model feedforward only.
+joint limits, the max-step gate, MuJoCo gravity, and the pose *scheduling*
+of the fast terms (pose-scaled damping gain and inertia gain, pose-tracked
+band-pass centre). The teleop pipeline's target shaping — the pose
+low-pass, the IK-output EMA, and the Python trapezoid with its engage
+velocity ramp and output guard — also stays: those filters condition the
+*target stream* and live with IK. In rt mode a command sink hands
+per-joint 9-float tuples `(p_des, mode, kp, kd, t_ff, kd_host, damp_w0,
+damp_q, j_eff)` to `almond_axol.rt.RtAxol`, which ships them to this core
+(~120 Hz) instead of sending CAN from Python. `t_ff` is gravity only in
+tracked mode; `mode 0` (gravity comp) is a tracker-bypassing passthrough
+with `v_des = 0`.
 
-The core owns the wire and the **fast physics**:
+The core owns the wire and the **fast physics**, all per tick from its
+own trajectory and feedback states:
 
 - Hard 240 Hz pacing (spin-assisted `sleep_until`, zero-late in practice).
+- **In-core target tracker**: the golden-ported `TrapezoidalFilter`
+  (`filter::Trapezoid`) chases the latest streamed target under the
+  config velocity/acceleration limits (teleop caps × 1.5 headroom),
+  replacing linear segment interpolation. Its `(pos, vel, accel)` states
+  are the wire command — velocity feedforward is continuous instead of
+  frozen between targets, and target-rate wobble is absorbed by the
+  tracker's own dynamics.
+- **In-core friction + inertia feedforwards**: the tanh friction model
+  (per-joint params ride the config) on the tracker velocity, and the
+  streamed pose-scaled `j_eff` on the tracker acceleration — coherent
+  with the executed trajectory, not with Python's 120 Hz pre-tracker view
+  of it (differentiating the raw target for the inertia term is exactly
+  the noise the trapezoid exists to remove).
 - **In-core host damping**: band-passed `(v_des − v_meas)` scaled by the
   streamed pose-scheduled gain, computed every tick from same-tick
-  feedback. The filter chain (`src/filter.rs`) is ported from
-  `almond_axol.robot.control` and golden-tested against it. Damping is a
-  phase race — computing the torque in Python put it ~14 ms behind the
-  velocity it acts on (120 Hz sample + socket + interpolation segment),
-  which pushed the shoulder burst band (4-9 Hz) past 90° of loop phase,
-  where a damper *pumps* the mode: that was the violent rt-teleop shaking
-  of 2026-08-27. In-core, the torque lands within one tick, and damping
-  stays live through every core-owned hold (watchdog, orphaned client) —
-  frozen-`t_ff` holds used to leave the shoulders ringing on firmware kd
-  alone. `cargo test` includes a dissipated-power comparison of the two
-  chains.
-- Linear interpolation of `p_des` / `t_ff` between successive targets over
-  one estimated sender period — no steps on the bus when Python's rate
-  wobbles (this costs one sender period, ~8 ms, of added latency).
-- Watchdog: targets stop arriving → the in-flight segment completes and
-  the arms hold there, damping active (matching what the firmware itself
-  does if a host dies mid-command, plus the damper). Client disconnect
-  while armed → hold 10 s, then disable and exit, so an orphaned core
-  never stays energized.
+  feedback, with `v_des` the tracker velocity. The filter chain
+  (`src/filter.rs`) is ported from `almond_axol.robot.control` and
+  golden-tested against it. Damping is a phase race — computing the
+  torque in Python put it ~14 ms behind the velocity it acts on (120 Hz
+  sample + socket + interpolation), which pushed the shoulder burst band
+  (4-9 Hz) past 90° of loop phase, where a damper *pumps* the mode: that
+  was the violent rt-teleop shaking of 2026-08-27. In-core, the torque
+  lands within one tick, and damping stays live through every core-owned
+  hold (watchdog, orphaned client) — frozen-`t_ff` holds used to leave
+  the shoulders ringing on firmware kd alone. `cargo test` includes a
+  dissipated-power comparison of the two chains.
+- Watchdog: targets stop arriving → the tracker converges on the last
+  target and the arms hold there, damping active (matching what the
+  firmware itself does if a host dies mid-command, plus the damper).
+  Client disconnect while armed → hold 10 s, then disable and exit, so an
+  orphaned core never stays energized.
 - Deviation abort: any joint more than `abort_deg` (default 25°) from its
-  played target disables both buses.
+  *commanded* (tracker-output) position disables both buses.
 - Max-step gate on incoming targets (corruption defense; Python's gate is
-  the real per-command limit).
+  the real per-command limit — and whatever gets through, the tracker's
+  limits bound what the wire can see).
 - Any protocol error (e.g. a version-skewed target size) stops the bus
   threads and disables the motors before the process exits — never an
   energized orphan.

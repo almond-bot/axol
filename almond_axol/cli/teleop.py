@@ -355,10 +355,16 @@ async def _run(cfg: TeleopCmdConfig) -> None:
         if cfg.rt:
             # Hybrid realtime core: the Rust axol-rt subprocess owns the CAN
             # buses and paces the control loop; Python's motion_control math
-            # streams impedance targets to it (see almond_axol.rt).
+            # streams impedance targets to it (see almond_axol.rt). The
+            # teleop velocity/acceleration caps configure the core's own
+            # target tracker (with headroom — see RtAxol).
             from ..rt import RtAxol
 
-            robot = RtAxol(robot)
+            robot = RtAxol(
+                robot,
+                max_vel=cfg.teleop.teleop_max_vel,
+                max_accel=cfg.teleop.teleop_max_accel,
+            )
     # Powered-cart robots (--cart.enabled true) get the base + lift driven by
     # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
     # sim — there's no cart hardware model in the visualizer.
