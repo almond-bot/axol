@@ -7,6 +7,7 @@ import sys
 from ..rt import install as rt_install
 from ..utils.dotenv import load_local_env
 from . import calibration as calibration_cmd
+from . import migrate_dataset as migrate_dataset_cmd
 from . import provision as provision_cmd
 from . import serve as serve_cmd
 from .can import driver as can_driver
@@ -77,6 +78,10 @@ _DRACCUS_COMMANDS: dict[str, tuple[str, str]] = {
         "Teach waypoints by hand, then replay them as straight-line moves.",
     ),
     "collect-data": ("collect_data", "Record teleoperation episodes."),
+    "collect-dagger": (
+        "collect_dagger",
+        "DAgger collection: a policy drives, the operator intervenes from VR.",
+    ),
     "replay-dataset": (
         "replay_dataset",
         "Replay a recorded dataset episode on the robot.",
@@ -142,6 +147,7 @@ def main() -> None:
     tune_motion.add_parser(subparsers)
     tune_filter.add_parser(subparsers)
     motion_add_parser(subparsers)
+    migrate_dataset_cmd.add_parser(subparsers)
     serve_cmd.add_parser(subparsers)
 
     # Register the draccus + diagnostics commands as bare subparsers purely so

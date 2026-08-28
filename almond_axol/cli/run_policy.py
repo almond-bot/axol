@@ -27,6 +27,7 @@ import logging
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -192,7 +193,11 @@ class RunPolicyConfig:
 # agnostic — it only calls the small surface below, and phrases its operator
 # prompts without naming a key or a button, since each control renders the
 # affordance its own surface has (the terminal appends "[Enter]", the panel
-# draws a button).
+# draws a button). ``begin_gate`` / ``poll_gate`` are a non-blocking form of
+# the between-episode gate for ``collect-dagger``, whose idle phase has to
+# keep ticking VR teleop while it waits; ``begin_episode``'s optional subtask
+# hook lets the operator switch a running policy's instruction mid-episode
+# (``--subtasks``).
 # ----------------------------------------------------------------------
 
 # Buttons the panel renders per phase (see EpisodeControls in the web app).
@@ -244,6 +249,13 @@ _EPISODE_CONTACT_PROMPT = (
     "the arms are limp and free to move. Clear them, then return to rest."
 )
 
+# Panel phases a gate can open in (snapshot() renders a single gate button
+# for any of them). "contact" is the guarded return-to-rest's limp
+# gravity-comp hold, badged as needing the operator rather than as a plain
+# "ready to start"; "limp" is the discard-cleanup hold.
+_GATE_READY = "ready"
+_GATE_CONTACT = "contact"
+
 
 class _StdinPolicyControl:
     """Terminal episode control: stdin keystrokes + Enter-to-continue prompts."""
@@ -253,7 +265,9 @@ class _StdinPolicyControl:
         self._result: dict[str, str | None] = {"choice": None}
         self._thread: "threading.Thread | None" = None
 
-    def await_continue(self, message: str) -> bool:
+    def await_continue(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> bool:
         try:
             input(f"{message} [Enter] ")
             return True
@@ -269,14 +283,40 @@ class _StdinPolicyControl:
     def await_manual_reset(self) -> bool:
         return self.await_continue(_DISCARD_LIMP_PROMPT)
 
-    def begin_episode(self) -> None:
+    def begin_gate(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> None:
+        from lerobot.utils.utils import log_say
+
+        log_say(message)
+
+    def note_gate(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> None:
+        # Panel-only: a terminal session reads the announcements instead.
+        pass
+
+    def note_episode(self, episode: int) -> None:
+        # Panel-only readout; the terminal announces episodes via log_say.
+        pass
+
+    def poll_gate(self) -> str | None:
+        # Terminal collect-dagger opens an episode from the VR record button
+        # only, so there is nothing to poll here.
+        return None
+
+    def begin_episode(
+        self,
+        on_subtask: "Callable[[int], None] | None" = None,
+        num_subtasks: int = 0,
+    ) -> None:
         from ..lerobot.rollout import stdin_watcher
 
         self._stop = threading.Event()
         self._result = {"choice": None}
         self._thread = threading.Thread(
             target=stdin_watcher,
-            args=(self._stop, self._result),
+            args=(self._stop, self._result, on_subtask, num_subtasks),
             name="axol-stdin-watcher",
             daemon=True,
         )
@@ -327,11 +367,18 @@ class _QueuePolicyControl:
         self._q: "queue.Queue[str]" = queue.Queue()
         self._stop = stop_event
         self._choice: str | None = None
+        self._on_subtask: "Callable[[int], None] | None" = None
+        self._num_subtasks = 0
         # Episode phase/count, read by the serve runner so the web control panel
         # on ANY connected computer can show the right controls (see snapshot()).
         self._state_lock = threading.Lock()
         self._phase = "preparing"
         self._episodes_recorded = 0
+        # The (1-based) dataset episode being recorded, when the session
+        # numbers episodes off the dataset (a resumed dataset counts past the
+        # session's own saves) — see note_episode(). None falls back to the
+        # session count.
+        self._episode: int | None = None
         # Instruction + button label of the gate currently open, if any.
         self._gate_message = ""
         self._gate_label = "Start episode"
@@ -347,6 +394,11 @@ class _QueuePolicyControl:
         with self._state_lock:
             self._episodes_recorded += 1
 
+    def note_episode(self, episode: int) -> None:
+        """The (1-based) dataset episode about to be recorded."""
+        with self._state_lock:
+            self._episode = episode
+
     def snapshot(self) -> dict[str, Any]:
         """Thread-safe phase/count/message/buttons for the /api/op/status API."""
         with self._state_lock:
@@ -361,7 +413,13 @@ class _QueuePolicyControl:
                 "phase": phase,
                 # Saves are what number an episode, so a discarded rollout is
                 # re-recorded under the same number — as the log line says.
-                "episode": self._episodes_recorded + 1,
+                # note_episode() overrides for sessions numbering off the
+                # dataset (a resume counts past the session's own saves).
+                "episode": (
+                    self._episode
+                    if self._episode is not None
+                    else self._episodes_recorded + 1
+                ),
                 "episodesRecorded": self._episodes_recorded,
                 "message": message,
                 "controls": controls,
@@ -375,6 +433,62 @@ class _QueuePolicyControl:
                 self._q.get_nowait()
         except queue.Empty:
             pass
+
+    @staticmethod
+    def _gate_decision(cmd: str) -> str | None:
+        """Map a queued command to a gate decision, or None to keep waiting."""
+        if cmd in ("continue", "start", "s"):
+            return "go"
+        return "quit" if cmd == "q" else None
+
+    def _take_subtask(self, cmd: str) -> bool:
+        """Route a subtask number to the live policy. True if ``cmd`` was one."""
+        if not (self._num_subtasks and self._on_subtask and cmd.isdigit()):
+            return False
+        idx = int(cmd)
+        if 1 <= idx <= self._num_subtasks:
+            self._on_subtask(idx)
+        return True
+
+    def begin_gate(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> None:
+        from lerobot.utils.utils import log_say
+
+        log_say(message)
+        with self._state_lock:
+            self._phase = phase
+            self._gate_message = message
+            self._gate_label = label
+
+    def note_gate(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> None:
+        """Re-label the open gate for the panel, without re-announcing it.
+
+        ``begin_gate`` speaks its message, which is right when a gate opens
+        and wrong for a transient swap *inside* one — a contact hold that
+        interrupts an idle-phase home states its own instruction and then
+        hands the gate back unchanged, and neither hand-off should be spoken
+        again.
+        """
+        with self._state_lock:
+            self._phase = phase
+            self._gate_message = message
+            self._gate_label = label
+
+    def poll_gate(self) -> str | None:
+        """Non-blocking gate check, for callers that must keep ticking."""
+        import queue
+
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            decision = self._gate_decision(cmd)
+            if decision is not None:
+                return decision
 
     def _await_gate(self, phase: str, message: str, label: str) -> bool:
         """Open a gate for the panel and block until the operator resolves it."""
@@ -392,14 +506,20 @@ class _QueuePolicyControl:
                 cmd = self._q.get(timeout=0.25)
             except queue.Empty:
                 continue
-            if cmd in ("continue", "start", "s"):
-                return True
-            if cmd == "q":
-                return False
+            decision = self._gate_decision(cmd)
+            if decision is not None:
+                return decision == "go"
         return False
 
-    def await_continue(self, message: str) -> bool:
-        return self._await_gate("ready", message, "Start episode")
+    def await_continue(
+        self, message: str, label: str = "Start episode", phase: str = _GATE_READY
+    ) -> bool:
+        cleared = self._await_gate(phase, message, label)
+        if cleared and phase == _GATE_CONTACT:
+            # The return replans and plays from here, so drop the contact
+            # buttons rather than leave them up over a moving arm.
+            self._set_phase("resetting")
+        return cleared
 
     def await_contact_clear(self) -> bool:
         cleared = self._await_gate("contact", _CONTACT_PROMPT, "Return to rest")
@@ -423,8 +543,14 @@ class _QueuePolicyControl:
             self._set_phase("resetting")
         return cleared
 
-    def begin_episode(self) -> None:
+    def begin_episode(
+        self,
+        on_subtask: "Callable[[int], None] | None" = None,
+        num_subtasks: int = 0,
+    ) -> None:
         self._choice = None
+        self._on_subtask = on_subtask
+        self._num_subtasks = num_subtasks
         self._drain()
         self._set_phase("recording")
 
@@ -433,14 +559,17 @@ class _QueuePolicyControl:
 
         if self._choice is not None:
             return self._choice
-        try:
-            cmd = self._q.get_nowait()
-        except queue.Empty:
-            return None
-        if cmd in ("s", "r", "q"):
-            self._choice = cmd
-            return cmd
-        return None
+        while True:
+            try:
+                cmd = self._q.get_nowait()
+            except queue.Empty:
+                return None
+            if cmd in ("s", "r", "q"):
+                self._choice = cmd
+                return cmd
+            # Subtask switches keep the episode running; anything else is
+            # ignored rather than mistaken for a decision.
+            self._take_subtask(cmd)
 
     def resolve_timeout(self, episode_time_s: int) -> str:
         import queue
@@ -466,6 +595,7 @@ class _QueuePolicyControl:
 
     def end_episode(self) -> None:
         # The episode ended; the loop returns to rest before the next gate.
+        self._on_subtask = None
         self._set_phase("resetting")
 
     def close(self) -> None:
@@ -1401,6 +1531,15 @@ def _run(
                 encoder_threads=4,
                 rgb_encoder=rgb_encoder,
             )
+            # LeRobot's codebase_version only identifies its dataset schema;
+            # record Axol's Cartesian world frame separately so this fresh
+            # dataset can never be mistaken for pre-v0.1.32 data and rotated
+            # a second time by migrate-dataset.
+            action_names = (action_features.get(ACTION) or {}).get("names") or []
+            if any("_ee." in name for name in action_names):
+                from ..recording.cartesian_frame import write_cartesian_frame_marker
+
+                write_cartesian_frame_marker(dataset_root)
 
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)

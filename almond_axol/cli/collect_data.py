@@ -183,7 +183,11 @@ def _existing_dataset_resolution(dataset_root: "Path") -> str | None:
     return None
 
 
-def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any | None:
+def _start_video_relay(
+    cfg: "CollectDataConfig",
+    dataset_resolution: str,
+    raw_transport: str | None = None,
+) -> Any | None:
     """Start the out-of-process video relay for data collection.
 
     The relay subprocess opens the ZED cameras on the GPU-resident gst pipeline,
@@ -196,6 +200,12 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
     ``dataset_resolution`` is the effective downscale target for the dataset (raw)
     branch — the configured value for a fresh dataset, or the existing dataset's
     resolution when resuming (the caller resolves this; see _run).
+
+    ``raw_transport`` optionally forces the relay's raw-branch transport for
+    every camera (see :class:`~almond_axol.video.video_proc.VideoRelayProcess`):
+    ``collect-dagger`` passes ``"pyshm"`` so the raw frames are readable by the
+    control process (policy observations) as well as the recorder subprocess.
+    ``None`` keeps the relay's default (gst shm where available).
 
     Returns the :class:`VideoRelayProcess`, or ``None`` when it can't be used
     (no cameras or aiortc unavailable), in which case the caller uses the
@@ -235,6 +245,8 @@ def _start_video_relay(cfg: "CollectDataConfig", dataset_resolution: str) -> Any
         # Downscale target for the dataset (raw) branch only; the encoded headset
         # branch keeps the full capture resolution. Clamped to capture in the relay.
         spec["dataset_resolution"] = dataset_resolution
+        if raw_transport is not None:
+            spec["raw_transport"] = raw_transport
         # The recorded eyes (``eyes``) must match observation_cameras() so the
         # relay's raw branch exports exactly the keys the recorder expects; the
         # streamed eyes (``stream_eyes``) drive the headset feed independently, so

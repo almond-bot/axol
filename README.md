@@ -111,6 +111,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Diagnostics Dashboard](https://docs.almond.bot/guides/diagnostics-dashboard) — live motor telemetry, health tiles, and diagnostics scripts, served by `axol serve`
 - [VR Interface](https://docs.almond.bot/guides/vr-interface) — the in-repo WebXR teleop app (`web/`)
 - [Quest over USB](https://docs.almond.bot/guides/quest-over-usb) — low-latency wired controller transport (poses over a USB `adb` tunnel; camera stays on the LAN)
+- [Quest Without Wearing It](https://docs.almond.bot/guides/quest-headless) — keep the headset awake with nobody wearing it (proximity sensor off) for headless sessions
 
 ### Advanced
 
@@ -118,7 +119,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -138,6 +139,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.flash`](https://docs.almond.bot/cli/motor-flash)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
+- [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)
