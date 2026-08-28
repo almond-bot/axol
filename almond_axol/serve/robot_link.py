@@ -41,6 +41,7 @@ from ..motor import BusObserver, CanBus, Joint, Motor, MotorError
 from ..motor.config import DamiaoParam
 from ..motor.damiao import DamiaoMotor
 from ..motor.myactuator import MyActuatorMotor, mit_ranges
+from ..teleop_activity import active_teleop
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
 _logger = logging.getLogger(__name__)
@@ -758,31 +759,43 @@ class RobotLink:
     async def _publish_loop(self) -> None:
         """Feed motor state and on-wire timing from the passive observers.
 
-        Timing is sampled in every connected state so this also measures an
-        ``axol teleop`` launched independently from a terminal. Motor state
-        only takes over here in BUSY: while the link owns the bus, its normal
-        sample loop already publishes values (and silently sources externally
-        commanded joints from the same observer). A task that isn't commanding
-        produces no timing frames, so the chart honestly goes quiet.
+        Timing is sampled only after ``VRTeleop.run`` begins, which is after
+        PyRoKi has produced its first solution. This excludes the RT core's
+        bring-up/compile-time hold traffic for both backends while still
+        measuring ``axol teleop`` launched independently from a terminal.
+        Motor state only takes over here in BUSY: while the link owns the bus,
+        its normal sample loop already publishes values (and silently sources
+        externally commanded joints from the same observer).
         """
         interval = 1.0 / SAMPLE_HZ
         slow_period = max(1, int(SAMPLE_HZ))  # ~1 Hz, matching the idle ping
         tick = 0
+        timing_session: str | None = None
         while True:
             await asyncio.sleep(interval)
             with self._lock:
                 busy = self._state == STATE_BUSY
             tick += 1
             try:
-                timing: dict[str, dict[str, Any]] = {}
-                for arm in self._arms:
-                    if arm.observer is None:
-                        continue
-                    snapshot = arm.observer.timing_snapshot()
-                    if snapshot is not None:
-                        timing[arm.side] = snapshot
-                if timing:
-                    self.hub.push_timing(timing)
+                activity = active_teleop()
+                if activity is not None and activity.token != timing_session:
+                    timing_session = activity.token
+                    self.hub.start_timing_session()
+                elif activity is None:
+                    timing_session = None
+
+                if activity is not None:
+                    timing: dict[str, dict[str, Any]] = {}
+                    for arm in self._arms:
+                        if arm.observer is None:
+                            continue
+                        snapshot = arm.observer.timing_snapshot(
+                            since=activity.started_at
+                        )
+                        if snapshot is not None:
+                            timing[arm.side] = snapshot
+                    if timing:
+                        self.hub.push_timing(timing)
 
                 if not busy:
                     continue

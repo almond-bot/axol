@@ -47,6 +47,7 @@ from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
 from ..vr.config import VRServerConfig
 from ..vr.server import VRServer
+from ..teleop_activity import TeleopActivityMarker
 from .config import VRTeleopConfig
 from .core import VRTeleopCore
 from .recorder import make as _recorder_make
@@ -427,6 +428,18 @@ class VRTeleop:
             else None
         )
 
+        # enable() has already received PyRoKi's first solution before run()
+        # can be entered. Publish this exact boundary for the independently
+        # running Diagnostics process: the RT core's earlier 240 Hz bring-up
+        # hold is safe robot traffic, but it is not a teleop-loop measurement.
+        # This lifecycle is shared by the classic Python and Rust backends.
+        activity = TeleopActivityMarker()
+        try:
+            activity.start()
+        except OSError as exc:
+            # Diagnostics must never prevent the robot's control loop from
+            # starting (read-only home, full disk, etc.).
+            _logger.warning("could not publish teleop timing boundary: %s", exc)
         _logger.info("VRTeleop loop started at %.0f Hz", self._config.frequency)
         # Track an absolute deadline so late wakeups are corrected in the next
         # cycle rather than accumulating as permanent drift.
@@ -574,6 +587,7 @@ class VRTeleop:
         except asyncio.CancelledError:
             pass
         finally:
+            activity.stop()
             diag.stop()
             tegra.stop()
 

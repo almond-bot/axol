@@ -235,6 +235,7 @@ type WsMessage =
   | ({ type: "frame" } & TelemetryFrame)
   | { type: "slow"; t: number; m: Record<string, SlowReading> }
   | ({ type: "timing" } & TimingFrame)
+  | { type: "timing_reset" }
   | { type: "state"; state: RobotState }
 
 export interface TelemetryStream {
@@ -282,6 +283,9 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
     let ws: WebSocket | null = null
     let retry: ReturnType<typeof setTimeout> | null = null
     let closed = false
+    // A run can become ready while the initial history request is in flight.
+    // Do not let that stale response repopulate the graph after timing_reset.
+    let timingGeneration = 0
 
     const buf = frames
     const slowBuf = slowFrames
@@ -305,6 +309,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
     }
 
     const backfill = async () => {
+      const requestedTimingGeneration = timingGeneration
       try {
         const {
           frames: history,
@@ -324,7 +329,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
           slowBuf.splice(0, 0, ...olderSlow)
           if (slowBuf.length > MAX_SLOW_FRAMES) slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
         }
-        if (timingHistory) {
+        if (timingHistory && requestedTimingGeneration === timingGeneration) {
           const newestTiming = timingBuf.length > 0 ? timingBuf[timingBuf.length - 1].t : -Infinity
           const olderTiming = timingHistory.filter(
             (f) => f.t < newestTiming || timingBuf.length === 0
@@ -357,6 +362,11 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
           appendSlow(slowToFrame(msg.t, msg.m))
         } else if (msg.type === "timing") {
           appendTiming({ t: msg.t, arms: msg.arms })
+        } else if (msg.type === "timing_reset") {
+          timingGeneration += 1
+          timingBuf.splice(0)
+          setTimingLatest({})
+          setVersion((v) => v + 1)
         } else if (msg.type === "state") {
           setState(msg.state)
         } else if (msg.type === "hello") {

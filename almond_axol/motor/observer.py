@@ -428,6 +428,7 @@ class BusObserver:
         self,
         window_s: float = _TIMING_WINDOW_S,
         target_hz: float = _CONTROL_TARGET_HZ,
+        since: float | None = None,
     ) -> dict | None:
         """Rolling on-wire control/CAN timing for this arm.
 
@@ -436,12 +437,16 @@ class BusObserver:
         loop cadence without mistaking the seven back-to-back CAN frames for
         seven control ticks. Single-joint diagnostics work for the same reason.
 
-        Returns ``None`` after command traffic has been quiet for ``window_s``.
-        All measurements come from kernel receive timestamps on the passive
+        ``since`` is an optional lifecycle boundary; samples before it are
+        excluded even when they are still inside the rolling window. Returns
+        ``None`` after command traffic has been quiet for ``window_s``. All
+        measurements come from kernel receive timestamps on the passive
         observer socket, making classic Python and Rust directly comparable.
         """
         now = time.time()
         cutoff = now - window_s
+        if since is not None:
+            cutoff = max(cutoff, since)
         candidates: list[tuple[int, Joint, JointObservation, list[float]]] = []
         for joint, obs in self._observations.items():
             commands = [ts for ts in obs.command_times if ts >= cutoff]

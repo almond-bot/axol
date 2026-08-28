@@ -25,7 +25,8 @@ Wire/message shapes (also served over REST for backfill):
 
     {"type": "state", "state": "busy"}
 
-- passive on-wire control timing, ~10 Hz while command traffic is active::
+- passive on-wire control timing, ~10 Hz while the post-PyRoKi teleop run is
+  active::
 
     {"type": "timing", "t": <epoch s>,
      "arms": {"left": {"commandHz": 240.0, "feedbackHz": 240.0,
@@ -127,6 +128,12 @@ class TelemetryHub:
         with self._lock:
             self._timing_frames.append(frame)
         self._fanout({"type": "timing", **frame})
+
+    def start_timing_session(self) -> None:
+        """Clear the previous graph when a newly-ready teleop run starts."""
+        with self._lock:
+            self._timing_frames.clear()
+        self._fanout({"type": "timing_reset"})
 
     def clear_slow(self) -> None:
         with self._lock:

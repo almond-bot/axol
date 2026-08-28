@@ -197,7 +197,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
   const stale = newest === 0 || nowT - newest > 2
   const quietReason =
     frames.length === 0
-      ? "start a control loop to measure its CAN traffic"
+      ? "start teleop and wait for PyRoKi to finish"
       : stale
         ? "control traffic stopped"
         : null
@@ -208,7 +208,8 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
         <div className="mr-2">
           <h2 className="font-heading text-base font-semibold">Control loop & CAN timing</h2>
           <p className="text-xs text-white/35">
-            Passive kernel timestamps · rolling 1s · zero added bus traffic
+            Post-PyRoKi teleop only · passive kernel timestamps · rolling 1s · zero added bus
+            traffic
           </p>
         </div>
         <div className="flex overflow-hidden rounded-md border border-white/10">
