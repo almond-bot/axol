@@ -474,6 +474,15 @@ class VRTeleop:
                 # contact (reset replans from wherever the arms are left).
                 # See VRTeleopCore.guarded_return.
                 if guard and self._core.is_resetting:
+                    # Reset/exit motion is deliberately outside the latest
+                    # engage segment. This branch bypasses the ordinary gate
+                    # update below, so close both measured recorders before
+                    # the guarded return starts instead of retaining its
+                    # several-second trip to rest in _meas/_rt.
+                    if self._robot_recorder is not None:
+                        self._robot_recorder(False)
+                    if self._rec is not None:
+                        self._rec.set_engaged(False)
                     await self._core.guarded_return(
                         send_step=_guard_send_step,
                         gravity_step=_guard_gravity_step,
