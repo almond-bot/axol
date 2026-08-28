@@ -1192,7 +1192,7 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
             encoder_threads=_ENCODER_THREADS,
             rgb_encoder=rgb_encoder,
         )
-    return LeRobotDataset.create(
+    dataset = LeRobotDataset.create(
         repo_id=config["repo_id"],
         fps=config["fps"],
         root=config["root"],
@@ -1204,6 +1204,15 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
         encoder_threads=_ENCODER_THREADS,
         rgb_encoder=rgb_encoder,
     )
+    # LeRobot's codebase_version describes the dataset format, not the Axol
+    # URDF/world frame.  Record our pose-frame provenance on fresh Cartesian
+    # datasets so future migrations can distinguish them without guessing.
+    action_names = (config["features"].get("action") or {}).get("names") or []
+    if any("_ee." in name for name in action_names):
+        from .cartesian_frame import write_cartesian_frame_marker
+
+        write_cartesian_frame_marker(config["dataset_root"])
+    return dataset
 
 
 def make_episode_durable(dataset: "LeRobotDataset") -> dict[str, Any]:

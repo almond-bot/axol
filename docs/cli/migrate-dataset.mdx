@@ -1,0 +1,53 @@
+---
+title: "migrate-dataset"
+description: "Migrate Cartesian datasets recorded before the v0.1.32 URDF frame change."
+---
+
+`axol migrate-dataset` updates Cartesian LeRobot datasets recorded with axol
+v0.1.31 or earlier so they replay correctly with v0.1.32 and later.
+
+In v0.1.32, the URDF root gained a +90° yaw so its world frame is FLU (+x
+forward, +y left, +z up). Older Cartesian datasets store poses in the previous
+frame. The migration applies that root transform to the position and
+orientation of both end effectors in `action` and `observation.state`. It does
+not alter videos, gripper values, timestamps, or joint-space datasets.
+
+```bash
+# Inspect the dataset and report the scope without changing it
+axol migrate-dataset --repo_id ilanri/checkers-demo-bimanual \
+  --from-version v0.1.29 --dry-run
+
+# Migrate it in place
+axol migrate-dataset --repo_id ilanri/checkers-demo-bimanual \
+  --from-version v0.1.29
+
+# A dataset outside $HF_LEROBOT_HOME can be addressed directly
+axol migrate-dataset --repo_id /data/checkers-demo-bimanual \
+  --from-version v0.1.29
+```
+
+The command updates every data parquet, recomputes per-episode and global
+statistics, and writes `meta/axol.json` to prevent accidental double migration.
+Before making changes it backs up every file it will replace under
+`meta/migrations/axol-urdf-root-yaw-v0.1.32/`. If migration fails, those files
+are restored automatically; a later run also recovers an interrupted migration
+before retrying.
+
+Only run this on Cartesian data recorded with axol v0.1.31 or earlier. A
+joint-space dataset does not need migration and is rejected. Legacy datasets do
+not record their axol version, so recording provenance is the reliable way to
+decide whether an unmarked dataset needs it. Fresh Cartesian datasets now write
+their pose-frame provenance to `meta/axol.json` automatically.
+
+`--from-version` is required because datasets made before pose-frame metadata
+was added cannot distinguish pre-v0.1.32 data that needs migration from later
+data that is already correct. The command rejects v0.1.32 and newer values.
+
+## Options
+
+| Option | Description |
+|---|---|
+| `--repo_id <id-or-path>` | Local repo id under `$HF_LEROBOT_HOME`, or a dataset directory path (required) |
+| `--root <path>` | Alternate root containing the repo id |
+| `--from-version <version>` | Axol version that recorded the dataset; must be older than v0.1.32 (required) |
+| `--dry-run` | Validate and report the files/rows that would change without writing |
