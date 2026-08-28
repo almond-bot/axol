@@ -218,7 +218,7 @@ config = AxolConfig(                                           # per-joint, left
 )
 ```
 
-Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
+Both arms share the same `ArmConfig` defaults for gains and masses; the right arm gets CoMs mirrored across X via `ArmConfig.mirror_to_right()`. The built production config sets `shoulder_1.kd_host_q=3` symmetrically: it keeps the shoulder damper centred on its pose-tracked impedance mode while excluding the separate 12.5–13.6 Hz mast/forearm mode seen in hardware traces. Other joints with `kd_host_q=None` use the shared 0.8. Per-motor friction values are identified separately for each arm (left/right motors measurably differ) — see `_LEFT_FRICTION` / `_RIGHT_FRICTION` in `almond_axol/robot/config.py`. Pass an explicit `left=` / `right=` to override either side.
 
 ## Gravity compensation
 

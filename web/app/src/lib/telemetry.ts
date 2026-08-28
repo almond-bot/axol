@@ -65,6 +65,38 @@ export interface TelemetryFrame {
   m: Record<string, FastSample>
 }
 
+/** Passive kernel-timestamped timing for one arm's most active command joint. */
+export interface ControlTiming {
+  sourceJoint: string
+  targetHz: number
+  commandHz: number | null
+  feedbackHz: number | null
+  commandPeriodMs: number | null
+  feedbackPeriodMs: number | null
+  commandJitterP95Ms: number | null
+  feedbackJitterP95Ms: number | null
+  commandGapMaxMs: number | null
+  feedbackGapMaxMs: number | null
+  commandBatchP50Ms: number | null
+  commandBatchP95Ms: number | null
+  feedbackBatchP95Ms: number | null
+  canCycleP50Ms: number | null
+  canCycleP95Ms: number | null
+  canUtilizationP95Pct: number | null
+  canHeadroomP05Ms: number | null
+  roundTripP50Ms: number | null
+  roundTripP95Ms: number | null
+  deadlineMisses: number
+  missedFeedback: number
+  commandAgeMs: number
+  feedbackAgeMs: number | null
+}
+
+export interface TimingFrame {
+  t: number
+  arms: Partial<Record<ArmSide, ControlTiming>>
+}
+
 /** Slow (1 Hz) per-motor reading piggybacked on the health ping. */
 export interface SlowReading {
   reachable: boolean
@@ -79,6 +111,7 @@ export interface TelemetrySnapshot {
   slow: Record<string, SlowReading>
   slowT: number | null
   latest: TelemetryFrame | null
+  timingLatest?: TimingFrame | null
 }
 
 export async function fetchTelemetry(): Promise<TelemetrySnapshot> {
@@ -92,6 +125,8 @@ export async function fetchTelemetryHistory(
   frames: TelemetryFrame[]
   /** 1 Hz sweep history (temperature/voltage); absent on older hosts. */
   slow?: { t: number; m: Record<string, SlowReading> }[]
+  /** Passive on-wire command/feedback timing; absent on older hosts. */
+  timing?: TimingFrame[]
 }> {
   return json(
     await fetch(apiUrl(`/api/telemetry/history?seconds=${seconds}&max_frames=${maxFrames}`))
@@ -183,6 +218,7 @@ async function json<T>(res: Response): Promise<T> {
 const MAX_FRAMES = 6000
 /** Slow (1 Hz) sweep buffer: the same 10-minute span. */
 const MAX_SLOW_FRAMES = 600
+const MAX_TIMING_FRAMES = 6000
 const RECONNECT_MS = 3000
 
 /** Chart-shaped frame from one slow sweep: m[key] = [temperature, voltage]. */
@@ -198,6 +234,7 @@ type WsMessage =
   | ({ type: "hello" } & TelemetrySnapshot)
   | ({ type: "frame" } & TelemetryFrame)
   | { type: "slow"; t: number; m: Record<string, SlowReading> }
+  | ({ type: "timing" } & TimingFrame)
   | { type: "state"; state: RobotState }
 
 export interface TelemetryStream {
@@ -212,6 +249,10 @@ export interface TelemetryStream {
    * Same in-place-mutated identity contract as `frames`.
    */
   slowFrames: TelemetryFrame[]
+  /** Passive on-wire control/CAN timing at the dashboard sample cadence. */
+  timingFrames: TimingFrame[]
+  /** Latest active timing reading per arm (undefined before traffic is seen). */
+  timingLatest: Partial<Record<ArmSide, ControlTiming>>
   /** Bumped on every appended frame — subscribe charts to this. */
   version: number
   /** WebSocket currently open. */
@@ -229,9 +270,11 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
   // new 6k-frame array per sample would thrash); `version` signals changes.
   const [frames] = useState<TelemetryFrame[]>(() => [])
   const [slowFrames] = useState<TelemetryFrame[]>(() => [])
+  const [timingFrames] = useState<TimingFrame[]>(() => [])
   const [version, setVersion] = useState(0)
   const [state, setState] = useState<RobotState>("disconnected")
   const [slow, setSlow] = useState<Record<string, SlowReading>>({})
+  const [timingLatest, setTimingLatest] = useState<Partial<Record<ArmSide, ControlTiming>>>({})
   const [streaming, setStreaming] = useState(false)
 
   useEffect(() => {
@@ -242,6 +285,7 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
 
     const buf = frames
     const slowBuf = slowFrames
+    const timingBuf = timingFrames
     const append = (frame: TelemetryFrame) => {
       buf.push(frame)
       if (buf.length > MAX_FRAMES) buf.splice(0, buf.length - MAX_FRAMES)
@@ -249,14 +293,24 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
     }
     const appendSlow = (frame: TelemetryFrame) => {
       slowBuf.push(frame)
-      if (slowBuf.length > MAX_SLOW_FRAMES)
-        slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+      if (slowBuf.length > MAX_SLOW_FRAMES) slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+      setVersion((v) => v + 1)
+    }
+    const appendTiming = (frame: TimingFrame) => {
+      timingBuf.push(frame)
+      if (timingBuf.length > MAX_TIMING_FRAMES)
+        timingBuf.splice(0, timingBuf.length - MAX_TIMING_FRAMES)
+      setTimingLatest((prev) => ({ ...prev, ...frame.arms }))
       setVersion((v) => v + 1)
     }
 
     const backfill = async () => {
       try {
-        const { frames: history, slow: slowHistory } = await fetchTelemetryHistory(600, 3000)
+        const {
+          frames: history,
+          slow: slowHistory,
+          timing: timingHistory,
+        } = await fetchTelemetryHistory(600, 3000)
         const newest = buf.length > 0 ? buf[buf.length - 1].t : -Infinity
         // Only frames older than what we already streamed, to keep t monotonic.
         const older = history.filter((f) => f.t < newest || buf.length === 0)
@@ -268,8 +322,18 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
             .filter((f) => f.t < newestSlow || slowBuf.length === 0)
             .map((f) => slowToFrame(f.t, f.m))
           slowBuf.splice(0, 0, ...olderSlow)
-          if (slowBuf.length > MAX_SLOW_FRAMES)
-            slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+          if (slowBuf.length > MAX_SLOW_FRAMES) slowBuf.splice(0, slowBuf.length - MAX_SLOW_FRAMES)
+        }
+        if (timingHistory) {
+          const newestTiming = timingBuf.length > 0 ? timingBuf[timingBuf.length - 1].t : -Infinity
+          const olderTiming = timingHistory.filter(
+            (f) => f.t < newestTiming || timingBuf.length === 0
+          )
+          timingBuf.splice(0, 0, ...olderTiming)
+          if (timingBuf.length > MAX_TIMING_FRAMES)
+            timingBuf.splice(0, timingBuf.length - MAX_TIMING_FRAMES)
+          const latest = timingBuf[timingBuf.length - 1]
+          if (latest) setTimingLatest((prev) => ({ ...prev, ...latest.arms }))
         }
         setVersion((v) => v + 1)
       } catch {
@@ -291,6 +355,8 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
         } else if (msg.type === "slow") {
           setSlow((prev) => ({ ...prev, ...msg.m }))
           appendSlow(slowToFrame(msg.t, msg.m))
+        } else if (msg.type === "timing") {
+          appendTiming({ t: msg.t, arms: msg.arms })
         } else if (msg.type === "state") {
           setState(msg.state)
         } else if (msg.type === "hello") {
@@ -315,7 +381,16 @@ export function useTelemetryStream(enabled: boolean): TelemetryStream {
       }
       setStreaming(false)
     }
-  }, [enabled, frames, slowFrames])
+  }, [enabled, frames, slowFrames, timingFrames])
 
-  return { state, slow, frames, slowFrames, version, streaming }
+  return {
+    state,
+    slow,
+    frames,
+    slowFrames,
+    timingFrames,
+    timingLatest,
+    version,
+    streaming,
+  }
 }

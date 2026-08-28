@@ -1289,9 +1289,10 @@ class AxolArm:
         # so we differentiate the joint-frame ``clipped`` array directly.
         # Classic mode only: in realtime-core mode the trajectory the wire
         # carries is rendered by the core's own tracker at 240 Hz, and the
-        # velocity/friction/inertia terms are computed there from its states
-        # (this loop's 120 Hz differentiation of the pre-tracker target
-        # would be out of phase with the executed motion).
+        # velocity/friction/inertia terms are computed there by applying
+        # these same low-pass derivative chains to the executed tracker
+        # position (this loop's 120 Hz differentiation of the pre-tracker
+        # target would be out of phase with the executed motion).
         sink_mode = self._command_sink is not None
         if not sink_mode:
             velocities = self._vel_diff.differentiate(list(clipped))
@@ -1360,9 +1361,9 @@ class AxolArm:
         # 90° of loop phase, where the damper pumps the mode instead of
         # damping it (the rt-teleop shaking of 2026-08-27). The core runs
         # the identical filter chain (see rust/axol-rt/src/filter.rs,
-        # golden-tested against this module) at 240 Hz on same-tick
-        # feedback; this side only *schedules* it, shipping the pose-scaled
-        # gain and band-pass centre/q per command.
+        # golden-tested against this module) at 240 Hz on the latest feedback,
+        # applying the result within one core tick; this side only *schedules*
+        # it, shipping the pose-scaled gain and band-pass centre/q per command.
         if not sink_mode:
             v_des_fast = self._vel_fast_diff.differentiate(list(clipped))
             try:

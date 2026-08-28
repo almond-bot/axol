@@ -25,6 +25,7 @@ import {
   type ActionMode,
 } from "@/components/diagnostics/diagnostic-actions"
 import { CanAdapterDialog } from "@/components/diagnostics/can-adapter-dialog"
+import { ControlHealth } from "@/components/diagnostics/control-health"
 import { TuningWorkbench } from "@/components/diagnostics/tuning-workbench"
 import {
   TelemetryChart,
@@ -154,9 +155,7 @@ export default function Diagnostics() {
   const [arm, setArm] = useState<ArmSide>(
     () => (localStorage.getItem("axolDiagArm") as ArmSide) || "left"
   )
-  const [metricKey, setMetricKey] = useState(
-    () => localStorage.getItem("axolDiagMetric") || "pos"
-  )
+  const [metricKey, setMetricKey] = useState(() => localStorage.getItem("axolDiagMetric") || "pos")
   const [windowSec, setWindowSec] = useState(120)
   const [hiddenJoints, setHiddenJoints] = useState<Set<JointName>>(new Set())
   // Zoom/pan pins the charts to a fixed range; null follows the live edge.
@@ -205,7 +204,10 @@ export default function Diagnostics() {
       .reverse()
       .find(
         (l) =>
-          l.trim() && !l.startsWith("[serve]") && !l.startsWith("[prompt] ") && !l.startsWith("@@live")
+          l.trim() &&
+          !l.startsWith("[serve]") &&
+          !l.startsWith("[prompt] ") &&
+          !l.startsWith("@@live")
       ) ?? null
 
   const stream = useTelemetryStream(serverOk)
@@ -639,8 +641,10 @@ export default function Diagnostics() {
   // Follow mode anchors the window to the newest sample; the page re-renders
   // on every stream tick, so the live edge advances with the data (and holds
   // still while the stream is paused). Zoom/pan pins a fixed range.
-  const lastT =
-    chartFrames.length > 0 ? chartFrames[chartFrames.length - 1].t : windowSec
+  const motorLastT = chartFrames.length > 0 ? chartFrames[chartFrames.length - 1].t : 0
+  const timingLastT =
+    stream.timingFrames.length > 0 ? stream.timingFrames[stream.timingFrames.length - 1].t : 0
+  const lastT = Math.max(motorLastT, timingLastT) || windowSec
   const view: ChartView = pinnedView ?? { t0: lastT - windowSec, t1: lastT }
 
   return (
@@ -781,6 +785,14 @@ export default function Diagnostics() {
             </div>
           ))}
         </section>
+
+        <ControlHealth
+          frames={stream.timingFrames}
+          version={stream.version}
+          nowT={lastT}
+          view={view}
+          onViewChange={setPinnedView}
+        />
 
         {/* Live charts */}
         <section className="flex flex-col gap-3">

@@ -76,19 +76,21 @@ own trajectory and feedback states:
 - **In-core target tracker**: the golden-ported `TrapezoidalFilter`
   (`filter::Trapezoid`) chases the latest streamed target under the
   config velocity/acceleration limits (teleop caps × 1.5 headroom),
-  replacing linear segment interpolation. Its `(pos, vel, accel)` states
-  are the wire command — velocity feedforward is continuous instead of
-  frozen between targets, and target-rate wobble is absorbed by the
-  tracker's own dynamics.
+  replacing linear segment interpolation. Its position is the wire
+  trajectory (the low-pass derivative below supplies wire velocity), and
+  target-rate wobble is absorbed by the tracker's own dynamics.
 - **In-core friction + inertia feedforwards**: the tanh friction model
-  (per-joint params ride the config) on the tracker velocity, and the
-  streamed pose-scaled `j_eff` on the tracker acceleration — coherent
-  with the executed trajectory, not with Python's 120 Hz pre-tracker view
-  of it (differentiating the raw target for the inertia term is exactly
-  the noise the trapezoid exists to remove).
+  (per-joint params ride the config) and streamed pose-scaled `j_eff` use
+  the classic Python 20 rad/s command-derivative chain, now driven by the
+  executed tracker position. The low-pass velocity plus second low-pass
+  acceleration derivative are important: the raw 240 Hz tracker
+  acceleration reacts to each new 120 Hz target differently from the
+  repeated-target tick, which previously produced an alternating inertia
+  torque and felt vibration during motion.
 - **In-core host damping**: band-passed `(v_des − v_meas)` scaled by the
-  streamed pose-scheduled gain, computed every tick from same-tick
-  feedback, with `v_des` the tracker velocity. The filter chain
+  streamed pose-scheduled gain, computed every tick from the latest
+  feedback, with `v_des` the fast low-pass derivative of tracker position.
+  The counter-torque reaches the wire within one 240 Hz tick. The filter chain
   (`src/filter.rs`) is ported from `almond_axol.robot.control` and
   golden-tested against it. Damping is a phase race — computing the
   torque in Python put it ~14 ms behind the velocity it acts on (120 Hz
@@ -98,7 +100,11 @@ own trajectory and feedback states:
   lands within one tick, and damping stays live through every core-owned
   hold (watchdog, orphaned client) — frozen-`t_ff` holds used to leave
   the shoulders ringing on firmware kd alone. `cargo test` includes a
-  dissipated-power comparison of the two chains.
+  dissipated-power comparison of the two chains. The shared robot config
+  gives shoulder-1 on both arms a Q=3 band: it keeps unity gain at the
+  intended ~3.2 Hz mode while rejecting the measured 12.5-13.6 Hz
+  mast/forearm structural mode. Classic and RT consume the same value, and
+  explicit calibration or CLI Q values remain authoritative.
 - Watchdog: targets stop arriving → the tracker converges on the last
   target and the arms hold there, damping active (matching what the
   firmware itself does if a host dies mid-command, plus the damper).
@@ -151,6 +157,22 @@ Guarded return works exactly as in classic mode: `torque_residuals` and
 `reset_command_state` are cache/state-only, and `gravity_compensate`
 streams its tuples through the same command sink — the contact watchdog,
 the limp contact hold, and the replanned reset all run against the core.
+
+### Control-term tracing
+
+Set `AXOL_RT_TRACE` to a path prefix to capture one CSV per arm without doing
+file I/O on the realtime threads:
+
+```bash
+AXOL_RT_TRACE=/tmp/axol-run axol teleop --rt
+# writes /tmp/axol-run-left.csv and /tmp/axol-run-right.csv
+```
+
+Each 240 Hz joint row includes the streamed target, wire position/velocity,
+measured position/velocity/torque, filter states, and separate gravity,
+friction, inertia, and host-damping torque contributions. The bus threads
+enqueue fixed-size rows into bounded channels; background threads format and
+write them, and the regular five-second status line reports any trace drops.
 
 ## Safety
 

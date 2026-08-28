@@ -9,16 +9,16 @@
 //!
 //! - a velocity/acceleration-limited tracker (`filter::Trapezoid`, the
 //!   golden-ported `TrapezoidalFilter`) chases the latest streamed target
-//!   at `loop_hz`, replacing linear segment interpolation — its `(pos,
-//!   vel, accel)` states are the wire command, so velocity feedforward is
-//!   continuous instead of frozen between targets;
+//!   at `loop_hz`, replacing linear segment interpolation — its position
+//!   renders the wire trajectory;
 //! - friction (`filter::friction`, per-joint params from the config) and
 //!   inertia (`j_eff` streamed pose-scaled per target) feedforwards from
-//!   the tracker's velocity/acceleration — coherent with the trajectory
-//!   actually executed, not with Python's 120 Hz view of it;
-//! - the host-damping torque — band-passed velocity damping from same-tick
+//!   low-pass derivatives of that trajectory. This preserves the classic
+//!   Python command chain and prevents the 120 Hz target staircase from
+//!   becoming an alternating 240 Hz acceleration torque;
+//! - the host-damping torque — band-passed velocity damping from the latest
 //!   feedback, using the pose-scheduled coefficients streamed with each
-//!   target;
+//!   target and reaching the wire within one core tick;
 //! - and the last target is held (tracker converges and stays, damping
 //!   live) when targets stop arriving.
 //!
@@ -101,9 +101,11 @@
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::bringup::{self, MotorSpec, Vendor};
@@ -111,6 +113,11 @@ use crate::can::CanSock;
 use crate::filter::{self, BandPass, LpDiff, Trapezoid};
 use crate::hold::sleep_until;
 use crate::proto;
+
+/// Pole (rad/s) of the motor-facing command derivatives — `CUTOFF_FREQ` in
+/// `almond_axol.robot.control`.  The slow pole keeps target-rate steps out of
+/// the friction and especially the inertia feedforward torque.
+const CONTROL_CUTOFF: f64 = 20.0;
 
 /// Pole (rad/s) of the damping chain's differentiators — `VEL_CUTOFF_FREQ`
 /// in `almond_axol.robot.control`: well above the shoulder resonance so the
@@ -277,7 +284,7 @@ pub struct JointCmd {
     pub damp_w0: f64,
     pub damp_q: f64,
     /// Pose-scaled inertia feedforward gain (Nm·s²/rad), applied to the
-    /// tracker's acceleration in tracked mode.
+    /// low-pass acceleration derivative of tracker position in tracked mode.
     pub j_eff: f64,
 }
 
@@ -293,6 +300,101 @@ struct Target {
 #[derive(Default)]
 struct TargetSlot {
     target: Option<Target>,
+}
+
+/// One fixed-size diagnostic sample passed from the realtime bus loop to a
+/// background CSV writer. Enabled only when `AXOL_RT_TRACE` is set; keeping
+/// formatting and disk I/O off the bus thread makes tracing safe to leave on
+/// while reproducing a timing-sensitive vibration.
+#[derive(Clone, Copy, Default)]
+struct TraceRow {
+    tick: u64,
+    time_s: f64,
+    seq: u32,
+    slot: usize,
+    motor_id: u8,
+    mode: f64,
+    target_p: f64,
+    cmd_p: f64,
+    cmd_v: f64,
+    cmd_a: f64,
+    cmd_v_fast: f64,
+    meas_p: f64,
+    motor_v: f64,
+    meas_v: f64,
+    meas_tau: f64,
+    gravity_ff: f64,
+    friction_ff: f64,
+    inertia_ff: f64,
+    damping_ff: f64,
+    total_ff: f64,
+    kd_host: f64,
+    damp_w0: f64,
+    damp_q: f64,
+    tick_dt: f64,
+    fb_dt: f64,
+}
+
+type TraceHandle = JoinHandle<io::Result<()>>;
+
+fn start_trace_writer(
+    side: u8,
+) -> io::Result<Option<(mpsc::SyncSender<TraceRow>, TraceHandle, PathBuf)>> {
+    let Ok(prefix) = std::env::var("AXOL_RT_TRACE") else {
+        return Ok(None);
+    };
+    if prefix.trim().is_empty() {
+        return Ok(None);
+    }
+    let side_name = if side == 0 { "left" } else { "right" };
+    let path = PathBuf::from(format!("{prefix}-{side_name}.csv"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(&path)?;
+    // About 17 seconds of headroom per arm at 240 Hz x 7 joints. A full
+    // channel never blocks the control loop: samples are dropped and counted.
+    let (tx, rx) = mpsc::sync_channel::<TraceRow>(28_000);
+    let handle = std::thread::spawn(move || -> io::Result<()> {
+        let mut out = io::BufWriter::new(file);
+        writeln!(
+            out,
+            "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+        )?;
+        for r in rx {
+            writeln!(
+                out,
+                "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+                r.tick,
+                r.time_s,
+                r.seq,
+                r.slot,
+                r.motor_id,
+                r.mode,
+                r.target_p,
+                r.cmd_p,
+                r.cmd_v,
+                r.cmd_a,
+                r.cmd_v_fast,
+                r.meas_p,
+                r.motor_v,
+                r.meas_v,
+                r.meas_tau,
+                r.gravity_ff,
+                r.friction_ff,
+                r.inertia_ff,
+                r.damping_ff,
+                r.total_ff,
+                r.kd_host,
+                r.damp_w0,
+                r.damp_q,
+                r.tick_dt,
+                r.fb_dt,
+            )?;
+        }
+        out.flush()
+    });
+    Ok(Some((tx, handle, path)))
 }
 
 struct Config {
@@ -836,6 +938,25 @@ fn bus_loop(
         let _ = ready_tx.send(Err(err));
         return Ok(());
     }
+    let (trace_tx, trace_handle) = match start_trace_writer(side) {
+        Ok(Some((tx, handle, path))) => {
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: RT control trace -> {}", path.display()),
+            );
+            (Some(tx), Some(handle))
+        }
+        Ok(None) => (None, None),
+        Err(err) => {
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: RT control trace disabled: {err}"),
+            );
+            (None, None)
+        }
+    };
     let _ = ready_tx.send(Ok(()));
 
     // Play state, indexed by target slot: the latest adopted command per
@@ -861,20 +982,25 @@ fn bus_loop(
         };
     }
     // The in-core target tracker, per slot: chases the latest streamed
-    // target at loop rate under the config vel/accel limits, and its
-    // (pos, vel, accel) states drive the wire command and the
-    // friction/inertia feedforwards. Seeded at the bring-up hold pose so
-    // the first tracked target starts transient-free.
+    // target at loop rate under the config vel/accel limits. Its position
+    // drives the classic command-derivative chains below; its internal
+    // velocity remains the integration state that bounds the trajectory.
+    // Seeded at the bring-up hold pose so the first tracked target starts
+    // transient-free.
     let mut trk: Vec<Trapezoid> = (0..N_SLOTS).map(|_| Trapezoid::new(0.0, 0.0)).collect();
     for m in &motors {
         trk[m.slot] = Trapezoid::new(m.max_vel, m.max_accel);
         trk[m.slot].seed(m.hold_pos);
     }
-    // In-core host damping, per slot: v_des from the tracker, v_meas from
-    // this loop's own feedback frames (fresh within one tick), band-passed
-    // at the streamed centre. See the module docstring for why this must
-    // live here and not in Python.
+    // In-core command derivatives and host damping, per slot.  The tracker
+    // position is differentiated through the same slow chains as classic
+    // Python before it drives friction/inertia feedforward.  Host damping
+    // gets separate fast desired/measured velocity derivatives followed by
+    // the resonance band-pass.
     struct Damp {
+        v_cmd: LpDiff,
+        a_cmd: LpDiff,
+        v_cmd_fast: LpDiff,
         v_meas: LpDiff,
         bp: BandPass,
         vel_meas: f64,
@@ -882,6 +1008,9 @@ fn bus_loop(
     }
     let mut damp: Vec<Damp> = (0..N_SLOTS)
         .map(|_| Damp {
+            v_cmd: LpDiff::new(CONTROL_CUTOFF),
+            a_cmd: LpDiff::new(CONTROL_CUTOFF),
+            v_cmd_fast: LpDiff::new(VEL_CUTOFF),
             v_meas: LpDiff::new(VEL_CUTOFF),
             bp: BandPass::new(),
             vel_meas: 0.0,
@@ -908,6 +1037,7 @@ fn bus_loop(
     let watchdog = Duration::from_secs_f64(cfg.watchdog_ms / 1e3);
     let mut rejected: u64 = 0;
     let mut late: u64 = 0;
+    let mut trace_dropped: u64 = 0;
     let mut ticks: u64 = 0;
     let mut watchdog_frozen = false;
     let mut next_stats = Instant::now() + Duration::from_secs(5);
@@ -922,6 +1052,7 @@ fn bus_loop(
     let _ = sock.set_send_timeout(Duration::from_millis(20));
 
     let start = Instant::now() + period;
+    let trace_epoch = start;
     let result = (|| -> io::Result<()> {
         loop {
             if stop.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
@@ -984,6 +1115,7 @@ fn bus_loop(
 
             // Send all commands back-to-back.
             let mut sent = 0usize;
+            let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
             for m in motors.iter() {
                 let c = &play[m.slot];
                 let (arb, frame) = if m.gripper {
@@ -1000,28 +1132,80 @@ fn bus_loop(
                     )
                 } else {
                     // Tracked mode: the trapezoid renders this tick's
-                    // (pos, vel, accel) toward the latest target, and the
-                    // fast feedforwards — friction on the tracker velocity,
-                    // inertia on its acceleration — are computed here, in
-                    // phase with the trajectory the wire actually carries.
+                    // position toward the latest target, and the wire
+                    // velocity plus fast feedforwards come from low-pass
+                    // derivatives of the trajectory the wire actually
+                    // carries.  Do not use the tracker's raw acceleration:
+                    // its 240 Hz loop sees Python's 120 Hz targets as a
+                    // two-tick staircase and turns that into alternating
+                    // inertia torque (the motion vibration fixed here).
                     // Passthrough (gravity comp / bring-up hold): p_des
                     // as-is, v_des = 0, slow t_ff only; the tracker re-seeds
                     // so a later mode switch starts transient-free.
-                    let (p_cmd, v_cmd, ff) = if c.mode >= 0.5 {
-                        let (p, v, a) = trk[m.slot].update(c.p_des, tick_dt);
-                        (p, v, filter::friction(v, m.fc, m.k, m.fv, m.fo) + c.j_eff * a)
+                    let tracked = c.mode >= 0.5;
+                    let p_cmd = if tracked {
+                        let (p, _, _) = trk[m.slot].update(c.p_des, tick_dt);
+                        p
                     } else {
                         trk[m.slot].seed(c.p_des);
-                        (c.p_des, 0.0, 0.0)
+                        c.p_des
                     };
                     cmd_pos[m.slot] = p_cmd;
-                    // In-core host damping: band-passed (v_des − v_meas)
-                    // scaled by the streamed pose-scheduled gain, applied
-                    // the same tick the feedback it acts on arrived.
                     let d = &mut damp[m.slot];
-                    let v_damp = d.bp.update(v_cmd - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
-                    let t_ff = c.t_ff + ff + c.kd_host * v_damp;
-                    let frame = proto::mit_encode(p_cmd, v_cmd, c.kp, c.kd, t_ff, &m.ranges);
+                    let (v_wire, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp) = if tracked {
+                        // Match classic AxolArm.motion_control: friction uses
+                        // the 20 rad/s low-pass position derivative, inertia
+                        // uses a second identical derivative, and damping
+                        // uses its independent 80 rad/s desired-velocity
+                        // derivative.  Only the source position/rate differ:
+                        // the core can use the trajectory it really sends.
+                        let v_cmd = d.v_cmd.update(p_cmd, tick_dt);
+                        let a_cmd = d.a_cmd.update(v_cmd, tick_dt);
+                        let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
+                        let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
+                        let inertia_ff = c.j_eff * a_cmd;
+                        let v_damp =
+                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
+                        (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
+                    } else {
+                        d.v_cmd.seed(p_cmd);
+                        d.a_cmd.seed(0.0);
+                        d.v_cmd_fast.seed(p_cmd);
+                        d.bp.reset();
+                        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                    };
+                    let damping_ff = c.kd_host * v_damp;
+                    let t_ff = c.t_ff + friction_ff + inertia_ff + damping_ff;
+                    if trace_tx.is_some() {
+                        trace_pending[m.slot] = Some(TraceRow {
+                            tick: ticks,
+                            time_s: began.saturating_duration_since(trace_epoch).as_secs_f64(),
+                            seq: last_seq.unwrap_or(0),
+                            slot: m.slot,
+                            motor_id: m.id,
+                            mode: c.mode,
+                            target_p: c.p_des,
+                            cmd_p: p_cmd,
+                            cmd_v: v_wire,
+                            cmd_a: a_cmd,
+                            cmd_v_fast: v_cmd_fast,
+                            meas_p: f64::NAN,
+                            motor_v: f64::NAN,
+                            meas_v: f64::NAN,
+                            meas_tau: f64::NAN,
+                            gravity_ff: c.t_ff,
+                            friction_ff,
+                            inertia_ff,
+                            damping_ff,
+                            total_ff: t_ff,
+                            kd_host: c.kd_host,
+                            damp_w0: c.damp_w0,
+                            damp_q: c.damp_q,
+                            tick_dt,
+                            fb_dt: f64::NAN,
+                        });
+                    }
+                    let frame = proto::mit_encode(p_cmd, v_wire, c.kp, c.kd, t_ff, &m.ranges);
                     let arb = match m.vendor {
                         Vendor::MyActuator => proto::MA_MC_REQ + m.id as u16,
                         Vendor::Damiao => m.id as u16,
@@ -1108,13 +1292,29 @@ fn bus_loop(
                 // Feed the damping chain's measured velocity from the
                 // frame's own receive spacing (the CAN reply cadence is the
                 // loop cadence; arrival jitter within a tick is µs-scale).
-                {
+                let (meas_v, fb_dt) = {
                     let d = &mut damp[motors[idx].slot];
                     let dt = d
                         .last_fb
                         .map_or(0.0, |p| recv_time.duration_since(p).as_secs_f64());
                     d.last_fb = Some(recv_time);
                     d.vel_meas = d.v_meas.update(pos, dt);
+                    (d.vel_meas, dt)
+                };
+                if let (Some(tx), Some(mut row)) = (
+                    trace_tx.as_ref(),
+                    trace_pending[motors[idx].slot].take(),
+                ) {
+                    row.meas_p = pos;
+                    row.motor_v = vel;
+                    row.meas_v = meas_v;
+                    row.meas_tau = tau;
+                    row.fb_dt = fb_dt;
+                    match tx.try_send(row) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => trace_dropped += 1,
+                        Err(mpsc::TrySendError::Disconnected(_)) => trace_dropped += 1,
+                    }
                 }
                 // Deviation abort against the *commanded* position (the
                 // tracker output), not the raw target — during a legitimate
@@ -1146,7 +1346,7 @@ fn bus_loop(
                     out_tx,
                     b'L',
                     &format!(
-                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {rejected} rejected targets, seq {:?}",
+                        "{iface}: {ticks} ticks, {late} late ({:.2}%), {rejected} rejected targets, {trace_dropped} trace drops, seq {:?}",
                         late as f64 / ticks as f64 * 100.0,
                         last_seq,
                     ),
@@ -1157,6 +1357,14 @@ fn bus_loop(
 
     if !bus_dead {
         bringup::disable(&sock, &motors);
+    }
+    drop(trace_tx);
+    if let Some(handle) = trace_handle {
+        match handle.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => send_text(out_tx, b'L', &format!("{iface}: trace writer: {err}")),
+            Err(_) => send_text(out_tx, b'L', &format!("{iface}: trace writer panicked")),
+        }
     }
     if let Err(err) = &result {
         send_text(out_tx, b'S', &format!("fault: {err}"));

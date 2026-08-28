@@ -25,6 +25,16 @@ Wire/message shapes (also served over REST for backfill):
 
     {"type": "state", "state": "busy"}
 
+- passive on-wire control timing, ~10 Hz while command traffic is active::
+
+    {"type": "timing", "t": <epoch s>,
+     "arms": {"left": {"commandHz": 240.0, "feedbackHz": 240.0,
+                         "commandJitterP95Ms": 0.02,
+                         "commandBatchP95Ms": 0.8,
+                         "canCycleP95Ms": 2.2,
+                         "roundTripP95Ms": 1.4,
+                         "deadlineMisses": 0, "missedFeedback": 0}, ...}}
+
 A *diagnostics run* wraps a launched session (script) with the telemetry
 frames observed during its lifetime, persisted under
 ``~/.almond/diagnostics/runs`` so past runs (ROM test, motor health, ...) can
@@ -56,6 +66,9 @@ SAMPLE_HZ = 10.0
 _BUFFER_FRAMES = int(SAMPLE_HZ * 600)
 # Slow (1 Hz) sweep ring: same 10-minute span, for temperature charting.
 _SLOW_BUFFER_FRAMES = 600
+# Control/CAN timing is published at the fast dashboard cadence and retained
+# for the same ten-minute comparison window.
+_TIMING_BUFFER_FRAMES = int(SAMPLE_HZ * 600)
 
 RUNS_DIR = Path.home() / ".almond" / "diagnostics" / "runs"
 
@@ -75,6 +88,7 @@ class TelemetryHub:
         self._frames: deque[dict[str, Any]] = deque(maxlen=_BUFFER_FRAMES)
         # Slow-sweep history ({"t": ..., "m": {...}}), for temperature charts.
         self._slow_frames: deque[dict[str, Any]] = deque(maxlen=_SLOW_BUFFER_FRAMES)
+        self._timing_frames: deque[dict[str, Any]] = deque(maxlen=_TIMING_BUFFER_FRAMES)
         # motor key -> latest slow reading (temperature/voltage/status/...).
         self._slow: dict[str, dict[str, Any]] = {}
         self._slow_t: float | None = None
@@ -106,6 +120,13 @@ class TelemetryHub:
                 changed = True
         if changed:
             self._fanout({"type": "state", "state": state})
+
+    def push_timing(self, arms: dict[str, dict[str, Any]]) -> None:
+        """Publish passive on-wire command/feedback timing for active arms."""
+        frame = {"t": time.time(), "arms": arms}
+        with self._lock:
+            self._timing_frames.append(frame)
+        self._fanout({"type": "timing", **frame})
 
     def clear_slow(self) -> None:
         with self._lock:
@@ -147,6 +168,9 @@ class TelemetryHub:
                 "slow": dict(self._slow),
                 "slowT": self._slow_t,
                 "latest": latest,
+                "timingLatest": (
+                    self._timing_frames[-1] if self._timing_frames else None
+                ),
             }
 
     def history(self, seconds: float, max_frames: int = 3000) -> list[dict[str, Any]]:
@@ -164,6 +188,18 @@ class TelemetryHub:
         cutoff = time.time() - seconds
         with self._lock:
             return [f for f in self._slow_frames if f["t"] >= cutoff]
+
+    def timing_history(
+        self, seconds: float, max_frames: int = 3000
+    ) -> list[dict[str, Any]]:
+        """Buffered on-wire timing frames from the last ``seconds``."""
+        cutoff = time.time() - seconds
+        with self._lock:
+            frames = [f for f in self._timing_frames if f["t"] >= cutoff]
+        if len(frames) > max_frames:
+            stride = len(frames) / max_frames
+            frames = [frames[int(i * stride)] for i in range(max_frames)]
+        return frames
 
     def frames_between(self, start: float, end: float) -> list[dict[str, Any]]:
         with self._lock:

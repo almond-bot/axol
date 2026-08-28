@@ -42,7 +42,10 @@ from __future__ import annotations
 import math
 import struct
 import time
-from dataclasses import dataclass
+from bisect import bisect_left
+from collections import deque
+from dataclasses import dataclass, field
+from statistics import median
 from typing import Callable
 
 import can
@@ -79,6 +82,26 @@ from .myactuator import _uint_to_float as _ma_uint_to_float
 from .types import MotorStatus
 
 
+# The RT core's motor-facing target. Timing snapshots also use this reference
+# for classic Python, deliberately: the resulting missed-cycle count answers
+# whether traffic actually met the 240 Hz bar instead of grading each backend
+# against its own slower cadence.
+_CONTROL_TARGET_HZ = 240.0
+_TIMING_WINDOW_S = 1.0
+_TIMING_SAMPLES = 1024  # >4 seconds at 240 Hz
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    """Linearly interpolated percentile without a numpy dependency."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
 @dataclass
 class JointObservation:
     """Latest state reconstructed for one joint from observed traffic.
@@ -105,6 +128,35 @@ class JointObservation:
     fast_ts: float = 0.0
     slow_ts: float = 0.0
     commanded_ts: float = 0.0
+    command_times: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_TIMING_SAMPLES)
+    )
+    feedback_times: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_TIMING_SAMPLES)
+    )
+    # (feedback timestamp, command->feedback latency seconds)
+    response_latencies: deque[tuple[float, float]] = field(
+        default_factory=lambda: deque(maxlen=_TIMING_SAMPLES)
+    )
+    missed_feedback_times: deque[float] = field(
+        default_factory=lambda: deque(maxlen=_TIMING_SAMPLES)
+    )
+    pending_command_ts: float = 0.0
+
+    def note_command(self, ts: float) -> None:
+        """Record one motor-facing command and an overwritten unanswered one."""
+        if self.pending_command_ts > 0.0 and ts > self.pending_command_ts:
+            self.missed_feedback_times.append(ts)
+        self.commanded_ts = ts
+        self.command_times.append(ts)
+        self.pending_command_ts = ts
+
+    def note_feedback(self, ts: float) -> None:
+        """Record feedback cadence and pair it to the latest command."""
+        self.feedback_times.append(ts)
+        if self.pending_command_ts > 0.0 and ts >= self.pending_command_ts:
+            self.response_latencies.append((ts, ts - self.pending_command_ts))
+            self.pending_command_ts = 0.0
 
 
 class _MyActuatorDecoder:
@@ -125,7 +177,7 @@ class _MyActuatorDecoder:
 
     def on_motion_command(self, data: bytes, ts: float) -> None:
         """A MIT command on 0x400+id: proof another process is driving this joint."""
-        self.obs.commanded_ts = ts
+        self.obs.note_command(ts)
 
     def on_standard_request(self, data: bytes, ts: float) -> None:
         """A request on 0x140+id — only closed-loop control commands count.
@@ -135,10 +187,11 @@ class _MyActuatorDecoder:
         poller suppress itself off its own requests.
         """
         if data[0] in (_MA_VELOCITY_CONTROL, _MA_POS_CONTROL):
-            self.obs.commanded_ts = ts
+            self.obs.note_command(ts)
 
     def on_motion_feedback(self, data: bytes, ts: float) -> None:
         """MIT feedback on 0x500+id: fixed-point position/velocity/torque."""
+        self.obs.note_feedback(ts)
         pos_int = (data[1] << 8) | data[2]
         vel_int = (data[3] << 4) | (data[4] >> 4)
         torq_int = ((data[4] & 0x0F) << 8) | data[5]
@@ -162,6 +215,8 @@ class _MyActuatorDecoder:
             self.obs.velocity = struct.unpack_from("<h", data, 4)[0] * (math.pi / 180.0)
             self.obs.fast_ts = ts
             self.obs.slow_ts = ts
+            if cmd in (_MA_VELOCITY_CONTROL, _MA_POS_CONTROL):
+                self.obs.note_feedback(ts)
         elif cmd == _MA_READ_STATUS1:  # 0x9A: voltage + error bitmask
             self.obs.voltage = struct.unpack_from("<H", data, 4)[0] * 0.1
             bits = struct.unpack_from("<H", data, 6)[0]
@@ -199,7 +254,7 @@ class _DamiaoDecoder:
         requests, 0x33 register reads), so anything on the command IDs is
         another process driving the joint.
         """
-        self.obs.commanded_ts = ts
+        self.obs.note_command(ts)
 
     def on_feedback(self, data: bytes, ts: float) -> None:
         """A frame on this motor's MST_ID: register traffic or MIT feedback."""
@@ -231,6 +286,7 @@ class _DamiaoDecoder:
         self.obs.status = _DM_STATUS_MAP.get(status, MotorStatus.UNKNOWN).name
         self.obs.fast_ts = ts
         self.obs.slow_ts = ts
+        self.obs.note_feedback(ts)
 
     def _on_register_reply(self, data: bytes, ts: float) -> None:
         rid = data[3]
@@ -367,6 +423,153 @@ class BusObserver:
                 continue
             out[joint] = (o.position, o.velocity, o.torque)
         return out
+
+    def timing_snapshot(
+        self,
+        window_s: float = _TIMING_WINDOW_S,
+        target_hz: float = _CONTROL_TARGET_HZ,
+    ) -> dict | None:
+        """Rolling on-wire control/CAN timing for this arm.
+
+        The most frequently commanded joint is the tick probe. A teleop loop
+        sends every arm joint once per tick, so following one joint measures
+        loop cadence without mistaking the seven back-to-back CAN frames for
+        seven control ticks. Single-joint diagnostics work for the same reason.
+
+        Returns ``None`` after command traffic has been quiet for ``window_s``.
+        All measurements come from kernel receive timestamps on the passive
+        observer socket, making classic Python and Rust directly comparable.
+        """
+        now = time.time()
+        cutoff = now - window_s
+        candidates: list[tuple[int, Joint, JointObservation, list[float]]] = []
+        for joint, obs in self._observations.items():
+            commands = [ts for ts in obs.command_times if ts >= cutoff]
+            if commands and now - commands[-1] <= window_s:
+                candidates.append((len(commands), joint, obs, commands))
+        if not candidates:
+            return None
+        # Prefer the first joint in control order whose count is within one of
+        # the busiest. A single dropped frame must not make the tick boundary
+        # jump to a later joint: shoulder_1 is normally the first CAN command
+        # of an arm tick, which lets the batch/cycle spans below cover the
+        # whole arm rather than a suffix of it.
+        max_count = max(item[0] for item in candidates)
+        _, joint, obs, commands = next(
+            item for item in candidates if item[0] >= max_count - 1
+        )
+        if len(commands) < 2:
+            return None
+
+        feedback = [ts for ts in obs.feedback_times if ts >= cutoff]
+        command_dt = [b - a for a, b in zip(commands, commands[1:]) if b > a]
+        feedback_dt = [b - a for a, b in zip(feedback, feedback[1:]) if b > a]
+        nominal_dt = 1.0 / target_hz
+
+        # Merge every active joint's event stamps once, then slice each tick
+        # with binary search. Commands for one tick are sent in control order;
+        # feedback follows on the same bus. With the first commanded joint as
+        # the boundary, these spans are the physical quantities operators care
+        # about: how long command transmission occupied the bus, and how long
+        # until the arm's last reply arrived.
+        all_commands = sorted(
+            ts
+            for candidate in self._observations.values()
+            for ts in candidate.command_times
+            if ts >= cutoff
+        )
+        all_feedback = sorted(
+            ts
+            for candidate in self._observations.values()
+            for ts in candidate.feedback_times
+            if ts >= cutoff
+        )
+        command_batches: list[float] = []
+        feedback_batches: list[float] = []
+        can_cycles: list[float] = []
+        can_utilization: list[float] = []
+        can_headroom: list[float] = []
+        for start, end in zip(commands, commands[1:]):
+            ci0 = bisect_left(all_commands, start)
+            ci1 = bisect_left(all_commands, end)
+            if ci1 <= ci0:
+                continue
+            tick_commands = all_commands[ci0:ci1]
+            command_batches.append(tick_commands[-1] - tick_commands[0])
+
+            fi0 = bisect_left(all_feedback, tick_commands[0])
+            fi1 = bisect_left(all_feedback, end)
+            if fi1 <= fi0:
+                continue
+            tick_feedback = all_feedback[fi0:fi1]
+            feedback_batches.append(tick_feedback[-1] - tick_feedback[0])
+            cycle = tick_feedback[-1] - tick_commands[0]
+            period = end - start
+            can_cycles.append(cycle)
+            if period > 0.0:
+                can_utilization.append(100.0 * cycle / period)
+                can_headroom.append(period - cycle)
+
+        def rate(ts: list[float]) -> float | None:
+            span = ts[-1] - ts[0] if len(ts) >= 2 else 0.0
+            return (len(ts) - 1) / span if span > 0 else None
+
+        def period_ms(dt: list[float]) -> float | None:
+            return median(dt) * 1000.0 if dt else None
+
+        def jitter_p95_ms(dt: list[float]) -> float | None:
+            if not dt:
+                return None
+            centre = median(dt)
+            return _percentile([abs(value - centre) * 1000.0 for value in dt], 0.95)
+
+        def percentile_ms(values: list[float], q: float) -> float | None:
+            result = _percentile(values, q)
+            return result * 1000.0 if result is not None else None
+
+        # A gap of 1.5 nominal periods has lost one 240 Hz deadline. Rounding
+        # the gap to elapsed nominal ticks makes an 8.33 ms classic tick count
+        # as one missed 240 Hz cycle, while ordinary RT jitter counts as zero.
+        deadline_misses = sum(
+            max(0, int(value / nominal_dt + 0.5) - 1) for value in command_dt
+        )
+        latencies_ms = [
+            latency * 1000.0 for ts, latency in obs.response_latencies if ts >= cutoff
+        ]
+        missed_feedback = sum(ts >= cutoff for ts in obs.missed_feedback_times)
+        if (
+            obs.pending_command_ts > 0.0
+            and now - obs.pending_command_ts > nominal_dt * 1.5
+        ):
+            missed_feedback += 1
+
+        return {
+            "sourceJoint": joint.name,
+            "targetHz": target_hz,
+            "commandHz": rate(commands),
+            "feedbackHz": rate(feedback),
+            "commandPeriodMs": period_ms(command_dt),
+            "feedbackPeriodMs": period_ms(feedback_dt),
+            "commandJitterP95Ms": jitter_p95_ms(command_dt),
+            "feedbackJitterP95Ms": jitter_p95_ms(feedback_dt),
+            "commandGapMaxMs": max(command_dt) * 1000.0 if command_dt else None,
+            "feedbackGapMaxMs": max(feedback_dt) * 1000.0 if feedback_dt else None,
+            "commandBatchP50Ms": percentile_ms(command_batches, 0.50),
+            "commandBatchP95Ms": percentile_ms(command_batches, 0.95),
+            "feedbackBatchP95Ms": percentile_ms(feedback_batches, 0.95),
+            "canCycleP50Ms": percentile_ms(can_cycles, 0.50),
+            "canCycleP95Ms": percentile_ms(can_cycles, 0.95),
+            "canUtilizationP95Pct": _percentile(can_utilization, 0.95),
+            "canHeadroomP05Ms": percentile_ms(can_headroom, 0.05),
+            "roundTripP50Ms": _percentile(latencies_ms, 0.50),
+            "roundTripP95Ms": _percentile(latencies_ms, 0.95),
+            "deadlineMisses": deadline_misses,
+            "missedFeedback": missed_feedback,
+            "commandAgeMs": max(0.0, now - commands[-1]) * 1000.0,
+            "feedbackAgeMs": (
+                max(0.0, now - feedback[-1]) * 1000.0 if feedback else None
+            ),
+        }
 
     def slow_snapshot(self, max_age_s: float = 3.0) -> dict[Joint, dict]:
         """Temperature/voltage/status for joints heard from within ``max_age_s``.

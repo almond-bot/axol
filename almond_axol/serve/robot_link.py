@@ -756,13 +756,14 @@ class RobotLink:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     async def _publish_loop(self) -> None:
-        """Feed the hub from the passive observers while a task owns command.
+        """Feed motor state and on-wire timing from the passive observers.
 
-        While the link owns the bus the ping/sample loops publish from their
-        own request/response reads, so this loop only takes over in the BUSY
-        state — decoding whatever traffic the running task generates. A task
-        that isn't commanding (e.g. sitting at a prompt) produces no frames,
-        and the chart honestly goes quiet.
+        Timing is sampled in every connected state so this also measures an
+        ``axol teleop`` launched independently from a terminal. Motor state
+        only takes over here in BUSY: while the link owns the bus, its normal
+        sample loop already publishes values (and silently sources externally
+        commanded joints from the same observer). A task that isn't commanding
+        produces no timing frames, so the chart honestly goes quiet.
         """
         interval = 1.0 / SAMPLE_HZ
         slow_period = max(1, int(SAMPLE_HZ))  # ~1 Hz, matching the idle ping
@@ -771,10 +772,20 @@ class RobotLink:
             await asyncio.sleep(interval)
             with self._lock:
                 busy = self._state == STATE_BUSY
-            if not busy:
-                continue
             tick += 1
             try:
+                timing: dict[str, dict[str, Any]] = {}
+                for arm in self._arms:
+                    if arm.observer is None:
+                        continue
+                    snapshot = arm.observer.timing_snapshot()
+                    if snapshot is not None:
+                        timing[arm.side] = snapshot
+                if timing:
+                    self.hub.push_timing(timing)
+
+                if not busy:
+                    continue
                 motors: dict[str, list[float]] = {}
                 for arm in self._arms:
                     if arm.observer is None:

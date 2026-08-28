@@ -34,6 +34,17 @@ impl LpDiff {
         self.pos_prev = Some(pos);
         self.vel
     }
+
+    /// Re-prime the differentiator at a stationary position.
+    ///
+    /// Passthrough control can move a joint without advancing the tracked
+    /// command trajectory.  Re-seeding prevents that mode switch from
+    /// becoming a fictitious velocity/acceleration impulse when tracked
+    /// control resumes.
+    pub fn seed(&mut self, pos: f64) {
+        self.vel = 0.0;
+        self.pos_prev = Some(pos);
+    }
 }
 
 /// Chamberlin state-variable band-pass, unity gain and ~zero phase at the
@@ -69,6 +80,13 @@ impl BandPass {
         let hp = x - self.lp - self.bp / q;
         self.bp += f * hp;
         self.bp / q
+    }
+
+    /// Clear stored energy when leaving the tracked control mode.
+    pub fn reset(&mut self) {
+        self.lp = 0.0;
+        self.bp = 0.0;
+        self.primed = false;
     }
 }
 
@@ -298,6 +316,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression for motion vibration in the split 120/240 Hz pipeline.
+    ///
+    /// A smooth target arrives twice slower than the wire loop.  The inner
+    /// tracker removes position steps, but its raw acceleration still reacts
+    /// differently on the adoption tick and the repeated-target tick.  Using
+    /// that raw acceleration for `j_eff` created a large alternating torque.
+    /// The classic two-differentiator command chain must remove essentially
+    /// all of that target-rate component before it reaches the motor.
+    #[test]
+    fn command_derivatives_reject_target_rate_acceleration() {
+        let mut trk = Trapezoid::new(
+            1.5 * 2.0 * std::f64::consts::PI,
+            1.5 * 7.0 * std::f64::consts::PI,
+        );
+        trk.seed(0.0);
+        let mut vel = LpDiff::new(20.0);
+        let mut accel = LpDiff::new(20.0);
+        vel.seed(0.0);
+        accel.seed(0.0);
+
+        let mut raw_pair_delta_sq = 0.0;
+        let mut filtered_pair_delta_sq = 0.0;
+        let mut pairs = 0usize;
+        let mut raw_first = 0.0;
+        let mut filtered_first = 0.0;
+        for k in 0..1200usize {
+            // 0.5 Hz smooth motion sampled at 120 Hz, each sample held for
+            // two 240 Hz wire ticks.
+            let target_t = (k / 2) as f64 / 120.0;
+            let target = 0.6 * (2.0 * std::f64::consts::PI * 0.5 * target_t).sin();
+            let (pos, _, raw_accel) = trk.update(target, DT);
+            let v = vel.update(pos, DT);
+            let filtered_accel = accel.update(v, DT);
+
+            if k >= 240 {
+                if k % 2 == 0 {
+                    raw_first = raw_accel;
+                    filtered_first = filtered_accel;
+                } else {
+                    raw_pair_delta_sq += (raw_accel - raw_first).powi(2);
+                    filtered_pair_delta_sq += (filtered_accel - filtered_first).powi(2);
+                    pairs += 1;
+                }
+            }
+        }
+
+        let raw_rms = (raw_pair_delta_sq / pairs as f64).sqrt();
+        let filtered_rms = (filtered_pair_delta_sq / pairs as f64).sqrt();
+        assert!(raw_rms > 1.0, "fixture must expose the raw acceleration ripple");
+        assert!(
+            filtered_rms < 0.05 * raw_rms,
+            "command derivative chain must reject target-rate ripple: raw {raw_rms:e}, filtered {filtered_rms:e}"
+        );
     }
 
     /// Golden values from `almond_axol.robot.control.compute_friction`

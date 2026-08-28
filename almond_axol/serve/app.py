@@ -461,11 +461,12 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         return {
             "frames": hub.history(seconds, max_frames),
             "slow": hub.slow_history(seconds),
+            "timing": hub.timing_history(seconds, max_frames),
         }
 
     @app.websocket("/api/telemetry/ws")
     async def telemetry_ws(ws: WebSocket) -> None:
-        """Live telemetry stream: frame / slow / state messages (see telemetry.py)."""
+        """Live motor + control timing stream (see :mod:`.telemetry`)."""
         await ws.accept()
         queue = hub.subscribe()
         try:

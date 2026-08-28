@@ -23,11 +23,12 @@ CAN buses are owned by the ``axol-rt`` subprocess:
   POSITION_FORCE command (motor-frame target, speed limit, torque limit).
 - The *fast* physics all run in the core, per 240 Hz tick, from its own
   trajectory and feedback states: a golden-ported trapezoid tracker chases
-  the latest target (replacing linear interpolation — continuous velocity
-  feedforward), friction and inertia feedforwards come from the tracker's
-  velocity/acceleration (friction params ride the config; the pose-scaled
-  ``j_eff`` rides each target), and band-passed velocity damping applies
-  the streamed pose-scheduled coefficients against same-tick feedback.
+  the latest target (replacing linear interpolation), the classic 20 rad/s
+  command-derivative chain computes smooth friction/inertia feedforwards
+  from that executed trajectory (friction params ride the config; the
+  pose-scaled ``j_eff`` rides each target), and band-passed velocity damping
+  applies the streamed pose-scheduled coefficients against the latest
+  feedback within one core tick.
   Computing the damping torque in Python put it ~14 ms behind the motion —
   past 90° of loop phase in the shoulder burst band, where a damper pumps
   instead of damps (the rt-teleop shaking of 2026-08-27; see
@@ -200,9 +201,9 @@ class RtAxol:
         # coefficients, so a gravity-loaded joint would sag by ~gravity/kp —
         # and ring on firmware kd alone if disturbed — until the caller's
         # first command, which for teleop is minutes away (JAX compile).
-        # One motion_control at the measured pose ships the gravity/friction
-        # terms plus the pose-scheduled damping coefficients; the watchdog
-        # then holds it, damping included.
+        # One motion_control at the measured pose ships gravity plus the
+        # pose-scheduled fast-term coefficients; the watchdog then holds it,
+        # damping included.
         pos_l, pos_r = await self.get_positions()
         await self.motion_control(left=pos_l, right=pos_r)
         _logger.info(

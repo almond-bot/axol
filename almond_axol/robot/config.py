@@ -150,7 +150,10 @@ class JointConfig:
                   enters the 5% settle band — a 0.2° RMS sub-Hz wander, not
                   a ring). When ``kd_host_hz`` is pinned on a *measured*
                   ring frequency, set q ≈ 2-3 to confine the damping to the
-                  ring and release the approach.
+                  ring and release the approach. Production shoulder_1 uses
+                  q=3 on both arms even with its pose-tracked centre: hardware
+                  traces found a separate 12.5-13.6 Hz mast/forearm mode that
+                  the old wide band could feed.
     """
 
     kp: float
@@ -425,6 +428,22 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     every subsequent :class:`AxolConfig` in the process.
     """
     arm = ArmConfig() if is_left else ArmConfig().mirror_to_right()
+    # Both sides couple shoulder-1 into a ~13 Hz mast/forearm structural
+    # mode. With the old wide Q=0.8 shoulder damper, its high-side leakage
+    # became phase-positive at that mode: an RT control-term trace measured
+    # 0.551 Nm / +0.0255 W and a whole-arm right-side shudder (47/87/99 mdeg
+    # RMS at shoulder-1 / elbow / wrist-3); repeated left-side traces expose
+    # the same 12.5-12.9 Hz mode. Q=3 keeps unity gain at the intended,
+    # pose-tracked ~3.2 Hz shoulder mode while confining it enough to cut the
+    # right-side figures to 6/10/9 mdeg in an otherwise-identical hardware
+    # A/B. Apply it symmetrically: the structure and control law are shared,
+    # and leaving one side at Q=0.8 merely moves the excitation risk there.
+    # This shared config feeds classic, RT, and every other control path;
+    # factory and local calibration entries can still override it.
+    arm = replace(
+        arm,
+        shoulder_1=replace(arm.shoulder_1, kd_host_q=3.0),
+    )
     arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, friction=replace(friction.shoulder_1)),
