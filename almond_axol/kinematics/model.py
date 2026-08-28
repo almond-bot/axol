@@ -39,12 +39,12 @@ _TORSO_LINKS: tuple[str, ...] = ("base", "s1")
 Self-collision on Axol is restricted to ``arm <-> torso`` pairs only.
 """
 
-# Home-pose penetration (m) beyond which a capsule pair is considered
-# overlapping by construction and excluded from self-collision. Pairs within
-# this tolerance merely graze at the (never-teleoped) straight-down home pose
-# due to conservative capsule fits and must keep their protection — see
-# _build_robot_collision.
-_CAPSULE_GRAZE_TOL = 0.003
+# The two shoulder links mount directly onto the torso. Their conservative
+# capsules overlap the base by construction and cannot be used as collision
+# constraints. Distal links must remain protected even when their fitted
+# capsule overlaps at the straight-down home pose: their clearance relative
+# to that known-safe pose still detects an arm folding into the base.
+_SHOULDER_MOUNT_SUFFIXES = ("_s2", "_s3")
 
 # Per-pair collision-cost activation distances are derived from each pair's
 # clearance at the home pose: ``min(home_clearance - _MARGIN_REST_BUFFER,
@@ -101,13 +101,11 @@ def shared_robot_collision() -> pk.collision.RobotCollision:
     global _robot_coll
     with _lock:
         if _robot_coll is None:
-            _robot_coll = _build_robot_collision(_load_urdf(), shared_robot())
+            _robot_coll = _build_robot_collision(_load_urdf())
         return _robot_coll
 
 
-def _build_robot_collision(
-    urdf: yourdfpy.URDF, robot: pk.Robot
-) -> pk.collision.RobotCollision:
+def _build_robot_collision(urdf: yourdfpy.URDF) -> pk.collision.RobotCollision:
     """Build ``RobotCollision`` with self-collision restricted to torso<->arm pairs.
 
     Each Axol arm is a serial chain attached to a static torso (``base`` +
@@ -120,17 +118,14 @@ def _build_robot_collision(
     pairs are filtered out (cross-arm contacts are unreachable, within-arm
     is constrained by joint limits, and torso<->torso is rigidly fixed).
 
-    A second pass excludes any remaining pair that penetrates by more than
-    ``_CAPSULE_GRAZE_TOL`` at the home pose — those are over-conservative
-    capsule fits the IK can never separate (e.g. ``base <-> shoulder``
-    capsules that overlap by construction because the arms mount onto the
-    torso, at -12 mm and worse). Pairs that merely *graze* at the home pose
-    are kept: the home pose (arm hanging straight down) is one teleop never
-    occupies, and dropping a grazing pair removes its collision protection
-    everywhere. ``base <-> e2`` (the elbow) grazes at -1.4 mm and is exactly
-    the pair that keeps the elbow off the base — it used to be masked by the
-    operator elbow hint pulling the swivel outward; with elbow tracking
-    disabled it is the only thing standing between the elbow and the base.
+    Only the shoulder-mount links (``s2``/``s3``) are excluded. The old model
+    also discarded every distal pair whose conservative capsule happened to
+    overlap at the safe straight-down home pose. That removed ``base/s1 <->
+    e1`` — the upper-arm pair that physically contacted the base during a
+    cross-body reach — as well as ``base <-> w2``. The custom residual uses a
+    per-pair activation relative to home clearance, so those negative home
+    distances are usable: the cost is off at home and activates only when the
+    arm moves closer to the base than that known-safe reference.
     """
     link_names = [link.name for link in urdf.robot.links]
 
@@ -144,16 +139,11 @@ def _build_robot_collision(
     for i, a in enumerate(link_names):
         for b in link_names[i + 1 :]:
             keep = (is_torso(a) and is_arm(b)) or (is_torso(b) and is_arm(a))
+            arm_link = b if is_torso(a) else a if is_torso(b) else ""
+            if arm_link.endswith(_SHOULDER_MOUNT_SUFFIXES):
+                keep = False
             if not keep:
                 ignore.add((a, b))
-
-    rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
-    q0 = jnp.zeros(robot.joints.num_actuated_joints)
-    d = np.asarray(rc.compute_self_collision_distance(robot, q0))
-    ai = np.asarray(rc.active_idx_i)
-    aj = np.asarray(rc.active_idx_j)
-    for k in np.where(d < -_CAPSULE_GRAZE_TOL)[0]:
-        ignore.add((rc.link_names[ai[k]], rc.link_names[aj[k]]))
 
     rc = pk.collision.RobotCollision.from_urdf(urdf, user_ignore_pairs=tuple(ignore))
     _logger.info(
@@ -172,10 +162,9 @@ def collision_cost_params(
     default_margin)`` for each active pair — possibly negative for pairs
     whose conservative capsules already interpenetrate at home (see the
     constants above). ``ramp_width`` is the distance over which the residual
-    ramps quadratically from zero to its full linear slope: equal to the
-    activation start where that start is generous (matching pyroki's stock
-    cost shape exactly), floored at ``_RAMP_WIDTH_MIN`` so near-shell pairs
-    keep a steep, protective gradient onset.
+    ramps smoothly from zero to its full linear slope: equal to the activation
+    start where that start is generous, floored at ``_RAMP_WIDTH_MIN`` so
+    near-shell pairs keep a protective gradient onset.
 
     Cheap (one collision-distance evaluation), so callers compute it per
     solver instance rather than caching it here: the result depends on the

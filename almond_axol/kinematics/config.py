@@ -58,7 +58,7 @@ class KinematicsConfig:
             active during ordinary tracking, which makes the trust-region
             solver reject steps — the arm freezes while small target errors
             accumulate, then lurches once the error is large enough to punch
-            through             (the teleop "stuck, then jumps" failure). 0.025 matches
+            through (the teleop "stuck, then jumps" failure). 0.025 matches
             ``VRTeleopConfig.reset_collision_margin``. This value is the
             *ceiling*: each pair's actual activation distance is derived from
             its home-pose clearance (``min(home_clearance - 2 mm, this
@@ -73,7 +73,11 @@ class KinematicsConfig:
             weight-150 gradients into the arm as path-specific jitter; the
             formerly floor-clamped elbow pair tripled per-tick solver output
             acceleration during front-of-torso reaches and kicked the elbow
-            at every shell crossing).
+            at every shell crossing). Distal arm/base pairs remain active even
+            when their conservative capsules overlap at the physically safe
+            home pose. The upper-arm/base contact pair additionally has an
+            independent final-step guard calibrated from that safe reference,
+            so the pose task cannot push either arm through the base.
         self_collision_weight: Weight on the self-collision penalty. 150 was
             set by replaying recorded close-to-body teleop episodes through
             the solver offline: at 75 the task cost dragged the elbow up to
