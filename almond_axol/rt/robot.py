@@ -332,6 +332,16 @@ class RtAxol:
             if self._rec is not None:
                 self._record_sides.add(side)
                 if self._record_sides >= expected_sides:
+                    # The core packets carry motor-frame positions. Standard
+                    # `_meas.npz` files carry joint-frame positions (zero at
+                    # rest, normalized gripper), so convert through the same
+                    # AxolArm properties the classic recorder uses. Constant
+                    # motor offsets do not affect vibration spectra, but raw
+                    # values make pose attribution and replay incorrect.
+                    for record_side, record_arm in arms.items():
+                        base = record_side * 8
+                        self._record_qm[base : base + 8] = record_arm.positions
+                        self._record_tq[base : base + 8] = record_arm.torques
                     self._rec.record(qm=self._record_qm, tq=self._record_tq)
                     self._record_sides.clear()
 

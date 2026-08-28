@@ -247,44 +247,37 @@ class ArmConfig:
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            kd=2.0,
+            # Firmware damping is phase-safe. Motion replay previously
+            # validated kd=4, while kd=2 left an in-motion ring.
+            kd=4.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
             j_eff=0.25,
-            # Damps the reference robot's 3.9-5.9 Hz extension-jitter band
-            # (jit13: shoulder_3 led ~20 of 37 tracking-error bursts with
-            # the hand out to the side, where its reflected inertia peaks
-            # ~27x rest). The J(q)/J_ref schedule zeroes this at rest.
-            # CAUTION (jit18/19, 2026-08): on some builds this damper's
-            # band leaks onto an ~11 Hz structural mast mode and pumps it
-            # (ringing shoulder_2/wrist_2 on both arms); kd_host=0 killed
-            # that. rust_damping then caught the same coupling at 8-9 Hz:
-            # shoulder_3 measured 93 mdeg RMS against 31 mdeg commanded and
-            # wrist_2 followed at 107 mdeg despite its own kd_host being 0.
-            # The 4.77 Hz centre is hardware-measured, so use a narrow band
-            # here: Q=3 retains the intended-mode gain while cutting the
-            # 8.5 Hz gain from 76% to 27%. If mast ringing remains, zero
-            # shoulder_3 kd_host per robot instead of damping wrist_2.
-            kd_host=6.0,
-            kd_host_hz=4.77,  # 30 rad/s, centred on the measured band
-            kd_host_q=3.0,
+            # No host damping. Earlier jit18/19 power measurements showed
+            # kd_host pumping the coupled 11 Hz mast mode, and kd_host=0
+            # killed it. The 240 Hz rust_damping captures reproduce the same
+            # failure at 8.7 Hz: shoulder_3 and wrist_2 ring together even
+            # though wrist_2 has no host damping. Narrowing shoulder_3 from
+            # Q=0.8 to Q=3 did not remove it. Keep damping on the motor side;
+            # do not chase the coupled wrist symptom with another host term.
         )
     )
     elbow: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=4.0,
+            # The motor-side maximum is the phase-safe lever for the loaded
+            # 6.7-12.5 Hz transmission mode.
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=0.25,
             com=(-0.0256064, 0.0, -0.072044),
             j_eff=0.6,
-            # The elbow's ring is structural (transmission compliance) and
-            # moves with load: 6.7 Hz loaded (jit16, ~5° p2p shudder during
-            # fast reversals) up to 12.5 Hz light. Centre near the geometric
-            # mean covers the whole range in phase.
-            kd_host=8.0,
-            kd_host_hz=9.55,  # 60 rad/s, covering the 6.7-12.5 Hz range
+            # No host damping. The far-forward rust_damping event sits at
+            # 8.7-11.3 Hz while this joint's old host band was nearly fully
+            # active at 9.55 Hz. Hardware step/replay A/Bs found that term
+            # increased overshoot without removing a ring; firmware kd=5
+            # settled the joint without the host-loop phase risk.
         )
     )
     wrist_1: JointConfig = field(
