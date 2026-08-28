@@ -119,6 +119,7 @@ class RtAxol:
         self._record_qm = np.full(16, np.nan, dtype=np.float32)
         self._record_tq = np.full(16, np.nan, dtype=np.float32)
         self._record_sides: set[int] = set()
+        self._recording_engaged = False
 
     @property
     def left(self) -> AxolArm | None:
@@ -260,11 +261,19 @@ class RtAxol:
         waited once, so after a successful bring-up this returns immediately.
         """
         deadline = time.monotonic() + timeout
-        sides = [side for side, _arm in self._arms()]
-        while not all(self._fb_packets[s] > 0 for s in sides):
+        arms = self._arms()
+
+        def ready() -> bool:
+            return all(
+                self._fb_packets[side] > 0
+                and all(arm.motors[joint].has_position for joint in ARM_JOINTS)
+                for side, arm in arms
+            )
+
+        while not ready():
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"rt: no telemetry packet from the core within {timeout:.1f} s"
+                    f"rt: incomplete arm telemetry from the core after {timeout:.1f} s"
                 )
             await asyncio.sleep(0.02)
 
@@ -326,10 +335,10 @@ class RtAxol:
                 motor._velocity = vel
                 motor._torque = tau
                 motor._feedback_ts = ts
-                if self._rec is not None:
+                if self._rec is not None and self._recording_engaged:
                     self._record_qm[side * 8 + i] = pos
                     self._record_tq[side * 8 + i] = tau
-            if self._rec is not None:
+            if self._rec is not None and self._recording_engaged:
                 self._record_sides.add(side)
                 if self._record_sides >= expected_sides:
                     # The core packets carry motor-frame positions. Standard
@@ -355,6 +364,7 @@ class RtAxol:
     def set_recording_engaged(self, engaged: bool) -> None:
         """Gate the 240 Hz measurement recorder to the VR engaged segment."""
         if self._rec is not None:
+            self._recording_engaged = engaged
             self._rec.set_engaged(engaged)
             if not engaged:
                 self._record_sides.clear()
