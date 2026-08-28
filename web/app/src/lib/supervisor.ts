@@ -473,12 +473,12 @@ export async function sendEpisodeCommand(command: string): Promise<{ ok: boolean
 }
 
 // ---------------------------------------------------------------------------
-// Datasets on disk (the replay / collect-data panels' dataset picker)
+// Datasets on disk (the operation panels' shared repo-id picker)
 // ---------------------------------------------------------------------------
 
 /** One LeRobot dataset found on the serve host (see /api/datasets). */
 export interface DatasetInfo {
-  /** Repo id relative to the datasets root — what replay/collect take. */
+  /** Repo id relative to the datasets root — accepted by dataset operations. */
   repoId: string
   /** Absolute dataset directory on the serve host. */
   root: string
@@ -854,7 +854,8 @@ export const OPERATIONS: OperationMeta[] = [
   {
     id: "collect-data",
     label: "Collect data",
-    description: "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
+    description:
+      "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
     fields: ["mantis", "mantis_source", "repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,

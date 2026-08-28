@@ -670,7 +670,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(snapshot)
 
-    # -- datasets on disk (the replay / collect-data dataset picker) ----------
+    # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
     @app.get("/api/datasets")
     async def get_datasets() -> dict[str, Any]:

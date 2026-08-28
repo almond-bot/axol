@@ -330,22 +330,9 @@ export default function ControlPanel() {
     }
   }, [conn.state, updating])
 
-  // Auto-connect Axol once after the host comes online, if it's sitting idle.
-  // The ref makes it fire at most once per host session, so a manual robot
-  // disconnect afterwards isn't immediately undone.
-  const autoRobotRef = useRef(false)
-  useEffect(() => {
-    if (conn.state !== "ok") {
-      autoRobotRef.current = false
-      return
-    }
-    if (autoRobotRef.current || !robot) return
-    autoRobotRef.current = true
-    if (robot.state === "disconnected" && !robotBusy) {
-      robotConnectClick("axol")
-    }
-    // robotConnectClick is stable enough (only uses state setters / fetch).
-  }, [conn.state, robot, robotBusy])
+  // Last automatically selected idle telemetry profile. Keeping this latched
+  // means a manual disconnect is not immediately undone.
+  const autoRobotRef = useRef<HardwareProfile | null>(null)
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
   // appears. The latch clears once the tunnel is up (so a later drop retries
@@ -390,7 +377,7 @@ export default function ControlPanel() {
     setStartingUpdate(false)
     setUpdateAbandoned(false)
     setUpdatePhase(null)
-    autoRobotRef.current = false
+    autoRobotRef.current = null
   }
 
   function updateServerHost(value: string) {
@@ -442,6 +429,7 @@ export default function ControlPanel() {
 
   // -- per-operation settings --
   const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
+  const desiredHardwareProfile: HardwareProfile = settings.mantis ? "mantis" : "axol"
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -463,16 +451,19 @@ export default function ControlPanel() {
   }
 
   // -- robot connection --
-  async function robotConnectClick(profile: HardwareProfile) {
-    setRobotBusy(true)
-    try {
-      setRobot(await robotConnect(undefined, profile))
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setRobotBusy(false)
-    }
-  }
+  const robotConnectClick = useCallback(
+    async (profile: HardwareProfile) => {
+      setRobotBusy(true)
+      try {
+        setRobot(await robotConnect(undefined, profile))
+      } catch (e) {
+        toast.error(String(e))
+      } finally {
+        setRobotBusy(false)
+      }
+    },
+    [toast]
+  )
 
   async function robotDisconnectClick() {
     setRobotBusy(true)
@@ -551,6 +542,33 @@ export default function ControlPanel() {
   const hostBusy = isLive || !(update?.idle ?? true)
   // Reason shown in the banner; capitalized clause, no trailing period.
   const updateBusyReason = isLive ? "Stop the running operation" : "The server is busy"
+
+  // Connect the hardware represented by the selected run. The default path
+  // still auto-connects Axol on host load; enabling Mantis switches the shared
+  // idle telemetry link to its two grippers, and disabling it switches back.
+  // Never switch underneath a live operation. The profile latch preserves a
+  // deliberate manual disconnect until the selected profile changes.
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      autoRobotRef.current = null
+      return
+    }
+    if (isLive || !robot || robotBusy) return
+    if (autoRobotRef.current === desiredHardwareProfile) return
+    const activeProfile = robot.profile ?? "axol"
+    if (
+      activeProfile !== desiredHardwareProfile ||
+      robot.state === "disconnected" ||
+      robot.state === "error"
+    ) {
+      const timer = window.setTimeout(() => {
+        autoRobotRef.current = desiredHardwareProfile
+        robotConnectClick(desiredHardwareProfile)
+      }, 0)
+      return () => window.clearTimeout(timer)
+    }
+    autoRobotRef.current = desiredHardwareProfile
+  }, [conn.state, desiredHardwareProfile, isLive, robot, robotBusy, robotConnectClick])
 
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to

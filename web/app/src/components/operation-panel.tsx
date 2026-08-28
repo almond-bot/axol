@@ -97,13 +97,12 @@ export function OperationPanel({
 
   // Dataset picker: datasets found on the serve host, offered as a datalist
   // under the repo id field — typing a fresh id or a path stays possible.
-  // On replay it picks what to play; on collect-data it makes resuming an
-  // existing dataset a click instead of retyping its id. Refetched whenever
-  // the panel is editable (a run that just ended may have added one). Older
-  // hosts without /api/datasets simply leave the field a plain input.
-  const wantsDatasets =
-    (meta.id === "replay-dataset" || meta.id === "collect-data") &&
-    runFields.some((f) => f.key === "repo_id")
+  // Every operation with a repo_id gets the same picker: replay selects an
+  // input dataset, while collect-data, DAgger, and run-policy can resume an
+  // existing output dataset or type a new id. Refetched whenever the panel is
+  // editable (a run that just ended may have added one). Older hosts without
+  // /api/datasets simply leave the field a plain input.
+  const wantsDatasets = runFields.some((f) => f.key === "repo_id")
   const [datasets, setDatasets] = useState<DatasetInfo[]>([])
   useEffect(() => {
     if (!wantsDatasets || live) return
@@ -184,15 +183,23 @@ export function OperationPanel({
             {live &&
               Boolean(settings.mantis) &&
               (settings.mantis_source ?? "quest") !== "quest" && (
-              <>
-                <Button variant="outline" onClick={() => onEpisode("bridge-toggle")} disabled={busy}>
-                  Toggle tracking
-                </Button>
-                <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
-                  <RotateCcw /> Reset
-                </Button>
-              </>
-            )}
+                <>
+                  <Button
+                    variant="outline"
+                    onClick={() => onEpisode("bridge-toggle")}
+                    disabled={busy}
+                  >
+                    Toggle tracking
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() => onEpisode("bridge-reset")}
+                    disabled={busy}
+                  >
+                    <RotateCcw /> Reset
+                  </Button>
+                </>
+              )}
             {stopping ? (
               <Button variant="destructive" disabled>
                 <Loader2 className="animate-spin" />

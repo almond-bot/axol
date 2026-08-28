@@ -59,7 +59,7 @@ The same banner area also warns when the **control panel UI and the host backend
 
 ### Axol
 
-The panel connects the robot **automatically** once the host comes online (one attempt per host session, so a manual disconnect isn't immediately undone); the **Connect** button is the manual fallback / reconnect. Bringing up the robot:
+The panel connects the selected hardware **automatically** once the host comes online (one attempt per profile, so a manual disconnect isn't immediately undone). Axol is the default; enabling **Mantis** for the selected run switches the idle telemetry link to the Mantis grippers automatically, and disabling it switches back to Axol. Each tile's **Connect** button is the manual fallback / reconnect. Bringing up the hardware:
 
 - Enables the CAN interfaces — running [`can.setup`](/cli/can-setup) automatically the first time when the Axol Hub adapter is used and the host hasn't been configured yet. A non-hub SocketCAN adapter (chosen per arm in the **Robot** settings tab, or via the diagnostics dashboard's [CAN adapter picker](/guides/diagnostics-dashboard#choosing-can-adapters)) is brought up directly instead.
 - Pings all 16 motors once per second while idle, so the tile reflects live motor health as two rows of squares (grouped **L** / **R**): the top row is **CAN reachability**, the bottom row the motor's **error status**. Hover any square for the details (status, temperature).
