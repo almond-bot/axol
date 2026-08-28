@@ -562,8 +562,8 @@ class AxolArm:
         # boot wrap into the joint's offset, and removes it from the set.
         self._unverified_zeros: set[Joint] = set(ARM_JOINTS) - EITHER_STOP_JOINTS
         self._offset_lock = asyncio.Lock()
-        # Realtime-core hook (axol teleop --rt): when set, motion_control
-        # and gravity_compensate hand their per-joint 9-float tuples
+        # Realtime-core hook: production motion_control and
+        # gravity_compensate hand their per-joint 9-float tuples
         # (p_des motor-frame, mode, kp, kd, gravity t_ff, the pose-scheduled
         # damping coefficients kd_host/w0/q, and the pose-scaled j_eff) to
         # this callable instead of sending on the CAN bus — the Rust core
@@ -1389,7 +1389,7 @@ class AxolArm:
         motor_targets = clipped - self._joint_offsets
 
         if sink_mode:
-            # Realtime-core mode (axol teleop --rt): ship 9-float tuples to
+            # Production realtime-core mode: ship 9-float tuples to
             # the sink — which streams them to the Rust core that owns the
             # CAN bus. mode=1 (tracked): the core's own trapezoid tracker
             # renders the trajectory toward p_des at 240 Hz and computes the

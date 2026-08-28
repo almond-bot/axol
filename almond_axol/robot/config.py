@@ -14,13 +14,15 @@ the production-tuned values; override individual fields at construction or
 via :func:`dataclasses.replace`::
 
     from almond_axol.robot.config import AxolConfig, FrictionParams
+    from almond_axol.robot import Axol
+    from almond_axol.rt import RtAxol
 
     config = AxolConfig()
     config.left.elbow.kp = 200
     config.left.elbow.mass = 0.6
     config.left.elbow.com = (-0.025, 0.0, -0.07)
     config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
-    async with Axol(config=config) as axol: ...
+    async with RtAxol(Axol(config=config)) as axol: ...
 """
 
 from __future__ import annotations
@@ -437,8 +439,8 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     # right-side figures to 6/10/9 mdeg in an otherwise-identical hardware
     # A/B. Apply it symmetrically: the structure and control law are shared,
     # and leaving one side at Q=0.8 merely moves the excitation risk there.
-    # This shared config feeds classic, RT, and every other control path;
-    # factory and local calibration entries can still override it.
+    # This shared config feeds every production control path; factory and
+    # local calibration entries can still override it.
     arm = replace(
         arm,
         shoulder_1=replace(arm.shoulder_1, kd_host_q=3.0),

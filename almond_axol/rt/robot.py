@@ -5,13 +5,11 @@ Presents the same surface :class:`~almond_axol.teleop.VRTeleop` uses
 CAN buses are owned by the ``axol-rt`` subprocess:
 
 - ``enable()`` runs the split bring-up: the core resets the motors (prep),
-  then Python resolves joint offsets and MyActuator decode ranges against the
-  post-reset state over its own bus sockets, then the core enables and holds.
-  Once armed, the core is the *only* CAN consumer: Python's receive path is
-  muted at the kernel (zero-length CAN_RAW_FILTER) and the ``Motor`` caches
-  fill from the core's per-tick telemetry packets instead — ~480 packet
-  decodes/s replacing ~7,700 python-can frame dispatches/s on this
-  CPU-starved Jetson.
+  then Python resolves joint offsets and MyActuator decode ranges through a
+  Rust maintenance proxy. That proxy exits before the realtime core enables
+  and holds, making the core the sole CAN owner while armed. ``Motor`` caches
+  fill from the core's per-tick telemetry packets — ~480 packet decodes/s
+  replacing ~7,700 Python frame dispatches/s on this CPU-starved Jetson.
 - ``motion_control()`` runs the slow model math from
   ``AxolArm.motion_control`` (limits, gravity, the pose *scheduling* of the
   fast terms) and a command sink ships per-joint tuples to the core instead
@@ -182,7 +180,7 @@ class RtAxol:
         await self._robot.connect()
         for _side, arm in self._arms():
             await arm.resolve_joint_offsets()
-            # Python never calls Motor.enable() in rt mode, so run the
+            # Python never calls Motor.enable() in production control, so run the
             # MyActuator capability detection (position/torque decode ranges)
             # explicitly — otherwise the passive feedback decode would use
             # the legacy scaling on V4.4 firmware.
@@ -205,13 +203,16 @@ class RtAxol:
             arm._command_sink = self._make_sink(side)
         self._link.on_feedback = self._make_feedback_feed()
 
-        # From here the core owns the wire: silence Python's CAN receive
-        # path at the kernel (zero work per frame) — the caches now fill
-        # from the core's telemetry packets instead of passive listening.
-        for bus in self._buses():
-            bus.mute_rx()
-
-        await self._link.arm()
+        # Hand the interfaces over completely: the maintenance proxy exits
+        # before the realtime bus threads open their SocketCAN sockets.
+        await asyncio.gather(*(bus.close() for bus in self._buses()))
+        try:
+            await self._link.arm()
+        except Exception:
+            # Restore maintenance access so startup cleanup can still disable
+            # any motor the core managed to touch before failing.
+            await asyncio.gather(*(bus.start() for bus in self._buses()))
+            raise
         await self._wait_for_caches()
         # Prime one full hold target at the measured pose: the core's own
         # bring-up hold has no gravity feedforward (t_ff = 0) and no damping
@@ -478,10 +479,9 @@ class RtAxol:
         except Exception as exc:  # noqa: BLE001 - core may already be gone
             _logger.warning("rt: disarm failed (%s); core teardown continues", exc)
         await self._link.close()
-        # The belt-and-braces disable is a request/reply exchange — restore
-        # Python's CAN receive path first (muted since arm).
-        for bus in self._buses():
-            bus.unmute_rx()
+        # The core's bus threads have exited. Reopen Rust maintenance proxies
+        # before the belt-and-braces request/reply disable below.
+        await asyncio.gather(*(bus.start() for bus in self._buses()))
         # The core already disabled the motors on disarm/exit; repeating the
         # shutdown from Python is harmless (the bus is free again) and covers
         # a core that died mid-session. Also closes the Python buses.

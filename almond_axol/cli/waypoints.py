@@ -151,13 +151,8 @@ class WaypointsCmdConfig:
     """Arm joints to gravity-compensate while teaching; null frees all seven."""
     kd: float = 0.25
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
     play_only: bool = False
     """Skip teaching and replay ``file`` straight away. Implied by ``sim``."""
-    rt: bool = False
-    """Drive the wire through the Rust realtime core (axol-rt): the core owns
-    CAN at 240 Hz while this process streams targets (telemetry_hz is then
-    ignored). Same switch as ``axol teleop --rt``. Ignored with ``sim``."""
     sim: bool = False
     """Play the path in the browser visualizer instead of on the robot."""
     log_level: LogLevel = "INFO"
@@ -888,9 +883,7 @@ class _Session:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a teach-and-repeat session."""
-    cfg = parse(
-        WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only", "rt")
-    )
+    cfg = parse(WaypointsCmdConfig, normalize_bool_flags(argv, "sim", "play_only"))
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op.
     logging.basicConfig(level=getattr(logging, cfg.log_level), force=True)
@@ -944,27 +937,18 @@ async def _session(
         robot: RobotBase | RtAxol = Sim()
     else:
         from ..robot import Axol
+        from ..rt import RtAxol
 
-        robot = Axol(
-            config=cfg.axol,
-            left_channel=cfg.left_channel,
-            right_channel=cfg.right_channel,
+        # Rust is the sole hardware backend for both teaching and playback.
+        robot = RtAxol(
+            Axol(
+                config=cfg.axol,
+                left_channel=cfg.left_channel,
+                right_channel=cfg.right_channel,
+            )
         )
-        if cfg.rt:
-            # The core owns CAN; gravity comp (teaching) and playback both
-            # stream through the command sink, and start_telemetry below
-            # becomes a no-op (telemetry arrives every core tick).
-            from ..rt import RtAxol
-
-            robot = RtAxol(robot)
 
     async with robot:
-        if not cfg.sim:
-            await robot.start_telemetry(cfg.telemetry_hz)
-            # Motors may still be rebooting from set_control_mode(); block
-            # until every one has answered a poll before driving them.
-            await robot.wait_for_telemetry()
-
         session = _Session(cfg, robot, control, stop_event)
         try:
             await session.run()

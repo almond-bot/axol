@@ -362,13 +362,6 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 help="Gravity compensation control-loop rate.",
                 targets={"gravity-comp": ("rate_hz",)},
             ),
-            SettingDef(
-                key="robot.gravity_telemetry_hz",
-                label="Gravity telemetry rate (Hz)",
-                type="number",
-                help="Background motor telemetry rate during gravity compensation.",
-                targets={"gravity-comp": ("telemetry_hz",)},
-            ),
         ),
     ),
     SettingCategory(

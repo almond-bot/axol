@@ -37,8 +37,6 @@ gets through.
 """
 
 import re
-import socket
-import struct
 import subprocess
 import sys
 import time
@@ -338,53 +336,55 @@ _PROBE_WINDOW_S = 0.4
 def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
     """Send probe frames on ``iface`` and wait briefly for a matching reply.
 
-    Raw SocketCAN (no python-can machinery needed for a one-shot probe).
+    The Rust CAN proxy owns SocketCAN even for this one-shot setup probe.
     Unanswered probes are harmless: the IDs used command nothing, and a
     frame left queued behind an unpowered bus is dropped by the bring-up
     script's interface flap.
     """
-    try:
-        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-        s.bind((iface,))
-    except OSError:
+    import asyncio
+
+    from ...motor import CanBus
+
+    async def run_probe() -> bool:
+        hit = asyncio.Event()
+        bus = CanBus(iface)
+
+        def on_message(message) -> None:  # noqa: ANN001
+            if match(message.arbitration_id, bytes(message.data)):
+                hit.set()
+
+        bus._add_listener(on_message)
+        try:
+            async with bus:
+                for _ in range(_PROBE_ATTEMPTS):
+                    for can_id, data in frames:
+                        await bus._send(can_id, data)
+                    try:
+                        await asyncio.wait_for(hit.wait(), _PROBE_WINDOW_S)
+                        return True
+                    except TimeoutError:
+                        pass
+        except Exception:  # noqa: BLE001 - unavailable/wedged means no probe reply
+            return False
         return False
-    try:
-        for _ in range(_PROBE_ATTEMPTS):
-            for can_id, data in frames:
-                try:
-                    s.send(
-                        struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0"))
-                    )
-                except OSError:
-                    return False  # interface down / TX queue wedged
-            deadline = time.monotonic() + _PROBE_WINDOW_S
-            while (remaining := deadline - time.monotonic()) > 0:
-                s.settimeout(remaining)
-                try:
-                    frame = s.recv(16)
-                except (TimeoutError, OSError):
-                    break
-                can_id, dlc = struct.unpack("<IB3x", frame[:8])
-                if match(can_id & 0x7FF, frame[8 : 8 + dlc]):
-                    return True
-    finally:
-        s.close()
-    return False
+
+    return asyncio.run(run_probe())
 
 
 def _send_once(iface: str, can_id: int, data: bytes) -> None:
     """Fire one frame on ``iface`` and return; no reply expected."""
-    try:
-        s = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-        s.bind((iface,))
-    except OSError:
-        return
-    try:
-        s.send(struct.pack("<IB3x8s", can_id, len(data), data.ljust(8, b"\0")))
-    except OSError:
-        pass
-    finally:
-        s.close()
+    import asyncio
+
+    from ...motor import CanBus
+
+    async def send() -> None:
+        try:
+            async with CanBus(iface) as bus:
+                await bus._send(can_id, data)
+        except Exception:  # noqa: BLE001 - best-effort setup cleanup
+            pass
+
+    asyncio.run(send())
 
 
 def _probe_chest(iface: str) -> bool:

@@ -4,7 +4,7 @@ The Rust core starts commanding CAN before PyRoKi has compiled its first IK
 solution. That traffic safely holds the robot, but it is not part of the
 teleop run operators want to evaluate in Diagnostics. A small marker in
 ``~/.almond`` lets the independently running diagnostics server distinguish
-those phases for both the Python and Rust backends.
+those phases for the production Rust backend.
 """
 
 from __future__ import annotations

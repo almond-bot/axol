@@ -281,16 +281,6 @@ const TABS: WbTab[] = [
           "reference, so IK reconstruction error and tracking show together",
       },
       {
-        key: "rt",
-        label: "rust core",
-        type: "boolean",
-        hint:
-          "drive the wire through the axol-rt realtime core: the core owns " +
-          "CAN at 240 Hz (in-core trapezoid tracking, friction/inertia " +
-          "feedforward, velocity damping) while playback streams targets — " +
-          "same switch as teleop --rt; stored on the run for A/B comparison",
-      },
-      {
         key: "noise",
         label: "inject noise",
         type: "select",
@@ -879,7 +869,6 @@ function runFormValues(meta: TuningRunMeta): Record<string, string> | null {
       put("stiffness", p.stiffness)
       put("noise", p.noise)
       if (p.ik === true) out["ik"] = "true"
-      if (p.rt === true) out["rt"] = "true"
       if (p.filter === true) out["filter"] = "true"
       put("seed", p.seed)
       const overrides = Object.entries(g)
@@ -2454,7 +2443,6 @@ export function TuningWorkbench({
                       (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
                       r.params.ik === true ? "IK" : null,
-                      r.params.rt === true ? "RT" : null,
                       r.params.noise && r.params.noise !== "none"
                         ? `${r.params.noise as string} noise`
                         : null,
@@ -2640,7 +2628,6 @@ export function TuningWorkbench({
             {meta.params.source ? `${meta.params.source as string}` : ""}
             {meta.params.name ? `${meta.params.name as string}` : ""}
             {meta.params.ik === true ? " · IK" : ""}
-            {meta.params.rt === true ? " · RT" : ""}
             {meta.params.noise && meta.params.noise !== "none"
               ? ` · ${meta.params.noise as string} noise`
               : ""}
@@ -2829,7 +2816,6 @@ export function TuningWorkbench({
                       (r.params.name as string) ?? null,
                       (r.params.source as string) ?? null,
                       r.params.ik === true ? "IK" : null,
-                      r.params.rt === true ? "RT" : null,
                       r.params.noise && r.params.noise !== "none"
                         ? `${r.params.noise as string} noise`
                         : null,

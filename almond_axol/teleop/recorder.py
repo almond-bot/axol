@@ -48,7 +48,7 @@ import numpy as np
 _logger = logging.getLogger(__name__)
 
 # Default ring capacity: 5 minutes at the production 240 Hz control rate
-# (RT meas runs at 240 Hz; cmd, classic meas, and IK run around 120 Hz and
+# (Rust-core meas runs at 240 Hz; cmd and IK run around 120 Hz and
 # therefore retain up to twice as long). Older rows are overwritten, so
 # a long engaged segment keeps its *last* 5 minutes — disengage shortly
 # after the moment you want captured.

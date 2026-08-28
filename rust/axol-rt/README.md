@@ -5,15 +5,13 @@ Realtime CAN control core for the Almond Axol arms, in Rust. This is the
 (JAX), MuJoCo gravity/inertia, and the web/serve stack; Rust owns the CAN
 buses and runs the per-tick control loop with hard, GIL-free timing.
 
-Run it via `axol teleop --rt` — see "The hybrid split" below. Every other
-arm-motion flow takes the same switch: `axol gravity-comp --rt`,
-`axol waypoints --rt`, `axol tune.motion --rt`, and the LeRobot-based flows
-via `--robot_config.rt true` (`collect-data`, `run-policy`,
-`replay-dataset`). They all drive the robot through `almond_axol.rt.RtAxol`,
-so once armed the core is the only CAN consumer regardless of which command
-is running. (Bench/calibration flows that need direct register access —
-`tune.pid`, `tune.friction`, `motor.*` — stay on the classic Python path by
-design.)
+`axol teleop` and every other production arm-motion flow use it
+unconditionally: `gravity-comp`, `waypoints`, `tune.motion`,
+`tune.repeatability`, and the LeRobot-based `collect-data`, `run-policy`, and
+`replay-dataset` commands. Once armed, the core is the only CAN consumer.
+Bench/calibration flows that need direct register access (`tune.pid`,
+`tune.friction`, `motor.*`) remain maintenance tools outside the production
+control loop.
 
 ## Status
 
@@ -37,7 +35,7 @@ Working today (verified on the robot, both arm buses):
   gravity feedforward from `tools/gen_hold_params.py`.
 - `axol-rt serve` — the realtime core: owns both buses, paces a 240 Hz MIT
   stream, and plays impedance targets streamed from Python over a Unix
-  socket. This is what `axol teleop --rt` runs.
+  socket. This is what `axol teleop` runs.
 
 Measured on the robot (2026-08-27):
 
@@ -62,7 +60,7 @@ of the fast terms (pose-scaled damping gain and inertia gain, pose-tracked
 band-pass centre). The teleop pipeline's target shaping — the pose
 low-pass, the IK-output EMA, and the Python trapezoid with its engage
 velocity ramp and output guard — also stays: those filters condition the
-*target stream* and live with IK. In rt mode a command sink hands
+*target stream* and live with IK. A command sink hands
 per-joint 9-float tuples `(p_des, mode, kp, kd, t_ff, kd_host, damp_w0,
 damp_q, j_eff)` to `almond_axol.rt.RtAxol`, which ships them to this core
 (~120 Hz) instead of sending CAN from Python. `t_ff` is gravity only in
@@ -103,8 +101,8 @@ own trajectory and feedback states:
   dissipated-power comparison of the two chains. The shared robot config
   gives shoulder-1 on both arms a Q=3 band: it keeps unity gain at the
   intended ~3.2 Hz mode while rejecting the measured 12.5-13.6 Hz
-  mast/forearm structural mode. Classic and RT consume the same value, and
-  explicit calibration or CLI Q values remain authoritative.
+  mast/forearm structural mode. Every production flow consumes the same
+  value, and explicit calibration or CLI Q values remain authoritative.
 - Watchdog: targets stop arriving → the tracker converges on the last
   target and the arms hold there, damping active (matching what the
   firmware itself does if a host dies mid-command, plus the damper).
@@ -140,20 +138,20 @@ tick the core ships an `F` packet (per-slot position, velocity, torque,
 and frame age) over the socket, and Python fills its `Motor` caches from
 it — positions and torques stay fresh for `get_positions`, recording, and
 the contact watchdog, with receive timestamps reconstructed to within
-socket transit. Python's own CAN receive path is muted at the kernel
-(zero-length CAN_RAW_FILTER) while the core is armed, so the ~7,700
-frames/s SocketCAN would otherwise broadcast into python-can cost Python
-nothing; ~480 tiny packet decodes/s replace them.
+socket transit. The Rust maintenance proxy exits before the realtime core
+arms, so Python has no CAN socket and the core is the only command/feedback
+owner during control. Roughly 480 tiny telemetry packet decodes/s replace the
+~7,700 frame/s dispatch load of the removed Python control path.
 
-Bring-up is split so Python's calibration stays authoritative: the core
-resets the arm motors first (`prep`, gripper untouched), then Python
-resolves joint offsets and MyActuator decode ranges against the
-post-reset wrap state and brings up the gripper, then the core enables
-and holds (`arm`). The socket protocol lives in `src/serve.rs` (Rust) and
-`almond_axol/rt/link.py` (Python) — length-prefixed frames, text control
-messages, packed-binary targets.
+Bring-up is split so Python's calibration logic stays authoritative while
+Rust owns every CAN syscall: the core resets the arm motors first (`prep`,
+gripper untouched), then a Rust maintenance proxy carries offset/range reads
+and gripper calibration frames, the proxy exits, and the realtime core enables
+and holds (`arm`). The socket protocols live in `src/serve.rs` / `src/proxy.rs`
+(Rust) and the Python link classes — length-prefixed messages with packed
+targets or CAN frames.
 
-Guarded return works exactly as in classic mode: `torque_residuals` and
+Guarded return stays on the same core: `torque_residuals` and
 `reset_command_state` are cache/state-only, and `gravity_compensate`
 streams its tuples through the same command sink — the contact watchdog,
 the limp contact hold, and the replanned reset all run against the core.
@@ -164,7 +162,7 @@ Set `AXOL_RT_TRACE` to a path prefix to capture one CSV per arm without doing
 file I/O on the realtime threads:
 
 ```bash
-AXOL_RT_TRACE=/tmp/axol-run axol teleop --rt
+AXOL_RT_TRACE=/tmp/axol-run axol teleop
 # writes /tmp/axol-run-left.csv and /tmp/axol-run-right.csv
 ```
 
@@ -179,7 +177,11 @@ write them, and the regular five-second status line reports any trace drops.
 `scan` and `bench` are strictly read-only — safe against a powered robot
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
 the explicit config/prep/arm handshake, and every exit path (disarm,
-fault, signal, client loss) runs the disable sequence.
+fault, signal, client loss) runs the disable sequence. `proxy` is the sole
+frame transport for maintenance, tuning, firmware, diagnostics, cart, and
+lift clients. It shares the realtime core's persistent-TX-stall detection and
+queue purge, aborting instead of allowing stale motion frames to replay after
+an e-stop.
 
 ## Build / run
 
@@ -195,7 +197,7 @@ cargo build --release           # needs no cross-compile: built on the Jetson
 uv run python tools/gen_hold_params.py /tmp/hold.txt
 ./target/release/axol-rt hold --params /tmp/hold.txt --secs 5 --yes
 uv run python tools/rt_smoke.py --secs 8   # end-to-end serve smoke test
-uv run axol teleop --rt                    # the real thing
+uv run axol teleop                         # the real thing
 ```
 
 Default interfaces are `can_alm_axol_l` and `can_alm_axol_r`; pass others
@@ -204,6 +206,6 @@ via `AXOL_RT_BIN`, `PATH`, or this crate's `target/release/`.
 
 ## Roadmap
 
-Nothing pending — the split described above is fully built: the core owns
-the wire in both directions (commands out, telemetry packets back), and
-Python is CAN-silent from arm to disarm.
+Nothing pending — the split described above is fully built: Rust owns the
+wire in both directions for production control and every maintenance/tuning
+utility. Python is orchestration, model math, fitting, and UI only.

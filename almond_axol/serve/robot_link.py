@@ -761,7 +761,7 @@ class RobotLink:
 
         Timing is sampled only after ``VRTeleop.run`` begins, which is after
         PyRoKi has produced its first solution. This excludes the RT core's
-        bring-up/compile-time hold traffic for both backends while still
+        bring-up/compile-time hold traffic while still
         measuring ``axol teleop`` launched independently from a terminal.
         Motor state only takes over here in BUSY: while the link owns the bus,
         its normal sample loop already publishes values (and silently sources

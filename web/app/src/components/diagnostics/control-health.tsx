@@ -363,7 +363,7 @@ export function ControlHealth({ frames, version, nowT, view, onViewChange }: Con
       <p className="text-xs leading-relaxed text-white/35">
         Send batch is first-to-last arm command; full cycle continues through the final feedback.
         “Missed 240 Hz” counts command gaps that lost one or more 4.17 ms deadlines. All values come
-        from the same passive kernel-timestamped wire evidence for Python and Rust.
+        from passive kernel-timestamped evidence on the Rust-owned CAN wire.
       </p>
     </section>
   )

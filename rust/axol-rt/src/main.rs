@@ -20,6 +20,8 @@ mod can;
 mod filter;
 mod hold;
 mod proto;
+mod proxy;
+mod safety;
 mod scan;
 mod serve;
 mod txn;
@@ -31,7 +33,7 @@ fn main() {
     let (cmd, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
         None => {
-            eprintln!("usage: axol-rt <scan|bench> [options] [ifaces...]");
+            eprintln!("usage: axol-rt <scan|bench|hold|serve|proxy> [options]");
             std::process::exit(2);
         }
     };
@@ -103,6 +105,30 @@ fn main() {
                 std::process::exit(2);
             };
             serve::run(&socket)
+        }
+        "proxy" => {
+            let mut socket: Option<String> = None;
+            let mut iface: Option<String> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--socket" => socket = iter.next().cloned(),
+                    "--iface" => iface = iter.next().cloned(),
+                    other => {
+                        eprintln!("proxy: unknown argument {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let Some(socket) = socket else {
+                eprintln!("proxy: --socket PATH is required");
+                std::process::exit(2);
+            };
+            let Some(iface) = iface else {
+                eprintln!("proxy: --iface IFACE is required");
+                std::process::exit(2);
+            };
+            proxy::run(&socket, &iface)
         }
         other => {
             eprintln!("unknown command: {other}");

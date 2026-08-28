@@ -99,11 +99,6 @@ def _default_robot_config() -> AxolRobotConfig:
             "left_arm": ZedCameraConfig(serial=0),
             "right_arm": ZedCameraConfig(serial=0),
         },
-        # The control loop runs motion_control every step, whose command replies
-        # keep the joint cache fresh — so the background telemetry poll loop is
-        # redundant CAN/CPU load. Skipping it (telemetry_hz=0) matches `axol
-        # teleop` and keeps the control rate from sagging when teleop engages.
-        telemetry_hz=0.0,
     )
 
 

@@ -3,7 +3,7 @@ Axol robot as a LeRobot Robot.
 
 AxolRobot wraps the async Axol hardware driver behind LeRobot's synchronous
 Robot interface. A background thread runs a dedicated asyncio event loop so
-Axol's CAN telemetry keeps streaming while get_observation() and send_action()
+Rust-core telemetry keeps streaming while get_observation() and send_action()
 block synchronously on the calling thread.
 
 Typical usage::
@@ -97,7 +97,7 @@ class AxolRobot(Robot):
         self._right_pos_keys = [f"right_{j.value}.pos" for j in joints]
         self._left_trq_keys = [f"left_{j.value}.trq" for j in joints]
         self._right_trq_keys = [f"right_{j.value}.trq" for j in joints]
-        self._axol: Axol | RtAxol | None = None
+        self._axol: RtAxol | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self.cameras, self._stereo_cameras = self._build_cameras()
@@ -331,47 +331,20 @@ class AxolRobot(Robot):
         _logger.info("AxolRobot connected.")
 
     async def _connect_async(self) -> None:
-        robot = Axol(
-            self.config.axol_config,
-            left_channel=self.config.left_channel,
-            right_channel=self.config.right_channel,
-        )
-        if self.config.rt:
-            # The Rust core owns CAN: it runs the 240 Hz wire loop and
-            # streams telemetry back every tick, so both branches below
-            # (poll loop or reply-driven cache) are unnecessary — enable()
-            # already leaves the caches primed and the stream verified.
-            from ...rt import RtAxol as _RtAxol
+        # LeRobot uses the same sole production backend as teleop: Rust owns
+        # CAN at 240 Hz while Python streams policy/teleop targets.
+        from ...rt import RtAxol as _RtAxol
 
-            self._axol = _RtAxol(
-                robot,
-                max_vel=VRTeleopConfig.teleop_max_vel,
-                max_accel=VRTeleopConfig.teleop_max_accel,
-            )
-            await self._axol.enable()
-            return
-        self._axol = robot
+        self._axol = _RtAxol(
+            Axol(
+                self.config.axol_config,
+                left_channel=self.config.left_channel,
+                right_channel=self.config.right_channel,
+            ),
+            max_vel=VRTeleopConfig.teleop_max_vel,
+            max_accel=VRTeleopConfig.teleop_max_accel,
+        )
         await self._axol.enable()
-        if self.config.telemetry_hz > 0:
-            await self._axol.start_telemetry(
-                self.config.telemetry_hz, torque=self.config.observe_torques
-            )
-            await self._axol.wait_for_telemetry()
-        else:
-            # No background poll loop: rely on motion_control replies (every
-            # impedance/gripper command returns a feedback frame) to keep the
-            # position/torque cache fresh, exactly like `axol teleop`. This
-            # removes ~telemetry_hz × 16 redundant CAN transactions/sec that
-            # otherwise contend with motion_control on the bus and the loop.
-            #
-            # Seed the cache before the first cached read: get_positions() uses
-            # register reads that return values but don't populate the .position
-            # cache (only feedback frames do), and command sends are
-            # fire-and-forget, so issue one hold-in-place motion_control to
-            # elicit feedback from every motor and wait for those frames to land.
-            pos_l, pos_r = await self._axol.get_positions()
-            await self._axol.motion_control(left=pos_l, right=pos_r)
-            await self._axol.wait_for_telemetry()
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""

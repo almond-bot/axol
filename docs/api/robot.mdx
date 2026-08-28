@@ -3,10 +3,11 @@ title: "almond_axol.robot"
 description: "Hardware controller (Axol), simulator (Sim), configuration, and gravity compensation."
 ---
 
-Hardware controller for both arms. `Axol` opens one SocketCAN bus per arm on entry, enables all 16 motors, and calibrates the gripper open-stop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
+Hardware controller for both arms. `Axol` is the low-level hardware/model object; production motion wraps it in `RtAxol`, which exclusively owns CAN while armed and runs the control loop at 240 Hz. Direct-register calibration and diagnostics use the low-level object outside that production loop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
 
 ```python
 from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointConfig, FrictionParams, Sim
+from almond_axol.rt import RtAxol
 ```
 
 ## `Axol`
@@ -27,10 +28,8 @@ import numpy as np
 from almond_axol.robot import Axol
 
 async def main():
-    async with Axol() as axol:
-        await axol.start_telemetry(500)   # 500 Hz background polling
-
-        # non-blocking cached reads (after telemetry warms up)
+    async with RtAxol(Axol()) as axol:
+        # non-blocking cached reads from the core's 240 Hz feedback
         print("left positions (rad):", axol.left.positions)
         print("left torques (Nm):", axol.left.torques)
 
@@ -158,13 +157,14 @@ Each arm joint is configured with a single `JointConfig` carrying its impedance 
 
 ```python
 from almond_axol.robot import Axol, AxolConfig, FrictionParams
+from almond_axol.rt import RtAxol
 
 config = AxolConfig()
 config.left.elbow.kp = 200
 config.left.elbow.mass = 0.6
 config.left.elbow.com = (-0.025, 0.0, -0.07)
 config.left.elbow.friction = FrictionParams(fc=0.4, k=10.0, fv=0.05, fo=0.0)
-async with Axol(config=config) as axol: ...
+async with RtAxol(Axol(config=config)) as axol: ...
 ```
 
 Or build a fully custom arm with `dataclasses.replace` (start from the `AxolConfig` defaults so you keep the per-side friction values that get injected at construction):
@@ -230,11 +230,12 @@ If the arms sag or push back in gravity-comp mode, tune the relevant joint's `ma
 
 ```python
 from almond_axol.robot import AxolConfig, Axol
+from almond_axol.rt import RtAxol
 
 config = AxolConfig()
 config.left.elbow.mass = 0.6
 config.left.elbow.com = (-0.025, 0.0, -0.07)
-async with Axol(config=config) as axol: ...
+async with RtAxol(Axol(config=config)) as axol: ...
 ```
 
 See the [`gravity-comp`](/cli/gravity-comp) CLI command to hold the arms in gravity-compensation mode interactively.

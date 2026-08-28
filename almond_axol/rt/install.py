@@ -2,8 +2,8 @@
 axol rt.install
 
 Build and install the ``axol-rt`` realtime core binary (see
-``rust/axol-rt/``), so ``--rt`` mode works with no manual setup. Runs as a
-step of ``axol provision``, and standalone:
+``rust/axol-rt/``), the required hardware control backend. Runs as a step of
+``axol provision``, and standalone:
 
     axol rt.install
 

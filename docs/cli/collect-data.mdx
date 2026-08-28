@@ -3,7 +3,7 @@ title: "collect-data"
 description: "Record teleoperation episodes to a LeRobot-format dataset."
 ---
 
-Records teleoperation episodes using VR controller inputs and locally attached ZED cameras. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
+Records teleoperation episodes using VR controller inputs and locally attached ZED cameras. The Rust core owns arm CAN at 240 Hz. Saves to a [LeRobot](https://github.com/huggingface/lerobot)-format dataset. Loops until `Ctrl+C`.
 
 <Tip>
   For the end-to-end workflow, see the [Data Collection guide](/operations/data-collection).
@@ -31,7 +31,6 @@ This command is configured via draccus. The robot and teleop subsystems are expo
 | `--robot_config.video_backend {auto,gst,sdk}` | Camera capture backend (default: `auto`). `gst` is the GPU-resident zed-gstreamer pipeline (low latency, shared with the headset relay); `sdk` is the ZED Python SDK; `auto` prefers `gst` when its stack ([`gst.install`](/cli/gst-install) + [`gst.build-zed`](/cli/gst-build-zed)) is installed and falls back to the SDK. |
 | `--robot_config.axol_config.<side>.gripper.torque_limit FLOAT` | Max torque (Nm) for a gripper in POSITION_FORCE mode (default: 0.5); `<side>` is `left`/`right` |
 | `--robot_config.axol_config.left_stiffness S` | Compliance blend for the left arm in `[0, 1]`. Scalar or 7-element list (one per arm joint, in `Joint` enum order). `1` (default) = the tuned production gains; lower only adds compliance. Use `right_stiffness` for the right arm. See [`AxolConfig.left_stiffness`](/api/robot). |
-| `--robot_config.rt true` | **Experimental.** Drive the wire through the `axol-rt` Rust realtime core: the core owns CAN at 240 Hz (in-core trapezoid tracking, friction/inertia feedforward, velocity damping) while the collection loop streams targets — same switch as [`teleop --rt`](/cli/teleop). Requires the `axol-rt` binary. |
 | `--teleop_config.vr_teleop_config.position_multiplier FLOAT` | Scale factor on hand **position** (not orientation): the end-effector target moves this many times as far as your hand. `1.0` (default) is 1:1; `2.0` moves the arm twice as far, helping cover the robot's full reach when the arm is longer than the operator's. |
 | `--teleop_config.vr_teleop_config.rotation_multiplier FLOAT` | Scale factor on hand **orientation** (not position): the end-effector target rotates this many times as far as your wrist. `1.0` (default) is 1:1; `2.0` rotates the arm twice as far. |
 | `--rerun_ip IP` | IP of a Rerun viewer on your local machine for live visualization |
@@ -73,6 +72,6 @@ A resume still runs a **crash-consistency check** for that one remaining window 
 
   The hot control loop runs **on the robot's own asyncio event loop** (`AxolRobot.event_loop`), so each `motion_control` is awaited inline — cooperatively interleaved on a single thread, exactly like `axol teleop`. This removes the per-step cross-thread `send_action` round trip (`run_coroutine_threadsafe(...).result()`) that otherwise capped — and jittered — the control rate once teleop was engaged.
 
-  For the same reason, data collection defaults to **`telemetry_hz=0`**: the control loop already issues `motion_control` every step, and every impedance/gripper command returns a feedback frame that refreshes the joint position/torque cache. Running the background 120 Hz × 16-motor poll loop on top of that just adds redundant CAN traffic and CPU that contends with `motion_control` — so `collect-data` skips it and relies on command replies, matching teleop's bus load. (`run-policy` and other `AxolRobot` users keep the poll loop, since they don't command every step.)
+  Joint state always comes from the Rust core's native 240 Hz feedback stream. There is no separate Python telemetry poll loop competing with control traffic on CAN.
 
 </Info>

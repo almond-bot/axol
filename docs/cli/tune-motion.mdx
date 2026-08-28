@@ -3,7 +3,7 @@ title: "tune.motion"
 description: "Replay a committed reference motion through the production control path and score tracking accuracy and smoothness per joint."
 ---
 
-Replays a [reference motion](/cli/motion-build) through the production `motion_control` path — impedance gains, gravity/friction/inertia feedforward, and host-side damping all come from the same `AxolConfig` production uses — and scores **tracking accuracy** and **smoothness** per joint. Because the motion is identical from run to run and robot to robot, this is the deterministic A/B loop that ad-hoc teleop testing can't give you: override one gain with `--gain`, replay, and compare the numbers (and graphs, in the diagnostics dashboard).
+Replays a [reference motion](/cli/motion-build) through the production Rust-core `motion_control` path — impedance gains, gravity/friction/inertia feedforward, and host-side damping all come from the same `AxolConfig` production uses — and scores **tracking accuracy** and **smoothness** per joint. Because the motion is identical from run to run and robot to robot, this is the deterministic A/B loop that ad-hoc teleop testing can't give you: override one gain with `--gain`, replay, and compare the numbers (and graphs, in the diagnostics dashboard).
 
 Every run persists a tuning-run artifact (full per-joint time series + metrics) under `~/.almond/diagnostics/tuning/` for charting and side-by-side comparison.
 
@@ -17,7 +17,6 @@ The arm moves to the motion's start and back to rest on collision-aware planned 
 | `--ik` | Drive the run through the IK solver: each waypoint's end-effector poses (FK of the reference, with elbow hints) are re-solved to joints exactly like teleop's pose→joints loop, and the arms execute the *solver's* output — still scored against the clean reference, so IK reconstruction error and tracking error show up together. Per-solve times and the solved-vs-reference deviation are stored on the run (`ik_solve_ms_*`, `ik_dev_*`) |
 | `--noise MODE` | Corrupt the motion before streaming it, at the noise source's real pipeline entry point: `network` (jitter/outliers/stalls), `ik` (solver churn/jumps), `combined`, or `none` (default). Deterministic per `--seed` |
 | `--filter` | Replay the (possibly corrupted) stream through the production teleop filter stack (pose low-pass → EMA → trapezoid) before streaming — the hardware version of [`tune.filter`](/cli/tune-filter): the arm physically shows what the stack removes and what it costs in lag. Off streams it raw |
-| `--rt` | **Experimental.** Drive the wire through the `axol-rt` Rust realtime core: the core owns CAN at 240 Hz (in-core trapezoid tracking, friction/inertia feedforward, velocity damping) while playback streams targets — same switch as [`teleop --rt`](/cli/teleop). Stored on the run artifact (`rt`), so classic and rt runs can be A/B-compared. Requires the `axol-rt` binary |
 | `--seed N` | RNG seed for `--noise` — identical seed, identical corrupted stream (default: 0) |
 | `--label TEXT` | Free-form note stored on the run artifact |
 | `--torque-threshold NM` | Contact watchdog threshold (default: 8.0; 0 disables) |

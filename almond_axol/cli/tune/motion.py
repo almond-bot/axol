@@ -171,14 +171,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         "show up together. Composes after --noise/--filter.",
     )
     p.add_argument(
-        "--rt",
-        action="store_true",
-        help="Drive the wire through the Rust realtime core (axol-rt): the "
-        "core owns CAN at 240 Hz with in-core tracking, friction/inertia "
-        "feedforward, and velocity damping, while this process streams "
-        "targets — same switch as `axol teleop --rt`",
-    )
-    p.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -538,19 +530,12 @@ async def _run(args: argparse.Namespace) -> None:
     q_start = to_full(sent[0])
     traj_playback = [to_full(row) for row in sent]
 
-    robot: Axol | RtAxol = Axol(config=config)
-    if args.rt:
-        # The core owns CAN; playback streams targets through the command
-        # sink and the caches refresh from per-tick telemetry, so the
-        # start_telemetry/wait_for_telemetry pair below become no-ops.
-        from ...rt import RtAxol as _RtAxol
+    # Production playback always runs through the Rust core, matching teleop.
+    from ...rt import RtAxol as _RtAxol
 
-        robot = _RtAxol(robot)
+    robot: RtAxol = _RtAxol(Axol(config=config))
 
     async with robot as axol:
-        await axol.start_telemetry(500)
-        await axol.wait_for_telemetry()
-
         contact: tuple[str, float] | None = None
         try:
             q_now = snapshot(axol)
@@ -661,7 +646,6 @@ async def _run(args: argparse.Namespace) -> None:
                 "rate": motion.rate,
                 "stiffness": args.stiffness,
                 "columns": _COLUMNS,
-                "rt": bool(args.rt),
                 **stream_info,
             },
             label=args.label,

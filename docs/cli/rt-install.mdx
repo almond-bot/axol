@@ -1,9 +1,9 @@
 ---
 title: "rt.install"
-description: "Build and install the axol-rt realtime core binary, so --rt mode needs no manual setup."
+description: "Build and install the required axol-rt hardware control core."
 ---
 
-Builds and installs the `axol-rt` Rust realtime core — the binary behind [`teleop --rt`](/cli/teleop) and the `--rt` / `robot_config.rt` switch on every other arm-motion command. Runs automatically as a step of [`provision`](/cli/provision); run it by hand to (re)build on demand:
+Builds and installs the `axol-rt` Rust realtime core, the sole production hardware control backend for teleop and every other arm-motion command. It runs automatically as a step of [`provision`](/cli/provision); run it by hand to (re)build on demand:
 
 ```bash
 axol rt.install

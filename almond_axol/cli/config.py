@@ -533,15 +533,6 @@ class TeleopCmdConfig:
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is
     implied. Mutually exclusive with sim."""
-    rt: bool = False
-    """Experimental: run the CAN control loop in the Rust realtime core
-    (``axol-rt``). Python keeps VR, IK, and the full motion_control math,
-    but ships the per-joint impedance and gripper commands to the core,
-    which owns the buses and paces a hard 240 Hz loop, interpolating
-    between Python's ~120 Hz targets. Requires the axol-rt binary (build
-    with ``cargo build --release`` in rust/axol-rt, or set AXOL_RT_BIN).
-    Hardware only; the guarded return-to-rest paths fall back to plain
-    position streaming. Mutually exclusive with sim."""
     axol: AxolConfig = field(default_factory=AxolConfig)
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
@@ -593,10 +584,4 @@ class GravityCompCmdConfig:
     # making hand-guiding feel heavy.
     kd: float = 0.5
     rate_hz: float = 250.0
-    telemetry_hz: float = 500.0
-    rt: bool = False
-    """Drive the wire through the Rust realtime core (axol-rt): Python keeps
-    computing the gravity model per cycle, the core owns CAN at 240 Hz and
-    streams telemetry back (telemetry_hz is then ignored). Same flag as
-    ``axol teleop --rt``."""
     log_level: LogLevel = "INFO"

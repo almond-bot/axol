@@ -18,7 +18,7 @@ Typical usage::
 Or with custom components::
 
     async with VRTeleop(
-        Axol(),
+        RtAxol(Axol()),
         config=VRTeleopConfig(teleop_max_vel=2.0),
         vr_server_config=VRServerConfig(port=9000),
     ) as teleop:
@@ -108,6 +108,16 @@ class VRTeleop:
                                whenever a stick leaves its deadzone,
                                independent of the arm engage toggle.
         """
+        # Direct Python control-loop teleop is no longer supported. Keep this guard at
+        # the reusable API boundary so custom callers cannot silently bypass
+        # the production Rust core; Sim remains a valid alternate target.
+        from ..robot.axol import Axol
+
+        if isinstance(robot, Axol):
+            raise TypeError(
+                "VRTeleop hardware requires RtAxol(Axol()); direct Python "
+                "control has been removed"
+            )
         self._robot = robot
         self._cart = cart
         self._config = config
@@ -147,8 +157,8 @@ class VRTeleop:
         # and torques (8 left + 8 right), refreshed by the impedance feedback
         # frames so reading them costs no CAN traffic.
         # RtAxol receives feedback at the native 240 Hz wire rate and owns the
-        # same `_meas.npz` stage when recording is on. Classic Python and Sim
-        # keep this once-per-loop recorder (normally 120 Hz).
+        # same `_meas.npz` stage when recording is on. Sim keeps this
+        # once-per-loop recorder.
         self._robot_recorder = (
             getattr(robot, "set_recording_engaged", None)
             if getattr(robot, "records_measurements_at_control_rate", False)
@@ -444,7 +454,7 @@ class VRTeleop:
         # can be entered. Publish this exact boundary for the independently
         # running Diagnostics process: the RT core's earlier 240 Hz bring-up
         # hold is safe robot traffic, but it is not a teleop-loop measurement.
-        # This lifecycle is shared by the classic Python and Rust backends.
+        # This lifecycle gates the production Rust-core capture.
         activity = TeleopActivityMarker()
         try:
             activity.start()

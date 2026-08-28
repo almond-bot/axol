@@ -1,13 +1,13 @@
 """Passive CAN observer: read every motor's state without ever transmitting.
 
-SocketCAN delivers each frame on an interface to every open socket, so a
-socket that never sends can watch the traffic of whichever process currently
-commands the motors and reconstruct each joint's state from it. This splits
-bus *observation* from bus *command*: command access stays exclusive (two
-processes issuing request/response reads to the same motor would cross-match
-replies), but any number of processes may observe. ``axol serve`` uses this
-to keep live telemetry streaming while a teleop session or diagnostic owns
-command of the robot.
+A Rust proxy opens the observer's SocketCAN socket and forwards frames over a
+Unix socket, so Python can watch whichever Rust process currently commands the
+motors without owning CAN itself. This splits bus *observation* from bus
+*command*: command access stays exclusive (two processes issuing
+request/response reads to the same motor would cross-match replies), but any
+number of Rust-owned observers may watch. ``axol serve`` uses this to keep live
+telemetry streaming while a teleop session or diagnostic owns command of the
+robot.
 
 What each motor family gives an observer:
 
@@ -83,8 +83,8 @@ from .types import MotorStatus
 
 
 # The RT core's motor-facing target. Timing snapshots also use this reference
-# for classic Python, deliberately: the resulting missed-cycle count answers
-# whether traffic actually met the 240 Hz bar instead of grading each backend
+# deliberately: the resulting missed-cycle count answers whether traffic
+# actually met the production 240 Hz bar instead of grading a loop
 # against its own slower cadence.
 _CONTROL_TARGET_HZ = 240.0
 _TIMING_WINDOW_S = 1.0
@@ -307,11 +307,11 @@ class _DamiaoDecoder:
 class BusObserver:
     """Always-listening, never-transmitting view of one arm's CAN channel.
 
-    Opens its own SocketCAN socket (via :class:`CanBus`, reusing its
-    lost-interface recovery) and decodes every recognizable feedback or reply
-    frame into per-joint :class:`JointObservation` state — regardless of which
-    process generated the traffic. Never sends a single frame, so it is safe
-    to keep open while another process owns command of the bus.
+    Opens a Rust-owned CAN proxy (via :class:`CanBus`) and decodes every
+    recognizable feedback or reply frame into per-joint
+    :class:`JointObservation` state — regardless of which process generated
+    the traffic. Never sends a single frame, so it is safe to keep open while
+    another process owns command of the bus.
 
     Use from one event loop: the CAN reader dispatches on the loop
     :meth:`start` ran on, and snapshots are read on the same loop.
@@ -441,7 +441,7 @@ class BusObserver:
         excluded even when they are still inside the rolling window. Returns
         ``None`` after command traffic has been quiet for ``window_s``. All
         measurements come from kernel receive timestamps on the passive
-        observer socket, making classic Python and Rust directly comparable.
+        observer socket, keeping all diagnostic timing on the same clock.
         """
         now = time.time()
         cutoff = now - window_s
@@ -533,7 +533,7 @@ class BusObserver:
             return result * 1000.0 if result is not None else None
 
         # A gap of 1.5 nominal periods has lost one 240 Hz deadline. Rounding
-        # the gap to elapsed nominal ticks makes an 8.33 ms classic tick count
+        # the gap to elapsed nominal ticks makes an 8.33 ms gap count
         # as one missed 240 Hz cycle, while ordinary RT jitter counts as zero.
         deadline_misses = sum(
             max(0, int(value / nominal_dt + 0.5) - 1) for value in command_dt

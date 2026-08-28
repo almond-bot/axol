@@ -21,8 +21,8 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
                       :mod:`almond_axol.robot.gyro`).
 * ``rt.install``    — the ``axol-rt`` realtime core binary (Rust toolchain
                       via rustup if needed; sources fetched at the installed
-                      package's ref for tool installs), so ``--rt`` mode
-                      needs no manual setup (see :mod:`almond_axol.rt`).
+                      package's ref for tool installs), required by hardware
+                      control (see :mod:`almond_axol.rt`).
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -103,7 +103,7 @@ def run(_args: object = None) -> None:
     _step("GStreamer + PyGObject (gst.install)", gst_install.run)
     if have_sdk:
         _step("patched zed-gstreamer plugins (gst.build-zed)", gst_build_zed.run)
-    # The axol-rt realtime core (`--rt` mode): rustup toolchain if needed,
+    # The required axol-rt hardware control core: rustup toolchain if needed,
     # then build from the in-repo crate (dev checkout) or from the sources
     # at the installed package's exact ref (tool installs). Self-gates on
     # network/toolchain availability like every other step.

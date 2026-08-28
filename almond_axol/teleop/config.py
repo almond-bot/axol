@@ -156,8 +156,7 @@ class VRTeleopConfig:
             verbatim.  When set, every stage of the teleop pipeline — raw
             VR pose, filtered pose, IK output, smoothed command, measured
             joints — is captured to ``<prefix>_{ik,cmd,meas}.npz``. The
-            measured stage runs at the native 240 Hz core rate with ``--rt``
-            and at the configured Python control rate otherwise. The
+            measured stage runs at the native 240 Hz Rust-core rate. The
             capture covers the **latest engage→disengage segment** (last
             ~5 minutes of it): recording starts at engagement, disengaging
             writes the files, and re-engaging starts the segment over.  The

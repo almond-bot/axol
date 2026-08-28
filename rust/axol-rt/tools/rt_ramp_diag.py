@@ -1,4 +1,4 @@
-"""Quantify motion smoothness of a startup-like ramp: rt core vs classic.
+"""Quantify motion smoothness of a startup-like Rust-core ramp.
 
 Plays a min-jerk excursion on the wrists (out 3 s / hold 1 s / back 3 s —
 the same speed class as teleop's return-to-rest) and logs commanded vs
@@ -6,8 +6,7 @@ measured positions at the 120 Hz command rate. Reports band-passed
 (3-30 Hz) measured-velocity RMS per joint — the "felt jitter" band — and
 saves the raw streams to an npz.
 
-    uv run python rust/axol-rt/tools/rt_ramp_diag.py --mode rt
-    uv run python rust/axol-rt/tools/rt_ramp_diag.py --mode classic
+    uv run python rust/axol-rt/tools/rt_ramp_diag.py
 
 SAFETY: this script commands open-loop joint excursions with no collision
 checking (unlike teleop's reset trajectories, which are planned). Only
@@ -40,15 +39,12 @@ def min_jerk(alpha: float) -> float:
     return a**3 * (10 - 15 * a + 6 * a * a)
 
 
-async def main(mode: str, out: str) -> None:
+async def main(out: str) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
-    inner = Axol()
-    if mode == "rt":
-        from almond_axol.rt import RtAxol
+    from almond_axol.rt import RtAxol
 
-        robot = RtAxol(inner)
-    else:
-        robot = inner
+    inner = Axol()
+    robot = RtAxol(inner)
     await robot.enable()
     try:
         pos_l, pos_r = await robot.get_positions()
@@ -68,7 +64,7 @@ async def main(mode: str, out: str) -> None:
         names = ", ".join(
             f"joint[{j}] {math.degrees(a):+.0f}°" for j, a in EXCURSION.items()
         )
-        print(f"mode={mode}: min-jerk ramp {names}")
+        print(f"Rust core: min-jerk ramp {names}")
 
         deadline = time.perf_counter()
         t0 = deadline
@@ -117,11 +113,11 @@ async def main(mode: str, out: str) -> None:
     meas = np.asarray(meas_log)
     ts = np.asarray(ts_log)
     tt = np.asarray(t_log)
-    np.savez(out, t=tt, cmd=cmd, meas=meas, ts=ts, mode=mode)
+    np.savez(out, t=tt, cmd=cmd, meas=meas, ts=ts, mode="rust")
 
     # Jitter metric: velocity from measured positions against feedback
     # timestamps, band-passed 3-30 Hz (simple FFT mask), RMS per joint.
-    print(f"\n== {mode} ==   (saved {out})")
+    print(f"\n== rust ==   (saved {out})")
     joints = ["s1", "s2", "s3", "elbow", "w1", "w2", "w3"]
     # Offsets differ between frames; compare motion only (offsets constant).
     for i, name in enumerate(joints):
@@ -149,7 +145,6 @@ async def main(mode: str, out: str) -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["rt", "classic"], required=True)
     ap.add_argument("--out", default="/tmp/rt_ramp_diag.npz")
     args = ap.parse_args()
-    asyncio.run(main(args.mode, args.out))
+    asyncio.run(main(args.out))

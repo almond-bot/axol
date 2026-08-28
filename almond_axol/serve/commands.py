@@ -310,7 +310,7 @@ COMMANDS: dict[str, CommandDef] = {
         sim_flag="sim",
         robot_free_flags=("cart_only",),
         uses_headset=True,
-        per_run_fields=("sim", "cart_only", "rt"),
+        per_run_fields=("sim", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -325,7 +325,7 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         entrypoint=_gravity_comp_run,
         execution="async",
-        per_run_fields=("free_joints", "record", "rt"),
+        per_run_fields=("free_joints", "record"),
     ),
     "waypoints": CommandDef(
         "waypoints",
@@ -344,7 +344,7 @@ COMMANDS: dict[str, CommandDef] = {
         # The gravity-comp side of a session takes the same config shape
         # (axol.*, channels, kd, rates), so the settings table is inherited.
         settings_like="gravity-comp",
-        per_run_fields=("file", "loops", "play_only", "sim", "rt"),
+        per_run_fields=("file", "loops", "play_only", "sim"),
     ),
     "collect-data": CommandDef(
         "collect-data",
@@ -366,7 +366,7 @@ COMMANDS: dict[str, CommandDef] = {
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("repo_id", "task", "robot_config.rt"),
+        per_run_fields=("repo_id", "task"),
     ),
     "replay-dataset": CommandDef(
         "replay-dataset",
@@ -379,7 +379,7 @@ COMMANDS: dict[str, CommandDef] = {
         _replay_dataset,
         requires_hardware=True,
         entrypoint=_replay_dataset_run,
-        per_run_fields=("repo_id", "episode", "loop", "interpolate", "robot_config.rt"),
+        per_run_fields=("repo_id", "episode", "loop", "interpolate"),
     ),
     "run-policy": CommandDef(
         "run-policy",
@@ -399,7 +399,6 @@ COMMANDS: dict[str, CommandDef] = {
             "policy_type",
             "task",
             "repo_id",
-            "robot_config.rt",
         ),
     ),
     # -- Diagnostics ----------------------------------------------------------

@@ -12,10 +12,11 @@ from almond_axol.teleop import VRTeleop, VRTeleopConfig
 ```python
 import asyncio
 from almond_axol.robot import Axol
+from almond_axol.rt import RtAxol
 from almond_axol.teleop import VRTeleop
 
 async def main():
-    async with VRTeleop(Axol()) as teleop:
+    async with VRTeleop(RtAxol(Axol())) as teleop:
         await teleop.run()  # blocking; Ctrl+C to exit
 
 asyncio.run(main())

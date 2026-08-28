@@ -67,7 +67,6 @@ with AxolRobot(config) as robot:
 |---|---|---|
 | `cameras` | `{}` | `ZedCameraConfig` instances keyed by name, each opening a locally attached ZED camera by serial number. A camera with `stereo=True` expands into two observation keys, `<name>_left` / `<name>_right`, backed by a single grab (see `ZedStereoCamera` below). |
 | `axol_config` | `AxolConfig()` | Per-joint gains and safety parameters forwarded to the hardware driver |
-| `telemetry_hz` | `120.0` | Background joint telemetry polling rate in Hz |
 | `observe_torques` | `False` | Include joint torques in `observation.state` |
 | `observe_cartesian` | `False` | Work in Cartesian end-effector space instead of 16 joint positions: observations report per-arm 6-axis EE poses (+ gripper) via FK, and `send_action()` accepts the same and resolves it to joint targets via IK |
 | `left_channel` | `"can_alm_axol_l"` | SocketCAN interface for the left arm |

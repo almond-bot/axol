@@ -138,9 +138,9 @@ def home_pose() -> np.ndarray:
 class HardwareController:
     """Motion facade over :class:`Axol` that restricts commands to a joint subset.
 
-    Presents the same ``enable`` / ``disable`` / ``get_positions`` /
-    ``motion_control`` surface the ROM cycle drives on both backends, but only
-    ever touches the joints in ``present`` on hardware. When ``present`` is the
+    Presents the ``enable`` / ``disable`` / ``get_positions`` /
+    ``motion_control`` surface the ROM cycle drives, but only ever touches the
+    joints in ``present`` on hardware. When ``present`` is the
     full joint set this delegates straight to :class:`Axol` so a normal run
     keeps its full feedforward stack and max-step safety check; otherwise absent
     motors are never enabled, commanded, or read (so they may be off the bus).
