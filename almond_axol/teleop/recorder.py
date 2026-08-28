@@ -13,9 +13,10 @@ Activation is by the ``record`` field on
 Every tap site holds that config — including the IK worker, which receives
 it pickled through the subprocess spawn — so the prefix needs no other
 plumbing. Each process/stage writes ``<prefix>_<stage>.npz`` (the IK worker
-writes ``_ik``, the smoothing core ``_cmd``, the measured loop ``_meas``).
-The measured loop records at 240 Hz from Rust core feedback in RT mode and at
-the configured Python control rate otherwise. All rows are stamped with
+writes ``_ik``, the smoothing core ``_cmd``, and the Rust-backed robot writes
+``_meas`` plus a compact ``_rt`` file containing its motor-facing 240 Hz
+command, derivative, feedforward, damping, timing, and feedback internals).
+The measured loop records at 240 Hz from Rust core feedback. All rows are stamped with
 ``time.monotonic()``, which shares one epoch across processes on Linux, so the
 files can be merged on time.
 
@@ -61,6 +62,34 @@ _DEFAULT_CAPACITY = 72_000
 # separator is used verbatim, as before.
 RECORDINGS_DIR = Path.home() / ".almond" / "recordings"
 
+_RT_TRACE_COLUMNS = (
+    "tick",
+    "time_s",
+    "seq",
+    "slot",
+    "motor_id",
+    "mode",
+    "target_p",
+    "cmd_p",
+    "cmd_v",
+    "cmd_a",
+    "cmd_v_fast",
+    "meas_p",
+    "motor_v",
+    "meas_v",
+    "meas_tau",
+    "gravity_ff",
+    "friction_ff",
+    "inertia_ff",
+    "damping_ff",
+    "total_ff",
+    "kd_host",
+    "damp_w0",
+    "damp_q",
+    "tick_dt",
+    "fb_dt",
+)
+
 
 def resolve_prefix(prefix: str) -> str:
     """A bare recording name becomes a path in :data:`RECORDINGS_DIR`."""
@@ -68,6 +97,78 @@ def resolve_prefix(prefix: str) -> str:
         return prefix
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     return str(RECORDINGS_DIR / prefix)
+
+
+def compact_rt_trace(prefix: str) -> Path | None:
+    """Compact the gated Rust CSVs into ``<prefix>_rt.npz``.
+
+    Rust writes CSV through a non-blocking background thread so compression
+    and Python IPC cannot perturb its 240 Hz loop. After disarm, combine both
+    arm files into columnar arrays and remove the verbose intermediates. Rows
+    stay flat with ``side``/``slot`` columns so partial-arm captures need no
+    padding and diagnostics can select a joint directly.
+    """
+    prefix = resolve_prefix(prefix)
+    raw_paths = [Path(f"{prefix}_rt-{side}.csv") for side in ("left", "right")]
+    chunks: dict[str, list[np.ndarray]] = {
+        "side": [],
+        **{("t" if name == "time_s" else name): [] for name in _RT_TRACE_COLUMNS},
+    }
+    found_rows = False
+    found_files = False
+    for side, path in enumerate(raw_paths):
+        if not path.exists():
+            continue
+        found_files = True
+        with path.open("rb") as raw:
+            header = raw.readline().decode("ascii", "replace").strip().split(",")
+            has_rows = bool(raw.read(1))
+        if header != list(_RT_TRACE_COLUMNS):
+            raise ValueError(f"unexpected Rust trace schema in {path}")
+        if not has_rows:
+            continue
+        values = np.loadtxt(path, delimiter=",", skiprows=1, ndmin=2)
+        if values.shape[1] != len(_RT_TRACE_COLUMNS):
+            raise ValueError(
+                f"unexpected Rust trace width in {path}: {values.shape[1]}"
+            )
+        found_rows = True
+        chunks["side"].append(np.full(len(values), side, dtype=np.uint8))
+        for index, source_name in enumerate(_RT_TRACE_COLUMNS):
+            name = "t" if source_name == "time_s" else source_name
+            if source_name == "tick":
+                array = values[:, index].astype(np.uint64)
+            elif source_name == "seq":
+                array = values[:, index].astype(np.uint32)
+            elif source_name in {"slot", "motor_id"}:
+                array = values[:, index].astype(np.uint8)
+            elif source_name == "time_s":
+                # Python monotonic timestamps are large enough that float32
+                # would quantize away the 4.17 ms control-tick spacing.
+                array = values[:, index].astype(np.float64)
+            else:
+                array = values[:, index].astype(np.float32)
+            chunks[name].append(array)
+        del values
+    if not found_rows:
+        if found_files:
+            for path in raw_paths:
+                path.unlink(missing_ok=True)
+        return None
+
+    packed = {name: np.concatenate(parts) for name, parts in chunks.items() if parts}
+    packed["schema_version"] = np.asarray(1, dtype=np.uint8)
+    destination = Path(f"{prefix}_rt.npz")
+    temporary = destination.with_suffix(".npz.tmp")
+    with temporary.open("wb") as output:
+        np.savez_compressed(output, **packed)
+    temporary.replace(destination)
+    for path in raw_paths:
+        path.unlink(missing_ok=True)
+    _logger.info(
+        "Flight recorder: wrote %d Rust rows to %s", len(packed["t"]), destination
+    )
+    return destination
 
 
 def resolve_or_latest(prefix: str | None, stage: str | tuple[str, ...] = "cmd") -> str:

@@ -66,8 +66,11 @@ class RtLinkError(RuntimeError):
 class RtLink:
     """One ``axol-rt serve`` subprocess and its socket connection."""
 
-    def __init__(self, binary: str | None = None) -> None:
+    def __init__(
+        self, binary: str | None = None, trace_prefix: str | None = None
+    ) -> None:
         self._binary = binary or find_binary()
+        self._trace_prefix = trace_prefix
         self._socket_path = f"/tmp/axol-rt-{os.getpid()}.sock"
         self._proc: subprocess.Popen[bytes] | None = None
         self._reader: asyncio.StreamReader | None = None
@@ -81,8 +84,13 @@ class RtLink:
         """Launch the core and connect. The core is idle until configured."""
         # stdout/stderr inherit the console: the core logs little, and what
         # it does log (bring-up, faults) belongs in the teleop output.
+        env = None
+        if self._trace_prefix is not None:
+            env = dict(os.environ)
+            env["AXOL_RT_TRACE"] = f"{self._trace_prefix}_rt"
+            env["AXOL_RT_TRACE_GATED"] = "1"
         self._proc = subprocess.Popen(
-            [self._binary, "serve", "--socket", self._socket_path]
+            [self._binary, "serve", "--socket", self._socket_path], env=env
         )
         deadline = asyncio.get_running_loop().time() + _CONNECT_TIMEOUT_S
         while True:
@@ -206,6 +214,15 @@ class RtLink:
             struct.pack("<9d", *cmd) for cmd in cmds
         )
         self._send(payload)
+
+    def set_recording_engaged(self, engaged: bool) -> None:
+        """Gate the automatic Rust trace to the current teleop segment."""
+        if self._trace_prefix is None:
+            return
+        if engaged:
+            self._send(struct.pack("<cBd", b"R", 1, time.monotonic()))
+        else:
+            self._send(struct.pack("<cB", b"R", 0))
 
     async def close(self) -> None:
         """Tear down the link and the core process."""

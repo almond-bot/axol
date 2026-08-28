@@ -102,7 +102,6 @@ class RtAxol:
         self._abort_deg = abort_deg
         self._max_vel = max_vel
         self._max_accel = max_accel
-        self._link = RtLink()
         self._seq = 0
         # Telemetry packets received per side since arm.
         self._fb_packets = [0, 0]
@@ -110,10 +109,13 @@ class RtAxol:
         # one 16-DOF flight-recorder row at the native 240 Hz rate. Import the
         # recorder lazily so low-level RT users do not initialize teleop.
         self._rec = None
+        self._record_prefix: str | None = None
         if record:
-            from ..teleop.recorder import make as make_recorder
+            from ..teleop.recorder import make as make_recorder, resolve_prefix
 
-            self._rec = make_recorder(record, "meas", {"qm": 16, "tq": 16})
+            self._record_prefix = resolve_prefix(record)
+            self._rec = make_recorder(self._record_prefix, "meas", {"qm": 16, "tq": 16})
+        self._link = RtLink(trace_prefix=self._record_prefix)
         self._record_qm = np.full(16, np.nan, dtype=np.float32)
         self._record_tq = np.full(16, np.nan, dtype=np.float32)
         self._record_sides: set[int] = set()
@@ -382,8 +384,11 @@ class RtAxol:
         return self._rec is not None
 
     def set_recording_engaged(self, engaged: bool) -> None:
-        """Gate the 240 Hz measurement recorder to the VR engaged segment."""
+        """Gate measured and Rust-internal traces to the VR engaged segment."""
+        if engaged == self._recording_engaged:
+            return
         if self._rec is not None:
+            self._link.set_recording_engaged(engaged)
             self._recording_engaged = engaged
             self._rec.set_engaged(engaged)
             if not engaged:
@@ -470,7 +475,7 @@ class RtAxol:
     async def disable(self) -> None:
         """Disarm the core, tear the link down, then belt-and-braces disable."""
         if self._rec is not None:
-            self._rec.set_engaged(False)
+            self.set_recording_engaged(False)
         for _side, arm in self._arms():
             arm._command_sink = None
         self._link.on_feedback = None
@@ -492,3 +497,13 @@ class RtAxol:
         if self._rec is not None:
             # Join any disengage writer before the process can exit.
             self._rec.dump()
+        if self._record_prefix is not None:
+            # Rust deliberately writes its high-volume trace outside Python
+            # while armed. The bus is down now, so compacting cannot perturb
+            # control timing and the operator gets one coherent recording.
+            from ..teleop.recorder import compact_rt_trace
+
+            try:
+                await asyncio.to_thread(compact_rt_trace, self._record_prefix)
+            except Exception:  # noqa: BLE001 - retain raw CSVs for recovery
+                _logger.exception("rt: could not compact the control trace")

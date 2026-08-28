@@ -58,7 +58,7 @@ See the [`teleop`](/cli/teleop) CLI command for the equivalent command-line entr
 | `engage_duration` | `1.0` s | Seconds over which the velocity cap ramps (smoothstep) from `engage_max_vel` up to `teleop_max_vel` after engaging |
 | `ik_alpha` | `0.3` | EMA blend factor on IK output; `1.0` disables smoothing |
 | `pose_cutoff` | `2.5` Hz | Pole of the lag-compensated low-pass on raw VR poses (tremor rejection before IK) |
-| `record` | `None` | File prefix for the teleop flight recorder; captures every pipeline stage to `<prefix>_{ik,cmd,meas}.npz` (latest engage→disengage segment, written at disengage) for `axol diag.teleop-jitter` |
+| `record` | `None` | File prefix for the teleop flight recorder; captures every pipeline stage to `<prefix>_{ik,cmd,meas,rt}.npz` for `axol diag.teleop-jitter`. The compact `rt` stage contains the Rust core's actual 240 Hz motor command, derivative/feedforward/damping terms, timing, and feedback. All stages retain the latest engage→disengage segment; Python stages write at disengage and the Rust stage finalizes when the core disarms. |
 | `position_multiplier` | `1.0` | Scale on hand **position** (not orientation): the EE target moves this many times as far as the hand. `>1` extends reach when the arm is longer than the operator's |
 | `rotation_multiplier` | `1.0` | Scale on hand **orientation** (not position): the EE target rotates this many times as far as the hand. `>1` rotates the arm further than the wrist |
 | `reset_speed` | `0.1 rev/s` | Average joint velocity of the worst-case joint during return-to-rest (peak is `1.5×` this) |

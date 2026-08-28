@@ -167,8 +167,10 @@ the limp contact hold, and the replanned reset all run against the core.
 
 ### Control-term tracing
 
-Set `AXOL_RT_TRACE` to a path prefix to capture one CSV per arm without doing
-file I/O on the realtime threads:
+`axol teleop --teleop.record NAME` automatically gates this trace to the
+latest engaged segment and compacts both arms into `NAME_rt.npz` on teardown.
+For low-level runs outside teleop, set `AXOL_RT_TRACE` to a path prefix to
+capture one raw CSV per arm without doing file I/O on the realtime threads:
 
 ```bash
 AXOL_RT_TRACE=/tmp/axol-run axol teleop

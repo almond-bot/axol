@@ -68,6 +68,10 @@
 //!                     the pose-scaled inertia feedforward gain (Nm·s²/rad);
 //!                     slot 7 is the gripper (p_des motor-frame, max_speed
 //!                     rad/s, max_torque Nm, then six zeros)
+//! - `R` + binary      flight-recorder gate: enabled u8 and, on enable, the
+//!                     Python monotonic timestamp f64 LE. A rising edge
+//!                     truncates the previous segment and starts a gated
+//!                     `AXOL_RT_TRACE`; disable stops adding rows.
 //! - `D`               disarm: disable motors, threads exit
 //!
 //! Rust -> Python:
@@ -102,7 +106,7 @@
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -208,9 +212,57 @@ struct TraceRow {
 
 type TraceHandle = JoinHandle<io::Result<()>>;
 
+enum TraceMsg {
+    /// Discard the previous engage segment and start the file over.  This
+    /// mirrors the Python flight recorder's latest-segment semantics.
+    Reset,
+    Row(TraceRow),
+}
+
+fn trace_file(path: &PathBuf) -> io::Result<io::BufWriter<std::fs::File>> {
+    let mut out = io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(
+        out,
+        "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
+    )?;
+    Ok(out)
+}
+
+fn write_trace_row(out: &mut io::BufWriter<std::fs::File>, r: TraceRow) -> io::Result<()> {
+    writeln!(
+        out,
+        "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
+        r.tick,
+        r.time_s,
+        r.seq,
+        r.slot,
+        r.motor_id,
+        r.mode,
+        r.target_p,
+        r.cmd_p,
+        r.cmd_v,
+        r.cmd_a,
+        r.cmd_v_fast,
+        r.meas_p,
+        r.motor_v,
+        r.meas_v,
+        r.meas_tau,
+        r.gravity_ff,
+        r.friction_ff,
+        r.inertia_ff,
+        r.damping_ff,
+        r.total_ff,
+        r.kd_host,
+        r.damp_w0,
+        r.damp_q,
+        r.tick_dt,
+        r.fb_dt,
+    )
+}
+
 fn start_trace_writer(
     side: u8,
-) -> io::Result<Option<(mpsc::SyncSender<TraceRow>, TraceHandle, PathBuf)>> {
+) -> io::Result<Option<(mpsc::SyncSender<TraceMsg>, TraceHandle, PathBuf)>> {
     let Ok(prefix) = std::env::var("AXOL_RT_TRACE") else {
         return Ok(None);
     };
@@ -222,46 +274,20 @@ fn start_trace_writer(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = std::fs::File::create(&path)?;
     // About 17 seconds of headroom per arm at 240 Hz x 7 joints. A full
     // channel never blocks the control loop: samples are dropped and counted.
-    let (tx, rx) = mpsc::sync_channel::<TraceRow>(28_000);
+    let (tx, rx) = mpsc::sync_channel::<TraceMsg>(28_000);
+    let writer_path = path.clone();
     let handle = std::thread::spawn(move || -> io::Result<()> {
-        let mut out = io::BufWriter::new(file);
-        writeln!(
-            out,
-            "tick,time_s,seq,slot,motor_id,mode,target_p,cmd_p,cmd_v,cmd_a,cmd_v_fast,meas_p,motor_v,meas_v,meas_tau,gravity_ff,friction_ff,inertia_ff,damping_ff,total_ff,kd_host,damp_w0,damp_q,tick_dt,fb_dt"
-        )?;
-        for r in rx {
-            writeln!(
-                out,
-                "{},{:.9},{},{},{},{:.1},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.9},{:.9}",
-                r.tick,
-                r.time_s,
-                r.seq,
-                r.slot,
-                r.motor_id,
-                r.mode,
-                r.target_p,
-                r.cmd_p,
-                r.cmd_v,
-                r.cmd_a,
-                r.cmd_v_fast,
-                r.meas_p,
-                r.motor_v,
-                r.meas_v,
-                r.meas_tau,
-                r.gravity_ff,
-                r.friction_ff,
-                r.inertia_ff,
-                r.damping_ff,
-                r.total_ff,
-                r.kd_host,
-                r.damp_w0,
-                r.damp_q,
-                r.tick_dt,
-                r.fb_dt,
-            )?;
+        let mut out = trace_file(&writer_path)?;
+        for msg in rx {
+            match msg {
+                TraceMsg::Reset => {
+                    out.flush()?;
+                    out = trace_file(&writer_path)?;
+                }
+                TraceMsg::Row(row) => write_trace_row(&mut out, row)?,
+            }
         }
         out.flush()
     });
@@ -445,6 +471,21 @@ fn parse_target(payload: &[u8]) -> io::Result<(u8, Target)> {
     ))
 }
 
+fn parse_record_gate(payload: &[u8]) -> io::Result<Option<f64>> {
+    match payload {
+        [0] => Ok(None),
+        [1, timestamp @ ..] if timestamp.len() == 8 => {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(timestamp);
+            Ok(Some(f64::from_le_bytes(raw)))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record gate: expected enabled byte plus optional f64 timestamp",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -472,6 +513,17 @@ mod tests {
         // Wrong size (the previous 8-field layout) must be rejected, not
         // misparsed — a version-skewed client fails loudly.
         assert!(parse_target(&payload[..1 + 4 + N_SLOTS * 8 * 8]).is_err());
+    }
+
+    #[test]
+    fn parse_record_gate_roundtrip() {
+        let timestamp = 87_419.125f64;
+        let mut enabled = vec![1];
+        enabled.extend_from_slice(&timestamp.to_le_bytes());
+        assert_eq!(parse_record_gate(&enabled).unwrap(), Some(timestamp));
+        assert_eq!(parse_record_gate(&[0]).unwrap(), None);
+        assert!(parse_record_gate(&[1]).is_err());
+        assert!(parse_record_gate(&[0, 0]).is_err());
     }
 
     /// Live stall-detection check against a real interface whose bus has no
@@ -653,6 +705,13 @@ pub fn run(socket_path: &str) -> io::Result<()> {
         Mutex::new(TargetSlot::default()),
         Mutex::new(TargetSlot::default()),
     ]);
+    // A normal `--teleop.record` launch sets AXOL_RT_TRACE_GATED and uses
+    // `R` messages to retain only the latest engaged segment. A manually set
+    // AXOL_RT_TRACE remains the low-level always-on escape hatch.
+    let trace_gated = std::env::var_os("AXOL_RT_TRACE_GATED").is_some();
+    let trace_enabled = Arc::new(AtomicBool::new(!trace_gated));
+    let trace_generation = Arc::new(AtomicU64::new(u64::from(!trace_gated)));
+    let trace_origin_bits = Arc::new(AtomicU64::new(0.0f64.to_bits()));
     let stop = Arc::new(AtomicBool::new(false));
     // 0 = running, 1 = fault (set by a bus thread on abort).
     let fault = Arc::new(AtomicU8::new(0));
@@ -743,11 +802,25 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     let targets = Arc::clone(&targets);
                     let stop = Arc::clone(&stop);
                     let fault = Arc::clone(&fault);
+                    let trace_enabled = Arc::clone(&trace_enabled);
+                    let trace_generation = Arc::clone(&trace_generation);
+                    let trace_origin_bits = Arc::clone(&trace_origin_bits);
                     let out_tx = out_tx.clone();
                     let ready_tx = ready_tx.clone();
                     bus_threads.push(std::thread::spawn(move || {
                         bus_loop(
-                            &iface, side, &specs, &cfg, &targets, &stop, &fault, &out_tx, &ready_tx,
+                            &iface,
+                            side,
+                            &specs,
+                            &cfg,
+                            &targets,
+                            &stop,
+                            &fault,
+                            &trace_enabled,
+                            &trace_generation,
+                            &trace_origin_bits,
+                            &out_tx,
+                            &ready_tx,
                         )
                     }));
                 }
@@ -779,6 +852,18 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     if side <= 1 {
                         targets[side as usize].lock().unwrap().target = Some(target);
                     }
+                }
+                Err(err) => {
+                    loop_err = Some(err);
+                    break;
+                }
+            },
+            b'R' => match parse_record_gate(body) {
+                Ok(None) => trace_enabled.store(false, Ordering::Release),
+                Ok(Some(timestamp)) => {
+                    trace_origin_bits.store(timestamp.to_bits(), Ordering::Release);
+                    trace_generation.fetch_add(1, Ordering::AcqRel);
+                    trace_enabled.store(true, Ordering::Release);
                 }
                 Err(err) => {
                     loop_err = Some(err);
@@ -825,6 +910,9 @@ fn bus_loop(
     targets: &[Mutex<TargetSlot>; 2],
     stop: &AtomicBool,
     fault: &AtomicU8,
+    trace_enabled: &AtomicBool,
+    trace_generation: &AtomicU64,
+    trace_origin_bits: &AtomicU64,
     out_tx: &mpsc::Sender<Vec<u8>>,
     ready_tx: &mpsc::Sender<io::Result<()>>,
 ) -> io::Result<()> {
@@ -961,7 +1049,13 @@ fn bus_loop(
     let _ = sock.set_send_timeout(Duration::from_millis(20));
 
     let start = Instant::now() + period;
-    let trace_epoch = start;
+    let mut trace_epoch = start;
+    let mut trace_origin_s = f64::from_bits(trace_origin_bits.load(Ordering::Acquire));
+    let mut trace_generation_seen = if trace_enabled.load(Ordering::Acquire) {
+        trace_generation.load(Ordering::Acquire)
+    } else {
+        0
+    };
     let result = (|| -> io::Result<()> {
         loop {
             if stop.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
@@ -1020,6 +1114,30 @@ fn bus_loop(
             // a late tick then damps over the interval it actually covers).
             let tick_dt = prev_tick.map_or(0.0, |p| began.duration_since(p).as_secs_f64());
             prev_tick = Some(began);
+
+            // The user-facing flight recorder gates the verbose core trace to
+            // the same engage segment as IK/cmd/meas. On each new segment the
+            // writer truncates its prior file, preserving latest-only
+            // semantics without any formatting or disk I/O on this thread.
+            let mut trace_this_tick = trace_enabled.load(Ordering::Acquire);
+            if trace_this_tick {
+                let generation = trace_generation.load(Ordering::Acquire);
+                if generation != trace_generation_seen {
+                    let reset = trace_tx
+                        .as_ref()
+                        .is_some_and(|tx| tx.try_send(TraceMsg::Reset).is_ok());
+                    if reset {
+                        trace_generation_seen = generation;
+                        trace_epoch = began;
+                        trace_origin_s = f64::from_bits(trace_origin_bits.load(Ordering::Acquire));
+                    } else {
+                        // Never write a new segment behind stale rows. Retry
+                        // the reset next tick if the background queue is full.
+                        trace_this_tick = false;
+                        trace_dropped += 1;
+                    }
+                }
+            }
 
             // Send all commands back-to-back.
             let mut sent = 0usize;
@@ -1084,10 +1202,11 @@ fn bus_loop(
                     };
                     let damping_ff = c.kd_host * v_damp;
                     let t_ff = c.t_ff + friction_ff + inertia_ff + damping_ff;
-                    if trace_tx.is_some() {
+                    if trace_this_tick && trace_tx.is_some() {
                         trace_pending[m.slot] = Some(TraceRow {
                             tick: ticks,
-                            time_s: began.saturating_duration_since(trace_epoch).as_secs_f64(),
+                            time_s: trace_origin_s
+                                + began.saturating_duration_since(trace_epoch).as_secs_f64(),
                             seq: last_seq.unwrap_or(0),
                             slot: m.slot,
                             motor_id: m.id,
@@ -1227,7 +1346,7 @@ fn bus_loop(
                     row.meas_v = meas_v;
                     row.meas_tau = tau;
                     row.fb_dt = fb_dt;
-                    match tx.try_send(row) {
+                    match tx.try_send(TraceMsg::Row(row)) {
                         Ok(()) => {}
                         Err(mpsc::TrySendError::Full(_)) => trace_dropped += 1,
                         Err(mpsc::TrySendError::Disconnected(_)) => trace_dropped += 1,

@@ -11,7 +11,8 @@ sharing one monotonic clock:
 
     <prefix>_ik.npz    raw VR pose -> filtered pose -> EE target -> IK output
     <prefix>_cmd.npz   segment target -> EMA -> final guarded command
-    <prefix>_meas.npz  measured joints/torques (240 Hz Rust, 120 Hz Python)
+    <prefix>_meas.npz  measured joints/torques from Rust at 240 Hz
+    <prefix>_rt.npz    Rust tracker, motor command, fast torque terms + timing
 
 For every signal at every stage boundary this script resamples to a uniform
 grid, splits the motion into frequency bands, and prints where the
@@ -148,7 +149,9 @@ def _engaged_window(ik: dict[str, np.ndarray] | None) -> tuple[float, float] | N
 
 def _clip(data: dict[str, np.ndarray], span: tuple[float, float]) -> dict:
     m = (data["t"] >= span[0]) & (data["t"] <= span[1])
-    return {k: v[m] for k, v in data.items()}
+    return {
+        k: v[m] if np.ndim(v) > 0 and len(v) == len(m) else v for k, v in data.items()
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -170,6 +173,7 @@ def main(argv: list[str] | None = None) -> None:
     ik = _load(args.prefix, "ik")
     cmd = _load(args.prefix, "cmd")
     meas = _load(args.prefix, "meas")
+    rt = _load(args.prefix, "rt")
 
     span = None if args.full else _engaged_window(ik)
     if span is not None:
@@ -177,6 +181,7 @@ def main(argv: list[str] | None = None) -> None:
         ik = _clip(ik, span) if ik is not None else None
         cmd = _clip(cmd, span) if cmd is not None else None
         meas = _clip(meas, span) if meas is not None else None
+        rt = _clip(rt, span) if rt is not None else None
     else:
         print("analysis window: full capture")
 
@@ -201,6 +206,11 @@ def main(argv: list[str] | None = None) -> None:
             )
 
     # -- Joint-space stages (mdeg): IK q -> tgt -> ema -> out -> measured --
+    if rt is not None and len(rt["t"]) > 64:
+        first_joint = (rt["side"] == rt["side"][0]) & (rt["slot"] == 0)
+        rate = 1.0 / np.median(np.diff(rt["t"][first_joint]))
+        print(f"\nRust internal trace: {len(rt['t'])} joint rows at ~{rate:.0f} Hz")
+
     for arm_i, arm in enumerate(("left", "right")):
         sigs: dict[str, np.ndarray] = {}
         ts: dict[str, np.ndarray] = {}
@@ -217,6 +227,18 @@ def main(argv: list[str] | None = None) -> None:
             if meas is not None:
                 sigs[f"meas    {jn}"] = meas["qm"][:, arm_i * 8 + ji]
                 ts[f"meas    {jn}"] = meas["t"]
+            if rt is not None:
+                rm = (rt["side"] == arm_i) & (rt["slot"] == ji)
+                if "mode" in rt:
+                    rm &= rt["mode"] >= 0.5
+                if np.count_nonzero(rm) > 64:
+                    for stage, field in (
+                        ("rt tgt", "target_p"),
+                        ("rt cmd", "cmd_p"),
+                        ("rt meas", "meas_p"),
+                    ):
+                        sigs[f"{stage:<7} {jn}"] = rt[field][rm]
+                        ts[f"{stage:<7} {jn}"] = rt["t"][rm]
         if not sigs:
             continue
         print(f"\n===== {arm} arm, joint-space stages (mdeg RMS) =====")
@@ -245,6 +267,40 @@ def main(argv: list[str] | None = None) -> None:
             if sigs:
                 _print_table(
                     f"Measured torque — {arm} arm", meas["t"], sigs, 1.0, "Nm RMS"
+                )
+
+    # -- In-core torque attribution ---------------------------------------
+    if rt is not None and len(rt["t"]) > 64:
+        for arm_i, arm in enumerate(("left", "right")):
+            print(f"\nRust torque terms — {arm} arm (3-15 Hz RMS Nm)")
+            print(
+                f"  {'joint':<12} {'gravity':>9} {'friction':>9} "
+                f"{'inertia':>9} {'damping':>9} {'total':>9} {'damp W':>10}"
+            )
+            for ji, jn in enumerate(ARM_JOINT_NAMES):
+                if not joint_ok(jn):
+                    continue
+                rm = (rt["side"] == arm_i) & (rt["slot"] == ji)
+                if "mode" in rt:
+                    rm &= rt["mode"] >= 0.5
+                if np.count_nonzero(rm) <= 64:
+                    continue
+                mids = []
+                for field in (
+                    "gravity_ff",
+                    "friction_ff",
+                    "inertia_ff",
+                    "damping_ff",
+                    "total_ff",
+                ):
+                    mids.append(_band_rms(rt["t"][rm], rt[field][rm])[1])
+                # Negative power is dissipative; positive means the host
+                # damping term is feeding motion at the frequencies present.
+                power = float(np.nanmean(rt["damping_ff"][rm] * rt["meas_v"][rm]))
+                print(
+                    f"  {jn:<12} "
+                    + " ".join(f"{value:9.4f}" for value in mids)
+                    + f" {power:+10.5f}"
                 )
 
     print(

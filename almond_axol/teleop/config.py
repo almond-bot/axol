@@ -155,12 +155,14 @@ class VRTeleopConfig:
             motion.build`` finds it; a path prefix (``/tmp/jit``) is used
             verbatim.  When set, every stage of the teleop pipeline — raw
             VR pose, filtered pose, IK output, smoothed command, measured
-            joints — is captured to ``<prefix>_{ik,cmd,meas}.npz``. The
-            measured stage runs at the native 240 Hz Rust-core rate. The
-            capture covers the **latest engage→disengage segment** (last
-            ~5 minutes of it): recording starts at engagement, disengaging
-            writes the files, and re-engaging starts the segment over.  The
-            same prefix overwrites on the next run.  For ``axol
+            joints, and the Rust core's motor-facing command/torque internals
+            — is captured to ``<prefix>_{ik,cmd,meas,rt}.npz``. The measured
+            and Rust stages run at the native 240 Hz core rate. The capture
+            covers the **latest engage→disengage segment** (last ~5 minutes
+            of it): recording starts at engagement, Python stages write on
+            disengage, the compact Rust stage finalizes when the core disarms,
+            and re-engaging starts the segment over. The same prefix overwrites
+            on the next run. For ``axol
             motion.build`` or ``axol diag.offline``.  ``None`` (the
             default) disables recording entirely.
     """
