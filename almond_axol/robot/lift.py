@@ -1,5 +1,5 @@
 """
-Telescoping lift on the powered Axol Cart — jelly_legs CAN driver.
+Telescoping lift on Jelly — jelly_legs CAN driver.
 
 The lift legs are driven by our own PCB (firmware: ``jelly_legs`` in the
 circuits-py repo, ``designs/jelly_legs/firmware``), which replaced the
@@ -112,7 +112,7 @@ def _decode_status(data: bytes) -> LiftStatus:
 class Lift:
     """Hold-to-move lift commands over the chest CAN bus.
 
-    Typical usage (from :class:`almond_axol.robot.cart.Cart`)::
+    Typical usage (from :class:`almond_axol.robot.jelly.Jelly`)::
 
         lift = Lift()
         await lift.start()
@@ -229,7 +229,7 @@ class Lift:
         """Latch the commanded direction. +1 = up, 0 = stop, -1 = down.
 
         Safe to call from any thread at any rate (a latch, like
-        ``Cart.set_command``); the driver task consumes the latest value.
+        ``Jelly.set_command``); the driver task consumes the latest value.
         Should the caller die mid-hold, the firmware's 300 ms jog deadman
         stops the legs on its own.
         """

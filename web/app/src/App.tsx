@@ -285,7 +285,7 @@ function PoseVisualizer() {
 //     and move your hands apart (bigger) or together (smaller).
 //   - Reset: press B (right controller) to re-anchor every screen to the
 //     current gaze and clear all moves + resizes. (The thumbstick clicks are
-//     reserved for the powered cart's lift.)
+//     reserved for the Jelly's lift.)
 //
 // The screens behave like TVs: they are world-anchored where the operator was
 // looking when the session started, so the head can move freely while the
@@ -516,7 +516,7 @@ function ImmersiveCameraFeed({ wsRef }: { wsRef: RefObject<WebSocket | null> }) 
 
     // Pressing B on the right controller (buttons[5]) re-anchors the screens
     // to the current gaze and clears every move + resize. The thumbstick
-    // clicks (buttons[3]) are reserved for the powered cart's lift.
+    // clicks (buttons[3]) are reserved for the Jelly's lift.
     const reanchorPressed = right?.gamepad?.buttons?.[5]?.pressed ?? false
     if (reanchorPressed && !reanchorPrevRef.current) {
       anchoredRef.current = false

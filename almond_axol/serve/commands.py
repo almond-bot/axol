@@ -298,7 +298,7 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "Teleoperation",
         "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or cart-only to drive just the powered cart.",
+        "browser without hardware, or Jelly-only to drive just Jelly.",
         "Operate",
         "draccus",
         _teleop,

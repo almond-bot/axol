@@ -267,16 +267,16 @@ SETTINGS: tuple[SettingCategory, ...] = (
             ),
             SettingDef(
                 key="robot.cart_enabled",
-                label="Powered cart",
+                label="Jelly",
                 type="boolean",
                 help=(
-                    "This robot has the powered cart (x-drive omni base + "
+                    "This robot has Jelly (x-drive omni base + "
                     "telescoping lift). The headset thumbsticks then drive it "
                     "during teleop and data collection: left stick translates, "
                     "right stick x rotates, stick clicks run the lift. "
-                    "Operator mobility only — cart motion is never recorded "
-                    "into datasets and policies never control it. Cart "
-                    "parameters live under Advanced → Cart."
+                    "Operator mobility only — Jelly motion is never recorded "
+                    "into datasets and policies never control it. Jelly "
+                    "parameters live under Advanced → Jelly."
                 ),
                 targets={
                     "teleop": ("cart.enabled",),
@@ -807,7 +807,7 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
     ),
     AdvancedSection(
         key="cart",
-        label="Cart",
+        label="Jelly",
         ref_op="teleop",
         ref_prefix="cart",
         targets={"teleop": "cart", "collect-data": f"{_TELEOP_CFG}.cart"},

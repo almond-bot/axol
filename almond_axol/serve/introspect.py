@@ -74,6 +74,8 @@ class Schema:
 
 
 def _humanize(key: str) -> str:
+    if key == "cart_only":
+        return "Jelly only"
     return key.replace("_", " ")
 
 

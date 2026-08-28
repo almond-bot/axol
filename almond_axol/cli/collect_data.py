@@ -736,7 +736,7 @@ def _run(
         else:
             _register_camera_video(robot, teleop)
 
-        # Cart heading hold: feed the carrier board's BMI088 yaw rate to the
+        # Jelly heading hold: feed the carrier board's BMI088 yaw rate to the
         # cart, same as native teleop (see almond_axol.robot.gyro — nothing
         # here touches the video path). Best-effort: on failure the hold is
         # simply inert (no yaw rates arrive), which the cart logs once driving.

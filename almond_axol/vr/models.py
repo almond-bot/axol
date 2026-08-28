@@ -93,8 +93,8 @@ class VRFrame(BaseModel):
             omit the field) keep the previous always-trusted behaviour.
         r_tracked: Same as ``l_tracked`` for the right controller.
         l_stick_x: Left thumbstick x, [-1, 1], right = +1. With ``l_stick_y``
-            it drives the powered cart's translation when one is configured
-            (see :class:`almond_axol.robot.cart.Cart`). Neutral defaults keep
+            it drives Jelly's translation when one is configured
+            (see :class:`almond_axol.robot.jelly.Jelly`). Neutral defaults keep
             older web builds (which omit the stick fields) fully compatible.
         l_stick_y: Left thumbstick y, [-1, 1], pushed forward = -1 (WebXR
             xr-standard convention, same as a gamepad).

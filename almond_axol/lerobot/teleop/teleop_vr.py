@@ -52,7 +52,7 @@ from lerobot.teleoperators.utils import TeleopEvents
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ...constants import Joint
-from ...robot.cart import Cart
+from ...robot.jelly import Jelly
 from ...teleop.core import VRTeleopCore
 from ...teleop.worker import run_ik_worker
 from ...vr.models import VRFrame, VRState
@@ -115,12 +115,12 @@ class AxolVRTeleop(Teleoperator):
             config.vr_teleop_config, _logger, self._broadcast_tracking
         )
 
-        # Powered cart (x-drive base + telescoping lift), operator-only
+        # Jelly (x-drive base + telescoping lift), operator-only
         # mobility on robots that have one: the thumbsticks reposition the
-        # base/lift during a session, exactly as in native teleop. Cart state
+        # base/lift during a session, exactly as in native teleop. Jelly state
         # is NOT part of the action/observation space — it is never recorded
         # into the dataset and policies never control it.
-        self._cart: Cart | None = Cart(config.cart) if config.cart.enabled else None
+        self._cart: Jelly | None = Jelly(config.cart) if config.cart.enabled else None
 
         # Last smoothed command; protected by _q_lock so concurrent get_action
         # calls serialize (only the control loop calls it, so uncontended).
@@ -189,12 +189,12 @@ class AxolVRTeleop(Teleoperator):
         return True
 
     @property
-    def cart(self) -> Cart | None:
-        """The powered cart when configured (operator-only mobility), else None.
+    def cart(self) -> Jelly | None:
+        """Jelly when configured (operator-only mobility), else None.
 
         Exposed so the collect-data entry point can wire the video relay's
-        ZED IMU samples into the cart's heading hold. Deliberately absent
-        from ``action_features``: the cart is never part of the dataset.
+        ZED IMU samples into Jelly's heading hold. Deliberately absent
+        from ``action_features``: Jelly is never part of the dataset.
         """
         return self._cart
 
@@ -252,7 +252,7 @@ class AxolVRTeleop(Teleoperator):
         await self._vr_server.enable()
 
         if self._cart is not None:
-            # Runs on this dedicated event loop, so the cart's command task
+            # Runs on this dedicated event loop, so Jelly's command task
             # lives here too — off the caller's synchronous control loop.
             await self._cart.enable()
 
@@ -356,7 +356,7 @@ class AxolVRTeleop(Teleoperator):
             try:
                 await self._cart.disable()
             except Exception:  # noqa: BLE001 - never block the VR teardown
-                _logger.exception("cart disable failed")
+                _logger.exception("Jelly disable failed")
 
         if self._vr_server is not None:
             await self._vr_server.disable()
@@ -660,7 +660,7 @@ class AxolVRTeleop(Teleoperator):
         self._core.note_frame_reset(frame.reset)
 
         if self._cart is not None:
-            # Shared stick → cart mapping (see Cart.apply_vr_frame). Resets
+            # Shared stick → Jelly mapping (see Jelly.apply_vr_frame). Resets
             # force a stop so the base doesn't creep during return-to-rest.
             self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
 

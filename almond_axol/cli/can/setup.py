@@ -14,7 +14,7 @@ Up to four Axol buses, every one of them optional and independent:
     CAN channels on a single USB device:
       channel 0 (dev_id 0x0) -> can_alm_axol_l  (left arm)
       channel 1 (dev_id 0x1) -> can_alm_axol_r  (right arm)
-  - The powered cart's wheel bus: a single-channel candlelight adapter
+  - Jelly's wheel bus: a single-channel candlelight adapter
     (same generic VID/PID) carrying the four Damiao wheel motors at CAN
     IDs 0x01-0x04, named can_alm_axol_b.
   - The chest bus: another single-channel adapter, carrying the jelly_legs
@@ -501,7 +501,7 @@ def _write_udev_rules(
     # variants ship various VID/PIDs, and the serial already identifies the
     # exact adapter.
     for label, name, serial in (
-        ("Powered-cart wheel bus", _CAN_B, wheels_serial),
+        ("Jelly wheel bus", _CAN_B, wheels_serial),
         ("Chest bus (jelly_legs lift controller)", _CAN_C, chest_serial),
     ):
         if not serial:
@@ -978,7 +978,7 @@ def _find_single_serials(
     wheels_owner = wheels if wheels in attached else None
     chest_owner = chest if chest in attached else None
     for label, serial, owner in (
-        ("Cart wheel bus", wheels, wheels_owner),
+        ("Jelly wheel bus", wheels, wheels_owner),
         ("Chest bus", chest, chest_owner),
     ):
         if owner:

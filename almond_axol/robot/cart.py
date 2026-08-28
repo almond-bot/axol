@@ -1,6 +1,6 @@
-"""Powered Axol Cart: x-drive omni wheel base + telescoping lift.
+"""Jelly: x-drive omni-wheel base + telescoping lift.
 
-The powered cart has four omni wheels mounted at 45° on the corners (an
+Jelly has four omni wheels mounted at 45° on the corners (an
 x-drive), each driven by a Damiao motor in VELOCITY mode on a dedicated
 CAN bus, plus a telescoping lift driven by the jelly_legs board on its own
 chest CAN bus (see :mod:`almond_axol.robot.lift`). Wheel CAN IDs are
@@ -9,11 +9,11 @@ fixed by convention:
     id 1  front-left      id 2  front-right
     id 3  back-left       id 4  back-right
 
-:class:`Cart` exposes a latched command interface: any thread calls
-:meth:`Cart.set_command` with a normalized body velocity + lift direction,
-and an internal asyncio task (started by :meth:`Cart.enable`) applies slew
+:class:`Jelly` exposes a latched command interface: any thread calls
+:meth:`Jelly.set_command` with a normalized body velocity + lift direction,
+and an internal asyncio task (started by :meth:`Jelly.enable`) applies slew
 limiting, x-drive mixing, and the park/unpark state machine at
-``CartConfig.frequency``:
+``JellyConfig.frequency``:
 
 - While the command is non-zero the wheels track it in VELOCITY mode.
 - When the slew-limited command reaches zero (and the wheels are measured
@@ -36,7 +36,7 @@ limit.
 
 Body-frame convention: +x forward, +y left, +wz counter-clockwise. The
 mixing assumes each wheel's positive spin has a forward (+x) component;
-if a wheel runs backwards on your cart, flip its entry in
+if a wheel runs backwards on Jelly, flip its entry in
 :data:`WHEEL_SIGNS`.
 """
 
@@ -57,8 +57,8 @@ from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
 
 _logger = logging.getLogger(__name__)
 
-# The cart's wheels ride their own CAN interface, separate from the arm buses.
-# ``axol can.setup`` names the cart's adapter to this and includes it in the
+# Jelly's wheels ride their own CAN interface, separate from the arm buses.
+# ``axol can.setup`` names Jelly's adapter to this and includes it in the
 # @reboot bring-up alongside the arm channels.
 DEFAULT_CHANNEL = CAN_BASE
 
@@ -77,13 +77,13 @@ _SESSION_PMAX = 400.0
 # the velocity loop hasn't fully braked when the command reaches zero).
 _PARK_MAX_WHEEL_SPEED = 0.5
 
-# Rate of the per-cycle heading-hold trace line (CartConfig.yaw_log). The
+# Rate of the per-cycle heading-hold trace line (JellyConfig.yaw_log). The
 # hold's dynamics are ~1 s, so this resolves them without flooding a console
 # the 50 Hz command loop has to keep up with.
 _YAW_TRACE_HZ = 10.0
 
 # Seconds of driving with the IMU requested but no yaw sample ever fed
-# before the cart says the heading hold is dead.
+# before Jelly says the heading hold is dead.
 _YAW_SILENT_WARN_S = 3.0
 
 
@@ -138,16 +138,16 @@ def mix(
 
 
 @dataclass
-class CartConfig:
-    """Configuration for the powered Axol Cart.
+class JellyConfig:
+    """Configuration for Jelly.
 
     Attributes:
-        enabled:         Whether this robot has a powered cart at all. Only
+        enabled:         Whether this robot has Jelly. Only
                          consulted by entry points that support both variants
-                         (``axol teleop``); code constructing a :class:`Cart`
+                         (``axol teleop``); code constructing a :class:`Jelly`
                          directly ignores it.
         channel:         SocketCAN interface for the wheel motors. ``None``
-                         disables the wheels entirely (lift-only cart).
+                         disables the wheels entirely (lift-only Jelly).
         max_speed:       Peak wheel speed (rad/s) at a full-deflection command.
         turn_scale:      Rotation weight relative to translation, in [0, 1].
         slew:            Max change of the normalized body command per second;
@@ -165,7 +165,7 @@ class CartConfig:
                          cameras — the overhead ZED keeps its gst pipeline.
         yaw_hold_gain:   Heading-hold feedback gain, normalized wz per rad of
                          heading error. While translating without a commanded
-                         rotation, the yaw rate fed via :meth:`Cart.feed_yaw_rate`
+                         rotation, the yaw rate fed via :meth:`Jelly.feed_yaw_rate`
                          is integrated into a heading error that is steered
                          back to zero. 0 disables; a *negative* gain
                          compensates a sensor whose sign convention is
@@ -173,7 +173,7 @@ class CartConfig:
                          fed (and fresh).
         yaw_hold_max:    Clamp on the heading-hold correction (normalized wz).
         yaw_log:         Trace the heading hold: a 10 Hz state line while the
-                         cart translates and a per-stroke summary of the
+                         Jelly translates and a per-stroke summary of the
                          heading it actually drifted (see :class:`_YawLog`).
                          For diagnosing drift; off in normal operation.
         deadzone:        Stick deadzone (fraction of full deflection) applied
@@ -182,14 +182,14 @@ class CartConfig:
                          0 disables parking (wheels just idle in velocity mode).
         hold_kd:         Damping (Nm·s/rad) of the parked MIT hold.
         frequency:       Wheel command task rate in Hz.
-        command_timeout: Seconds without a fresh :meth:`Cart.set_command`
+        command_timeout: Seconds without a fresh :meth:`Jelly.set_command`
                          before the target is forced to zero (and the lift
                          stopped). Protects against a dead command source.
         lift:            Whether the telescoping lift is present (the
                          jelly_legs board on the chest CAN bus, see
                          :mod:`almond_axol.robot.lift`). The chest bus being
                          down at enable time only disables the lift with a
-                         warning — the buses are independent, so a cart can
+                         warning — the buses are independent, so Jelly can
                          still drive without it.
         lift_channel:    SocketCAN interface of the chest bus carrying the
                          jelly_legs lift controller.
@@ -218,9 +218,9 @@ class CartConfig:
 
 
 class _YawLog:
-    """Per-stroke trace of the heading hold (see ``CartConfig.yaw_log``).
+    """Per-stroke trace of the heading hold (see ``JellyConfig.yaw_log``).
 
-    Fed every command cycle; emits a throttled state line while the cart is
+    Fed every command cycle; emits a throttled state line while Jelly is
     translating and a summary when the stroke ends.
 
     The number to read is the stroke's heading drift — ``yaw_err``, the
@@ -230,7 +230,7 @@ class _YawLog:
     (``diagnostics/base/floor_sim.py``); a growing one means the hold isn't
     working, and the rest of the line says why — no samples, stale samples, a
     correction pinned at ``yaw_hold_max``, or a bias being integrated into the
-    error while the cart never sits still long enough to learn it.
+    error while Jelly never sits still long enough to learn it.
     """
 
     def __init__(self) -> None:
@@ -315,12 +315,12 @@ class _YawLog:
         )
 
 
-class Cart:
-    """Latched-command controller for the powered cart (wheels + lift).
+class Jelly:
+    """Latched-command controller for Jelly (wheels + lift).
 
     Typical usage::
 
-        cart = Cart(CartConfig())
+        cart = Jelly(JellyConfig())
         await cart.enable()
         cart.set_command(vx=0.5, vy=0.0, wz=0.0, lift=0)   # from any thread
         ...
@@ -328,11 +328,11 @@ class Cart:
 
     :meth:`set_command` only latches the target; the internal command task
     owns all bus/GPIO traffic. Values are normalized to [-1, 1] (body frame:
-    +x forward, +y left, +wz CCW) and scaled by ``CartConfig.max_speed`` /
+    +x forward, +y left, +wz CCW) and scaled by ``JellyConfig.max_speed`` /
     ``turn_scale``; ``lift`` is +1 up / 0 stop / -1 down.
     """
 
-    def __init__(self, config: CartConfig = CartConfig()) -> None:
+    def __init__(self, config: JellyConfig = JellyConfig()) -> None:
         self._config = config
         self._bus: CanBus | None = None
         self._motors: list[MotorDriver] = []
@@ -361,8 +361,8 @@ class Cart:
         self.send_failed: bool = False
 
     @property
-    def config(self) -> CartConfig:
-        """The configuration this cart was constructed with (read-only use)."""
+    def config(self) -> JellyConfig:
+        """The configuration this Jelly controller uses (read-only)."""
         return self._config
 
     @property
@@ -398,7 +398,7 @@ class Cart:
             except Exception as exc:  # noqa: BLE001 - lift is best-effort
                 await lift.close()
                 _logger.warning(
-                    "cart lift: could not open the chest bus %s (%s) — "
+                    "Jelly lift: could not open the chest bus %s (%s) — "
                     "the lift is disabled for this session",
                     cfg.lift_channel,
                     exc,
@@ -436,7 +436,7 @@ class Cart:
                 for w, m in zip(WHEELS, self._motors):
                     if abs(m._p_max - _SESSION_PMAX) > 1.0:
                         _logger.warning(
-                            "cart wheel %s PMAX readback %.0f != %.0f — parking "
+                            "Jelly wheel %s PMAX readback %.0f != %.0f — parking "
                             "may misbehave",
                             w.name,
                             m._p_max,
@@ -445,7 +445,7 @@ class Cart:
                 await asyncio.gather(
                     *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
                 )
-                _logger.info("cart wheels enabled on %s", cfg.channel)
+                _logger.info("Jelly wheels enabled on %s", cfg.channel)
         except BaseException:
             # A failed enable() propagates to the caller, who never calls
             # disable() — so everything opened above must be torn down here,
@@ -464,7 +464,7 @@ class Cart:
 
         if cfg.yaw_hold_gain != 0.0:
             _logger.info(
-                "cart heading hold: gain=%.2f max=%.2f imu=%s%s",
+                "Jelly heading hold: gain=%.2f max=%.2f imu=%s%s",
                 cfg.yaw_hold_gain,
                 cfg.yaw_hold_max,
                 cfg.imu,
@@ -495,7 +495,7 @@ class Cart:
             try:
                 await asyncio.gather(*[m.disable() for m in self._motors])
             except Exception:  # noqa: BLE001 - keep teardown going
-                _logger.exception("cart wheel disable failed")
+                _logger.exception("Jelly wheel disable failed")
             self._motors = []
 
         if self._bus is not None:
@@ -505,7 +505,7 @@ class Cart:
         if self._lift is not None:
             await self._lift.close()
             self._lift = None
-        _logger.info("cart disabled")
+        _logger.info("Jelly disabled")
 
     # ------------------------------------------------------------------
     # Command interface (any thread)
@@ -522,7 +522,7 @@ class Cart:
 
         Safe to call from any thread at any rate. The command task consumes
         the latest value; if no fresh command arrives within
-        ``CartConfig.command_timeout`` the target decays to a full stop.
+        ``JellyConfig.command_timeout`` the target decays to a full stop.
         """
 
         def clamp(v: float) -> float:
@@ -531,7 +531,7 @@ class Cart:
         vx, vy, wz = clamp(vx), clamp(vy), clamp(wz)
 
         # Snap near-cardinal translation onto the axis (see
-        # CartConfig.axis_snap_deg): thumbstick flicks are rarely perfectly
+        # JellyConfig.axis_snap_deg): thumbstick flicks are rarely perfectly
         # straight, and without this the transient off-axis component steers
         # the launch direction.
         snap = math.radians(self._config.axis_snap_deg)
@@ -552,7 +552,7 @@ class Cart:
         The single source of truth for the VR control mapping, shared by
         plain teleop (``VRTeleop``) and data collection (``AxolVRTeleop``) so
         the two flows cannot drift apart. Stick deflection is the deadman:
-        the cart moves only while a stick is pushed past its deadzone (or a
+        Jelly moves only while a stick is pushed past its deadzone (or a
         stick click holds the lift), independent of the arm engage toggle.
 
         Args:
@@ -616,7 +616,7 @@ class Cart:
         if any(abs(p) > 0.9 * _SESSION_PMAX for p in positions):
             self.park_failed = True
             _logger.warning(
-                "cart wheel position near the ±PMAX mapping limit — parking "
+                "Jelly wheel position near the ±PMAX mapping limit — parking "
                 "disabled. Power-cycle the base to reset wheel positions."
             )
             return None
@@ -746,7 +746,7 @@ class Cart:
             ):
                 warned_silent = True
                 _logger.warning(
-                    "cart heading hold: no yaw samples after %.0fs of driving — "
+                    "Jelly heading hold: no yaw samples after %.0fs of driving — "
                     "the hold is inert. Check that the board gyro opened "
                     "(almond_axol.robot.gyro) earlier in this log.",
                     _YAW_SILENT_WARN_S,
@@ -798,3 +798,9 @@ class Cart:
 
             elapsed = time.perf_counter() - t_iter
             await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+# Compatibility API: existing integrations and saved config schemas retain
+# the ``cart`` key and the historical class names.
+Cart = Jelly
+CartConfig = JellyConfig

@@ -46,11 +46,11 @@ export type AxolPoseData = {
   seq?: number
   /** Capture timestamp (ms, `performance.now()`) for server-side interpolation. */
   t?: number
-  /** Left thumbstick x, [-1, 1], right = +1 — powered-cart strafe. */
+  /** Left thumbstick x, [-1, 1], right = +1 — Jelly strafe. */
   l_stick_x?: number
-  /** Left thumbstick y, [-1, 1], pushed forward = -1 — powered-cart drive. */
+  /** Left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive. */
   l_stick_y?: number
-  /** Right thumbstick x, [-1, 1], right = +1 — powered-cart rotation. */
+  /** Right thumbstick x, [-1, 1], right = +1 — Jelly rotation. */
   r_stick_x?: number
   /** Left thumbstick pressed in — lift down while held. */
   l_stick_click?: boolean

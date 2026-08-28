@@ -27,15 +27,15 @@ Runs on the **real robot by default**; pass `--sim` for the browser visualizer. 
 | Flag | Description |
 |---|---|
 | `--sim` | Use the software visualizer instead of the real robot. Bare `--sim` works (or `--sim true`). Omit to run on real hardware (the default). |
-| `--cart_only` | Drive **only** the [powered cart](#powered-cart) — the arms are never constructed and the Axol hub CAN channels are never opened, so no arm hardware need be connected. A cart is implied (`--cart.enabled` isn't consulted). Mutually exclusive with `--sim`. |
+| `--cart_only` | Drive **only** [Jelly](#powered-cart) — the arms are never constructed and the Axol hub CAN channels are never opened, so no arm hardware need be connected. Jelly is implied (`--cart.enabled` isn't consulted). Mutually exclusive with `--sim`. |
 | `--left_channel <ch\|null>` | CAN channel for the left arm; `null` disables it. Default: `CAN_LEFT`. |
 | `--right_channel <ch\|null>` | CAN channel for the right arm; `null` disables it. Default: `CAN_RIGHT`. |
-| `--cart.enabled BOOL` | This robot has the [powered cart](#powered-cart) (x-drive base + telescoping lift). When set, the headset thumbsticks drive the base/lift (operator mobility only — never recorded, never policy-controlled). Default: `false`. |
-| `--cart.channel <ch\|null>` | SocketCAN interface for the cart's wheel motors; `null` disables the wheels (lift-only). Default: `can_alm_axol_b`, pinned by [`can.setup`](/cli/can-setup). |
-| `--cart.lift BOOL` | The telescoping lift is present (the jelly_legs controller on the chest bus). The chest bus being down only disables the lift with a warning — the cart still drives. Default: `true`. |
+| `--cart.enabled BOOL` | This robot has [Jelly](#powered-cart) (x-drive base + telescoping lift). When set, the headset thumbsticks drive the base/lift (operator mobility only — never recorded, never policy-controlled). Default: `false`. |
+| `--cart.channel <ch\|null>` | SocketCAN interface for Jelly's wheel motors; `null` disables the wheels (lift-only). Default: `can_alm_axol_b`, pinned by [`can.setup`](/cli/can-setup). |
+| `--cart.lift BOOL` | The telescoping lift is present (the jelly_legs controller on the chest bus). The chest bus being down only disables the lift with a warning — Jelly still drives. Default: `true`. |
 | `--cart.lift_channel <ch>` | SocketCAN interface of the chest bus carrying the lift controller. Default: `can_alm_axol_c`, pinned by [`can.setup`](/cli/can-setup). |
-| `--cart.imu BOOL` | Feed the carrier board's IMU into the cart's straight-line heading hold as its yaw reference (independent of the cameras). Default: `false`. |
-| `--cart.<field> VALUE` | Any other cart tunable — peak wheel speed (`--cart.max_speed`), turn rate, command slew, stick deadzone, park-hold stiffness, … The full set is the `CartConfig` dataclass, and each field also appears under **Advanced → Cart** in the [control panel](/guides/control-panel#settings). |
+| `--cart.imu BOOL` | Feed the carrier board's IMU into Jelly's straight-line heading hold as its yaw reference (independent of the cameras). Default: `false`. |
+| `--cart.<field> VALUE` | Any other Jelly tunable — peak wheel speed (`--cart.max_speed`), turn rate, command slew, stick deadzone, park-hold stiffness, … The full set is the `JellyConfig` (`CartConfig` compatibility alias) dataclass, and each field also appears under **Advanced → Jelly** in the [control panel](/guides/control-panel#settings). |
 | `--axol.left_stiffness S` | Compliance blend for the left arm in `[0, 1]`. Scalar (`0.8`) or a 7-element list (`[1.0,1.0,0.8,0.8,0.5,0.5,0.2]`, one per arm joint in `Joint` enum order). `1` (default) = the tuned production gains; lower only adds compliance, down to fully hand-guidable at `0`. See [`AxolConfig.left_stiffness`](/api/robot). |
 | `--axol.right_stiffness S` | Same, for the right arm. |
 | `--axol.left.gripper.torque_limit FLOAT` | Max torque (Nm) for the left gripper in POSITION_FORCE mode (default: 0.5). Use `right` for the right gripper. |
@@ -67,8 +67,8 @@ axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
 axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
 axol teleop --teleop.rotation_multiplier 2.0      # scale hand rotation 2x
 axol teleop --left_channel null                   # disable the left arm
-axol teleop --cart.enabled true                   # drive the powered cart from the thumbsticks
-axol teleop --cart_only                            # drive only the cart (no arms, no hub)
+axol teleop --cart.enabled true                   # drive Jelly from the thumbsticks
+axol teleop --cart_only                            # drive only Jelly (no arms, no hub)
 axol teleop --cameras "{overhead: 41234567, left_arm: 41234568, right_arm: 41234569}"
 axol teleop --cameras "{overhead: 41234567}"      # stereo overhead auto-detected, per-lens
 axol teleop --config_path my_teleop.json          # whole-config file
@@ -84,11 +84,13 @@ The whole relay — camera grab/encode plus WebRTC sending — runs in a **dedic
 
 For low-latency encode the NVENC/VIC engine clocks must be pinned to their maximum (the default Jetson devfreq governor scales them for throughput, not latency, which roughly triples per-frame encode time). This is handled by [`axol jetson.setup`](/cli/jetson-setup), run at boot by the installer's systemd unit — not at teleop startup. If no GStreamer hardware encoder is present at all, aiortc falls back to software H.264 — `SVGA` is then the recommended resolution.
 
-## Powered cart
+<a id="powered-cart"></a>
 
-Robots fitted with the **powered Axol Cart** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Enable it with `--cart.enabled true` (or the control panel's **Powered cart** toggle); the cart's own parameters live on the nested `cart` config (`--cart.max_speed`, `--cart.channel`, `--cart.imu`, …). Cart motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
+## Jelly
 
-`--cart_only` runs *just* the cart: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive the cart around without the arm hardware connected. The cart brings its own CAN interface up on start ([`can.setup`](/cli/can-setup) pins it as `can_alm_axol_b`), so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#powered-cart).
+Robots fitted with **Jelly** (x-drive omni base + telescoping lift) let the operator drive the whole robot from the headset thumbsticks — left stick translates, right stick rotates, the stick clicks run the lift. Enable it with `--cart.enabled true` (or the control panel's **Jelly** toggle); Jelly parameters retain the nested `cart` config key (`--cart.max_speed`, `--cart.channel`, `--cart.imu`, …) for compatibility. Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never drives it.
+
+`--cart_only` runs *just* Jelly: the arms are never constructed and the Axol hub CAN bus is never opened, so you can drive Jelly without the arm hardware connected. Jelly brings its own CAN interface up on start ([`can.setup`](/cli/can-setup) pins it as `can_alm_axol_b`), so no separate [`can.enable`](/cli/can-enable) step is needed. For the full control mapping see the [VR interface guide](/guides/vr-interface#powered-cart).
 
 <Note>
   This command takes its config via draccus, not fixed `argparse` flags. Field names use underscores, nested fields are dot-separated, `None` is `null`, and lists use `[a,b,c]` — see [Command configuration](/cli/configuration) for the full model.

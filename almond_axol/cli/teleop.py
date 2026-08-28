@@ -11,8 +11,8 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
-    axol teleop --cart.enabled true                   # powered cart (base+lift)
-    axol teleop --cart_only                           # drive just the cart, arms untouched
+    axol teleop --cart.enabled true                   # Jelly (base + lift)
+    axol teleop --cart_only                           # drive just Jelly, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
 """
 
@@ -267,7 +267,7 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
 
 
 def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
-    """Feed the cart's heading hold from the board BMI088 (``--cart.imu``).
+    """Feed Jelly's heading hold from the board BMI088 (``--cart.imu``).
 
     The yaw reference is the carrier board's own IMU rather than a camera, so
     nothing here touches the video path — the overhead ZED keeps the relay's
@@ -275,8 +275,8 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
 
     Returns a :class:`~almond_axol.robot.gyro.BoardYawRateSource` the caller
     must close on exit, or ``None``. Best-effort: any failure logs and leaves
-    the cart without a heading hold (which is inert when no yaw rates arrive,
-    and says so once the cart starts driving).
+    Jelly without a heading hold (which is inert when no yaw rates arrive,
+    and says so once Jelly starts driving).
     """
     if cart is None or not cfg.cart.imu:
         return None
@@ -288,26 +288,26 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
         return src
     except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
         _logger.warning(
-            "cart.imu: could not start the board gyro (%s); heading hold disabled",
+            "Jelly IMU: could not start the board gyro (%s); heading hold disabled",
             exc,
         )
         return None
 
 
 async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
-    """Drive only the powered cart from the headset — the arms stay cold.
+    """Drive only Jelly from the headset — the arms stay cold.
 
     No Axol construction, no IK, no arm CAN: just the VR server for the
-    thumbstick stream and the :class:`~almond_axol.robot.cart.Cart`. The
-    cart's own control mapping applies unchanged (stick deadman, reset stop,
-    staleness timeout — see ``Cart.apply_vr_frame``). Having a cart is
+    thumbstick stream and the :class:`~almond_axol.robot.jelly.Jelly`. The
+    Jelly's control mapping applies unchanged (stick deadman, reset stop,
+    staleness timeout — see ``Jelly.apply_vr_frame``). Having Jelly is
     implied, so ``--cart.enabled`` is not consulted; the rest of the
     ``cart.*`` parameters (channel, speeds, imu, ...) apply as usual.
     """
-    from ..robot.cart import Cart
+    from ..robot.jelly import Jelly
     from ..vr import VRServer
 
-    cart = Cart(cfg.cart)
+    cart = Jelly(cfg.cart)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
     # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
@@ -317,7 +317,7 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
     await cart.enable()
     imu_src = _wire_cart_imu(cfg, cart)
     _logger.info(
-        "cart-only teleop: thumbsticks drive the cart (deadman — release "
+        "Jelly-only teleop: thumbsticks drive Jelly (deadman — release "
         "to stop); the arms are untouched"
     )
     try:
@@ -336,7 +336,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
     if cfg.cart_only:
         if cfg.sim:
             raise ValueError(
-                "cart-only teleop has no sim mode (there is no cart hardware "
+                "Jelly-only teleop has no sim mode (there is no Jelly hardware "
                 "model in the visualizer) — drop --sim or --cart_only"
             )
         await _run_cart_only(cfg)
@@ -359,14 +359,14 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             max_accel=cfg.teleop.teleop_max_accel,
             record=cfg.teleop.record,
         )
-    # Powered-cart robots (--cart.enabled true) get the base + lift driven by
-    # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in
-    # sim — there's no cart hardware model in the visualizer.
+    # Jelly robots (--cart.enabled true) get the base + lift driven by
+    # the headset thumbsticks; VRTeleop owns Jelly's lifecycle. Skipped in
+    # sim — there is no Jelly hardware model in the visualizer.
     cart = None
     if cfg.cart.enabled and not cfg.sim:
-        from ..robot.cart import Cart
+        from ..robot.jelly import Jelly
 
-        cart = Cart(cfg.cart)
+        cart = Jelly(cfg.cart)
     teleop = VRTeleop(
         robot,
         config=cfg.teleop,

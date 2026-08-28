@@ -1,6 +1,6 @@
-"""Cart yaw-rate source from the ZED Box carrier board's BMI088 IMU.
+"""Jelly yaw-rate source from the ZED Box carrier board's BMI088 IMU.
 
-The powered cart's straight-line drift (uneven floor contact, omni-wheel
+Jelly's straight-line drift (uneven floor contact, omni-wheel
 effective-radius mismatch) is unobservable from wheel torque feedback — see
 ``almond_axol.diagnostics.base.floor_sim`` — so holding a heading needs an
 external yaw reference. The carrier board carries a Bosch BMI088 on its own
@@ -112,7 +112,7 @@ def install() -> None:
         return
     if not prime_sudo():
         _logger.warning(
-            "board IMU needs root to provision; the cart heading hold will be "
+            "board IMU needs root to provision; Jelly heading hold will be "
             "unavailable. Run manually: sudo chgrp imu %s && sudo chmod 0660 %s",
             control,
             control,
@@ -130,7 +130,7 @@ class BoardYawRateSource:
     """Streams the board BMI088's cart-frame yaw rate to a callback.
 
     The callback fires from a daemon thread at up to the sensor's 200 Hz; it
-    must be cheap and thread-safe (``Cart.feed_yaw_rate`` only latches a
+    must be cheap and thread-safe (``Jelly.feed_yaw_rate`` only latches a
     tuple).
 
     :meth:`open` starts the driver's sampling timer, which means writing

@@ -17,6 +17,7 @@ from .config import (
     JointConfig,
     PositionForceConfig,
 )
+from .jelly import Jelly, JellyConfig
 from .sim import Sim
 
 __all__ = [
@@ -31,6 +32,8 @@ __all__ = [
     "AxolConfig",
     "Cart",
     "CartConfig",
+    "Jelly",
+    "JellyConfig",
     "FrictionParams",
     "JointConfig",
     "PositionForceConfig",

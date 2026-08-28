@@ -1,12 +1,12 @@
 ---
 title: "almond_axol.robot"
-description: "Hardware controller (Axol), simulator (Sim), configuration, and gravity compensation."
+description: "Hardware controllers for Axol and Jelly, simulation, configuration, and gravity compensation."
 ---
 
 Hardware controller for both arms. `Axol` is the low-level hardware/model object; production motion wraps it in `RtAxol`, which exclusively owns CAN while armed and runs the control loop at 240 Hz. Direct-register calibration and diagnostics use the low-level object outside that production loop. `Sim` is a drop-in replacement that renders the robot in a browser using viser (requires the `sim` extra).
 
 ```python
-from almond_axol.robot import Axol, AxolConfig, ArmConfig, JointConfig, FrictionParams, Sim
+from almond_axol.robot import Axol, AxolConfig, Jelly, JellyConfig, Sim
 from almond_axol.rt import RtAxol
 ```
 
@@ -126,6 +126,20 @@ Each returns `(left_array, right_array)` where the absent arm is `None`.
 | `set_acceleration(left, right)` | Set per-joint acceleration ramp (rad/s²) |
 
 Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), which expose the same methods operating on a single arm.
+
+## `Jelly`
+
+`Jelly` controls the Jelly mobile base and telescoping lift. `JellyConfig`
+contains its wheel, lift, heading-hold, and command-safety settings. Existing
+integrations may continue importing `Cart` / `CartConfig`; those names are
+compatibility aliases. Saved command configuration also retains the
+`--cart.*` and `--cart_only` keys.
+
+```python
+from almond_axol.robot import Jelly, JellyConfig
+
+jelly = Jelly(JellyConfig(enabled=True))
+```
 
 ## `Sim`
 

@@ -9,7 +9,7 @@ Up to four buses, **each optional and independent**:
 
 - Left arm → `can_alm_axol_l` (Axol Hub channel 0)
 - Right arm → `can_alm_axol_r` (Axol Hub channel 1)
-- Powered cart's wheel bus (if present) → `can_alm_axol_b`
+- Jelly's wheel bus (if present) → `can_alm_axol_b`
 - Chest bus / lift controller (if present) → `can_alm_axol_c`
 
 ```bash
@@ -27,7 +27,7 @@ The Axol Hub (dual-channel USB CAN adapter) is told apart from the single-channe
 </Info>
 
 <Info>
-  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use the cart — [`axol teleop`](/cli/teleop) brings the cart's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
+  After setup, the interfaces come up automatically on every reboot (via a `@reboot` cron hook) **and** whenever the adapter re-enumerates mid-session: a udev rule pulls in the `axol-can-up.service` bring-up whenever the hub (re-)appears, so a replug — or a USB drop caused by motor EMI — heals itself within a second or two without operator action. You don't need `can.setup` just to use Jelly — [`axol teleop`](/cli/teleop) brings Jelly's own interface up on its own — but pinning it gives the adapter a stable name across reboots.
 </Info>
 
 <Note>

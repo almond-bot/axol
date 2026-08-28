@@ -98,9 +98,9 @@ Each frame sends a JSON message over the WebSocket:
   r_tracked: boolean // right controller optical-tracking state; see l_tracked
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
-  l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — powered-cart strafe (ignored without a cart)
-  l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — powered-cart drive
-  r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — powered-cart rotation
+  l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without a cart)
+  l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
+  r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
   r_stick_click: boolean  // right thumbstick pressed in — lift up while held
   seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
@@ -123,8 +123,8 @@ The operating mode (teleop vs. data collection) is **announced by the server on 
 | 7 | Left **Y** | Exit the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose |
 | 6 | Right **A** | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording — **data collection only** (no effect during plain teleop) |
 | — | Right **B** | Re-anchor the camera screens to your current gaze and clear all moves + resizes |
-| — | Left thumbstick | Drive the powered cart: forward/back + strafe (robots with a cart only; deadman — the base stops when released) |
-| — | Right thumbstick (x) | Rotate the powered cart |
+| — | Left thumbstick | Drive Jelly: forward/back + strafe (robots fitted with Jelly only; deadman — the base stops when released) |
+| — | Right thumbstick (x) | Rotate Jelly |
 | — | Left thumbstick (click) | Lower the telescoping lift while held |
 | — | Right thumbstick (click) | Raise the telescoping lift while held |
 
