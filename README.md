@@ -100,6 +100,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
 - [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+- [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
 ### Remote Teleop
 
@@ -140,6 +141,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
 - [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
+- [`migrate-dataset`](https://docs.almond.bot/cli/migrate-dataset)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)

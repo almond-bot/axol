@@ -1,0 +1,100 @@
+---
+title: "DAgger Collection"
+description: "Run a trained policy while you correct it from VR, recording the corrections to improve the policy — from the web control panel or the CLI."
+---
+
+DAgger collection runs a trained policy on the robot while you watch in VR and step in to correct it whenever it goes wrong — recording both the policy's motion and your corrections into a [LeRobot](/api/lerobot) dataset. It's the [DAgger](https://arxiv.org/abs/1011.0686) idea: instead of collecting demonstrations blindly, you gather them exactly where the current policy struggles, so retraining on the combined data fixes those failures. It runs on the **same machine** as [data collection](/operations/data-collection) and [run policy](/operations/run-policy) — the computer wired to the robot with the ZED cameras attached.
+
+It combines the two: a policy drives the arms like [Run Policy](/operations/run-policy), and the VR grip buttons let you take over and hand-guide like [Data Collection](/operations/data-collection). You can launch it from the **web control panel** or the **CLI** (`axol collect-dagger`).
+
+## Before you start
+
+- **Axol installed** ([one-command install](/installation)), CAN up, and motors verified.
+- **The ZED cameras the policy was trained on connected** (at least one), with their serials on hand — see the [Data Collection](/operations/data-collection#before-you-start) tip for listing them. Assign the **same** cameras, resolution, stereo setting, and fps the policy was trained on.
+- **A trained checkpoint** (local path or HuggingFace repo) and its policy type (`act`, `smolvla`, `pi0`, …). Inference runs **locally** on this machine (in-process, one action per control tick); a CUDA-capable PyTorch install is expected, or pass `--device cpu`.
+- **The VR TLS certificate authorized** once — see [Teleoperation](/operations/teleop#authorize-the-tls-certificate) — and the headset ready, since you drive interventions from it.
+
+## Run it
+
+<Tabs>
+  <Tab title="Control Panel">
+    <Steps>
+      <Step title="Connect the robot and assign cameras">
+        Connect the **Axol Host** and **Axol**, then assign the cameras the policy was trained on in the **Cameras** settings tab (at least one, recording enabled). See [Cameras](/guides/control-panel#cameras).
+      </Step>
+
+      <Step title="Select Collect DAgger and fill the fields">
+        Pick **Collect DAgger**. Set the **policy path**, **policy type**, **task**, and the dataset **repo id** — the per-run inputs. Point the repo id at an existing DAgger dataset to resume it. Stiffness, rates, and inference details come from the [Settings](/guides/control-panel#settings) tabs.
+      </Step>
+
+      <Step title="Start, then correct from the headset">
+        Press **Start** and connect the headset. Use the **Episode control** box to start and end episodes, and the **grip buttons** to take over and hand back while an episode runs (see [Intervening](#intervening) below). The panel mirrors the camera feeds and episode state so you can follow along with the headset off.
+      </Step>
+    </Steps>
+  </Tab>
+
+  <Tab title="CLI">
+    On the robot machine:
+
+    ```bash
+    axol collect-dagger \
+        --policy_path myorg/pick-place-policy \
+        --policy_type act \
+        --task "Pick the red cube and place it in the bin" \
+        --repo_id myorg/pick-place-dagger \
+        --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"
+    ```
+
+    The policy loads in-process and runs one inference per control tick. For CPU inference add `--device cpu`. Replace the serials with your cameras' — assign the same cameras the policy was trained on (the `cameras` dict is one inline YAML value; see [Command configuration](/cli/configuration#field-name-conventions)). Connect the headset and drive interventions from the controllers; `s` / `r` / `q` on stdin mirror save / discard / quit. Press `Ctrl+C` to finish. See [`collect-dagger`](/cli/collect-dagger) for the full field list.
+  </Tab>
+</Tabs>
+
+## Intervening
+
+While an episode is running, the policy drives the arms. The VR grip ("side") buttons let you take over the moment it needs help and hand back when it's recovered — the same grips you engage teleop with elsewhere:
+
+| While… | Press | Result | Recording |
+|---|---|---|---|
+| the **policy** is driving | **either** grip alone | **Freeze** — the robot holds its pose | pauses |
+| **frozen** | **both** grips | **Take over** — teleop engages at the arms' current pose | resumes |
+| you're **driving** | **either** grip alone | **Hand back** — the policy resumes | keeps running |
+
+A takeover engages at the robot's **measured** pose, so control never jerks the arm toward a stale target, and the **grippers adopt your controller triggers immediately** — pre-set the triggers before you squeeze the grips (hold a trigger down so a part already in the gripper stays held). When you hand back, the policy re-plans from where you left the arms rather than continuing from its pre-freeze plan. Nothing is recorded during the frozen gap, so the episode flows straight from the policy's motion into your correction and back — and the frames you record while driving are tagged as interventions (see [What gets recorded](#what-gets-recorded)).
+
+<Note>
+  If the headset link drops mid-intervention, tracking auto-disengages and control hands back to the policy — the arms won't stay latched to a stale pose.
+</Note>
+
+## Episodes
+
+Episode boundaries are driven from VR exactly like [data collection](/operations/data-collection#recording-an-episode):
+
+- **Record** button — start an episode (the policy starts driving and recording begins); press it again to **save**.
+- **Record** with the **reset** button held — **discard** and re-record.
+- On the CLI terminal, `s` saves, `r` discards, `q` discards and quits. `--episode_time_s` (default 600 s) is a safety cap that saves the episode if nothing is pressed.
+- With `--subtasks` supplied, typing a number `1..N` switches the policy's instruction mid-episode without ending it (the dataset's task stays `--task`).
+
+Between episodes the arms return to the rest pose so every episode starts from the same place, and the grips work as **plain teleop** (both to engage, one to disengage — nothing recorded) so you can reset the scene with the arms; the VR **reset** button homes them on demand. Every one of those rest moves is **guarded** by the same torque watchdog as [data collection](/operations/data-collection) and [run policy](/operations/run-policy): if it meets unexpected resistance it stops and the arms drop into a limp **gravity-compensation hold**. Free them by hand, then press the VR **reset** button (or **Return to rest** on the panel) to replan the return from where they are. Tune it with `--teleop_config.vr_teleop_config.reset_torque_threshold` (default 4.0 Nm; `0` disables it) or the control panel's **Reset contact threshold**.
+
+The control-panel **Episode control** box carries the same **Start episode** / **Save** / **Discard** / **Return to rest** buttons as [run policy](/guides/control-panel#episode-controls), so a session can be driven with the headset off.
+
+## What gets recorded
+
+Each saved episode is one continuous take: the policy's motion, then your correction, then the policy again — with the frozen gaps stitched out. Every dataset `collect-dagger` creates carries LeRobot's per-frame **`intervention`** flag, set `True` on the frames you recorded while driving and `False` on the policy's own frames, so training can weight or filter the corrections. Datasets are recorded and resumed with the same durability, crash-consistency repair, and resume behavior as [`collect-data`](/cli/collect-data); resuming a dataset requires it to already carry the `intervention` feature (one recorded by this command).
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Train a Policy" icon="graduation-cap" href="/operations/train-policy">
+    Retrain on the combined demonstrations and corrections.
+  </Card>
+  <Card title="Run Policy" icon="robot" href="/operations/run-policy">
+    Run the retrained policy autonomously.
+  </Card>
+  <Card title="collect-dagger reference" icon="terminal" href="/cli/collect-dagger">
+    Every flag and the intervention internals.
+  </Card>
+  <Card title="Data Collection" icon="record-vinyl" href="/operations/data-collection">
+    Record fresh teleoperation episodes from scratch.
+  </Card>
+</CardGroup>
