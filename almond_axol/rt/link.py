@@ -35,13 +35,10 @@ _ARM_TIMEOUT_S = 15.0
 
 
 def find_binary() -> str:
-    """Locate the ``axol-rt`` binary: env override, PATH, then the repo build."""
+    """Locate ``axol-rt``: env override, this checkout's build, then PATH."""
     env = os.environ.get("AXOL_RT_BIN")
     if env:
         return env
-    on_path = shutil.which("axol-rt")
-    if on_path:
-        return on_path
     repo_build = (
         Path(__file__).resolve().parents[2]
         / "rust"
@@ -52,6 +49,9 @@ def find_binary() -> str:
     )
     if repo_build.exists():
         return str(repo_build)
+    on_path = shutil.which("axol-rt")
+    if on_path:
+        return on_path
     raise FileNotFoundError(
         "axol-rt binary not found — build it with "
         "`cargo build --release` in rust/axol-rt, put it on PATH, or set "

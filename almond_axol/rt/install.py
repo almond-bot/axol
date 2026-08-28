@@ -21,7 +21,7 @@ Three concerns, each idempotent and self-gating:
 * **Binary** — dev checkouts leave it in ``target/release/`` (where
   :func:`almond_axol.rt.link.find_binary` already looks, and where a manual
   ``cargo build`` stays authoritative). Tool installs copy it to
-  ``~/.local/bin/axol-rt`` — on PATH, ``find_binary``'s second stop — and
+  ``~/.local/bin/axol-rt`` — on PATH after the dev-checkout probe — and
   stamp the built ref so a re-run of ``axol provision`` at the same version
   skips the build.
 """
