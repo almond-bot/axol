@@ -13,9 +13,11 @@ Activation is by the ``record`` field on
 Every tap site holds that config — including the IK worker, which receives
 it pickled through the subprocess spawn — so the prefix needs no other
 plumbing. Each process/stage writes ``<prefix>_<stage>.npz`` (the IK worker
-writes ``_ik``, the smoothing core ``_cmd``, the control loop ``_meas``).
-All rows are stamped with ``time.monotonic()``, which shares one epoch
-across processes on Linux, so the files can be merged on time.
+writes ``_ik``, the smoothing core ``_cmd``, the measured loop ``_meas``).
+The measured loop records at 240 Hz from Rust core feedback in RT mode and at
+the configured Python control rate otherwise. All rows are stamped with
+``time.monotonic()``, which shares one epoch across processes on Linux, so the
+files can be merged on time.
 
 Recording covers **engaged segments only**: each tap gates its recorder on
 its process's engage state (:meth:`TeleopRecorder.set_engaged`), so the
@@ -46,8 +48,8 @@ import numpy as np
 _logger = logging.getLogger(__name__)
 
 # Default ring capacity: 5 minutes at the production 240 Hz control rate
-# (the cmd/meas taps run once per control tick, so this is the sizing rate;
-# the IK tap at 120 Hz keeps twice as long). Older rows are overwritten, so
+# (RT meas runs at 240 Hz; cmd, classic meas, and IK run around 120 Hz and
+# therefore retain up to twice as long). Older rows are overwritten, so
 # a long engaged segment keeps its *last* 5 minutes — disengage shortly
 # after the moment you want captured.
 _DEFAULT_CAPACITY = 72_000

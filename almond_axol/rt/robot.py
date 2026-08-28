@@ -84,6 +84,7 @@ class RtAxol:
         abort_deg: float = 25.0,
         max_vel: float = 2.0 * math.pi,
         max_accel: float = 7.0 * math.pi,
+        record: str | None = None,
     ) -> None:
         """Wrap ``robot`` for the realtime core.
 
@@ -93,6 +94,9 @@ class RtAxol:
                 ``VRTeleopConfig.teleop_max_vel``.
             max_accel: Teleop joint-acceleration cap (rad/s²), same
                 treatment.
+            record: Teleop flight-recorder prefix. When set, measured
+                position/torque is captured from the core's feedback packets
+                at its native ``loop_hz`` instead of the Python target rate.
         """
         self._robot = robot
         self._loop_hz = loop_hz
@@ -104,6 +108,17 @@ class RtAxol:
         self._seq = 0
         # Telemetry packets received per side since arm.
         self._fb_packets = [0, 0]
+        # Pair independently arriving left/right core feedback packets into
+        # one 16-DOF flight-recorder row at the native 240 Hz rate. Import the
+        # recorder lazily so low-level RT users do not initialize teleop.
+        self._rec = None
+        if record:
+            from ..teleop.recorder import make as make_recorder
+
+            self._rec = make_recorder(record, "meas", {"qm": 16, "tq": 16})
+        self._record_qm = np.full(16, np.nan, dtype=np.float32)
+        self._record_tq = np.full(16, np.nan, dtype=np.float32)
+        self._record_sides: set[int] = set()
 
     @property
     def left(self) -> AxolArm | None:
@@ -293,6 +308,7 @@ class RtAxol:
         """
         arms = dict(self._arms())
         joints = list(ARM_JOINTS)
+        expected_sides = set(arms)
 
         def feed(side: int, slots: dict[int, FeedbackSlot]) -> None:
             arm = arms.get(side)
@@ -310,8 +326,28 @@ class RtAxol:
                 motor._velocity = vel
                 motor._torque = tau
                 motor._feedback_ts = ts
+                if self._rec is not None:
+                    self._record_qm[side * 8 + i] = pos
+                    self._record_tq[side * 8 + i] = tau
+            if self._rec is not None:
+                self._record_sides.add(side)
+                if self._record_sides >= expected_sides:
+                    self._rec.record(qm=self._record_qm, tq=self._record_tq)
+                    self._record_sides.clear()
 
         return feed
+
+    @property
+    def records_measurements_at_control_rate(self) -> bool:
+        """Whether this wrapper owns the standard ``_meas`` recording."""
+        return self._rec is not None
+
+    def set_recording_engaged(self, engaged: bool) -> None:
+        """Gate the 240 Hz measurement recorder to the VR engaged segment."""
+        if self._rec is not None:
+            self._rec.set_engaged(engaged)
+            if not engaged:
+                self._record_sides.clear()
 
     async def _wait_for_caches(self) -> None:
         """Block until the core's telemetry stream is flowing for every arm.
@@ -392,6 +428,8 @@ class RtAxol:
 
     async def disable(self) -> None:
         """Disarm the core, tear the link down, then belt-and-braces disable."""
+        if self._rec is not None:
+            self._rec.set_engaged(False)
         for _side, arm in self._arms():
             arm._command_sink = None
         self._link.on_feedback = None
@@ -411,3 +449,6 @@ class RtAxol:
             await self._robot.disable()
         except Exception:  # noqa: BLE001 - best-effort cleanup
             _logger.exception("rt: python-side disable failed")
+        if self._rec is not None:
+            # Join any disengage writer before the process can exit.
+            self._rec.dump()

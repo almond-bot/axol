@@ -11,7 +11,7 @@ sharing one monotonic clock:
 
     <prefix>_ik.npz    raw VR pose -> filtered pose -> EE target -> IK output
     <prefix>_cmd.npz   segment target -> EMA -> final guarded command
-    <prefix>_meas.npz  measured joint positions and torques
+    <prefix>_meas.npz  measured joints/torques (240 Hz Rust, 120 Hz Python)
 
 For every signal at every stage boundary this script resamples to a uniform
 grid, splits the motion into frequency bands, and prints where the

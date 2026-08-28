@@ -364,6 +364,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 robot,
                 max_vel=cfg.teleop.teleop_max_vel,
                 max_accel=cfg.teleop.teleop_max_accel,
+                record=cfg.teleop.record,
             )
     # Powered-cart robots (--cart.enabled true) get the base + lift driven by
     # the headset thumbsticks; VRTeleop owns the cart's lifecycle. Skipped in

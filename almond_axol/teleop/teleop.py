@@ -146,7 +146,19 @@ class VRTeleop:
         # taps the measured side per control tick — cached joint positions
         # and torques (8 left + 8 right), refreshed by the impedance feedback
         # frames so reading them costs no CAN traffic.
-        self._rec = _recorder_make(config.record, "meas", {"qm": 16, "tq": 16})
+        # RtAxol receives feedback at the native 240 Hz wire rate and owns the
+        # same `_meas.npz` stage when recording is on. Classic Python and Sim
+        # keep this once-per-loop recorder (normally 120 Hz).
+        self._robot_recorder = (
+            getattr(robot, "set_recording_engaged", None)
+            if getattr(robot, "records_measurements_at_control_rate", False)
+            else None
+        )
+        self._rec = (
+            None
+            if self._robot_recorder is not None
+            else _recorder_make(config.record, "meas", {"qm": 16, "tq": 16})
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -471,6 +483,8 @@ class VRTeleop:
                 t_start = time.perf_counter()
                 left, right = self.step()
                 t_step = time.perf_counter()
+                if self._robot_recorder is not None:
+                    self._robot_recorder(self._core.teleop_enabled)
                 await self._robot.motion_control(left=left, right=right)
 
                 if self._rec is not None:
@@ -587,6 +601,8 @@ class VRTeleop:
         except asyncio.CancelledError:
             pass
         finally:
+            if self._robot_recorder is not None:
+                self._robot_recorder(False)
             activity.stop()
             diag.stop()
             tegra.stop()
