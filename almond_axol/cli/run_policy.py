@@ -1407,6 +1407,15 @@ def _run(
                 encoder_threads=4,
                 rgb_encoder=rgb_encoder,
             )
+            # LeRobot's codebase_version only identifies its dataset schema;
+            # record Axol's Cartesian world frame separately so this fresh
+            # dataset can never be mistaken for pre-v0.1.32 data and rotated
+            # a second time by migrate-dataset.
+            action_names = (action_features.get(ACTION) or {}).get("names") or []
+            if any("_ee." in name for name in action_names):
+                from ..recording.cartesian_frame import write_cartesian_frame_marker
+
+                write_cartesian_frame_marker(dataset_root)
 
     if rerun_ip:
         init_rerun(session_name="axol_run_policy", ip=rerun_ip, port=rerun_port)
