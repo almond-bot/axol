@@ -451,7 +451,7 @@ class OperationRunner:
                 )
 
         is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
-        # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
+        # A robot-free run (sim, or e.g. teleop's jelly_only) never touches the
         # arms, so the persistent robot link stays connected and its motor
         # telemetry keeps streaming while the op runs.
         robot_free = is_sim or any(

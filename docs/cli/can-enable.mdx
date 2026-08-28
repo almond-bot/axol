@@ -7,7 +7,7 @@ Re-runs the CAN startup script to configure and bring up the interfaces. Normall
 
 For setups without the Axol Hub CAN adapter, pass `--channels` to bring up other SocketCAN interfaces directly — one for a single arm, two for both. This skips the hub startup script (no `can.setup` needed): each named interface is configured (1 Mbit/s bitrate, txqueuelen) and brought up; interfaces already up are left untouched.
 
-The startup script also brings up [Jelly](/guides/vr-interface#powered-cart)'s pinned wheel bus (`can_alm_axol_b`) and the chest bus carrying the lift controller (`can_alm_axol_c`) when they were configured, and skips any interface — arm hub, Jelly, or chest — that isn't attached, so every hardware combination (Jelly-only, arm-only, all of them) comes up cleanly. You rarely need to run this for Jelly or its lift anyway: [`axol teleop`](/cli/teleop) brings their interfaces up itself when it starts.
+The startup script also brings up [Jelly](/guides/vr-interface#jelly)'s pinned wheel bus (`can_alm_axol_b`) and the chest bus carrying the lift controller (`can_alm_axol_c`) when they were configured, and skips any interface — arm hub, Jelly, or chest — that isn't attached, so every hardware combination (Jelly-only, arm-only, all of them) comes up cleanly. You rarely need to run this for Jelly or its lift anyway: [`axol teleop`](/cli/teleop) brings their interfaces up itself when it starts.
 
 ```bash
 axol can.enable                      # Axol Hub (startup script)

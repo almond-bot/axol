@@ -92,7 +92,7 @@ The headset only shows the feeds for cameras that are actually being streamed (s
 | 6 | A | **Record**: start a take (3-second countdown). While recording, arms the **Save episode?** confirmation — press **A** again to save, or **X** to cancel and keep recording. **Data collection only** (no effect during plain teleop) |
 | 7 | Y | **Exit** the XR session — sends a reset first, so the arms return to rest and disengage instead of holding the last pose and jerking on the next entry |
 | — | Right **B** | **Reset the camera screens** — re-anchor to your current gaze and clear all moves + resizes |
-| — | Left thumbstick | **Drive Jelly** — push to move forward/back and strafe (robots with [Jelly](#powered-cart) only; deadman, so the base stops when released) |
+| — | Left thumbstick | **Drive Jelly** — push to move forward/back and strafe (robots with [Jelly](#jelly) only; deadman, so the base stops when released) |
 | — | Right thumbstick (x) | **Rotate Jelly** |
 | — | Left thumbstick (click) | **Lower** Jelly's telescoping lift while held |
 | — | Right thumbstick (click) | **Raise** Jelly's telescoping lift while held |
@@ -109,7 +109,7 @@ The headset only shows the feeds for cameras that are actually being streamed (s
   **A dropped link never moves the robot.** If the pose stream stops while tracking is engaged — you doff the headset, open the system menu, quit the app, or the link drops — the arms **auto-disengage** after about half a second and **hold position** wherever they are. When you return, re-engaging (both grips) takes a fresh snapshot, so the arms never jerk toward the controllers on the next entry; press **X** to send them back to the rest pose when you're ready.
 </Note>
 
-<a id="powered-cart"></a>
+<a id="jelly"></a>
 
 ## Jelly
 
@@ -121,7 +121,7 @@ Robots equipped with **Jelly** (an x-drive omni-wheel base plus a telescoping li
 
 The sticks are their own **deadman**: the base only moves while a stick is deflected and coasts to a smooth stop the moment you let go, independent of whether arm tracking is engaged. Jelly motion is **operator mobility only** — it's never recorded into a dataset and a policy never controls it, so you can reposition the robot mid-session (during teleop *or* data collection) without touching the recorded data.
 
-Enable Jelly per robot from the control panel's **Jelly** toggle (Robot settings) or with [`axol teleop --cart.enabled true`](/cli/teleop); the tunables live under **Advanced → Jelly** (the compatibility `--cart.*` flags). To drive **only** Jelly with the arms left untouched — no Axol hub needed — use the control panel's **Jelly only** checkbox or [`axol teleop --cart_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring Jelly's CAN adapter.
+Enable Jelly per robot from the control panel's **Jelly** toggle (Robot settings) or with [`axol teleop --jelly.enabled true`](/cli/teleop); the tunables live under **Advanced → Jelly** (or the `--jelly.*` flags). To drive **only** Jelly with the arms left untouched — no Axol hub needed — use the control panel's **Jelly only** checkbox or [`axol teleop --jelly_only`](/cli/teleop). See [`can.setup`](/cli/can-setup) for wiring Jelly's CAN adapter.
 
 The telescoping lift needs a one-time [`axol lift.home`](/cli/lift-home) calibration before it will move, and [`axol lift.goto`](/cli/lift-goto) raises it to the robot-install height; both are also on the panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics**.
 

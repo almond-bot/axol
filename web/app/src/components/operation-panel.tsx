@@ -128,7 +128,7 @@ export function OperationPanel({
   }, [wantsDatasets, datasets])
 
   const isSim = isSimRun(meta, settings)
-  // Sim, or a run that never touches the arms (teleop's cart-only mode):
+  // Sim, or a run that never touches the arms (teleop's Jelly-only mode):
   // either way the arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
@@ -138,7 +138,7 @@ export function OperationPanel({
   if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
   // A faulted motor blocks every hardware operation (the server refuses the
   // start too) — driving through an over-temp / stalled / unreachable motor
-  // risks the arm. Sim and cart-only runs never touch the arm motors.
+  // risks the arm. Sim and Jelly-only runs never touch the arm motors.
   if (!robotFree) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
@@ -260,7 +260,7 @@ export function OperationPanel({
                   camera feeds — grouped so it can expand to a fullscreen
                   operator view (the headset-off replacement for the HUD). */}
               {/* Skipped for robot-free runs: sim has the browser viewer, and
-                  cart-only has no camera relay or HUD popups to mirror. */}
+                  Jelly-only has no camera relay or HUD popups to mirror. */}
               {live && (meta.episodeControl || (meta.usesHeadset && !robotFree)) && (
                 <OperatorDeck
                   label={meta.label}

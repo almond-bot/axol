@@ -98,7 +98,7 @@ Each frame sends a JSON message over the WebSocket:
   r_tracked: boolean // right controller optical-tracking state; see l_tracked
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
-  l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without a cart)
+  l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — Jelly strafe (ignored without Jelly)
   l_stick_y: number  // left thumbstick y, [-1, 1], pushed forward = -1 — Jelly drive
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — Jelly rotation
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
@@ -215,7 +215,7 @@ class VRFrame(BaseModel):     # headset → server (every XR frame)
     reset: bool
     state: VRState             # one of TELEOP / DATA_COLLECTION / RECORDING
     l_stick_x: float = 0.0     # thumbstick + click fields drive the powered
-    l_stick_y: float = 0.0     # cart (base + lift) when one is configured;
+    l_stick_y: float = 0.0     # Jelly (base + lift) when configured;
     r_stick_x: float = 0.0     # neutral defaults keep older web builds working
     l_stick_click: bool = False
     r_stick_click: bool = False

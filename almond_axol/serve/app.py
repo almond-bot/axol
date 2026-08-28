@@ -918,7 +918,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
-            # (teleop's cart_only) never touches the *arms*, so both stay allowed.
+            # (teleop's jelly_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
             is_sim = cmd.sim_flag is not None and bool(req.args.get(cmd.sim_flag))
             robot_free = is_sim or any(

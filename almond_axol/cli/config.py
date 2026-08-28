@@ -516,20 +516,20 @@ class TeleopCmdConfig:
     ``vr_server`` config — e.g. ``--vr_server.port 9000``.
 
     Robots on Jelly (x-drive base + telescoping lift) enable it
-    with ``--cart.enabled true``; the thumbsticks then drive the base (left
+    with ``--jelly.enabled true``; the thumbsticks then drive the base (left
     stick translates, right stick x rotates) and the stick clicks run the
     lift (left click down, right click up), independent of the arm engage
-    toggle. Jelly parameters use the compatibility ``cart`` config key — e.g.
-    ``--cart.max_speed 5`` or ``--cart.channel can0``.
+    toggle. Jelly parameters live on the nested ``jelly`` config — e.g.
+    ``--jelly.max_speed 5`` or ``--jelly.channel can0``.
 
-    ``--cart_only`` drives *just* Jelly: the arms are never constructed
+    ``--jelly_only`` drives *just* Jelly: the arms are never constructed
     and the Axol hub CAN channels are never touched — only the VR server
     (thumbstick stream) and the Jelly run. Having Jelly is implied, so
-    ``--cart.enabled`` is not consulted.
+    ``--jelly.enabled`` is not consulted.
     """
 
     sim: bool = False
-    cart_only: bool = False
+    jelly_only: bool = False
     """Drive only Jelly from the headset thumbsticks. The arms and their CAN
     channels are left untouched (no Axol hub needed); Jelly is
     implied. Mutually exclusive with sim."""
@@ -537,7 +537,7 @@ class TeleopCmdConfig:
     teleop: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server: VRServerConfig = field(default_factory=VRServerConfig)
-    cart: JellyConfig = field(default_factory=JellyConfig)
+    jelly: JellyConfig = field(default_factory=JellyConfig)
     left_channel: str | None = CAN_LEFT
     right_channel: str | None = CAN_RIGHT
     cameras: dict[str, int] = field(default_factory=dict)

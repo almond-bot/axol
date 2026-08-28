@@ -266,7 +266,7 @@ SETTINGS: tuple[SettingCategory, ...] = (
                 },
             ),
             SettingDef(
-                key="robot.cart_enabled",
+                key="robot.jelly_enabled",
                 label="Jelly",
                 type="boolean",
                 help=(
@@ -279,8 +279,8 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "parameters live under Advanced → Jelly."
                 ),
                 targets={
-                    "teleop": ("cart.enabled",),
-                    "collect-data": (f"{_TELEOP_CFG}.cart.enabled",),
+                    "teleop": ("jelly.enabled",),
+                    "collect-data": (f"{_TELEOP_CFG}.jelly.enabled",),
                 },
             ),
             SettingDef(
@@ -806,11 +806,11 @@ ADVANCED_SECTIONS: tuple[AdvancedSection, ...] = (
         targets={"teleop": "kinematics", "collect-data": _KIN},
     ),
     AdvancedSection(
-        key="cart",
+        key="jelly",
         label="Jelly",
         ref_op="teleop",
-        ref_prefix="cart",
-        targets={"teleop": "cart", "collect-data": f"{_TELEOP_CFG}.cart"},
+        ref_prefix="jelly",
+        targets={"teleop": "jelly", "collect-data": f"{_TELEOP_CFG}.jelly"},
     ),
     AdvancedSection(
         key="vr_server",

@@ -21,8 +21,8 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
         vr_teleop_config:      VR teleop session parameters (rest poses, frequency, smoothing).
         kinematics_config:  IK solver parameters forwarded to the subprocess.
         vr_server_config:   VR WebSocket server parameters (port, TLS certs).
-        cart:               Jelly (x-drive base + telescoping lift) for
-                            robots that have one; ``cart.enabled`` gates it.
+        jelly:               Jelly (x-drive base + telescoping lift) for
+                            robots that have one; ``jelly.enabled`` gates it.
                             Operator-only mobility: the thumbsticks reposition
                             the base/lift during a session, but Jelly state is
                             never recorded into the dataset and policies never
@@ -38,5 +38,5 @@ class AxolVRTeleopConfig(TeleoperatorConfig):
     vr_teleop_config: VRTeleopConfig = field(default_factory=VRTeleopConfig)
     kinematics_config: KinematicsConfig = field(default_factory=KinematicsConfig)
     vr_server_config: VRServerConfig = field(default_factory=VRServerConfig)
-    cart: JellyConfig = field(default_factory=JellyConfig)
+    jelly: JellyConfig = field(default_factory=JellyConfig)
     has_gripper: bool = True

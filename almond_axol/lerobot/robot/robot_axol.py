@@ -119,8 +119,10 @@ class AxolRobot(Robot):
         # went through. Joint-action clients (teleop, collect-data, joint
         # policies) are untouched: their pipelines already shape commands
         # upstream, and double-filtering a tuned path buys nothing.
-        self._cart_shapers: tuple[TrapezoidalFilter, TrapezoidalFilter] | None = None
-        self._cart_last_send: float = 0.0
+        self._cartesian_shapers: tuple[
+            TrapezoidalFilter, TrapezoidalFilter
+        ] | None = None
+        self._cartesian_last_send: float = 0.0
 
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
@@ -643,10 +645,10 @@ class AxolRobot(Robot):
         # from the actual measured positions — which also zeroes the velocity
         # — rather than ramping from a stale command at a stale speed.
         now = time.monotonic()
-        gap = now - self._cart_last_send
-        self._cart_last_send = now
-        if self._cart_shapers is None:
-            self._cart_shapers = (
+        gap = now - self._cartesian_last_send
+        self._cartesian_last_send = now
+        if self._cartesian_shapers is None:
+            self._cartesian_shapers = (
                 TrapezoidalFilter(
                     VRTeleopConfig.teleop_max_vel, VRTeleopConfig.teleop_max_accel, 0.0
                 ),
@@ -655,7 +657,7 @@ class AxolRobot(Robot):
                 ),
             )
             gap = float("inf")
-        shaper_l, shaper_r = self._cart_shapers
+        shaper_l, shaper_r = self._cartesian_shapers
         if gap > 0.25:
             shaper_l.reset(seed=np.asarray(left_cur, dtype=np.float32)[:7])
             shaper_r.reset(seed=np.asarray(right_cur, dtype=np.float32)[:7])

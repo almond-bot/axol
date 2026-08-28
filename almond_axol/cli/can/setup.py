@@ -91,7 +91,7 @@ def _scan_adapters() -> dict[str, dict]:
     """Every attached gs_usb CAN adapter: serial -> {vid, pid, dev_ids}.
 
     The dual-channel Axol arm hub shows up as one serial with dev_ids {0, 1};
-    a single-channel adapter (the cart's wheel-bus CANable, a UMI rig, ...)
+    a single-channel adapter (Jelly's wheel-bus CANable, a UMI rig, ...)
     as one serial with {0}. Matched on the gs_usb driver rather than a VID/PID
     so CANable firmware variants that don't use the candlelight 1d50:606f IDs
     still count; the Jetson's built-in mttcan controller has no USB serial and
@@ -123,7 +123,7 @@ def _scan_adapters() -> dict[str, dict]:
 def _detect_serials() -> list[str]:
     """Serials of every attached *dual-channel* Axol adapter — hub candidates.
 
-    Single-channel devices (the cart's wheel-bus adapter, UMI rigs) share the
+    Single-channel devices (Jelly's wheel-bus adapter, UMI rigs) share the
     generic VID/PID but can never be the hub, so they are excluded rather
     than left to make the scan ambiguous.
     """
@@ -265,17 +265,17 @@ def _find_serial() -> str | None:
 
     if not unique:
         # An unplugged hub on an already-configured host (e.g. re-running
-        # setup on a cart-only session) keeps its pinned serial — the udev
+        # setup on a Jelly-only session) keeps its pinned serial — the udev
         # rule and startup script stay valid for whenever it's reattached.
         if configured:
             print(f"  No hub attached — keeping configured serial {configured}.")
             return configured
         if not _stdin_is_tty():
-            print("  No arm hub found — continuing without one (cart/chest only).")
+            print("  No arm hub found — continuing without one (Jelly/chest only).")
             return None
         print(
             "\n  No arm hub found. Enter its serial manually, or leave blank "
-            "for a robot without one (cart/chest only):"
+            "for a robot without one (Jelly/chest only):"
         )
         return input("  Serial: ").strip() or None
 
@@ -460,11 +460,11 @@ def _identify_adapter(serial: str) -> str | None:
     wheels = _probe_wheels(iface)
     chest = _probe_chest(iface)
     if chest and wheels:
-        # The pre-split combined cart bus (jelly_legs next to the wheels).
+        # The pre-split combined Jelly bus (jelly_legs next to the wheels).
         print(
             f"  WARNING: both the wheel motors and the jelly_legs board "
             f"answer on {iface} — treating it as the wheel bus. Point the "
-            f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
+            f"lift at it explicitly (jelly.lift_channel={_CAN_B}) or move "
             f"the lift onto its own chest bus."
         )
         return "wheels"
@@ -570,7 +570,7 @@ def _write_cron_script() -> None:
     """Write the bring-up script covering all four interfaces.
 
     Every interface is optional and checked for presence at runtime, so one
-    script serves every hardware combination — arm-only, cart-only, chest-
+    script serves every hardware combination — arm-only, Jelly-only, chest-
     only, or all of them — and an unplugged adapter never blocks the rest.
     """
     print(f"Writing CAN startup script to {_CRON_SCRIPT}...")
@@ -931,7 +931,7 @@ def ensure_setup(
     attachment-aware detection (:func:`_resolve_hub_serial`) and the
     single-channel wheel/chest adapters by probing their buses
     (:func:`_find_single_serials`), so a replacement adapter — a new hub, a
-    new cart/chest CANable, or a different Axol plugged into this host — is
+    new Jelly/chest CANable, or a different Axol plugged into this host — is
     re-pinned on the next connect without the interactive flow. Only an
     adapter whose bus doesn't answer (devices unpowered, unrelated hardware)
     is left to the interactive ``axol can.setup``.
@@ -959,7 +959,7 @@ def _find_single_serials(
     but absent adapter is only a fallback: an attached adapter whose bus
     probes as wheels/chest takes over the pin (the adapter was replaced, or a
     different Axol was plugged into this host), while nothing claiming the bus
-    keeps the old pin so a temporarily unplugged cart/chest stays configured.
+    keeps the old pin so a temporarily unplugged Jelly/chest stays configured.
 
     Every unpinned attached single-channel adapter is identified by probing
     its bus (see :func:`_identify_adapter`); one where nothing answers —

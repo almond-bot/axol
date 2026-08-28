@@ -74,7 +74,7 @@ class Schema:
 
 
 def _humanize(key: str) -> str:
-    if key == "cart_only":
+    if key == "jelly_only":
         return "Jelly only"
     return key.replace("_", " ")
 
@@ -169,7 +169,7 @@ def _field_docs(instance: Any) -> dict[str, str]:
     preceding comment) applies, and the CLI's curated overrides beat those.
     The curated map is keyed by bare field name — it exists to paper over
     draccus mis-extractions — so it must not shadow an explicit docstring on
-    an unrelated class that happens to reuse the name (``cart.max_speed`` vs
+    an unrelated class that happens to reuse the name (``jelly.max_speed`` vs
     the gripper's).
     """
     if not dataclasses.is_dataclass(instance):

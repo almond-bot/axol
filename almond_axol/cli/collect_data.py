@@ -703,7 +703,7 @@ def _run(
     # If any of this setup fails, tear the relay subprocess down so it doesn't
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
-    imu_src: Any | None = None  # board-gyro yaw source for the cart, if wired
+    imu_src: Any | None = None  # board-gyro yaw source for Jelly, if wired
     try:
         robot.connect()
 
@@ -737,18 +737,18 @@ def _run(
             _register_camera_video(robot, teleop)
 
         # Jelly heading hold: feed the carrier board's BMI088 yaw rate to the
-        # cart, same as native teleop (see almond_axol.robot.gyro — nothing
+        # Jelly, same as native teleop (see almond_axol.robot.gyro — nothing
         # here touches the video path). Best-effort: on failure the hold is
-        # simply inert (no yaw rates arrive), which the cart logs once driving.
-        if teleop.cart is not None and teleop.cart.config.imu:
+        # simply inert (no yaw rates arrive), which Jelly logs once driving.
+        if teleop.jelly is not None and teleop.jelly.config.imu:
             try:
                 from ..robot.gyro import BoardYawRateSource
 
-                imu_src = BoardYawRateSource(teleop.cart.feed_yaw_rate)
+                imu_src = BoardYawRateSource(teleop.jelly.feed_yaw_rate)
                 imu_src.open()
             except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
                 _logger.warning(
-                    "cart.imu: could not start the board gyro (%s); heading "
+                    "Jelly IMU: could not start the board gyro (%s); heading "
                     "hold disabled",
                     exc,
                 )

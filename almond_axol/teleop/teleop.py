@@ -76,7 +76,7 @@ class VRTeleop:
         config:            Teleop session parameters (rest poses, loop frequency).
         kinematics_config: IK solver parameters forwarded to the subprocess.
         vr_server_config:  VR WebSocket server parameters (port, TLS certs).
-        cart:              Jelly (x-drive base + lift) for robots that
+        jelly:              Jelly (x-drive base + lift) for robots that
                            have one; ``None`` for a static base.
     """
 
@@ -87,7 +87,7 @@ class VRTeleop:
         config: VRTeleopConfig = VRTeleopConfig(),
         kinematics_config: KinematicsConfig = KinematicsConfig(),
         vr_server_config: VRServerConfig = VRServerConfig(),
-        cart: Jelly | None = None,
+        jelly: Jelly | None = None,
     ) -> None:
         """Construct the teleoperation session.
 
@@ -99,7 +99,7 @@ class VRTeleop:
             config:            Teleop loop parameters (rest poses, frequency, velocity limits).
             kinematics_config: IK solver cost weights forwarded to the IK subprocess.
             vr_server_config:  VR WebSocket server parameters (port, TLS certs).
-            cart:              Jelly (x-drive base + telescoping lift),
+            jelly:              Jelly (x-drive base + telescoping lift),
                                or ``None`` for a robot on a static base. When
                                present, the headset thumbsticks drive it: left
                                stick translates, right stick x rotates, stick
@@ -119,7 +119,7 @@ class VRTeleop:
                 "control has been removed"
             )
         self._robot = robot
-        self._cart = cart
+        self._jelly = jelly
         self._config = config
         self._kinematics_config = kinematics_config
         self._vr_server = VRServer(vr_server_config)
@@ -219,11 +219,11 @@ class VRTeleop:
         await loop.run_in_executor(None, self._vr_ready.wait)
 
         await self._robot.enable()
-        if self._cart is not None:
+        if self._jelly is not None:
             # After the arms so a Jelly failure (missing CAN interface, GPIO
             # chip) surfaces before the IK worker spins up; its command task
             # runs on this event loop.
-            await self._cart.enable()
+            await self._jelly.enable()
 
         pos_l, pos_r = await self._robot.get_positions()
         self._core.set_initial_grips(
@@ -299,9 +299,9 @@ class VRTeleop:
             self._vr_thread.join(timeout=5.0)
             self._vr_thread = None
 
-        if self._cart is not None:
+        if self._jelly is not None:
             try:
-                await self._cart.disable()
+                await self._jelly.disable()
             except Exception:  # noqa: BLE001 - never block the arm shutdown
                 _logger.exception("Jelly disable failed")
         await self._robot.disable()
@@ -599,7 +599,7 @@ class VRTeleop:
                 # Hybrid pacing (see _FINE_SLEEP): asyncio for the bulk of
                 # the wait, precise blocking sleep for the last stretch. The
                 # zero-sleep on the hot path still yields once per cycle so
-                # sibling tasks (cart, diag) can't be starved outright.
+                # sibling tasks (jelly, diag) can't be starved outright.
                 coarse = deadline - time.perf_counter() - _FINE_SLEEP
                 await asyncio.sleep(max(coarse, 0.0))
                 fine = deadline - time.perf_counter()
@@ -680,11 +680,11 @@ class VRTeleop:
             ):
                 self._vr_frame_times.pop(0)
         self._core.note_frame_reset(frame.reset)
-        if self._cart is not None:
+        if self._jelly is not None:
             # The stick → Jelly mapping lives on Jelly (shared with the
             # collect-data flow). Resets force a stop so the base doesn't
             # creep while the arms replay their return-to-rest trajectory.
-            self._cart.apply_vr_frame(frame, resetting=self._core.is_resetting)
+            self._jelly.apply_vr_frame(frame, resetting=self._core.is_resetting)
 
     # ------------------------------------------------------------------
     # IK loop (daemon thread)

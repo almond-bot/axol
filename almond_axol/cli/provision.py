@@ -17,7 +17,7 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``gst.build-zed`` — the patched zedxonesrc/zedsrc plugins (sensor-accurate
                       PTS so collected images line up with joint samples).
 * ``gyro.install``  — group access to the carrier board's BMI088 sampling
-                      timer, the cart heading hold's yaw reference (see
+                      timer, Jelly heading hold's yaw reference (see
                       :mod:`almond_axol.robot.gyro`).
 * ``rt.install``    — the ``axol-rt`` realtime core binary (Rust toolchain
                       via rustup if needed; sources fetched at the installed
@@ -93,7 +93,7 @@ def run(_args: object = None) -> None:
     # it just prints a notice.
     _step("ZED Box camera driver (zed.driver)", zed_driver.ensure_driver)
     # Group access to the board IMU's sampling timer, so teleop can start the
-    # cart's yaw reference without root. Self-gates on the driver's presence.
+    # Jelly's yaw reference without root. Self-gates on the driver's presence.
     _step("board IMU (gyro.install)", gyro.install)
     have_sdk = _ZED_SDK.exists()
     if have_sdk:

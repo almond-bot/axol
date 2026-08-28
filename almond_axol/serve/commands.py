@@ -128,7 +128,7 @@ class CommandDef:
         # robot.
         self.sim_flag = sim_flag
         # Arg names that mean "doesn't touch the arms" without being sim
-        # (teleop's cart_only): the run skips the robot link and the
+        # (teleop's jelly_only): the run skips the robot link and the
         # motor-fault gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
         # Driven from the VR headset, so the panel tells the operator to point
@@ -308,9 +308,9 @@ COMMANDS: dict[str, CommandDef] = {
         camera_mode="teleop",
         streams_video=True,
         sim_flag="sim",
-        robot_free_flags=("cart_only",),
+        robot_free_flags=("jelly_only",),
         uses_headset=True,
-        per_run_fields=("sim", "cart_only"),
+        per_run_fields=("sim", "jelly_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",

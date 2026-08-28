@@ -11,8 +11,8 @@ field is reachable from the CLI (draccus-style) or from a JSON/YAML file:
     axol teleop --axol.left.elbow.kp 60 --axol.right.gripper.torque_limit 0.7
     axol teleop --teleop.position_multiplier 2.0      # scale hand motion 2x
     axol teleop --left_channel null                   # disable the left arm
-    axol teleop --cart.enabled true                   # Jelly (base + lift)
-    axol teleop --cart_only                           # drive just Jelly, arms untouched
+    axol teleop --jelly.enabled true                   # Jelly (base + lift)
+    axol teleop --jelly_only                           # drive just Jelly, arms untouched
     axol teleop --config_path my_teleop.json          # whole-config file
 """
 
@@ -37,7 +37,7 @@ def _get_local_ip() -> str:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "cart_only"))
+    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "jelly_only"))
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
@@ -266,8 +266,8 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
         _logger.warning("failed to enable camera video: %s", exc)
 
 
-def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
-    """Feed Jelly's heading hold from the board BMI088 (``--cart.imu``).
+def _wire_jelly_imu(cfg: TeleopCmdConfig, jelly: Any) -> Any | None:
+    """Feed Jelly's heading hold from the board BMI088 (``--jelly.imu``).
 
     The yaw reference is the carrier board's own IMU rather than a camera, so
     nothing here touches the video path — the overhead ZED keeps the relay's
@@ -278,12 +278,12 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
     Jelly without a heading hold (which is inert when no yaw rates arrive,
     and says so once Jelly starts driving).
     """
-    if cart is None or not cfg.cart.imu:
+    if jelly is None or not cfg.jelly.imu:
         return None
     try:
         from ..robot.gyro import BoardYawRateSource
 
-        src = BoardYawRateSource(cart.feed_yaw_rate)
+        src = BoardYawRateSource(jelly.feed_yaw_rate)
         src.open()
         return src
     except Exception as exc:  # noqa: BLE001 - heading hold is best-effort
@@ -294,28 +294,28 @@ def _wire_cart_imu(cfg: TeleopCmdConfig, cart: Any) -> Any | None:
         return None
 
 
-async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
+async def _run_jelly_only(cfg: TeleopCmdConfig) -> None:
     """Drive only Jelly from the headset — the arms stay cold.
 
     No Axol construction, no IK, no arm CAN: just the VR server for the
     thumbstick stream and the :class:`~almond_axol.robot.jelly.Jelly`. The
     Jelly's control mapping applies unchanged (stick deadman, reset stop,
     staleness timeout — see ``Jelly.apply_vr_frame``). Having Jelly is
-    implied, so ``--cart.enabled`` is not consulted; the rest of the
-    ``cart.*`` parameters (channel, speeds, imu, ...) apply as usual.
+    implied, so ``--jelly.enabled`` is not consulted; the rest of the
+    ``jelly.*`` parameters (channel, speeds, imu, ...) apply as usual.
     """
     from ..robot.jelly import Jelly
     from ..vr import VRServer
 
-    cart = Jelly(cfg.cart)
+    jelly = Jelly(cfg.jelly)
     server = VRServer(cfg.vr_server)
     server.set_mode("teleop")
     # apply_vr_frame is thread-safe and stops on frame.reset itself; with no
     # arms there is no reset trajectory to wait out (resetting stays False).
-    server.set_on_frame(cart.apply_vr_frame)
+    server.set_on_frame(jelly.apply_vr_frame)
 
-    await cart.enable()
-    imu_src = _wire_cart_imu(cfg, cart)
+    await jelly.enable()
+    imu_src = _wire_jelly_imu(cfg, jelly)
     _logger.info(
         "Jelly-only teleop: thumbsticks drive Jelly (deadman — release "
         "to stop); the arms are untouched"
@@ -326,20 +326,20 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
     finally:
         if imu_src is not None:
             await asyncio.to_thread(imu_src.close)
-        await cart.disable()
+        await jelly.disable()
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
     from ..robot import Axol, Sim
     from ..teleop import VRTeleop
 
-    if cfg.cart_only:
+    if cfg.jelly_only:
         if cfg.sim:
             raise ValueError(
                 "Jelly-only teleop has no sim mode (there is no Jelly hardware "
-                "model in the visualizer) — drop --sim or --cart_only"
+                "model in the visualizer) — drop --sim or --jelly_only"
             )
-        await _run_cart_only(cfg)
+        await _run_jelly_only(cfg)
         return
 
     if cfg.sim:
@@ -359,20 +359,20 @@ async def _run(cfg: TeleopCmdConfig) -> None:
             max_accel=cfg.teleop.teleop_max_accel,
             record=cfg.teleop.record,
         )
-    # Jelly robots (--cart.enabled true) get the base + lift driven by
+    # Jelly robots (--jelly.enabled true) get the base + lift driven by
     # the headset thumbsticks; VRTeleop owns Jelly's lifecycle. Skipped in
     # sim — there is no Jelly hardware model in the visualizer.
-    cart = None
-    if cfg.cart.enabled and not cfg.sim:
+    jelly = None
+    if cfg.jelly.enabled and not cfg.sim:
         from ..robot.jelly import Jelly
 
-        cart = Jelly(cfg.cart)
+        jelly = Jelly(cfg.jelly)
     teleop = VRTeleop(
         robot,
         config=cfg.teleop,
         kinematics_config=cfg.kinematics,
         vr_server_config=cfg.vr_server,
-        cart=cart,
+        jelly=jelly,
     )
     if cfg.cameras:
         # The VR server accepts headsets long before the cameras finish
@@ -402,7 +402,7 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 # headsets parked on webrtc-pending with an honest
                 # unavailable instead of leaving them connecting forever.
                 teleop.set_video_sources(None)
-        imu_src = _wire_cart_imu(cfg, cart)
+        imu_src = _wire_jelly_imu(cfg, jelly)
         try:
             await teleop.run()
         finally:

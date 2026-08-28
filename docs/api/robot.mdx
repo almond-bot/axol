@@ -130,10 +130,7 @@ Individual arms are accessible via `axol.left` and `axol.right` (`AxolArm`), whi
 ## `Jelly`
 
 `Jelly` controls the Jelly mobile base and telescoping lift. `JellyConfig`
-contains its wheel, lift, heading-hold, and command-safety settings. Existing
-integrations may continue importing `Cart` / `CartConfig`; those names are
-compatibility aliases. Saved command configuration also retains the
-`--cart.*` and `--cart_only` keys.
+contains its wheel, lift, heading-hold, and command-safety settings.
 
 ```python
 from almond_axol.robot import Jelly, JellyConfig

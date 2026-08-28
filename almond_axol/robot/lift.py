@@ -156,7 +156,7 @@ class Lift:
     async def start(self) -> None:
         """Open the chest bus and start the jog/status task.
 
-        Brings the interface up if it isn't yet (mirroring the cart's wheel
+        Brings the interface up if it isn't yet (mirroring Jelly's wheel
         bus); a missing interface raises ``RuntimeError`` naming it.
         """
         from ..cli.can.setup import bring_up_interfaces, iface_up
