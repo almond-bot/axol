@@ -166,15 +166,23 @@ class TeleopRecorder:
         self._engaged = False
         self._writer: threading.Thread | None = None
 
-    def record(self, **values: np.ndarray | float) -> None:
-        """Append one row; ``t`` is stamped automatically (``time.monotonic``).
+    def record(
+        self,
+        *,
+        timestamp: float | None = None,
+        **values: np.ndarray | float,
+    ) -> None:
+        """Append one row, normally stamped with ``time.monotonic()``.
 
-        No-op while disengaged (see :meth:`set_engaged`).
+        ``timestamp`` lets a source with a more accurate sample clock retain
+        it—RT feedback uses reconstructed kernel receive times rather than
+        Python socket-delivery time. No-op while disengaged (see
+        :meth:`set_engaged`).
         """
         if not self._engaged:
             return
         i = self._head
-        self._t[i] = time.monotonic()
+        self._t[i] = time.monotonic() if timestamp is None else timestamp
         for name, buf in self._buffers.items():
             v = values.get(name)
             if v is None:

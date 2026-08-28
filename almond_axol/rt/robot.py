@@ -119,6 +119,7 @@ class RtAxol:
         self._record_qm = np.full(16, np.nan, dtype=np.float32)
         self._record_tq = np.full(16, np.nan, dtype=np.float32)
         self._record_sides: set[int] = set()
+        self._record_side_ts: dict[int, float] = {}
         self._recording_engaged = False
 
     @property
@@ -340,6 +341,10 @@ class RtAxol:
                     self._record_tq[side * 8 + i] = tau
             if self._rec is not None and self._recording_engaged:
                 self._record_sides.add(side)
+                if slots:
+                    self._record_side_ts[side] = max(
+                        value[3] for value in slots.values()
+                    )
                 if self._record_sides >= expected_sides:
                     # The core packets carry motor-frame positions. Standard
                     # `_meas.npz` files carry joint-frame positions (zero at
@@ -351,8 +356,22 @@ class RtAxol:
                         base = record_side * 8
                         self._record_qm[base : base + 8] = record_arm.positions
                         self._record_tq[base : base + 8] = record_arm.torques
-                    self._rec.record(qm=self._record_qm, tq=self._record_tq)
+                    # FeedbackSlot timestamps use time.time() (reconstructed
+                    # from the core's per-frame age). Convert their mean to
+                    # the recorder's monotonic epoch at the instant of use;
+                    # this preserves the real 240 Hz sample grid even when
+                    # Python receives several socket packets in a burst.
+                    wall_ts = sum(
+                        self._record_side_ts[s] for s in expected_sides
+                    ) / len(expected_sides)
+                    mono_ts = wall_ts + (time.monotonic() - time.time())
+                    self._rec.record(
+                        timestamp=mono_ts,
+                        qm=self._record_qm,
+                        tq=self._record_tq,
+                    )
                     self._record_sides.clear()
+                    self._record_side_ts.clear()
 
         return feed
 
@@ -368,6 +387,7 @@ class RtAxol:
             self._rec.set_engaged(engaged)
             if not engaged:
                 self._record_sides.clear()
+                self._record_side_ts.clear()
 
     async def _wait_for_caches(self) -> None:
         """Block until the core's telemetry stream is flowing for every arm.
