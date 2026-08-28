@@ -318,9 +318,7 @@ class _LocalPolicy:
             for k, v in robot.observation_features.items()
             if isinstance(v, tuple)
         }
-        if not (
-            expected_visuals <= provided_visuals or provided_visuals <= expected_visuals
-        ):
+        if not expected_visuals <= provided_visuals:
             raise ValueError(
                 "Visual feature mismatch between policy and robot cameras.\n"
                 f"Policy expects: {sorted(expected_visuals)}\n"
@@ -1116,6 +1114,7 @@ def _run(
                 limiter=(
                     PolicyActionLimiter(cfg.policy_max_vel, cfg.policy_max_accel, fps)
                     if cfg.policy_max_vel > 0
+                    and not getattr(robot.config, "observe_cartesian", False)
                     else None
                 ),
             )
