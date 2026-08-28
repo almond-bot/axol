@@ -309,8 +309,8 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol from a VR headset. Mantis mode automatically starts "
-        "the saved tracker bridge; simulation previews without hardware.",
+        "Drive the Axol from a VR headset. Mantis supports Quest, Lighthouse, "
+        "or Ultimate tracking; simulation previews without hardware.",
         "Operate",
         "draccus",
         _teleop,
@@ -324,7 +324,7 @@ COMMANDS: dict[str, CommandDef] = {
         # like cart_only it never touches the arms or their motor faults.
         robot_free_flags=("cart_only", "mantis"),
         uses_headset=True,
-        per_run_fields=("sim", "mantis", "cart_only"),
+        per_run_fields=("sim", "mantis", "mantis_source", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -362,8 +362,8 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes with local ZED cameras. Mantis mode "
-        "automatically starts the saved tracker bridge.",
+        "Record teleoperation episodes with local ZED cameras. Mantis supports "
+        "Quest, Lighthouse, or Ultimate tracking.",
         "Operate",
         "draccus",
         _collect_data,
@@ -382,7 +382,7 @@ COMMANDS: dict[str, CommandDef] = {
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("mantis", "repo_id", "task"),
+        per_run_fields=("mantis", "mantis_source", "repo_id", "task"),
     ),
     "collect-dagger": CommandDef(
         "collect-dagger",

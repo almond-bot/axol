@@ -103,10 +103,11 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     logging.basicConfig(level=logging.INFO, force=True)
 
     from ..tracker import load_tracker_config
+    from ..tracker.config import select_tracker_backend
 
     config = load_tracker_config()
     if args.backend is not None:
-        config.backend = args.backend
+        select_tracker_backend(config, args.backend)
     if args.left is not None:
         config.left = args.left
     if args.right is not None:

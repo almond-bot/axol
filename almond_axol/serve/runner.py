@@ -536,7 +536,8 @@ class OperationRunner:
             target = self._run_async
         else:
             target = self._run_thread
-        manage_bridge = bool(args.get("mantis"))
+        mantis_source = str(args.get("mantis_source", "quest"))
+        manage_bridge = bool(args.get("mantis")) and mantis_source != "quest"
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
@@ -958,10 +959,25 @@ class OperationRunner:
         return int(getattr(server, "port", 8000))
 
     def _start_tracker_bridge(self, session: Session, cfg: Any) -> None:
-        """Start the saved tracker bridge and wait for hardware initialization."""
+        """Start the selected tracker bridge and wait for initialization."""
         from ..tracker import load_tracker_config
+        from ..tracker.config import select_tracker_backend
 
         config = load_tracker_config()
+        source = str(getattr(cfg, "mantis_source", "quest"))
+        backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
+        if backend is None:
+            raise RuntimeError(
+                f"Mantis source {source!r} does not use a tracker bridge"
+            )
+        select_tracker_backend(config, backend)
+        if (
+            config.left is None or config.right is None
+        ) and not config.allow_single_side:
+            raise RuntimeError(
+                f"No complete {source} tracker binding is saved; run "
+                f"`axol tracker.identify --backend {backend}` first"
+            )
         ctx = multiprocessing.get_context("spawn")
         stop_event = ctx.Event()
         command_queue = ctx.Queue()

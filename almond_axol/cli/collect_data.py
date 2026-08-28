@@ -86,7 +86,7 @@ from ..robot.control import ContactWatchdog
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
-from .config import DatasetResolution, LogLevel, parse
+from .config import DatasetResolution, LogLevel, MantisSource, parse
 
 if TYPE_CHECKING:
     from ..lerobot.robot.robot_axol import AxolRobot
@@ -408,8 +408,10 @@ class CollectDataConfig:
     # on can_mantis_l/r, wrist cameras only, absolute pose mapping, and the
     # Cartesian EE-pose dataset schema. The Axol arms are not involved.
     mantis: bool = False
-    # The control panel starts the saved tracker bridge automatically for a
-    # Mantis run; direct CLI use still starts tracker.bridge separately.
+    mantis_source: MantisSource = "quest"
+    """Pose source for Mantis mode. Quest connects through the WebXR client;
+    Lighthouse and Ultimate start the corresponding tracker bridge when the
+    operation is launched from the control panel."""
     # Mantis only: zero-phase low-pass cutoff (Hz) applied to the recorded EE
     # pose track at episode save, removing broadband tracker noise without lag
     # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for

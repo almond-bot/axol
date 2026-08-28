@@ -181,7 +181,9 @@ export function OperationPanel({
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {live && Boolean(settings.mantis) && (
+            {live &&
+              Boolean(settings.mantis) &&
+              (settings.mantis_source ?? "quest") !== "quest" && (
               <>
                 <Button variant="outline" onClick={() => onEpisode("bridge-toggle")} disabled={busy}>
                   Toggle tracking

@@ -148,6 +148,7 @@ AggregateFn = register_literal(
         "conservative",
     ]
 )
+MantisSource = register_literal(Literal["quest", "lighthouse", "ultimate"])
 
 
 # ----------------------------------------------------------------------
@@ -529,10 +530,15 @@ class TeleopCmdConfig:
     sim: bool = False
     # Mantis bench mode: drive the two handheld grippers on can_mantis_l/r
     # while the arms exist only as the VR client's URDF overlay — absolute
-    # pose mapping is forced on. The control panel automatically starts the
-    # saved tracker bridge; direct CLI use still supplies its own VR client.
+    # pose mapping is forced on. The control panel uses mantis_source to either
+    # wait for Quest WebXR or start the selected tracker bridge. Direct CLI use
+    # still supplies its own VR client.
     # No robot, no cameras, no recording. Mutually exclusive with --sim.
     mantis: bool = False
+    mantis_source: MantisSource = "quest"
+    """Pose source for Mantis mode. Quest connects through the WebXR client;
+    Lighthouse and Ultimate start the corresponding tracker bridge when the
+    operation is launched from the control panel."""
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is

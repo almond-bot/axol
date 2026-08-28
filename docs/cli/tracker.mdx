@@ -3,7 +3,7 @@ title: "tracker.bridge / tracker.identify"
 description: "Headset-free Mantis teleop and data collection with Vive trackers."
 ---
 
-Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged. The control panel starts and stops this bridge automatically for Mantis operations; the commands below are for direct CLI use and bring-up.
+Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged. In the control panel, **Mantis tracking** explicitly selects Quest, Lighthouse, or Ultimate; the latter two start and stop their matching bridge automatically. The commands below are for direct CLI use and bring-up.
 
 Two tracker families are supported, plus two hardware-free backends for bring-up:
 
@@ -32,15 +32,16 @@ The absolute (Mantis) IK mode solves the rigid tracker→gripper mount and the w
 ## Workflow
 
 ```bash
-# One-time: bind each physical tracker to its rig side.
-axol tracker.identify
+# One-time per tracker family: bind each physical tracker to its rig side.
+axol tracker.identify --backend survive   # Lighthouse
+axol tracker.identify --backend ultimate
 
 # Direct CLI session: teleop/collection in one terminal and bridge in another.
 axol teleop --mantis                # or: axol collect-data --mantis ...
 axol tracker.bridge
 ```
 
-From the control panel, selecting **Mantis** and pressing **Start** performs both steps. While it is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
+From the control panel, select **Mantis**, then pick **Quest**, **Lighthouse**, or **Ultimate** under **Mantis tracking**. Quest connects directly from the headset and starts no bridge. Lighthouse and Ultimate restore their own saved device bindings and start the matching bridge. While a bridge is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/mantis/tcp_transform.json` overrides it when present. For everything else, the absolute (Mantis) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
@@ -61,13 +62,17 @@ A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its las
 
 ## `axol tracker.identify`
 
-Discovers the powered-on trackers, then asks you to shake each rig in turn; the device with the most motion is bound to that side. Saves `~/.almond/tracker/config.json`:
+Discovers the powered-on trackers, then asks you to shake each rig in turn; the device with the most motion is bound to that side. Bindings are retained separately for Lighthouse and Ultimate so the panel can switch between them. Saves `~/.almond/tracker/config.json`:
 
 ```json
 {
   "backend": "survive",
   "left": "T20",
   "right": "T21",
+  "bindings": {
+    "survive": {"left": "T20", "right": "T21"},
+    "ultimate": {"left": "A1:B2:C3", "right": "D4:E5:F6"}
+  },
   "ultimate_quat_order": "xyzw",
   "ultimate_up_axis": "z"
 }
