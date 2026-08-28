@@ -442,11 +442,11 @@ class RolloutCaptureThread(threading.Thread):
                 continue
 
             obs_processed = self.robot_obs_proc(obs)
-            # UMI-collected datasets declare observation.pose_lag (pose↔image
+            # Mantis-collected datasets declare observation.pose_lag (pose↔image
             # capture skew, filled by the collect-data recorder). Rollouts have
             # no separate pose stream — state and images are sampled together
             # in get_observation — so the skew is 0 by construction. Provide it
-            # so run-policy can record into (resume) a UMI dataset.
+            # so run-policy can record into (resume) a Mantis dataset.
             if "observation.pose_lag" in self.dataset.features:
                 obs_processed.setdefault("pose_lag", 0.0)
             obs_frame = build_dataset_frame(

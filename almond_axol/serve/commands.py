@@ -308,11 +308,11 @@ COMMANDS: dict[str, CommandDef] = {
         camera_mode="teleop",
         streams_video=True,
         sim_flag="sim",
-        # umi drives the handheld rig's own CAN buses (can_alm_umi_l/r), so
+        # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
         # like cart_only it never touches the arms or their motor faults.
-        robot_free_flags=("cart_only", "umi"),
+        robot_free_flags=("cart_only", "mantis"),
         uses_headset=True,
-        per_run_fields=("sim", "umi", "cart_only"),
+        per_run_fields=("sim", "mantis", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -362,14 +362,14 @@ COMMANDS: dict[str, CommandDef] = {
         # Recording is teleoperated, so the panel tells the operator to point
         # the headset at this machine — and shows the relay's camera feeds.
         uses_headset=True,
-        # umi records with the handheld rig (its own CAN buses) — the Axol
+        # mantis records with the handheld rig (its own CAN buses) — the Axol
         # arms and their motor-fault gate are not involved.
-        robot_free_flags=("umi",),
+        robot_free_flags=("mantis",),
         # Panel-driven episodes (headset-off collection): the dashboard can
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("umi", "repo_id", "task"),
+        per_run_fields=("mantis", "repo_id", "task"),
     ),
     "replay-dataset": CommandDef(
         "replay-dataset",

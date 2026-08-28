@@ -43,6 +43,7 @@ import {
   useSessionLogs,
   type CommandSpec,
   type FormValue,
+  type HardwareProfile,
   type RobotChannels,
   type RobotState,
   type RobotStatus,
@@ -100,9 +101,9 @@ const PAGE_COMMAND_IDS = [
 // The Axol hub adapter's persistent interface names (created by can.setup).
 // A configured channel equal to its hub default is omitted from launches so
 // the commands run their own defaults.
-const HUB: Record<"left" | "right", string> = {
-  left: "can_alm_axol_l",
-  right: "can_alm_axol_r",
+const HARDWARE_DEFAULTS: Record<HardwareProfile, Record<"left" | "right", string>> = {
+  axol: { left: "can_alm_axol_l", right: "can_alm_axol_r" },
+  mantis: { left: "can_mantis_l", right: "can_mantis_r" },
 }
 
 /**
@@ -267,20 +268,24 @@ export default function Diagnostics() {
       const spec = commands.find((c) => c.id === command)
       const channels = robot?.channels
       if (!spec || !channels) return {}
+      const profile = robot.profile ?? "axol"
+      const defaults = HARDWARE_DEFAULTS[profile]
       const keys = new Set(flattenFields(spec.schema).map((f) => f.key))
       const out: Record<string, FormValue> = {}
+      if (keys.has("target")) out.target = profile
+      if (profile === "mantis" && keys.has("joints")) out.joints = "gripper"
       if (keys.has("left_channel")) {
-        if (channels.left && channels.left !== HUB.left) out.left_channel = channels.left
+        if (channels.left && channels.left !== defaults.left) out.left_channel = channels.left
         if (!channels.left && keys.has("no_left")) out.no_left = true
       }
       if (keys.has("right_channel")) {
-        if (channels.right && channels.right !== HUB.right) out.right_channel = channels.right
+        if (channels.right && channels.right !== defaults.right) out.right_channel = channels.right
         if (!channels.right && keys.has("no_right")) out.no_right = true
       }
       if (keys.has("channel") && keys.has("arm")) {
         const side: "left" | "right" = args.arm === "right" ? "right" : "left"
         const chan = channels[side]
-        if (chan && chan !== HUB[side]) out.channel = chan
+        if (chan && chan !== defaults[side]) out.channel = chan
       }
       return out
     },
@@ -334,23 +339,23 @@ export default function Diagnostics() {
   const connectRobot = useCallback(async () => {
     setRobotBusy(true)
     try {
-      setRobot(await robotConnect())
+      setRobot(await robotConnect(undefined, robot?.profile ?? "axol"))
     } catch (e) {
       toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
-  }, [toast])
+  }, [toast, robot?.profile])
 
   // Manual CAN interface selection — the fallback when the Axol hub adapter
   // (and its auto-named interfaces) can't be found. The server persists the
   // choice, so later connects and operations reuse it.
   const [adapterOpen, setAdapterOpen] = useState(false)
   const connectWithChannels = useCallback(
-    async (channels: RobotChannels) => {
+    async (profile: HardwareProfile, channels: RobotChannels) => {
       setRobotBusy(true)
       try {
-        setRobot(await robotConnect(channels))
+        setRobot(await robotConnect(channels, profile))
         setAdapterOpen(false)
       } catch (e) {
         toast.error(String(e))
@@ -385,7 +390,10 @@ export default function Diagnostics() {
 
   // The joints this robot actually has — the gripperless SKU drops GRIPPER
   // from the motor tiles, chart series, and `--joints` pickers.
-  const joints = useMemo(() => jointsFor(robot?.hasGripper), [robot])
+  const joints = useMemo(
+    () => (robot?.profile === "mantis" ? (["GRIPPER"] as const) : jointsFor(robot?.hasGripper)),
+    [robot]
+  )
 
   const series: ChartSeries[] = useMemo(
     () =>
@@ -430,7 +438,8 @@ export default function Diagnostics() {
         ? "right"
         : null
   const configHiddenKeys = useMemo(() => {
-    const keys = ["left_channel", "right_channel", "channel"]
+    const keys = ["left_channel", "right_channel", "channel", "target"]
+    if (robot?.profile === "mantis") keys.push("joints")
     if (robot?.channels && !robot.channels.left) keys.push("no_left")
     if (robot?.channels && !robot.channels.right) keys.push("no_right")
     return keys
@@ -575,6 +584,10 @@ export default function Diagnostics() {
       presetArgs: { yes: true },
     },
   ]
+  const visibleMotorTools =
+    robot?.profile === "mantis"
+      ? MOTOR_TOOLS.filter((tool) => !["zero", "flash"].includes(tool.key))
+      : MOTOR_TOOLS
   const [motorTool, setMotorTool] = useState<string | null>(null)
   const openTool = MOTOR_TOOLS.find((t) => t.key === motorTool) ?? null
   const openToolSpec = openTool ? canCommand(openTool.command) : null
@@ -605,7 +618,8 @@ export default function Diagnostics() {
         {robot && robot.state === "disconnected" && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
             <p className="text-sm text-white/60">
-              The robot link is disconnected — connect to start streaming motor telemetry.
+              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected —
+              connect to start streaming motor telemetry.
             </p>
             <div className="ml-auto flex items-center gap-2">
               <Button
@@ -613,12 +627,12 @@ export default function Diagnostics() {
                 size="sm"
                 onClick={() => setAdapterOpen(true)}
                 disabled={robotBusy}
-                title="Pick the CAN interface(s) to use when the Axol hub adapter isn't attached."
+                title="Choose Axol or Mantis and the CAN interface(s) to inspect."
               >
                 <Cable /> CAN adapter…
               </Button>
               <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
-                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect robot
+                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect {robot.profile === "mantis" ? "Mantis" : "robot"}
               </Button>
             </div>
           </div>
@@ -632,7 +646,7 @@ export default function Diagnostics() {
                 size="sm"
                 onClick={() => setAdapterOpen(true)}
                 disabled={robotBusy}
-                title="If the Axol hub CAN adapter can't be found, pick the interface(s) of the adapter you're using instead."
+                title="Choose Axol or Mantis and the CAN interfaces to inspect."
               >
                 <Cable /> Choose CAN adapter
               </Button>
@@ -693,7 +707,7 @@ export default function Diagnostics() {
                   </Button>
                 )
               })}
-              {MOTOR_TOOLS.map((tool) => {
+              {visibleMotorTools.map((tool) => {
                 const cmd = canCommand(tool.command)
                 if (!cmd) return null
                 return (
@@ -714,7 +728,7 @@ export default function Diagnostics() {
           {(["left", "right"] as ArmSide[]).map((side) => (
             <div key={side} className="flex flex-col gap-2">
               <span className="text-xs font-medium tracking-wide text-white/45 uppercase">
-                {side} arm
+                {side} {robot?.profile === "mantis" ? "gripper" : "arm"}
               </span>
               <MotorGrid
                 arm={side}
@@ -766,7 +780,7 @@ export default function Diagnostics() {
                       : "text-white/50 hover:bg-white/[0.05]"
                   )}
                 >
-                  {a} arm
+                  {a} {robot?.profile === "mantis" ? "gripper" : "arm"}
                 </button>
               ))}
             </div>
@@ -880,6 +894,7 @@ export default function Diagnostics() {
       {/* Manual CAN interface selection (non-Axol-hub adapters) */}
       {adapterOpen && (
         <CanAdapterDialog
+          profile={robot?.profile ?? "axol"}
           channels={robot?.channels}
           busy={robotBusy}
           onConnect={connectWithChannels}

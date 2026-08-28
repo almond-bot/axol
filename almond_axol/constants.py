@@ -43,8 +43,8 @@ CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
 
 # Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).
-CAN_UMI_LEFT = "can_alm_umi_l"
-CAN_UMI_RIGHT = "can_alm_umi_r"
+CAN_MANTIS_LEFT = "can_mantis_l"
+CAN_MANTIS_RIGHT = "can_mantis_r"
 
 ARM_JOINTS: list[Joint] = [j for j in Joint if j != Joint.GRIPPER]
 

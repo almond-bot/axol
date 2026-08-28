@@ -641,12 +641,12 @@ def _serve_policy_server(server_cfg_dict: dict[str, Any]) -> None:
 
     disable_observation_similarity_filter()
 
-    # Register the UMI relative-EE processor steps so checkpoints trained with
-    # `axol umi.train` deserialize their processor pipelines here.
+    # Register the Mantis relative-EE processor steps so checkpoints trained with
+    # `axol mantis.train` deserialize their processor pipelines here.
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
-    from ..umi import processor as _umi_processor  # noqa: F401
+    from ..mantis import processor as _mantis_processor  # noqa: F401
 
     serve(PolicyServerConfig(**server_cfg_dict))
 
@@ -665,7 +665,7 @@ def _snap_to_newest_indices(
     - Grippers (``*gripper.pos``): averaging would smear bang-bang grasp
       commands into a slow squeeze.
     - Rotation-vector dims (``*_ee.rx/.ry/.rz``): rotation vectors
-      double-cover SO(3), and the composed absolute rotvecs the UMI policy
+      double-cover SO(3), and the composed absolute rotvecs the Mantis policy
       emits are canonicalized to angle in [0, pi]. Two nearly identical
       orientations near the pi boundary can therefore arrive as ``+pi*a``
       and ``-pi*a`` in successive chunks; their weighted average is ~the

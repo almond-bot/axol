@@ -729,7 +729,7 @@ def _build_frame(
 
     ``t_host`` is the same playout instant mapped onto the host clock
     (``time.perf_counter`` seconds); it becomes the frame's ``t_host`` for
-    consumers that align dataset rows to capture time (UMI recording).
+    consumers that align dataset rows to capture time (Mantis recording).
 
     Uses ``model_construct`` (no validation) with explicit ``float()``
     conversion: this runs per sample on the IK dispatch thread and the fields

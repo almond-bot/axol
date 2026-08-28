@@ -7,10 +7,10 @@ moves is the gripper, driven by the rig's CAN trigger node. That is the
 whole rig minus the trackers, which is exactly what you want when
 bringing up or debugging a Mantis gripper::
 
-    axol teleop --umi                     # one terminal
+    axol teleop --mantis                     # one terminal
     axol tracker.bridge --backend static  # another; Enter to engage
 
-The UMI's seven arm joints per side are virtual (there is no arm), so a
+The Mantis's seven arm joints per side are virtual (there is no arm), so a
 frozen arm pose costs nothing physically. Unlike the ``synthetic``
 backend — which orbits the devices through small circles to exercise the
 whole bridge → IK → sim pipeline — nothing here ever moves, so a

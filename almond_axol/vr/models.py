@@ -28,6 +28,13 @@ class VRState(str, Enum):
     ERROR = "error"
 
 
+class VREpisodeOutcome(str, Enum):
+    """Operator-supplied outcome attached to an episode-ending transition."""
+
+    SUCCESS = "success"
+    FAILURE = "failure"
+
+
 class VRPosition(BaseModel):
     """3-DOF position in metres."""
 
@@ -73,6 +80,10 @@ class VRFrame(BaseModel):
         r_lock:  Right grip button state (True = pressed). See l_lock.
         reset:   Rising edge (False → True) triggers a reset to rest pose.
         state:   Current teleoperation session state (data_collection / teleop / recording).
+        episode_outcome: Outcome attached to a RECORDING → DATA_COLLECTION
+            transition. ``None`` keeps the legacy controller behavior (success
+            unless ``reset`` requests re-recording); tracker trigger gestures
+            set this explicitly so failure remains distinct from re-record.
         t:       Client capture timestamp in milliseconds (``performance.now()``).
             Used by the server's pose interpolator to reconstruct the true motion
             cadence when frames arrive batched/jittered over the network. Optional:
@@ -87,7 +98,7 @@ class VRFrame(BaseModel):
             clock (``time.perf_counter`` seconds), stamped server-side by the
             pose interpolator from ``t`` and its headset↔host clock-offset
             estimate. This is the timestamp dataset rows should be aligned to
-            when the pose stream is the ground truth (UMI recording): it names
+            when the pose stream is the ground truth (Mantis recording): it names
             when the hand actually was at this pose, not when the frame was
             played out. ``None`` until the interpolator has seen the frame.
         l_tracked: True while the left controller's position is optically
@@ -121,6 +132,7 @@ class VRFrame(BaseModel):
     r_lock: bool = False
     reset: bool = False
     state: VRState = VRState.TELEOP
+    episode_outcome: VREpisodeOutcome | None = None
     t: float | None = None
     seq: int | None = None
     t_host: float | None = None

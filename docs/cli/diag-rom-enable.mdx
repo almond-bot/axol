@@ -7,6 +7,8 @@ Enables the motors, eases to home, then loops a full range-of-motion sweep of ev
 
 Joint positions and torques are captured to a CSV under `~/.almond/diagnostics/captures` at 5 Hz so the run can be charted in the [diagnostics dashboard](https://docs.almond.bot/guides/diagnostics-dashboard)'s run history.
 
+With `--target mantis`, the same soak machinery exercises only the two grippers at ID 8 on `can_mantis_l` / `can_mantis_r`; arm-joint and grasp-hold steps do not apply.
+
 ```bash
 axol diag.rom-enable
 axol diag.rom-enable --no-right                          # left arm only
@@ -14,8 +16,9 @@ axol diag.rom-enable --joints wrist_1,wrist_2,wrist_3    # subset of joints
 axol diag.rom-enable --web-prompts                       # dashboard-driven prompts
 axol diag.rom-enable --no-capture                        # skip the telemetry CSV
 axol diag.rom-enable --no-right --left-channel can0      # one arm on a non-hub CAN adapter
+axol diag.rom-enable --target mantis                     # both Mantis grippers
 ```
 
-`--left-channel` / `--right-channel` override the SocketCAN interface used for each arm (default: the Axol hub adapter's `can_alm_axol_l` / `can_alm_axol_r`) — for setups where the Axol hub CAN adapter isn't attached. With a single-channel adapter, combine a channel override with `--no-left` / `--no-right` to run one arm.
+`--left-channel` / `--right-channel` override the SocketCAN interface used for each side. Defaults are the Axol pair for `--target axol` and the Mantis pair for `--target mantis`. With a single-channel adapter, combine a channel override with `--no-left` / `--no-right`.
 
 By default each hands-on gripper step is an interactive `input()` prompt on the terminal. `--web-prompts` instead emits a `[prompt] …` marker and blocks on stdin, so the web dashboard can turn the step into a **Continue** button (it's set automatically when launched from the dashboard).

@@ -1,8 +1,8 @@
 """Host-side reader for the Mantis handheld trigger's CAN messages.
 
 The Mantis rig's onboard MCU (RP2350 running can2040 PIO CAN — the
-``axol_umi`` board in the circuits-tsx repo) sits on the same per-side
-gripper CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``, SocketCAN,
+``axol_mantis`` board in the circuits-tsx repo) sits on the same per-side
+gripper CAN bus (``can_mantis_l`` / ``can_mantis_r``, SocketCAN,
 1 Mbit/s) as the Damiao gripper motor and continuously
 publishes the trigger state. SocketCAN delivers every frame to every
 open socket, so :class:`TriggerReader` opens its own filtered bus and
@@ -161,7 +161,7 @@ class TriggerReader:
     first frame).
 
     Args:
-        channel: SocketCAN interface name, e.g. ``"can_alm_umi_l"``.
+        channel: SocketCAN interface name, e.g. ``"can_mantis_l"``.
         bus:     Pre-opened bus-like object (``recv``/``shutdown``) — used
             by the tests to feed synthetic frames without CAN hardware.
     """

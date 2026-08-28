@@ -372,6 +372,11 @@ export function AxolVRClient({
       return { x: p.x, y: p.y, z: p.z }
     }
 
+    // Keep the teleop endpoint explicit: this is WebXR's virtual aim/pointer
+    // pose, not gripSpace. TODO(mantis-calibration): empirically measure the
+    // standard Quest cradle's target-ray→gripper-TCP transform with the URDF
+    // overlay and promote it to the design constant; targetRaySpace has no
+    // dimensioned physical shell datum to recover in CAD.
     const l_hand = getPose(leftSource?.targetRaySpace)
     const r_hand = getPose(rightSource?.targetRaySpace)
 

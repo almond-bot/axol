@@ -460,7 +460,18 @@ class OperationRunner:
         robot_free = is_sim or any(
             bool(args.get(flag)) for flag in cmd.robot_free_flags
         )
-        needs_robot = cmd.uses_can_bus and not robot_free
+        hardware_profile = "mantis" if bool(args.get("mantis")) else "axol"
+        link_matches_run = (
+            self._robot_link is not None
+            and self._robot_link.profile() == hardware_profile
+        )
+        # Only release an idle link whose buses this run will use. An Axol
+        # link and a Mantis run (or vice versa) own distinct CAN interfaces.
+        needs_robot = (
+            cmd.uses_can_bus
+            and link_matches_run
+            and (not robot_free or hardware_profile == "mantis")
+        )
         log_level = self._log_level(args)
 
         session.status = "running"

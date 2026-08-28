@@ -55,12 +55,12 @@ def main(argv: list[str]) -> None:
 
     disable_observation_similarity_filter()
 
-    # Register the UMI relative-EE processor steps so checkpoints trained with
-    # `axol umi.train` deserialize their processor pipelines here.
+    # Register the Mantis relative-EE processor steps so checkpoints trained with
+    # `axol mantis.train` deserialize their processor pipelines here.
     from lerobot.async_inference.configs import PolicyServerConfig
     from lerobot.async_inference.policy_server import serve
 
-    from ..umi import processor as _umi_processor  # noqa: F401
+    from ..mantis import processor as _mantis_processor  # noqa: F401
     from ..utils.ports import reclaim_port
 
     # The gRPC port is fixed (it must match run-policy's ``--server_port``), so

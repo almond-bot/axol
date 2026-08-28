@@ -166,7 +166,7 @@ class VRTeleopConfig:
         tcp_transform_left: Tracker→gripper SE(3) transform for the left rig
             as ``[x, y, z, qx, qy, qz, qw]`` (gripper frame expressed in the
             tracker's local frame) — the rig's factory design constant, or a
-            per-unit override from ``~/.almond/umi/tcp_transform.json``.
+            per-unit override from ``~/.almond/mantis/tcp_transform.json``.
             When set, ``absolute_mode`` maps each tracked pose through it —
             recorded TCP poses become mount-independent and wrist rotations
             stop smearing into position error — instead of absorbing the
@@ -241,10 +241,10 @@ class VRTeleopConfig:
     tracker_key: str | None = None
 
 
-def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
+def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
     """Force the Mantis mapping/faithfulness profile in place.
 
-    Shared by ``collect-data --umi`` and ``teleop --umi`` so the two flows
+    Shared by ``collect-data --mantis`` and ``teleop --mantis`` so the two flows
     behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
     alignment act), and transparent smoothing — the EMA and trapezoid filters
     exist to protect a physical arm and only add lag between the solution and
@@ -259,9 +259,9 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
     explicitly set config values; the override-file entry for the active
     tracker (``config.tracker_key``, or derived — see
-    :func:`almond_axol.umi.calibration.tracker_key_for_side`); the rig's
+    :func:`almond_axol.mantis.calibration.tracker_key_for_side`); the rig's
     factory design transform for the tracker family
-    (:data:`~almond_axol.umi.calibration.DESIGN_TCP_TRANSFORMS` — a design
+    (:data:`~almond_axol.mantis.calibration.DESIGN_TCP_TRANSFORMS` — a design
     constant, so it applies out of the box); a legacy unkeyed override
     entry. A tracker with none of these is warned about loudly: the session
     would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
@@ -274,9 +274,9 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
     config.pose_min_cutoff = 5.0
 
     if config.tcp_transform_left is None or config.tcp_transform_right is None:
-        from ..umi.calibration import (
+        from ..mantis.calibration import (
             LEGACY_TRACKER_KEY,
-            UMI_TCP_TRANSFORM_FILE,
+            MANTIS_TCP_TRANSFORM_FILE,
             design_transform_for,
             load_tcp_transforms,
             tracker_key_for_side,
@@ -307,7 +307,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                     side,
                     key,
                     reason,
-                    UMI_TCP_TRANSFORM_FILE,
+                    MANTIS_TCP_TRANSFORM_FILE,
                 )
             elif LEGACY_TRACKER_KEY in entries:
                 setattr(config, attr, entries[LEGACY_TRACKER_KEY])
@@ -319,7 +319,7 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                     side,
                     key,
                     reason,
-                    UMI_TCP_TRANSFORM_FILE,
+                    MANTIS_TCP_TRANSFORM_FILE,
                 )
             else:
                 _logger.warning(
@@ -334,5 +334,5 @@ def apply_umi_teleop_profile(config: VRTeleopConfig) -> None:
                     side,
                     key,
                     reason,
-                    UMI_TCP_TRANSFORM_FILE,
+                    MANTIS_TCP_TRANSFORM_FILE,
                 )

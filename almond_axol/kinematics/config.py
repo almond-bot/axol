@@ -159,7 +159,7 @@ class KinematicsConfig:
 
 
 # Solver values the Mantis profile forces (see
-# :func:`apply_umi_kinematics_profile`). Tuned with ``scripts/umi_ik_bench.py``
+# :func:`apply_mantis_kinematics_profile`). Tuned with ``scripts/mantis_ik_bench.py``
 # against the feasibility floor of a near-unconstrained solve: within the
 # reachable workspace this tracks the hand with ~2 mm mean / <6 mm p95 excess
 # jaw-tip error over that floor, with no null-space drift while the hand is
@@ -184,7 +184,7 @@ class KinematicsConfig:
 #                    frame can't teleport the solution.
 #   max_iterations   12 (from 8): recovers convergence headroom the higher
 #                    weights consume, within the 30 Hz solve budget.
-UMI_KINEMATICS_OVERRIDES: dict[str, float | int] = {
+MANTIS_KINEMATICS_OVERRIDES: dict[str, float | int] = {
     "pos_weight": 200.0,
     "ori_weight": 120.0,
     "manipulability_weight": 0.0,
@@ -194,15 +194,15 @@ UMI_KINEMATICS_OVERRIDES: dict[str, float | int] = {
 }
 
 
-def apply_umi_kinematics_profile(config: KinematicsConfig) -> None:
+def apply_mantis_kinematics_profile(config: KinematicsConfig) -> None:
     """Apply the Mantis solver profile in place.
 
-    Shared by ``teleop --umi`` and ``collect-data --umi`` (the same way
-    :func:`almond_axol.teleop.config.apply_umi_teleop_profile` is). Each
+    Shared by ``teleop --mantis`` and ``collect-data --mantis`` (the same way
+    :func:`almond_axol.teleop.config.apply_mantis_teleop_profile` is). Each
     override is applied only when the field still holds its dataclass
     default, so explicit ``--kinematics.<field>`` flags win over the profile.
     """
     defaults = KinematicsConfig()
-    for name, value in UMI_KINEMATICS_OVERRIDES.items():
+    for name, value in MANTIS_KINEMATICS_OVERRIDES.items():
         if getattr(config, name) == getattr(defaults, name):
             setattr(config, name, value)

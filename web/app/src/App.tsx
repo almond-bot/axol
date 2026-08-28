@@ -1172,7 +1172,7 @@ function ConnectionStatus({ status }: { status: AxolConnectionStatus }) {
 }
 
 export default function App() {
-  // Zero-touch bootstrap (axol umi.session): ?host= pre-fills the server and
+  // Zero-touch bootstrap (axol mantis.session): ?host= pre-fills the server and
   // ?autoconnect=1 connects without a click — the headset browser is launched
   // at this URL over adb, so the only remaining human steps are wearing the
   // headset and the browser-mandated trigger pull to enter AR.

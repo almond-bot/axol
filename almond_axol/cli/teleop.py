@@ -37,7 +37,9 @@ def _get_local_ip() -> str:
 
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a VR teleop session."""
-    cfg = parse(TeleopCmdConfig, normalize_bool_flags(argv, "sim", "umi", "cart_only"))
+    cfg = parse(
+        TeleopCmdConfig, normalize_bool_flags(argv, "sim", "mantis", "cart_only")
+    )
     # force=True: a dependency imported before this point may install a root
     # handler (leaving the level at WARNING), which would make this a no-op
     # and silently drop log_say() / INFO status lines.
@@ -330,11 +332,11 @@ async def _run_cart_only(cfg: TeleopCmdConfig) -> None:
 
 
 async def _run(cfg: TeleopCmdConfig) -> None:
-    from ..robot import Axol, Sim, Umi
+    from ..robot import Axol, Sim, Mantis
     from ..teleop import VRTeleop
 
-    if cfg.umi and cfg.sim:
-        raise SystemExit("--umi and --sim are mutually exclusive")
+    if cfg.mantis and cfg.sim:
+        raise SystemExit("--mantis and --sim are mutually exclusive")
 
     if cfg.cart_only:
         if cfg.sim:
@@ -342,32 +344,32 @@ async def _run(cfg: TeleopCmdConfig) -> None:
                 "cart-only teleop has no sim mode (there is no cart hardware "
                 "model in the visualizer) — drop --sim or --cart_only"
             )
-        if cfg.umi:
+        if cfg.mantis:
             raise ValueError(
-                "--umi drives the handheld rig and --cart_only the powered "
+                "--mantis drives the handheld rig and --cart_only the powered "
                 "cart — pick one"
             )
         await _run_cart_only(cfg)
         return
 
-    if cfg.umi:
+    if cfg.mantis:
         # Mantis bench mode: the Quest triggers drive the two real
         # grippers; the arms exist only as the headset's URDF overlay. Force
-        # the same absolute-mapping profile collect-data --umi uses so the
+        # the same absolute-mapping profile collect-data --mantis uses so the
         # bench test exercises exactly what collection will.
-        from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
-        from ..kinematics.config import apply_umi_kinematics_profile
-        from ..teleop.config import apply_umi_teleop_profile
+        from ..constants import CAN_LEFT, CAN_RIGHT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+        from ..kinematics.config import apply_mantis_kinematics_profile
+        from ..teleop.config import apply_mantis_teleop_profile
 
         left = cfg.left_channel
         right = cfg.right_channel
         if left == CAN_LEFT:
-            left = CAN_UMI_LEFT
+            left = CAN_MANTIS_LEFT
         if right == CAN_RIGHT:
-            right = CAN_UMI_RIGHT
-        apply_umi_teleop_profile(cfg.teleop)
-        apply_umi_kinematics_profile(cfg.kinematics)
-        robot = Umi(config=cfg.axol, left_channel=left, right_channel=right)
+            right = CAN_MANTIS_RIGHT
+        apply_mantis_teleop_profile(cfg.teleop)
+        apply_mantis_kinematics_profile(cfg.kinematics)
+        robot = Mantis(config=cfg.axol, left_channel=left, right_channel=right)
     elif cfg.sim:
         robot = Sim()
     else:

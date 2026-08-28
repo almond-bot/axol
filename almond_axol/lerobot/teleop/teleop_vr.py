@@ -13,7 +13,7 @@ Episode control is exposed via get_teleop_events(), mapped from VRState
 transitions:
   - DATA_COLLECTION → RECORDING:         start recording (no event)
   - RECORDING → DATA_COLLECTION + reset: RERECORD_EPISODE (discard)
-  - RECORDING → DATA_COLLECTION:         TERMINATE_EPISODE + SUCCESS
+  - RECORDING → DATA_COLLECTION:         TERMINATE_EPISODE + SUCCESS/FAILURE
 
 After a TERMINATE_EPISODE the caller should push SAVING to the headset via
 send_feedback_state(VRState.SAVING) to block controls while writing the
@@ -55,7 +55,7 @@ from ...constants import Joint
 from ...robot.cart import Cart
 from ...teleop.core import VRTeleopCore
 from ...teleop.worker import run_ik_worker
-from ...vr.models import VRFrame, VRState
+from ...vr.models import VREpisodeOutcome, VRFrame, VRState
 from ...vr.server import VRServer
 from .config_vr import AxolVRTeleopConfig
 
@@ -138,6 +138,7 @@ class AxolVRTeleop(Teleoperator):
         self._event_lock = threading.Lock()
         self._rerecord_latch: bool = False
         self._terminate_latch: bool = False
+        self._failure_latch: bool = False
         self._start_recording_latch: bool = False
 
         # Rolling ~2s windows of IK-solve and VR-frame timestamps, for the
@@ -549,7 +550,7 @@ class AxolVRTeleop(Teleoperator):
     def _broadcast_json(self, obj: dict[str, Any]) -> None:
         """Push an arbitrary JSON message to the headset (fire-and-forget).
 
-        Used by the shared core for the URDF overlay state in absolute (UMI)
+        Used by the shared core for the URDF overlay state in absolute (Mantis)
         mode. Safe to call from any thread.
         """
         if self._vr_server is None or self._loop is None:
@@ -647,7 +648,7 @@ class AxolVRTeleop(Teleoperator):
         """Host-clock capture time of the pose behind the latest action.
 
         ``time.perf_counter`` seconds, estimated by the VR server's pose
-        interpolator (``VRFrame.t_host``). UMI data collection stamps dataset
+        interpolator (``VRFrame.t_host``). Mantis data collection stamps dataset
         rows with this so image exposure and pose share one capture timeline.
         ``None`` before the first solve or when the client doesn't stamp
         capture times.
@@ -655,12 +656,12 @@ class AxolVRTeleop(Teleoperator):
         return self._core.last_pose_host_ts
 
     def tcp_poses(self) -> dict | None:
-        """Latest base-frame TCP target per side (absolute/UMI mode only).
+        """Latest base-frame TCP target per side (absolute/Mantis mode only).
 
         ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}`` in the robot
         base frame — the tracked ground-truth pose the IK solver chased for
-        the latest action. UMI data collection records this per dataset row
-        so training can use raw TCP trajectories (e.g. UMI-style relative EE
+        the latest action. Mantis data collection records this per dataset row
+        so training can use raw TCP trajectories (e.g. Mantis-style relative EE
         actions) independent of the joint solutions. ``None`` before the
         first solve or outside absolute mode.
         """
@@ -672,7 +673,7 @@ class AxolVRTeleop(Teleoperator):
         ``time.perf_counter`` seconds of the last IK reply whose TCP differed
         from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
         A tracker dropout / IK stall keeps replying with an identical pose,
-        so UMI data collection compares this against "now" to count stale
+        so Mantis data collection compares this against "now" to count stale
         frames — frozen poses recorded under fresh row timestamps. ``None``
         before the first absolute-mode solve.
         """
@@ -684,7 +685,7 @@ class AxolVRTeleop(Teleoperator):
         Mirrors the shared core's engage toggle. While disengaged the IK
         target — and therefore the recorded TCP — holds still even though the
         operator's hands move, and the *next* engage re-fits the world→base
-        transform; UMI data collection uses this to count disengaged frames
+        transform; Mantis data collection uses this to count disengaged frames
         and to flag mid-episode re-engages that invalidate an episode.
         """
         return self._core.teleop_enabled
@@ -700,14 +701,17 @@ class AxolVRTeleop(Teleoperator):
         with self._event_lock:
             rerecord = self._rerecord_latch
             terminate = self._terminate_latch
+            failure = self._failure_latch
             start_recording = self._start_recording_latch
             self._rerecord_latch = False
             self._terminate_latch = False
+            self._failure_latch = False
             self._start_recording_latch = False
         return {
             TeleopEvents.IS_INTERVENTION: False,
             TeleopEvents.TERMINATE_EPISODE: terminate,
-            TeleopEvents.SUCCESS: terminate,
+            TeleopEvents.SUCCESS: terminate and not failure,
+            TeleopEvents.FAILURE: failure,
             TeleopEvents.RERECORD_EPISODE: rerecord,
             "start_recording": start_recording,
         }
@@ -754,6 +758,9 @@ class AxolVRTeleop(Teleoperator):
             else:
                 with self._event_lock:
                     self._terminate_latch = True
+                    self._failure_latch = (
+                        frame.episode_outcome == VREpisodeOutcome.FAILURE
+                    )
         self._prev_state = curr
 
     # ------------------------------------------------------------------

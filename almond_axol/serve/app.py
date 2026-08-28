@@ -12,14 +12,14 @@ import os
 import socket
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from ..constants import URDF_PATH
+from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.sudo import prime_sudo
@@ -80,14 +80,15 @@ class RobotConnectRequest(BaseModel):
     ``channelsSet`` distinguishes "connect with the stored/default interfaces"
     (an empty body) from an explicit selection. A ``None`` channel disables
     that arm, so a single non-Axol-hub adapter can drive one arm only. The
-    selection is persisted to the shared settings
-    (``robot.left_channel`` / ``robot.right_channel``), so every operation and
-    later connects use it too.
+    Axol selections are persisted to the shared operation settings. Mantis
+    selections affect only the idle diagnostics link, so inspecting the rig
+    cannot overwrite the robot's channels.
     """
 
     leftChannel: str | None = None
     rightChannel: str | None = None
     channelsSet: bool = False
+    profile: Literal["axol", "mantis"] = "axol"
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -388,14 +389,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any] | JSONResponse:
         """Connect the robot link, optionally onto explicit CAN interfaces.
 
-        An explicit selection (``channelsSet``) is persisted to the shared
-        settings first; either way the link is (re)pointed at the settings'
-        channels, so an interface change takes effect on the next connect.
+        Axol channel selections are persisted to the shared operation settings.
+        Mantis selection is diagnostics-only: it points the idle telemetry link
+        at the rig without changing the robot channels used by operations.
         """
+        profile = req.profile if req is not None else "axol"
         if req is not None and req.channelsSet:
             if not req.leftChannel and not req.rightChannel:
                 return JSONResponse(
-                    {"error": "select a CAN interface for at least one arm"},
+                    {"error": "select a CAN interface for at least one side"},
                     status_code=400,
                 )
             if robot.status()["state"] == "busy":
@@ -403,21 +405,26 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                     {"error": "cannot change CAN interfaces while a task owns the bus"},
                     status_code=409,
                 )
-            settings.update(
-                values={
-                    "robot.left_channel": req.leftChannel or "null",
-                    "robot.right_channel": req.rightChannel or "null",
-                }
-            )
-        channels = settings.can_channels()
-        if channels != robot.channels():
+            if profile == "axol":
+                settings.update(
+                    values={
+                        "robot.left_channel": req.leftChannel or "null",
+                        "robot.right_channel": req.rightChannel or "null",
+                    }
+                )
+            channels = (req.leftChannel, req.rightChannel)
+        elif profile == "mantis":
+            channels = (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+        else:
+            channels = settings.can_channels()
+        if channels != robot.channels() or profile != robot.profile():
             if robot.status()["state"] == "busy":
                 return JSONResponse(
                     {"error": "cannot change CAN interfaces while a task owns the bus"},
                     status_code=409,
                 )
             await asyncio.to_thread(robot.disconnect)
-            robot.set_channels(*channels)
+            robot.set_channels(*channels, profile=profile)
         return await asyncio.to_thread(robot.connect)
 
     @app.post("/api/robot/disconnect")
@@ -762,7 +769,9 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             robot_free = is_sim or any(
                 bool(req.args.get(flag)) for flag in cmd.robot_free_flags
             )
-            if not robot_free:
+            hardware_profile = "mantis" if bool(req.args.get("mantis")) else "axol"
+            link_matches_run = robot.profile() == hardware_profile
+            if (not robot_free or hardware_profile == "mantis") and link_matches_run:
                 fault_response = await _motor_fault_response()
                 if fault_response is not None:
                     return fault_response

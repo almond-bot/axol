@@ -22,7 +22,13 @@ import threading
 import time
 from typing import Any, Callable
 
-from ..constants import ARM_JOINTS, CAN_LEFT, CAN_RIGHT
+from ..constants import (
+    ARM_JOINTS,
+    CAN_LEFT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
+)
 from ..motor import CanBus, Joint, Motor, MotorError
 from .telemetry import SAMPLE_HZ, TelemetryHub, motor_key
 
@@ -266,17 +272,23 @@ class RobotLink:
         right_channel: str | None = CAN_RIGHT,
         hub: TelemetryHub | None = None,
         has_gripper: Callable[[], bool] | None = None,
+        profile: str = "axol",
     ) -> None:
         """Construct the link.
 
         Args:
-            left_channel:  SocketCAN interface for the left arm; None disables.
-            right_channel: Same for the right arm.
+            left_channel:  SocketCAN interface for the left side; None disables.
+            right_channel: Same for the right side.
             hub:           Telemetry hub to publish sweeps into.
             has_gripper:   Callable returning whether this robot has grippers
                            (e.g. ``SettingsStore.has_gripper``), re-read on
                            every connect. ``None`` means always ``True``.
+            profile:       ``axol`` for all configured arm motors, or ``mantis``
+                           for only the two grippers at CAN ID 8.
         """
+        if profile not in ("axol", "mantis"):
+            raise ValueError(f"unknown hardware profile: {profile}")
+        self._profile = profile
         self._has_gripper_provider = has_gripper
         self._arms: list[_ArmLink] = []
         if left_channel:
@@ -316,6 +328,8 @@ class RobotLink:
         While the link is up this is the connect-time snapshot matching the
         opened motors; otherwise the current setting.
         """
+        if self._profile == "mantis":
+            return [Joint.GRIPPER]
         with self._lock:
             active = self._active_joints
         if active is not None:
@@ -413,7 +427,17 @@ class RobotLink:
         right = next((a.channel for a in self._arms if a.side == "right"), None)
         return left, right
 
-    def set_channels(self, left_channel: str | None, right_channel: str | None) -> None:
+    def profile(self) -> str:
+        """The hardware represented by this idle link: ``axol`` or ``mantis``."""
+        return self._profile
+
+    def set_channels(
+        self,
+        left_channel: str | None,
+        right_channel: str | None,
+        *,
+        profile: str = "axol",
+    ) -> None:
         """Swap the CAN interfaces the link uses (e.g. a non-Axol-hub adapter).
 
         A ``None`` channel disables that arm, so a single-adapter setup can run
@@ -421,7 +445,12 @@ class RobotLink:
         the link (or a task borrowing its bus) is up, since the open buses
         belong to the old interfaces.
         """
-        if self.channels() == (left_channel, right_channel):
+        if profile not in ("axol", "mantis"):
+            raise ValueError(f"unknown hardware profile: {profile}")
+        if (
+            self.channels() == (left_channel, right_channel)
+            and self._profile == profile
+        ):
             return
         with self._lock:
             if self._state not in (STATE_DISCONNECTED, STATE_ERROR):
@@ -433,6 +462,7 @@ class RobotLink:
                 self._arms.append(_ArmLink(left_channel, "left"))
             if right_channel:
                 self._arms.append(_ArmLink(right_channel, "right"))
+            self._profile = profile
         self.hub.clear_slow()
 
     def status(self) -> dict[str, Any]:
@@ -463,6 +493,7 @@ class RobotLink:
             "error": error,
             "lastPing": last_ping,
             "channels": {"left": left_channel, "right": right_channel},
+            "profile": self._profile,
             "hasGripper": Joint.GRIPPER in joints,
             "motors": motors,
             "motorCount": len(motors),
@@ -499,7 +530,7 @@ class RobotLink:
     async def _open_and_start(self) -> None:
         # Snapshot the joint set from the live setting for this connection;
         # status() reports from the same snapshot until the link is torn down.
-        joints = list(Joint) if self._has_gripper() else list(ARM_JOINTS)
+        joints = self._joints()
         with self._lock:
             self._active_joints = joints
         for arm in self._arms:
@@ -577,7 +608,23 @@ class RobotLink:
         hub-specific ``can.setup`` (udev rules, interface renames, RX-wedge
         recovery), just plain SocketCAN interface configuration.
         """
-        return {arm.channel for arm in self._arms} == {CAN_LEFT, CAN_RIGHT}
+        return self._profile == "axol" and {arm.channel for arm in self._arms} == {
+            CAN_LEFT,
+            CAN_RIGHT,
+        }
+
+    def _uses_mantis_hub(self) -> bool:
+        """True when every selected bus belongs to the named Mantis hub."""
+        channels = {arm.channel for arm in self._arms}
+        return (
+            self._profile == "mantis"
+            and bool(channels)
+            and channels
+            <= {
+                CAN_MANTIS_LEFT,
+                CAN_MANTIS_RIGHT,
+            }
+        )
 
     def _enable_custom_can(self) -> None:
         """Bring up user-chosen CAN interfaces (no Axol hub adapter present).
@@ -620,10 +667,26 @@ class RobotLink:
         Custom (non-Axol-hub) interfaces skip all of that: they just need to
         exist and be up (see :meth:`_enable_custom_can`).
         """
-        from ..cli.can.setup import bring_up_can, ensure_setup, rx_alive
+        from ..cli.can.setup import (
+            _MANTIS_PROFILE,
+            bring_up_can,
+            ensure_mantis_setup,
+            ensure_setup,
+            rx_alive,
+        )
 
         if not self._arms:
             raise RuntimeError("No CAN interfaces configured")
+        if self._uses_mantis_hub():
+            if not _MANTIS_PROFILE.cron_script.exists():
+                _logger.info("Mantis CAN profile missing; running automatic setup.")
+                ensure_mantis_setup()
+                return
+            if self._can_already_up() and rx_alive(_MANTIS_PROFILE):
+                _logger.info("Mantis CAN interfaces already up; grippers responding.")
+                return
+            bring_up_can(_MANTIS_PROFILE)
+            return
         if not self._uses_axol_hub():
             self._enable_custom_can()
             return

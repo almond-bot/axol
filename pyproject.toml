@@ -35,7 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gamepad = ["pygame>=2.6"]
-# training backs `axol umi.train` (LeRobot's trainer: accelerate + wandb);
+# training backs `axol mantis.train` (LeRobot's trainer: accelerate + wandb);
 # diffusion adds the diffusers dependency for --policy.type diffusion.
 # Floor 0.6.1: the bindings use lerobot.lerobot_types + the VideoEncoderConfig
 # API (both landed in 0.6.1). Our own installs pin the exact rev via

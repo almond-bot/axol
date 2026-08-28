@@ -658,7 +658,7 @@ class SnapshotWriter:
     no pickle, no lock, no blocking, so it stays off the hot path. The recorder
     subprocess reads via :class:`SnapshotReader`: either the newest snapshot
     (``read_latest``) or the one whose timestamp is nearest a camera frame's
-    capture time (``read_nearest`` — UMI pose↔image pairing). Single-writer /
+    capture time (``read_nearest`` — Mantis pose↔image pairing). Single-writer /
     single-reader.
     """
 

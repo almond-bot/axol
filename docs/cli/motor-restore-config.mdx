@@ -7,8 +7,9 @@ Writes a JSON snapshot produced by [`motor.dump-config`](https://docs.almond.bot
 
 | Flag | Description |
 |---|---|
-| `--l` / `--r` | Select the left or right arm (mutually exclusive, required) |
-| `--channel IFACE` | SocketCAN interface to use instead of the selected arm's Axol hub interface, for setups without the Axol hub CAN adapter (e.g. `can0`) |
+| `--l` / `--r` | Select the left or right side (mutually exclusive, required) |
+| `--target {axol,mantis}` | Use that side's Axol arm or Mantis gripper bus (default: `axol`); Mantis restores only ID 8 |
+| `--channel IFACE` | Override the selected hardware's default SocketCAN interface (e.g. `can0`) |
 | `snapshot` | JSON file from `motor.dump-config` (positional, required) |
 | `--id ID` | Restore only this motor CAN ID, hex or decimal. Omit to restore every motor in the snapshot |
 | `--include-protected` | Also write protected parameters — factory calibration, CAN IDs, baud rate (dangerous) |
@@ -19,6 +20,7 @@ Parameters already holding the saved value are skipped, so restoring onto a matc
 ```bash
 axol motor.restore-config --l arm-left.json            # every motor in the snapshot
 axol motor.restore-config --l --id 0x01 arm-left.json  # just one motor
+axol motor.restore-config --target mantis --l mantis-left.json
 ```
 
 <Note>

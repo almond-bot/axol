@@ -2,10 +2,10 @@
 
 The Mantis is a pair of handheld devices — a Quest controller rigidly mounted
 to the same Damiao gripper the robot uses — held by a human demonstrator. Each
-gripper sits alone on its own CAN bus (``can_alm_umi_l`` / ``can_alm_umi_r``)
+gripper sits alone on its own CAN bus (``can_mantis_l`` / ``can_mantis_r``)
 at the production gripper CAN ID (0x08).
 
-:class:`Umi` mirrors the :class:`~almond_axol.robot.axol.Axol` control surface
+:class:`Mantis` mirrors the :class:`~almond_axol.robot.axol.Axol` control surface
 (``enable`` / ``get_positions`` / ``motion_control`` / per-side ``positions`` /
 ``torques``) so the LeRobot wrapper and ``collect-data`` drive it unchanged.
 The seven arm joints per side are **virtual**: there is no arm, so
@@ -24,7 +24,7 @@ import logging
 
 import numpy as np
 
-from ..constants import ARM_JOINTS, CAN_UMI_LEFT, CAN_UMI_RIGHT
+from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 from ..motor import CanBus, ControlMode, Joint, Motor
 from .axol import GRIPPER_TRAVEL, calibrate_gripper_open_stop
 from .base import RobotBase
@@ -35,7 +35,7 @@ _logger = logging.getLogger(__name__)
 _N_ARM = len(ARM_JOINTS)
 
 
-class UmiGripperArm:
+class MantisGripperArm:
     """One handheld gripper plus a virtual 7-joint arm.
 
     Mirrors the parts of :class:`~almond_axol.robot.axol.AxolArm` that the
@@ -130,7 +130,7 @@ class UmiGripperArm:
         )
 
 
-class Umi(RobotBase):
+class Mantis(RobotBase):
     """The Mantis rig's dual handheld grippers behind the ``Axol`` control surface.
 
     Args:
@@ -143,24 +143,24 @@ class Umi(RobotBase):
     def __init__(
         self,
         config: AxolConfig = AxolConfig(),
-        left_channel: str | None = CAN_UMI_LEFT,
-        right_channel: str | None = CAN_UMI_RIGHT,
+        left_channel: str | None = CAN_MANTIS_LEFT,
+        right_channel: str | None = CAN_MANTIS_RIGHT,
     ) -> None:
         if left_channel is None and right_channel is None:
             raise ValueError(
                 "At least one of left_channel or right_channel must be specified."
             )
 
-        self.left: UmiGripperArm | None = None
-        self.right: UmiGripperArm | None = None
+        self.left: MantisGripperArm | None = None
+        self.right: MantisGripperArm | None = None
         self._left_bus: CanBus | None = None
         self._right_bus: CanBus | None = None
         if left_channel is not None:
             self._left_bus = CanBus(left_channel)
-            self.left = UmiGripperArm(self._left_bus, config.left.gripper)
+            self.left = MantisGripperArm(self._left_bus, config.left.gripper)
         if right_channel is not None:
             self._right_bus = CanBus(right_channel)
-            self.right = UmiGripperArm(self._right_bus, config.right.gripper)
+            self.right = MantisGripperArm(self._right_bus, config.right.gripper)
 
     # -- Lifecycle -------------------------------------------------------------
 

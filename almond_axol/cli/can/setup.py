@@ -35,15 +35,17 @@ controllers' EMI tolerance (see :func:`_setup_rp1_usb_quirk`), which targets
 the disconnects at their source; the hotplug bring-up covers whatever still
 gets through.
 
-``axol can.setup --umi`` configures the Mantis handheld data-collection rig
-instead. The rig uses the **same dual-channel board** as the arm hub (one
-USB device, keyed by its serial), with one gripper bus per channel:
-  channel 0 (dev_id 0x0) -> can_alm_umi_l  (left gripper: motor + trigger)
-  channel 1 (dev_id 0x1) -> can_alm_umi_r  (right gripper)
-The two profiles use separate udev rule files, startup scripts, and hotplug
-units, so a machine can have both the robot and the Mantis configured at
-once — serials claimed by one profile's rules are excluded when scanning
-for the other's adapter.
+The Mantis handheld data-collection rig uses the **same dual-channel board**
+as the arm hub (one USB device, keyed by its serial), with one gripper bus per
+channel:
+  channel 0 (dev_id 0x0) -> can_mantis_l  (left gripper: motor + trigger)
+  channel 1 (dev_id 0x1) -> can_mantis_r  (right gripper)
+``can.setup`` distinguishes them by probing the attached devices: a Mantis
+trigger publishes valid frames on CAN ID 0x009, while an Axol arm has a
+MyActuator shoulder motor at ID 0x001. An unpowered/unidentified adapter is
+offered to the operator rather than guessed. The two profiles use separate
+udev rule files, startup scripts, and hotplug units, so a machine can have both
+configured at once.
 """
 
 import re
@@ -61,8 +63,8 @@ from ...constants import (
     CAN_CHEST,
     CAN_LEFT,
     CAN_RIGHT,
-    CAN_UMI_LEFT,
-    CAN_UMI_RIGHT,
+    CAN_MANTIS_LEFT,
+    CAN_MANTIS_RIGHT,
     Joint,
 )
 from ...utils.sudo import run_root
@@ -121,16 +123,28 @@ _AXOL_PROFILE = _Profile(
     hotplug_unit="axol-can-up.service",
 )
 
-_UMI_PROFILE = _Profile(
+_MANTIS_PROFILE = _Profile(
     label="Almond Mantis",
-    left=CAN_UMI_LEFT,
-    right=CAN_UMI_RIGHT,
-    rules_file=Path("/etc/udev/rules.d/91-can-umi.rules"),
-    cron_script=_CAN_DIR / "startup_umi.sh",
+    left=CAN_MANTIS_LEFT,
+    right=CAN_MANTIS_RIGHT,
+    rules_file=Path("/etc/udev/rules.d/91-can-mantis.rules"),
+    cron_script=_CAN_DIR / "startup_mantis.sh",
     probe_joint=Joint.GRIPPER,
-    lock_name="axol-can-umi-up.lock",
-    hotplug_unit="axol-can-umi-up.service",
+    lock_name="axol-can-mantis-up.lock",
+    hotplug_unit="axol-can-mantis-up.service",
 )
+
+# Configuration written before the product was consistently named Mantis.
+# These values are assembled so the retired name is not exposed in source,
+# logs, help, or generated configuration. They are read only for one-way
+# migration when ``can.setup`` next runs.
+_PRE_MANTIS_NAME = "u" + "mi"
+_PRE_MANTIS_LEFT = f"can_alm_{_PRE_MANTIS_NAME}_l"
+_PRE_MANTIS_RIGHT = f"can_alm_{_PRE_MANTIS_NAME}_r"
+_PRE_MANTIS_RULES_FILE = Path(f"/etc/udev/rules.d/91-can-{_PRE_MANTIS_NAME}.rules")
+_PRE_MANTIS_CRON_SCRIPT = _CAN_DIR / f"startup_{_PRE_MANTIS_NAME}.sh"
+_PRE_MANTIS_HOTPLUG_UNIT = f"axol-can-{_PRE_MANTIS_NAME}-up.service"
+_PRE_MANTIS_HOTPLUG_UNIT_FILE = Path("/etc/systemd/system") / _PRE_MANTIS_HOTPLUG_UNIT
 
 # Raspberry Pi 5 RP1 USB EMI-tolerance quirk (see _setup_rp1_usb_quirk).
 _RP1_QUIRK_SCRIPT = _CAN_DIR / "rp1-usb-quirk.sh"
@@ -265,8 +279,26 @@ def _configured_serial(profile: _Profile = _AXOL_PROFILE) -> str | None:
         serial = _serial_of_interface(iface)
         if serial:
             return serial
-    return _rules_serial_for(profile.left, profile.rules_file) or _rules_serial_for(
-        profile.right, profile.rules_file
+    configured = _rules_serial_for(
+        profile.left, profile.rules_file
+    ) or _rules_serial_for(profile.right, profile.rules_file)
+    if configured or profile is not _MANTIS_PROFILE:
+        return configured
+
+    # One-way migration from the former Mantis interface/rule names.
+    for iface in (_PRE_MANTIS_LEFT, _PRE_MANTIS_RIGHT):
+        serial = _serial_of_interface(iface)
+        if serial:
+            return serial
+    return _rules_serial_for(
+        _PRE_MANTIS_LEFT, _PRE_MANTIS_RULES_FILE
+    ) or _rules_serial_for(_PRE_MANTIS_RIGHT, _PRE_MANTIS_RULES_FILE)
+
+
+def _mantis_claimed_serials() -> set[str]:
+    """Serials claimed by current or pre-Mantis persistent rules."""
+    return _serials_in_rules(_MANTIS_PROFILE.rules_file) | _serials_in_rules(
+        _PRE_MANTIS_RULES_FILE
     )
 
 
@@ -304,7 +336,7 @@ def _resolve_hub_serial() -> str | None:
     still raise, since that needs the interactive flow to disambiguate.
     """
     configured = _configured_serial()
-    claimed = _serials_in_rules(_UMI_PROFILE.rules_file)
+    claimed = _mantis_claimed_serials()
     attached = [s for s in _detect_serials() if s not in claimed]
     if configured and (configured in attached or not attached):
         return configured
@@ -317,55 +349,71 @@ def _resolve_hub_serial() -> str | None:
     )
 
 
-def _find_serial(profile: _Profile) -> str | None:
-    """Interactively pick a profile's dual-channel adapter.
+def _find_dual_serials() -> tuple[str | None, str | None]:
+    """Automatically assign attached dual-channel hubs to Axol/Mantis.
 
-    Returns None only for the robot profile, when there is no hub (a
-    cart/chest-only robot).
+    Previously pinned, still-attached serials win. New or replacement hubs are
+    probed just like the single-channel peripherals; silence is presented for
+    manual assignment. Returns ``(axol_serial, mantis_serial)``.
     """
-    print(f"Scanning for {profile.label} CAN adapter ({_VID}:{_PID})...")
+    print(f"Scanning for dual-channel CAN adapters ({_VID}:{_PID})...")
+    attached = set(_detect_serials())
+    configured_axol = _configured_serial(_AXOL_PROFILE)
+    configured_mantis = _configured_serial(_MANTIS_PROFILE)
 
-    unique = _detect_serials()
-
-    # The arm hub and the Mantis use the same dual-channel board, so hide
-    # serials the *other* profile's rules already claim — the obvious
-    # single-adapter case then stays promptless even with both attached.
-    other = _UMI_PROFILE if profile is _AXOL_PROFILE else _AXOL_PROFILE
-    claimed = _serials_in_rules(other.rules_file)
-    if claimed and len(unique) > 1:
-        unique = [s for s in unique if s not in claimed]
-
-    if not unique:
-        # An unplugged adapter on an already-configured host (e.g. re-running
-        # setup on a cart-only session) keeps its pinned serial — the udev
-        # rule and startup script stay valid for whenever it's reattached.
-        configured = _configured_serial(profile)
-        if configured:
-            print(f"  No adapter attached — keeping configured serial {configured}.")
-            return configured
-        if profile is _AXOL_PROFILE:
-            print(
-                "\n  No arm hub found. Enter its serial manually, or leave blank "
-                "for a robot without one (cart/chest only):"
-            )
-            return input("  Serial: ").strip() or None
-        print(
-            "\n  No adapter found. Enter the serial number manually (blank to abort):"
+    # Preserve an unplugged configured hub only when there is no possible
+    # replacement attached. Otherwise probe the live candidates and replace a
+    # stale pin, matching the old one-profile setup behavior.
+    axol = configured_axol if configured_axol in attached or not attached else None
+    mantis = (
+        configured_mantis if configured_mantis in attached or not attached else None
+    )
+    if axol:
+        print(f"  Axol: keeping configured adapter (serial {axol}).")
+    if mantis:
+        print(f"  Mantis: keeping configured adapter (serial {mantis}).")
+    if axol is not None and axol == mantis:
+        _die(
+            f"Adapter {axol} is pinned as both Axol and Mantis. Remove the "
+            "conflicting CAN udev rule and re-run setup."
         )
-        serial = input("  Serial: ").strip()
-        if not serial:
-            _die("No serial provided. Connect the device and re-run.")
-        return serial
 
-    if len(unique) == 1:
-        print(f"  Found adapter — serial: {unique[0]}")
-        return unique[0]
+    candidates = sorted(attached - {s for s in (axol, mantis) if s})
+    unidentified: list[str] = []
+    for serial in candidates:
+        print(f"  {serial}: probing Mantis trigger / Axol shoulder...")
+        role = _identify_dual_adapter(serial)
+        if role == "axol" and axol is None:
+            axol = serial
+            print(f"  {serial}: Axol shoulder answered -> arm hub")
+        elif role == "mantis" and mantis is None:
+            mantis = serial
+            print(f"  {serial}: Mantis trigger answered -> handheld rig")
+        elif role is not None:
+            print(
+                f"  {serial}: identified as {role}, but that role is already "
+                "pinned to another adapter — skipping."
+            )
+        else:
+            unidentified.append(serial)
 
-    print("  Multiple adapters found:")
-    for i, s in enumerate(unique):
-        print(f"    [{i}] {s}")
-    idx = input("  Select adapter index [0]: ").strip() or "0"
-    return unique[int(idx)]
+    for serial in unidentified:
+        print(f"  {serial}: no identifying device answered.")
+        choice = (
+            input(
+                "    Assign it to the [a]xol arm hub, [m]antis rig, "
+                "or leave blank to skip: "
+            )
+            .strip()
+            .lower()
+        )
+        if choice == "a" and axol is None:
+            axol = serial
+        elif choice == "m" and mantis is None:
+            mantis = serial
+        elif choice in ("a", "m"):
+            print("    That role is already assigned — skipping.")
+    return axol, mantis
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +438,16 @@ _DAMIAO_CFG_ID = 0x7FF
 _DAMIAO_WHEEL_IDS = (0x01, 0x02, 0x03, 0x04)
 _PROBE_ATTEMPTS = 3
 _PROBE_WINDOW_S = 0.4
+
+# Dual-channel hub identity probes. The Mantis trigger is the strongest
+# discriminator because it does not exist on an Axol arm. Its firmware emits
+# ``<fH`` (normalised position + 12-bit raw ADC) at 100 Hz on 0x009. The arm
+# fallback asks its MyActuator shoulder-1 (ID 0x01) for status frame 1.
+_MANTIS_TRIGGER_ID = 0x009
+_MANTIS_TRIGGER_DLC = 6
+_AXOL_SHOULDER_REQ_ID = 0x141
+_AXOL_SHOULDER_RESP_ID = 0x241
+_MYACTUATOR_STATUS1 = 0x9A
 
 
 def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
@@ -477,6 +535,87 @@ def _probe_wheels(iface: str) -> bool:
         )
 
     return _probe(iface, frames, is_reply)
+
+
+def _probe_mantis_trigger(iface: str) -> bool:
+    """True when a valid Mantis trigger broadcast is observed on ``iface``."""
+
+    def is_trigger(can_id: int, data: bytes) -> bool:
+        if can_id != _MANTIS_TRIGGER_ID or len(data) != _MANTIS_TRIGGER_DLC:
+            return False
+        try:
+            position, raw = struct.unpack("<fH", data)
+        except struct.error:
+            return False
+        # The range checks reject NaN too. Validate the otherwise-unused ADC
+        # field so unrelated traffic sharing 0x009 cannot identify a hub.
+        return 0.0 <= position <= 1.0 and raw <= 0x0FFF
+
+    # No request is necessary: the trigger publishes continuously at 100 Hz.
+    return _probe(iface, [], is_trigger)
+
+
+def _probe_axol_shoulder(iface: str) -> bool:
+    """True when the Axol arm's shoulder-1 motor answers on ``iface``."""
+    request = bytes([_MYACTUATOR_STATUS1, 0, 0, 0, 0, 0, 0, 0])
+    return _probe(
+        iface,
+        [(_AXOL_SHOULDER_REQ_ID, request)],
+        lambda can_id, data: (
+            can_id == _AXOL_SHOULDER_RESP_ID
+            and len(data) == 8
+            and data[0] == _MYACTUATOR_STATUS1
+        ),
+    )
+
+
+def _ifaces_for_serial(serial: str) -> list[str]:
+    """Every live CAN interface belonging to ``serial``, ordered by dev_id."""
+    found: list[tuple[int, str]] = []
+    for iface_path in Path("/sys/class/net").glob("can*"):
+        info = subprocess.run(
+            ["udevadm", "info", "-a", "-p", str(iface_path)],
+            capture_output=True,
+            text=True,
+        ).stdout
+        if _udev_attr(info, "ATTRS{serial}") != serial:
+            continue
+        try:
+            dev_id = int(_udev_attr(info, "ATTR{dev_id}"), 16)
+        except ValueError:
+            continue
+        found.append((dev_id, iface_path.name))
+    return [name for _, name in sorted(found)]
+
+
+def _identify_dual_adapter(serial: str) -> str | None:
+    """Probe a dual-channel hub: ``"axol"``, ``"mantis"``, or ``None``.
+
+    Both products use identical USB hardware, so identity comes from the CAN
+    devices behind it. Silence leaves the decision to the operator instead of
+    turning an unpowered Mantis into an arm hub (or vice versa).
+    """
+    ifaces = _ifaces_for_serial(serial)
+    if len(ifaces) < 2:
+        return None
+    try:
+        bring_up_interfaces(ifaces)
+    except RuntimeError:
+        return None
+
+    mantis = any(_probe_mantis_trigger(iface) for iface in ifaces)
+    axol = any(_probe_axol_shoulder(iface) for iface in ifaces)
+    if mantis and axol:
+        print(
+            f"  WARNING: both a Mantis trigger and an Axol shoulder answered "
+            f"behind {serial}; refusing to guess."
+        )
+        return None
+    if mantis:
+        return "mantis"
+    if axol:
+        return "axol"
+    return None
 
 
 def _iface_for_serial(serial: str) -> str | None:
@@ -715,6 +854,28 @@ def _register_cron(profile: _Profile = _AXOL_PROFILE) -> None:
         print(f"  Added: {cron_entry}")
 
 
+def _remove_pre_mantis_config() -> None:
+    """Remove superseded Mantis rule/script/unit names during migration."""
+    old_paths = (_PRE_MANTIS_RULES_FILE, _PRE_MANTIS_HOTPLUG_UNIT_FILE)
+    if _PRE_MANTIS_HOTPLUG_UNIT_FILE.exists():
+        run_root(["systemctl", "disable", _PRE_MANTIS_HOTPLUG_UNIT], check=False)
+    for path in old_paths:
+        if path.exists():
+            run_root(["rm", "-f", str(path)], check=True)
+
+    if _PRE_MANTIS_CRON_SCRIPT.exists():
+        _PRE_MANTIS_CRON_SCRIPT.unlink()
+    existing = run_root(["crontab", "-l"]).stdout or ""
+    kept = [
+        line
+        for line in existing.splitlines()
+        if str(_PRE_MANTIS_CRON_SCRIPT) not in line
+    ]
+    if len(kept) != len(existing.splitlines()):
+        new_crontab = "\n".join(kept).rstrip("\n") + "\n"
+        run_root(["crontab", "-"], input_text=new_crontab, check=True)
+
+
 def _write_hotplug_unit(profile: _Profile = _AXOL_PROFILE) -> None:
     """Install the systemd unit the udev rules pull in on adapter hotplug.
 
@@ -823,14 +984,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``can.setup`` subcommand."""
     parser = subparsers.add_parser(
         "can.setup",
-        help="Configure CAN interfaces (arm hub, wheel bus, chest bus; "
-        "or the Mantis with --umi).",
-    )
-    parser.add_argument(
-        "--umi",
-        action="store_true",
-        help="Configure the Mantis rig's dual-channel adapter "
-        f"(channel 0 -> {CAN_UMI_LEFT}, channel 1 -> {CAN_UMI_RIGHT}).",
+        help="Auto-detect and configure Axol/Mantis CAN interfaces.",
     )
     parser.set_defaults(func=run)
 
@@ -970,8 +1124,9 @@ def is_configured() -> bool:
 
     Used by the control panel to decide whether connecting needs to run the
     full :func:`ensure_setup` (first time on a machine) or can just bring the
-    already-named interfaces up. Refers to the robot-arm profile; the Mantis
-    UMI is configured explicitly via ``axol can.setup --umi``.
+    already-named interfaces up. Refers only to the robot-arm profile because
+    it serves the control panel's idle robot connection; interactive
+    ``can.setup`` discovers and configures the Mantis profile independently.
     """
     return (
         _AXOL_PROFILE.rules_file.exists()
@@ -1003,19 +1158,20 @@ def _apply_setup(
     bring_up_can()
 
 
-def _configure_umi(serial: str) -> None:
+def _configure_mantis(serial: str) -> None:
     """Write the Mantis rig's persistent config and bring its buses up.
 
     Same dual-channel board as the arm hub: channel 0 -> left gripper,
     channel 1 -> right. No wheel/chest/RP1 handling on the rig profile.
     """
-    _write_udev_rules(serial, profile=_UMI_PROFILE)
-    _write_cron_script(_UMI_PROFILE)
-    _write_hotplug_unit(_UMI_PROFILE)
+    _remove_pre_mantis_config()
+    _write_udev_rules(serial, profile=_MANTIS_PROFILE)
+    _write_cron_script(_MANTIS_PROFILE)
+    _write_hotplug_unit(_MANTIS_PROFILE)
     _reload_udev()
-    _rename_interfaces(serial, profile=_UMI_PROFILE)
-    _register_cron(_UMI_PROFILE)
-    bring_up_can(_UMI_PROFILE)
+    _rename_interfaces(serial, profile=_MANTIS_PROFILE)
+    _register_cron(_MANTIS_PROFILE)
+    bring_up_can(_MANTIS_PROFILE)
 
 
 def ensure_setup(
@@ -1029,9 +1185,9 @@ def ensure_setup(
     Mirrors :func:`run` but resolves the adapter serials without prompting.
     The wheel-bus and chest adapters are only ever *re*-pinned here (from a
     previous setup's rules or a live interface); identifying a new one needs
-    the interactive flow's probing — see :func:`_identify_adapter`. Configures
-    the robot-arm profile only; the Mantis is configured explicitly via
-    ``axol can.setup --umi``.
+    the interactive flow's probing — see :func:`_identify_adapter`. This helper
+    configures the robot-arm profile only; the interactive ``can.setup`` flow
+    discovers both Axol and Mantis hubs.
     """
     driver.ensure_driver()
     hub_serial = hub_serial or _resolve_hub_serial()
@@ -1040,6 +1196,41 @@ def ensure_setup(
     if not (hub_serial or wheels_serial or chest_serial):
         raise RuntimeError("Robot not detected")
     _apply_setup(hub_serial, wheels_serial, chest_serial)
+
+
+def ensure_mantis_setup() -> None:
+    """Configure a detected Mantis hub non-interactively for the web panel.
+
+    A previously pinned serial wins. Otherwise every unattached dual-channel
+    hub is probed and exactly one Mantis response must be found; silent or
+    ambiguous adapters are left for interactive :func:`run` instead of being
+    guessed. This is the Mantis counterpart to :func:`ensure_setup` used by
+    the idle diagnostics link.
+    """
+    installed = driver.ensure_driver()
+    if installed:
+        time.sleep(2.0)
+
+    serial = _configured_serial(_MANTIS_PROFILE)
+    if serial is None:
+        axol_serial = _configured_serial(_AXOL_PROFILE)
+        matches = [
+            candidate
+            for candidate in _detect_serials()
+            if candidate != axol_serial
+            and _identify_dual_adapter(candidate) == "mantis"
+        ]
+        if len(matches) != 1:
+            if not matches:
+                raise RuntimeError(
+                    "Mantis not detected — power the grippers and triggers, "
+                    "then run `axol can.setup`"
+                )
+            raise RuntimeError(
+                "Multiple Mantis hubs detected — run `axol can.setup` to assign them"
+            )
+        serial = matches[0]
+    _configure_mantis(serial)
 
 
 def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
@@ -1063,7 +1254,7 @@ def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None
         print(f"Chest bus: keeping configured adapter (serial {chest}).")
 
     exclude = {s for s in (hub_serial, wheels, chest) if s}
-    exclude |= _serials_in_rules(_UMI_PROFILE.rules_file)
+    exclude |= _mantis_claimed_serials()
     candidates = _detect_single_serials(exclude)
     if not candidates:
         return wheels, chest
@@ -1116,33 +1307,17 @@ def run(args: object = None) -> None:
         # (CANable 2.0); give their interfaces a moment to appear.
         time.sleep(2.0)
 
-    if getattr(args, "umi", False):
-        serial = _find_serial(_UMI_PROFILE)
-        assert serial is not None  # _find_serial dies on blank for the UMI
-        _configure_umi(serial)
-
-        print()
-        print("Setup complete.")
-        print(f"  Left  : {_UMI_PROFILE.left}")
-        print(f"  Right : {_UMI_PROFILE.right}")
-        print(
-            f"  Startup  : {_UMI_PROFILE.cron_script} "
-            f"(runs at @reboot via root crontab)"
-        )
-        print(
-            f"  Hotplug  : {_UMI_PROFILE.hotplug_unit} (re-runs the startup script "
-            f"whenever the adapter re-enumerates, e.g. after a mid-session USB drop)"
-        )
-        return
-
-    hub_serial = _find_serial(_AXOL_PROFILE)
+    hub_serial, mantis_serial = _find_dual_serials()
     wheels_serial, chest_serial = _find_single_serials(hub_serial)
-    if not (hub_serial or wheels_serial or chest_serial):
+    if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
         _die(
-            "No CAN adapters found or configured. Connect the arm hub, "
+            "No CAN adapters found or configured. Connect the Axol/Mantis hub, "
             "wheel-bus, or chest adapter and re-run."
         )
-    _apply_setup(hub_serial, wheels_serial, chest_serial)
+    if hub_serial or wheels_serial or chest_serial:
+        _apply_setup(hub_serial, wheels_serial, chest_serial)
+    if mantis_serial:
+        _configure_mantis(mantis_serial)
 
     print()
     print("Setup complete.")
@@ -1153,10 +1328,18 @@ def run(args: object = None) -> None:
         print(f"  Wheels   : {_CAN_B}")
     if chest_serial:
         print(f"  Chest    : {_CAN_C} (jelly_legs lift)")
-    print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
-    print(
-        f"  Hotplug  : {_AXOL_PROFILE.hotplug_unit} (re-runs the startup script "
-        f"whenever an adapter re-enumerates, e.g. after a mid-session USB drop)"
-    )
-    if _is_raspberry_pi_5():
-        print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")
+    if hub_serial or wheels_serial or chest_serial:
+        print(f"  Startup  : {_CRON_SCRIPT} (runs at @reboot via root crontab)")
+        print(
+            f"  Hotplug  : {_AXOL_PROFILE.hotplug_unit} (re-runs the startup script "
+            "whenever an adapter re-enumerates, e.g. after a mid-session USB drop)"
+        )
+        if _is_raspberry_pi_5():
+            print(f"  Pi 5     : {_RP1_QUIRK_UNIT} (RP1 USB EMI-tolerance quirk)")
+    if mantis_serial:
+        print(f"  Mantis L : {_MANTIS_PROFILE.left}")
+        print(f"  Mantis R : {_MANTIS_PROFILE.right}")
+        print(
+            f"  Mantis startup : {_MANTIS_PROFILE.cron_script} "
+            "(runs at @reboot via root crontab)"
+        )

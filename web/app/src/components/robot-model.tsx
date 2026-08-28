@@ -44,7 +44,7 @@ const _targetPos = new THREE.Vector3()
 const _targetQuat = new THREE.Quaternion()
 
 /**
- * Virtual Axol overlay for absolute (UMI) mode.
+ * Virtual Axol overlay for absolute (Mantis) mode.
  *
  * Fetches the robot URDF + meshes from the connected teleop server
  * (`https://host:8000/urdf/`) and renders it in the passthrough scene at the

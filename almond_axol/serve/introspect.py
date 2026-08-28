@@ -72,12 +72,10 @@ class Schema:
         self.emit = emit
 
 
-# Field keys whose label is a product name rather than the humanized key.
-# ``umi`` stays the flag/config name for compatibility; the panel shows the
-# rig's product name, Mantis (almond.bot/mantis-umi).
+# Field keys whose label benefits from capitalization or units.
 _PRODUCT_LABELS = {
-    "umi": "Mantis",
-    "umi_smooth_hz": "Mantis smoothing Hz",
+    "mantis": "Mantis",
+    "mantis_smooth_hz": "Mantis smoothing Hz",
 }
 
 

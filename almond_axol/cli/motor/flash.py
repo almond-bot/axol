@@ -39,7 +39,9 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:  # type: ignore[
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=__doc__,
     )
-    add_side_and_channel_arguments(p)
+    # Mantis grippers are Damiao motors; this updater speaks only the
+    # MyActuator bootloader protocol.
+    add_side_and_channel_arguments(p, supports_mantis=False)
     p.add_argument(
         "firmware",
         type=Path,

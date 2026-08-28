@@ -140,7 +140,7 @@ export function OperationPanel({
   if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
   // A faulted motor blocks every hardware operation (the server refuses the
   // start too) — driving through an over-temp / stalled / unreachable motor
-  // risks the arm. Sim, cart-only, and UMI runs never touch the arm motors.
+  // risks the arm. Sim, cart-only, and Mantis runs never touch the arm motors.
   if (!robotFree) {
     for (const f of robot?.faults ?? []) {
       blockers.push(`Fix motor fault: ${motorFaultLabel(f)}`)
@@ -159,7 +159,7 @@ export function OperationPanel({
   }
   // Teleop's run modes are mutually exclusive (the server refuses the start
   // too); catch the combination before the Start button instead of after.
-  const modeFlags = ["sim", "umi", "cart_only"].filter(
+  const modeFlags = ["sim", "mantis", "cart_only"].filter(
     (f) => meta.fields.includes(f) && Boolean(settings[f])
   )
   if (modeFlags.length > 1) {

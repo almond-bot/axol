@@ -236,7 +236,7 @@ class IKWorker:
         self._snap_elbow_ctrl: dict[str, np.ndarray] = {}
         self._snap_elbow_fk: dict[str, np.ndarray] = {}
 
-        # Absolute (UMI) mode state: the world-anchored base transform solved
+        # Absolute (Mantis) mode state: the world-anchored base transform solved
         # at engage — ``(R_wb, t_wb)`` maps base-frame FLU coordinates into the
         # raw VR world frame — plus each controller's rigid controller→TCP
         # offset ``(p_off, R_off)`` expressed in the controller's local frame.
@@ -246,7 +246,7 @@ class IKWorker:
         self._abs_base: tuple[np.ndarray, np.ndarray] | None = None
         self._abs_offset: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         # Tracker→gripper transforms (the rig's factory design constants, or
-        # per-unit file overrides — see almond_axol.umi.calibration), per
+        # per-unit file overrides — see almond_axol.mantis.calibration), per
         # side as ``(p_off_3, R_off_3x3)`` in the tracker's local frame.
         # When present for a side, engage uses it verbatim instead of
         # absorbing the mount offset into the engage snapshot.
@@ -274,7 +274,7 @@ class IKWorker:
         self.abs_base_msg: dict[str, list[float]] | None = None
         # Latest absolute-mode TCP target per side, in the robot base frame:
         # ``{"left": [x, y, z, qx, qy, qz, qw], "right": [...]}``. This is the
-        # tracked ground-truth pose the IK solver chases — UMI data collection
+        # tracked ground-truth pose the IK solver chases — Mantis data collection
         # records it per row so training can use raw TCP trajectories instead
         # of (or alongside) the IK joint solutions. Holds the last engaged
         # target while disengaged (mirroring the latched virtual joints);
@@ -1034,9 +1034,9 @@ def run_ik_worker(
             elif isinstance(msg, VRFrame):
                 q = worker.step(msg, q)
                 if config.absolute_mode:
-                    # Absolute (UMI) mode replies carry the engage-calibrated
+                    # Absolute (Mantis) mode replies carry the engage-calibrated
                     # base transform (for the headset's URDF overlay) and the
-                    # base-frame TCP targets (recorded per dataset row by UMI
+                    # base-frame TCP targets (recorded per dataset row by Mantis
                     # data collection) alongside the joint solution.
                     conn.send(("q", q.copy(), worker.abs_base_msg, worker.last_tcp_msg))
                 else:

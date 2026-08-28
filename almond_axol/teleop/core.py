@@ -96,7 +96,7 @@ class VRTeleopCore:
         self._logger = logger
         self._broadcast = broadcast_tracking
         # Optional generic server→headset JSON push (fire-and-forget), used in
-        # absolute (UMI) mode to stream the calibrated base + joint solution
+        # absolute (Mantis) mode to stream the calibrated base + joint solution
         # for the headset's URDF overlay.
         self._broadcast_json = broadcast_json
 
@@ -114,16 +114,16 @@ class VRTeleopCore:
         # Raw IK solution (full URDF vector) + per-arm joint indices into it.
         self.q: np.ndarray | None = None
         # Host-clock capture time of the VR pose behind the latest IK target
-        # (``VRFrame.t_host``). UMI recording stamps dataset rows with this so
+        # (``VRFrame.t_host``). Mantis recording stamps dataset rows with this so
         # they align to when the hand was actually at the pose, not to the
         # control-loop tick that consumed it. ``None`` until the first solve
         # (or when the transport doesn't provide capture times).
         self.last_pose_host_ts: float | None = None
-        # Absolute (UMI) mode: the engage-calibrated base transform in VR world
+        # Absolute (Mantis) mode: the engage-calibrated base transform in VR world
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
         self.abs_base: dict | None = None
-        # Absolute (UMI) mode: latest base-frame TCP target per side
+        # Absolute (Mantis) mode: latest base-frame TCP target per side
         # ({"left": [x,y,z,qx,qy,qz,qw], "right": [...]}), the tracked
         # ground-truth pose behind the joint solution. ``None`` before the
         # first solve / outside absolute mode.
@@ -131,7 +131,7 @@ class VRTeleopCore:
         # Monotonic (``time.perf_counter``) time of the last IK reply whose
         # ``tcp_msg`` *differed* from the previous one — i.e. when
         # ``last_tcp`` last took a new value. A frozen tracker / stalled IK
-        # keeps replying with an identical TCP, so consumers (UMI data
+        # keeps replying with an identical TCP, so consumers (Mantis data
         # collection) compare this against "now" to detect stale poses being
         # recorded under fresh row timestamps. ``None`` until the first
         # absolute-mode solve.
@@ -1016,7 +1016,7 @@ class VRTeleopCore:
                 conn.send(frame_to_send)
                 result = recv_with_timeout(conn, _IK_RECV_TIMEOUT, stop_event)
                 if result is not None:
-                    # Absolute (UMI) mode replies are ("q", q, base_msg,
+                    # Absolute (Mantis) mode replies are ("q", q, base_msg,
                     # tcp_msg); relative mode replies are the bare joint array.
                     if isinstance(result, tuple) and result[0] == "q":
                         _, q_arr, base_msg, tcp_msg = result
@@ -1049,7 +1049,7 @@ class VRTeleopCore:
     def _maybe_broadcast_urdf_state(self) -> None:
         """Push the URDF overlay state to the headset, throttled to ~60 Hz.
 
-        Only meaningful in absolute (UMI) mode: the message carries the
+        Only meaningful in absolute (Mantis) mode: the message carries the
         engage-calibrated base transform in VR world coords plus the current
         IK joint solution keyed by URDF joint name (arm joints + the actuated
         gripper finger joints from the live trigger values), so the web client
@@ -1152,7 +1152,7 @@ class VRTeleopCore:
                     )
                     result = recv_with_timeout(conn, _IK_RECV_TIMEOUT)
                     if result is not None:
-                        # Absolute (UMI) mode replies are ("q", q, base, tcp).
+                        # Absolute (Mantis) mode replies are ("q", q, base, tcp).
                         if isinstance(result, tuple) and result[0] == "q":
                             self.set_target(result[1])
                         else:

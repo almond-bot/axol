@@ -6,7 +6,7 @@ Intentional hand motion lives well below ~10 Hz, so once the full episode is
 buffered we can low-pass the pose track *acausally* (``scipy.signal.filtfilt``
 runs the filter forward and backward — zero phase shift, no lag) and remove
 most of the noise without distorting the motion. This benefits every consumer
-of the absolute stored poses — chunk-relative training (``axol umi.train``),
+of the absolute stored poses — chunk-relative training (``axol mantis.train``),
 any externally-derived action representation, latency analysis — which is why
 it runs at recording time rather than in a training pipeline.
 
@@ -17,7 +17,7 @@ space (sign-continuous, renormalized) and converted back to rotation vectors,
 so trajectories crossing the rotation-vector wrap stay clean.
 
 Applied by the dataset recorder just before ``save_episode`` when the
-``smooth_ee_hz`` recorder config is set (``collect-data --umi`` enables it;
+``smooth_ee_hz`` recorder config is set (``collect-data --mantis`` enables it;
 on-robot FK poses come from joint encoders and don't need it). A paused and
 resumed episode is filtered as one contiguous track, so a large pose jump
 across the gap is smeared over ~1/cutoff seconds around it.

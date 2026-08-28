@@ -11,7 +11,7 @@ export interface AxolUrdfBase {
 }
 
 /**
- * Latest URDF overlay state pushed by the server in absolute (UMI) mode.
+ * Latest URDF overlay state pushed by the server in absolute (Mantis) mode.
  *
  * `base` is the robot base transform solved at engage (null before the first
  * engage — the overlay should stay hidden until then). `joints` is the current
@@ -26,7 +26,7 @@ export interface AxolUrdfState {
 /**
  * Tracks the server's `{"type":"urdf_state"}` pushes as a frame-readable ref.
  *
- * In absolute (UMI) mode the teleop server streams the engage-calibrated robot
+ * In absolute (Mantis) mode the teleop server streams the engage-calibrated robot
  * base transform plus the live IK joint solution (~30 Hz) so the headset can
  * render the virtual robot exactly where the calibration placed it — the
  * operator verifies hardware↔URDF alignment by checking the virtual gripper

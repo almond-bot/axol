@@ -62,18 +62,18 @@ def default_tracking_ik_config() -> "KinematicsConfig":
     policy replays absolute end-effector poses from its training data, so
     deployment needs the accurate-tracking weights instead. Those are exactly
     the Mantis overrides (pos_weight=200, ori_weight=120,
-    margin=0.02, ... — see ``UMI_KINEMATICS_OVERRIDES`` and its rationale in
+    margin=0.02, ... — see ``MANTIS_KINEMATICS_OVERRIDES`` and its rationale in
     :mod:`almond_axol.kinematics.config`), applied here via
-    :func:`apply_umi_kinematics_profile` so the two stay in lock-step.
+    :func:`apply_mantis_kinematics_profile` so the two stay in lock-step.
 
     Returns:
         A fresh config; mutate the result (or pass your own via
         ``AxolRobot(..., ik_config=...)``) to override individual fields.
     """
-    from ...kinematics.config import KinematicsConfig, apply_umi_kinematics_profile
+    from ...kinematics.config import KinematicsConfig, apply_mantis_kinematics_profile
 
     config = KinematicsConfig()
-    apply_umi_kinematics_profile(config)
+    apply_mantis_kinematics_profile(config)
     return config
 
 

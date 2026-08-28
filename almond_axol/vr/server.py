@@ -710,7 +710,7 @@ class VRServer:
             allow_headers=["*"],
         )
 
-        # Robot model for the headset's URDF overlay (absolute/UMI mode): the
+        # Robot model for the headset's URDF overlay (absolute/Mantis mode): the
         # web client fetches /urdf/axol.urdf and resolves its
         # package://assembly/... mesh references against /urdf/.
         app.mount("/urdf", StaticFiles(directory=str(URDF_PATH.parent)), name="urdf")

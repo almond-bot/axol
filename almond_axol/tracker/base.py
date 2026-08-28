@@ -3,7 +3,7 @@
 Every backend reports poses in the **WebXR world convention** the teleop
 stack assumes (see ``_VR_UP`` in :mod:`almond_axol.teleop.worker`): a
 right-handed, gravity-aligned frame with **+y up**, positions in metres,
-orientations as unit ``(x, y, z, w)`` quaternions. The absolute (UMI) IK
+orientations as unit ``(x, y, z, w)`` quaternions. The absolute (Mantis) IK
 mode absorbs any world yaw/translation and the rigid tracker→gripper
 mount at engage time, so gravity alignment and scale are the only things
 a backend must get right.

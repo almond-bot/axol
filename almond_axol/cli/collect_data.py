@@ -5,6 +5,7 @@ Record teleoperation episodes with the Axol robot and its local ZED cameras.
 Episode boundaries are driven by VR controller commands:
   - DATA_COLLECTION → RECORDING:              start collecting frames
   - RECORDING → DATA_COLLECTION:              stop; save episode (success)
+  - RECORDING → DATA_COLLECTION + failure:    stop; save episode (failure)
   - RECORDING → DATA_COLLECTION + reset btn:  stop; discard episode (rerecord)
 
 and/or, when launched from the web control panel (``axol serve``), by episode
@@ -93,14 +94,14 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
-    """Rewrite the parsed config for Mantis collection (``--umi``).
+def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
+    """Rewrite the parsed config for Mantis collection (``--mantis``).
 
     Robot side: swap a plain :class:`AxolRobotConfig` for
-    :class:`UmiRobotConfig` (handheld grippers on ``can_alm_umi_l/r``, virtual
+    :class:`MantisRobotConfig` (handheld grippers on ``can_mantis_l/r``, virtual
     arms), carrying over every field the operator may have set and only
     replacing CAN channels still at the robot-arm defaults. Teleop side: force
-    the UMI mapping/faithfulness profile —
+    the Mantis mapping/faithfulness profile —
 
     - ``absolute_mode``: controllers map to world-anchored absolute targets
       (the engage squeeze is the start-pose alignment act);
@@ -115,11 +116,11 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
     """
     from dataclasses import fields
 
-    from ..constants import CAN_LEFT, CAN_RIGHT, CAN_UMI_LEFT, CAN_UMI_RIGHT
-    from ..lerobot.robot.config_umi import UmiRobotConfig
+    from ..constants import CAN_LEFT, CAN_RIGHT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, AxolRobotConfig) and not isinstance(
-        cfg.robot_config, UmiRobotConfig
+        cfg.robot_config, MantisRobotConfig
     ):
         kwargs = {
             f.name: getattr(cfg.robot_config, f.name)
@@ -127,9 +128,9 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
             if f.init
         }
         if kwargs.get("left_channel") == CAN_LEFT:
-            kwargs["left_channel"] = CAN_UMI_LEFT
+            kwargs["left_channel"] = CAN_MANTIS_LEFT
         if kwargs.get("right_channel") == CAN_RIGHT:
-            kwargs["right_channel"] = CAN_UMI_RIGHT
+            kwargs["right_channel"] = CAN_MANTIS_RIGHT
         # The rig has no overhead camera; drop the placeholder slot so the
         # camera dialog / CLI surface matches the hardware (an explicitly
         # assigned serial is kept — someone may rig a scene camera).
@@ -138,29 +139,29 @@ def _apply_umi_profile(cfg: "CollectDataConfig") -> None:
         if overhead is not None and int(getattr(overhead, "serial", 0) or 0) <= 0:
             cameras.pop("overhead")
         kwargs["cameras"] = cameras
-        cfg.robot_config = UmiRobotConfig(**kwargs)
+        cfg.robot_config = MantisRobotConfig(**kwargs)
 
-    # UMI datasets are Cartesian: state/action are absolute base-frame EE
+    # Mantis datasets are Cartesian: state/action are absolute base-frame EE
     # poses (+ gripper), the same schema on-robot collection produces with
     # ``observe_cartesian`` — so rig and robot episodes mix in one dataset,
-    # train with ``axol umi.train``, and deploy with ``run-policy``. The
+    # train with ``axol mantis.train``, and deploy with ``run-policy``. The
     # rig's virtual joints are IK artifacts and are not recorded.
     if not getattr(cfg.robot_config, "observe_cartesian", False):
-        _logger.info("--umi: forcing observe_cartesian (EE-pose dataset schema).")
+        _logger.info("--mantis: forcing observe_cartesian (EE-pose dataset schema).")
     cfg.robot_config.observe_cartesian = True
 
     if isinstance(cfg.teleop_config, AxolVRTeleopConfig):
-        from ..kinematics.config import apply_umi_kinematics_profile
-        from ..teleop.config import apply_umi_teleop_profile
+        from ..kinematics.config import apply_mantis_kinematics_profile
+        from ..teleop.config import apply_mantis_teleop_profile
 
         tc = cfg.teleop_config.vr_teleop_config
         if not tc.absolute_mode or tc.ik_alpha != 1.0:
             _logger.info(
-                "--umi: forcing absolute_mode, ik_alpha=1.0, and transparent "
+                "--mantis: forcing absolute_mode, ik_alpha=1.0, and transparent "
                 "trapezoid limits on the teleop config."
             )
-        apply_umi_teleop_profile(tc)
-        apply_umi_kinematics_profile(cfg.teleop_config.kinematics_config)
+        apply_mantis_teleop_profile(tc)
+        apply_mantis_kinematics_profile(cfg.teleop_config.kinematics_config)
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -379,12 +380,12 @@ class CollectDataConfig:
     them from the CLI (e.g. ``--robot_config.axol_config.left_stiffness
     0.8``) or supply a whole-config file with ``--config_path``.
 
-    ``--umi true`` records with the Mantis instead of the robot:
-    grippers on ``can_alm_umi_l/r``, wrist cameras only, absolute
+    ``--mantis true`` records with the Mantis instead of the robot:
+    grippers on ``can_mantis_l/r``, wrist cameras only, absolute
     (world-anchored) pose mapping, dataset rows stamped with the VR pose
     capture time, and the Cartesian EE-pose schema (state/action are absolute
     base-frame poses from the tracker, same schema as on-robot
-    ``observe_cartesian`` collection). See :func:`_apply_umi_profile`.
+    ``observe_cartesian`` collection). See :func:`_apply_mantis_profile`.
     """
 
     repo_id: str
@@ -392,14 +393,14 @@ class CollectDataConfig:
     robot_config: RobotConfig = field(default_factory=_default_robot_config)
     teleop_config: TeleoperatorConfig = field(default_factory=AxolVRTeleopConfig)
     # Record with the Mantis handheld rig instead of the robot: its grippers
-    # on can_alm_umi_l/r, wrist cameras only, absolute pose mapping, and the
+    # on can_mantis_l/r, wrist cameras only, absolute pose mapping, and the
     # Cartesian EE-pose dataset schema. The Axol arms are not involved.
-    umi: bool = False
+    mantis: bool = False
     # Mantis only: zero-phase low-pass cutoff (Hz) applied to the recorded EE
     # pose track at episode save, removing broadband tracker noise without lag
     # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for
     # on-robot collection, whose FK poses come from joint encoders.
-    umi_smooth_hz: float = 10.0
+    mantis_smooth_hz: float = 10.0
     fps: int = 60
     teleop_hz: int = 120
     # Resolution the recorded dataset video is downscaled to (on the relay's VIC,
@@ -430,7 +431,7 @@ class CollectDataConfig:
     # re-recorded with a loud spoken/logged explanation. Set false as an
     # escape hatch (debugging the gate, or deliberately recording unusual
     # sessions) — the per-episode QA summary is still logged, the bad episode
-    # is just saved anyway. Only UMI episodes can fail the gate; on-robot
+    # is just saved anyway. Only Mantis episodes can fail the gate; on-robot
     # episodes read poses from joint encoders and always pass.
     qa_gate: bool = True
     rerun_ip: str | None = None
@@ -458,7 +459,7 @@ _QA_MAX_DISENGAGED_FRACTION = 0.01
 class EpisodeQAStats:
     """Per-episode data-quality counters, collected while recording.
 
-    Populated by ``_episode_loop`` in UMI mode, one increment per control
+    Populated by ``_episode_loop`` in Mantis mode, one increment per control
     tick while an episode is recording. On-robot collection leaves everything
     at zero — its poses come from joint encoders, so the tracker failure
     modes measured here can't occur and the episode always passes the gate.
@@ -745,13 +746,13 @@ def _run(
     from lerobot.utils.visualization_utils import init_rerun
 
     from ..lerobot.robot.robot_axol import _LEFT_EE_KEYS, _RIGHT_EE_KEYS, AxolRobot
-    from ..lerobot.robot.robot_umi import UmiRobot
+    from ..lerobot.robot.robot_mantis import MantisRobot
     from ..lerobot.teleop.teleop_vr import AxolVRTeleop
-    from ..umi.relative import quat_xyzw_to_rotvec
+    from ..mantis.relative import quat_xyzw_to_rotvec
     from ..vr.models import VRState
 
-    if cfg.umi:
-        _apply_umi_profile(cfg)
+    if cfg.mantis:
+        _apply_mantis_profile(cfg)
 
     # Default keeps the CLI path unchanged: episode decisions come from the VR
     # controller only. The web panel injects a _QueueCollectControl so the
@@ -799,21 +800,23 @@ def _run(
                 "dialog (or set its record_resolution / eyes)."
             )
 
-    from ..lerobot.robot.config_umi import UmiRobotConfig
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
 
-    umi_mode = isinstance(cfg.robot_config, UmiRobotConfig)
+    mantis_mode = isinstance(cfg.robot_config, MantisRobotConfig)
 
     # The teleop's action keys must match the robot's: propagate the SKU's
     # gripper capability so the gripperless SKU records no gripper channels.
     # The Mantis always has grippers, so only the real robot propagates.
     if (
-        not umi_mode
+        not mantis_mode
         and isinstance(cfg.robot_config, AxolRobotConfig)
         and isinstance(cfg.teleop_config, AxolVRTeleopConfig)
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
-    robot = UmiRobot(cfg.robot_config) if umi_mode else AxolRobot(cfg.robot_config)
+    robot = (
+        MantisRobot(cfg.robot_config) if mantis_mode else AxolRobot(cfg.robot_config)
+    )
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
@@ -941,7 +944,7 @@ def _run(
         features = {**action_features, **obs_features}
         obs_keys = list(robot.get_joint_observation().keys())
         action_keys = list(robot.action_features.keys())
-        if umi_mode:
+        if mantis_mode:
             # ``observation.pose_lag`` is the residual pose↔image skew per row
             # (camera capture time minus pose capture time), injected by the
             # capture loop for training-time latency handling. On-robot
@@ -1024,8 +1027,8 @@ def _run(
         "push_to_hub": push_to_hub,
         "log_level": cfg.log_level,
         # Tracked (VR) poses carry measurement noise the robot's encoder FK
-        # doesn't — smooth only UMI episodes (see record_proc._maybe_smooth_episode).
-        "smooth_ee_hz": cfg.umi_smooth_hz if umi_mode else 0.0,
+        # doesn't — smooth only Mantis episodes (see record_proc._maybe_smooth_episode).
+        "smooth_ee_hz": cfg.mantis_smooth_hz if mantis_mode else 0.0,
     }
     try:
         if is_complete:
@@ -1110,7 +1113,7 @@ def _run(
     max_gap = {"v": 0.0}
     max_slip = {"v": 0.0}
     prev_t0 = {"v": 0.0}
-    # UMI only: worst pose-stream age (tick time minus pose capture time) in the
+    # Mantis only: worst pose-stream age (tick time minus pose capture time) in the
     # window — transit + playout delay + filter lag, the residual misalignment
     # between what the wrist cameras saw and the pose the row records.
     max_pose_lag = {"v": 0.0}
@@ -1128,7 +1131,7 @@ def _run(
         span = loop_times[-1] - loop_times[0]
         n = len(loop_times)
         loop_hz = (n - 1) / span if span > 0 else 0.0
-        if umi_mode:
+        if mantis_mode:
             _logger.info(
                 "loop: %.1f Hz  vr: %.1f Hz  ik: %.1f Hz  pose_lag: %.0f ms",
                 loop_hz,
@@ -1171,7 +1174,7 @@ def _run(
     async def _episode_loop() -> tuple[bool, bool, bool, EpisodeQAStats]:
         recording = False
         rerecord = False
-        # Per-episode data-quality counters (UMI mode; see EpisodeQAStats).
+        # Per-episode data-quality counters (Mantis mode; see EpisodeQAStats).
         # Reset when recording actually starts so the pre-record phase never
         # pollutes the verdict.
         stats = EpisodeQAStats()
@@ -1288,7 +1291,7 @@ def _run(
             # exposure timestamps.
             row_ts = t0
             act_ds = robot.action_to_dataset(act_processed)
-            if umi_mode:
+            if mantis_mode:
                 pose_ts = teleop.pose_capture_ts()
                 if pose_ts is not None:
                     row_ts = pose_ts
@@ -1321,11 +1324,11 @@ def _run(
                         act_ds.update(zip(keys, pose6))
             recorder.publish(joint_obs, act_ds, row_ts)
 
-            # Per-episode QA counters (UMI only — encoder-FK poses can't go
+            # Per-episode QA counters (Mantis only — encoder-FK poses can't go
             # stale). Frozen TCPs and disengaged spans record a motionless
             # pose under fresh timestamps; a re-engage re-fits the world→base
             # transform and shifts the frame of every later row.
-            if umi_mode and recording:
+            if mantis_mode and recording:
                 stats.total_frames += 1
                 engaged = teleop.is_engaged()
                 if not engaged:
@@ -1403,6 +1406,10 @@ def _run(
                 )
                 break
             if events[TeleopEvents.TERMINATE_EPISODE]:
+                if events.get(TeleopEvents.FAILURE):
+                    log_say("Episode ended as failure.")
+                else:
+                    log_say("Episode ended successfully.")
                 teleop.send_feedback_state(VRState.SAVING)
                 break
             if events[TeleopEvents.RERECORD_EPISODE]:

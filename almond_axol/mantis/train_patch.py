@@ -1,12 +1,12 @@
-"""Inject the UMI relative-EE processor steps into LeRobot's train script.
+"""Inject the Mantis relative-EE processor steps into LeRobot's train script.
 
-``axol umi.train`` *is* ``lerobot-train`` — same config surface, same policies,
+``axol mantis.train`` *is* ``lerobot-train`` — same config surface, same policies,
 same checkpoints — with exactly one seam patched in: the processor factory.
 :func:`install` wraps ``make_pre_post_processors`` inside the train module so
 
-1. the preprocessor gains a :class:`~almond_axol.umi.processor.UMIRelativeEEStep`
+1. the preprocessor gains a :class:`~almond_axol.mantis.processor.MantisRelativeEEStep`
    right before normalization and the postprocessor gains its paired
-   :class:`~almond_axol.umi.processor.UMIAbsoluteEEStep` right after
+   :class:`~almond_axol.mantis.processor.MantisAbsoluteEEStep` right after
    unnormalization, and
 2. the normalization statistics for ``action`` / ``observation.state`` are
    recomputed over the *relativized* values (the dataset's on-disk stats
@@ -30,7 +30,7 @@ from lerobot.lerobot_types import TransitionKey
 from lerobot.processor import NormalizerProcessorStep, UnnormalizerProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
 
-from .processor import UMIAbsoluteEEStep, UMIRelativeEEStep, ee_pose_groups
+from .processor import MantisAbsoluteEEStep, MantisRelativeEEStep, ee_pose_groups
 
 _logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ def compute_relative_stats(
 
     Samples windows across every episode using the policy's own delta indices
     (the exact chunks it will train on), runs them through the same
-    :class:`UMIRelativeEEStep` used in the pipeline, and computes stats over
+    :class:`MantisRelativeEEStep` used in the pipeline, and computes stats over
     the relativized values. Keys mirror the dataset's on-disk stats entries so
     any normalization mode (mean/std, min/max, quantiles) keeps working.
     """
@@ -92,7 +92,7 @@ def compute_relative_stats(
     total_frames = sum(stop - start for start, stop in slices)
     stride = max(1, total_frames // _STATS_MAX_WINDOWS)
 
-    step = UMIRelativeEEStep(action_names=action_names, state_names=state_names)
+    step = MantisRelativeEEStep(action_names=action_names, state_names=state_names)
     rel_actions: list[np.ndarray] = []
     rel_states: list[np.ndarray] = []
     for start, stop in slices:
@@ -156,18 +156,18 @@ def _swap_stats(stats: dict | None, relative: dict) -> dict | None:
     return out
 
 
-def _insert_steps(preprocessor, postprocessor, relative_step: UMIRelativeEEStep):
+def _insert_steps(preprocessor, postprocessor, relative_step: MantisRelativeEEStep):
     """Place the relative step before normalize and its pair after unnormalize."""
     pre_steps = list(preprocessor.steps)
-    if any(isinstance(s, UMIRelativeEEStep) for s in pre_steps):
-        raise RuntimeError("preprocessor already contains a UMIRelativeEEStep")
+    if any(isinstance(s, MantisRelativeEEStep) for s in pre_steps):
+        raise RuntimeError("preprocessor already contains a MantisRelativeEEStep")
     norm_idx = next(
         (i for i, s in enumerate(pre_steps) if isinstance(s, NormalizerProcessorStep)),
         None,
     )
     if norm_idx is None:
         raise RuntimeError(
-            "umi.train: the policy's preprocessor has no NormalizerProcessorStep; "
+            "mantis.train: the policy's preprocessor has no NormalizerProcessorStep; "
             "cannot place the relative-EE step (unsupported policy type?)."
         )
     pre_steps.insert(norm_idx, relative_step)
@@ -184,10 +184,10 @@ def _insert_steps(preprocessor, postprocessor, relative_step: UMIRelativeEEStep)
     )
     if unnorm_idx is None:
         raise RuntimeError(
-            "umi.train: the policy's postprocessor has no UnnormalizerProcessorStep; "
+            "mantis.train: the policy's postprocessor has no UnnormalizerProcessorStep; "
             "cannot place the absolute-EE step (unsupported policy type?)."
         )
-    post_steps.insert(unnorm_idx + 1, UMIAbsoluteEEStep(relative_step=relative_step))
+    post_steps.insert(unnorm_idx + 1, MantisAbsoluteEEStep(relative_step=relative_step))
     postprocessor.steps = post_steps
 
 
@@ -207,7 +207,7 @@ def install(train_module) -> None:
     def patched_make_datasets(cfg):
         if getattr(cfg.dataset, "streaming", False):
             raise ValueError(
-                "umi.train computes relative-action stats from the on-disk "
+                "mantis.train computes relative-action stats from the on-disk "
                 "dataset and does not support --dataset.streaming."
             )
         dataset, eval_dataset = original_make_datasets(cfg)
@@ -218,25 +218,25 @@ def install(train_module) -> None:
         dataset = captured.get("dataset")
         if dataset is None:
             raise RuntimeError(
-                "umi.train: processors requested before the dataset was built"
+                "mantis.train: processors requested before the dataset was built"
             )
 
         action_names = _feature_names(dataset, ACTION)
         state_names = _feature_names(dataset, OBS_STATE)
         if not ee_pose_groups(action_names):
             raise ValueError(
-                "umi.train needs a Cartesian dataset (actions named "
+                "mantis.train needs a Cartesian dataset (actions named "
                 "'*_ee.x/.y/.z/.rx/.ry/.rz'), but the action features are "
-                f"{action_names}. Record with `axol collect-data --umi` or "
+                f"{action_names}. Record with `axol collect-data --mantis` or "
                 "`--robot_config.observe_cartesian true`."
             )
 
-        _logger.info("umi.train: computing chunk-relative normalization stats...")
+        _logger.info("mantis.train: computing chunk-relative normalization stats...")
         relative_stats = compute_relative_stats(
             dataset, policy_cfg, action_names, state_names
         )
         _logger.info(
-            "umi.train: relative action std %s",
+            "mantis.train: relative action std %s",
             np.array2string(relative_stats[ACTION]["std"], precision=4),
         )
 
@@ -262,18 +262,22 @@ def install(train_module) -> None:
             policy_cfg, pretrained_path, **kwargs
         )
 
-        has_relative = any(isinstance(s, UMIRelativeEEStep) for s in preprocessor.steps)
+        has_relative = any(
+            isinstance(s, MantisRelativeEEStep) for s in preprocessor.steps
+        )
         if has_relative:
-            # Fine-tuning a umi.train checkpoint: the steps deserialized from
+            # Fine-tuning a mantis.train checkpoint: the steps deserialized from
             # it and the factory already re-wired the relative/absolute pair.
-            _logger.info("umi.train: relative-EE steps loaded from checkpoint.")
+            _logger.info("mantis.train: relative-EE steps loaded from checkpoint.")
         else:
             _insert_steps(
                 preprocessor,
                 postprocessor,
-                UMIRelativeEEStep(action_names=action_names, state_names=state_names),
+                MantisRelativeEEStep(
+                    action_names=action_names, state_names=state_names
+                ),
             )
-            _logger.info("umi.train: injected relative-EE processor steps.")
+            _logger.info("mantis.train: injected relative-EE processor steps.")
         return preprocessor, postprocessor
 
     train_module.make_train_eval_datasets = patched_make_datasets

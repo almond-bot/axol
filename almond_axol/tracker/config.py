@@ -2,7 +2,7 @@
 
 Written by ``axol tracker.identify`` (backend + left/right device binding)
 and read by ``axol tracker.bridge``. Kept as a plain JSON file — like the
-UMI TCP-offset calibration — so it survives reinstalls and is trivially
+Mantis TCP-offset calibration — so it survives reinstalls and is trivially
 editable by hand.
 """
 
@@ -12,7 +12,7 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from ..constants import CAN_UMI_LEFT, CAN_UMI_RIGHT
+from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
 
 TRACKER_CONFIG_FILE = Path.home() / ".almond" / "tracker" / "config.json"
 
@@ -44,7 +44,7 @@ class TrackerConfig:
         trigger_can_right: SocketCAN interface of the right rig's trigger
             node, or ``None``.
         allow_single_side: Let the bridge run with only one side's
-            tracker bound. Off by default: absolute-mode (UMI) engagement
+            tracker bound. Off by default: absolute-mode (Mantis) engagement
             fits the base transform from BOTH controller positions, so
             the placeholder pose streamed for an unbound side corrupts it.
     """
@@ -54,8 +54,8 @@ class TrackerConfig:
     right: str | None = None
     ultimate_quat_order: str = "xyzw"
     ultimate_up_axis: str = "z"
-    trigger_can_left: str | None = CAN_UMI_LEFT
-    trigger_can_right: str | None = CAN_UMI_RIGHT
+    trigger_can_left: str | None = CAN_MANTIS_LEFT
+    trigger_can_right: str | None = CAN_MANTIS_RIGHT
     allow_single_side: bool = False
 
 
@@ -65,8 +65,22 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
         return TrackerConfig()
+    old_stem = "u" + "mi"
+    old_channels = {
+        f"can_alm_{old_stem}_l": CAN_MANTIS_LEFT,
+        f"can_alm_{old_stem}_r": CAN_MANTIS_RIGHT,
+    }
+    migrated = False
+    for key in ("trigger_can_left", "trigger_can_right"):
+        if data.get(key) in old_channels:
+            data[key] = old_channels[data[key]]
+            migrated = True
+
     known = {f for f in TrackerConfig.__dataclass_fields__}
-    return TrackerConfig(**{k: v for k, v in data.items() if k in known})
+    config = TrackerConfig(**{k: v for k, v in data.items() if k in known})
+    if migrated:
+        save_tracker_config(config, path)
+    return config
 
 
 def save_tracker_config(

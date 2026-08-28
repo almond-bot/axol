@@ -5,7 +5,12 @@ import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
-import { fetchCanInterfaces, type CanInterface, type RobotChannels } from "@/lib/supervisor"
+import {
+  fetchCanInterfaces,
+  type CanInterface,
+  type HardwareProfile,
+  type RobotChannels,
+} from "@/lib/supervisor"
 
 type ArmsMode = "both" | "left" | "right"
 
@@ -15,9 +20,9 @@ const ARMS_MODES: { key: ArmsMode; label: string }[] = [
   { key: "right", label: "Right only" },
 ]
 
-const DEFAULTS: Record<"left" | "right", string> = {
-  left: "can_alm_axol_l",
-  right: "can_alm_axol_r",
+const DEFAULTS: Record<HardwareProfile, Record<"left" | "right", string>> = {
+  axol: { left: "can_alm_axol_l", right: "can_alm_axol_r" },
+  mantis: { left: "can_mantis_l", right: "can_mantis_r" },
 }
 
 function initialMode(channels: RobotChannels | null | undefined): ArmsMode {
@@ -36,20 +41,23 @@ function initialMode(channels: RobotChannels | null | undefined): ArmsMode {
  * automatically, and interface names never need to be retyped per run.
  */
 export function CanAdapterDialog({
+  profile: initialProfile,
   channels,
   busy,
   onConnect,
   onClose,
 }: {
+  profile: HardwareProfile
   /** Currently configured interfaces (prefills the form); null when unknown. */
   channels: RobotChannels | null | undefined
   busy: boolean
-  onConnect: (channels: RobotChannels) => void
+  onConnect: (profile: HardwareProfile, channels: RobotChannels) => void
   onClose: () => void
 }) {
+  const [profile, setProfile] = useState<HardwareProfile>(initialProfile)
   const [mode, setMode] = useState<ArmsMode>(() => initialMode(channels))
-  const [left, setLeft] = useState(channels?.left ?? DEFAULTS.left)
-  const [right, setRight] = useState(channels?.right ?? DEFAULTS.right)
+  const [left, setLeft] = useState(channels?.left ?? DEFAULTS[initialProfile].left)
+  const [right, setRight] = useState(channels?.right ?? DEFAULTS[initialProfile].right)
   const [detected, setDetected] = useState<CanInterface[] | null>(null)
   // Listing failed (offline host, or a serve release predating the
   // /api/can/interfaces endpoint) — different from "queried, none found".
@@ -97,10 +105,9 @@ export function CanAdapterDialog({
           <div className="flex flex-col gap-1">
             <h3 className="font-heading text-base font-semibold">CAN adapter</h3>
             <p className="text-sm leading-relaxed text-white/45">
-              Pick the SocketCAN interface of the adapter driving each arm — one adapter is enough
-              for a single arm (the other arm is then skipped everywhere). The mapping is saved and
-              applied to every diagnostic, calibration tool and operation; reopen this dialog to
-              change it. The Axol hub adapter&apos;s own interfaces are the prefilled defaults.
+              Choose Axol or Mantis, then the SocketCAN interface for each side. Axol mappings are
+              shared with robot operations; Mantis selection drives the diagnostics link without
+              changing the robot&apos;s saved channels.
             </p>
           </div>
           <Button
@@ -112,6 +119,28 @@ export function CanAdapterDialog({
           >
             <X />
           </Button>
+        </div>
+
+        <div className="flex self-start overflow-hidden rounded-md border border-white/10">
+          {(["axol", "mantis"] as HardwareProfile[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              onClick={() => {
+                setProfile(item)
+                setLeft(DEFAULTS[item].left)
+                setRight(DEFAULTS[item].right)
+              }}
+              className={cn(
+                "px-3 py-1.5 text-xs capitalize transition-colors",
+                profile === item
+                  ? "bg-[#eff483]/15 text-[#eff483]"
+                  : "text-white/50 hover:bg-white/[0.05]"
+              )}
+            >
+              {item}
+            </button>
+          ))}
         </div>
 
         <div className="flex self-start overflow-hidden rounded-md border border-white/10">
@@ -127,7 +156,7 @@ export function CanAdapterDialog({
                   : "text-white/50 hover:bg-white/[0.05]"
               )}
             >
-              {m.label}
+              {profile === "mantis" ? m.label.replace("arms", "grippers") : m.label}
             </button>
           ))}
         </div>
@@ -145,7 +174,7 @@ export function CanAdapterDialog({
 
         {wantLeft && (
           <ChannelField
-            label="Left arm interface"
+            label={`Left ${profile === "mantis" ? "gripper" : "arm"} interface`}
             value={left}
             detected={detected ?? []}
             disabled={busy}
@@ -154,7 +183,7 @@ export function CanAdapterDialog({
         )}
         {wantRight && (
           <ChannelField
-            label="Right arm interface"
+            label={`Right ${profile === "mantis" ? "gripper" : "arm"} interface`}
             value={right}
             detected={detected ?? []}
             disabled={busy}
@@ -166,7 +195,11 @@ export function CanAdapterDialog({
           <Button variant="ghost" size="sm" onClick={onClose}>
             Cancel
           </Button>
-          <Button size="sm" onClick={() => onConnect(selection)} disabled={busy || !valid}>
+          <Button
+            size="sm"
+            onClick={() => onConnect(profile, selection)}
+            disabled={busy || !valid}
+          >
             {busy ? <Loader2 className="animate-spin" /> : <Plug />} Save &amp; connect
           </Button>
         </div>

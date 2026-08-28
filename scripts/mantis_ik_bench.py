@@ -1,8 +1,8 @@
 """
-Headless benchmark for the UMI absolute-mode IK tracking pipeline.
+Headless benchmark for the Mantis absolute-mode IK tracking pipeline.
 
-Drives the real ``IKWorker`` (the exact code path ``teleop --umi`` and
-``collect-data --umi`` run) with synthetic-but-realistic hand trajectories and
+Drives the real ``IKWorker`` (the exact code path ``teleop --mantis`` and
+``collect-data --mantis`` run) with synthetic-but-realistic hand trajectories and
 measures what the dataset would contain: the residual between the solved
 joints' FK and where the physical hand-held gripper actually was.
 
@@ -12,8 +12,8 @@ fingertips are what interact with the scene — a dataset is replayable on the
 robot only if FK(recorded joints) puts the tips where the camera saw them.
 
 Run:
-    uv run python scripts/umi_ik_bench.py --configs default balanced
-    uv run python scripts/umi_ik_bench.py --list
+    uv run python scripts/mantis_ik_bench.py --configs default balanced
+    uv run python scripts/mantis_ik_bench.py --list
 """
 
 from __future__ import annotations
@@ -47,9 +47,9 @@ import numpy as np
 from almond_axol.constants import GRIPPER_TIP_IN_GRIPPER_FRAME
 from almond_axol.kinematics.config import (
     KinematicsConfig,
-    apply_umi_kinematics_profile,
+    apply_mantis_kinematics_profile,
 )
-from almond_axol.teleop.config import VRTeleopConfig, apply_umi_teleop_profile
+from almond_axol.teleop.config import VRTeleopConfig, apply_mantis_teleop_profile
 from almond_axol.teleop.worker import IKWorker
 from almond_axol.vr.models import VRFrame, VRPose, VRPosition, VRQuaternion
 
@@ -72,9 +72,9 @@ def _cfg(**kw: float) -> KinematicsConfig:
     return dataclasses.replace(KinematicsConfig(), **kw)
 
 
-def _umi_cfg() -> KinematicsConfig:
+def _mantis_cfg() -> KinematicsConfig:
     cfg = KinematicsConfig()
-    apply_umi_kinematics_profile(cfg)
+    apply_mantis_kinematics_profile(cfg)
     return cfg
 
 
@@ -97,10 +97,10 @@ PRESETS: dict[str, KinematicsConfig] = {
         max_joint_delta=0.05,
         max_iterations=16,
     ),
-    # The shipped UMI profile (kinematics/config.py) — what --umi runs.
-    "umi": _umi_cfg(),
+    # The shipped Mantis profile (kinematics/config.py) — what --mantis runs.
+    "mantis": _mantis_cfg(),
     # Oracle counterpart with the same margin, for a fair floor.
-    "oracle_umi": _cfg(
+    "oracle_mantis": _cfg(
         pos_weight=1000.0,
         ori_weight=300.0,
         rest_weight=1.0,
@@ -350,7 +350,7 @@ def run_config(
     tremor_rms: float,
 ) -> dict:
     tcfg = VRTeleopConfig()
-    apply_umi_teleop_profile(tcfg)
+    apply_mantis_teleop_profile(tcfg)
     tcfg.frequency = fps
     # Deterministic bench: don't pick up a machine-local pivot calibration.
     tcfg.tcp_offset_left = None
@@ -582,7 +582,7 @@ def main() -> None:
         default=None,
         help="Subset of trajectories to run (default: all)",
     )
-    ap.add_argument("--out", type=Path, default=Path("/tmp/umi_ik_bench"))
+    ap.add_argument("--out", type=Path, default=Path("/tmp/mantis_ik_bench"))
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
 
@@ -609,15 +609,15 @@ def main() -> None:
     # The oracle floor (feasibility baseline) for excess-error scoring: use a
     # previously saved run when available so it isn't recomputed every time.
     oracle: dict | None = None
-    oracle_path = args.out / "oracle_umi.json"
+    oracle_path = args.out / "oracle_mantis.json"
     if oracle_path.exists():
         oracle = json.loads(oracle_path.read_text())
 
     for name, kcfg in todo.items():
         res = run_config(name, kcfg, trajs, args.fps, args.tremor_mm * 1e-3)
-        if name == "oracle_umi":
+        if name == "oracle_mantis":
             oracle = res
-        print_report(name, res, oracle if name != "oracle_umi" else None)
+        print_report(name, res, oracle if name != "oracle_mantis" else None)
         (args.out / f"{name}.json").write_text(json.dumps(res, indent=1))
         print(f"(saved {args.out / (name + '.json')})")
 

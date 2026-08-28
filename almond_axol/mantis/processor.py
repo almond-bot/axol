@@ -1,13 +1,13 @@
 """Chunk-relative end-effector processor steps for LeRobot pipelines.
 
-These two steps give any LeRobot policy (ACT, diffusion, ...) the UMI papers'
-relative-action semantics while keeping the *dataset* absolute and standard:
+These two steps give any LeRobot policy (ACT, diffusion, ...) chunk-relative
+action semantics while keeping the *dataset* absolute and standard:
 
 - The dataset stores absolute base-frame Cartesian state/actions
   (``{side}_ee.{x,y,z,rx,ry,rz}`` + ``{side}_gripper.pos``), the same schema
-  for UMI-rig and on-robot collection, so episodes from both sources mix in
+  for Mantis-rig and on-robot collection, so episodes from both sources mix in
   one dataset.
-- :class:`UMIRelativeEEStep` runs in the *pre*-processor (before
+- :class:`MantisRelativeEEStep` runs in the *pre*-processor (before
   normalization). During training it rewrites every action chunk into the
   frame of the current end-effector pose (``T_rel = T_ref^-1 T_k`` per side)
   and zeroes the observation's EE pose dims (each state frame relative to
@@ -18,14 +18,14 @@ relative-action semantics while keeping the *dataset* absolute and standard:
   observation once and queue it (a past frame's value cannot be revised as
   time advances), and only per-frame semantics are identical in training
   and inference. Proprioception therefore carries gripper (and torque)
-  history but no pose; the motion cue comes from vision, as in UMI.
-- :class:`UMIAbsoluteEEStep` runs in the *post*-processor (after
+  history but no pose; the motion cue comes from vision.
+- :class:`MantisAbsoluteEEStep` runs in the *post*-processor (after
   unnormalization) and composes predicted relative actions with the cached
   reference (``T_abs = T_ref T_rel``), producing absolute Cartesian actions
   that ``run-policy`` executes through the robot's standard IK path.
 
 Both steps are registered with LeRobot's ``ProcessorStepRegistry``, so a
-checkpoint trained with them (see ``axol umi.train``) reloads them
+checkpoint trained with them (see ``axol mantis.train``) reloads them
 automatically in ``run-policy`` / the inference server — deployment is the
 stock LeRobot path. They subclass LeRobot's generic relative/absolute steps
 so the factory's post-load reconnection (``relative_step`` wiring) applies.
@@ -258,9 +258,9 @@ def _current_frame(state: Tensor) -> Tensor:
     return state[..., -1, :] if state.ndim == 3 else state
 
 
-@ProcessorStepRegistry.register("umi_relative_ee_processor")
+@ProcessorStepRegistry.register("mantis_relative_ee_processor")
 @dataclass
-class UMIRelativeEEStep(RelativeActionsProcessorStep):
+class MantisRelativeEEStep(RelativeActionsProcessorStep):
     """Relativize EE pose dims of actions; zero them in the proprio state.
 
     Runs before normalization. During training the batch carries both the
@@ -268,7 +268,7 @@ class UMIRelativeEEStep(RelativeActionsProcessorStep):
     per batch: the chunk reference is the current-frame EE pose read from
     ``observation.state``. At inference only the observation is present; the
     absolute state is cached (base-class behavior) for the paired
-    :class:`UMIAbsoluteEEStep` in the post-processor.
+    :class:`MantisAbsoluteEEStep` in the post-processor.
 
     State pose dims are zeroed per frame (see the module docstring for why
     per-frame is the only train/inference-consistent choice under LeRobot's
@@ -298,7 +298,7 @@ class UMIRelativeEEStep(RelativeActionsProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION) or {}
         state = observation.get(OBS_STATE) if observation else None
 
-        # Cache the *absolute* state for the paired UMIAbsoluteEEStep before
+        # Cache the *absolute* state for the paired MantisAbsoluteEEStep before
         # any relativization below (never mutated in place).
         if state is not None:
             self._last_state = state
@@ -317,7 +317,7 @@ class UMIRelativeEEStep(RelativeActionsProcessorStep):
             # written with the action ones. Guard against divergent layouts.
             if [g for g in action_groups] != [g for g in state_groups]:
                 raise ValueError(
-                    "umi_relative_ee_processor: action and state EE pose "
+                    "mantis_relative_ee_processor: action and state EE pose "
                     f"layouts differ (action {action_groups} vs state "
                     f"{state_groups}); relative actions need matching layouts."
                 )
@@ -344,13 +344,13 @@ class UMIRelativeEEStep(RelativeActionsProcessorStep):
         }
 
 
-@ProcessorStepRegistry.register("umi_absolute_ee_processor")
+@ProcessorStepRegistry.register("mantis_absolute_ee_processor")
 @dataclass
-class UMIAbsoluteEEStep(AbsoluteActionsProcessorStep):
+class MantisAbsoluteEEStep(AbsoluteActionsProcessorStep):
     """Compose predicted relative EE actions back to absolute poses.
 
     Runs after unnormalization in the post-processor. Reads the absolute
-    reference pose cached by the paired :class:`UMIRelativeEEStep` during the
+    reference pose cached by the paired :class:`MantisRelativeEEStep` during the
     preceding preprocessor call — in both the policy server and synchronous
     rollouts the preprocessor runs immediately before the chunk is predicted
     and postprocessed, so the cached state is the chunk's reference by
@@ -365,13 +365,13 @@ class UMIAbsoluteEEStep(AbsoluteActionsProcessorStep):
             return transition
         if self.relative_step is None:
             raise RuntimeError(
-                "umi_absolute_ee_processor needs its paired "
-                "umi_relative_ee_processor (relative_step is None)."
+                "mantis_absolute_ee_processor needs its paired "
+                "mantis_relative_ee_processor (relative_step is None)."
             )
         cached = self.relative_step.get_cached_state()
         if cached is None:
             raise RuntimeError(
-                "umi_absolute_ee_processor: no cached state — the "
+                "mantis_absolute_ee_processor: no cached state — the "
                 "preprocessor must run before the postprocessor."
             )
         action = transition.get(TransitionKey.ACTION)

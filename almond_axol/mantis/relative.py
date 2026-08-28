@@ -1,4 +1,4 @@
-"""Small numpy rotation conversions for the UMI recording path.
+"""Small numpy rotation conversions for the Mantis recording path.
 
 The training-time relative-EE math lives in :mod:`.processor` (torch, inside
 the policy's processor pipeline). This module only holds the conversions the

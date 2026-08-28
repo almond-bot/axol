@@ -3,7 +3,7 @@ axol tracker.bridge
 
 Stream Vive tracker poses into a running teleop session as VRFrame JSON.
 
-Run it next to ``axol teleop --umi`` / ``collect-data --umi`` (or against
+Run it next to ``axol teleop --mantis`` / ``collect-data --mantis`` (or against
 ``axol teleop --sim`` for a dry run): it opens the configured tracker
 backend, composes VRFrames at 120 Hz, and connects to the VR WebSocket
 server exactly like a headset would — nothing downstream changes.
@@ -90,7 +90,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "--allow-single-side",
         action="store_true",
         help="Run with only one side's tracker bound. WARNING: absolute-mode "
-        "(UMI) engagement fits the base transform from BOTH controller "
+        "(Mantis) engagement fits the base transform from BOTH controller "
         "positions, so the placeholder pose streamed for the unbound side "
         "corrupts it.",
     )

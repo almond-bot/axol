@@ -979,7 +979,7 @@ def run_capture_loop(
                 continue
 
             # Pair the row with the snapshot captured nearest the freshest
-            # camera exposure time (UMI pose↔image alignment); latest-wins
+            # camera exposure time (Mantis pose↔image alignment); latest-wins
             # when no nearest reader was provided.
             row_cap_ts = max(cap for (_f, cap, _r) in frames.values())
             snap = (
@@ -999,7 +999,7 @@ def run_capture_loop(
             # Residual pose↔image skew for this row: freshest camera exposure
             # time minus the snapshot's capture time (both on the system-wide
             # perf_counter timeline). Only recorded when the dataset declares
-            # an ``observation.pose_lag`` feature (UMI mode) — otherwise
+            # an ``observation.pose_lag`` feature (Mantis mode) — otherwise
             # build_dataset_frame ignores the value.
             obs_processed["pose_lag"] = row_cap_ts - snap_ts
 
@@ -1282,15 +1282,15 @@ def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
     """Zero-phase low-pass the buffered episode's EE pose track before save.
 
     Active only when the recorder config carries a positive ``smooth_ee_hz``
-    cutoff — collect-data sets it for UMI sessions, where the pose track comes
+    cutoff — collect-data sets it for Mantis sessions, where the pose track comes
     from the VR tracker and carries broadband measurement noise on the order
     of the per-frame motion. On-robot sessions (encoder FK) leave it unset.
-    See :func:`almond_axol.umi.smoothing.smooth_episode_ee_poses`.
+    See :func:`almond_axol.mantis.smoothing.smooth_episode_ee_poses`.
     """
     cutoff_hz = float(config.get("smooth_ee_hz") or 0.0)
     if cutoff_hz <= 0.0:
         return
-    from ..umi.smoothing import smooth_episode_ee_poses
+    from ..mantis.smoothing import smooth_episode_ee_poses
 
     smooth_episode_ee_poses(
         dataset.writer.episode_buffer, dataset.meta.features, config["fps"], cutoff_hz

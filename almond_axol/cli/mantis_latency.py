@@ -1,9 +1,9 @@
 """
-axol umi.latency
+axol mantis.latency
 
-Pose↔image latency validation for the Mantis (exUMI method).
+Pose↔image latency validation for the Mantis tracking pipeline.
 
-UMI training pairs each wrist-camera frame with the tracker pose captured at
+Mantis training pairs each wrist-camera frame with the tracker pose captured at
 the same instant, and the recorder already does nearest-timestamp matching on
 the shared ``perf_counter`` timeline — but that is only as good as the two
 timestamps themselves (camera exposure time from the ZED SDK, tracker capture
@@ -52,9 +52,9 @@ _MIN_PEAK_CORR = 0.8
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
-    """Register the ``umi.latency`` subcommand."""
+    """Register the ``mantis.latency`` subcommand."""
     p = subparsers.add_parser(
-        "umi.latency",
+        "mantis.latency",
         help="Measure residual pose↔image latency by sweeping over an ArUco marker.",
     )
     p.add_argument(
@@ -306,7 +306,7 @@ async def _run(side: str, serial: int, duration: float) -> None:
             cam_thread = threading.Thread(
                 target=_camera_capture_thread,
                 args=(cam, detector, marker_track, stop, stats),
-                name="umi-latency-cam",
+                name="mantis-latency-cam",
                 daemon=True,
             )
             cam_thread.start()

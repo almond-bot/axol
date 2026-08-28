@@ -228,6 +228,7 @@ export async function restartHost(): Promise<{ ok: boolean }> {
 // ---------------------------------------------------------------------------
 
 export type RobotState = "disconnected" | "connecting" | "connected" | "busy" | "error"
+export type HardwareProfile = "axol" | "mantis"
 
 export interface MotorHealth {
   arm: string
@@ -266,6 +267,8 @@ export interface RobotStatus {
   faults?: MotorFault[]
   /** Configured CAN interfaces (older hosts omit this). */
   channels?: RobotChannels
+  /** Hardware currently shown by the idle diagnostics link. */
+  profile?: HardwareProfile
   /** Whether this robot has grippers (older hosts omit this = true). */
   hasGripper?: boolean
 }
@@ -288,15 +291,19 @@ export async function fetchRobotStatus(): Promise<RobotStatus> {
  * host and reused by every later connect and operation; omit it to connect
  * with the stored/default interfaces.
  */
-export async function robotConnect(channels?: RobotChannels): Promise<RobotStatus> {
-  const init: RequestInit = { method: "POST" }
-  if (channels) {
-    init.headers = { "Content-Type": "application/json" }
-    init.body = JSON.stringify({
-      leftChannel: channels.left,
-      rightChannel: channels.right,
-      channelsSet: true,
-    })
+export async function robotConnect(
+  channels?: RobotChannels,
+  profile: HardwareProfile = "axol"
+): Promise<RobotStatus> {
+  const init: RequestInit = {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      leftChannel: channels?.left ?? null,
+      rightChannel: channels?.right ?? null,
+      channelsSet: channels != null,
+      profile,
+    }),
   }
   return json(await fetch(apiUrl("/api/robot/connect"), init))
 }
@@ -822,12 +829,12 @@ export const OPERATIONS: OperationMeta[] = [
     id: "teleop",
     label: "Teleoperation",
     description: "Drive the Axol from a VR headset. Enable sim to preview in the browser.",
-    fields: ["sim", "umi"],
+    fields: ["sim", "mantis"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
     simFlag: "sim",
-    robotFreeFlags: ["umi"],
+    robotFreeFlags: ["mantis"],
     episodeControl: false,
     usesHeadset: true,
   },
@@ -848,12 +855,12 @@ export const OPERATIONS: OperationMeta[] = [
     id: "collect-data",
     label: "Collect data",
     description: "Record teleoperation episodes to a LeRobot dataset with the ZED cameras.",
-    fields: ["umi", "repo_id", "task"],
+    fields: ["mantis", "repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,
     simFlag: null,
-    robotFreeFlags: ["umi"],
+    robotFreeFlags: ["mantis"],
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
     // "Preparing" forever. Its collect-data does run the VR server with the

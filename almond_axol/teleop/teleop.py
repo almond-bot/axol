@@ -173,7 +173,7 @@ class VRTeleop:
     def _broadcast_json(self, obj: dict) -> None:
         """Push an arbitrary JSON message to the headset (fire-and-forget).
 
-        Used by the shared core for the URDF overlay state in absolute (UMI)
+        Used by the shared core for the URDF overlay state in absolute (Mantis)
         mode. Safe to call from any thread.
         """
         if self._vr_loop is None:
