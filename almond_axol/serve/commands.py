@@ -309,8 +309,8 @@ COMMANDS: dict[str, CommandDef] = {
         "teleop",
         "teleop",
         "Teleoperation",
-        "Drive the Axol from a VR headset. Enable simulation to preview in the "
-        "browser without hardware, or cart-only to drive just the powered cart.",
+        "Drive the Axol from a VR headset. Mantis mode automatically starts "
+        "the saved tracker bridge; simulation previews without hardware.",
         "Operate",
         "draccus",
         _teleop,
@@ -362,7 +362,8 @@ COMMANDS: dict[str, CommandDef] = {
         "collect-data",
         "collect-data",
         "Collect data",
-        "Record teleoperation episodes to a LeRobot dataset with the local ZED cameras.",
+        "Record teleoperation episodes with local ZED cameras. Mantis mode "
+        "automatically starts the saved tracker bridge.",
         "Operate",
         "draccus",
         _collect_data,

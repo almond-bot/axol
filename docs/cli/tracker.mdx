@@ -3,7 +3,7 @@ title: "tracker.bridge / tracker.identify"
 description: "Headset-free Mantis teleop and data collection with Vive trackers."
 ---
 
-Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged.
+Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged. The control panel starts and stops this bridge automatically for Mantis operations; the commands below are for direct CLI use and bring-up.
 
 Two tracker families are supported, plus two hardware-free backends for bring-up:
 
@@ -21,8 +21,8 @@ Both hardware-free backends bind their own devices, so they need no `tracker.ide
 To bring up or debug a Mantis **gripper** on its own — no trackers, no base stations, no libsurvive — use `--backend static`. The arms hold still and the rig's CAN trigger node is the only thing that can change the commanded state, so a squeeze is unambiguously the cause of any motion you see:
 
 ```bash
-axol teleop --mantis                     # one terminal
-axol tracker.bridge --backend static  # another
+axol teleop --mantis                  # one terminal (direct CLI use)
+axol tracker.bridge --backend static  # another; automatic from the panel
 ```
 
 Press **Enter** in the bridge terminal to engage, then squeeze the trigger — the gripper should track your squeeze proportionally. Nothing moves before you engage: a disengaged arm freezes its pose *and* its gripper. Prefer `static` over `synthetic` here, since synthetic's orbiting devices keep the commanded arm state changing and muddy the picture.
@@ -35,11 +35,12 @@ The absolute (Mantis) IK mode solves the rigid tracker→gripper mount and the w
 # One-time: bind each physical tracker to its rig side.
 axol tracker.identify
 
-# Every session: teleop or collection in one terminal...
+# Direct CLI session: teleop/collection in one terminal and bridge in another.
 axol teleop --mantis                # or: axol collect-data --mantis ...
-# ...and the bridge in another.
 axol tracker.bridge
 ```
+
+From the control panel, selecting **Mantis** and pressing **Start** performs both steps. While it is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/mantis/tcp_transform.json` overrides it when present. For everything else, the absolute (Mantis) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 

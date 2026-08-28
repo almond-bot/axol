@@ -527,10 +527,11 @@ class TeleopCmdConfig:
     """
 
     sim: bool = False
-    # Mantis bench mode: drive the two handheld grippers (on
-    # can_mantis_l/r) from the Quest triggers while the arms exist only as
-    # the headset's URDF overlay — absolute pose mapping is forced on. No
-    # robot, no cameras, no recording. Mutually exclusive with --sim.
+    # Mantis bench mode: drive the two handheld grippers on can_mantis_l/r
+    # while the arms exist only as the VR client's URDF overlay — absolute
+    # pose mapping is forced on. The control panel automatically starts the
+    # saved tracker bridge; direct CLI use still supplies its own VR client.
+    # No robot, no cameras, no recording. Mutually exclusive with --sim.
     mantis: bool = False
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and

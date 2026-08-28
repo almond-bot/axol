@@ -31,10 +31,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import ssl
 import sys
 import threading
 import time
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -156,6 +158,47 @@ class StdinControls:
         return toggle, reset
 
 
+class BridgeControls(Protocol):
+    """Control source consumed by :class:`TrackerBridge`."""
+
+    quit: Any
+
+    def start(self) -> None: ...
+
+    def consume(self) -> tuple[bool, bool]: ...
+
+
+class StopEventControls:
+    """Headless controls for a bridge managed by another process.
+
+    The owning process supplies an event that ends the bridge and an optional
+    queue carrying control-panel toggle/reset requests.
+    """
+
+    def __init__(self, stop_event: Any, command_queue: Any = None) -> None:
+        self.quit = stop_event
+        self._commands = command_queue
+
+    def start(self) -> None:
+        pass
+
+    def consume(self) -> tuple[bool, bool]:
+        toggle = False
+        reset = False
+        if self._commands is None:
+            return toggle, reset
+        while True:
+            try:
+                command = self._commands.get_nowait()
+            except queue.Empty:
+                break
+            if command == "toggle":
+                toggle = True
+            elif command == "reset":
+                reset = True
+        return toggle, reset
+
+
 class TrackerBridge:
     """Composes and streams VRFrames from a :class:`TrackerSource`.
 
@@ -185,7 +228,7 @@ class TrackerBridge:
         host: str = "localhost",
         port: int = VR_PORT,
         hz: float = 120.0,
-        controls: StdinControls | None = None,
+        controls: BridgeControls | None = None,
         left_trigger: TriggerReader | None = None,
         right_trigger: TriggerReader | None = None,
         allow_single_side: bool = False,
@@ -415,11 +458,17 @@ class TrackerBridge:
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE  # the VR server's cert is self-signed
 
-        print(
-            "Streaming tracker poses. Controls: Enter = engage/disengage, "
-            "r = reset, q = quit; trigger x3 = start/success, "
-            "trigger x4 = failure."
-        )
+        if isinstance(self._controls, StdinControls):
+            print(
+                "Streaming tracker poses. Controls: Enter = engage/disengage, "
+                "r = reset, q = quit; trigger x3 = start/success, "
+                "trigger x4 = failure."
+            )
+        else:
+            print(
+                "Streaming tracker poses (managed by control panel); "
+                "trigger x3 = start/success, trigger x4 = failure."
+            )
         while not self._controls.quit.is_set():
             try:
                 async with websockets.connect(uri, ssl=ssl_ctx, max_queue=4) as ws:

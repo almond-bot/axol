@@ -408,6 +408,8 @@ class CollectDataConfig:
     # on can_mantis_l/r, wrist cameras only, absolute pose mapping, and the
     # Cartesian EE-pose dataset schema. The Axol arms are not involved.
     mantis: bool = False
+    # The control panel starts the saved tracker bridge automatically for a
+    # Mantis run; direct CLI use still starts tracker.bridge separately.
     # Mantis only: zero-phase low-pass cutoff (Hz) applied to the recorded EE
     # pose track at episode save, removing broadband tracker noise without lag
     # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for

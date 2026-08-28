@@ -68,6 +68,8 @@ The panel connects the robot **automatically** once the host comes online (one a
 
 The server runs as root under the one-command install's systemd service, so CAN bring-up needs no password. While a task is running the 1 Hz polling pauses and the robot is handed to the task.
 
+For **Mantis** teleop or collection, Start also launches the tracker bridge using the backend, left/right bindings, and trigger CAN channels saved by [`tracker.identify`](/cli/tracker). The bridge starts before the VR server, reconnects until it is available, and is stopped automatically with the operation. While running, the panel shows **Toggle tracking** and **Reset**, replacing the bridge terminal's Enter and `r` controls. A missing binding or tracker-backend startup failure is shown as an operation error instead of leaving an apparently running session with no poses.
+
 <Warning>
   Closing the browser tab — or disconnecting the **host** — does **not** stop anything: the robot link and any running operation live in the `serve` process and keep running. Use **Stop**, **Robot Disconnect**, or stop `axol serve` to tear them down.
 </Warning>

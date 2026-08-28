@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any, Callable
 
 from ..utils.ports import VR_PORT
 
@@ -99,26 +100,56 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
 
 def run(args) -> None:  # type: ignore[no-untyped-def]
     """Open the tracker backend (and trigger PCBs) and stream frames until quit."""
-    from ..tracker import HARDWARE_FREE_BINDINGS, create_source, load_tracker_config
-    from ..tracker.bridge import TrackerBridge
-    from ..tracker.trigger import TriggerReader
-
     logging.basicConfig(level=logging.INFO, force=True)
+
+    from ..tracker import load_tracker_config
 
     config = load_tracker_config()
     if args.backend is not None:
         config.backend = args.backend
-    left = args.left if args.left is not None else config.left
-    right = args.right if args.right is not None else config.right
-    binding = HARDWARE_FREE_BINDINGS.get(config.backend)
-    if binding is not None and left is None and right is None:
-        left, right = binding
+    if args.left is not None:
+        config.left = args.left
+    if args.right is not None:
+        config.right = args.right
 
     if args.trigger_can_left is not None:
         config.trigger_can_left = args.trigger_can_left
     if args.trigger_can_right is not None:
         config.trigger_can_right = args.trigger_can_right
-    allow_single_side = args.allow_single_side or config.allow_single_side
+    config.allow_single_side = args.allow_single_side or config.allow_single_side
+
+    run_configured_bridge(
+        config,
+        host=args.host,
+        port=args.port,
+        hz=args.hz,
+    )
+
+
+def run_configured_bridge(
+    config: Any,
+    *,
+    host: str = "localhost",
+    port: int = VR_PORT,
+    hz: float = 120.0,
+    controls: Any = None,
+    on_ready: Callable[[], None] | None = None,
+) -> None:
+    """Run one configured bridge, optionally under headless lifecycle controls.
+
+    ``on_ready`` fires after the tracker backend, trigger readers, and bridge
+    object are ready. The WebSocket connection may not exist yet: the bridge
+    deliberately starts before the operation's VR server and reconnects until
+    that server begins listening.
+    """
+    from ..tracker import HARDWARE_FREE_BINDINGS, create_source
+    from ..tracker.bridge import TrackerBridge
+    from ..tracker.trigger import TriggerReader
+
+    left, right = config.left, config.right
+    binding = HARDWARE_FREE_BINDINGS.get(config.backend)
+    if binding is not None and left is None and right is None:
+        left, right = binding
 
     triggers: dict[str, TriggerReader] = {}
     source = create_source(config)
@@ -147,13 +178,16 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             source,
             left=left,
             right=right,
-            host=args.host,
-            port=args.port,
-            hz=args.hz,
+            host=host,
+            port=port,
+            hz=hz,
+            controls=controls,
             left_trigger=triggers.get("left"),
             right_trigger=triggers.get("right"),
-            allow_single_side=allow_single_side,
+            allow_single_side=config.allow_single_side,
         )
+        if on_ready is not None:
+            on_ready()
         asyncio.run(bridge.run())
     except KeyboardInterrupt:
         pass

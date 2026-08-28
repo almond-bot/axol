@@ -70,6 +70,12 @@ _FORCE_GRACE_S = 5.0
 _RECORDER_PROC_NAME = "dataset-recorder"
 _FINALIZE_GRACE_S = 200.0
 
+# A managed Mantis bridge reports ready after its tracker backend and trigger
+# readers open. It does not wait for the operation's VR server: its WebSocket
+# loop reconnects until that server begins listening.
+_BRIDGE_READY_TIMEOUT_S = 30.0
+_BRIDGE_STOP_TIMEOUT_S = 4.0
+
 # Loggers whose records we never forward to the UI: webserver lifecycle,
 # access logs, low-level asyncio chatter. We still want the underlying ops'
 # own logs (``almond_axol.*``, ``can.*``, lerobot, jaxls, pyroki, etc.).
@@ -99,6 +105,43 @@ _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 
 # The camera slots the control panel can configure serials for.
 _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
+
+
+def _managed_tracker_bridge_main(
+    config: Any, stop_event: Any, command_queue: Any, ready_conn: Any, port: int
+) -> None:
+    """Spawn-process entry point for a control-panel-owned tracker bridge."""
+    logging.basicConfig(level=logging.INFO, force=True)
+    ready_sent = False
+
+    def ready() -> None:
+        nonlocal ready_sent
+        ready_conn.send({"ok": True})
+        ready_sent = True
+        ready_conn.close()
+
+    try:
+        from ..cli.tracker_bridge import run_configured_bridge
+        from ..tracker.bridge import StopEventControls
+
+        run_configured_bridge(
+            config,
+            port=port,
+            controls=StopEventControls(stop_event, command_queue),
+            on_ready=ready,
+        )
+    except BaseException as exc:
+        if not ready_sent:
+            try:
+                ready_conn.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        raise
+    finally:
+        try:
+            ready_conn.close()
+        except OSError:
+            pass
 
 
 def _forward_line(sink: Any, line: str) -> None:
@@ -350,6 +393,11 @@ class OperationRunner:
         # the force-kill only targets subprocesses this op spawned (relay,
         # recorder, IK worker) and never anything the serve process owns.
         self._baseline_children: set[int] = set()
+        # Mantis operations launched from the panel own a tracker bridge child
+        # for exactly the operation's lifetime.
+        self._bridge_process: multiprocessing.Process | None = None
+        self._bridge_stop_event: Any = None
+        self._bridge_commands: Any = None
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
@@ -488,7 +536,8 @@ class OperationRunner:
             target = self._run_async
         else:
             target = self._run_thread
-        run_args = (session, op_id, cfg, log_level, needs_robot)
+        manage_bridge = bool(args.get("mantis"))
+        run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True
         )
@@ -542,6 +591,9 @@ class OperationRunner:
             session.status = "stopping"
         session.emit("[serve] stopping…")
         self._stop_event.set()
+        bridge_stop = self._bridge_stop_event
+        if bridge_stop is not None:
+            bridge_stop.set()
         loop, task = self._async_loop, self._async_task
         if loop is not None and task is not None:
             try:
@@ -638,6 +690,16 @@ class OperationRunner:
 
         Returns ``False`` when no op with episode control is running.
         """
+        bridge_command = {
+            "bridge-toggle": "toggle",
+            "bridge-reset": "reset",
+        }.get(command)
+        if bridge_command is not None and self._bridge_commands is not None:
+            try:
+                self._bridge_commands.put(bridge_command)
+                return True
+            except (OSError, ValueError):
+                return False
         control = self._episode_control
         if control is None:
             return False
@@ -886,6 +948,84 @@ class OperationRunner:
         raw = str(args.get("log_level", "INFO")).upper()
         return getattr(logging, raw, logging.INFO)
 
+    @staticmethod
+    def _bridge_port(cfg: Any) -> int:
+        """VR server port from native teleop or LeRobot collection config."""
+        server = getattr(cfg, "vr_server", None)
+        if server is None:
+            teleop = getattr(cfg, "teleop_config", None)
+            server = getattr(teleop, "vr_server_config", None)
+        return int(getattr(server, "port", 8000))
+
+    def _start_tracker_bridge(self, session: Session, cfg: Any) -> None:
+        """Start the saved tracker bridge and wait for hardware initialization."""
+        from ..tracker import load_tracker_config
+
+        config = load_tracker_config()
+        ctx = multiprocessing.get_context("spawn")
+        stop_event = ctx.Event()
+        command_queue = ctx.Queue()
+        parent_conn, child_conn = ctx.Pipe(duplex=False)
+        process = ctx.Process(
+            target=_managed_tracker_bridge_main,
+            args=(
+                config,
+                stop_event,
+                command_queue,
+                child_conn,
+                self._bridge_port(cfg),
+            ),
+            name="tracker-bridge",
+            daemon=True,
+        )
+        process.start()
+        child_conn.close()
+        with self._lock:
+            self._bridge_process = process
+            self._bridge_stop_event = stop_event
+            self._bridge_commands = command_queue
+
+        try:
+            if not parent_conn.poll(_BRIDGE_READY_TIMEOUT_S):
+                raise RuntimeError(
+                    "tracker bridge did not initialize within "
+                    f"{_BRIDGE_READY_TIMEOUT_S:.0f}s"
+                )
+            result = parent_conn.recv()
+            if not result.get("ok"):
+                raise RuntimeError(result.get("error") or "tracker bridge failed")
+        except (EOFError, OSError) as exc:
+            raise RuntimeError("tracker bridge exited during startup") from exc
+        finally:
+            parent_conn.close()
+        session.emit(
+            f"[serve] Mantis tracker bridge ready (pid {process.pid}, "
+            f"backend {config.backend})"
+        )
+
+    def _stop_tracker_bridge(self, session: Session) -> None:
+        """Stop and reap the bridge child owned by the current operation."""
+        with self._lock:
+            process = self._bridge_process
+            stop_event = self._bridge_stop_event
+            command_queue = self._bridge_commands
+            self._bridge_process = None
+            self._bridge_stop_event = None
+            self._bridge_commands = None
+        if process is None:
+            return
+        if stop_event is not None:
+            stop_event.set()
+        process.join(timeout=_BRIDGE_STOP_TIMEOUT_S)
+        if process.is_alive():
+            session.emit("[serve] tracker bridge did not stop cleanly; terminating")
+            process.terminate()
+            process.join(timeout=1.0)
+        if command_queue is not None:
+            command_queue.close()
+            command_queue.join_thread()
+        session.emit("[serve] Mantis tracker bridge stopped")
+
     # -- async ops (teleop / gravity-comp) ----------------------------------
 
     def _run_async(
@@ -895,6 +1035,7 @@ class OperationRunner:
         cfg: Any,
         log_level: int,
         needs_robot: bool,
+        manage_bridge: bool,
     ) -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -908,6 +1049,8 @@ class OperationRunner:
 
         with _Capture(session, log_level):
             try:
+                if manage_bridge:
+                    self._start_tracker_bridge(session, cfg)
                 task = loop.create_task(_wrap())
                 self._async_task = task
                 loop.run_until_complete(task)
@@ -919,6 +1062,8 @@ class OperationRunner:
                 )
                 session.emit(f"[serve] error: {session.error}")
             finally:
+                if manage_bridge:
+                    self._stop_tracker_bridge(session)
                 try:
                     loop.run_until_complete(loop.shutdown_asyncgens())
                 except Exception:  # noqa: BLE001
@@ -937,12 +1082,15 @@ class OperationRunner:
         cfg: Any,
         log_level: int,
         needs_robot: bool,
+        manage_bridge: bool,
     ) -> None:
         from .commands import COMMANDS
 
         cmd = COMMANDS[op_id]
         with _Capture(session, log_level):
             try:
+                if manage_bridge:
+                    self._start_tracker_bridge(session, cfg)
                 core = cmd.load_entrypoint()
                 control_cls = cmd.load_episode_control()
                 if control_cls is None:
@@ -961,6 +1109,8 @@ class OperationRunner:
                 session.emit(f"[serve] error: {session.error}")
             finally:
                 self._episode_control = None
+                if manage_bridge:
+                    self._stop_tracker_bridge(session)
         self._finish(session, needs_robot)
 
     # -- shared teardown ----------------------------------------------------

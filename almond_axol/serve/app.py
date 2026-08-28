@@ -112,8 +112,9 @@ class EpisodeRequest(BaseModel):
     ``run-policy`` takes ``start`` | ``s`` | ``r`` | ``q``; ``collect-data``
     takes ``start`` | ``s`` | ``r`` | ``continue``; ``waypoints`` takes
     ``record`` | ``undo`` | ``clear`` | ``grip-left`` | ``grip-right`` |
-    ``play`` | ``stop`` | ``quit``. The panel sends back whatever the op
-    published in ``controls``.
+    ``play`` | ``stop`` | ``quit``. A managed Mantis bridge also accepts
+    ``bridge-toggle`` and ``bridge-reset``. The panel sends back whatever the
+    operation published in ``controls`` plus those bridge actions.
     """
 
     command: str
