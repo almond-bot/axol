@@ -35,7 +35,10 @@ pub fn run(ifaces: &[String], hz: f64, secs: f64, mode: Mode) -> io::Result<()> 
         Mode::Pipelined => "pipelined",
         Mode::Serial => "serial",
     };
-    println!("bench: {hz} Hz for {secs}s, {mode_name}, buses: {}", ifaces.join(", "));
+    println!(
+        "bench: {hz} Hz for {secs}s, {mode_name}, buses: {}",
+        ifaces.join(", ")
+    );
 
     let handles: Vec<_> = ifaces
         .iter()
@@ -75,9 +78,7 @@ fn bench_bus(sock: &CanSock, hz: f64, secs: f64, mode: Mode) -> io::Result<TickS
         let deadline = start + period * k as u32;
         sleep_until(deadline);
         let began = Instant::now();
-        stats
-            .lateness
-            .push((began - deadline).as_secs_f64() * 1e3);
+        stats.lateness.push((began - deadline).as_secs_f64() * 1e3);
 
         let missing = match mode {
             Mode::Pipelined => tick_pipelined(sock, reply_timeout)?,
@@ -132,12 +133,7 @@ fn tick_pipelined(sock: &CanSock, timeout: Duration) -> io::Result<usize> {
 fn tick_serial(sock: &CanSock, timeout: Duration) -> io::Result<usize> {
     let mut missing = 0;
     for &id in &proto::MA_IDS {
-        let resp = txn::ma_request(
-            sock,
-            id,
-            proto::ma_cmd(proto::MA_MULTI_TURN_ANGLE),
-            timeout,
-        )?;
+        let resp = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_MULTI_TURN_ANGLE), timeout)?;
         if resp.is_none() {
             missing += 1;
         }

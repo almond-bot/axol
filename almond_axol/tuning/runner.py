@@ -22,6 +22,7 @@ import numpy as np
 from ..constants import ARM_JOINTS
 from ..motor import Joint, MotorError
 from ..robot.axol import arm_limits
+from ..robot.control import DAMP_BP_Q, DAMP_BP_W0
 from .feedforward import FeedForward
 from .joint_frame import JointFrameMotor
 
@@ -308,16 +309,20 @@ async def ramp_impedance(
     """Ramp one impedance-mode joint to ``target`` (joint frame) at ``speed``, with gravity FF."""
     start = await motor.get_position()
     duration = max(abs(target - start) / speed, 0.5)
-    dt = 1.0 / rate_hz
-    t0 = time.monotonic()
-    while True:
-        t = time.monotonic() - t0
-        alpha = min(t / duration, 1.0)
+    count = max(2, math.ceil(duration * rate_hz) + 1)
+    samples = []
+    for i in range(count):
+        alpha = i / (count - 1)
         q = start + alpha * (target - start)
-        await motor.set_impedance(q, 0.0, kp, kd, gravity_fn(q))
-        if alpha >= 1.0:
-            break
-        await asyncio.sleep(dt)
+        samples.append((q, q, gravity_fn(q)))
+    await motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=rate_hz,
+        samples=samples,
+        differentiate=False,
+        feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, DAMP_BP_W0, DAMP_BP_Q),
+    )
 
 
 async def ramp_others_to_zero(
@@ -444,6 +449,14 @@ class HolderMonitor:
         dev = abs(pos - base)
         if dev > self.peak[j]:
             self.peak[j] = dev
+
+    async def sample_all(self) -> None:
+        """Snapshot every holder before/after a Rust-owned probe."""
+        for joint, motor in self._motors.items():
+            pos = await motor.get_position()
+            self._last[joint] = pos
+            base = self._baseline.setdefault(joint, pos)
+            self.peak[joint] = max(self.peak[joint], abs(pos - base))
 
     def rebase(self) -> None:
         """Freeze each holder's baseline at its latest reading, zero the peaks.
@@ -580,48 +593,29 @@ async def run_sine(
     await asyncio.sleep(1.0)
 
     print(f"  running {duration:.1f} s at {rate_hz:.0f} Hz ...")
-    dt = 1.0 / rate_hz
-    log: list[dict] = []
+    count = max(1, math.ceil(duration * rate_hz))
+    samples: list[tuple[float, float, float]] = []
+    for k in range(count):
+        t = k / rate_hz
+        clean = center + amp * math.sin(2 * math.pi * freq * t)
+        target = clean + (noise[k % len(noise)] if noise is not None else 0.0)
+        samples.append((target, clean, ff.gravity_fn(target)))
+    if monitor is not None:
+        await monitor.sample_all()
+    differentiate, feedforward = ff.rust_config
+    log = await test_motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=rate_hz,
+        samples=samples,
+        differentiate=differentiate,
+        feedforward=feedforward,
+    )
+    if monitor is not None:
+        await monitor.sample_all()
     live = LiveStream("sine", joint)
-    start = time.monotonic()
-    k = 0
-
-    while True:
-        t = time.monotonic() - start
-        if t >= duration:
-            break
-        loop_start = time.monotonic()
-
-        target = center + amp * math.sin(2 * math.pi * freq * t)
-        if noise is not None:
-            target += noise[k % len(noise)]
-        k += 1
-        v_des, t_ff = ff.compute(target, cached_meas(test_motor))
-        await test_motor.set_impedance(target, v_des, kp, kd, t_ff)
-        # The impedance response frame already carried position feedback
-        # (just cached) — reading it instead of a separate poll halves the
-        # CAN round trips per cycle, which is what makes production-rate
-        # (240 Hz) testing reachable. Production never polls separately.
-        meas = cached_meas(test_motor)
-        actual = meas[0] if meas is not None else await test_motor.get_position()
-        if monitor is not None:
-            await monitor.sample()
-        t_read = time.monotonic() - start
-        target_at_read = center + amp * math.sin(2 * math.pi * freq * t_read)
-        log.append(
-            {
-                "t": round(t_read, 5),
-                "target": target_at_read,
-                "actual": actual,
-                "error": actual - target_at_read,
-                "torque": cached_torque(test_motor),
-            }
-        )
-        live.add(t_read, target_at_read, actual)
-
-        spent = time.monotonic() - loop_start
-        if spent < dt:
-            await asyncio.sleep(dt - spent)
+    for row in log:
+        live.add(row["t"], row["target"], row["actual"])
 
     live.flush()
     report_achieved_rate(log, rate_hz)
@@ -740,8 +734,6 @@ async def run_step(
         print(f"  moving to step center ({center:.4f} rad) ...")
         await ramp_impedance(test_motor, kp, kd, center, ff.gravity_fn, rate_hz)
 
-    dt = 1.0 / rate_hz
-
     # Settle at the center — same length as a step phase — running the test
     # gains and live feedforward, before the scored step. The ramp arrival
     # (or a gain change from the previous sweep candidate) leaves the joint
@@ -749,52 +741,44 @@ async def run_step(
     # right away scores that leftover transient as if the step caused it.
     # This phase is commanded at full rate but not logged.
     print(f"  settling at center for {hold:.1f} s ...")
-    settle_start = time.monotonic()
-    while time.monotonic() - settle_start < hold:
-        loop_start = time.monotonic()
-        _, t_ff = ff.compute(center, cached_meas(test_motor))
-        await test_motor.set_impedance(center, 0.0, kp, kd, t_ff)
-        if monitor is not None:
-            # Keep the holders' latest readings warm through the settle …
-            await monitor.sample()
-        spent = time.monotonic() - loop_start
-        if spent < dt:
-            await asyncio.sleep(dt - spent)
+    settle_count = max(1, math.ceil(hold * rate_hz))
+    differentiate, feedforward = ff.rust_config
+    settle = [(center, center, ff.gravity_fn(center))] * settle_count
+    if monitor is not None:
+        await monitor.sample_all()
+    await test_motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=rate_hz,
+        samples=settle,
+        differentiate=differentiate,
+        feedforward=feedforward,
+    )
     if monitor is not None:
         # … then freeze the baselines here, so any holder still finishing its
         # park ramp during the settle doesn't score as reaction-torque wobble.
         monitor.rebase()
 
-    log: list[dict] = []
+    phase_count = max(1, math.ceil(hold * rate_hz))
+    samples = []
+    for phase_target in (step_target, center):
+        samples.extend(
+            (phase_target, phase_target, ff.gravity_fn(phase_target))
+            for _ in range(phase_count)
+        )
+    log = await test_motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=rate_hz,
+        samples=samples,
+        differentiate=differentiate,
+        feedforward=feedforward,
+    )
+    if monitor is not None:
+        await monitor.sample_all()
     live = LiveStream("step", joint)
-    start = time.monotonic()
-
-    for phase_target in [step_target, center]:
-        phase_start = time.monotonic()
-        while time.monotonic() - phase_start < hold:
-            loop_start = time.monotonic()
-            t = time.monotonic() - start
-            _, t_ff = ff.compute(phase_target, cached_meas(test_motor))
-            await test_motor.set_impedance(phase_target, 0.0, kp, kd, t_ff)
-            # Position from the impedance response just cached — no separate
-            # poll (see run_sine).
-            meas = cached_meas(test_motor)
-            actual = meas[0] if meas is not None else await test_motor.get_position()
-            if monitor is not None:
-                await monitor.sample()
-            log.append(
-                {
-                    "t": round(t, 5),
-                    "target": phase_target,
-                    "actual": actual,
-                    "error": actual - phase_target,
-                    "torque": cached_torque(test_motor),
-                }
-            )
-            live.add(t, phase_target, actual)
-            spent = time.monotonic() - loop_start
-            if spent < dt:
-                await asyncio.sleep(dt - spent)
+    for row in log:
+        live.add(row["t"], row["target"], row["actual"])
 
     live.flush()
     report_achieved_rate(log, rate_hz)

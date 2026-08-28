@@ -70,6 +70,10 @@ class FeedForward:
         self._j_eff = j_eff
         self._differentiate_target = differentiate_target
         self._host_kd = host_kd
+        self._host_w0 = (
+            2 * math.pi * host_kd_hz if host_kd_hz is not None else DAMP_BP_W0
+        )
+        self._host_q = host_kd_q if host_kd_q is not None else DAMP_BP_Q
         # Mirrors production motion_control: motor-facing v_des/a_des keep the
         # slow pole; the host damping term uses fast differentiators feeding a
         # band-pass centred on the shoulder resonance (see BandPass in
@@ -80,8 +84,19 @@ class FeedForward:
         self._v_meas_diff = Differentiator(1, cutoff=VEL_CUTOFF_FREQ)
         self._damp_bp = BandPass(
             1,
-            2 * math.pi * host_kd_hz if host_kd_hz is not None else DAMP_BP_W0,
-            q=host_kd_q if host_kd_q is not None else DAMP_BP_Q,
+            self._host_w0,
+            q=self._host_q,
+        )
+
+    @property
+    def rust_config(self) -> tuple[bool, tuple[float, ...]]:
+        """Control/filter parameters consumed by the Rust experiment loop."""
+        return self._differentiate_target, (
+            *self._fric,
+            self._j_eff,
+            self._host_kd,
+            self._host_w0,
+            self._host_q,
         )
 
     def compute(

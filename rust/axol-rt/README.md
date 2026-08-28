@@ -11,11 +11,13 @@ unconditionally: `gravity-comp`, `waypoints`, `tune.motion`,
 `replay-dataset` commands. Once armed, the core is the only CAN consumer.
 Bench/calibration flows that need direct register access (`tune.pid`,
 `tune.friction`, `motor.*`) remain maintenance tools outside the production
-control loop.
+control loop. Their timed PID/friction experiments nevertheless execute in
+Rust through the proxy's experiment engine; Python only plans gravity/reference
+samples and fits the returned measurements.
 
 ## Status
 
-Working today (verified on the robot, both arm buses):
+Working today:
 
 - Raw SocketCAN via `libc` — no wrapper crates, direct control over
   timeouts/filters for the realtime loop.
@@ -36,6 +38,13 @@ Working today (verified on the robot, both arm buses):
 - `axol-rt serve` — the realtime core: owns both buses, paces a 240 Hz MIT
   stream, and plays impedance targets streamed from Python over a Unix
   socket. This is what `axol teleop` runs.
+- `axol-rt proxy` — maintenance CAN plus a precisely paced tuning experiment
+  engine and Rust-side rolling timing aggregation. Passive dashboard clients
+  receive 30 Hz state frames and 10 Hz timing summaries while Rust observes
+  every on-wire frame.
+- `axol-rt jelly` — owns Jelly's four wheel motors: enable/disable, 50 Hz
+  vector slew and x-drive mix, command watchdog, gyro heading hold, and the
+  velocity/impedance park state machine.
 
 Measured on the robot (2026-08-27):
 
@@ -178,10 +187,10 @@ write them, and the regular five-second status line reports any trace drops.
 at rest. `hold` requires `--yes` to actuate. `serve` only actuates after
 the explicit config/prep/arm handshake, and every exit path (disarm,
 fault, signal, client loss) runs the disable sequence. `proxy` is the sole
-frame transport for maintenance, tuning, firmware, diagnostics, cart, and
-lift clients. It shares the realtime core's persistent-TX-stall detection and
-queue purge, aborting instead of allowing stale motion frames to replay after
-an e-stop.
+frame transport for maintenance, tuning, firmware, and arm diagnostics;
+`jelly` owns Jelly's wheel bus, while the proxy carries its lift bus. Both use
+the realtime core's persistent-TX-stall detection and queue purge, aborting
+instead of allowing stale motion frames to replay after an e-stop.
 
 ## Build / run
 

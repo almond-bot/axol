@@ -1,29 +1,34 @@
-//! axol-rt: realtime CAN control core for the Almond Axol arms (early scaffolding).
+//! axol-rt: realtime CAN services for Almond Axol and Jelly.
 //!
-//! Current subcommands are strictly read-only — they send no enable or motion
-//! commands, so they are safe to run against a powered robot at rest:
+//! Read-only tools:
 //!
 //!   axol-rt scan  [ifaces...]                     identity + state of every motor
 //!   axol-rt bench [--hz N] [--secs N] [--serial] [ifaces...]
 //!                                                 paced full-bus telemetry loop
 //!
-//! Motion (requires a params file from tools/gen_hold_params.py, and --yes):
+//! Motion/control services:
 //!
 //!   axol-rt hold --params FILE [--secs N] [--hz N] [--abort-deg N] [--yes]
 //!                                                 enable + hold current pose
 //!   axol-rt serve --socket PATH                   realtime core driven over a
 //!                                                 Unix socket (see serve.rs)
+//!   axol-rt proxy --socket PATH --iface IFACE     maintenance transport,
+//!                                                 tuning, timing aggregation
+//!   axol-rt jelly --socket PATH --iface IFACE     Jelly wheel controller
 
 mod bench;
 mod bringup;
 mod can;
+mod experiment;
 mod filter;
 mod hold;
+mod jelly;
 mod proto;
 mod proxy;
 mod safety;
 mod scan;
 mod serve;
+mod timing;
 mod txn;
 
 const DEFAULT_IFACES: [&str; 2] = ["can_alm_axol_l", "can_alm_axol_r"];
@@ -33,7 +38,7 @@ fn main() {
     let (cmd, rest) = match args.split_first() {
         Some((cmd, rest)) => (cmd.as_str(), rest),
         None => {
-            eprintln!("usage: axol-rt <scan|bench|hold|serve|proxy> [options]");
+            eprintln!("usage: axol-rt <scan|bench|hold|serve|proxy|jelly> [options]");
             std::process::exit(2);
         }
     };
@@ -130,6 +135,30 @@ fn main() {
             };
             proxy::run(&socket, &iface)
         }
+        "jelly" => {
+            let mut socket: Option<String> = None;
+            let mut iface: Option<String> = None;
+            let mut iter = rest.iter();
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--socket" => socket = iter.next().cloned(),
+                    "--iface" => iface = iter.next().cloned(),
+                    other => {
+                        eprintln!("jelly: unknown argument {other}");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            let Some(socket) = socket else {
+                eprintln!("jelly: --socket PATH is required");
+                std::process::exit(2);
+            };
+            let Some(iface) = iface else {
+                eprintln!("jelly: --iface IFACE is required");
+                std::process::exit(2);
+            };
+            jelly::run(&socket, &iface)
+        }
         other => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -151,10 +180,8 @@ fn parse_ifaces(rest: &[String]) -> Vec<String> {
 }
 
 fn expect_f64(value: Option<&String>, flag: &str) -> f64 {
-    value
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            eprintln!("{flag} needs a numeric value");
-            std::process::exit(2);
-        })
+    value.and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+        eprintln!("{flag} needs a numeric value");
+        std::process::exit(2);
+    })
 }

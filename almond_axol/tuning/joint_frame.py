@@ -23,6 +23,13 @@ from __future__ import annotations
 import math
 
 from ..motor import ControlMode, Joint, Motor
+from ..motor.damiao import DamiaoMotor
+from ..motor.myactuator import (
+    MyActuatorMotor,
+    _MA_KD_MAX,
+    _MA_KP_MAX,
+    _MA_V_MAX,
+)
 from ..robot.axol import (
     EITHER_STOP_JOINTS,
     closer_end_stop,
@@ -80,6 +87,51 @@ class JointFrameMotor:
 
     async def disable(self) -> None:
         await self.motor.disable()
+
+    async def run_experiment(
+        self,
+        *,
+        kp: float,
+        kd: float,
+        rate_hz: float,
+        samples: list[tuple[float, ...]],
+        differentiate: bool,
+        feedforward: tuple[float, float, float, float, float, float, float, float],
+    ) -> list[dict]:
+        """Execute timed impedance samples entirely in the Rust CAN core."""
+        driver = self.motor._driver
+        if isinstance(driver, MyActuatorMotor):
+            vendor = 0
+            ranges = (
+                driver._p_max,
+                _MA_V_MAX,
+                _MA_KP_MAX,
+                _MA_KD_MAX,
+                driver._t_max,
+            )
+        elif isinstance(driver, DamiaoMotor):
+            vendor = 1
+            ranges = (
+                driver._p_max,
+                driver._v_max,
+                500.0,
+                5.0,
+                driver._t_max,
+            )
+        else:  # pragma: no cover - the arm has only these two vendors
+            raise TypeError(f"unsupported tuning motor {type(driver).__name__}")
+        return await driver._bus.run_experiment(
+            vendor=vendor,
+            motor_id=driver._motor_id,
+            differentiate=differentiate,
+            rate_hz=rate_hz,
+            offset=self.offset,
+            kp=kp,
+            kd=kd,
+            ranges=ranges,
+            feedforward=feedforward,
+            samples=samples,
+        )
 
 
 async def joint_frame_motors(

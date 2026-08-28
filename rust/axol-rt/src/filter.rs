@@ -18,7 +18,11 @@ pub struct LpDiff {
 
 impl LpDiff {
     pub fn new(cutoff: f64) -> Self {
-        Self { cutoff, vel: 0.0, pos_prev: None }
+        Self {
+            cutoff,
+            vel: 0.0,
+            pos_prev: None,
+        }
     }
 
     pub fn update(&mut self, pos: f64, dt: f64) -> f64 {
@@ -61,7 +65,11 @@ pub struct BandPass {
 
 impl BandPass {
     pub fn new() -> Self {
-        Self { lp: 0.0, bp: 0.0, primed: false }
+        Self {
+            lp: 0.0,
+            bp: 0.0,
+            primed: false,
+        }
     }
 
     pub fn update(&mut self, x: f64, w0: f64, q: f64, dt: f64) -> f64 {
@@ -131,7 +139,13 @@ impl Trapezoid {
     /// Unseeded, matching the Python original: the first `update` adopts
     /// the target as the output (no transient).
     pub fn new(max_vel: f64, max_accel: f64) -> Self {
-        Self { max_vel, max_accel, pos: 0.0, vel: 0.0, seeded: false }
+        Self {
+            max_vel,
+            max_accel,
+            pos: 0.0,
+            vel: 0.0,
+            seeded: false,
+        }
     }
 
     /// Adopt `pos` as the current output with zero velocity — used at arm
@@ -366,7 +380,10 @@ mod tests {
 
         let raw_rms = (raw_pair_delta_sq / pairs as f64).sqrt();
         let filtered_rms = (filtered_pair_delta_sq / pairs as f64).sqrt();
-        assert!(raw_rms > 1.0, "fixture must expose the raw acceleration ripple");
+        assert!(
+            raw_rms > 1.0,
+            "fixture must expose the raw acceleration ripple"
+        );
         assert!(
             filtered_rms < 0.05 * raw_rms,
             "command derivative chain must reject target-rate ripple: raw {raw_rms:e}, filtered {filtered_rms:e}"
@@ -457,7 +474,11 @@ mod tests {
             while applied + 1 < sched.len() && sched[applied + 1].0 <= t {
                 applied += 1;
             }
-            let tau = if sched[applied].0 <= t { sched[applied].1 } else { 0.0 };
+            let tau = if sched[applied].0 <= t {
+                sched[applied].1
+            } else {
+                0.0
+            };
             let v_true = 0.01 * w * (w * t).cos();
             power_classic += tau * v_true;
         }

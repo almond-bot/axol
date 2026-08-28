@@ -124,7 +124,10 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         let Some((pos_frame, _)) =
             txn::ma_request(sock, id, proto::ma_cmd(proto::MA_MULTI_TURN_ANGLE), TIMEOUT)?
         else {
-            return Err(err(format!("{} (0x{id:02X}): no position reply", spec.joint)));
+            return Err(err(format!(
+                "{} (0x{id:02X}): no position reply",
+                spec.joint
+            )));
         };
         motors.push(ReadyMotor {
             id,
@@ -168,7 +171,10 @@ pub fn prepare(sock: &CanSock, iface: &str, specs: &[MotorSpec]) -> io::Result<V
         let t_max = read_dm_register(sock, id, proto::DM_REG_TMAX)?;
 
         let Some((fb, _)) = txn::dm_request_feedback(sock, id, TIMEOUT)? else {
-            return Err(err(format!("{} (0x{id:02X}): no feedback reply", spec.joint)));
+            return Err(err(format!(
+                "{} (0x{id:02X}): no feedback reply",
+                spec.joint
+            )));
         };
         let decoded = proto::dm_decode_feedback(&fb, p_max, v_max, t_max);
         motors.push(ReadyMotor {
@@ -251,9 +257,10 @@ pub fn disable(sock: &CanSock, motors: &[ReadyMotor]) {
     for m in motors {
         for _ in 0..3 {
             let sent = match m.vendor {
-                Vendor::MyActuator => {
-                    sock.send(proto::MA_REQ + m.id as u16, &proto::ma_cmd(proto::MA_SHUTDOWN))
-                }
+                Vendor::MyActuator => sock.send(
+                    proto::MA_REQ + m.id as u16,
+                    &proto::ma_cmd(proto::MA_SHUTDOWN),
+                ),
                 Vendor::Damiao => sock.send(m.id as u16, &proto::DM_DISABLE),
             };
             if let Err(err) = sent {

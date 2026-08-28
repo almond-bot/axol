@@ -77,17 +77,19 @@ async def _ramp_to(
     duration: float = 2.0,
 ) -> None:
     start_pos = await motor.get_position()
-    dt = 1.0 / _RATE_HZ
-    t0 = time.monotonic()
-    while True:
-        t = time.monotonic() - t0
-        alpha = min(t / duration, 1.0)
-        await motor.set_impedance(
-            start_pos + alpha * (target - start_pos), 0.0, kp, kd, 0.0
-        )
-        if alpha >= 1.0:
-            break
-        await asyncio.sleep(dt)
+    count = max(2, math.ceil(duration * _RATE_HZ) + 1)
+    samples = [
+        (start_pos + i / (count - 1) * (target - start_pos), target, 0.0)
+        for i in range(count)
+    ]
+    await motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=samples,
+        differentiate=False,
+        feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8),
+    )
 
 
 # Homing order: distal to proximal. This ordering is what makes commanding
@@ -207,18 +209,11 @@ async def _run_sweep_raw(
     d_cruise = travel - d_decel
     t_cruise = d_cruise / v
     warmup_time = t_cruise * _WARMUP_FRACTION
-    dt = 1.0 / _RATE_HZ
-
-    samples: list[tuple[float, float]] = []
-
-    t0 = time.monotonic()
-    while True:
-        now = time.monotonic()
-        t = now - t0
-        if t >= t_cruise + t_decel:
-            break
-        loop_start = now
-
+    count = max(1, math.ceil((t_cruise + t_decel) * _RATE_HZ))
+    program = []
+    cruise_mask = []
+    for i in range(count):
+        t = i / _RATE_HZ
         if t <= t_cruise:
             target = start_pos + sign * v * t
             v_des = sign * v
@@ -227,18 +222,21 @@ async def _run_sweep_raw(
             v_brake = max(v - decel * tau, 0.0)
             target = start_pos + sign * (d_cruise + v * tau - 0.5 * decel * tau * tau)
             v_des = sign * v_brake
-        # set_impedance returns a feedback frame, which updates
-        # motor.position / motor.torque via the driver _on_feedback hook.
-        await motor.set_impedance(target, v_des, kp, kd, 0.0)
-
-        if warmup_time <= t <= t_cruise:
-            samples.append((motor.position, motor.torque))
-
-        spent = time.monotonic() - loop_start
-        if spent < dt:
-            await asyncio.sleep(dt - spent)
-
-    return samples
+        program.append((target, target, 0.0, v_des))
+        cruise_mask.append(warmup_time <= t <= t_cruise)
+    rows = await motor.run_experiment(
+        kp=kp,
+        kd=kd,
+        rate_hz=_RATE_HZ,
+        samples=program,
+        differentiate=False,
+        feedforward=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 20.0, 0.8),
+    )
+    return [
+        (row["actual"], row["torque"])
+        for row, keep in zip(rows, cruise_mask)
+        if keep and math.isfinite(row["actual"]) and math.isfinite(row["torque"])
+    ]
 
 
 def _bin_by_position(

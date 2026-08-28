@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import struct
@@ -16,6 +17,8 @@ _logger = logging.getLogger(__name__)
 _CONNECT_TIMEOUT_S = 5.0
 _READY_TIMEOUT_S = 5.0
 _FRAME = struct.Struct("<IB8sQ")  # arbitration id, DLC, data, Unix timestamp ns
+_EXPERIMENT_ROW = struct.Struct("<4d")
+_MAX_MESSAGE = 32 * 1024 * 1024
 
 
 class CanBus:
@@ -39,6 +42,8 @@ class CanBus:
         self._listeners: list[Callable[[can.Message], None]] = []
         self._ready = asyncio.Event()
         self._closed_reason: str | None = None
+        self._timing: dict | None = None
+        self._experiment_waiter: asyncio.Future[list[dict]] | None = None
 
     async def start(self) -> None:
         """Start the Rust transport and wait until it owns the CAN socket."""
@@ -156,6 +161,20 @@ class CanBus:
     def _add_listener(self, listener: Callable[[can.Message], None]) -> None:
         self._listeners.append(listener)
 
+    @property
+    def timing(self) -> dict | None:
+        """Latest rolling timing snapshot aggregated by the Rust proxy."""
+        return self._timing
+
+    def reset_timing(self) -> None:
+        """Start a fresh Rust-side timing window at a lifecycle boundary."""
+        self._timing = None
+        self._send_message(b"Z")
+
+    def enable_observer_mode(self) -> None:
+        """Keep Rust timing at wire rate while forwarding state at ~30 Hz/ID."""
+        self._send_message(b"O\x01")
+
     async def _send(self, arbitration_id: int, data: bytes) -> None:
         """Forward one standard CAN frame to the Rust-owned socket."""
         if self._writer is None or self._writer.is_closing():
@@ -181,6 +200,61 @@ class CanBus:
                 f"axol-rt proxy for {self._channel} disconnected"
             ) from exc
 
+    async def run_experiment(
+        self,
+        *,
+        vendor: int,
+        motor_id: int,
+        differentiate: bool,
+        rate_hz: float,
+        offset: float,
+        kp: float,
+        kd: float,
+        ranges: tuple[float, float, float, float, float],
+        feedforward: tuple[float, float, float, float, float, float, float, float],
+        samples: list[tuple[float, ...]],
+    ) -> list[dict]:
+        """Run a planned tuning program on the Rust timing/filter loop."""
+        if self._experiment_waiter is not None:
+            raise RuntimeError("a tuning experiment is already running on this bus")
+        header = struct.pack(
+            "<4B4d5d8dI",
+            vendor,
+            motor_id,
+            int(differentiate),
+            0,
+            rate_hz,
+            offset,
+            kp,
+            kd,
+            *ranges,
+            *feedforward,
+            len(samples),
+        )
+        body = b"".join(
+            struct.pack(
+                "<4d", *(sample if len(sample) == 4 else (*sample, float("nan")))
+            )
+            for sample in samples
+        )
+        waiter: asyncio.Future[list[dict]] = asyncio.get_running_loop().create_future()
+        self._experiment_waiter = waiter
+        try:
+            self._send_message(b"X" + header + body)
+            assert self._writer is not None
+            await self._writer.drain()
+            return await waiter
+        except asyncio.CancelledError:
+            if self._writer is not None and not self._writer.is_closing():
+                self._send_message(b"K")
+                try:
+                    await asyncio.shield(self._writer.drain())
+                except ConnectionError:
+                    pass
+            raise
+        finally:
+            self._experiment_waiter = None
+
     def _send_message(self, payload: bytes) -> None:
         if self._writer is None or self._writer.is_closing():
             raise RuntimeError(f"CAN proxy for {self._channel} is not connected")
@@ -192,17 +266,61 @@ class CanBus:
             while True:
                 header = await self._reader.readexactly(4)
                 (size,) = struct.unpack("<I", header)
-                if size <= 0 or size > 1024:
+                if size <= 0 or size > _MAX_MESSAGE:
                     raise RuntimeError(f"invalid axol-rt proxy message size {size}")
                 payload = await self._reader.readexactly(size)
                 if payload == b"R":
                     self._ready.set()
                     continue
                 if payload[:1] == b"E":
+                    if (
+                        self._experiment_waiter is not None
+                        and not self._experiment_waiter.done()
+                    ):
+                        self._experiment_waiter.set_exception(
+                            can.CanOperationError(
+                                payload[1:].decode("utf-8", errors="replace")
+                            )
+                        )
                     _logger.warning(
                         "axol-rt proxy: %s",
                         payload[1:].decode("utf-8", errors="replace"),
                     )
+                    continue
+                if payload[:1] == b"T":
+                    try:
+                        self._timing = json.loads(payload[1:])
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        _logger.warning("axol-rt proxy: invalid timing snapshot")
+                    continue
+                if payload[:1] == b"X":
+                    waiter = self._experiment_waiter
+                    if waiter is None or len(payload) < 5:
+                        _logger.warning("axol-rt proxy: unexpected experiment result")
+                        continue
+                    (count,) = struct.unpack_from("<I", payload, 1)
+                    if len(payload) != 5 + count * _EXPERIMENT_ROW.size:
+                        waiter.set_exception(
+                            RuntimeError("invalid Rust experiment result")
+                        )
+                        continue
+                    rows = []
+                    for i in range(count):
+                        t, target, actual, torque = _EXPERIMENT_ROW.unpack_from(
+                            payload, 5 + i * _EXPERIMENT_ROW.size
+                        )
+                        rows.append(
+                            {
+                                "t": round(t, 5),
+                                "target": target,
+                                "actual": actual,
+                                "error": actual - target,
+                                "torque": torque,
+                            }
+                        )
+                    waiter.set_result(rows)
+                    continue
+                if payload == b"K":
                     continue
                 if payload[:1] != b"F" or len(payload) != 1 + _FRAME.size:
                     _logger.warning("axol-rt proxy: invalid message tag/size")
@@ -224,6 +342,15 @@ class CanBus:
                         name = getattr(listener, "__name__", repr(listener))
                         _logger.error("CAN listener %s error: %s", name, exc)
         except (asyncio.IncompleteReadError, ConnectionResetError) as exc:
+            if (
+                self._experiment_waiter is not None
+                and not self._experiment_waiter.done()
+            ):
+                self._experiment_waiter.set_exception(
+                    can.CanOperationError(
+                        "axol-rt proxy disconnected during experiment"
+                    )
+                )
             if self._proc is not None and self._proc.poll() is not None:
                 self._closed_reason = (
                     f"axol-rt proxy for {self._channel} exited "

@@ -192,9 +192,7 @@ pub const DM_STATUS_ENABLED: u8 = 0x1;
 
 /// True when `data` is a register-read reply for (`motor_id`, `rid`).
 pub fn dm_is_register_reply(data: &[u8; 8], motor_id: u16, rid: u8) -> bool {
-    (data[0] as u16 | ((data[1] as u16) << 8)) == motor_id
-        && data[2] == 0x33
-        && data[3] == rid
+    (data[0] as u16 | ((data[1] as u16) << 8)) == motor_id && data[2] == 0x33 && data[3] == rid
 }
 
 /// Decode the value of a register-read reply as f64 (uint32 regs widened).
@@ -264,14 +262,7 @@ pub struct MitRanges {
 /// both vendors (`set_impedance` in `myactuator.py`, `_send_cmd` IMPEDANCE
 /// branch in `damiao.py`); only the scaling ranges differ.
 #[allow(dead_code)] // staged for the command path (tested)
-pub fn mit_encode(
-    p_des: f64,
-    v_des: f64,
-    kp: f64,
-    kd: f64,
-    t_ff: f64,
-    r: &MitRanges,
-) -> [u8; 8] {
+pub fn mit_encode(p_des: f64, v_des: f64, kp: f64, kd: f64, t_ff: f64, r: &MitRanges) -> [u8; 8] {
     let p_u = float_to_uint(p_des, -r.p_max, r.p_max, 16);
     let v_u = float_to_uint(v_des, -r.v_max, r.v_max, 12);
     let kp_u = float_to_uint(kp, 0.0, r.kp_max, 12);

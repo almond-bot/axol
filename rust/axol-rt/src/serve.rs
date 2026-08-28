@@ -285,7 +285,10 @@ fn parse_config(text: &str) -> io::Result<Config> {
     let mut buses: Vec<(u8, String, Vec<MotorSpec>)> = Vec::new();
 
     let bad = |line: &str| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("config: bad line: {line}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config: bad line: {line}"),
+        )
     };
     for line in text.lines() {
         let line = line.trim();
@@ -294,22 +297,39 @@ fn parse_config(text: &str) -> io::Result<Config> {
         }
         let f: Vec<&str> = line.split_whitespace().collect();
         match f[0] {
-            "loop_hz" => loop_hz = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+            "loop_hz" => {
+                loop_hz = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?
+            }
             "watchdog_ms" => {
-                watchdog_ms = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?
+                watchdog_ms = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?
             }
             "max_step_rad" => {
-                max_step_rad = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?
+                max_step_rad = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?
             }
             "abort_deg" => {
-                abort_deg = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?
+                abort_deg = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?
             }
             "joint" | "gripper" => {
                 // joint <side 0|1> <iface> <name> <motor_id> <kp> <kd>
                 //       <max_vel> <max_accel> <fc> <k> <fv> <fo>
                 // gripper <side 0|1> <iface> <motor_id>
                 let gripper = f[0] == "gripper";
-                let side: u8 = f.get(1).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?;
+                let side: u8 = f
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .ok_or_else(|| bad(line))?;
                 let iface = f.get(2).ok_or_else(|| bad(line))?.to_string();
                 let bus = match buses.iter_mut().find(|(s, i, _)| *s == side && *i == iface) {
                     Some(bus) => bus,
@@ -319,12 +339,17 @@ fn parse_config(text: &str) -> io::Result<Config> {
                     }
                 };
                 let num = |i: usize| -> io::Result<f64> {
-                    f.get(i).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))
+                    f.get(i)
+                        .and_then(|v| v.parse().ok())
+                        .ok_or_else(|| bad(line))
                 };
                 let spec = if gripper {
                     MotorSpec {
                         joint: "gripper".to_string(),
-                        motor_id: f.get(3).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        motor_id: f
+                            .get(3)
+                            .and_then(|v| v.parse().ok())
+                            .ok_or_else(|| bad(line))?,
                         kp: 0.0,
                         kd: 0.0,
                         gripper: true,
@@ -339,7 +364,10 @@ fn parse_config(text: &str) -> io::Result<Config> {
                 } else {
                     MotorSpec {
                         joint: f.get(3).ok_or_else(|| bad(line))?.to_string(),
-                        motor_id: f.get(4).and_then(|v| v.parse().ok()).ok_or_else(|| bad(line))?,
+                        motor_id: f
+                            .get(4)
+                            .and_then(|v| v.parse().ok())
+                            .ok_or_else(|| bad(line))?,
                         kp: num(5)?,
                         kd: num(6)?,
                         gripper: false,
@@ -362,7 +390,10 @@ fn parse_config(text: &str) -> io::Result<Config> {
         }
     }
     if buses.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "config: no joints"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "config: no joints",
+        ));
     }
     Ok(Config {
         loop_hz,
@@ -519,7 +550,10 @@ mod tests {
         assert!(specs[2].gripper);
         assert_eq!(specs[0].max_vel, 9.4);
         assert_eq!(specs[0].max_accel, 33.0);
-        assert_eq!((specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo), (0.6, 250.0, 0.15, 0.02));
+        assert_eq!(
+            (specs[0].fc, specs[0].k, specs[0].fv, specs[0].fo),
+            (0.6, 250.0, 0.15, 0.02)
+        );
         // A joint line missing the tracker/friction params (the previous
         // 7-field layout) must be rejected, not defaulted.
         assert!(parse_config("joint 0 canL shoulder_1 1 250 3.5\n").is_err());
@@ -548,7 +582,11 @@ fn read_msg(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
 fn writer_thread(mut stream: UnixStream, rx: mpsc::Receiver<Vec<u8>>) {
     for msg in rx {
         let len = (msg.len() as u32).to_le_bytes();
-        if stream.write_all(&len).and_then(|_| stream.write_all(&msg)).is_err() {
+        if stream
+            .write_all(&len)
+            .and_then(|_| stream.write_all(&msg))
+            .is_err()
+        {
             return; // peer gone; reader side handles shutdown semantics
         }
     }
@@ -611,8 +649,10 @@ pub fn run(socket_path: &str) -> io::Result<()> {
 
     let mut config: Option<Arc<Config>> = None;
     // Index 0 = left, 1 = right.
-    let targets: Arc<[Mutex<TargetSlot>; 2]> =
-        Arc::new([Mutex::new(TargetSlot::default()), Mutex::new(TargetSlot::default())]);
+    let targets: Arc<[Mutex<TargetSlot>; 2]> = Arc::new([
+        Mutex::new(TargetSlot::default()),
+        Mutex::new(TargetSlot::default()),
+    ]);
     let stop = Arc::new(AtomicBool::new(false));
     // 0 = running, 1 = fault (set by a bus thread on abort).
     let fault = Arc::new(AtomicU8::new(0));
@@ -679,8 +719,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 };
                 let mut ok = true;
                 for (_, iface, specs) in &cfg.buses {
-                    let step = CanSock::open(iface)
-                        .and_then(|sock| bringup::prep(&sock, specs));
+                    let step = CanSock::open(iface).and_then(|sock| bringup::prep(&sock, specs));
                     if let Err(err) = step {
                         send_text(&out_tx, b'S', &format!("fault: prep {iface}: {err}"));
                         ok = false;
@@ -708,8 +747,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     let ready_tx = ready_tx.clone();
                     bus_threads.push(std::thread::spawn(move || {
                         bus_loop(
-                            &iface, side, &specs, &cfg, &targets, &stop, &fault, &out_tx,
-                            &ready_tx,
+                            &iface, side, &specs, &cfg, &targets, &stop, &fault, &out_tx, &ready_tx,
                         )
                     }));
                 }
@@ -965,8 +1003,7 @@ fn bus_loop(
 
             // Watchdog: no fresh target — the tracker converges on the last
             // target and holds there (damping stays live).
-            let starved =
-                last_arrival.is_some_and(|a| began.duration_since(a) > watchdog);
+            let starved = last_arrival.is_some_and(|a| began.duration_since(a) > watchdog);
             if starved && !watchdog_frozen {
                 watchdog_frozen = true;
                 send_text(
@@ -1182,10 +1219,9 @@ fn bus_loop(
                     d.vel_meas = d.v_meas.update(pos, dt);
                     (d.vel_meas, dt)
                 };
-                if let (Some(tx), Some(mut row)) = (
-                    trace_tx.as_ref(),
-                    trace_pending[motors[idx].slot].take(),
-                ) {
+                if let (Some(tx), Some(mut row)) =
+                    (trace_tx.as_ref(), trace_pending[motors[idx].slot].take())
+                {
                     row.meas_p = pos;
                     row.motor_v = vel;
                     row.meas_v = meas_v;

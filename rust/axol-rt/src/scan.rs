@@ -44,7 +44,8 @@ fn scan_bus(sock: &CanSock) -> io::Result<()> {
 }
 
 fn scan_myactuator(sock: &CanSock, id: u8) -> io::Result<Option<String>> {
-    let Some((ver, rtt)) = txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
+    let Some((ver, rtt)) =
+        txn::ma_request(sock, id, proto::ma_cmd(proto::MA_READ_VERSION), TIMEOUT)?
     else {
         return Ok(None);
     };

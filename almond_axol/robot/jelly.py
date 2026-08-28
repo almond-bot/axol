@@ -10,10 +10,9 @@ fixed by convention:
     id 3  back-left       id 4  back-right
 
 :class:`Jelly` exposes a latched command interface: any thread calls
-:meth:`Jelly.set_command` with a normalized body velocity + lift direction,
-and an internal asyncio task (started by :meth:`Jelly.enable`) applies slew
-limiting, x-drive mixing, and the park/unpark state machine at
-``JellyConfig.frequency``:
+:meth:`Jelly.set_command` with a normalized body velocity + lift direction.
+The Rust ``axol-rt jelly`` service applies slew limiting, x-drive mixing,
+heading hold, the watchdog, and park/unpark at ``JellyConfig.frequency``:
 
 - While the command is non-zero the wheels track it in VELOCITY mode.
 - When the slew-limited command reaches zero (and the wheels are measured
@@ -43,16 +42,16 @@ if a wheel runs backwards on Jelly, flip its entry in
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import math
+import os
+import struct
+import subprocess
 import time
 from dataclasses import dataclass
 
 from ..constants import CAN_BASE, CAN_CHEST
-from ..motor import CanBus, ControlMode, make_driver
-from ..motor.damiao import _DM_REG_PMAX
-from ..motor.driver import MotorDriver
+from ..rt.link import find_binary
 from .lift import DOWN, JOG_SPEED, STOP, UP, Lift, LiftStatus
 
 _logger = logging.getLogger(__name__)
@@ -65,17 +64,6 @@ DEFAULT_CHANNEL = CAN_BASE
 # Per-wheel spin-direction calibration: flip an entry to -1 if that wheel
 # drives the wrong way with everything else correct.
 WHEEL_SIGNS: dict[int, float] = {1: 1.0, 2: -1.0, 3: 1.0, 4: -1.0}
-
-# Position-mapping range (PMAX, register 21) written at startup, in rad.
-# Wide enough that a session's accumulated wheel rotation stays in range
-# (the factory 12.5 rad is ~2 wheel turns), narrow enough that the 16-bit
-# MIT position encoding keeps sub-centidegree resolution (~12 mrad here).
-_SESSION_PMAX = 400.0
-
-# Measured wheel speed (rad/s) below which parking is allowed. Guards
-# against anchoring a wheel that is still coasting (e.g. on a slope where
-# the velocity loop hasn't fully braked when the command reaches zero).
-_PARK_MAX_WHEEL_SPEED = 0.5
 
 # Rate of the per-cycle heading-hold trace line (JellyConfig.yaw_log). The
 # hold's dynamics are ~1 s, so this resolves them without flooding a console
@@ -326,18 +314,22 @@ class Jelly:
         ...
         await jelly.disable()
 
-    :meth:`set_command` only latches the target; the internal command task
-    owns all bus/GPIO traffic. Values are normalized to [-1, 1] (body frame:
-    +x forward, +y left, +wz CCW) and scaled by ``JellyConfig.max_speed`` /
-    ``turn_scale``; ``lift`` is +1 up / 0 stop / -1 down.
+    :meth:`set_command` only latches the target. The Rust service owns wheel
+    control and CAN; a small Python bridge forwards targets and owns the
+    separate lift driver. Values are normalized to [-1, 1] (body frame: +x
+    forward, +y left, +wz CCW); ``lift`` is +1 up / 0 stop / -1 down.
     """
 
     def __init__(self, config: JellyConfig = JellyConfig()) -> None:
         self._config = config
-        self._bus: CanBus | None = None
-        self._motors: list[MotorDriver] = []
         self._lift: Lift | None = None
         self._task: asyncio.Task | None = None
+        self._reader_task: asyncio.Task | None = None
+        self._proc: subprocess.Popen[bytes] | None = None
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._socket_path = f"/tmp/axol-jelly-{os.getpid()}-{id(self):x}.sock"
+        self._ready = asyncio.Event()
 
         # Latched target, written from any thread (single-reference swap is
         # atomic under the GIL), consumed by the command task.
@@ -385,9 +377,10 @@ class Jelly:
     # ------------------------------------------------------------------
 
     async def enable(self) -> None:
-        """Open the CAN bus, enable the wheel motors, init the lift, and start
-        the command task."""
+        """Start the Rust wheel controller and the optional lift."""
         cfg = self._config
+        self._ready.clear()
+        self.send_failed = False
         if cfg.lift:
             # The chest bus is optional and independent of the wheels: a
             # missing/unpowered lift only costs the lift, never the drive.
@@ -404,63 +397,65 @@ class Jelly:
                     exc,
                 )
 
-        try:
-            if cfg.channel is not None:
-                # Seamless enable: bring the wheel interface up if it isn't yet
-                # (boot normally handles this via can.setup's @reboot script,
-                # but a freshly plugged adapter or a manual teardown shouldn't
-                # need a separate can.enable). A missing interface raises with
-                # its name.
-                from ..cli.can.setup import bring_up_interfaces, iface_up
+        if cfg.channel is not None:
+            from ..cli.can.setup import bring_up_interfaces, iface_up
 
-                if not iface_up(cfg.channel):
-                    bring_up_interfaces([cfg.channel])
-                self._bus = CanBus(cfg.channel)
-                await self._bus.start()
-                # Wheel IDs 1-4 collide with the arm-bus MyActuator IDs in the
-                # driver-inference table, so the Damiao protocol is forced.
-                self._motors = [
-                    make_driver(self._bus, w.motor_id, motor_type="damiao")
-                    for w in WHEELS
+            if not iface_up(cfg.channel):
+                bring_up_interfaces([cfg.channel])
+            self._proc = subprocess.Popen(
+                [
+                    find_binary(),
+                    "jelly",
+                    "--socket",
+                    self._socket_path,
+                    "--iface",
+                    cfg.channel,
                 ]
-                # Widen the position-mapping range (RAM only) before enable()
-                # reads it back, so multi-turn wheel positions stay valid for
-                # the MIT park hold.
-                await asyncio.gather(
-                    *[
-                        m._write_register(_DM_REG_PMAX, _SESSION_PMAX)
-                        for m in self._motors
-                    ]
-                )
-                await asyncio.gather(*[m.enable() for m in self._motors])
-                for w, m in zip(WHEELS, self._motors):
-                    if abs(m._p_max - _SESSION_PMAX) > 1.0:
-                        _logger.warning(
-                            "Jelly wheel %s PMAX readback %.0f != %.0f — parking "
-                            "may misbehave",
-                            w.name,
-                            m._p_max,
-                            _SESSION_PMAX,
-                        )
-                await asyncio.gather(
-                    *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
-                )
-                _logger.info("Jelly wheels enabled on %s", cfg.channel)
-        except BaseException:
-            # A failed enable() propagates to the caller, who never calls
-            # disable() — so everything opened above must be torn down here,
-            # or the lift's CAN reader and jog task would keep running (and a
-            # half-started wheel bus would stay open).
-            self._motors = []
-            if self._bus is not None:
-                with contextlib.suppress(Exception):
-                    await self._bus.close()
-                self._bus = None
-            if self._lift is not None:
-                with contextlib.suppress(Exception):
-                    await self._lift.close()
-                self._lift = None
-            raise
+            )
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while True:
+                try:
+                    self._reader, self._writer = await asyncio.open_unix_connection(
+                        self._socket_path
+                    )
+                    break
+                except (ConnectionRefusedError, FileNotFoundError):
+                    if self._proc.poll() is not None:
+                        returncode = self._proc.returncode
+                        await self.disable()
+                        raise RuntimeError(
+                            f"axol-rt Jelly core exited with {returncode}"
+                        ) from None
+                    if asyncio.get_running_loop().time() >= deadline:
+                        await self.disable()
+                        raise RuntimeError("timed out connecting to axol-rt Jelly core")
+                    await asyncio.sleep(0.05)
+            self._reader_task = asyncio.create_task(
+                self._rust_reader_loop(), name="jelly-rust-reader"
+            )
+            values = (
+                cfg.max_speed,
+                cfg.turn_scale,
+                cfg.slew,
+                cfg.axis_snap_deg,
+                cfg.yaw_hold_gain,
+                cfg.yaw_hold_max,
+                cfg.hold_kp,
+                cfg.hold_kd,
+                cfg.frequency,
+                cfg.command_timeout,
+            )
+            self._send_rust(b"C" + struct.pack("<10d", *values))
+            await self._writer.drain()
+            try:
+                await asyncio.wait_for(self._ready.wait(), 10.0)
+            except BaseException:
+                await self.disable()
+                raise
+            if self.send_failed:
+                await self.disable()
+                raise RuntimeError("axol-rt Jelly core failed during startup")
+            _logger.info("Jelly Rust wheel core enabled on %s", cfg.channel)
 
         if cfg.yaw_hold_gain != 0.0:
             _logger.info(
@@ -471,7 +466,7 @@ class Jelly:
                 " (yaw_log on)" if cfg.yaw_log else "",
             )
 
-        self._task = asyncio.create_task(self._command_loop(), name="jelly-command")
+        self._task = asyncio.create_task(self._bridge_loop(), name="jelly-rust-bridge")
 
     async def disable(self) -> None:
         """Stop the command task, stop and disable the wheels, release the lift."""
@@ -483,24 +478,45 @@ class Jelly:
                 pass
             self._task = None
 
-        if self._motors:
+        if self._writer is not None:
             try:
-                # Leave impedance park (if held) and command a stop before
-                # disabling, mirroring the manual-drive teardown.
-                if self.parked:
-                    await self._unpark()
-                await asyncio.gather(*[m.set_velocity(0.0) for m in self._motors])
-            except Exception:  # noqa: BLE001 - best-effort stop before disable
+                self._send_rust(b"Q")
+                await self._writer.drain()
+            except (ConnectionError, RuntimeError):
                 pass
+            self._writer.close()
             try:
-                await asyncio.gather(*[m.disable() for m in self._motors])
-            except Exception:  # noqa: BLE001 - keep teardown going
-                _logger.exception("Jelly wheel disable failed")
-            self._motors = []
-
-        if self._bus is not None:
-            await self._bus.close()
-            self._bus = None
+                await self._writer.wait_closed()
+            except ConnectionError:
+                pass
+            self._writer = None
+        if self._reader_task is not None:
+            try:
+                await asyncio.wait_for(self._reader_task, 2.0)
+            except TimeoutError:
+                self._reader_task.cancel()
+                try:
+                    await self._reader_task
+                except asyncio.CancelledError:
+                    pass
+            self._reader_task = None
+        self._reader = None
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                try:
+                    await asyncio.to_thread(self._proc.wait, 3.0)
+                except subprocess.TimeoutExpired:
+                    self._proc.terminate()
+                    try:
+                        await asyncio.to_thread(self._proc.wait, 2.0)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                        await asyncio.to_thread(self._proc.wait)
+            self._proc = None
+        try:
+            os.unlink(self._socket_path)
+        except OSError:
+            pass
 
         if self._lift is not None:
             await self._lift.close()
@@ -529,19 +545,6 @@ class Jelly:
             return max(-1.0, min(1.0, float(v)))
 
         vx, vy, wz = clamp(vx), clamp(vy), clamp(wz)
-
-        # Snap near-cardinal translation onto the axis (see
-        # JellyConfig.axis_snap_deg): thumbstick flicks are rarely perfectly
-        # straight, and without this the transient off-axis component steers
-        # the launch direction.
-        snap = math.radians(self._config.axis_snap_deg)
-        if snap > 0.0 and (vx != 0.0 or vy != 0.0):
-            heading = math.atan2(vy, vx)
-            nearest = round(heading / (math.pi / 2)) * (math.pi / 2)
-            if abs(heading - nearest) <= snap:
-                mag = math.hypot(vx, vy)
-                vx = mag * math.cos(nearest)
-                vy = mag * math.sin(nearest)
 
         self._target = (vx, vy, wz, int(lift))
         self._target_time = time.monotonic()
@@ -594,207 +597,102 @@ class Jelly:
         self._yaw_samples += 1
 
     # ------------------------------------------------------------------
-    # Command task
+    # Rust bridge (IPC only; control timing and CAN stay in Rust)
     # ------------------------------------------------------------------
 
-    async def _park(self) -> list[float] | None:
-        """Switch the wheels to the MIT position hold at their current positions.
+    def _send_rust(self, payload: bytes) -> None:
+        if self._writer is None or self._writer.is_closing():
+            raise RuntimeError("Jelly Rust core is not connected")
+        self._writer.write(struct.pack("<I", len(payload)) + payload)
 
-        Returns the per-wheel anchor positions, or None if parking is not
-        currently safe:
+    async def _rust_reader_loop(self) -> None:
+        assert self._reader is not None
+        yaw_log = _YawLog() if self._config.yaw_log else None
+        try:
+            while True:
+                (size,) = struct.unpack("<I", await self._reader.readexactly(4))
+                payload = await self._reader.readexactly(size)
+                if payload == b"R":
+                    self._ready.set()
+                    continue
+                if payload[:1] == b"E":
+                    self.send_failed = True
+                    _logger.error(
+                        "Jelly Rust core: %s",
+                        payload[1:].decode(errors="replace"),
+                    )
+                    self._ready.set()
+                    continue
+                if payload[:1] != b"U" or len(payload) != 82:
+                    _logger.warning("Jelly Rust core sent an invalid status packet")
+                    continue
+                *values, flags = struct.unpack("<10dB", payload[1:])
+                self.body_cmd = tuple(values[:3])
+                self.wheel_speeds = list(values[3:7])
+                self.yaw_correction = values[7]
+                self.parked = bool(flags & 1)
+                self.park_failed = bool(flags & 2)
+                self.send_failed = bool(flags & 4)
+                if yaw_log is not None:
+                    sample = self._yaw_rate
+                    rate = sample[0] if sample is not None else None
+                    age = time.monotonic() - sample[1] if sample is not None else None
+                    translating = math.hypot(*self.body_cmd[:2]) > 0.1
+                    held = (
+                        translating
+                        and abs(self.body_cmd[2]) <= 0.05
+                        and age is not None
+                        and age <= 0.3
+                    )
+                    yaw_log.update(
+                        now=time.monotonic(),
+                        translating=translating,
+                        held=held,
+                        rate=rate,
+                        bias=values[9],
+                        err=values[8],
+                        corr=values[7],
+                        saturated=abs(values[7]) >= self._config.yaw_hold_max,
+                        age=age,
+                        samples=self._yaw_samples,
+                    )
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            if not self._ready.is_set():
+                self.send_failed = True
+            self._ready.set()
+        except asyncio.CancelledError:
+            raise
 
-        - a wheel is still measurably moving (coasting past the ramped-down
-          command, e.g. on a slope) — retried next cycle once it settles, or
-        - a wheel reports a position too close to the widened ±PMAX mapping
-          limit, where a wrapped/clamped anchor would mean a phantom position
-          error at full torque (sets :attr:`park_failed`; not retried).
-        """
-        velocities = await asyncio.gather(*[m.get_velocity() for m in self._motors])
-        if any(abs(v) > _PARK_MAX_WHEEL_SPEED for v in velocities):
-            return None
-        positions = await asyncio.gather(*[m.get_position() for m in self._motors])
-        if any(abs(p) > 0.9 * _SESSION_PMAX for p in positions):
-            self.park_failed = True
-            _logger.warning(
-                "Jelly wheel position near the ±PMAX mapping limit — parking "
-                "disabled. Power-cycle the base to reset wheel positions."
-            )
-            return None
-        await asyncio.gather(
-            *[m.set_control_mode(ControlMode.IMPEDANCE) for m in self._motors]
-        )
-        return list(positions)
-
-    async def _unpark(self) -> None:
-        """Return parked wheels to VELOCITY mode (clears the motors' command state)."""
-        await asyncio.gather(
-            *[m.set_control_mode(ControlMode.VELOCITY) for m in self._motors]
-        )
-
-    async def _command_loop(self) -> None:
-        """Apply slew limiting, mixing, park/unpark, and lift edges at the
-        configured rate.
-
-        While driving the wheels track the slew-limited command in VELOCITY
-        mode. Once the command has ramped to zero (and the wheels are measured
-        slow) they are parked: held at their current positions by the motor's
-        internal MIT position loop with ``hold_kp``/``hold_kd``. The hold
-        command is re-sent every cycle to keep the lost-comm watchdog fed.
-        Holding in the motor's own loop (rather than an outer software loop
-        over CAN) is what makes the wheel rigid instead of giving first and
-        correcting after.
-        """
-        cfg = self._config
-        interval = 1.0 / cfg.frequency
-        max_delta = cfg.slew * interval
-        cmd = [0.0, 0.0, 0.0]  # slewed (vx, vy, wz), normalized [-1, 1]
-        hold_pos: list[float] | None = None  # per-wheel park anchors (rad)
-        yaw_err = 0.0  # integrated heading error (rad) since the stroke start
-        yaw_bias = 0.0  # gyro bias estimate (rad/s), learned while stopped
-        yaw_log = _YawLog() if cfg.yaw_log else None
+    async def _bridge_loop(self) -> None:
+        interval = 1.0 / self._config.frequency
         warned_silent = False
-        t_loop0 = time.monotonic()
-
+        started = time.monotonic()
         while True:
-            t_iter = time.perf_counter()
-
-            vx, vy, wz, lift_dir = self._target
-            # A dead command source (teleop thread gone, headset stream
-            # dropped) must not leave the base driving: decay to a stop.
-            if time.monotonic() - self._target_time > cfg.command_timeout:
-                vx, vy, wz, lift_dir = 0.0, 0.0, 0.0, STOP
-
-            # Slew the (vx, vy, wz) command as a single vector: cap the step's
-            # magnitude but keep its direction. Ramping each axis at its own
-            # fixed rate distorts direction — a mostly-forward command with a
-            # small lateral part would finish the lateral ramp almost
-            # instantly while forward is still climbing, veering the base
-            # sideways before it straightens out.
-            deltas = [t - c for t, c in zip((vx, vy, wz), cmd)]
-            norm = math.sqrt(sum(d * d for d in deltas))
-            if norm > max_delta:
-                k = max_delta / norm
-                deltas = [d * k for d in deltas]
-            for i, d in enumerate(deltas):
-                cmd[i] += d
-
-            moving = any(abs(c) >= 1e-3 for c in cmd)
-            driving = moving or any(abs(t) >= 1e-3 for t in (vx, vy, wz))
-
-            # Heading hold on an external yaw reference. NB: deliberately
-            # *not* torque feedback — a simulation study of this exact plant
-            # showed the drift mechanisms (lateral slide on an unloaded
-            # diagonal, radius-mismatch path curvature) are unobservable from
-            # wheel torque, while a gyro heading hold fixes everything
-            # fixable (see the removed diagnostics/base/floor_sim.py in git
-            # history). While translating with
-            # no commanded rotation, integrate the fed yaw rate into the
-            # heading error since the stroke began and steer it out;
-            # re-reference on stops and commanded turns (the operator is
-            # choosing a new heading). The gyro bias is learned while the
-            # Jelly is stopped so it doesn't masquerade as rotation.
-            yaw_corr = 0.0
-            translating = math.hypot(cmd[0], cmd[1]) > 0.1
-            turning = abs(cmd[2]) > 0.05
-            sample = self._yaw_rate
-            rate: float | None = None
-            age: float | None = None
-            held = saturated = False
-            if cfg.yaw_hold_gain != 0.0 and sample is not None:
-                rate, ts = sample
-                age = time.monotonic() - ts
-                if age > 0.3:  # sensor died: drop the hold
-                    yaw_err = 0.0
-                elif translating and not turning:
-                    yaw_err += (rate - yaw_bias) * interval
-                    raw_corr = -cfg.yaw_hold_gain * yaw_err
-                    yaw_corr = max(-cfg.yaw_hold_max, min(cfg.yaw_hold_max, raw_corr))
-                    saturated = yaw_corr != raw_corr
-                    held = True
-                else:
-                    yaw_err = 0.0
-                    if not driving:
-                        yaw_bias += 0.02 * (rate - yaw_bias)
-            self.yaw_correction = yaw_corr
-
             now = time.monotonic()
-            if yaw_log is not None:
-                yaw_log.update(
-                    now=now,
-                    translating=translating,
-                    held=held,
-                    rate=rate,
-                    bias=yaw_bias,
-                    err=yaw_err,
-                    corr=yaw_corr,
-                    saturated=saturated,
-                    age=age,
-                    samples=self._yaw_samples,
-                )
-
-            # An IMU that was asked for but never delivers is the quiet
-            # failure: an unprovisioned sampler or a stalled driver leaves the
-            # hold looking configured and doing nothing. Say it once, the
-            # first time it matters.
-            if (
-                not warned_silent
-                and cfg.imu
-                and cfg.yaw_hold_gain != 0.0
-                and driving
-                and self._yaw_rate is None
-                and now - t_loop0 > _YAW_SILENT_WARN_S
-            ):
-                warned_silent = True
-                _logger.warning(
-                    "Jelly heading hold: no yaw samples after %.0fs of driving — "
-                    "the hold is inert. Check that the board gyro opened "
-                    "(almond_axol.robot.gyro) earlier in this log.",
-                    _YAW_SILENT_WARN_S,
-                )
-
-            speeds = mix(
-                cmd[0], cmd[1], cmd[2] + yaw_corr, cfg.max_speed, cfg.turn_scale
-            )
-
+            vx, vy, wz, lift_dir = self._target
+            age = max(0.0, now - self._target_time)
+            if self._writer is not None:
+                self._send_rust(b"T" + struct.pack("<4d", vx, vy, wz, age))
+                if self._yaw_rate is not None:
+                    rate, ts = self._yaw_rate
+                    self._send_rust(b"Y" + struct.pack("<2d", rate, max(0.0, now - ts)))
+                await self._writer.drain()
+            if age > self._config.command_timeout:
+                lift_dir = STOP
             if self._lift is not None:
                 self._lift.command(lift_dir)
             self.lift_dir = lift_dir if self._lift is not None else STOP
-
-            if self._motors:
-                try:
-                    if driving:
-                        self.park_failed = False
-                        if hold_pos is not None:
-                            await self._unpark()
-                            hold_pos = None
-
-                    if not driving and cfg.hold_kp > 0.0 and not self.park_failed:
-                        if hold_pos is None:
-                            hold_pos = await self._park()
-                        if hold_pos is not None:
-                            await asyncio.gather(
-                                *[
-                                    m.set_impedance(
-                                        p, 0.0, cfg.hold_kp, cfg.hold_kd, 0.0
-                                    )
-                                    for m, p in zip(self._motors, hold_pos)
-                                ]
-                            )
-                    if hold_pos is None:
-                        await asyncio.gather(
-                            *[m.set_velocity(s) for m, s in zip(self._motors, speeds)]
-                        )
-                    self.send_failed = False
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001 - transient bus errors: retry
-                    # Transient send failures (buffer full, bus-off recovery)
-                    # are surfaced via send_failed; the next cycle retries.
-                    self.send_failed = True
-
-            self.body_cmd = (cmd[0], cmd[1], cmd[2])
-            self.wheel_speeds = speeds
-            self.parked = hold_pos is not None
-
-            elapsed = time.perf_counter() - t_iter
-            await asyncio.sleep(max(0.0, interval - elapsed))
+            if (
+                not warned_silent
+                and self._config.imu
+                and self._config.yaw_hold_gain != 0.0
+                and any(abs(v) >= 1e-3 for v in (vx, vy, wz))
+                and self._yaw_rate is None
+                and now - started > _YAW_SILENT_WARN_S
+            ):
+                warned_silent = True
+                _logger.warning(
+                    "Jelly heading hold has no yaw samples after %.0fs",
+                    _YAW_SILENT_WARN_S,
+                )
+            await asyncio.sleep(interval)

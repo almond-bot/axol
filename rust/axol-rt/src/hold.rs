@@ -110,13 +110,7 @@ pub fn parse_params(path: &str) -> io::Result<Vec<JointParams>> {
     Ok(out)
 }
 
-pub fn run(
-    params_path: &str,
-    secs: f64,
-    hz: f64,
-    abort_deg: f64,
-    yes: bool,
-) -> io::Result<()> {
+pub fn run(params_path: &str, secs: f64, hz: f64, abort_deg: f64, yes: bool) -> io::Result<()> {
     let params = parse_params(params_path)?;
     let mut ifaces: Vec<String> = Vec::new();
     for p in &params {
@@ -130,15 +124,22 @@ pub fn run(
         "hold: {} joints on {} bus(es), {hz} Hz for {secs}s, abort at {abort_deg}° deviation{}",
         params.len(),
         ifaces.len(),
-        if yes { "" } else { "  [DRY RUN — pass --yes to actuate]" },
+        if yes {
+            ""
+        } else {
+            "  [DRY RUN — pass --yes to actuate]"
+        },
     );
 
     let stop = Arc::new(AtomicBool::new(false));
     let handles: Vec<_> = ifaces
         .iter()
         .map(|iface| {
-            let joints: Vec<JointParams> =
-                params.iter().filter(|p| &p.iface == iface).cloned().collect();
+            let joints: Vec<JointParams> = params
+                .iter()
+                .filter(|p| &p.iface == iface)
+                .cloned()
+                .collect();
             let iface = iface.clone();
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || -> io::Result<()> {
@@ -261,9 +262,7 @@ fn stream(
                 &m.ready.ranges,
             );
             match m.ready.vendor {
-                Vendor::MyActuator => {
-                    sock.send(proto::MA_MC_REQ + m.ready.id as u16, &frame)?
-                }
+                Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.ready.id as u16, &frame)?,
                 Vendor::Damiao => sock.send(m.ready.id as u16, &frame)?,
             }
         }

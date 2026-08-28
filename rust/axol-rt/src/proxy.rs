@@ -6,15 +6,18 @@
 //! centralized in this process.
 
 use crate::can::CanSock;
+use crate::experiment::{FeedbackStore, RawSample};
 use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
+use crate::timing::TimingAggregator;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_MESSAGE: usize = 1024;
+const MAX_MESSAGE: usize = 32 * 1024 * 1024;
 
 fn read_message(stream: &mut UnixStream) -> io::Result<Option<Vec<u8>>> {
     let mut header = [0u8; 4];
@@ -53,7 +56,13 @@ fn receive_loop(
     output: Arc<Mutex<UnixStream>>,
     muted: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    timing: Arc<Mutex<TimingAggregator>>,
+    feedback: FeedbackStore,
+    observer_mode: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    let mut feedback_generation = 0u64;
+    let mut last_forward: HashMap<u32, Instant> = HashMap::new();
+    let mut next_timing = Instant::now();
     while !stop.load(Ordering::Acquire) {
         let frame = match socket.recv() {
             Ok(Some(frame)) => frame,
@@ -65,9 +74,55 @@ fn receive_loop(
                 return Err(io::Error::new(err.kind(), message));
             }
         };
+        let received = Instant::now();
+        feedback_generation = feedback_generation.wrapping_add(1);
+        {
+            let mut samples = feedback.0.lock().unwrap();
+            samples.insert(
+                frame.id,
+                RawSample {
+                    data: frame.data,
+                    at: received,
+                    generation: feedback_generation,
+                },
+            );
+            feedback.1.notify_all();
+        }
+        let timing_payload = {
+            let mut timing = timing.lock().unwrap();
+            timing.observe(frame.id, &frame.data, received);
+            if received >= next_timing {
+                next_timing = received + Duration::from_millis(100);
+                timing.snapshot_json(received).map(|json| {
+                    let mut payload = Vec::with_capacity(1 + json.len());
+                    payload.push(b'T');
+                    payload.extend_from_slice(json.as_bytes());
+                    payload
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(payload) = timing_payload {
+            if write_message(&output, &payload).is_err() {
+                break;
+            }
+        }
         if muted.load(Ordering::Relaxed) {
             continue;
         }
+        let register_reply = (0x11..=0x18).contains(&frame.id)
+            && frame.data[1] <= 0x0f
+            && matches!(frame.data[2], 0x33 | 0x55 | 0xaa | 0xcc);
+        if observer_mode.load(Ordering::Relaxed)
+            && !register_reply
+            && last_forward
+                .get(&frame.id)
+                .is_some_and(|at| received.duration_since(*at) < Duration::from_millis(33))
+        {
+            continue;
+        }
+        last_forward.insert(frame.id, received);
         let timestamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -98,13 +153,19 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
     let output = Arc::new(Mutex::new(stream.try_clone()?));
     let muted = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
+    let timing = Arc::new(Mutex::new(TimingAggregator::new()));
+    let feedback: FeedbackStore = Arc::new((Mutex::new(HashMap::new()), Condvar::new()));
+    let observer_mode = Arc::new(AtomicBool::new(false));
     write_message(&output, b"R")?;
     let receiver = std::thread::spawn({
         let socket = Arc::clone(&socket);
         let output = Arc::clone(&output);
         let muted = Arc::clone(&muted);
         let stop = Arc::clone(&stop);
-        move || receive_loop(socket, output, muted, stop)
+        let timing = Arc::clone(&timing);
+        let feedback = Arc::clone(&feedback);
+        let observer_mode = Arc::clone(&observer_mode);
+        move || receive_loop(socket, output, muted, stop, timing, feedback, observer_mode)
     });
 
     let result = (|| -> io::Result<()> {
@@ -155,6 +216,30 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
                 }
                 b'M' if payload.len() == 2 => {
                     muted.store(payload[1] != 0, Ordering::Release);
+                }
+                b'Z' if payload.len() == 1 => timing.lock().unwrap().reset(),
+                b'O' if payload.len() == 2 => {
+                    observer_mode.store(payload[1] != 0, Ordering::Release)
+                }
+                b'X' => {
+                    muted.store(false, Ordering::Release);
+                    match crate::experiment::run(
+                        &payload[1..],
+                        &socket,
+                        &feedback,
+                        &mut enobufs_since,
+                        &stream,
+                    ) {
+                        Ok(response) => write_message(&output, &response)?,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                            write_message(&output, b"K")?;
+                        }
+                        Err(err) => {
+                            let message = format!("tuning experiment failed: {err}");
+                            write_error(&output, &message);
+                            return Err(io::Error::new(err.kind(), message));
+                        }
+                    }
                 }
                 b'Q' if payload.len() == 1 => break,
                 tag => {

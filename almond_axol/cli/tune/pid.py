@@ -820,68 +820,55 @@ async def _run(args: argparse.Namespace) -> None:
                 for k in range(ramp_n):
                     await _hand_cycle(hold, (k + 1) / ramp_n)
 
-                stop = asyncio.Event()
-
-                async def _hold_loop() -> None:
-                    while not stop.is_set():
-                        await _hand_cycle(
-                            hold, 1.0, skip=frozenset({joint}), log_holders=True
-                        )
-
-                hold_task = asyncio.create_task(_hold_loop())
                 pose_results: list[dict] = []
-                try:
-                    for i, (kp, kd) in enumerate(candidates):
-                        if len(candidates) > 1:
-                            print(
-                                f"\n[{i + 1}/{len(candidates)}] pose {pose_n}: "
-                                f"testing Kp={kp}  Kd={kd}"
+                for i, (kp, kd) in enumerate(candidates):
+                    if len(candidates) > 1:
+                        print(
+                            f"\n[{i + 1}/{len(candidates)}] pose {pose_n}: "
+                            f"testing Kp={kp}  Kd={kd}"
+                        )
+                    else:
+                        print(f"\n  pose {pose_n}: testing Kp={kp}  Kd={kd}")
+                    ff = FeedForward(
+                        gravity_fn,
+                        *fric,
+                        j_eff=j_eff,
+                        differentiate_target=False,
+                        host_kd=host_kd,
+                        host_kd_hz=host_kd_hz,
+                        host_kd_q=host_kd_q,
+                    )
+                    log, amp = await run_step(
+                        motors,
+                        joint,
+                        kp,
+                        kd,
+                        amp_rad,
+                        args.hold,
+                        args.rate,
+                        is_left,
+                        ff,
+                        relative=True,
+                    )
+                    metrics = step_metrics(log, amp, args.hold)
+                    _print_stats_step(metrics, len(log), kp, kd)
+                    pose_results.append({"kp": kp, "kd": kd, "metrics": metrics})
+                    _persist_run(kp, kd, log, metrics, f"step@pose{pose_n}")
+                    if csv_writer is not None:
+                        for r in log:
+                            csv_writer.writerow(
+                                [
+                                    kp,
+                                    kd,
+                                    f"step@pose{pose_n}",
+                                    f"{r['t']:.5f}",
+                                    f"{r['target']:.6f}",
+                                    f"{r['actual']:.6f}",
+                                    f"{r['error']:.6f}",
+                                    f"{r['torque']:.4f}",
+                                ]
                             )
-                        else:
-                            print(f"\n  pose {pose_n}: testing Kp={kp}  Kd={kd}")
-                        ff = FeedForward(
-                            gravity_fn,
-                            *fric,
-                            j_eff=j_eff,
-                            differentiate_target=False,
-                            host_kd=host_kd,
-                            host_kd_hz=host_kd_hz,
-                            host_kd_q=host_kd_q,
-                        )
-                        log, amp = await run_step(
-                            motors,
-                            joint,
-                            kp,
-                            kd,
-                            amp_rad,
-                            args.hold,
-                            args.rate,
-                            is_left,
-                            ff,
-                            relative=True,
-                        )
-                        metrics = step_metrics(log, amp, args.hold)
-                        _print_stats_step(metrics, len(log), kp, kd)
-                        pose_results.append({"kp": kp, "kd": kd, "metrics": metrics})
-                        _persist_run(kp, kd, log, metrics, f"step@pose{pose_n}")
-                        if csv_writer is not None:
-                            for r in log:
-                                csv_writer.writerow(
-                                    [
-                                        kp,
-                                        kd,
-                                        f"step@pose{pose_n}",
-                                        f"{r['t']:.5f}",
-                                        f"{r['target']:.6f}",
-                                        f"{r['actual']:.6f}",
-                                        f"{r['error']:.6f}",
-                                        f"{r['torque']:.4f}",
-                                    ]
-                                )
-                            csv_file.flush()
-                finally:
-                    stop.set()
-                    await hold_task
+                        csv_file.flush()
                 _print_holder_report()
                 if len(pose_results) > 1:
                     _print_ranking("step", pose_results)
