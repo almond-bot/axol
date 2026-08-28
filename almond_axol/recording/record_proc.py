@@ -766,19 +766,21 @@ class _SnapshotPublisher:
         import collections
 
         self._lock = threading.Lock()
-        self._ring: collections.deque[tuple[dict, dict, float]] = collections.deque(
-            maxlen=maxlen
+        self._ring: collections.deque[tuple[dict, dict, float, bool]] = (
+            collections.deque(maxlen=maxlen)
         )
 
-    def write(self, joint_obs: dict, action: dict, ts: float) -> None:
+    def write(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
         with self._lock:
-            self._ring.append((joint_obs, action, ts))
+            self._ring.append((joint_obs, action, ts, intervention))
 
-    def read_latest(self) -> tuple[dict, dict, float] | None:
+    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         with self._lock:
             return self._ring[-1] if self._ring else None
 
-    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float] | None:
+    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float, bool] | None:
         """Snapshot whose timestamp is nearest ``target_ts`` (see SnapshotReader)."""
         with self._lock:
             if not self._ring:
@@ -820,9 +822,9 @@ def _obs_for_rerun(obs: dict[str, Any], cam_keys: Any) -> dict[str, Any]:
 def run_capture_loop(
     *,
     cameras: dict[str, Any],
-    read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot: Callable[[], tuple[dict, dict, float, bool] | None],
     read_snapshot_nearest: (
-        Callable[[float], tuple[dict, dict, float] | None] | None
+        Callable[[float], tuple[dict, dict, float, bool] | None] | None
     ) = None,
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
@@ -859,11 +861,19 @@ def run_capture_loop(
     ``frame_counter`` (optional) is a mutable ``{"n": int}`` incremented after
     every appended row, so the owner can convert instants into dataset time
     (``n / fps``) — e.g. to annotate intervention spans.
+
+    When the dataset declares an ``intervention`` feature (LeRobot's native
+    DAgger annotation: a per-frame bool, see ``lerobot.rollout``'s DAgger
+    strategy), each row is tagged from the snapshot's intervention flag — the
+    publisher (the control loop) marks the ticks where a human was driving.
     """
     try:
+        import numpy as np
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
+
+        tag_intervention = "intervention" in dataset.features
 
         # Wait for the first snapshot *published after this episode started*.
         # The snapshot slot is a single latest-wins register that persists
@@ -990,7 +1000,7 @@ def run_capture_loop(
             if snap is None:
                 tick += 1
                 continue
-            joint_obs, action, snap_ts = snap
+            joint_obs, action, snap_ts, intervention = snap
 
             obs: dict[str, Any] = dict(joint_obs)
             for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
@@ -1009,7 +1019,10 @@ def run_capture_loop(
             act_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
             if stop_event.is_set():
                 return
-            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            row = {**obs_frame, **act_frame, "task": task}
+            if tag_intervention:
+                row["intervention"] = np.array([intervention], dtype=bool)
+            dataset.add_frame(row)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             frames_added += 1
@@ -1032,9 +1045,9 @@ def run_capture_loop(
 def run_encoded_capture_loop(
     *,
     cameras: dict[str, Any],
-    read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot: Callable[[], tuple[dict, dict, float, bool] | None],
     read_snapshot_nearest: (
-        Callable[[float], tuple[dict, dict, float] | None] | None
+        Callable[[float], tuple[dict, dict, float, bool] | None] | None
     ) = None,
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
@@ -1069,9 +1082,12 @@ def run_encoded_capture_loop(
     episode's mp4 is decodable from frame 0.
     """
     try:
+        import numpy as np
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
+
+        tag_intervention = "intervention" in dataset.features
 
         # Wait for the first snapshot *published after this episode started* —
         # the slot persists across episodes, so a stale previous-episode
@@ -1191,7 +1207,7 @@ def run_encoded_capture_loop(
                 # dropped picture) while later rows kept advancing.
                 snap = last_snap
             last_snap = snap
-            joint_obs, action, snap_ts = snap
+            joint_obs, action, snap_ts, intervention = snap
 
             # Process joint obs alone, then inject the AU bytes as the video
             # values: build_dataset_frame copies video values verbatim, so each
@@ -1212,7 +1228,10 @@ def run_encoded_capture_loop(
             act_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
             if stop_event.is_set():
                 return
-            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            row = {**obs_frame, **act_frame, "task": task}
+            if tag_intervention:
+                row["intervention"] = np.array([intervention], dtype=bool)
+            dataset.add_frame(row)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             rows_added += 1
@@ -1264,7 +1283,7 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
             encoder_threads=_ENCODER_THREADS,
             rgb_encoder=rgb_encoder,
         )
-    return LeRobotDataset.create(
+    dataset = LeRobotDataset.create(
         repo_id=config["repo_id"],
         fps=config["fps"],
         root=config["root"],
@@ -1276,6 +1295,15 @@ def _open_dataset(config: dict) -> "LeRobotDataset":
         encoder_threads=_ENCODER_THREADS,
         rgb_encoder=rgb_encoder,
     )
+    # LeRobot's codebase_version describes the dataset format, not the Axol
+    # URDF/world frame.  Record our pose-frame provenance on fresh Cartesian
+    # datasets so future migrations can distinguish them without guessing.
+    action_names = (config["features"].get("action") or {}).get("names") or []
+    if any("_ee." in name for name in action_names):
+        from .cartesian_frame import write_cartesian_frame_marker
+
+        write_cartesian_frame_marker(config["dataset_root"])
+    return dataset
 
 
 def _maybe_smooth_episode(dataset: "LeRobotDataset", config: dict) -> None:
@@ -1596,8 +1624,10 @@ class InProcessRecorder:
         self._capture_error: dict[str, str | None] = {"v": None}
         self._episodes_recorded = 0
 
-    def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
-        self._publisher.write(joint_obs, action, ts)
+    def publish(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
+        self._publisher.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
         return self._dataset.num_episodes
@@ -2039,8 +2069,10 @@ class DatasetRecorderProcess:
     def pid(self) -> int | None:
         return self._proc.pid
 
-    def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
-        self._snap.write(joint_obs, action, ts)
+    def publish(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
+        self._snap.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
         return self._episode_count

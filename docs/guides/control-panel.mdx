@@ -99,14 +99,14 @@ The Cameras tab **detects the cameras** plugged into the host and shows one card
 
 The Cameras tab is the single source of truth for all camera settings — these fields appear nowhere else. It controls two independent branches:
 
-- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop and collect-data). Run policy relays no video, so it ignores this branch entirely.
-- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream). Because **run policy** streams no headset video, it also captures its policy observations at this resolution — the size the dataset was recorded at and the policy was trained on, rather than grabbing a larger headset frame it would only throw away.
+- **Stream** — what is relayed to the VR headset over WebRTC (used by teleop and collect-data). Run policy relays no video, so it ignores this branch entirely; collect DAgger does relay a headset view for the operator, but at the **Record** resolution below, so it too ignores this branch.
+- **Record** — what is written to the dataset during data collection (downscaled on the GPU's VIC, independently of the stream). Because **run policy** and **collect DAgger** feed the policy from what's recorded rather than from a headset stream, they capture their policy observations at this resolution — the size the dataset was recorded at and the policy was trained on — rather than grabbing a larger headset frame they'd only throw away.
 
 Each branch has its own **resolution** dropdown (`SVGA` / `HD1080` / `HD1200`, or **Off** to disable that branch globally) — so the headset can see a high-resolution feed while the dataset stores a lighter `SVGA` one, or vice versa. Each assigned camera then has independent **Stream** and **Record** controls: a single on/off for a mono camera, or per-eye **L** / **R** checkboxes for a stereo one (none checked = off for that branch). So you can stream a camera without recording it (or the reverse), choose which mono cameras feed the headset vs. the dataset, stream both eyes of a stereo camera for depth while recording only one, or turn either branch off entirely.
 
 A stereo **overhead** captures both eyes from one grab; with both eyes selected it's rendered per-lens in the headset (streamed as one side-by-side feed) and recorded as the two observation keys `overhead_left` / `overhead_right`. A single eye — or a stereo **wrist** — is exposed under the plain slot name, so it costs and reads exactly like a mono camera.
 
-The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data and run policy need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting **collect data** or **run policy** also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
+The assignments and stream/record selection persist **on the host** with the rest of the [shared settings](#settings), so every operation and every operator device sees the same camera setup. Teleop streams whichever cameras have streaming enabled; **collect data, run policy, and collect DAgger need at least one camera with recording enabled** (they error early otherwise, since a policy needs the cameras it was trained on). Starting any of those three also re-verifies that every assigned camera is physically present and **blocks the start with an alert** naming the missing serial if one isn't — reconnect it, then **Refresh** (or **Restart daemon**) in the Cameras tab. Teleop streams whatever is configured and is never blocked by this check.
 
 ### Quest USB
 
@@ -126,6 +126,7 @@ Pick an operation from the selector. Each panel asks only for its **per-run inpu
 | **Collect data** | Axol + Cameras | Record VR teleop episodes to a LeRobot dataset with the cameras. The **repo id** field is a picker offering the datasets already on the host (with episode counts) so you can resume one, or type a new id. The feeds are mirrored in the panel's [operator view](#operator-view) and the [episode controls](#episode-controls) can start and end takes, so a session can be driven with the headset off. |
 | **Replay dataset** | Axol | Replay a recorded [`collect-data`](/cli/replay-dataset) episode on the arms, then return to rest. No cameras needed. The **repo id** field is a picker offering the datasets on the host (with episode counts), and also accepts a bare id or a filesystem path. Toggle **loop** to replay continuously until **Stop**, and **interpolate** to smooth playback by upsampling the recorded actions to ~120 Hz commands. |
 | **Run policy** | Axol + Cameras | Run a trained policy via LeRobot async inference — locally or on a remote [inference server](/cli/inference-server). |
+| **Collect DAgger** | Axol + Cameras | Run a trained policy while you correct it from VR: the grip buttons freeze the policy and hand control to you, and the policy segments plus your corrections are recorded to a LeRobot dataset (with a per-frame intervention tag). The **repo id** field resumes an existing DAgger dataset or takes a new id. See [DAgger Collection](/operations/dagger). |
 
 ### Before you can start
 
@@ -139,15 +140,15 @@ Starting an operation streams its logs into the console at the bottom of the pag
 
 ## Operator view
 
-While **teleoperation** or **collect data** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
+While **teleoperation**, **collect data**, or **collect DAgger** streams camera video to the headset (camera slots assigned), the control panel mirrors those **live camera feeds**, so you can watch the robot's point of view on the dashboard and not only in VR. The panel joins the running operation's video stream as one more **view-only** client and shows the same tracks the headset receives — no extra work for the robot, and the [Cameras settings tab](#cameras) still decides what streams. A side-by-side stereo overhead is shown cropped to its left eye. (A **sim** or **Cart only** teleop run shows no mirrored feeds — neither relays headset video.)
 
 The **fullscreen** toggle on the camera-feeds header expands the feeds to a full-screen operator display that fits without scrolling; **Esc** or **Exit fullscreen** leaves. If the feeds never connect, the panel offers a one-tap button to **authorize** the stream server's self-signed certificate — the same one-time step the [VR app](/guides/vr-interface) uses.
 
 ## Episode controls
 
-While **Run policy** or **Collect data** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the episode number and saved count. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header.
+While **Run policy**, **Collect DAgger**, or **Collect data** is live, an **Episode control** box appears in the operation card, led by a colored **phase badge** (Ready, Recording, Saving, Resetting, …) with the episode number and saved count. The box is driven by the host, so it shows the same phase on **every** connected computer, not just the tab that started the run. To end the run entirely, use **Stop** in the card header.
 
-For **Run policy**:
+For **Run policy** and **Collect DAgger** (which share the same episode controls — collect DAgger adds the VR grip [intervention flow](/operations/dagger#intervening) on top):
 
 | Button | Effect |
 |---|---|

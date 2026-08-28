@@ -100,6 +100,7 @@ Each operation can be driven from the web control panel or the CLI:
 - [Data Collection](https://docs.almond.bot/operations/data-collection) — record teleop episodes to a LeRobot dataset
 - [Replay Dataset](https://docs.almond.bot/cli/replay-dataset) — replay a recorded dataset episode on the robot, once or on a loop
 - [Run Policy](https://docs.almond.bot/operations/run-policy) — run a trained policy, local or remote inference
+- [DAgger Collection](https://docs.almond.bot/operations/dagger) — run a policy while correcting it from VR, recording the corrections
 
 ### Remote Teleop
 
@@ -119,7 +120,7 @@ Each operation can be driven from the web control panel or the CLI:
 
 ### CLI Reference
 
-- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `replay-dataset`, `run-policy`, `inference-server`
+- [Command configuration](https://docs.almond.bot/cli/configuration) — draccus config model for `teleop`, `gravity-comp`, `waypoints`, `collect-data`, `collect-dagger`, `replay-dataset`, `run-policy`, `inference-server`
 - [`serve`](https://docs.almond.bot/cli/serve) — web control panel + API server
 - [`can.setup`](https://docs.almond.bot/cli/can-setup)
 - [`can.enable`](https://docs.almond.bot/cli/can-enable)
@@ -139,6 +140,8 @@ Each operation can be driven from the web control panel or the CLI:
 - [`motor.flash`](https://docs.almond.bot/cli/motor-flash)
 - [`teleop`](https://docs.almond.bot/cli/teleop)
 - [`collect-data`](https://docs.almond.bot/cli/collect-data)
+- [`collect-dagger`](https://docs.almond.bot/cli/collect-dagger)
+- [`migrate-dataset`](https://docs.almond.bot/cli/migrate-dataset)
 - [`replay-dataset`](https://docs.almond.bot/cli/replay-dataset)
 - [`run-policy`](https://docs.almond.bot/cli/run-policy)
 - [`inference-server`](https://docs.almond.bot/cli/inference-server)

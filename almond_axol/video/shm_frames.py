@@ -651,14 +651,12 @@ class SnapshotWriter:
     """Control-process side: publish joint/action snapshots into a shm ring.
 
     A lock-free seqlock ring over one shared-memory block: ``_SNAP_RING_SLOTS``
-    slots of float64s (``[ts, *joint_obs_vals, *action_vals]`` in fixed
-    ``obs_keys`` / ``action_keys`` order), each guarded by its own seq counter,
-    plus a global committed-write count. The control loop calls :meth:`write`
-    every tick; the cost is a handful of dict lookups + aligned float stores —
-    no pickle, no lock, no blocking, so it stays off the hot path. The recorder
-    subprocess reads via :class:`SnapshotReader`: either the newest snapshot
-    (``read_latest``) or the one whose timestamp is nearest a camera frame's
-    capture time (``read_nearest`` — Mantis pose↔image pairing). Single-writer /
+    slots of float64s
+    (``[ts, *joint_obs_vals, *action_vals, intervention]`` in fixed key order),
+    each guarded by its own seq counter, plus a global committed-write count.
+    The intervention value is 0.0/1.0 for DAgger collection. The control loop
+    calls :meth:`write` every tick; the recorder reads either the newest
+    snapshot or the one nearest a camera frame's capture time. Single-writer /
     single-reader.
     """
 
@@ -666,7 +664,7 @@ class SnapshotWriter:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
         n = len(self._obs_keys) + len(self._action_keys)
-        self._slot_len = 1 + n
+        self._slot_len = 2 + n
         header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
         self._shm = shared_memory.SharedMemory(
             create=True, size=header_bytes + 8 * _SNAP_RING_SLOTS * self._slot_len
@@ -688,7 +686,9 @@ class SnapshotWriter:
         self._meta["seq"][0] = 0  # committed-write count
         self._slot_seq[:] = 0
 
-    def write(self, joint_obs: dict, action: dict, ts: float) -> None:
+    def write(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
         """Pack one snapshot into the next ring slot (per-slot seqlock)."""
         c = int(self._meta["seq"][0])
         slot = c % _SNAP_RING_SLOTS
@@ -702,6 +702,7 @@ class SnapshotWriter:
         for k in self._action_keys:
             d[i] = action[k]
             i += 1
+        d[i] = 1.0 if intervention else 0.0
         self._slot_seq[slot] += 1  # even: committed
         self._meta["seq"][0] = c + 1
 
@@ -720,16 +721,15 @@ class SnapshotReader:
     """Recorder-subprocess side: read joint/action snapshots from the shm ring.
 
     Attaches to a :class:`SnapshotWriter`'s block by name and reconstructs the
-    ``(joint_obs, action, ts)`` dicts using the same key order. Returns ``None``
-    before the first write (mirroring the in-process ``_SnapshotPublisher``
-    contract), so the caller can skip a tick just as it did before.
+    ``(joint_obs, action, ts, intervention)`` using the same key order. Returns
+    ``None`` before the first write (mirroring the in-process publisher).
     """
 
     def __init__(self, name: str, obs_keys: list[str], action_keys: list[str]) -> None:
         self._obs_keys = list(obs_keys)
         self._action_keys = list(action_keys)
         n = len(self._obs_keys) + len(self._action_keys)
-        self._slot_len = 1 + n
+        self._slot_len = 2 + n
         header_bytes = _SNAP_HEADER_BYTES + 8 * _SNAP_RING_SLOTS
         self._shm = shared_memory.SharedMemory(name=name)
         self._meta = np.ndarray((1,), dtype=_SNAP_META_DTYPE, buffer=self._shm.buf)
@@ -759,22 +759,23 @@ class SnapshotReader:
                 return snap
         return None
 
-    def _to_dicts(self, snap: np.ndarray) -> tuple[dict, dict, float]:
+    def _to_dicts(self, snap: np.ndarray) -> tuple[dict, dict, float, bool]:
         ts = float(snap[0])
         vals = snap[1:]
         no = len(self._obs_keys)
         joint_obs = {k: float(vals[i]) for i, k in enumerate(self._obs_keys)}
         action = {k: float(vals[no + i]) for i, k in enumerate(self._action_keys)}
-        return joint_obs, action, ts
+        intervention = bool(snap[-1] >= 0.5)
+        return joint_obs, action, ts, intervention
 
-    def read_latest(self) -> tuple[dict, dict, float] | None:
+    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         count = int(self._meta["seq"][0])
         if count == 0:
             return None
         snap = self._read_slot((count - 1) % _SNAP_RING_SLOTS)
         return self._to_dicts(snap) if snap is not None else None
 
-    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float] | None:
+    def read_nearest(self, target_ts: float) -> tuple[dict, dict, float, bool] | None:
         """Return the buffered snapshot whose timestamp is nearest ``target_ts``.
 
         Pairs a camera frame's capture time with the pose/action snapshot

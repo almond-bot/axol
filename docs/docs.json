@@ -31,7 +31,8 @@
           "operations/data-collection",
           "operations/replay-dataset",
           "operations/train-policy",
-          "operations/run-policy"
+          "operations/run-policy",
+          "operations/dagger"
         ]
       },
       {
@@ -78,6 +79,8 @@
               "cli/teleop",
               "cli/tracker",
               "cli/collect-data",
+              "cli/collect-dagger",
+              "cli/migrate-dataset",
               "cli/replay-dataset",
               "cli/run-policy",
               "cli/inference-server",
