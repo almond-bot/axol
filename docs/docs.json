@@ -31,7 +31,8 @@
           "operations/data-collection",
           "operations/replay-dataset",
           "operations/train-policy",
-          "operations/run-policy"
+          "operations/run-policy",
+          "operations/dagger"
         ]
       },
       {
@@ -77,6 +78,7 @@
               "cli/motor-flash",
               "cli/teleop",
               "cli/collect-data",
+              "cli/collect-dagger",
               "cli/migrate-dataset",
               "cli/replay-dataset",
               "cli/run-policy",
