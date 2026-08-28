@@ -249,9 +249,12 @@ class ArmConfig:
     shoulder_3: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=180.0,
-            # Firmware damping is phase-safe. Motion replay previously
-            # validated kd=4, while kd=2 left an in-motion ring.
-            kd=4.0,
+            # Firmware damping is phase-safe. The synchronized Rust trace
+            # caught a load-dependent 3.5 Hz mode at 0.52° RMS versus only
+            # 0.13° commanded with kd=4, while the motor torque remained
+            # dissipative. Use the firmware maximum to add damping without
+            # reviving the delayed host-torque failure below.
+            kd=5.0,
             friction=_ZERO_FRICTION,
             mass=3.75,
             com=(0.0, 0.00286547, -0.164964),
@@ -294,7 +297,11 @@ class ArmConfig:
     wrist_2: JointConfig = field(
         default_factory=lambda: JointConfig(
             kp=130.0,
-            kd=3.0,
+            # The same trace measured 0.36° RMS at the coupled 3.5 Hz mode
+            # versus 0.08° commanded, with materially weaker motor damping
+            # than shoulder_3. kd=3.5 was previously replay-verified clean;
+            # stop there because kd=5 produced a unit-dependent 110 Hz buzz.
+            kd=3.5,
             friction=_ZERO_FRICTION,
             mass=0.65,
             com=(0.0, 0.0285, -0.0285),
