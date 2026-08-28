@@ -259,10 +259,16 @@ class ArmConfig:
             # CAUTION (jit18/19, 2026-08): on some builds this damper's
             # band leaks onto an ~11 Hz structural mast mode and pumps it
             # (ringing shoulder_2/wrist_2 on both arms); kd_host=0 killed
-            # that. If mast ringing appears, zero this per-robot via
-            # calibration override.
+            # that. rust_damping then caught the same coupling at 8-9 Hz:
+            # shoulder_3 measured 93 mdeg RMS against 31 mdeg commanded and
+            # wrist_2 followed at 107 mdeg despite its own kd_host being 0.
+            # The 4.77 Hz centre is hardware-measured, so use a narrow band
+            # here: Q=3 retains the intended-mode gain while cutting the
+            # 8.5 Hz gain from 76% to 27%. If mast ringing remains, zero
+            # shoulder_3 kd_host per robot instead of damping wrist_2.
             kd_host=6.0,
             kd_host_hz=4.77,  # 30 rad/s, centred on the measured band
+            kd_host_q=3.0,
         )
     )
     elbow: JointConfig = field(
