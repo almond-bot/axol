@@ -324,7 +324,7 @@ COMMANDS: dict[str, CommandDef] = {
         # like cart_only it never touches the arms or their motor faults.
         robot_free_flags=("cart_only", "mantis"),
         uses_headset=True,
-        per_run_fields=("sim", "mantis", "mantis_source", "cart_only"),
+        per_run_fields=("sim", "mantis", "cart_only"),
     ),
     "gravity-comp": CommandDef(
         "gravity-comp",
@@ -382,7 +382,7 @@ COMMANDS: dict[str, CommandDef] = {
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
-        per_run_fields=("mantis", "mantis_source", "repo_id", "task"),
+        per_run_fields=("mantis", "repo_id", "task"),
     ),
     "collect-dagger": CommandDef(
         "collect-dagger",

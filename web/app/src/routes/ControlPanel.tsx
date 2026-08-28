@@ -789,6 +789,7 @@ export default function ControlPanel() {
   }
 
   const viewerHost = serverHost || hostInfo?.lanIp || ""
+  const mantisSource = String(settingsSnap?.values["teleop.mantis_source"] ?? "lighthouse")
 
   // UI/backend skew warning (stale local bundle, or hosted UI on a different
   // release than the robot). Suppressed while the update banner covers the
@@ -871,6 +872,7 @@ export default function ControlPanel() {
           meta={meta}
           spec={spec}
           settings={settings}
+          mantisSource={mantisSource}
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}

@@ -44,6 +44,7 @@ export function OperationPanel({
   meta,
   spec,
   settings,
+  mantisSource,
   onChange,
   onReset,
   onResetAll,
@@ -66,6 +67,8 @@ export function OperationPanel({
   meta: OperationMeta
   spec: CommandSpec | null
   settings: Record<string, FormValue>
+  /** Shared Teleop & VR setting used when this is a Mantis run. */
+  mantisSource: string
   onChange: (key: string, value: FormValue) => void
   onReset: (key: string) => void
   onResetAll: () => void
@@ -180,26 +183,20 @@ export function OperationPanel({
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {live &&
-              Boolean(settings.mantis) &&
-              (settings.mantis_source ?? "quest") !== "quest" && (
-                <>
-                  <Button
-                    variant="outline"
-                    onClick={() => onEpisode("bridge-toggle")}
-                    disabled={busy}
-                  >
-                    Toggle tracking
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => onEpisode("bridge-reset")}
-                    disabled={busy}
-                  >
-                    <RotateCcw /> Reset
-                  </Button>
-                </>
-              )}
+            {live && Boolean(settings.mantis) && mantisSource !== "quest" && (
+              <>
+                <Button
+                  variant="outline"
+                  onClick={() => onEpisode("bridge-toggle")}
+                  disabled={busy}
+                >
+                  Toggle tracking
+                </Button>
+                <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
+                  <RotateCcw /> Reset
+                </Button>
+              </>
+            )}
             {stopping ? (
               <Button variant="destructive" disabled>
                 <Loader2 className="animate-spin" />

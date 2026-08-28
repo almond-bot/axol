@@ -377,11 +377,11 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
     err: "bg-red-400/70",
   }
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+    <div className="flex items-center gap-2 whitespace-nowrap">
       {arms.map((arm) => (
-        <div key={arm} className="flex items-center gap-1.5">
+        <div key={arm} className="flex items-center gap-1">
           <span className="font-mono text-[0.6rem] text-white/35">{arm[0].toUpperCase()}</span>
-          <div className="flex gap-1">
+          <div className="flex gap-0.5">
             {robot.motors
               .filter((m) => m.arm === arm)
               .map((m, index, motors) => {
@@ -395,7 +395,7 @@ export function MotorGrid({ robot }: { robot: RobotStatus }) {
                     aria-describedby={tooltip}
                     className="group/motor relative inline-flex rounded-[3px] outline-none focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-[#111]"
                   >
-                    <span className={cn("size-3 rounded-[3px]", SQUARE[color(m)])} />
+                    <span className={cn("size-2.5 rounded-[3px]", SQUARE[color(m)])} />
                     <span
                       id={tooltip}
                       role="tooltip"

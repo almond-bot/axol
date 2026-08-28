@@ -373,6 +373,21 @@ SETTINGS: tuple[SettingCategory, ...] = (
         description="How VR controller motion drives the arms (teleop and data collection).",
         settings=(
             SettingDef(
+                key="teleop.mantis_source",
+                label="Mantis tracking",
+                type="select",
+                options=("quest", "lighthouse", "ultimate"),
+                help=(
+                    "Pose source used when Mantis is enabled for a run. "
+                    "Quest connects directly over WebXR; Lighthouse and "
+                    "Ultimate automatically start their tracker bridge."
+                ),
+                targets={
+                    "teleop": ("mantis_source",),
+                    "collect-data": ("mantis_source",),
+                },
+            ),
+            SettingDef(
                 key="teleop.frequency",
                 label="Teleop rate (Hz)",
                 type="number",

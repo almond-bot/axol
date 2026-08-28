@@ -829,7 +829,7 @@ export const OPERATIONS: OperationMeta[] = [
     id: "teleop",
     label: "Teleoperation",
     description: "Drive Axol from VR; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
-    fields: ["sim", "mantis", "mantis_source"],
+    fields: ["sim", "mantis"],
     requiresRobot: true,
     requiresCameras: false,
     simCapable: true,
@@ -856,7 +856,7 @@ export const OPERATIONS: OperationMeta[] = [
     label: "Collect data",
     description:
       "Record with ZED cameras; Mantis supports Quest, Lighthouse, or Ultimate tracking.",
-    fields: ["mantis", "mantis_source", "repo_id", "task"],
+    fields: ["mantis", "repo_id", "task"],
     requiresRobot: true,
     requiresCameras: true,
     simCapable: false,

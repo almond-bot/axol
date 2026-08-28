@@ -535,7 +535,7 @@ class TeleopCmdConfig:
     # still supplies its own VR client.
     # No robot, no cameras, no recording. Mutually exclusive with --sim.
     mantis: bool = False
-    mantis_source: MantisSource = "quest"
+    mantis_source: MantisSource = "lighthouse"
     """Pose source for Mantis mode. Quest connects through the WebXR client;
     Lighthouse and Ultimate start the corresponding tracker bridge when the
     operation is launched from the control panel."""

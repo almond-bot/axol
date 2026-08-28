@@ -536,7 +536,7 @@ class OperationRunner:
             target = self._run_async
         else:
             target = self._run_thread
-        mantis_source = str(args.get("mantis_source", "quest"))
+        mantis_source = str(args.get("mantis_source", "lighthouse"))
         manage_bridge = bool(args.get("mantis")) and mantis_source != "quest"
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(
@@ -964,7 +964,7 @@ class OperationRunner:
         from ..tracker.config import select_tracker_backend
 
         config = load_tracker_config()
-        source = str(getattr(cfg, "mantis_source", "quest"))
+        source = str(getattr(cfg, "mantis_source", "lighthouse"))
         backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source)
         if backend is None:
             raise RuntimeError(
