@@ -6,9 +6,11 @@ use std::time::Duration;
 
 use crate::can::CanSock;
 use crate::proto;
+use crate::safety::purge_tx_queue;
 use crate::txn;
 
 pub const TIMEOUT: Duration = Duration::from_millis(100);
+const SEND_TIMEOUT: Duration = Duration::from_millis(20);
 /// Post-0x76 reboot settle; the Python driver measures ~1.12 s and waits 2.
 pub const RESET_SETTLE: Duration = Duration::from_millis(2200);
 
@@ -229,23 +231,44 @@ pub fn read_dm_register(sock: &CanSock, motor_id: u16, rid: u8) -> io::Result<f6
     )))
 }
 
-pub fn enable(sock: &CanSock, motors: &[ReadyMotor]) -> io::Result<()> {
+pub fn enable(sock: &CanSock, iface: &str, motors: &[ReadyMotor]) -> io::Result<()> {
+    // A full socket buffer must not strand motors that were enabled earlier in
+    // this batch or prevent the rollback below from running to completion.
+    sock.set_send_timeout(SEND_TIMEOUT)?;
+    // Record a motor before its enable write: a failed request may still have
+    // reached the controller, even when its acknowledgement did not return.
+    let mut attempted = Vec::new();
     for m in motors {
         if m.gripper {
             continue; // enabled by the Python side's calibration flow
         }
-        match m.vendor {
+        attempted.push(m.clone());
+        let result = match m.vendor {
             Vendor::MyActuator => {
-                if txn::ma_request(sock, m.id, proto::ma_cmd(proto::MA_RELEASE_BRAKE), TIMEOUT)?
-                    .is_none()
-                {
-                    return Err(io::Error::other(format!(
+                match txn::ma_request(sock, m.id, proto::ma_cmd(proto::MA_RELEASE_BRAKE), TIMEOUT) {
+                    Ok(Some(_)) => Ok(()),
+                    Ok(None) => Err(io::Error::other(format!(
                         "{}: brake release not acknowledged",
                         m.joint
-                    )));
+                    ))),
+                    Err(err) => Err(err),
                 }
             }
-            Vendor::Damiao => sock.send(m.id as u16, &proto::DM_ENABLE)?,
+            Vendor::Damiao => sock.send(m.id as u16, &proto::DM_ENABLE),
+        };
+        if let Err(err) = result {
+            if !disable_inner(sock, &attempted) {
+                let purged = purge_tx_queue(iface);
+                eprintln!(
+                    "{iface}: motor-enable rollback had failed writes{}",
+                    if purged {
+                        "; stale TX queue purged"
+                    } else {
+                        "; QUEUE PURGE FAILED, flap the interface before re-powering"
+                    }
+                );
+            }
+            return Err(err);
         }
     }
     Ok(())
@@ -254,6 +277,13 @@ pub fn enable(sock: &CanSock, motors: &[ReadyMotor]) -> io::Result<()> {
 /// Best-effort disable of every motor; Damiao gets the repeated-send
 /// treatment the Python driver uses.
 pub fn disable(sock: &CanSock, motors: &[ReadyMotor]) {
+    let _ = disable_inner(sock, motors);
+}
+
+/// Return false if any rollback frame could not be written. Callers performing
+/// partial-enable rollback use that signal to purge potentially stale enables.
+fn disable_inner(sock: &CanSock, motors: &[ReadyMotor]) -> bool {
+    let mut complete = true;
     for m in motors {
         for _ in 0..3 {
             let sent = match m.vendor {
@@ -264,9 +294,11 @@ pub fn disable(sock: &CanSock, motors: &[ReadyMotor]) {
                 Vendor::Damiao => sock.send(m.id as u16, &proto::DM_DISABLE),
             };
             if let Err(err) = sent {
+                complete = false;
                 eprintln!("disable {}: {err}", m.joint);
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    complete
 }

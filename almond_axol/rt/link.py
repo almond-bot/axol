@@ -252,14 +252,20 @@ class RtLink:
     async def close(self) -> None:
         """Tear down the link and the core process."""
         if self._reader_task is not None:
-            self._reader_task.cancel()
+            reader_task = self._reader_task
+            self._reader_task = None
+            reader_task.cancel()
             try:
-                await self._reader_task
+                await reader_task
             except asyncio.CancelledError:
                 pass
-            self._reader_task = None
+            except BaseException:  # noqa: BLE001 - process teardown is mandatory
+                _logger.exception("axol-rt: reader failed during link teardown")
         if self._writer is not None:
-            self._writer.close()
+            try:
+                self._writer.close()
+            except Exception:  # noqa: BLE001 - still terminate the core
+                _logger.exception("axol-rt: writer failed during link teardown")
             self._writer = None
         if self._proc is not None:
             if self._proc.poll() is None:

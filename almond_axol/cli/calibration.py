@@ -84,11 +84,14 @@ def run(args: argparse.Namespace) -> None:
     except RuntimeError as exc:
         raise SystemExit(f"ERROR: {exc}")
     if document is None:
+        # Scope the empty cache to this robot so values cached for a previous
+        # Axol can never survive a confirmed cloud miss.
+        save_factory_calibration({"version": 1}, hub_serial=serial)
         raise SystemExit(
             f"No factory calibration stored for hub {serial} — run "
             "axol tune.factory on the robot first."
         )
-    path = save_factory_calibration(document)
+    path = save_factory_calibration(document, hub_serial=serial)
     print(f"Saved to {path}:")
     _summarize(document)
     print(

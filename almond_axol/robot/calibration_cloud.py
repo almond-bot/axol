@@ -85,6 +85,13 @@ def push_calibration(
 ) -> None:
     """Upsert one robot's calibration object (keyed by hub serial)."""
     url, key = creds
+    stored_hub_serial = calibration.get("hub_serial")
+    if stored_hub_serial not in (None, hub_serial):
+        raise RuntimeError(
+            "Calibration identity mismatch: document belongs to "
+            f"{stored_hub_serial!r}, not {hub_serial!r}"
+        )
+    calibration = {**calibration, "hub_serial": hub_serial}
     req = urllib.request.Request(
         f"{url}/storage/v1/object/{_object_path(hub_serial)}",
         data=json.dumps(calibration, indent=2, sort_keys=True).encode(),
@@ -134,5 +141,21 @@ def fetch_calibration(hub_serial: str) -> dict[str, Any] | None:
         raise RuntimeError(f"Supabase fetch failed ({exc.code}): {detail}")
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Supabase unreachable: {exc.reason}")
-    doc = json.loads(raw)
-    return doc if isinstance(doc, dict) else None
+    try:
+        doc = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"Malformed factory calibration for hub {hub_serial}: {exc}"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise RuntimeError(
+            f"Malformed factory calibration for hub {hub_serial}: "
+            "top level is not an object"
+        )
+    stored_hub_serial = doc.get("hub_serial")
+    if stored_hub_serial not in (None, hub_serial):
+        raise RuntimeError(
+            "Factory calibration identity mismatch: fetched document belongs "
+            f"to {stored_hub_serial!r}, not {hub_serial!r}"
+        )
+    return doc

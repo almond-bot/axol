@@ -64,6 +64,7 @@ from ...robot.calibration import (
 )
 from ...robot.config import AxolConfig
 from ...robot.gravity import GravityCompensator
+from ...robot.identity import hub_serial
 from ...tuning import joint_frame_motors, ramp_stages, save_run, sweep_safety
 from ..motor import add_side_and_channel_arguments, resolve_channel
 from .friction import (
@@ -309,6 +310,7 @@ async def _run(args: argparse.Namespace) -> None:
     joint = Joint(args.joint)
     is_left = args.l
     side_str = "left" if is_left else "right"
+    serial = hub_serial()
     resolved = AxolConfig().resolved()
     jc = getattr(resolved.left if is_left else resolved.right, joint.value)
     kp = args.kp if args.kp is not None else jc.kp
@@ -316,7 +318,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     print(f"\nAxol gravity identification — {side_str} {joint.value}")
     print(f"  Sweep velocity: {args.velocity:g} deg/s   Kp={kp}  Kd={kd}")
-    cal_side = load_calibration()[side_str]
+    cal_side = load_calibration(expected_hub_serial=serial)[side_str] if serial else {}
     cal = cal_side.get(joint.value, {})
     if "com" in cal:
         print(f"  Current CoM is already calibrated: {cal['com']} (refining it)")
@@ -399,7 +401,16 @@ async def _run(args: argparse.Namespace) -> None:
                 print(f"\n  ! Gravity fit rejected: {exc}")
                 return
             _report_and_save(
-                args, joint, side_str, jc, q_bins, tau_meas, fit, other_targets
+                args,
+                joint,
+                side_str,
+                jc,
+                q_bins,
+                tau_meas,
+                fit,
+                other_targets,
+                serial,
+                cal_side,
             )
 
         except KeyboardInterrupt:
@@ -431,6 +442,8 @@ def _report_and_save(
     tau_meas: np.ndarray,
     fit: tuple[tuple[float, float, float], float, np.ndarray, np.ndarray] | None,
     clearance: dict[Joint, float],
+    hub_serial: str | None,
+    cal_side: dict[str, dict],
 ) -> None:
     print(f"\n{'─' * 50}")
     if fit is None:
@@ -519,7 +532,7 @@ def _report_and_save(
         print(f"{'─' * 50}")
         return
 
-    friction_cal = load_calibration()[side_str].get(joint.value, {}).get("friction")
+    friction_cal = cal_side.get(joint.value, {}).get("friction")
     friction_update = None
     if friction_cal is not None:
         friction_update = {**friction_cal, "fo": round(offset, 4)}
@@ -528,6 +541,7 @@ def _report_and_save(
         joint.value,
         com=tuple(round(v, 5) for v in com_fit),
         friction=friction_update,
+        hub_serial=hub_serial,
     )
     print(f"\n  Saved to {path}")
     if friction_update is not None:

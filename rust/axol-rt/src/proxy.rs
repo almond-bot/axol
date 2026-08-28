@@ -225,6 +225,7 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
                     muted.store(false, Ordering::Release);
                     match crate::experiment::run(
                         &payload[1..],
+                        iface,
                         &socket,
                         &feedback,
                         &mut enobufs_since,
@@ -241,6 +242,10 @@ pub fn run(socket_path: &str, iface: &str) -> io::Result<()> {
                         }
                     }
                 }
+                // A cancellation can race the experiment's final poll.  In
+                // that case its completed X reply wins and this packet is a
+                // harmless, already-satisfied cancellation request.
+                b'K' if payload.len() == 1 => {}
                 b'Q' if payload.len() == 1 => break,
                 tag => {
                     return Err(io::Error::new(

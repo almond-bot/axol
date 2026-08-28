@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use crate::bringup::{self, MotorSpec, ReadyMotor, Vendor};
 use crate::can::CanSock;
 use crate::proto;
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome, STALL_DETECT};
 
 /// Parameter sanity limits — a params file outside these is rejected whole.
 const KP_LIMIT: f64 = 250.0;
@@ -174,6 +175,9 @@ fn bus_hold(
     stop: &AtomicBool,
 ) -> io::Result<()> {
     let sock = CanSock::open(iface)?;
+    // Ensure a full socket buffer cannot block either the command loop or
+    // best-effort rollback indefinitely.
+    sock.set_send_timeout(Duration::from_millis(20))?;
     sock.drain()?;
     let specs: Vec<MotorSpec> = joints.iter().map(|p| p.spec.clone()).collect();
     bringup::prep(&sock, &specs)?;
@@ -213,8 +217,8 @@ fn bus_hold(
     }
 
     let readies: Vec<ReadyMotor> = motors.iter().map(|m| m.ready.clone()).collect();
-    bringup::enable(&sock, &readies)?;
-    let result = stream(&sock, &mut motors, secs, hz, abort_deg, stop);
+    bringup::enable(&sock, iface, &readies)?;
+    let result = stream(&sock, iface, &mut motors, secs, hz, abort_deg, stop);
     bringup::disable(&sock, &readies);
 
     println!("-- {iface} hold report --");
@@ -234,6 +238,7 @@ fn bus_hold(
 /// deviation tracking with abort.
 fn stream(
     sock: &CanSock,
+    iface: &str,
     motors: &mut [HeldMotor],
     secs: f64,
     hz: f64,
@@ -244,6 +249,7 @@ fn stream(
     let abort_rad = abort_deg.to_radians();
     let ticks = (secs * hz) as u64;
     let start = Instant::now() + period;
+    let mut enobufs_since: Option<Instant> = None;
 
     for k in 0..ticks {
         if stop.load(Ordering::SeqCst) || SIGINT.load(Ordering::SeqCst) {
@@ -265,9 +271,24 @@ fn stream(
                 m.t_ff,
                 &m.ready.ranges,
             );
-            match m.ready.vendor {
-                Vendor::MyActuator => sock.send(proto::MA_MC_REQ + m.ready.id as u16, &frame)?,
-                Vendor::Damiao => sock.send(m.ready.id as u16, &frame)?,
+            let command_id = match m.ready.vendor {
+                Vendor::MyActuator => proto::MA_MC_REQ + m.ready.id as u16,
+                Vendor::Damiao => m.ready.id as u16,
+            };
+            match guarded_send(sock, command_id, &frame, &mut enobufs_since)? {
+                SendOutcome::Sent | SendOutcome::Dropped => {}
+                SendOutcome::Stalled => {
+                    let purged = purge_tx_queue(iface);
+                    return Err(io::Error::other(format!(
+                        "{iface}: hold TX queue stalled >{}s{}",
+                        STALL_DETECT.as_secs(),
+                        if purged {
+                            "; stale hold frames purged"
+                        } else {
+                            "; QUEUE PURGE FAILED, flap the interface before re-powering"
+                        }
+                    )));
+                }
             }
         }
 

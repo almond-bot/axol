@@ -14,6 +14,7 @@ File shape (every level optional)::
 
     {
       "version": 1,
+      "hub_serial": "004800345542501420373234",
       "left": {
         "elbow": {
           "kp": 40.0,
@@ -50,6 +51,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .identity import hub_serial as current_hub_serial
+
 _logger = logging.getLogger(__name__)
 
 CALIBRATION_PATH = Path.home() / ".almond" / "calibration.json"
@@ -69,6 +72,28 @@ _FRICTION_FIELDS = ("fc", "k", "fv", "fo")
 # A corrupt file must never take the robot down, but silently ignoring it
 # would make a bad calibration mysterious — warn once per process.
 _warned_invalid = False
+_warned_identity: set[tuple[Path, str | None, str]] = set()
+
+
+def _backup_displaced_calibration(path: Path, contents: bytes) -> Path:
+    """Preserve a calibration file before replacing its robot identity.
+
+    Backups sit beside the live file as ``<name>.displaced``, then
+    ``<name>.displaced.1``, and so on. Exclusive creation makes the numbering
+    collision-safe even when two writers race; a failed backup aborts the
+    replacement, leaving the live file untouched.
+    """
+    index = 0
+    while True:
+        suffix = ".displaced" if index == 0 else f".displaced.{index}"
+        backup = path.with_name(path.name + suffix)
+        try:
+            with backup.open("xb") as file:
+                file.write(contents)
+        except FileExistsError:
+            index += 1
+            continue
+        return backup
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -77,14 +102,19 @@ def _coerce_float(value: Any) -> float | None:
     return float(value)
 
 
-def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]:
+def load_calibration(
+    path: Path = CALIBRATION_PATH, *, expected_hub_serial: str | None = None
+) -> dict[str, dict[str, Any]]:
     """Read and sanitize the calibration file.
 
     Returns ``{"left": {joint: {...}}, "right": {joint: {...}}}`` with only
     recognized, numeric fields kept; an absent or unreadable file yields empty
     sides. Joint keys are not validated here — the consumer looks joints up
     by name and ignores strangers — so a file written by a newer version with
-    extra joints degrades gracefully.
+    extra joints degrades gracefully. When ``expected_hub_serial`` is given,
+    an unscoped legacy document or a document for another robot is ignored.
+    Omitting it retains the legacy low-level loading behavior for callers that
+    are inspecting or migrating old files; hardware defaults always pass it.
     """
     global _warned_invalid
     out: dict[str, dict[str, Any]] = {side: {} for side in _SIDES}
@@ -106,6 +136,25 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
                 "Ignoring calibration file %s: top level is not an object.", path
             )
         return out
+
+    if expected_hub_serial is not None:
+        stored_hub_serial = raw.get("hub_serial")
+        if stored_hub_serial != expected_hub_serial:
+            reason = (
+                "has no robot identity"
+                if stored_hub_serial is None
+                else f"belongs to hub {stored_hub_serial!r}"
+            )
+            warning_key = (path, expected_hub_serial, repr(stored_hub_serial))
+            if warning_key not in _warned_identity:
+                _warned_identity.add(warning_key)
+                _logger.warning(
+                    "Ignoring calibration file %s: it %s, not the selected hub %r.",
+                    path,
+                    reason,
+                    expected_hub_serial,
+                )
+            return out
 
     for side in _SIDES:
         joints = raw.get(side)
@@ -164,15 +213,38 @@ def load_calibration(path: Path = CALIBRATION_PATH) -> dict[str, dict[str, Any]]
     return out
 
 
-def load_factory_calibration() -> dict[str, dict[str, Any]]:
+def load_factory_calibration(
+    *, expected_hub_serial: str | None = None
+) -> dict[str, dict[str, Any]]:
     """The fetched factory calibration, sanitized like the local file."""
-    return load_calibration(path=FACTORY_CALIBRATION_PATH)
+    return load_calibration(
+        path=FACTORY_CALIBRATION_PATH,
+        expected_hub_serial=expected_hub_serial,
+    )
 
 
 def save_factory_calibration(
-    document: dict[str, Any], path: Path = FACTORY_CALIBRATION_PATH
+    document: dict[str, Any],
+    path: Path = FACTORY_CALIBRATION_PATH,
+    *,
+    hub_serial: str | None = None,
 ) -> Path:
-    """Persist a fetched factory-calibration document (atomic write)."""
+    """Persist a fetched factory-calibration document (atomic write).
+
+    ``hub_serial`` scopes legacy cloud documents that predate identity
+    metadata. A contradictory identity is rejected instead of caching data
+    under the wrong robot.
+    """
+    stored_hub_serial = document.get("hub_serial")
+    if hub_serial is not None:
+        if not hub_serial:
+            raise ValueError("hub_serial must not be empty")
+        if stored_hub_serial not in (None, hub_serial):
+            raise ValueError(
+                "Factory calibration identity mismatch: document belongs to "
+                f"{stored_hub_serial!r}, not {hub_serial!r}"
+            )
+        document = {**document, "hub_serial": hub_serial}
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n")
@@ -188,17 +260,24 @@ def update_joint_calibration(
     kd: float | None = None,
     j_eff: float | None = None,
     kd_host: float | None = None,
+    kd_host_hz: float | None = None,
+    kd_host_q: float | None = None,
     friction: dict[str, float] | None = None,
     com: tuple[float, float, float] | None = None,
+    hub_serial: str | None = None,
     path: Path = CALIBRATION_PATH,
 ) -> Path:
     """Merge new values into one joint's calibration entry and persist.
 
-    Only the provided fields are touched — saving PID gains does not clobber
-    a previously saved friction fit, and vice versa. ``friction`` must carry
-    all of ``fc`` / ``k`` / ``fv`` / ``fo``; ``com`` is the link's fitted
-    centre of mass (metres, URDF link frame). The write is atomic
-    (tmp + rename), matching the settings store.
+    Only the provided fields are touched — saving PID gains or its host
+    damping band does not clobber a previously saved friction fit, and vice
+    versa. ``friction`` must carry all of ``fc`` / ``k`` / ``fv`` / ``fo``;
+    ``com`` is the link's fitted centre of mass (metres, URDF link frame).
+    The document is scoped to ``hub_serial`` (auto-detected when omitted) and
+    stale data for another robot is never merged into it. If an existing file
+    is unscoped or belongs to another robot, it is preserved in a numbered
+    ``.displaced`` backup before the new robot's file replaces it. The write
+    is atomic (tmp + rename), matching the settings store.
     """
     if side not in _SIDES:
         raise ValueError(f"side must be one of {_SIDES}, got {side!r}")
@@ -207,8 +286,20 @@ def update_joint_calibration(
         if missing:
             raise ValueError(f"friction is missing fields: {', '.join(missing)}")
 
+    if hub_serial is None:
+        hub_serial = current_hub_serial()
+    elif not hub_serial:
+        raise ValueError("hub_serial must not be empty")
+    if not hub_serial:
+        raise RuntimeError(
+            "Cannot save per-robot calibration without an Axol hub identity; "
+            "attach the hub or explicitly supply its serial"
+        )
+
+    original: bytes | None = None
     try:
-        raw = json.loads(path.read_text())
+        original = path.read_bytes()
+        raw = json.loads(original)
         if not isinstance(raw, dict):
             raw = {}
     except FileNotFoundError:
@@ -217,7 +308,31 @@ def update_joint_calibration(
         _logger.warning("Rewriting unreadable calibration file %s.", path)
         raw = {}
 
+    stored_hub_serial = raw.get("hub_serial")
+    if stored_hub_serial != hub_serial:
+        backup = (
+            _backup_displaced_calibration(path, original)
+            if original is not None
+            else None
+        )
+        scope = (
+            "an unscoped legacy robot"
+            if stored_hub_serial is None
+            else f"hub {stored_hub_serial!r}"
+        )
+        if backup is not None:
+            _logger.warning(
+                "Replacing calibration file %s for %s with calibration for "
+                "hub %r; displaced values were preserved in %s.",
+                path,
+                scope,
+                hub_serial,
+                backup,
+            )
+        raw = {}
+
     raw["version"] = 1
+    raw["hub_serial"] = hub_serial
     side_map = raw.setdefault(side, {})
     if not isinstance(side_map, dict):
         side_map = {}
@@ -234,6 +349,8 @@ def update_joint_calibration(
         ("kd", kd),
         ("j_eff", j_eff),
         ("kd_host", kd_host),
+        ("kd_host_hz", kd_host_hz),
+        ("kd_host_q", kd_host_q),
     ):
         if value is not None:
             entry[field] = float(value)

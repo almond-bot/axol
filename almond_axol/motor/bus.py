@@ -110,29 +110,49 @@ class CanBus:
 
     async def close(self) -> None:
         """Close the proxy connection and reap its Rust process."""
-        if self._writer is not None and not self._writer.is_closing():
+        if self._writer is not None:
+            writer = self._writer
             try:
-                self._send_message(b"Q")
-                await self._writer.drain()
-            except (ConnectionError, RuntimeError):
-                pass
-            self._writer.close()
-            try:
-                await self._writer.wait_closed()
-            except ConnectionError:
-                pass
-            self._writer = None
-        if self._reader_task is not None:
-            if self._reader_task is not asyncio.current_task():
-                try:
-                    await asyncio.wait_for(self._reader_task, 1.0)
-                except TimeoutError:
-                    self._reader_task.cancel()
+                if not writer.is_closing():
                     try:
-                        await self._reader_task
+                        self._send_message(b"Q")
+                        await asyncio.wait_for(writer.drain(), 1.0)
+                    except (ConnectionError, RuntimeError, TimeoutError):
+                        pass
+                    writer.close()
+                    try:
+                        await asyncio.wait_for(writer.wait_closed(), 1.0)
+                    except (ConnectionError, RuntimeError, TimeoutError):
+                        pass
+            finally:
+                self._writer = None
+        if self._reader_task is not None:
+            reader_task = self._reader_task
+            self._reader_task = None
+            if reader_task is not asyncio.current_task():
+                try:
+                    await asyncio.wait_for(reader_task, 1.0)
+                except TimeoutError:
+                    reader_task.cancel()
+                    try:
+                        await reader_task
                     except asyncio.CancelledError:
                         pass
-            self._reader_task = None
+                    except Exception:  # noqa: BLE001 - still reap the proxy
+                        _logger.exception(
+                            "axol-rt proxy reader for %s failed during teardown",
+                            self._channel,
+                        )
+                except asyncio.CancelledError:
+                    # Includes an already-cancelled reader. Teardown must still
+                    # reap the process; caller cancellation is handled by its
+                    # outer lifecycle owner.
+                    pass
+                except Exception:  # noqa: BLE001 - still reap the proxy
+                    _logger.exception(
+                        "axol-rt proxy reader for %s failed during teardown",
+                        self._channel,
+                    )
         self._reader = None
         if self._proc is not None:
             if self._proc.poll() is None:
@@ -295,8 +315,18 @@ class CanBus:
                     continue
                 if payload[:1] == b"X":
                     waiter = self._experiment_waiter
-                    if waiter is None or len(payload) < 5:
+                    if waiter is None:
                         _logger.warning("axol-rt proxy: unexpected experiment result")
+                        continue
+                    if waiter.done():
+                        # Cancelling run_experiment cancels its bare awaited
+                        # Future before the K packet has drained. A completed X
+                        # may race that drain; it is stale, not a reader error.
+                        continue
+                    if len(payload) < 5:
+                        waiter.set_exception(
+                            RuntimeError("invalid Rust experiment result")
+                        )
                         continue
                     (count,) = struct.unpack_from("<I", payload, 1)
                     if len(payload) != 5 + count * _EXPERIMENT_ROW.size:

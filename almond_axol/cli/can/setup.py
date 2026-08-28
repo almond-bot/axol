@@ -43,6 +43,7 @@ import time
 from pathlib import Path
 
 from ...constants import CAN_BASE, CAN_BRINGUP_SCRIPT, CAN_CHEST, CAN_LEFT, CAN_RIGHT
+from ...robot.identity import select_hub_serial
 from ...utils.sudo import run_root
 from . import driver
 
@@ -191,15 +192,11 @@ def hub_serial() -> str | None:
 
     The hub travels with the arms, so its serial keys the robot's factory
     calibration in the cloud (see :mod:`almond_axol.robot.calibration_cloud`)
-    across compute-host swaps. Prefers the serial pinned by a previous
-    ``can.setup`` (unambiguous with several candlelight devices attached);
-    falls back to a live scan when exactly one dual-channel hub is present.
+    across compute-host swaps. A configured serial wins only while it is
+    attached (or while no hub is attached); a different, unambiguous attached
+    hub replaces a stale pin.
     """
-    serial = _configured_serial()
-    if serial:
-        return serial
-    detected = _detect_serials()
-    return detected[0] if len(detected) == 1 else None
+    return _resolve_hub_serial()
 
 
 def _configured_named_serial(name: str) -> str | None:
@@ -233,17 +230,7 @@ def _resolve_hub_serial() -> str | None:
     picks in the same situation. Several attached candidates still raise,
     since that needs the interactive flow to disambiguate.
     """
-    configured = _configured_serial()
-    attached = _detect_serials()
-    if configured and (configured in attached or not attached):
-        return configured
-    if len(attached) == 1:
-        return attached[0]
-    if not attached:
-        return None
-    raise RuntimeError(
-        "Multiple CAN adapters found — run `axol can.setup` once to pick the Axol's"
-    )
+    return select_hub_serial(_configured_serial(), _detect_serials())
 
 
 def _stdin_is_tty() -> bool:
@@ -948,6 +935,8 @@ def ensure_setup(
     if not (hub_serial or wheels_serial or chest_serial):
         raise RuntimeError("Robot not detected")
     _apply_setup(hub_serial, wheels_serial, chest_serial)
+    if hub_serial:
+        _pull_factory_calibration(hub_serial)
 
 
 def _find_single_serials(
@@ -1059,7 +1048,12 @@ def _pull_factory_calibration(serial: str) -> None:
 
     try:
         document = fetch_calibration(serial)
-    except RuntimeError as exc:
+        # A confirmed cloud miss must also supersede a cache belonging to a
+        # robot previously attached to this host. The empty scoped document
+        # preserves the useful "none stored" result without stale values.
+        if document is None:
+            save_factory_calibration({"version": 1}, hub_serial=serial)
+    except (OSError, RuntimeError, ValueError) as exc:
         print(f"  Factory calibration: not fetched ({exc})")
         return
     if document is None:
@@ -1068,7 +1062,11 @@ def _pull_factory_calibration(serial: str) -> None:
             "(run axol tune.factory at the factory)"
         )
         return
-    save_factory_calibration(document)
+    try:
+        save_factory_calibration(document, hub_serial=serial)
+    except (OSError, ValueError) as exc:
+        print(f"  Factory calibration: not cached ({exc})")
+        return
     print(f"  Factory calibration: fetched into {FACTORY_CALIBRATION_PATH}")
 
 

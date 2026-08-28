@@ -273,6 +273,60 @@ fn collect_feedback(
     Ok(seen.into_iter().filter(|value| *value).count())
 }
 
+/// Once the first enable may have reached a wheel, every exit must return all
+/// wheels to velocity mode, command zero speed, and disable them.  Arming the
+/// guard before the send also covers a write whose result is ambiguous.
+struct WheelDisableGuard<'a> {
+    sock: &'a CanSock,
+    iface: &'a str,
+    armed: bool,
+    bus_dead: bool,
+}
+
+impl Drop for WheelDisableGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed || self.bus_dead {
+            return;
+        }
+        let mut cleanup_failed = false;
+        if let Err(err) = set_mode(self.sock, 3) {
+            cleanup_failed = true;
+            eprintln!("{}: wheel rollback mode switch failed: {err}", self.iface);
+        }
+        for id in IDS {
+            if let Err(err) = self.sock.send(0x200 + id as u16, &velocity_frame(0.0)) {
+                cleanup_failed = true;
+                eprintln!(
+                    "{}: wheel 0x{id:02X} rollback zero failed: {err}",
+                    self.iface
+                );
+            }
+            for _ in 0..3 {
+                if let Err(err) = self.sock.send(id as u16, &proto::DM_DISABLE) {
+                    cleanup_failed = true;
+                    eprintln!(
+                        "{}: wheel 0x{id:02X} rollback disable failed: {err}",
+                        self.iface
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if cleanup_failed {
+            let purged = purge_tx_queue(self.iface);
+            eprintln!(
+                "{}: wheel rollback had failed writes{}",
+                self.iface,
+                if purged {
+                    "; stale TX queue purged"
+                } else {
+                    "; QUEUE PURGE FAILED, flap the interface before re-powering"
+                }
+            );
+        }
+    }
+}
+
 fn control_loop(
     iface: &str,
     cfg: Config,
@@ -294,10 +348,19 @@ fn control_loop(
         kd_max: 5.0,
         t_max: 18.0,
     }; 4];
+    // This guard predates the first enable attempt so any later register,
+    // mode, command, feedback, or IPC failure rolls the wheels back.
+    let mut disable = WheelDisableGuard {
+        sock: &sock,
+        iface,
+        armed: false,
+        bus_dead: false,
+    };
     for (i, id) in IDS.into_iter().enumerate() {
         ranges[i].p_max = bringup::read_dm_register(&sock, id as u16, proto::DM_REG_PMAX)?;
         ranges[i].v_max = bringup::read_dm_register(&sock, id as u16, proto::DM_REG_VMAX)?;
         ranges[i].t_max = bringup::read_dm_register(&sock, id as u16, proto::DM_REG_TMAX)?;
+        disable.armed = true;
         sock.send(id as u16, &proto::DM_ENABLE)?;
     }
     set_mode(&sock, 3)?;
@@ -313,7 +376,6 @@ fn control_loop(
     let mut next = Instant::now() + period;
     let mut next_status = Instant::now();
     let mut enobufs = None;
-    let mut bus_dead = false;
     for id in IDS {
         sock.send(0x200 + id as u16, &velocity_frame(0.0))?;
     }
@@ -435,7 +497,7 @@ fn control_loop(
             })();
             send_failed = send_result.is_err();
             if let Err(e) = send_result {
-                bus_dead = true;
+                disable.bus_dead = true;
                 let _ = purge_tx_queue(iface);
                 return Err(e);
             }
@@ -466,16 +528,6 @@ fn control_loop(
         }
         Ok(())
     })();
-    if !bus_dead {
-        let _ = set_mode(&sock, 3);
-        for id in IDS {
-            let _ = sock.send(0x200 + id as u16, &velocity_frame(0.0));
-            for _ in 0..3 {
-                let _ = sock.send(id as u16, &proto::DM_DISABLE);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        }
-    }
     result
 }
 

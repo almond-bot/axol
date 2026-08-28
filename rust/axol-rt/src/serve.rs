@@ -1181,7 +1181,7 @@ fn bus_loop(
             return Ok(());
         }
     };
-    if let Err(err) = bringup::enable(&sock, &motors) {
+    if let Err(err) = bringup::enable(&sock, iface, &motors) {
         let _ = ready_tx.send(Err(err));
         return Ok(());
     }

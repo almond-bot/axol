@@ -378,18 +378,48 @@ class Jelly:
 
     async def enable(self) -> None:
         """Start the Rust wheel controller and the optional lift."""
+        try:
+            await self._enable()
+        except BaseException:
+            # enable() callers cannot invoke disable() through an async context
+            # that never entered. Finish rollback even when enable was cancelled.
+            cleanup = asyncio.create_task(self.disable(), name="jelly-startup-rollback")
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except BaseException:  # noqa: BLE001 - preserve original error
+                    # A second cancellation (or other interruption) must not
+                    # turn shield into fire-and-forget cleanup: the event loop
+                    # may close as soon as the original error reaches caller.
+                    continue
+            if not cleanup.cancelled():
+                cleanup_exc = cleanup.exception()
+                if cleanup_exc is not None:
+                    _logger.error(
+                        "Jelly startup rollback failed",
+                        exc_info=cleanup_exc,
+                    )
+            else:
+                _logger.error("Jelly startup rollback was unexpectedly cancelled")
+            raise
+
+    async def _enable(self) -> None:
+        """Start Jelly resources; :meth:`enable` owns rollback."""
         cfg = self._config
         self._ready.clear()
         self.send_failed = False
         if cfg.lift:
-            # The chest bus is optional and independent of the wheels: a
-            # missing/unpowered lift only costs the lift, never the drive.
+            # Publish the lift before its first await so cancellation during a
+            # partial start can still find and close its bus.
             lift = Lift(cfg.lift_channel, cfg.lift_speed)
+            self._lift = lift
             try:
                 await lift.start()
-                self._lift = lift
             except Exception as exc:  # noqa: BLE001 - lift is best-effort
+                # Keep it published until close succeeds; if close itself
+                # fails, the outer rollback gets another chance to finish.
                 await lift.close()
+                self._lift = None
                 _logger.warning(
                     "Jelly lift: could not open the chest bus %s (%s) — "
                     "the lift is disabled for this session",
@@ -422,12 +452,10 @@ class Jelly:
                 except (ConnectionRefusedError, FileNotFoundError):
                     if self._proc.poll() is not None:
                         returncode = self._proc.returncode
-                        await self.disable()
                         raise RuntimeError(
                             f"axol-rt Jelly core exited with {returncode}"
                         ) from None
                     if asyncio.get_running_loop().time() >= deadline:
-                        await self.disable()
                         raise RuntimeError("timed out connecting to axol-rt Jelly core")
                     await asyncio.sleep(0.05)
             self._reader_task = asyncio.create_task(
@@ -447,13 +475,8 @@ class Jelly:
             )
             self._send_rust(b"C" + struct.pack("<10d", *values))
             await self._writer.drain()
-            try:
-                await asyncio.wait_for(self._ready.wait(), 10.0)
-            except BaseException:
-                await self.disable()
-                raise
+            await asyncio.wait_for(self._ready.wait(), 10.0)
             if self.send_failed:
-                await self.disable()
                 raise RuntimeError("axol-rt Jelly core failed during startup")
             _logger.info("Jelly Rust wheel core enabled on %s", cfg.channel)
 
@@ -470,24 +493,33 @@ class Jelly:
 
     async def disable(self) -> None:
         """Stop the command task, stop and disable the wheels, release the lift."""
+        # Do this synchronously before any wheel/core await. Lift._run owns the
+        # CAN writes and will observe the latch independently of wheel teardown.
+        if self._lift is not None:
+            self._lift.command(STOP)
+        self.lift_dir = STOP
+
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            self._task = None
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
+            except Exception as exc:  # noqa: BLE001 - bridge may have lost IPC
+                _logger.warning("Jelly bridge stopped with an error: %s", exc)
 
         if self._writer is not None:
             try:
                 self._send_rust(b"Q")
-                await self._writer.drain()
-            except (ConnectionError, RuntimeError):
+                await asyncio.wait_for(self._writer.drain(), 1.0)
+            except (ConnectionError, RuntimeError, TimeoutError):
                 pass
             self._writer.close()
             try:
-                await self._writer.wait_closed()
-            except ConnectionError:
+                await asyncio.wait_for(self._writer.wait_closed(), 1.0)
+            except (ConnectionError, TimeoutError):
                 pass
             self._writer = None
         if self._reader_task is not None:
@@ -499,6 +531,8 @@ class Jelly:
                     await self._reader_task
                 except asyncio.CancelledError:
                     pass
+            except Exception as exc:  # noqa: BLE001 - keep teardown going
+                _logger.warning("Jelly reader stopped with an error: %s", exc)
             self._reader_task = None
         self._reader = None
         if self._proc is not None:
@@ -667,32 +701,54 @@ class Jelly:
         interval = 1.0 / self._config.frequency
         warned_silent = False
         started = time.monotonic()
-        while True:
-            now = time.monotonic()
-            vx, vy, wz, lift_dir = self._target
-            age = max(0.0, now - self._target_time)
-            if self._writer is not None:
-                self._send_rust(b"T" + struct.pack("<4d", vx, vy, wz, age))
-                if self._yaw_rate is not None:
-                    rate, ts = self._yaw_rate
-                    self._send_rust(b"Y" + struct.pack("<2d", rate, max(0.0, now - ts)))
-                await self._writer.drain()
-            if age > self._config.command_timeout:
-                lift_dir = STOP
+        try:
+            while True:
+                now = time.monotonic()
+                vx, vy, wz, lift_dir = self._target
+                age = max(0.0, now - self._target_time)
+                if age > self._config.command_timeout:
+                    lift_dir = STOP
+                if self._lift is not None:
+                    self._lift.command(lift_dir)
+                self.lift_dir = lift_dir if self._lift is not None else STOP
+
+                if self._writer is not None:
+                    self._send_rust(b"T" + struct.pack("<4d", vx, vy, wz, age))
+                    if self._yaw_rate is not None:
+                        rate, ts = self._yaw_rate
+                        self._send_rust(
+                            b"Y" + struct.pack("<2d", rate, max(0.0, now - ts))
+                        )
+                    # A wedged wheel socket must not wedge the independent lift
+                    # deadman past the target's own expiry. A normal drain is
+                    # much faster than one command interval; the 1 ms floor
+                    # only keeps wait_for's timeout strictly positive when the
+                    # target is already stale.
+                    drain_timeout = max(
+                        1e-3,
+                        min(
+                            interval,
+                            self._config.command_timeout - age,
+                        ),
+                    )
+                    await asyncio.wait_for(self._writer.drain(), drain_timeout)
+                if (
+                    not warned_silent
+                    and self._config.imu
+                    and self._config.yaw_hold_gain != 0.0
+                    and any(abs(v) >= 1e-3 for v in (vx, vy, wz))
+                    and self._yaw_rate is None
+                    and now - started > _YAW_SILENT_WARN_S
+                ):
+                    warned_silent = True
+                    _logger.warning(
+                        "Jelly heading hold has no yaw samples after %.0fs",
+                        _YAW_SILENT_WARN_S,
+                    )
+                await asyncio.sleep(interval)
+        finally:
+            # Lift._run otherwise keeps retransmitting its last jog forever,
+            # preventing the firmware deadman from expiring when wheel IPC dies.
             if self._lift is not None:
-                self._lift.command(lift_dir)
-            self.lift_dir = lift_dir if self._lift is not None else STOP
-            if (
-                not warned_silent
-                and self._config.imu
-                and self._config.yaw_hold_gain != 0.0
-                and any(abs(v) >= 1e-3 for v in (vx, vy, wz))
-                and self._yaw_rate is None
-                and now - started > _YAW_SILENT_WARN_S
-            ):
-                warned_silent = True
-                _logger.warning(
-                    "Jelly heading hold has no yaw samples after %.0fs",
-                    _YAW_SILENT_WARN_S,
-                )
-            await asyncio.sleep(interval)
+                self._lift.command(STOP)
+            self.lift_dir = STOP

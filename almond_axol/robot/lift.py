@@ -177,20 +177,25 @@ class Lift:
     async def close(self) -> None:
         """Stop the task and the legs, and close the bus."""
         if self._task is not None:
-            self._task.cancel()
+            task = self._task
+            self._task = None
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
-        if self._bus is not None:
-            try:
-                await self._send(_OP_JOG, struct.pack("<h", 0))
-            except Exception:  # noqa: BLE001 - best-effort stop before close
-                pass
-            await self._bus.close()
-            self._bus = None
-        self._direction = STOP
+            except Exception as exc:  # noqa: BLE001 - still close the bus below
+                _logger.warning("lift: command task stopped with an error: %s", exc)
+        try:
+            if self._bus is not None:
+                try:
+                    await self._send(_OP_JOG, struct.pack("<h", 0))
+                except Exception:  # noqa: BLE001 - best-effort stop before close
+                    pass
+                await self._bus.close()
+                self._bus = None
+        finally:
+            self._direction = STOP
 
     async def home(self) -> None:
         """Start the firmware's two-ended homing sequence (takes ~1-2 min).

@@ -1011,19 +1011,25 @@ async def _run(args: argparse.Namespace) -> None:
 
             if args.save and results:
                 best = min(results, key=lambda r: r["metrics"]["score"])
-                # Persist kd_host only when the operator set it explicitly:
-                # the gains were validated with that damping active, so the
-                # two must be saved (and later loaded) together.
+                # Persist host damping settings only when the operator set
+                # them explicitly: the gains were validated with that exact
+                # band active, so they must be loaded together later.
                 path = update_joint_calibration(
                     side_str,
                     joint.value,
                     kp=best["kp"],
                     kd=best["kd"],
                     kd_host=args.host_kd,
+                    kd_host_hz=args.host_kd_hz,
+                    kd_host_q=args.host_kd_q,
                 )
                 saved = f"Kp={best['kp']}  Kd={best['kd']}"
                 if args.host_kd is not None:
                     saved += f"  kd_host={args.host_kd}"
+                if args.host_kd_hz is not None:
+                    saved += f"  kd_host_hz={args.host_kd_hz}"
+                if args.host_kd_q is not None:
+                    saved += f"  kd_host_q={args.host_kd_q}"
                 print(f"\n  Saved {saved} to {path}")
                 print(
                     "  (loaded automatically by AxolConfig on this machine; "

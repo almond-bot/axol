@@ -171,6 +171,34 @@ class RtAxol:
 
     async def enable(self) -> None:
         """Full rt bring-up: prep (core resets) -> Python reads -> arm."""
+        try:
+            await self._enable()
+        except BaseException:
+            # A failed/cancelled __aenter__ has no __aexit__. Run teardown in
+            # its own shielded task so every resource acquired by _enable is
+            # rolled back before the original failure reaches the caller.
+            cleanup = asyncio.create_task(self.disable(), name="rt-startup-rollback")
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except BaseException:  # noqa: BLE001 - preserve original cause
+                    # Keep joining after repeated cancellation/interruption.
+                    # Otherwise caller can close the loop while this safety
+                    # cleanup is merely an unreferenced background task.
+                    continue
+            if not cleanup.cancelled():
+                cleanup_exc = cleanup.exception()
+                if cleanup_exc is not None:
+                    _logger.error(
+                        "rt: startup rollback failed",
+                        exc_info=cleanup_exc,
+                    )
+            else:
+                _logger.error("rt: startup rollback was unexpectedly cancelled")
+            raise
+
+    async def _enable(self) -> None:
+        """Bring up the realtime core; :meth:`enable` owns rollback."""
         self._fb_packets = [0, 0]
         await self._link.start()
         await self._link.configure(self._config_text())
@@ -184,11 +212,14 @@ class RtAxol:
             await arm.resolve_joint_offsets()
             # Python never calls Motor.enable() in production control, so run the
             # MyActuator capability detection (position/torque decode ranges)
-            # explicitly — otherwise the passive feedback decode would use
-            # the legacy scaling on V4.4 firmware.
+            # and undervoltage provisioning explicitly. Otherwise passive
+            # feedback would use legacy scaling on V4.4 firmware and a fresh
+            # motor could retain the factory voltage threshold.
             for j in ARM_JOINTS:
                 if _JOINT_CONFIG[j].motor_id <= 5:
-                    await arm.motors[j]._driver._detect_capabilities()
+                    driver = arm.motors[j]._driver
+                    await driver._detect_capabilities()
+                    await driver._apply_low_voltage_threshold()
 
         # Gripper bring-up runs from Python while the bus is still quiet —
         # the exact classic flow (enable/calibrate or attach/restore) the
@@ -208,13 +239,7 @@ class RtAxol:
         # Hand the interfaces over completely: the maintenance proxy exits
         # before the realtime bus threads open their SocketCAN sockets.
         await asyncio.gather(*(bus.close() for bus in self._buses()))
-        try:
-            await self._link.arm()
-        except Exception:
-            # Restore maintenance access so startup cleanup can still disable
-            # any motor the core managed to touch before failing.
-            await asyncio.gather(*(bus.start() for bus in self._buses()))
-            raise
+        await self._link.arm()
         await self._wait_for_caches()
         # Prime one full hold target at the measured pose: the core's own
         # bring-up hold has no gravity feedforward (t_ff = 0) and no damping
@@ -387,13 +412,28 @@ class RtAxol:
         """Gate measured and Rust-internal traces to the VR engaged segment."""
         if engaged == self._recording_engaged:
             return
-        if self._rec is not None:
+        if self._rec is None:
+            return
+        if engaged:
             self._link.set_recording_engaged(engaged)
-            self._recording_engaged = engaged
-            self._rec.set_engaged(engaged)
-            if not engaged:
-                self._record_sides.clear()
-                self._record_side_ts.clear()
+            self._recording_engaged = True
+            self._rec.set_engaged(True)
+            return
+
+        # Clear local state before touching a faulted core: RtLink._send may
+        # reject the trace packet, but teardown and recorder finalization must
+        # still proceed. Disengagement is deliberately best-effort.
+        self._recording_engaged = False
+        self._record_sides.clear()
+        self._record_side_ts.clear()
+        try:
+            self._link.set_recording_engaged(False)
+        except Exception as exc:  # noqa: BLE001 - core may already be faulted
+            _logger.warning("rt: could not disengage the core trace (%s)", exc)
+        try:
+            self._rec.set_engaged(False)
+        except Exception:  # noqa: BLE001 - do not abort hardware teardown
+            _logger.exception("rt: could not disengage the measurement trace")
 
     async def _wait_for_caches(self) -> None:
         """Block until the core's telemetry stream is flowing for every arm.
@@ -483,10 +523,34 @@ class RtAxol:
             await self._link.disarm()
         except Exception as exc:  # noqa: BLE001 - core may already be gone
             _logger.warning("rt: disarm failed (%s); core teardown continues", exc)
-        await self._link.close()
-        # The core's bus threads have exited. Reopen Rust maintenance proxies
-        # before the belt-and-braces request/reply disable below.
-        await asyncio.gather(*(bus.start() for bus in self._buses()))
+        try:
+            await self._link.close()
+        except Exception:  # noqa: BLE001 - continue with maintenance disable
+            _logger.exception("rt: core link teardown failed")
+        # Reopen Rust maintenance proxies only after proving that the core's
+        # bus-owning process has exited.
+        buses = self._buses()
+        core_process = self._link._proc
+        core_stopped = core_process is None or core_process.poll() is not None
+        if core_stopped:
+            results = await asyncio.gather(
+                *(bus.start() for bus in buses), return_exceptions=True
+            )
+        else:
+            # Never contend for SocketCAN with a core whose teardown failed.
+            # Its own watchdog/exit guard remains the only safe motor owner.
+            _logger.error(
+                "rt: core process is still running; refusing to reopen "
+                "maintenance proxies"
+            )
+            results = [RuntimeError("realtime core still owns the bus")] * len(buses)
+        for bus, result in zip(buses, results):
+            if isinstance(result, BaseException):
+                _logger.warning(
+                    "rt: could not reopen maintenance proxy on %s (%s)",
+                    bus._channel,
+                    result,
+                )
         # The core already disabled the motors on disarm/exit; repeating the
         # shutdown from Python is harmless (the bus is free again) and covers
         # a core that died mid-session. Also closes the Python buses.
@@ -495,9 +559,12 @@ class RtAxol:
         except Exception:  # noqa: BLE001 - best-effort cleanup
             _logger.exception("rt: python-side disable failed")
         if self._rec is not None:
-            # Join any disengage writer before the process can exit.
-            self._rec.dump()
-        if self._record_prefix is not None:
+            # Join any disengage writer before teardown returns.
+            try:
+                self._rec.dump()
+            except Exception:  # noqa: BLE001 - continue trace finalization
+                _logger.exception("rt: could not dump the measurement trace")
+        if self._record_prefix is not None and core_stopped:
             # Rust deliberately writes its high-volume trace outside Python
             # while armed. The bus is down now, so compacting cannot perturb
             # control timing and the operator gets one coherent recording.
@@ -507,3 +574,7 @@ class RtAxol:
                 await asyncio.to_thread(compact_rt_trace, self._record_prefix)
             except Exception:  # noqa: BLE001 - retain raw CSVs for recovery
                 _logger.exception("rt: could not compact the control trace")
+        elif self._record_prefix is not None:
+            _logger.warning(
+                "rt: retaining raw control trace because the core is still running"
+            )

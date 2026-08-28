@@ -7,7 +7,7 @@
 use crate::can::CanSock;
 use crate::filter::{self, BandPass, LpDiff};
 use crate::proto::{self, MitRanges};
-use crate::safety::{guarded_send, SendOutcome};
+use crate::safety::{guarded_send, purge_tx_queue, SendOutcome};
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::AsRawFd;
@@ -157,6 +157,7 @@ fn sleep_until(deadline: Instant) {
 /// `(t, clean_target, actual, torque)` f64 rows.
 pub fn run(
     payload: &[u8],
+    iface: &str,
     socket: &CanSock,
     feedback: &FeedbackStore,
     enobufs_since: &mut Option<Instant>,
@@ -246,7 +247,15 @@ pub fn run(
             SendOutcome::Sent => {}
             SendOutcome::Dropped => {}
             SendOutcome::Stalled => {
-                return Err(io::Error::other("CAN TX stalled during tuning experiment"))
+                let purged = purge_tx_queue(iface);
+                return Err(io::Error::other(format!(
+                    "CAN {iface} TX stalled during tuning experiment{}",
+                    if purged {
+                        "; stale queue purged"
+                    } else {
+                        "; QUEUE PURGE FAILED, flap the interface before re-powering"
+                    }
+                )));
             }
         }
 

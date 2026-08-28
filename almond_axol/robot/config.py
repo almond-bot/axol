@@ -27,13 +27,23 @@ via :func:`dataclasses.replace`::
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..constants import ARM_JOINTS
-from .calibration import load_calibration, load_factory_calibration
+from .calibration import (
+    CALIBRATION_PATH,
+    FACTORY_CALIBRATION_PATH,
+    load_calibration,
+    load_factory_calibration,
+)
+from .identity import hub_serial
+
+_logger = logging.getLogger(__name__)
+_warned_calibration_identity = False
 
 
 @dataclass
@@ -468,8 +478,24 @@ def _build_arm(friction: _ArmFriction, *, is_left: bool) -> ArmConfig:
     # local values winning, so a locally retuned friction fit shadows the
     # factory's while the factory's com (say) still applies.
     side = "left" if is_left else "right"
-    factory = load_factory_calibration()[side]
-    local = load_calibration()[side]
+    if not CALIBRATION_PATH.is_file() and not FACTORY_CALIBRATION_PATH.is_file():
+        return arm
+    try:
+        current_hub_serial = hub_serial()
+    except (OSError, RuntimeError) as exc:
+        global _warned_calibration_identity
+        if not _warned_calibration_identity:
+            _warned_calibration_identity = True
+            _logger.warning(
+                "Ignoring per-robot calibration because the attached Axol hub "
+                "identity is ambiguous: %s",
+                exc,
+            )
+        return arm
+    if current_hub_serial is None:
+        return arm
+    factory = load_factory_calibration(expected_hub_serial=current_hub_serial)[side]
+    local = load_calibration(expected_hub_serial=current_hub_serial)[side]
     if not factory and not local:
         return arm
     return replace(

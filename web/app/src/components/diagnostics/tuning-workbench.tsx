@@ -46,7 +46,7 @@ const ARM_JOINT_OPTIONS = [
 // Run kinds this workbench presents. Anything else in the store (e.g. old
 // offline-analysis artifacts) is hidden rather than half-rendered. "filter"
 // artifacts (the retired offline-only tab) still render for old runs.
-const KNOWN_KINDS = new Set(["sine", "step", "motion", "filter", "build", "kinematics"])
+const KNOWN_KINDS = new Set(["sine", "step", "motion", "gravity", "filter", "build", "kinematics"])
 
 /* ------------------------------------------------------------------ */
 /* Inline launcher: what to run, its parameters, and the Run button   */

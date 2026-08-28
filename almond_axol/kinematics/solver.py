@@ -168,6 +168,7 @@ def _base_collision_safe_step(
     q_from: jax.Array,
     q_to: jax.Array,
     clearance_floor: jax.Array,
+    max_joint_delta: jax.Array,
 ) -> tuple[jax.Array, jax.Array]:
     """Project a rate-limited joint step along the base-clearance boundary.
 
@@ -177,10 +178,44 @@ def _base_collision_safe_step(
     joint step using the clearance Jacobian; tangential motion survives, so
     the arm can slide/reconfigure around the base rather than freezing. A
     negative floor is valid for conservative capsules that overlap at the
-    physically safe home pose.
+    physically safe home pose. Both the proposed step and any clearance
+    correction are scaled along their full joint-space direction to stay
+    within the per-call delta budget and the robot's joint limits.
     """
 
     guard_buffer = jnp.array(5e-4, dtype=q_from.dtype)
+
+    def bound_step(q_candidate: jax.Array) -> jax.Array:
+        """Shorten a step without changing its joint-space direction."""
+        delta = q_candidate - q_from
+        max_abs = jnp.max(jnp.abs(delta))
+        rate_scale = jnp.minimum(
+            1.0,
+            jnp.maximum(max_joint_delta, 0.0) / jnp.maximum(max_abs, 1e-12),
+        )
+        delta = delta * rate_scale
+
+        # Find the largest scalar that keeps every component inside its hard
+        # joint interval. Scaling the whole vector preserves the tangent
+        # projection; clipping individual joints could point it back into the
+        # base after the clearance calculation.
+        room = jnp.where(
+            delta > 0.0,
+            robot.joints.upper_limits - q_from,
+            q_from - robot.joints.lower_limits,
+        )
+        limit_scale = jnp.where(
+            delta == 0.0,
+            1.0,
+            jnp.maximum(room, 0.0) / jnp.maximum(jnp.abs(delta), 1e-12),
+        )
+        delta = delta * jnp.clip(jnp.min(limit_scale), 0.0, 1.0)
+        return q_from + delta
+
+    # The caller already rate-limits q_to, but applying the constraints at
+    # this boundary makes them part of the projection's contract and also
+    # enforces the solver's otherwise-soft joint limits.
+    q_to = bound_step(q_to)
 
     def margin(q: jax.Array) -> jax.Array:
         distances = robot_coll.compute_self_collision_distance(robot, q)
@@ -196,7 +231,7 @@ def _base_collision_safe_step(
         inward_step = jnp.dot(gradient, delta)
         allowed_step = guard_buffer - from_margin
         correction = jnp.maximum(allowed_step - inward_step, 0.0) / gradient_sq
-        q_slide = q_from + delta + correction * gradient
+        q_slide = bound_step(q_from + delta + correction * gradient)
         slide_margin = margin(q_slide)
 
         def recover_existing(_unused: None) -> jax.Array:
@@ -987,6 +1022,7 @@ class KinematicsSolver:
             jnp.asarray(q_current, dtype=jnp.float32),
             jnp.asarray(q_out, dtype=jnp.float32),
             self._base_clearance_floor,
+            jnp.asarray(delta_budget, dtype=jnp.float32),
         )
         guard_active = bool(guard_active_jax)
         if guard_active and not self._base_collision_guard_active:

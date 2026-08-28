@@ -137,6 +137,7 @@ async def _calibrate_joint(
     joint: Joint,
     is_left: bool,
     velocities_rad: list[float],
+    hub_serial: str,
 ) -> dict[str, Any] | None:
     """Sweep one joint, fit friction + CoM, save both, return the entry.
 
@@ -251,6 +252,7 @@ async def _calibrate_joint(
         joint.value,
         friction=entry.get("friction"),
         com=tuple(entry["com"]) if "com" in entry else None,
+        hub_serial=hub_serial,
     )
     return entry
 
@@ -260,6 +262,7 @@ async def _calibrate_arm(
     is_left: bool,
     velocities_rad: list[float],
     results: dict[str, dict[str, Any]],
+    hub_serial: str,
 ) -> None:
     """Home the arm, calibrate all 7 joints distal->proximal, park, disable.
 
@@ -283,7 +286,9 @@ async def _calibrate_arm(
             print("  Homing all joints to rest (distal to proximal) ...")
             await _home_all(motors)
             for joint in _CAL_ORDER:
-                entry = await _calibrate_joint(motors, joint, is_left, velocities_rad)
+                entry = await _calibrate_joint(
+                    motors, joint, is_left, velocities_rad, hub_serial
+                )
                 if entry:
                     results[joint.value] = entry
         finally:
@@ -299,6 +304,13 @@ async def _calibrate_arm(
 
 
 async def _run(args: argparse.Namespace) -> None:
+    serial = args.hub_serial or hub_serial()
+    if serial is None:
+        raise SystemExit(
+            "No Axol hub identity detected — attach the robot's hub or pass "
+            "--hub-serial before starting factory calibration."
+        )
+
     velocities_rad = [math.radians(v) for v in args.velocities]
     sides = {
         "both": [("left", args.left_channel), ("right", args.right_channel)],
@@ -307,7 +319,6 @@ async def _run(args: argparse.Namespace) -> None:
     }[args.arms]
 
     creds = supabase_credentials()
-    serial = args.hub_serial or hub_serial()
     print("\nAxol factory calibration — friction + gravity, all joints")
     print(f"  Arms: {', '.join(s for s, _ in sides)}")
     print(f"  Velocities: {[round(v, 1) for v in args.velocities]} deg/s")
@@ -319,13 +330,17 @@ async def _run(args: argparse.Namespace) -> None:
             "locally only."
         )
 
-    document: dict[str, Any] = {"version": 1}
+    document: dict[str, Any] = {"version": 1, "hub_serial": serial}
     try:
         for side_str, channel in sides:
             side_results: dict[str, dict[str, Any]] = {}
             document[side_str] = side_results
             await _calibrate_arm(
-                channel, side_str == "left", velocities_rad, side_results
+                channel,
+                side_str == "left",
+                velocities_rad,
+                side_results,
+                serial,
             )
     except KeyboardInterrupt:
         print("\n  Interrupted — keeping what completed.")
@@ -337,12 +352,6 @@ async def _run(args: argparse.Namespace) -> None:
     if creds is None:
         print("  Skipped cloud upload (no Supabase credentials).")
         return
-    if serial is None:
-        print(
-            "  ! No Axol hub adapter serial detected — cannot key the cloud "
-            "upload. Re-run the upload with --hub-serial once known."
-        )
-        return
     if n == 0:
         print("  Nothing calibrated — skipping cloud upload.")
         return
@@ -350,7 +359,7 @@ async def _run(args: argparse.Namespace) -> None:
     # the other arm's stored data.
     try:
         existing = fetch_calibration(serial) or {}
-        merged: dict[str, Any] = {"version": 1}
+        merged: dict[str, Any] = {"version": 1, "hub_serial": serial}
         for s in ("left", "right"):
             old = existing.get(s)
             new = document.get(s)
