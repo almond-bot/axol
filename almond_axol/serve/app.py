@@ -391,8 +391,8 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """Connect the robot link, optionally onto explicit CAN interfaces.
 
         Axol channel selections are persisted to the shared operation settings.
-        Mantis selection is diagnostics-only: it points the idle telemetry link
-        at the rig without changing the robot channels used by operations.
+        Mantis selection points the idle telemetry link at the rig without
+        changing the Axol channels stored for robot operations.
         """
         profile = req.profile if req is not None else "axol"
         if req is not None and req.channelsSet:

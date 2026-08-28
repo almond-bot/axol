@@ -31,6 +31,7 @@ import {
   type CameraSpec,
   type CommandSpec,
   type FormValue,
+  type HardwareProfile,
   type OperationId,
   type OperationMeta,
   type PolicyState,
@@ -341,7 +342,7 @@ export default function ControlPanel() {
     if (autoRobotRef.current || !robot) return
     autoRobotRef.current = true
     if (robot.state === "disconnected" && !robotBusy) {
-      robotConnectClick()
+      robotConnectClick("axol")
     }
     // robotConnectClick is stable enough (only uses state setters / fetch).
   }, [conn.state, robot, robotBusy])
@@ -462,10 +463,10 @@ export default function ControlPanel() {
   }
 
   // -- robot connection --
-  async function robotConnectClick() {
+  async function robotConnectClick(profile: HardwareProfile) {
     setRobotBusy(true)
     try {
-      setRobot(await robotConnect())
+      setRobot(await robotConnect(undefined, profile))
     } catch (e) {
       toast.error(String(e))
     } finally {
@@ -809,7 +810,7 @@ export default function ControlPanel() {
           opRunning={hostBusy}
           robot={robot}
           robotBusy={robotBusy}
-          onRobotConnect={() => robotConnectClick()}
+          onRobotConnect={robotConnectClick}
           onRobotDisconnect={robotDisconnectClick}
         />
 
@@ -924,7 +925,7 @@ function OperationSelector({
             type="button"
             onClick={() => onSelect(op.id)}
             className={cn(
-              "flex flex-col gap-1 rounded-xl border p-3 text-left transition-all",
+              "rounded-xl border p-3 text-left transition-all",
               active
                 ? "border-[#eff483]/40 bg-[#eff483]/10"
                 : "border-white/10 bg-white/[0.02] hover:border-white/25 hover:bg-white/[0.05]"
@@ -936,9 +937,6 @@ function OperationSelector({
               </span>
               {running && <span className="size-2 animate-pulse rounded-full bg-emerald-400" />}
             </div>
-            <span className="text-xs text-white/40">
-              {op.requiresCameras ? "Axol + Cameras" : op.simCapable ? "Axol or Sim" : "Axol"}
-            </span>
           </button>
         )
       })}
