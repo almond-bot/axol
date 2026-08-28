@@ -352,51 +352,85 @@ def _resolve_hub_serial() -> str | None:
 def _find_dual_serials() -> tuple[str | None, str | None]:
     """Automatically assign attached dual-channel hubs to Axol/Mantis.
 
-    Previously pinned, still-attached serials win. New or replacement hubs are
-    probed just like the single-channel peripherals; silence is presented for
-    manual assignment. Returns ``(axol_serial, mantis_serial)``.
+    Every attached hub is probed, including hubs already pinned by udev rules.
+    A positive device response overrides a stale pin; a silent configured hub
+    keeps its old role. New silent hardware is presented for manual assignment.
+    Returns ``(axol_serial, mantis_serial)``.
     """
     print(f"Scanning for dual-channel CAN adapters ({_VID}:{_PID})...")
     attached = set(_detect_serials())
     configured_axol = _configured_serial(_AXOL_PROFILE)
     configured_mantis = _configured_serial(_MANTIS_PROFILE)
 
-    # Preserve an unplugged configured hub only when there is no possible
-    # replacement attached. Otherwise probe the live candidates and replace a
-    # stale pin, matching the old one-profile setup behavior.
-    axol = configured_axol if configured_axol in attached or not attached else None
-    mantis = (
-        configured_mantis if configured_mantis in attached or not attached else None
-    )
-    if axol:
-        print(f"  Axol: keeping configured adapter (serial {axol}).")
-    if mantis:
-        print(f"  Mantis: keeping configured adapter (serial {mantis}).")
-    if axol is not None and axol == mantis:
+    # Probe configured adapters too. Otherwise an adapter incorrectly pinned
+    # as Axol once is excluded forever and can.setup never sees its Mantis
+    # trigger, so every subsequent run preserves the wrong interface names.
+    roles: dict[str, str | None] = {}
+    for serial in sorted(attached):
+        print(f"  {serial}: probing Mantis trigger / Axol shoulder...")
+        roles[serial] = _identify_dual_adapter(serial)
+
+    if (
+        configured_axol is not None
+        and configured_axol == configured_mantis
+        and roles.get(configured_axol) is None
+    ):
         _die(
-            f"Adapter {axol} is pinned as both Axol and Mantis. Remove the "
-            "conflicting CAN udev rule and re-run setup."
+            f"Adapter {configured_axol} is pinned as both Axol and Mantis, "
+            "and no device answered to resolve the conflict. Power the hardware "
+            "or remove the conflicting CAN udev rule, then re-run setup."
         )
 
-    candidates = sorted(attached - {s for s in (axol, mantis) if s})
-    unidentified: list[str] = []
-    for serial in candidates:
-        print(f"  {serial}: probing Mantis trigger / Axol shoulder...")
-        role = _identify_dual_adapter(serial)
-        if role == "axol" and axol is None:
-            axol = serial
-            print(f"  {serial}: Axol shoulder answered -> arm hub")
-        elif role == "mantis" and mantis is None:
-            mantis = serial
-            print(f"  {serial}: Mantis trigger answered -> handheld rig")
-        elif role is not None:
-            print(
-                f"  {serial}: identified as {role}, but that role is already "
-                "pinned to another adapter — skipping."
-            )
-        else:
-            unidentified.append(serial)
+    def detected_for(role: str, configured: str | None) -> str | None:
+        matches = sorted(serial for serial, found in roles.items() if found == role)
+        if not matches:
+            return None
+        selected = configured if configured in matches else matches[0]
+        label = "Axol shoulder" if role == "axol" else "Mantis trigger"
+        print(f"  {selected}: {label} answered -> {role}")
+        for serial in matches:
+            if serial != selected:
+                print(
+                    f"  {serial}: also identified as {role}, but that role is "
+                    "already assigned — skipping."
+                )
+        return selected
 
+    axol = detected_for("axol", configured_axol)
+    mantis = detected_for("mantis", configured_mantis)
+
+    # Preserve an old assignment only when its attached hardware was silent
+    # (power may be off), or when no possible replacement is attached at all.
+    for role, configured in (
+        ("axol", configured_axol),
+        ("mantis", configured_mantis),
+    ):
+        current = axol if role == "axol" else mantis
+        other = mantis if role == "axol" else axol
+        keep = (
+            current is None
+            and configured is not None
+            and configured != other
+            and (
+                not attached
+                or (configured in attached and roles.get(configured) is None)
+            )
+        )
+        if keep:
+            if role == "axol":
+                axol = configured
+            else:
+                mantis = configured
+            print(
+                f"  {role.capitalize()}: no device answered; keeping configured "
+                f"adapter (serial {configured})."
+            )
+
+    unidentified = [
+        serial
+        for serial, role in sorted(roles.items())
+        if role is None and serial not in (axol, mantis)
+    ]
     for serial in unidentified:
         print(f"  {serial}: no identifying device answered.")
         choice = (
@@ -1307,6 +1341,8 @@ def run(args: object = None) -> None:
         # (CANable 2.0); give their interfaces a moment to appear.
         time.sleep(2.0)
 
+    configured_axol = _configured_serial(_AXOL_PROFILE)
+    configured_mantis = _configured_serial(_MANTIS_PROFILE)
     hub_serial, mantis_serial = _find_dual_serials()
     wheels_serial, chest_serial = _find_single_serials(hub_serial)
     if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
@@ -1314,10 +1350,26 @@ def run(args: object = None) -> None:
             "No CAN adapters found or configured. Connect the Axol/Mantis hub, "
             "wheel-bus, or chest adapter and re-run."
         )
+    axol_reclassified = configured_axol is not None and configured_axol == mantis_serial
+    mantis_reclassified = (
+        configured_mantis is not None and configured_mantis == hub_serial
+    )
     if hub_serial or wheels_serial or chest_serial:
         _apply_setup(hub_serial, wheels_serial, chest_serial)
+    elif axol_reclassified:
+        # _configure_mantis below reloads udev and renames the live interfaces;
+        # just erase the stale Axol serial match first. Running the full Axol
+        # bring-up here would pointlessly probe the Mantis grippers as shoulders.
+        _write_udev_rules(None)
     if mantis_serial:
         _configure_mantis(mantis_serial)
+    elif mantis_reclassified:
+        # The live Axol response overrode a stale Mantis pin. Leave its startup
+        # assets harmlessly installed, but remove the serial-matching udev rule
+        # so the adapter cannot be renamed back to Mantis on its next hotplug.
+        _remove_pre_mantis_config()
+        _write_udev_rules(None, profile=_MANTIS_PROFILE)
+        _reload_udev()
 
     print()
     print("Setup complete.")
