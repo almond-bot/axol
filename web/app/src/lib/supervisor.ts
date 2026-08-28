@@ -522,6 +522,8 @@ export const RESOLUTION_OFF = "off"
  */
 export interface CameraSpec {
   serials: Record<CameraSlot, string>
+  /** Mantis wrist-camera assignment, kept separate from the Axol camera map. */
+  mantis_serials?: Pick<Record<CameraSlot, string>, "left_arm" | "right_arm">
   /** Capture resolution → headset stream (full quality), or `"off"`. */
   stream_resolution?: string
   /** Dataset downscale target (collect-data recording), or `"off"`. */
@@ -687,14 +689,33 @@ export function urdfUrl(): string {
   return apiUrl("/api/urdf/axol.urdf")
 }
 
-export function cameraCount(spec: CameraSpec): number {
-  return Object.values(spec.serials).filter((s) => s.trim()).length
+export function cameraSerials(
+  spec: CameraSpec,
+  mantis?: boolean
+): Partial<Record<CameraSlot, string>> {
+  if (mantis === true) {
+    return (
+      spec.mantis_serials ?? {
+        left_arm: spec.serials.left_arm,
+        right_arm: spec.serials.right_arm,
+      }
+    )
+  }
+  return spec.serials
+}
+
+export function cameraCount(spec: CameraSpec, mantis?: boolean): number {
+  const values =
+    mantis === undefined
+      ? [...Object.values(spec.serials), ...Object.values(spec.mantis_serials ?? {})]
+      : Object.values(cameraSerials(spec, mantis))
+  return new Set(values.map((s) => s?.trim()).filter(Boolean)).size
 }
 
 /** Non-empty, trimmed serials assigned across the camera slots. */
-export function configuredSerials(spec: CameraSpec): string[] {
-  return Object.values(spec.serials)
-    .map((s) => s.trim())
+export function configuredSerials(spec: CameraSpec, mantis = false): string[] {
+  return Object.values(cameraSerials(spec, mantis))
+    .map((s) => s?.trim() ?? "")
     .filter(Boolean)
 }
 
@@ -703,9 +724,13 @@ export function configuredSerials(spec: CameraSpec): string[] {
  * cameras the operator assigned but that aren't physically connected. An empty
  * result means every assigned camera was found.
  */
-export function missingCameraSerials(spec: CameraSpec, detected: CameraDevice[]): string[] {
+export function missingCameraSerials(
+  spec: CameraSpec,
+  detected: CameraDevice[],
+  mantis = false
+): string[] {
   const present = new Set(detected.map((d) => String(d.serial)))
-  return configuredSerials(spec).filter((s) => !present.has(s))
+  return configuredSerials(spec, mantis).filter((s) => !present.has(s))
 }
 
 // ---------------------------------------------------------------------------

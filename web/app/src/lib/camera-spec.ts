@@ -28,7 +28,8 @@ type BranchMap = Partial<Record<CameraSlot, BranchSel>>
  */
 export function materializeCameraSpec(
   spec: CameraSpec,
-  devices: CameraDevice[] | null
+  devices: CameraDevice[] | null,
+  mantis = false
 ): CameraSpec {
   const kindBySerial = new Map((devices ?? []).map((d) => [String(d.serial), d.kind]))
   const materialize = (map: BranchMap, slot: CameraSlot, stereo: boolean): BranchSel =>
@@ -36,7 +37,11 @@ export function materializeCameraSpec(
   const outStream: BranchMap = { ...(spec.stream ?? {}) }
   const outRecord: BranchMap = { ...(spec.record ?? {}) }
   for (const key of CAMERA_SLOT_KEYS) {
-    const kind = kindBySerial.get(spec.serials[key].trim())
+    const mappedSerial =
+      mantis && key !== "overhead"
+        ? (spec.mantis_serials?.[key] ?? spec.serials[key])
+        : spec.serials[key]
+    const kind = kindBySerial.get(mappedSerial.trim())
     if (!kind) continue // unknown kind / unassigned: leave backend defaults
     const stereo = kind === "stereo"
     outStream[key] = materialize(spec.stream ?? {}, key, stereo)
@@ -47,6 +52,10 @@ export function materializeCameraSpec(
       overhead: spec.serials.overhead.trim(),
       left_arm: spec.serials.left_arm.trim(),
       right_arm: spec.serials.right_arm.trim(),
+    },
+    mantis_serials: {
+      left_arm: (spec.mantis_serials?.left_arm ?? spec.serials.left_arm).trim(),
+      right_arm: (spec.mantis_serials?.right_arm ?? spec.serials.right_arm).trim(),
     },
     stream_resolution: spec.stream_resolution || spec.resolution || "SVGA",
     record_resolution: spec.record_resolution || "SVGA",

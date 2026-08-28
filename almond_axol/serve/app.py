@@ -53,12 +53,15 @@ class OpStartRequest(BaseModel):
 
         {
           "serials": {"overhead": 41234567, "left_arm": ..., "right_arm": ...},
+          "mantis_serials": {"left_arm": ..., "right_arm": ...},
           "stream_resolution": "HD1200",   # capture res → headset; "off" disables
           "record_resolution": "SVGA",     # dataset downscale; "off" disables
           "stream": {"overhead": "both", "left_arm": true},   # per-slot headset
           "record": {"overhead": "left", "left_arm": false}   # per-slot dataset
         }
 
+    ``mantis_serials`` is a separate two-camera assignment used whenever the
+    operation's Mantis toggle is on; Axol continues to use ``serials``.
     The ``stream`` / ``record`` maps decide per camera whether it takes part in
     each branch: ``false`` opts a camera out, ``true`` opts a mono camera in, and
     an eye name (``"both"`` / ``"left"`` / ``"right"``) opts a stereo camera in

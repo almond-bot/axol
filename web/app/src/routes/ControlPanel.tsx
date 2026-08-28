@@ -59,6 +59,7 @@ type OpSettings = Record<OperationId, Record<string, FormValue>>
 
 const DEFAULT_CAMERAS: CameraSpec = {
   serials: { overhead: "", left_arm: "", right_arm: "" },
+  mantis_serials: { left_arm: "", right_arm: "" },
   stream_resolution: "SVGA",
   record_resolution: "SVGA",
   stream: {},
@@ -74,6 +75,13 @@ function loadCameras(): CameraSpec {
         ...DEFAULT_CAMERAS,
         ...parsed,
         serials: { ...DEFAULT_CAMERAS.serials, ...(parsed.serials ?? {}) },
+        mantis_serials: {
+          ...DEFAULT_CAMERAS.mantis_serials,
+          ...(parsed.mantis_serials ?? {
+            left_arm: parsed.serials?.left_arm ?? "",
+            right_arm: parsed.serials?.right_arm ?? "",
+          }),
+        },
         // Migrate the legacy single `resolution` to the streaming resolution.
         stream_resolution:
           parsed.stream_resolution ?? parsed.resolution ?? DEFAULT_CAMERAS.stream_resolution,
@@ -689,6 +697,7 @@ export default function ControlPanel() {
       // gated on them. Teleop streams whatever cameras are configured but must
       // never be blocked by camera detection, and sim never touches hardware.
       const isSimSelected = isSimRun(meta, settings)
+      const mantisSelected = Boolean(settings.mantis)
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
         // dialog closed) instead of spawning a fresh enumeration on every start
@@ -709,7 +718,7 @@ export default function ControlPanel() {
           toast.error(`Can't verify cameras: ${detErr}`)
           return
         }
-        const missing = missingCameraSerials(cameras, devices ?? [])
+        const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected)
         if (missing.length > 0) {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
@@ -729,7 +738,8 @@ export default function ControlPanel() {
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim). Newer hosts also hold the
       // spec in their settings store; sending it stays compatible with old ones.
-      const camSpec = meta.requiresCameras || cameraCount(cameras) > 0 ? cameras : undefined
+      const camSpec =
+        meta.requiresCameras || cameraCount(cameras, mantisSelected) > 0 ? cameras : undefined
       const result = await startOperation(opId, args, camSpec)
       setSession(result)
       // Fresh run — clear any stale phase; the live poll repopulates it.
@@ -843,6 +853,7 @@ export default function ControlPanel() {
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
+              mantisMode={Boolean(settings.mantis)}
               onSave={handleSettingsSave}
               devices={cameraDevices}
               detecting={cameraDetecting}

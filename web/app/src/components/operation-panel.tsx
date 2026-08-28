@@ -136,7 +136,7 @@ export function OperationPanel({
   // arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
-  const camCount = cameraCount(cameras)
+  const camCount = cameraCount(cameras, Boolean(settings.mantis))
 
   const blockers: string[] = []
   if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")

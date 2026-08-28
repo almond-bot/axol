@@ -62,6 +62,7 @@ export function SettingsSection({
   snapshot,
   supportError,
   cameras,
+  mantisMode,
   onSave,
   devices,
   detecting,
@@ -80,6 +81,8 @@ export function SettingsSection({
   supportError: string | null
   /** Current camera spec (server-stored, with localStorage fallback). */
   cameras: CameraSpec
+  /** Whether the currently selected run is using the Mantis hardware profile. */
+  mantisMode: boolean
   onSave: (patch: SettingsPatch) => Promise<void>
   devices: CameraDevice[] | null
   detecting: boolean
@@ -95,8 +98,8 @@ export function SettingsSection({
   const fileRef = useRef<HTMLInputElement>(null)
 
   const patch = useMemo(
-    () => (draft ? computePatch(snapshot, cameras, draft, devices) : null),
-    [draft, snapshot, cameras, devices]
+    () => (draft ? computePatch(snapshot, cameras, draft, devices, mantisMode) : null),
+    [draft, snapshot, cameras, devices, mantisMode]
   )
   const dirty = patch != null && Object.keys(patch).length > 0
 
@@ -255,6 +258,7 @@ export function SettingsSection({
             ) : tab === "cameras" ? (
               <CamerasPanel
                 spec={draft.cameras}
+                mantisMode={mantisMode}
                 onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
                 devices={devices}
                 detecting={detecting}
@@ -335,7 +339,8 @@ function computePatch(
   snapshot: SettingsSnapshot | null,
   storedCameras: CameraSpec,
   draft: Draft,
-  devices: CameraDevice[] | null
+  devices: CameraDevice[] | null,
+  mantisMode: boolean
 ): SettingsPatch {
   const patch: SettingsPatch = {}
 
@@ -349,7 +354,7 @@ function computePatch(
   }
   if (Object.keys(valuesPatch).length > 0) patch.values = valuesPatch
 
-  const camerasOut = materializeCameraSpec(draft.cameras, devices)
+  const camerasOut = materializeCameraSpec(draft.cameras, devices, mantisMode)
   if (JSON.stringify(camerasOut) !== JSON.stringify(storedCameras)) {
     patch.cameras = camerasOut
     patch.camerasSet = true

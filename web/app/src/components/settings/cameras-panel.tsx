@@ -10,7 +10,6 @@ import {
   type CameraSpec,
 } from "@/lib/supervisor"
 import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectOption } from "@/components/ui/select"
 import { useToast } from "@/components/ui/toast"
@@ -19,10 +18,15 @@ import { cn } from "@/lib/utils"
 
 type BranchMap = Partial<Record<CameraSlot, BranchSel>>
 
-const CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
+const AXOL_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
   { key: "overhead", label: "Overhead" },
   { key: "left_arm", label: "Left arm" },
   { key: "right_arm", label: "Right arm" },
+]
+
+const MANTIS_CAMERA_SLOTS: { key: CameraSlot; label: string }[] = [
+  { key: "left_arm", label: "Left Mantis" },
+  { key: "right_arm", label: "Right Mantis" },
 ]
 
 const RESOLUTIONS: { value: string; label: string }[] = [
@@ -45,12 +49,15 @@ const RESOLUTIONS: { value: string; label: string }[] = [
  */
 export function CamerasPanel({
   spec,
+  mantisMode,
   onChange,
   devices,
   detecting,
   onRefresh,
 }: {
   spec: CameraSpec
+  /** Show the two-camera Mantis assignment instead of the Axol layout. */
+  mantisMode: boolean
   onChange: (spec: CameraSpec) => void
   /** Detected ZED devices (shared with the badge; null until first detection). */
   devices: CameraDevice[] | null
@@ -70,7 +77,13 @@ export function CamerasPanel({
     setPreviewNonce((n) => n + 1)
   }
 
-  const serials = spec.serials
+  const cameraSlots = mantisMode ? MANTIS_CAMERA_SLOTS : AXOL_CAMERA_SLOTS
+  const serials: Partial<Record<CameraSlot, string>> = mantisMode
+    ? (spec.mantis_serials ?? {
+        left_arm: spec.serials.left_arm,
+        right_arm: spec.serials.right_arm,
+      })
+    : spec.serials
   const streamResolution = spec.stream_resolution || spec.resolution || "SVGA"
   const recordResolution = spec.record_resolution || "SVGA"
   const stream = spec.stream ?? {}
@@ -93,6 +106,7 @@ export function CamerasPanel({
   // never flags it: surface the detected kind next to each assigned slot and
   // shape the per-camera controls (mono = a single toggle; stereo = L/R).
   const kindBySerial = new Map((devices ?? []).map((d) => [String(d.serial), d.kind]))
+  const detectedSerials = (devices ?? []).map((d) => String(d.serial))
 
   const streamingOn = streamResolution !== RESOLUTION_OFF
   const recordingOn = recordResolution !== RESOLUTION_OFF
@@ -122,12 +136,43 @@ export function CamerasPanel({
     onChange({ ...spec, [key]: { ...map, [slot]: next } })
   }
 
+  function assignCamera(slot: CameraSlot, serial: string) {
+    const next = { ...serials, [slot]: serial }
+    if (serial) {
+      for (const candidate of cameraSlots) {
+        if (candidate.key !== slot && next[candidate.key]?.trim() === serial) {
+          next[candidate.key] = ""
+        }
+      }
+    }
+    if (mantisMode) {
+      onChange({
+        ...spec,
+        mantis_serials: {
+          left_arm: next.left_arm ?? "",
+          right_arm: next.right_arm ?? "",
+        },
+      })
+    } else {
+      onChange({
+        ...spec,
+        serials: {
+          overhead: next.overhead ?? "",
+          left_arm: next.left_arm ?? "",
+          right_arm: next.right_arm ?? "",
+        },
+      })
+    }
+  }
+
   return (
     <div className="flex flex-col gap-5">
       <p className="text-xs text-white/45">
-        Assign the ZED cameras connected to this machine to their slots, then choose what each one
-        is used for. Collect data and run policy need at least one camera recording; teleop streams
-        whichever are set to the headset.
+        {mantisMode
+          ? "Assign the two ZED cameras connected to this machine to the left and right Mantis. This mapping is stored separately from the Axol camera layout."
+          : "Assign the ZED cameras connected to this machine to their Axol slots."}{" "}
+        Then choose what each one is used for. Collect data and run policy need at least one camera
+        recording; teleop streams whichever are set to the headset.
       </p>
 
       <div className="flex flex-col gap-2">
@@ -166,7 +211,7 @@ export function CamerasPanel({
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {devices.map((d) => {
-              const slot = CAMERA_SLOTS.find(({ key }) => serials[key].trim() === String(d.serial))
+              const slot = cameraSlots.find(({ key }) => serials[key]?.trim() === String(d.serial))
               return (
                 <div
                   key={d.serial}
@@ -211,18 +256,19 @@ export function CamerasPanel({
       </div>
 
       <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-        <Label>Cameras</Label>
-        {CAMERA_SLOTS.map((slot) => {
-          const kind = kindBySerial.get(serials[slot.key].trim())
+        <Label>{mantisMode ? "Mantis cameras" : "Axol cameras"}</Label>
+        {cameraSlots.map((slot) => {
+          const serial = serials[slot.key]?.trim() ?? ""
+          const kind = kindBySerial.get(serial)
           const stereo = kind === "stereo"
-          const assignedSlot = serials[slot.key].trim() !== ""
+          const assignedSlot = serial !== ""
           return (
             <div key={slot.key} className="flex flex-col gap-2">
               <div className="flex items-center justify-between gap-4">
                 <div className="flex min-w-0 items-center gap-2.5">
                   {assignedSlot && kind && (
                     <CameraPreview
-                      serial={Number(serials[slot.key].trim())}
+                      serial={Number(serial)}
                       nonce={previewNonce}
                       className="h-10 w-16 shrink-0"
                     />
@@ -230,18 +276,24 @@ export function CamerasPanel({
                   <Label className="text-white/70">{slot.label}</Label>
                   {kind && <KindBadge kind={kind} />}
                 </div>
-                <Input
-                  value={serials[slot.key]}
-                  inputMode="numeric"
-                  spellCheck={false}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  onChange={(e) =>
-                    onChange({ ...spec, serials: { ...serials, [slot.key]: e.target.value } })
-                  }
-                  placeholder="serial"
-                  className="max-w-[180px]"
-                />
+                <Select
+                  value={serial}
+                  onChange={(e) => assignCamera(slot.key, e.target.value)}
+                  className="max-w-[240px]"
+                  aria-label={`${slot.label} camera`}
+                >
+                  <SelectOption value="" label="Not assigned" />
+                  {serial && !detectedSerials.includes(serial) && (
+                    <SelectOption value={serial} label={`${serial} (not detected)`} />
+                  )}
+                  {(devices ?? []).map((device) => (
+                    <SelectOption
+                      key={device.serial}
+                      value={String(device.serial)}
+                      label={`${device.serial} · ${humanModel(device.model)}`}
+                    />
+                  ))}
+                </Select>
               </div>
               {assignedSlot && kind && (
                 <div className="ml-1 flex flex-wrap items-center gap-x-5 gap-y-1.5 rounded-md border border-white/10 bg-white/[0.02] px-3 py-2">

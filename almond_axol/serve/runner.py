@@ -471,6 +471,10 @@ class OperationRunner:
                 if cameras is None:
                     cameras = self._settings.cameras()
 
+            cameras = self._camera_spec_for_profile(
+                cameras, mantis=bool(args.get("mantis"))
+            )
+
             # Fold the camera spec into the argv-style args for the ops whose
             # camera serials are required draccus inputs.
             if cameras and cmd.camera_mode == "argv":
@@ -732,6 +736,34 @@ class OperationRunner:
         self._await_stop(session, thread)
 
     # -- config building ----------------------------------------------------
+
+    @staticmethod
+    def _camera_spec_for_profile(
+        cameras: dict[str, Any] | None, *, mantis: bool
+    ) -> dict[str, Any] | None:
+        """Select the saved camera assignment for the active hardware profile.
+
+        Axol uses the normal overhead/left-arm/right-arm map. Mantis has its
+        own two-camera map so changing gripper cameras does not overwrite the
+        Axol rig. Older saved specs fall back to the Axol left/right entries.
+        """
+        if not mantis or not cameras:
+            return cameras
+
+        selected = dict(cameras)
+        axol_serials = cameras.get("serials") or {}
+        raw_mantis = cameras.get("mantis_serials")
+        mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
+        selected["serials"] = {
+            "overhead": "",
+            "left_arm": mantis_serials.get(
+                "left_arm", axol_serials.get("left_arm", "")
+            ),
+            "right_arm": mantis_serials.get(
+                "right_arm", axol_serials.get("right_arm", "")
+            ),
+        }
+        return selected
 
     @staticmethod
     def _camera_serials(cameras: dict[str, Any] | None) -> dict[str, int]:
