@@ -22,6 +22,11 @@
 //! - and the last target is held (tracker converges and stays, damping
 //!   live) when targets stop arriving.
 //!
+//! On robot-sized hosts the launcher reserves two CPUs for CAN and exports
+//! one assignment per side. Each bus thread pins itself before opening its
+//! interface and requests SCHED_FIFO priority when permitted, keeping camera,
+//! IK, and dataset load from stretching the damping loop's phase delay.
+//!
 //! Targets carry a mode flag: gravity-comp / hold flows stream
 //! *passthrough* targets (`mode 0`) that bypass the tracker and the
 //! friction/inertia terms — a hand-guided limp arm needs `v_des = 0` and
@@ -95,6 +100,10 @@
 //!   (the tracker output) disables both buses (e.g. a collision or a
 //!   runaway). The gripper is exempt — stalling against an object is its
 //!   normal operation.
+//! - Every command batch accepts exactly one fresh reply per motor. A missed
+//!   sample suppresses host damping; repeated/bursty feedback loss disables
+//!   both buses. Late ticks follow the same fail-closed rule, and a full-cycle
+//!   overrun is an immediate fault.
 //! - The gripper is not commanded at all until the first target arrives
 //!   (matching classic mode, where it sits idle until motion_control).
 //! - Watchdog: no target for `watchdog_ms` holds the last target (the
@@ -108,7 +117,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -132,12 +141,185 @@ const VEL_CUTOFF: f64 = 80.0;
 /// Target-tuple slots per arm: 7 arm joints + the gripper.
 const N_SLOTS: usize = 8;
 const GRIPPER_SLOT: usize = 7;
+/// Three absent samples is 12.5 ms at 240 Hz. Continuing impedance control
+/// beyond this point would let the host-damping term act on stale velocity,
+/// so fail closed and require a fresh arm instead.
+const MAX_CONSECUTIVE_MISSED_FEEDBACK: u8 = 3;
+/// Also reject bursty loss that never happens on consecutive ticks. Four
+/// misses in 32 ticks is 12.5% loss over 133 ms at 240 Hz; the failing
+/// collection capture reached nine, while healthy operation should remain
+/// comfortably below this after stale-frame isolation.
+const MAX_RECENT_MISSED_FEEDBACK: u32 = 4;
+/// Leave a small slice of each cycle for telemetry handoff and the next
+/// absolute sleep. The rest is valid reply time; the old 80% window discarded
+/// delayed USB-CAN replies despite there still being cycle headroom.
+const REPLY_GUARD: Duration = Duration::from_micros(150);
+/// A tick starting more than this far past its deadline is phase-degraded. Its
+/// host damping is suppressed even when feedback itself is fresh.
+const LATE_TICK: Duration = Duration::from_micros(500);
+const MAX_RECENT_LATE_TICKS: u32 = 8;
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_signal(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
+
+/// Put one CAN loop on its reserved CPU and request a real-time scheduler.
+///
+/// CPU isolation is mandatory when the launcher supplied an assignment: a
+/// failure means the process topology is not the one Python planned, so it is
+/// safer to refuse to arm than to silently recreate collection-time jitter.
+/// SCHED_FIFO is mandatory when the launcher requests it: a normal Linux
+/// timeslice can exceed the entire 240 Hz period even on a dedicated CPU.
+/// Production runs as a privileged service; development builds receive only
+/// `CAP_SYS_NICE` via `axol rt.install` / the documented `setcap` command.
+fn configure_bus_scheduling(
+    iface: &str,
+    side: u8,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+) -> io::Result<()> {
+    let cpu_key = if side == 0 {
+        "AXOL_RT_CPU_LEFT"
+    } else {
+        "AXOL_RT_CPU_RIGHT"
+    };
+    if let Ok(raw) = std::env::var(cpu_key) {
+        let cpu: usize = raw.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{iface}: invalid {cpu_key}={raw:?}"),
+            )
+        })?;
+        let mut set = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
+        unsafe {
+            libc::CPU_ZERO(&mut set);
+            libc::CPU_SET(cpu, &mut set);
+        }
+        let rc = unsafe {
+            libc::sched_setaffinity(
+                0,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &set as *const libc::cpu_set_t,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::other(format!(
+                "{iface}: could not pin CAN loop to CPU {cpu}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        send_text(
+            out_tx,
+            b'L',
+            &format!("{iface}: CAN loop isolated on CPU {cpu}"),
+        );
+    }
+
+    if let Ok(raw) = std::env::var("AXOL_RT_FIFO_PRIORITY") {
+        let priority: libc::c_int = raw.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{iface}: invalid AXOL_RT_FIFO_PRIORITY={raw:?}"),
+            )
+        })?;
+        let min = unsafe { libc::sched_get_priority_min(libc::SCHED_FIFO) };
+        let max = unsafe { libc::sched_get_priority_max(libc::SCHED_FIFO) };
+        if priority < min || priority > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{iface}: SCHED_FIFO priority {priority} outside {min}..={max}"),
+            ));
+        }
+        let param = libc::sched_param {
+            sched_priority: priority,
+        };
+        let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+        if rc == 0 {
+            send_text(
+                out_tx,
+                b'L',
+                &format!("{iface}: CAN loop SCHED_FIFO priority {priority}"),
+            );
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{iface}: cannot enter SCHED_FIFO priority {priority}: {}; refusing to arm without real-time scheduling (run `axol rt.install` or grant CAP_SYS_NICE to axol-rt)",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Schedule the next batch from the instant this batch actually began.
+///
+/// A deadline based on the old absolute grid compresses the interval following
+/// any late wake: 1.5 ms late at 240 Hz would make the next command gap only
+/// 2.67 ms. Motors cannot recover elapsed control time, and that shortened
+/// feedback/command phase can turn host damping into excitation. A relative
+/// start-to-start period gives up an unobservable amount of wall-clock phase
+/// instead: lateness can lower the average rate briefly, but can never produce
+/// a catch-up command faster than the configured rate.
+fn next_bus_deadline(began: Instant, period: Duration) -> Instant {
+    began + period
+}
+
+/// Accept at most one reply from each motor commanded in this tick.
+///
+/// CAN frames carry no command sequence number. The bus loop therefore drains
+/// late frames before sending and uses this per-batch set to prevent duplicate
+/// or unsolicited feedback from satisfying another motor's reply budget.
+fn mark_unique_expected_reply(expected: &[bool], seen: &mut [bool], idx: usize) -> bool {
+    if idx >= expected.len() || idx >= seen.len() || !expected[idx] || seen[idx] {
+        return false;
+    }
+    seen[idx] = true;
+    true
+}
+
+#[derive(Clone, Copy, Default)]
+struct FeedbackHealth {
+    consecutive_misses: u8,
+    recent_misses: u32,
+}
+
+impl FeedbackHealth {
+    /// Record one 240 Hz feedback opportunity. Returns true once either the
+    /// consecutive-loss or rolling-loss safety limit has been reached.
+    fn record(&mut self, received: bool) -> bool {
+        self.recent_misses = (self.recent_misses << 1) | u32::from(!received);
+        if received {
+            self.consecutive_misses = 0;
+        } else {
+            self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+        }
+        self.consecutive_misses >= MAX_CONSECUTIVE_MISSED_FEEDBACK
+            || self.recent_misses.count_ones() >= MAX_RECENT_MISSED_FEEDBACK
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TimingHealth {
+    recent_late: u32,
+    consecutive_late: u8,
+}
+
+impl TimingHealth {
+    fn record(&mut self, on_time: bool) -> bool {
+        self.recent_late = (self.recent_late << 1) | u32::from(!on_time);
+        if on_time {
+            self.consecutive_late = 0;
+        } else {
+            self.consecutive_late = self.consecutive_late.saturating_add(1);
+        }
+        self.consecutive_late >= 3 || self.recent_late.count_ones() >= MAX_RECENT_LATE_TICKS
+    }
+}
+
+type BusStartGate = (Mutex<Option<Instant>>, Condvar);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JointCmd {
@@ -526,6 +708,57 @@ mod tests {
         assert!(parse_record_gate(&[0, 0]).is_err());
     }
 
+    #[test]
+    fn bus_deadline_never_catches_up_after_overrun() {
+        let base = Instant::now();
+        let period = Duration::from_millis(4);
+        assert_eq!(
+            next_bus_deadline(base + Duration::from_millis(2), period),
+            base + Duration::from_millis(6)
+        );
+    }
+
+    #[test]
+    fn replies_must_be_expected_and_unique() {
+        let expected = [true, true, false];
+        let mut seen = [false; 3];
+        assert!(mark_unique_expected_reply(&expected, &mut seen, 0));
+        assert!(!mark_unique_expected_reply(&expected, &mut seen, 0));
+        assert!(!mark_unique_expected_reply(&expected, &mut seen, 2));
+        assert!(mark_unique_expected_reply(&expected, &mut seen, 1));
+        assert_eq!(seen, [true, true, false]);
+    }
+
+    #[test]
+    fn feedback_health_catches_consecutive_and_bursty_loss() {
+        let mut consecutive = FeedbackHealth::default();
+        assert!(!consecutive.record(false));
+        assert!(!consecutive.record(false));
+        assert!(consecutive.record(false));
+
+        let mut bursty = FeedbackHealth::default();
+        for _ in 0..3 {
+            assert!(!bursty.record(false));
+            assert!(!bursty.record(true));
+        }
+        assert!(bursty.record(false));
+
+        let mut healthy = FeedbackHealth::default();
+        for tick in 0..128 {
+            assert!(!healthy.record(tick % 32 != 0));
+        }
+    }
+
+    #[test]
+    fn timing_health_catches_clustered_late_ticks() {
+        let mut health = TimingHealth::default();
+        for _ in 0..7 {
+            assert!(!health.record(false));
+            assert!(!health.record(true));
+        }
+        assert!(health.record(false));
+    }
+
     /// Live stall-detection check against a real interface whose bus has no
     /// powered nodes (motors off = the e-stop condition). Uses ID 0x7F0 —
     /// unused by both motor protocols — so the frames left in the TX queue
@@ -797,6 +1030,11 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                 stop.store(false, Ordering::SeqCst);
                 fault.store(0, Ordering::SeqCst);
                 let (ready_tx, ready_rx) = mpsc::channel::<io::Result<()>>();
+                // Release both buses onto one epoch only after bring-up has
+                // completed. Each side then gets half a period of phase
+                // separation, preventing both USB-CAN adapters from bursting
+                // commands and replies through the same xHCI interrupt at once.
+                let start_gate = Arc::new((Mutex::new(None), Condvar::new()));
                 for (side, iface, specs) in cfg.buses.clone() {
                     let cfg = Arc::clone(cfg);
                     let targets = Arc::clone(&targets);
@@ -807,6 +1045,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                     let trace_origin_bits = Arc::clone(&trace_origin_bits);
                     let out_tx = out_tx.clone();
                     let ready_tx = ready_tx.clone();
+                    let start_gate = Arc::clone(&start_gate);
                     bus_threads.push(std::thread::spawn(move || {
                         bus_loop(
                             &iface,
@@ -821,6 +1060,7 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                             &trace_origin_bits,
                             &out_tx,
                             &ready_tx,
+                            &start_gate,
                         )
                     }));
                 }
@@ -842,6 +1082,11 @@ pub fn run(socket_path: &str) -> io::Result<()> {
                             break;
                         }
                     }
+                }
+                {
+                    let (lock, wake) = &*start_gate;
+                    *lock.lock().unwrap() = Some(Instant::now() + Duration::from_millis(20));
+                    wake.notify_all();
                 }
                 if ok {
                     send_text(&out_tx, b'S', "armed");
@@ -915,7 +1160,12 @@ fn bus_loop(
     trace_origin_bits: &AtomicU64,
     out_tx: &mpsc::Sender<Vec<u8>>,
     ready_tx: &mpsc::Sender<io::Result<()>>,
+    start_gate: &BusStartGate,
 ) -> io::Result<()> {
+    if let Err(err) = configure_bus_scheduling(iface, side, out_tx) {
+        let _ = ready_tx.send(Err(err));
+        return Ok(());
+    }
     let sock = match CanSock::open(iface) {
         Ok(s) => s,
         Err(err) => {
@@ -1019,6 +1269,10 @@ fn bus_loop(
     // an `F` packet — the core is the only CAN consumer; Python fills its
     // Motor caches from these instead of passively reading the bus.
     let mut latest: [SlotFeedback; N_SLOTS] = [None; N_SLOTS];
+    // Whether the immediately preceding tick produced a fresh sample for
+    // each slot. Host damping is suppressed for one tick after a miss; the
+    // firmware's local kd remains active without relying on stale host state.
+    let mut feedback_fresh = [false; N_SLOTS];
     // Wire command per slot this tick (tracker output or passthrough) —
     // the reference the deviation abort measures against.
     let mut cmd_pos: [f64; N_SLOTS] = [0.0; N_SLOTS];
@@ -1043,13 +1297,28 @@ fn bus_loop(
     // freshly purged queue should stay empty).
     let mut enobufs_since: Option<Instant> = None;
     let mut bus_dead = false;
+    let mut feedback_health = [FeedbackHealth::default(); N_SLOTS];
+    let mut timing_health = TimingHealth::default();
     // Belt-and-braces: sends on a dead bus normally fail fast with ENOBUFS,
     // but if the socket sndbuf fills first a blocking write would hang the
     // loop; the timeout turns that into EAGAIN (treated as TX-full).
     let _ = sock.set_send_timeout(Duration::from_millis(20));
 
-    let start = Instant::now() + period;
-    let mut trace_epoch = start;
+    let start_at = {
+        let (lock, wake) = start_gate;
+        let mut value = lock.lock().unwrap();
+        while value.is_none() {
+            value = wake.wait(value).unwrap();
+        }
+        value.unwrap()
+    };
+    let phase = if side == 0 {
+        Duration::ZERO
+    } else {
+        period.mul_f64(0.5)
+    };
+    let mut deadline = start_at + phase;
+    let mut trace_epoch = deadline;
     let mut trace_origin_s = f64::from_bits(trace_origin_bits.load(Ordering::Acquire));
     let mut trace_generation_seen = if trace_enabled.load(Ordering::Acquire) {
         trace_generation.load(Ordering::Acquire)
@@ -1061,11 +1330,25 @@ fn bus_loop(
             if stop.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
                 return Ok(());
             }
-            let deadline = start + period * ticks as u32;
             sleep_until(deadline);
             let began = Instant::now();
-            if began - deadline > Duration::from_micros(500) {
+            let lateness = began.saturating_duration_since(deadline);
+            let timing_on_time = lateness <= LATE_TICK;
+            if !timing_on_time {
                 late += 1;
+            }
+            // A whole-cycle overrun means the causal sample/command ordering
+            // has been lost. Stop before issuing another impedance command.
+            // Smaller isolated late ticks are tolerated with host damping
+            // suppressed below; clustered lateness also fails closed.
+            if lateness >= period || timing_health.record(timing_on_time) {
+                fault.store(1, Ordering::SeqCst);
+                stop.store(true, Ordering::SeqCst);
+                return Err(io::Error::other(format!(
+                    "{iface}: control timing unhealthy ({:.3} ms late, {} of the last 32 ticks late); stopping before phase-sensitive damping",
+                    lateness.as_secs_f64() * 1e3,
+                    timing_health.recent_late.count_ones(),
+                )));
             }
             ticks += 1;
 
@@ -1139,10 +1422,16 @@ fn bus_loop(
                 }
             }
 
-            // Send all commands back-to-back.
-            let mut sent = 0usize;
+            // Discard replies that missed the preceding tick's window before
+            // issuing this batch. The protocols carry no sequence number, so
+            // this boundary is what makes every accepted sample current.
+            sock.drain_nonblocking()?;
+
+            // Send all commands back-to-back and remember exactly which
+            // motors were successfully queued in this tick.
+            let mut expected = vec![false; motors.len()];
             let mut trace_pending: [Option<TraceRow>; N_SLOTS] = [None; N_SLOTS];
-            for m in motors.iter() {
+            for (motor_index, m) in motors.iter().enumerate() {
                 let c = &play[m.slot];
                 let (arb, frame) = if m.gripper {
                     // Idle until the first target (classic mode leaves the
@@ -1190,8 +1479,15 @@ fn bus_loop(
                         let v_cmd_fast = d.v_cmd_fast.update(p_cmd, tick_dt);
                         let friction_ff = filter::friction(v_cmd, m.fc, m.k, m.fv, m.fo);
                         let inertia_ff = c.j_eff * a_cmd;
-                        let v_damp =
-                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt);
+                        let v_damp = if feedback_fresh[m.slot] && timing_on_time {
+                            d.bp.update(v_cmd_fast - d.vel_meas, c.damp_w0, c.damp_q, tick_dt)
+                        } else {
+                            // A missing frame makes measured velocity stale.
+                            // Reset rather than carrying band-pass energy into
+                            // the first tick after feedback recovers.
+                            d.bp.reset();
+                            0.0
+                        };
                         (v_cmd, a_cmd, v_cmd_fast, friction_ff, inertia_ff, v_damp)
                     } else {
                         d.v_cmd.seed(p_cmd);
@@ -1240,7 +1536,7 @@ fn bus_loop(
                     (arb, frame)
                 };
                 match guarded_send(&sock, arb, &frame, &mut enobufs_since)? {
-                    SendOutcome::Sent => sent += 1,
+                    SendOutcome::Sent => expected[motor_index] = true,
                     SendOutcome::Dropped => {}
                     SendOutcome::Stalled => {
                         // The e-stop path: nothing has ACKed for >1 s. Stop
@@ -1279,9 +1575,13 @@ fn bus_loop(
                 }
             }
 
-            // Collect replies; deviation abort against the played target.
-            let reply_deadline = deadline + Duration::from_secs_f64(period.as_secs_f64() * 0.8);
-            let mut pending = sent;
+            // Collect replies; deviation abort against the played target. The
+            // window begins when this tick actually began, not at its nominal
+            // schedule point: a late wake must not discard shoulder feedback
+            // simply because the old absolute deadline has already elapsed.
+            let reply_deadline = began + period.saturating_sub(REPLY_GUARD);
+            let mut seen = vec![false; motors.len()];
+            let mut pending = expected.iter().filter(|&&value| value).count();
             while pending > 0 {
                 let now = Instant::now();
                 if now >= reply_deadline {
@@ -1318,7 +1618,10 @@ fn bus_loop(
                     }
                     _ => continue,
                 };
-                pending = pending.saturating_sub(1);
+                if !mark_unique_expected_reply(&expected, &mut seen, idx) {
+                    continue;
+                }
+                pending -= 1;
                 let recv_time = Instant::now();
                 latest[motors[idx].slot] = Some((pos, vel, tau, recv_time));
                 // No deviation abort for the gripper: stalling against an
@@ -1369,6 +1672,28 @@ fn bus_loop(
                 }
             }
 
+            // Never continue phase-sensitive host damping when an arm motor
+            // has stopped producing fresh feedback. A single miss suppresses
+            // host damping on the next tick; sustained or bursty degradation
+            // faults both buses and forces a clean re-arm. The gripper is
+            // intentionally excluded.
+            for (idx, motor) in motors.iter().enumerate() {
+                if motor.gripper {
+                    continue;
+                }
+                feedback_fresh[motor.slot] = seen[idx];
+                if feedback_health[motor.slot].record(seen[idx]) {
+                    fault.store(1, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                    return Err(io::Error::other(format!(
+                        "{iface}: {} feedback unhealthy ({} consecutive, {} of the last 32 ticks missing); stopping before damping can use stale velocity",
+                        motor.joint,
+                        feedback_health[motor.slot].consecutive_misses,
+                        feedback_health[motor.slot].recent_misses.count_ones(),
+                    )));
+                }
+            }
+
             // Ship this tick's telemetry to Python (non-blocking mpsc; the
             // writer thread does the socket I/O). Skipped until the first
             // reply so an all-empty packet never races the bring-up reads.
@@ -1388,6 +1713,7 @@ fn bus_loop(
                     ),
                 );
             }
+            deadline = next_bus_deadline(began, period);
         }
     })();
 

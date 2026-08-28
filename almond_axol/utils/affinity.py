@@ -1,9 +1,12 @@
 """CPU-core isolation for the real-time / latency-critical work during recording.
 
-During ``collect-data`` the box runs four kinds of work that contend for cores:
+During ``collect-data`` the box runs five kinds of work that contend for cores:
 
-* **realtime** — the control process: the 120 Hz loop plus its web/VR/teleop and
-  IK-dispatch threads. Background work landing on its cores stalls it (arm jerk).
+* **can** — the two Rust 240 Hz CAN loops. On an 8+ core robot each arm owns a
+  dedicated core; the Rust process pins the bus threads individually.
+* **realtime** — the Python 120 Hz target loop plus its web/VR/teleop and
+  IK-dispatch threads. It has a separate core from CAN, so Python or camera
+  activity cannot delay a motor tick.
 * **ik** — the out-of-process JAX IK solver (a ~1-core solve). On 8+ cores it
   gets a dedicated core so recording load can't preempt it mid-solve (which drops
   its rate ~115 -> ~80 Hz); on smaller hosts it shares the realtime cores.
@@ -22,9 +25,10 @@ runs on its own cores.
 
 ``pin_realtime`` / ``pin_ik`` / ``pin_relay`` / ``pin_background`` apply the
 partition to the calling process (new threads inherit it; ``subprocess`` children
-inherit the relay/recorder affinity). Best-effort and self-gating: a no-op on
-machines with too few cores or without ``sched_setaffinity`` (e.g. macOS), so
-off-Jetson dev is unaffected.
+inherit the relay/recorder affinity). The CAN set is exported to ``axol-rt``,
+which assigns one bus thread to each core itself. Best-effort and self-gating: a
+no-op on machines with too few cores or without ``sched_setaffinity`` (e.g.
+macOS), so off-Jetson dev is unaffected.
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ _MIN_CORES = 4
 
 
 def core_groups() -> dict[str, set[int]] | None:
-    """``{"realtime", "ik", "relay", "background"}`` → core sets, or ``None``.
+    """``{"can", "realtime", "ik", "relay", "background"}`` → core sets.
 
     Based on the machine's *physical* core count, NOT the process's current
     affinity: the control process pins itself before spawning the relay/recorder,
@@ -49,14 +53,13 @@ def core_groups() -> dict[str, set[int]] | None:
     a restricted mask). Reading the inherited mask would wrongly see only the
     realtime cores.
 
-    8+ cores: control 2 / ik 1 / relay 2 / dataset rest. The ``realtime`` group is
-    the control process (the 120 Hz loop + web/VR/teleop threads); ``ik`` is a
-    *dedicated* core for the out-of-process JAX IK solver. IK is a ~1-core solve,
-    and while recording the control cores fill up (loop + status polls + the frame
-    bookkeeping), so on a shared core the solver keeps its CPU share but gets
-    descheduled mid-solve — its wall-time-per-solve stretches and its rate sags
-    (~115 -> ~80 Hz). A dedicated core removes that preemption and, by moving the
-    solver off the control cores, also de-contends the control loop.
+    8+ cores: CAN 2 / Python control 1 / IK 1 / relay 2 / dataset 2. Each CAN
+    arm gets one of the final two cores, away from CPU0: the Jetson routes its
+    xHCI interrupt there, and both USB CAN adapters plus the cameras traverse
+    that controller. Dataset work gets CPUs 0-1 because it tolerates those
+    interrupts. This also avoids the old shared ``realtime`` layout where
+    camera/WebRTC bookkeeping made 5-15% of nominal 240 Hz motor ticks late.
+    ``ik`` remains a dedicated core so it cannot deschedule CAN or Python.
 
     The relay gets *two* cores so :func:`isolate_relay_cpu` can split its Python
     work (the aiortc WebRTC send + encoded-AU pull loops, all GIL-serialized) onto
@@ -77,18 +80,30 @@ def core_groups() -> dict[str, set[int]] | None:
     if not n or n < _MIN_CORES:
         return None
     if n >= 8:
-        rt = {0, 1}
-        ik = {2}
+        # CPU0 services the Jetson's xHCI interrupt (both USB CAN adapters and
+        # cameras) and is therefore a poor place for a motor deadline. Put the
+        # Rust bus loops on the last two cores and leave the housekeeping CPUs
+        # to throughput-tolerant dataset work.
+        can = {n - 2, n - 1}
+        rt = {2}
+        ik = {3}
+        relay = {4, 5}
+        bg = {0, 1}
+    elif n >= 6:
+        can = {0, 1}
+        rt = ik = {2}
         relay = {3, 4}
         bg = set(range(5, n))
-    elif n >= 6:
-        rt = ik = {0, 1}
-        relay = {2, 3}
-        bg = set(range(4, n))
     else:  # 4-5 cores: isolate control only; relay + dataset share the rest
-        rt = ik = {0, 1}
+        can = rt = ik = {0, 1}
         relay = bg = set(range(2, n))
-    return {"realtime": rt, "ik": ik, "relay": relay, "background": bg}
+    return {
+        "can": can,
+        "realtime": rt,
+        "ik": ik,
+        "relay": relay,
+        "background": bg,
+    }
 
 
 def pin_realtime() -> bool:

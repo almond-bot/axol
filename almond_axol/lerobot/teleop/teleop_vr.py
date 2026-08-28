@@ -393,6 +393,11 @@ class AxolVRTeleop(Teleoperator):
         return self._core.is_resetting
 
     @property
+    def is_tracking(self) -> bool:
+        """True while either arm is actively following the operator."""
+        return self._core.teleop_enabled
+
+    @property
     def reset_pending(self) -> bool:
         """True while a reset press is latched but not yet dispatched.
 

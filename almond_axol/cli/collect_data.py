@@ -69,6 +69,8 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.control import ContactWatchdog
+from ..teleop_activity import TeleopActivityMarker
+from ..teleop.recorder import resolve_prefix
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -600,7 +602,26 @@ def _run(
     ):
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
+        # Always retain a synchronized control trace for hardware collection.
+        # Camera/recorder load is exactly where timing-only faults can appear,
+        # and without the Rust rows a dangerous oscillation leaves only a
+        # five-second aggregate lateness counter. Honour an explicit recorder
+        # name; otherwise create a unique per-session prefix. The IK/cmd taps
+        # still gate themselves to actual tracking, while the Rust/measured
+        # trace is enabled below only after PyRoKi startup and remains active
+        # through guarded returns so recovery-path faults are captured too.
+        vrt_cfg = cfg.teleop_config.vr_teleop_config
+        trace_name = vrt_cfg.record or (
+            time.strftime("collect_data_%Y%m%d_%H%M%S")
+            + f"_{time.time_ns() % 1_000_000_000:09d}"
+        )
+        trace_prefix = resolve_prefix(trace_name)
+        vrt_cfg.record = trace_prefix
+    else:
+        trace_prefix = None
+
     robot = AxolRobot(cfg.robot_config)
+    robot.configure_control_trace(trace_prefix)
     teleop = AxolVRTeleop(cfg.teleop_config)
 
     # Check resume eligibility before connecting (file check only)
@@ -716,6 +737,7 @@ def _run(
     # leak a held camera (it is daemonic, but a long-lived parent could outlive
     # the failure).
     imu_src: Any | None = None  # board-gyro yaw source for Jelly, if wired
+    activity = TeleopActivityMarker()
     try:
         robot.connect()
 
@@ -738,6 +760,15 @@ def _run(
 
         pos_l, pos_r = robot.positions
         teleop.connect(q_start_left=pos_l, q_start_right=pos_r)
+        try:
+            activity.start()
+        except OSError as exc:
+            _logger.warning("could not publish teleop timing boundary: %s", exc)
+        if trace_prefix is not None:
+            _logger.info(
+                "collection control trace armed (tracking/reset only): %s_*",
+                trace_prefix,
+            )
 
         # Stream the overhead + wrist cameras to the headset so the operator can
         # see the scene and grippers. With the relay this is the subprocess's
@@ -769,12 +800,17 @@ def _run(
         # IK worker is still compiling JAX, its VR server thread is otherwise
         # left running and keeps holding its WebSocket port, so the next run
         # can't bind it. disconnect() is a no-op if connect() never ran.
+        activity.stop()
         if imu_src is not None:
             imu_src.close()
         try:
             teleop.disconnect()
         except Exception:
             _logger.exception("teleop cleanup after failed setup failed")
+        try:
+            robot.disconnect()
+        except Exception:
+            _logger.exception("robot cleanup after failed setup failed")
         if relay is not None:
             relay.shutdown()
         raise
@@ -958,7 +994,11 @@ def _run(
             # discard flow consumes its reset press, and a headset-exit
             # reset mid-take is deliberately left as-is.)
             if not recording and teleop.is_resetting:
-                await _guarded_return()
+                robot.set_control_trace_active(True)
+                try:
+                    await _guarded_return()
+                finally:
+                    robot.set_control_trace_active(False)
                 # A contact hold during that move left the panel on the
                 # "contact" phase, and nothing else re-announces this phase
                 # until the next episode — the outer loop only runs
@@ -970,6 +1010,11 @@ def _run(
             deadline += teleop_interval
             t0 = time.perf_counter()
             _maybe_log_rate(t0)
+            # Record only robot-driving windows, never camera/JAX startup or
+            # an idle pre-record wait. Keeping the gate open across the last
+            # tracking command and a following reset captures the transition
+            # that previously oscillated during collection.
+            robot.set_control_trace_active(teleop.is_tracking or teleop.is_resetting)
 
             # Camera reads happen on the capture thread; the control loop only
             # ever touches joint state.
@@ -1127,8 +1172,12 @@ def _run(
     async def _return_home_loop() -> None:
         """Post-episode return: request the reset, then play it guarded."""
         log_say("Returning to rest pose.")
-        teleop.request_reset()
-        await _guarded_return()
+        robot.set_control_trace_active(True)
+        try:
+            teleop.request_reset()
+            await _guarded_return()
+        finally:
+            robot.set_control_trace_active(False)
 
     async def _contact_hold_loop() -> None:
         """Tracking contact: hold limp until reset, then return to rest guarded.
@@ -1138,18 +1187,22 @@ def _run(
         an orphaned/stopped hold nothing is latched and the return is skipped
         (the arms hold position where they are).
         """
-        await teleop.contact_hold(
-            gravity_step=_guard_gravity_step,
-            reset_command_state=robot.reset_command_state,
-            get_positions=lambda: robot.positions,
-            stopped=_stopped,
-            announce=log_say,
-            on_contact=_guard_on_contact,
-            hold_tick=_guard_hold_tick,
-            vr_alive=teleop.vr_alive,
-        )
-        if teleop.is_resetting:
-            await _guarded_return()
+        robot.set_control_trace_active(True)
+        try:
+            await teleop.contact_hold(
+                gravity_step=_guard_gravity_step,
+                reset_command_state=robot.reset_command_state,
+                get_positions=lambda: robot.positions,
+                stopped=_stopped,
+                announce=log_say,
+                on_contact=_guard_on_contact,
+                hold_tick=_guard_hold_tick,
+                vr_alive=teleop.vr_alive,
+            )
+            if teleop.is_resetting:
+                await _guarded_return()
+        finally:
+            robot.set_control_trace_active(False)
 
     def _run_on_robot_loop(coro: Any) -> Any:
         """Run ``coro`` on the robot's event loop and block until it returns.
@@ -1278,6 +1331,8 @@ def _run(
 
         if imu_src is not None:
             imu_src.close()
+        activity.stop()
+        robot.set_control_trace_active(False)
         robot.disconnect()
         teleop.disconnect()
         # Recorder owns the dataset: finalize, optional push, and empty-dataset

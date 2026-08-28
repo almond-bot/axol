@@ -119,10 +119,15 @@ class AxolRobot(Robot):
         # went through. Joint-action clients (teleop, collect-data, joint
         # policies) are untouched: their pipelines already shape commands
         # upstream, and double-filtering a tuned path buys nothing.
-        self._cartesian_shapers: tuple[
-            TrapezoidalFilter, TrapezoidalFilter
-        ] | None = None
+        self._cartesian_shapers: tuple[TrapezoidalFilter, TrapezoidalFilter] | None = (
+            None
+        )
         self._cartesian_last_send: float = 0.0
+        # Optional flight-recorder prefix configured by collect-data before
+        # connect(). RtAxol owns the 240 Hz measured + motor-facing traces;
+        # keeping this runtime-only avoids exposing a diagnostics plumbing
+        # detail as part of LeRobot's persistent robot configuration schema.
+        self._control_trace: str | None = None
 
     def _build_cameras(self) -> tuple[dict, list]:
         """Build the camera set, expanding any stereo camera into two eyes.
@@ -345,8 +350,20 @@ class AxolRobot(Robot):
             ),
             max_vel=VRTeleopConfig.teleop_max_vel,
             max_accel=VRTeleopConfig.teleop_max_accel,
+            record=self._control_trace,
         )
         await self._axol.enable()
+
+    def configure_control_trace(self, prefix: str | None) -> None:
+        """Configure the Rust flight-recorder prefix before :meth:`connect`."""
+        if self.is_connected:
+            raise RuntimeError("control trace must be configured before connect")
+        self._control_trace = prefix
+
+    def set_control_trace_active(self, active: bool) -> None:
+        """Gate the Rust/measured trace after IK startup has completed."""
+        if self._axol is not None:
+            self._axol.set_recording_engaged(active)
 
     def disconnect(self) -> None:
         """Disable motors, stop telemetry, close CAN buses, and disconnect cameras."""

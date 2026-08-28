@@ -192,6 +192,10 @@ ExecStartPre=-${BIN_DIR}/axol jetson.setup
 ExecStart=${BIN_DIR}/axol serve
 Restart=always
 RestartSec=3
+# Permit the Rust CAN children to request their bounded SCHED_FIFO priority.
+# Manual development shells normally have an rtprio hard limit of zero; the
+# production service must not depend on the ambient login configuration.
+LimitRTPRIO=20
 # A stop during a recording session must outlive the serve layer's dataset
 # teardown: its stop watchdog gives the recorder subprocess up to 200s to
 # finalize the dataset (encode the last episode, flush parquet, write meta).

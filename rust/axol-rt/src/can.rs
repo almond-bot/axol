@@ -137,6 +137,18 @@ impl CanSock {
 
     /// Blocking receive. Returns `Ok(None)` on timeout (`SO_RCVTIMEO`).
     pub fn recv(&self) -> io::Result<Option<Frame>> {
+        self.recv_with_flags(0)
+    }
+
+    /// Receive without waiting, independently of the socket's configured
+    /// timeout. The realtime loop uses this immediately before sending a new
+    /// batch so a reply that arrived after the previous tick's deadline can
+    /// never be mistaken for feedback from the new command.
+    pub fn recv_nonblocking(&self) -> io::Result<Option<Frame>> {
+        self.recv_with_flags(libc::MSG_DONTWAIT)
+    }
+
+    fn recv_with_flags(&self, flags: libc::c_int) -> io::Result<Option<Frame>> {
         let mut frame = CanFrameRaw {
             can_id: 0,
             can_dlc: 0,
@@ -146,10 +158,11 @@ impl CanSock {
             data: [0; 8],
         };
         let n = unsafe {
-            libc::read(
+            libc::recv(
                 self.fd,
                 &mut frame as *mut CanFrameRaw as *mut libc::c_void,
                 std::mem::size_of::<CanFrameRaw>(),
+                flags,
             )
         };
         if n < 0 {
@@ -169,11 +182,15 @@ impl CanSock {
         }))
     }
 
+    /// Drop frames already queued without changing the receive timeout.
+    pub fn drain_nonblocking(&self) -> io::Result<()> {
+        while self.recv_nonblocking()?.is_some() {}
+        Ok(())
+    }
+
     /// Drain anything already queued on the socket without blocking.
     pub fn drain(&self) -> io::Result<()> {
-        self.set_recv_timeout(Duration::from_micros(1))?;
-        while self.recv()?.is_some() {}
-        Ok(())
+        self.drain_nonblocking()
     }
 }
 

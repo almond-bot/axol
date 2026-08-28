@@ -319,13 +319,26 @@ class _Capture:
         # child can't wedge shutdown.
         if self._reader is not None:
             self._reader.join(timeout=2.0)
+        # TextIOWrapper.close() must run while its underlying descriptor still
+        # exists. These wrappers use closefd=False, so closing them marks the
+        # Python object closed (and performs its final flush) without taking
+        # ownership of the saved fd. The old order closed the raw fd first;
+        # when GC later finalized the wrapper — often during a heavy Torch
+        # import at collect-data startup — its implicit flush raised an
+        # ignored ``OSError: [Errno 9] Bad file descriptor``.
+        for stream in (self._saved_out, self._saved_err):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._saved_out = self._saved_err = None
         for fd in (self._saved_out_fd, self._saved_err_fd):
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError:
                     pass
-        self._saved_out = self._saved_err = None
         self._saved_out_fd = self._saved_err_fd = None
         self._reader = None
 

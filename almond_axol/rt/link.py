@@ -77,16 +77,33 @@ class RtLink:
         self._writer: asyncio.StreamWriter | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._states: asyncio.Queue[str] = asyncio.Queue()
+        self._fault: str | None = None
         # Called for each telemetry packet: (side, {slot: FeedbackSlot}).
         self.on_feedback: Callable[[int, dict[int, FeedbackSlot]], None] | None = None
 
     async def start(self) -> None:
         """Launch the core and connect. The core is idle until configured."""
+        self._fault = None
         # stdout/stderr inherit the console: the core logs little, and what
         # it does log (bring-up, faults) belongs in the teleop output.
-        env = None
+        env = dict(os.environ)
+        # Keep the motor deadlines independent of Python/IK/video scheduling.
+        # On robot-sized hosts affinity.core_groups() reserves two CAN cores;
+        # the Rust process pins one bus thread to each. SCHED_FIFO is requested
+        # as a second layer when the launcher has CAP_SYS_NICE / an rtprio
+        # allowance (the installed root service does); a manual unprivileged
+        # run still gets the hard CPU partition and Rust logs the denied
+        # priority request explicitly.
+        from ..utils.affinity import core_groups
+
+        groups = core_groups()
+        if groups is not None:
+            can_cores = sorted(groups["can"])
+            if len(can_cores) >= 2 and groups["can"].isdisjoint(groups["realtime"]):
+                env["AXOL_RT_CPU_LEFT"] = str(can_cores[0])
+                env["AXOL_RT_CPU_RIGHT"] = str(can_cores[1])
+                env["AXOL_RT_FIFO_PRIORITY"] = "20"
         if self._trace_prefix is not None:
-            env = dict(os.environ)
             env["AXOL_RT_TRACE"] = f"{self._trace_prefix}_rt"
             env["AXOL_RT_TRACE_GATED"] = "1"
         self._proc = subprocess.Popen(
@@ -127,6 +144,12 @@ class RtLink:
                 body = payload[1:].decode("utf-8", errors="replace")
                 if tag == b"S":
                     _logger.info("axol-rt: %s", body)
+                    if body.startswith("fault:"):
+                        # The core has already stopped both buses. Latch the
+                        # reason so the next target/control action fails too,
+                        # instead of leaving a UI operation apparently alive
+                        # after its motor owner has failed closed.
+                        self._fault = body
                     self._states.put_nowait(body)
                 elif tag == b"L":
                     _logger.info("axol-rt: %s", body)
@@ -160,6 +183,8 @@ class RtLink:
         return side, slots
 
     def _send(self, payload: bytes) -> None:
+        if self._fault is not None:
+            raise RtLinkError(f"axol-rt: {self._fault}")
         if self._writer is None or self._writer.is_closing():
             raise RtLinkError("axol-rt link is not connected")
         self._writer.write(struct.pack("<I", len(payload)) + payload)

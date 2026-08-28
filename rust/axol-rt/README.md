@@ -79,7 +79,11 @@ with `v_des = 0`.
 The core owns the wire and the **fast physics**, all per tick from its
 own trajectory and feedback states:
 
-- Hard 240 Hz pacing (spin-assisted `sleep_until`, zero-late in practice).
+- Hard 240 Hz pacing (spin-assisted `sleep_until`). On 8+ core robot hosts,
+  the left and right CAN threads are pinned to dedicated CPUs, separate from
+  Python control, IK, camera relay, and dataset recording. They additionally
+  request SCHED_FIFO priority 20 when permitted by the launcher; CPU isolation
+  remains active with an explicit warning for unprivileged development runs.
 - **In-core target tracker**: the golden-ported `TrapezoidalFilter`
   (`filter::Trapezoid`) chases the latest streamed target under the
   config velocity/acceleration limits (teleop caps × 1.5 headroom),
@@ -169,6 +173,9 @@ the limp contact hold, and the replanned reset all run against the core.
 
 `axol teleop --teleop.record NAME` automatically gates this trace to the
 latest engaged segment and compacts both arms into `NAME_rt.npz` on teardown.
+`axol collect-data` always assigns a unique prefix when none was supplied and
+records tracking plus guarded-reset motion after PyRoKi is ready, so a
+collection-only timing or damping fault is preserved automatically.
 For low-level runs outside teleop, set `AXOL_RT_TRACE` to a path prefix to
 capture one raw CSV per arm without doing file I/O on the realtime threads:
 

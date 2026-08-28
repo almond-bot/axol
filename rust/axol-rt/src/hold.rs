@@ -252,6 +252,10 @@ fn stream(
         let deadline = start + period * k as u32;
         sleep_until(deadline);
 
+        // Do not attribute a reply that missed the previous window to this
+        // command batch (the motor protocols carry no sequence number).
+        sock.drain_nonblocking()?;
+
         for m in motors.iter() {
             let frame = proto::mit_encode(
                 m.ready.hold_pos,
@@ -269,6 +273,7 @@ fn stream(
 
         let reply_deadline = deadline + Duration::from_secs_f64(period.as_secs_f64() * 0.8);
         let mut pending = motors.len();
+        let mut seen = vec![false; motors.len()];
         while pending > 0 {
             let now = Instant::now();
             if now >= reply_deadline {
@@ -305,6 +310,10 @@ fn stream(
                 }
                 _ => continue,
             };
+            if seen[idx] {
+                continue;
+            }
+            seen[idx] = true;
             let m = &mut motors[idx];
             m.replies += 1;
             pending -= 1;

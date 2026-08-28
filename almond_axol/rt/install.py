@@ -33,6 +33,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 
@@ -191,6 +192,41 @@ def _install(binary: Path, ref: str) -> Path:
     return dest
 
 
+def _grant_realtime(binary: Path) -> None:
+    """Give only the Rust core permission to enter its bounded RT policy.
+
+    A dedicated CPU is not sufficient under Linux's normal scheduler: a
+    SCHED_OTHER thread can still be suspended beyond the entire 4.17 ms motor
+    period. File-scoped ``CAP_SYS_NICE`` lets ``axol-rt`` raise its own two CAN
+    threads without running the Python/UI/camera process as root.
+    """
+    if sys.platform != "linux":
+        return
+    setcap = shutil.which("setcap")
+    if setcap is None and Path("/usr/sbin/setcap").exists():
+        setcap = "/usr/sbin/setcap"
+    if setcap is None:
+        raise RuntimeError("setcap is required to grant axol-rt real-time scheduling")
+
+    cmd = [setcap, "cap_sys_nice=ep", str(binary)]
+    if os.geteuid() == 0:
+        subprocess.run(cmd, check=True)
+    elif sys.stdin is not None and sys.stdin.isatty():
+        # Interactive development install: ask once through the shared sudo
+        # helper. Headless provisioning is normally the root system service;
+        # if it is not, fail loudly below instead of hanging for a password.
+        from ..utils.sudo import prime_sudo, run_root
+
+        if not prime_sudo():
+            raise RuntimeError("sudo is required to grant CAP_SYS_NICE to axol-rt")
+        run_root(cmd, check=True)
+    else:
+        raise RuntimeError(
+            "axol-rt needs CAP_SYS_NICE; run `axol rt.install` interactively"
+        )
+    print(f"axol-rt realtime scheduling enabled: {binary}")
+
+
 def run(_args: object = None) -> None:
     """Build + install axol-rt; idempotent, prints what it did."""
     crate = _repo_crate()
@@ -199,6 +235,7 @@ def run(_args: object = None) -> None:
         # it up, and a manual `cargo build` there stays the source of truth
         # (no PATH copy that could shadow a newer in-repo build).
         binary = _build(crate, _ensure_toolchain())
+        _grant_realtime(binary)
         print(f"axol-rt built: {binary}")
         return
 
@@ -209,10 +246,12 @@ def run(_args: object = None) -> None:
     url, ref = source
     dest = _INSTALL_DIR / "axol-rt"
     if dest.exists() and _STAMP.exists() and _STAMP.read_text().strip() == ref:
+        _grant_realtime(dest)
         print(f"axol-rt already installed at {dest} (ref {ref}).")
         return
     cargo = _ensure_toolchain()
     print(f"Fetching axol-rt sources ({url} @ {ref}) ...")
     binary = _build(_fetch_crate(url, ref), cargo)
     dest = _install(binary, ref)
+    _grant_realtime(dest)
     print(f"axol-rt installed: {dest} (ref {ref})")
