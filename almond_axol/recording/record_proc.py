@@ -763,13 +763,15 @@ class _SnapshotPublisher:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._latest: tuple[dict, dict, float] | None = None
+        self._latest: tuple[dict, dict, float, bool] | None = None
 
-    def write(self, joint_obs: dict, action: dict, ts: float) -> None:
+    def write(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
         with self._lock:
-            self._latest = (joint_obs, action, ts)
+            self._latest = (joint_obs, action, ts, intervention)
 
-    def read_latest(self) -> tuple[dict, dict, float] | None:
+    def read_latest(self) -> tuple[dict, dict, float, bool] | None:
         with self._lock:
             return self._latest
 
@@ -808,7 +810,7 @@ def _obs_for_rerun(obs: dict[str, Any], cam_keys: Any) -> dict[str, Any]:
 def run_capture_loop(
     *,
     cameras: dict[str, Any],
-    read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot: Callable[[], tuple[dict, dict, float, bool] | None],
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
     fps: int,
@@ -838,11 +840,19 @@ def run_capture_loop(
     ``frame_counter`` (optional) is a mutable ``{"n": int}`` incremented after
     every appended row, so the owner can convert instants into dataset time
     (``n / fps``) — e.g. to annotate intervention spans.
+
+    When the dataset declares an ``intervention`` feature (LeRobot's native
+    DAgger annotation: a per-frame bool, see ``lerobot.rollout``'s DAgger
+    strategy), each row is tagged from the snapshot's intervention flag — the
+    publisher (the control loop) marks the ticks where a human was driving.
     """
     try:
+        import numpy as np
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
+
+        tag_intervention = "intervention" in dataset.features
 
         # Wait for the first snapshot *published after this episode started*.
         # The snapshot slot is a single latest-wins register that persists
@@ -952,7 +962,7 @@ def run_capture_loop(
             if snap is None:
                 tick += 1
                 continue
-            joint_obs, action, _snap_ts = snap
+            joint_obs, action, _snap_ts, intervention = snap
 
             obs: dict[str, Any] = dict(joint_obs)
             for cam_key, (frame, _cap_ts, _recv_ts) in frames.items():
@@ -965,7 +975,10 @@ def run_capture_loop(
             act_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
             if stop_event.is_set():
                 return
-            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            row = {**obs_frame, **act_frame, "task": task}
+            if tag_intervention:
+                row["intervention"] = np.array([intervention], dtype=bool)
+            dataset.add_frame(row)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             frames_added += 1
@@ -988,7 +1001,7 @@ def run_capture_loop(
 def run_encoded_capture_loop(
     *,
     cameras: dict[str, Any],
-    read_snapshot: Callable[[], tuple[dict, dict, float] | None],
+    read_snapshot: Callable[[], tuple[dict, dict, float, bool] | None],
     dataset: "LeRobotDataset",
     robot_obs_proc: Callable[[Any], Any],
     fps: int,
@@ -1022,9 +1035,12 @@ def run_encoded_capture_loop(
     episode's mp4 is decodable from frame 0.
     """
     try:
+        import numpy as np
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame
         from lerobot.utils.visualization_utils import log_rerun_data
+
+        tag_intervention = "intervention" in dataset.features
 
         # Wait for the first snapshot *published after this episode started* —
         # the slot persists across episodes, so a stale previous-episode
@@ -1124,7 +1140,7 @@ def run_encoded_capture_loop(
                 # dropped picture) while later rows kept advancing.
                 snap = last_snap
             last_snap = snap
-            joint_obs, action, _snap_ts = snap
+            joint_obs, action, _snap_ts, intervention = snap
 
             # Process joint obs alone, then inject the AU bytes as the video
             # values: build_dataset_frame copies video values verbatim, so each
@@ -1140,7 +1156,10 @@ def run_encoded_capture_loop(
             act_frame = build_dataset_frame(dataset.features, action, prefix=ACTION)
             if stop_event.is_set():
                 return
-            dataset.add_frame({**obs_frame, **act_frame, "task": task})
+            row = {**obs_frame, **act_frame, "task": task}
+            if tag_intervention:
+                row["intervention"] = np.array([intervention], dtype=bool)
+            dataset.add_frame(row)
             if frame_counter is not None:
                 frame_counter["n"] += 1
             rows_added += 1
@@ -1510,8 +1529,10 @@ class InProcessRecorder:
         self._frames: dict[str, int] = {"n": 0}
         self._episodes_recorded = 0
 
-    def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
-        self._publisher.write(joint_obs, action, ts)
+    def publish(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
+        self._publisher.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
         return self._dataset.num_episodes
@@ -1922,8 +1943,10 @@ class DatasetRecorderProcess:
     def pid(self) -> int | None:
         return self._proc.pid
 
-    def publish(self, joint_obs: dict, action: dict, ts: float) -> None:
-        self._snap.write(joint_obs, action, ts)
+    def publish(
+        self, joint_obs: dict, action: dict, ts: float, intervention: bool = False
+    ) -> None:
+        self._snap.write(joint_obs, action, ts, intervention)
 
     def episode_count(self) -> int:
         return self._episode_count

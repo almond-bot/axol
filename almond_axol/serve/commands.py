@@ -201,6 +201,12 @@ def _collect_data() -> type:
     return CollectDataConfig
 
 
+def _collect_dagger() -> type:
+    from ..cli.collect_dagger import DaggerConfig
+
+    return DaggerConfig
+
+
 def _replay_dataset() -> type:
     from ..cli.replay_dataset import ReplayDatasetConfig
 
@@ -250,6 +256,12 @@ def _collect_data_control() -> Callable[..., Any]:
     from ..cli.collect_data import _QueueCollectControl
 
     return _QueueCollectControl
+
+
+def _collect_dagger_run() -> Callable[..., Any]:
+    from ..cli.collect_dagger import _run
+
+    return _run
 
 
 def _replay_dataset_run() -> Callable[..., Any]:
@@ -359,6 +371,25 @@ COMMANDS: dict[str, CommandDef] = {
         # headset HUD (phase, episode number, saved count).
         episode_control=_collect_data_control,
         per_run_fields=("repo_id", "task"),
+    ),
+    "collect-dagger": CommandDef(
+        "collect-dagger",
+        "collect-dagger",
+        "Collect DAgger data",
+        "Run a trained policy while the operator watches in VR and intervenes "
+        "with the grip buttons; policy segments and corrections are recorded "
+        "to a LeRobot dataset.",
+        "Operate",
+        "draccus",
+        _collect_dagger,
+        requires_hardware=True,
+        entrypoint=_collect_dagger_run,
+        requires_cameras=True,
+        camera_mode="argv",
+        uses_headset=True,
+        episode_control=_run_policy_control,
+        per_run_fields=("policy_path", "policy_type", "task", "repo_id"),
+        settings_like="collect-data",
     ),
     "replay-dataset": CommandDef(
         "replay-dataset",
