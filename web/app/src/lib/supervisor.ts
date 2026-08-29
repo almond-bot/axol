@@ -605,8 +605,6 @@ export interface TrackerBinding {
   complete: boolean
   left: string | null
   right: string | null
-  /** Native backend present on the serve host; absent on older hosts. */
-  available?: boolean | null
 }
 
 export async function fetchTrackerBindings(): Promise<{

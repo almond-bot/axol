@@ -90,7 +90,6 @@ const STATE_BADGE: Record<
 // that started it.
 const PAGE_COMMAND_IDS = [
   "tracker.identify",
-  "tracker.install",
   "can.setup",
   "can.enable",
   "motor.set-can-id",
