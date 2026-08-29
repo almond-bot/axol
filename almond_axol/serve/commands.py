@@ -567,6 +567,17 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_can_bus=False,
     ),
+    "tracker.install": CommandDef(
+        "tracker.install",
+        "tracker.install",
+        "Install Lighthouse support",
+        "Build and install the pinned libsurvive runtime and Vive USB permissions.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_install"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
     "can.setup": CommandDef(
         "can.setup",
         "can.setup",

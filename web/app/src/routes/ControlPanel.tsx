@@ -887,7 +887,7 @@ export default function ControlPanel() {
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}
-          onOpenSettings={() => openSettings(settingsTab === "cameras" ? "robot" : settingsTab)}
+          onOpenSettings={() => openSettings(settings.mantis ? "mantis" : "robot")}
           cameras={cameras}
           robot={robot}
           live={selectedLive}

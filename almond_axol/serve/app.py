@@ -677,6 +677,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     async def get_tracker_bindings() -> dict[str, Any]:
         """Whether each physical Mantis tracker backend has both sides bound."""
         from ..tracker import load_tracker_config
+        from ..tracker.survive import is_available as survive_is_available
 
         config = await asyncio.to_thread(load_tracker_config)
         bindings: dict[str, dict[str, Any]] = {}
@@ -691,6 +692,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 "complete": bool(left and right),
                 "left": left,
                 "right": right,
+                "available": survive_is_available() if backend == "survive" else None,
             }
         return {"bindings": bindings}
 

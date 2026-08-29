@@ -23,6 +23,7 @@ saved by ``axol tracker.identify`` survives restarts.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import shutil
 import subprocess
@@ -34,6 +35,14 @@ import numpy as np
 from .base import TrackerPose, TrackerSource, zup_to_yup_pos, zup_to_yup_quat
 
 _logger = logging.getLogger(__name__)
+
+
+def is_available() -> bool:
+    """Whether this interpreter can launch either libsurvive transport."""
+    return (
+        importlib.util.find_spec("pysurvive") is not None
+        or shutil.which("survive-cli") is not None
+    )
 
 
 def _convert(
@@ -73,8 +82,9 @@ class SurviveSource(TrackerSource):
             if shutil.which("survive-cli") is None:
                 raise RuntimeError(
                     "libsurvive is not available: neither the pysurvive Python "
-                    "bindings nor a survive-cli binary on PATH. Build libsurvive "
-                    "from source (see docs/cli/tracker.mdx)."
+                    "bindings nor a survive-cli binary on PATH. Install Lighthouse "
+                    "support from the control panel's Mantis settings, or run "
+                    "`axol tracker.install`."
                 ) from None
             target = self._run_cli
             _logger.info("survive backend: using survive-cli subprocess")

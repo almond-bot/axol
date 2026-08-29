@@ -39,7 +39,7 @@ import { PosePanel } from "./pose-panel"
 import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
-export type SettingsTab = string // "cameras" | "usb" | "pose" | "advanced" | a category key
+export type SettingsTab = string // "cameras" | "mantis" | "usb" | "pose" | "advanced" | category
 
 interface Draft {
   values: Record<string, SettingValue>
@@ -193,11 +193,11 @@ export function SettingsSection({
     }
   }
 
-  // Tab order: the hardware attached to the host first (Cameras, Quest USB),
-  // then the behaviour categories with the pose editor after Teleop & VR,
-  // then the per-op Advanced overrides.
+  // Tab order: attached hardware first (Axol cameras, Mantis, Quest USB), then
+  // behaviour categories, the pose editor, and per-op Advanced overrides.
   const tabs: { key: SettingsTab; label: string }[] = [
-    { key: "cameras", label: "Cameras" },
+    { key: "cameras", label: "Axol cameras" },
+    { key: "mantis", label: "Mantis" },
     { key: "usb", label: "Quest USB" },
   ]
   for (const cat of schema) {
@@ -209,6 +209,9 @@ export function SettingsSection({
   const activeCategory = schema.find((c) => c.key === tab)
   const poseFields =
     schema.find((c) => c.key === "teleop")?.settings.filter((s) => s.ui.widget === "pose") ?? []
+  const mantisSourceField = schema
+    .find((c) => c.key === "teleop")
+    ?.settings.find((s) => s.key === "teleop.mantis_source")
 
   return (
     <Card className="gap-0 p-0">
@@ -259,12 +262,35 @@ export function SettingsSection({
             ) : tab === "cameras" ? (
               <CamerasPanel
                 spec={draft.cameras}
-                mantisMode={mantisMode}
+                mantisMode={false}
                 onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
                 devices={devices}
                 detecting={detecting}
                 onRefresh={onRefresh}
               />
+            ) : tab === "mantis" ? (
+              <div className="flex flex-col gap-6">
+                {mantisSourceField && (
+                  <SettingRow
+                    field={mantisSourceField}
+                    value={draft.values[mantisSourceField.key]}
+                    onChange={setValue}
+                  />
+                )}
+                <TrackerBindingPanel
+                  source={String(draft.values["teleop.mantis_source"] ?? "lighthouse")}
+                />
+                <div className="border-t border-white/10 pt-5">
+                  <CamerasPanel
+                    spec={draft.cameras}
+                    mantisMode
+                    onChange={(spec) => setDraft((d) => (d ? { ...d, cameras: spec } : d))}
+                    devices={devices}
+                    detecting={detecting}
+                    onRefresh={onRefresh}
+                  />
+                </div>
+              </div>
             ) : tab === "usb" ? (
               <UsbPanel usb={usb} usbBusy={usbBusy} onUsbConnect={onUsbConnect} />
             ) : tab === "pose" ? (
@@ -286,18 +312,12 @@ export function SettingsSection({
                 }
               />
             ) : activeCategory ? (
-              <>
-                <CategoryPanel
-                  category={activeCategory}
-                  values={draft.values}
-                  onChange={setValue}
-                />
-                {activeCategory.key === "teleop" && (
-                  <TrackerBindingPanel
-                    source={String(draft.values["teleop.mantis_source"] ?? "lighthouse")}
-                  />
-                )}
-              </>
+              <CategoryPanel
+                category={activeCategory}
+                values={draft.values}
+                onChange={setValue}
+                excludeKeys={activeCategory.key === "teleop" ? ["teleop.mantis_source"] : []}
+              />
             ) : (
               <p className="text-sm text-white/40">Loading settings…</p>
             )}
@@ -534,12 +554,16 @@ function CategoryPanel({
   category,
   values,
   onChange,
+  excludeKeys = [],
 }: {
   category: SettingsCategory
   values: Record<string, SettingValue>
   onChange: (key: string, value: SettingValue | null) => void
+  excludeKeys?: string[]
 }) {
-  const fields = category.settings.filter((s) => s.ui.widget !== "pose")
+  const fields = category.settings.filter(
+    (s) => s.ui.widget !== "pose" && !excludeKeys.includes(s.key)
+  )
   return (
     <div className="flex flex-col gap-4">
       <p className="text-xs text-white/45">{category.description}</p>

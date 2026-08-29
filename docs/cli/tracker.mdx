@@ -1,9 +1,9 @@
 ---
-title: "tracker.bridge / tracker.identify"
+title: "tracker.bridge / tracker.identify / tracker.install"
 description: "Headset-free Mantis teleop and data collection with Vive trackers."
 ---
 
-Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged. In the control panel, **Settings → Teleop & VR → Mantis tracking** selects Quest, Lighthouse (the default), or Ultimate; the latter two start and stop their matching bridge automatically. The commands below are for direct CLI use and bring-up.
+Drives the Mantis from **HTC Vive trackers instead of a Quest headset**. A tracker is rigidly mounted where the Quest controller normally sits; `axol tracker.bridge` reads the tracker poses and streams them to the VR WebSocket server as standard `VRFrame` JSON — exactly what a headset sends — so [`teleop --mantis`](/cli/teleop) and [`collect-data --mantis`](/cli/collect-data) run unchanged. In the control panel, **Settings → Mantis** selects Quest, Lighthouse (the default), or Ultimate; the latter two start and stop their matching bridge automatically. The commands below are for direct CLI use and bring-up.
 
 Two tracker families are supported, plus two hardware-free backends for bring-up:
 
@@ -41,7 +41,7 @@ axol teleop --mantis                # or: axol collect-data --mantis ...
 axol tracker.bridge
 ```
 
-From the control panel, select **Mantis** in the operation card, then pick **Quest**, **Lighthouse**, or **Ultimate** under **Settings → Teleop & VR → Mantis tracking**. Quest connects directly from the headset and starts no bridge. Lighthouse (the default) and Ultimate show their binding status in the same settings tab; press **Identify trackers** there for a guided left/right motion capture, with no terminal required. Once bound, they restore their own saved device bindings and start the matching bridge. While a bridge is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
+From the control panel, select **Mantis** in the operation card, then pick **Quest**, **Lighthouse**, or **Ultimate** under **Settings → Mantis**. That dedicated tab also holds the two Mantis camera assignments and tracker binding. Quest connects directly from the headset and starts no bridge. Lighthouse (the default) and Ultimate show their binding status there; press **Identify trackers** for a guided left/right motion capture, with no terminal required. If libsurvive is absent, the same card offers **Install Lighthouse support** first. Once bound, they restore their own saved device bindings and start the matching bridge. While a bridge is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/mantis/tcp_transform.json` overrides it when present. For everything else, the absolute (Mantis) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
@@ -82,9 +82,17 @@ The control panel's **Identify trackers** button runs this command on the serve 
 |---|---|
 | `--backend {survive,ultimate,synthetic}` | Backend to use and save. Default: the saved config, else `survive`. |
 
-## Vive Tracker 3.0 setup (libsurvive)
+## `axol tracker.install` / Vive Tracker 3.0 setup
 
-Mount 1–2 SteamVR base stations (1.0 or 2.0) with the workspace in view, then build [libsurvive](https://github.com/collabora/libsurvive) on the Jetson — the PyPI `pysurvive` wheel is outdated, so build from source:
+`axol provision` installs a pinned [libsurvive](https://github.com/collabora/libsurvive) build automatically. On an existing host, press **Install Lighthouse support** under **Settings → Mantis**, or run:
+
+```bash
+axol tracker.install
+```
+
+The command installs build dependencies, builds `survive-cli` with Eigen (not OpenBLAS), installs the Vive udev rule, and is safe to rerun. Then mount 1–2 SteamVR base stations (1.0 or 2.0) with the workspace in view and connect each tracker over USB-C or its HTC dongle.
+
+For a manual fallback, use the same upstream source:
 
 ```bash
 sudo apt install build-essential cmake zlib1g-dev libx11-dev libusb-1.0-0-dev \
@@ -93,7 +101,7 @@ git clone https://github.com/collabora/libsurvive.git && cd libsurvive
 # udev rules so the trackers are readable without root
 sudo cp ./useful_files/81-vive.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-cmake -B build -DUSE_HIDAPI=1 -DUSE_EIGEN=ON && cmake --build build -j
+cmake -B build -DUSE_HIDAPI=ON -DUSE_EIGEN=ON -DUSE_OPENBLAS=OFF && cmake --build build -j
 sudo cmake --install build
 # optional, preferred: the Python bindings (the bridge falls back to
 # parsing a survive-cli subprocess when these aren't importable)
@@ -104,7 +112,7 @@ uv pip install ./bindings/python
   On ARM, avoid linking libsurvive against OpenBLAS (known instability/CPU blowups); `-DUSE_EIGEN=ON` sidesteps it. Close SteamVR if one is somehow present — it competes for the devices.
 </Note>
 
-Connect each tracker over USB-C or its HTC dongle. libsurvive calibrates the base-station world on first run (leave the trackers still and visible for a few seconds); the resulting world frame is shared by all trackers and gravity-aligned.
+libsurvive calibrates the base-station world on first run (leave the trackers still and visible for a few seconds); the resulting world frame is shared by all trackers and gravity-aligned.
 
 ## Vive Ultimate Tracker setup (dongle + pyvut)
 

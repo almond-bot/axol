@@ -19,6 +19,8 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 * ``gyro.install``  — group access to the carrier board's BMI088 sampling
                       timer, the cart heading hold's yaw reference (see
                       :mod:`almond_axol.robot.gyro`).
+* ``tracker.install`` — pinned libsurvive + Vive USB permissions for Mantis
+                        Lighthouse tracking.
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
@@ -39,6 +41,7 @@ from pathlib import Path
 
 from ..robot import gyro
 from ..utils import adb
+from . import tracker_install
 from .gst import build_zed as gst_build_zed
 from .gst import install as gst_install
 from .zed import driver as zed_driver
@@ -57,7 +60,7 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         "provision",
         help=(
             "Install/refresh the non-PyPI + system pieces "
-            "(pyzed, GStreamer/PyGObject, patched zed-gstreamer plugins)."
+            "(Lighthouse tracking, pyzed, GStreamer, camera plugins)."
         ),
     ).set_defaults(func=run)
 
@@ -81,6 +84,7 @@ def run(_args: object = None) -> None:
     # poses over a USB `adb reverse` tunnel (avoids WiFi latency). Self-gates
     # on apt-get.
     _step("adb (Quest-over-USB)", adb.install)
+    _step("Lighthouse tracking (tracker.install)", tracker_install.run)
     # ZED Box Duo units ship with a known-bad factory GMSL capture driver;
     # replace it with the pinned release. Self-gates on the factory package
     # being present (ensure_driver, not run: a *quiet* no-op everywhere else)

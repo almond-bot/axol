@@ -44,8 +44,8 @@ gamepad = ["pygame>=2.6"]
 lerobot = ["lerobot[dataset,viz,async,training,diffusion]>=0.6.1"]
 sim = ["viser>=1.0.24"]
 # Vive tracker bridge (axol tracker.bridge). websockets is the bridge's WSS
-# client; hidapi backs the Ultimate Tracker dongle path. libsurvive (Tracker
-# 3.0) and pyvut (Ultimate) are operator-installed — see docs/cli/tracker.mdx.
+# client; hidapi backs the Ultimate Tracker dongle path. libsurvive is installed
+# by `axol provision`; pyvut (Ultimate) remains operator-installed.
 tracker = ["websockets>=12", "hidapi>=0.14"]
 
 [project.scripts]
@@ -53,4 +53,3 @@ axol = "almond_axol.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
-
