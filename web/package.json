@@ -7,9 +7,15 @@
   ],
   "scripts": {
     "build": "npm run build -w @almond/axol-vr-client && npm run build -w axol-vr-app",
-    "format": "prettier --write \"**/*.{ts,tsx,json,css}\""
+    "format": "prettier --write \"**/*.{ts,tsx,json,css}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,json,css}\"",
+    "lint": "npm run lint -w axol-vr-app",
+    "test": "vitest run --coverage"
   },
   "devDependencies": {
-    "prettier": "^3.8.1"
+    "@vitest/coverage-v8": "^3.2.4",
+    "jsdom": "^26.1.0",
+    "prettier": "^3.8.1",
+    "vitest": "^3.2.4"
   }
 }

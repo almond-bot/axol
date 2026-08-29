@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Python 3.13 and locked dependencies
+        run: |
+          uv python install 3.13
+          uv sync --locked --extra sim --dev
+      - name: Lint and format check
+        run: |
+          uvx --from ruff==0.9.7 ruff check .
+          uvx --from ruff==0.9.7 ruff format --check .
+      - name: Unit and integration tests
+        run: uv run pytest --junitxml=pytest.xml
+      - name: Build distributable packages
+        run: |
+          uv build
+          uv build --project plugins/lerobot_robot_axol
+      - name: Upload Python test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-test-report
+          path: pytest.xml
+          if-no-files-found: ignore
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Format and lint
+        run: |
+          npm run format:check
+          npm run lint
+      - name: Unit and component tests
+        run: npm test
+      - name: Production build and type check
+        run: npm run build
+      - name: Dependency audit
+        run: npm audit --audit-level=high

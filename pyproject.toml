@@ -48,3 +48,31 @@ axol = "almond_axol.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["almond_axol"]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--cov=almond_axol",
+    "--cov-report=term-missing:skip-covered",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["almond_axol"]
+omit = [
+    "almond_axol/lerobot/*",
+]
+
+[tool.coverage.report]
+fail_under = 30
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
