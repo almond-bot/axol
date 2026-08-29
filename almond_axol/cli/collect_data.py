@@ -9,7 +9,7 @@ Episode boundaries are driven by VR controller commands:
   - RECORDING → DATA_COLLECTION + reset btn:  stop; discard episode (rerecord)
 
 and/or, when launched from the web control panel (``axol serve``), by episode
-commands pushed through :class:`_QueueEpisodeControl` (``POST
+commands pushed through :class:`_QueueCollectControl` (``POST
 /api/op/episode``): ``start`` begins recording after a spoken 3-second
 countdown, ``s`` terminates + saves, ``r`` discards + re-records, ``q`` quits
 the session. Both sources are live at once — either can start or end an

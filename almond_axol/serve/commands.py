@@ -270,12 +270,6 @@ def _replay_dataset_run() -> Callable[..., Any]:
     return _run
 
 
-def _collect_data_control() -> Callable[..., Any]:
-    from ..cli.collect_data import _QueueEpisodeControl
-
-    return _QueueEpisodeControl
-
-
 def _run_policy_run() -> Callable[..., Any]:
     from ..cli.run_policy import _run
 
