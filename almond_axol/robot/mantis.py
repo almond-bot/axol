@@ -25,7 +25,7 @@ import logging
 import numpy as np
 
 from ..constants import ARM_JOINTS, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
-from ..motor import CanBus, ControlMode, Joint, Motor
+from ..motor import CanBus, ControlMode, Joint, Motor, MotorError
 from .axol import GRIPPER_TRAVEL, calibrate_gripper_open_stop
 from .base import RobotBase
 from .config import AxolConfig, PositionForceConfig
@@ -33,6 +33,7 @@ from .config import AxolConfig, PositionForceConfig
 _logger = logging.getLogger(__name__)
 
 _N_ARM = len(ARM_JOINTS)
+_DEFAULT_GRIPPER_POSITION = 1.0
 
 
 class MantisGripperArm:
@@ -52,28 +53,90 @@ class MantisGripperArm:
         self._open_pos = 0.0
         self._closed_pos = GRIPPER_TRAVEL
         self._virtual_arm = np.zeros(_N_ARM, dtype=np.float32)
+        # Before the first calibration, raw motor radians cannot be mapped to
+        # the public [closed=0, open=1] range.  Echo a known-safe virtual open
+        # position until that mapping exists, just as the seven virtual arm
+        # joints echo their latest target.
+        self._gripper_target = _DEFAULT_GRIPPER_POSITION
+        self._enabled = False
+        self._disable_pending = False
+        self._calibrated = False
+        self._telemetry_active = False
 
     # -- Lifecycle -----------------------------------------------------------
 
     async def enable(self) -> None:
-        """Enable the gripper motor, calibrate its open stop, and arm POSITION_FORCE."""
-        await self._motor.enable()
-        await self._motor.set_control_mode(ControlMode.IMPEDANCE)
-        self._open_pos = await calibrate_gripper_open_stop(self._motor)
-        self._closed_pos = self._open_pos + GRIPPER_TRAVEL
-        await self._motor.set_control_mode(ControlMode.POSITION_FORCE)
+        """Enable this gripper, calibrating only on its first activation.
+
+        Episode boundaries disable motor torque but deliberately retain the
+        measured hard-stop in memory.  Re-enabling for a later episode can
+        therefore return directly to POSITION_FORCE mode without sweeping the
+        jaws open a second time.
+        """
+        if self._enabled:
+            return
+
+        # A previous disable may have failed after closing the software command
+        # gate.  Make one more best-effort attempt before bringing the motor up
+        # from a known state.
+        if self._disable_pending:
+            await self._motor.disable()
+            self._disable_pending = False
+
+        try:
+            await self._motor.enable()
+            self._disable_pending = True
+            if not self._calibrated:
+                await self._motor.set_control_mode(ControlMode.IMPEDANCE)
+                self._open_pos = await calibrate_gripper_open_stop(self._motor)
+                self._closed_pos = self._open_pos + GRIPPER_TRAVEL
+                self._calibrated = True
+            await self._motor.set_control_mode(ControlMode.POSITION_FORCE)
+            await self._send_gripper_target()
+            self._enabled = True
+        except BaseException:
+            # Once enable() reached the hardware, a later configuration or
+            # calibration failure must not leave a single gripper live.
+            self._enabled = False
+            if self._disable_pending:
+                try:
+                    await self._motor.disable()
+                except Exception:  # noqa: BLE001 - retain original failure
+                    _logger.exception("Mantis gripper cleanup disable failed")
+                else:
+                    self._disable_pending = False
+            raise
 
     async def disable(self) -> None:
+        """Close the command gate immediately, then disable motor torque."""
+        self._enabled = False
+        if not self._disable_pending:
+            return
         await self._motor.disable()
+        self._disable_pending = False
+
+    async def force_disable(self) -> None:
+        """Disable and verify hardware whose state predates this process."""
+        self._enabled = False
+        self._disable_pending = True
+        await self._motor.disable()
+        self._disable_pending = False
 
     async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
         await self._motor.start_telemetry(hz, torque=torque)
+        self._telemetry_active = True
 
     async def stop_telemetry(self) -> None:
         await self._motor.stop_telemetry()
+        self._telemetry_active = False
 
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
         """Block until the gripper motor has reported at least one position."""
+        # With polling disabled, command replies normally seed the cache.  A
+        # deferred gripper intentionally receives no command until an episode
+        # starts, so there is nothing to wait for during Robot.connect().
+        if not self._telemetry_active and not self._enabled:
+            return
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while not self._motor.has_position:
@@ -89,26 +152,53 @@ class MantisGripperArm:
         """Raw motor radians → [0 = closed, 1 = open]."""
         return (raw - self._closed_pos) / (self._open_pos - self._closed_pos)
 
+    def _normalized_position(self) -> float:
+        """Return cached feedback, or a safe virtual value before calibration."""
+        if not self._calibrated or not self._motor.has_position:
+            return self._gripper_target
+        return float(np.clip(self._normalize(self._motor.position), 0.0, 1.0))
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def is_calibrated(self) -> bool:
+        return self._calibrated
+
     @property
     def positions(self) -> np.ndarray:
         """Latest positions, shape (8,) in Joint order (cached gripper feedback)."""
         out = np.empty(_N_ARM + 1, dtype=np.float32)
         out[:_N_ARM] = self._virtual_arm
-        out[_N_ARM] = self._normalize(self._motor.position)
+        out[_N_ARM] = self._normalized_position()
         return out
 
     @property
     def torques(self) -> np.ndarray:
         """Latest torques, shape (8,); the virtual arm joints report zero."""
         out = np.zeros(_N_ARM + 1, dtype=np.float32)
-        out[_N_ARM] = self._motor.torque
+        try:
+            out[_N_ARM] = self._motor.torque
+        except MotorError:
+            # Disabled/deferred motors may not have emitted torque feedback
+            # yet.  Zero is the only meaningful placeholder for that state.
+            pass
         return out
 
     async def get_positions(self) -> np.ndarray:
         """Actively read the gripper position; virtual arm joints as stored."""
         out = np.empty(_N_ARM + 1, dtype=np.float32)
         out[:_N_ARM] = self._virtual_arm
-        out[_N_ARM] = self._normalize(await self._motor.get_position())
+        if self._telemetry_active:
+            out[_N_ARM] = self._normalized_position()
+        else:
+            raw = await self._motor.get_position()
+            out[_N_ARM] = (
+                float(np.clip(self._normalize(raw), 0.0, 1.0))
+                if self._calibrated
+                else self._gripper_target
+            )
         return out
 
     # -- Commands -------------------------------------------------------------
@@ -120,8 +210,19 @@ class MantisGripperArm:
             q: Shape (8,) targets in Joint order — arm joints in radians
                (stored, nothing physical to move), gripper normalised [0, 1].
         """
+        q = np.asarray(q, dtype=float)
+        if q.size < _N_ARM + 1:
+            raise ValueError(f"Mantis target must contain {_N_ARM + 1} positions")
         self._virtual_arm = np.asarray(q[:_N_ARM], dtype=np.float32).copy()
-        raw = self._closed_pos + float(q[_N_ARM]) * (self._open_pos - self._closed_pos)
+        self._gripper_target = float(np.clip(q[_N_ARM], 0.0, 1.0))
+        if not self._enabled:
+            return
+        await self._send_gripper_target()
+
+    async def _send_gripper_target(self) -> None:
+        raw = self._closed_pos + self._gripper_target * (
+            self._open_pos - self._closed_pos
+        )
         raw = float(np.clip(raw, self._open_pos, self._closed_pos))
         await self._motor.set_position_force(
             raw,
@@ -145,6 +246,8 @@ class Mantis(RobotBase):
         config: AxolConfig = AxolConfig(),
         left_channel: str | None = CAN_MANTIS_LEFT,
         right_channel: str | None = CAN_MANTIS_RIGHT,
+        *,
+        defer_gripper_enable: bool = False,
     ) -> None:
         if left_channel is None and right_channel is None:
             raise ValueError(
@@ -153,6 +256,10 @@ class Mantis(RobotBase):
 
         self.left: MantisGripperArm | None = None
         self.right: MantisGripperArm | None = None
+        self._defer_gripper_enable = defer_gripper_enable
+        self._connected = False
+        self._telemetry_settings: tuple[float, bool] | None = None
+        self._lifecycle_lock = asyncio.Lock()
         self._left_bus: CanBus | None = None
         self._right_bus: CanBus | None = None
         if left_channel is not None:
@@ -165,44 +272,149 @@ class Mantis(RobotBase):
     # -- Lifecycle -------------------------------------------------------------
 
     async def enable(self) -> None:
-        """Start CAN buses and enable + calibrate both grippers."""
-        await asyncio.gather(
-            *[b.start() for b in (self._left_bus, self._right_bus) if b is not None]
+        """Start CAN buses and, by default, immediately enable both grippers.
+
+        ``defer_gripper_enable=True`` changes only the second half: buses are
+        connected for reads and telemetry, while the motors remain disabled
+        until :meth:`enable_grippers` is called at recording start.
+        """
+        async with self._lifecycle_lock:
+            await self._connect_unlocked()
+            if not self._defer_gripper_enable:
+                await self._enable_grippers_unlocked()
+
+    async def connect(self) -> None:
+        """Start both CAN buses; deferred mode also verifies torque-off."""
+        async with self._lifecycle_lock:
+            await self._connect_unlocked()
+
+    async def _connect_unlocked(self) -> None:
+        if self._connected:
+            return
+        buses = [b for b in (self._left_bus, self._right_bus) if b is not None]
+        results = await asyncio.gather(
+            *[b.start() for b in buses], return_exceptions=True
         )
-        await asyncio.gather(
-            *[a.enable() for a in (self.left, self.right) if a is not None]
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            await asyncio.gather(*[b.close() for b in buses], return_exceptions=True)
+            raise failures[0]
+
+        if self._defer_gripper_enable:
+            # A previous process may have died with a motor enabled. Merely
+            # skipping enable() would then leave it holding throughout the
+            # pre-record phase, so establish and verify torque-off before this
+            # deferred connection is considered ready.
+            arms = [a for a in (self.left, self.right) if a is not None]
+            disabled = await asyncio.gather(
+                *[a.force_disable() for a in arms], return_exceptions=True
+            )
+            failures = [r for r in disabled if isinstance(r, BaseException)]
+            if failures:
+                await asyncio.gather(
+                    *[b.close() for b in buses], return_exceptions=True
+                )
+                raise failures[0]
+        self._connected = True
+
+    async def enable_grippers(self) -> None:
+        """Enable both grippers as one operation, cleaning up partial failure."""
+        async with self._lifecycle_lock:
+            await self._connect_unlocked()
+            await self._enable_grippers_unlocked()
+
+    async def _enable_grippers_unlocked(self) -> None:
+        arms = [a for a in (self.left, self.right) if a is not None]
+        telemetry = self._telemetry_settings
+        if telemetry is not None:
+            await self._stop_telemetry_unlocked()
+
+        results = await asyncio.gather(
+            *[a.enable() for a in arms], return_exceptions=True
         )
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            cleanup = await asyncio.gather(
+                *[a.force_disable() for a in arms], return_exceptions=True
+            )
+            for result in cleanup:
+                if isinstance(result, BaseException):
+                    _logger.error("Mantis partial-enable cleanup failed: %s", result)
+            if telemetry is not None:
+                try:
+                    await self._start_telemetry_unlocked(*telemetry)
+                except Exception:  # noqa: BLE001 - retain enable failure
+                    _logger.exception(
+                        "Could not restore Mantis telemetry after enable failure"
+                    )
+            raise failures[0]
+
+        if telemetry is not None:
+            try:
+                await self._start_telemetry_unlocked(*telemetry)
+            except BaseException:
+                await asyncio.gather(
+                    *[a.force_disable() for a in arms], return_exceptions=True
+                )
+                raise
+
+    async def disable_grippers(self) -> None:
+        """Force-disable both grippers while keeping buses and calibration."""
+        async with self._lifecycle_lock:
+            arms = [a for a in (self.left, self.right) if a is not None]
+            results = await asyncio.gather(
+                *[a.force_disable() for a in arms], return_exceptions=True
+            )
+            failures = [r for r in results if isinstance(r, BaseException)]
+            if failures:
+                raise failures[0]
 
     async def disable(self) -> None:
         """Disable the grippers and close the CAN buses."""
-        arms = [a for a in (self.left, self.right) if a is not None]
-        try:
-            await asyncio.gather(
-                *[a.stop_telemetry() for a in arms],
-                *[a.disable() for a in arms],
+        async with self._lifecycle_lock:
+            arms = [a for a in (self.left, self.right) if a is not None]
+            buses = [b for b in (self._left_bus, self._right_bus) if b is not None]
+            await self._stop_telemetry_unlocked()
+            results = await asyncio.gather(
+                *[a.force_disable() for a in arms], return_exceptions=True
             )
-        except Exception:
-            _logger.exception("Mantis gripper disable failed")
-        finally:
-            await asyncio.gather(
-                *[b.close() for b in (self._left_bus, self._right_bus) if b is not None]
-            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    _logger.error("Mantis gripper disable failed: %s", result)
+            await asyncio.gather(*[b.close() for b in buses], return_exceptions=True)
+            self._connected = False
 
     # -- Telemetry ---------------------------------------------------------------
 
     async def start_telemetry(self, hz: float, *, torque: bool = False) -> None:
-        await asyncio.gather(
-            *[
-                a.start_telemetry(hz, torque=torque)
-                for a in (self.left, self.right)
-                if a is not None
-            ]
+        async with self._lifecycle_lock:
+            await self._start_telemetry_unlocked(hz, torque)
+
+    async def _start_telemetry_unlocked(self, hz: float, torque: bool) -> None:
+        arms = [a for a in (self.left, self.right) if a is not None]
+        results = await asyncio.gather(
+            *[a.start_telemetry(hz, torque=torque) for a in arms],
+            return_exceptions=True,
         )
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            await asyncio.gather(
+                *[a.stop_telemetry() for a in arms], return_exceptions=True
+            )
+            self._telemetry_settings = None
+            raise failures[0]
+        self._telemetry_settings = (hz, torque)
 
     async def stop_telemetry(self) -> None:
+        async with self._lifecycle_lock:
+            await self._stop_telemetry_unlocked()
+
+    async def _stop_telemetry_unlocked(self) -> None:
         await asyncio.gather(
-            *[a.stop_telemetry() for a in (self.left, self.right) if a is not None]
+            *[a.stop_telemetry() for a in (self.left, self.right) if a is not None],
+            return_exceptions=True,
         )
+        self._telemetry_settings = None
 
     async def wait_for_telemetry(self, timeout: float = 5.0) -> None:
         await asyncio.gather(

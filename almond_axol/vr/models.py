@@ -84,6 +84,10 @@ class VRFrame(BaseModel):
             transition. ``None`` keeps the legacy controller behavior (success
             unless ``reset`` requests re-recording); tracker trigger gestures
             set this explicitly so failure remains distinct from re-record.
+        lock_release_id: Internal managed-tracker handshake. When set on a
+            frame whose lock bits are both false, the teleop core echoes the
+            identifier after it has consumed that release. This lets the
+            bridge wait for a real low→high edge even while IK is blocked.
         t:       Client capture timestamp in milliseconds (``performance.now()``).
             Used by the server's pose interpolator to reconstruct the true motion
             cadence when frames arrive batched/jittered over the network. Optional:
@@ -133,6 +137,7 @@ class VRFrame(BaseModel):
     reset: bool = False
     state: VRState = VRState.TELEOP
     episode_outcome: VREpisodeOutcome | None = None
+    lock_release_id: int | None = None
     t: float | None = None
     seq: int | None = None
     t_host: float | None = None

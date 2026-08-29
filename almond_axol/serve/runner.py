@@ -716,10 +716,13 @@ class OperationRunner:
 
         Returns ``False`` when no op with episode control is running.
         """
-        bridge_command = {
-            "bridge-toggle": "toggle",
-            "bridge-reset": "reset",
-        }.get(command)
+        # Managed Mantis teleop and collection always track. Reject the old
+        # toggle command explicitly so a stale panel (or forged API request)
+        # cannot enqueue a disengage pulse. Reset remains a valid bridge
+        # action because it does not serve as an operator pause control.
+        if command == "bridge-toggle":
+            return False
+        bridge_command = {"bridge-reset": "reset"}.get(command)
         if bridge_command is not None and self._bridge_commands is not None:
             try:
                 self._bridge_commands.put(bridge_command)
@@ -1029,7 +1032,7 @@ class OperationRunner:
         ) and not config.allow_single_side:
             raise RuntimeError(
                 f"No complete {source} tracker binding is saved; open Settings → "
-                "Teleop & VR and select Identify trackers first"
+                "Mantis and select Identify trackers first"
             )
         ctx = multiprocessing.get_context("spawn")
         stop_event = ctx.Event()

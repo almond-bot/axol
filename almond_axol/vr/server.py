@@ -94,6 +94,12 @@ class VRServer:
         # in its legacy free-toggle behaviour (older backends that never set it).
         self._mode: str | None = None
 
+        # Last tracking state reported by the teleop core. Keep it alongside
+        # the other connection-seeded state so a managed tracker bridge that
+        # reconnects can distinguish an already-engaged core from one that
+        # auto-disengaged while the bridge was away.
+        self._tracking: bool | None = None
+
         # Current episode number to show in the headset HUD during data
         # collection (the 1-based index of the episode being recorded next).
         # Broadcast whenever it changes and re-sent to any client that connects
@@ -352,6 +358,13 @@ class VRServer:
                 await ws.send_text(text)
             except Exception as exc:
                 _logger.warning("Failed to send feedback to client: %s", exc)
+
+    async def broadcast_tracking(self, enabled: bool) -> None:
+        """Store and broadcast the teleop core's current tracking state."""
+        self._tracking = bool(enabled)
+        await self.broadcast_text(
+            json.dumps({"type": "tracking", "value": self._tracking})
+        )
 
     async def _broadcast_hud(self, exclude: WebSocket | None = None) -> None:
         """Relay the current headset HUD state to (other) connected clients."""
@@ -738,6 +751,15 @@ class VRServer:
                     )
                 except Exception as exc:  # noqa: BLE001 - best-effort announce
                     _logger.warning("failed to send mode to client: %s", exc)
+            # Seed tracking too: managed Mantis bridges use this state after a
+            # reconnect to re-engage only when the core is actually disabled.
+            if server._tracking is not None:
+                try:
+                    await websocket.send_text(
+                        json.dumps({"type": "tracking", "value": server._tracking})
+                    )
+                except Exception as exc:  # noqa: BLE001 - best-effort announce
+                    _logger.warning("failed to send tracking to client: %s", exc)
             # Likewise seed the current episode number so a headset joining
             # mid-session shows the right value immediately, not on the next
             # episode. Best-effort for the same reason as the mode announce.

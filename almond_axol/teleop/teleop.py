@@ -162,10 +162,9 @@ class VRTeleop:
         """
         if self._vr_loop is None:
             return
-        text = json.dumps({"type": "tracking", "value": enabled})
         try:
             asyncio.run_coroutine_threadsafe(
-                self._vr_server.broadcast_text(text), self._vr_loop
+                self._vr_server.broadcast_tracking(enabled), self._vr_loop
             )
         except RuntimeError:
             pass  # VR loop already shut down

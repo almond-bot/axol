@@ -480,6 +480,21 @@ class VRTeleopCore:
         self._prev_l_lock = l_lock
         self._prev_r_lock = r_lock
 
+        # Managed tracker bridges hold both lock bits low until this explicit
+        # acknowledgement comes back. Unlike a fixed-duration release pulse,
+        # the handshake cannot be missed while this IK thread is blocked for
+        # several seconds waiting on a solve.
+        lock_release_id = getattr(frame, "lock_release_id", None)
+        if (
+            lock_release_id is not None
+            and not l_lock
+            and not r_lock
+            and self._broadcast_json is not None
+        ):
+            self._broadcast_json(
+                {"type": "lock_release", "value": int(lock_release_id)}
+            )
+
         # Only track a gripper while its arm is engaged, so a frozen arm's
         # grasp (and a disengaged session) can't be actuated by the trigger.
         if self.left_enabled:

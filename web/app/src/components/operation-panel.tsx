@@ -185,18 +185,9 @@ export function OperationPanel({
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             {live && mantisMode && mantisSource !== "quest" && (
-              <>
-                <Button
-                  variant="outline"
-                  onClick={() => onEpisode("bridge-toggle")}
-                  disabled={busy}
-                >
-                  Pause / resume tracking
-                </Button>
-                <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
-                  <RotateCcw /> Reset
-                </Button>
-              </>
+              <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
+                <RotateCcw /> Reset
+              </Button>
             )}
             {stopping ? (
               <Button variant="destructive" disabled>

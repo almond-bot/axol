@@ -421,6 +421,10 @@ class DamiaoMotor(MotorDriver):
                     return
             except MotorError:
                 pass
+        raise MotorError(
+            f"Damiao motor {self._motor_id:#04x} did not confirm disabled "
+            f"after {max_attempts} attempts"
+        )
 
     async def get_control_mode(self) -> ControlMode:
         """Read the active control mode from the motor's register."""

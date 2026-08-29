@@ -539,10 +539,9 @@ class AxolVRTeleop(Teleoperator):
         """
         if self._vr_server is None or self._loop is None:
             return
-        text = json.dumps({"type": "tracking", "value": enabled})
         try:
             asyncio.run_coroutine_threadsafe(
-                self._vr_server.broadcast_text(text), self._loop
+                self._vr_server.broadcast_tracking(enabled), self._loop
             )
         except RuntimeError:
             pass  # event loop already shut down

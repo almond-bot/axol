@@ -155,10 +155,11 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
         from ..teleop.config import apply_mantis_teleop_profile
 
         tc = cfg.teleop_config.vr_teleop_config
-        if not tc.absolute_mode or tc.ik_alpha != 1.0:
+        if not tc.absolute_mode or tc.hold_to_engage or tc.ik_alpha != 1.0:
             _logger.info(
-                "--mantis: forcing absolute_mode, ik_alpha=1.0, and transparent "
-                "trapezoid limits on the teleop config."
+                "--mantis: forcing absolute_mode, hold_to_engage=false, "
+                "ik_alpha=1.0, and transparent trapezoid limits on the "
+                "teleop config."
             )
         apply_mantis_teleop_profile(tc)
         apply_mantis_kinematics_profile(cfg.teleop_config.kinematics_config)
@@ -831,7 +832,9 @@ def _run(
         cfg.teleop_config.has_gripper = cfg.robot_config.axol_config.has_gripper
 
     robot = (
-        MantisRobot(cfg.robot_config) if mantis_mode else AxolRobot(cfg.robot_config)
+        MantisRobot(cfg.robot_config, defer_gripper_enable=True)
+        if mantis_mode
+        else AxolRobot(cfg.robot_config)
     )
     teleop = AxolVRTeleop(cfg.teleop_config)
 
@@ -1219,23 +1222,53 @@ def _run(
             else None
         )
 
-        def _start_recording() -> None:
-            """Open the relay's raw branch and start a recorder episode."""
+        async def _start_recording() -> bool:
+            """Enable Mantis grippers, then start capture for this take."""
             nonlocal recording, stats, recording_started_at, capture_checked
             nonlocal was_engaged
+            if mantis_mode:
+                log_say("Preparing Mantis grippers.")
+                enable_task = asyncio.create_task(robot.enable_grippers_async())
+                while not enable_task.done() and not _stopped():
+                    await asyncio.sleep(0.05)
+                if _stopped():
+                    # Calibration is the only autonomous Mantis gripper move.
+                    # Stop must interrupt its sweep instead of waiting for all
+                    # hard-stop steps and CAN retries to finish.
+                    enable_task.cancel()
+                    try:
+                        await enable_task
+                    except asyncio.CancelledError:
+                        pass
+                    finally:
+                        await robot.disable_grippers_async()
+                    return False
+                await enable_task
+            if _stopped():
+                if mantis_mode:
+                    await robot.disable_grippers_async()
+                return False
+            try:
+                if relay is not None:
+                    relay.set_raw_enabled(True)
+                recorder.start_episode(task)
+            except BaseException:
+                if relay is not None:
+                    relay.set_raw_enabled(False)
+                if mantis_mode:
+                    await robot.disable_grippers_async()
+                raise
             recording = True
             stats = EpisodeQAStats()
             recording_started_at = time.perf_counter()
             capture_checked = False
             was_engaged = teleop.is_engaged()
-            if relay is not None:
-                relay.set_raw_enabled(True)
-            recorder.start_episode(task)
             control.note_recording()
             log_say("Recording started.")
             # Reflect the recording state on the headset HUD (no-op for the
             # VR-initiated start, where the headset already switched itself).
             teleop.send_feedback_state(VRState.RECORDING)
+            return True
 
         # Absolute-deadline pacing (mirrors `axol teleop`): late wakeups are
         # corrected on the next cycle instead of stretching the command interval.
@@ -1406,7 +1439,14 @@ def _run(
 
             if start_requested and not recording:
                 pending_start = None
-                _start_recording()
+                if not await _start_recording():
+                    return recording, rerecord, False, stats
+                # First-use calibration can take seconds. Re-anchor absolute
+                # pacing so the hot loop does not try to "catch up" that gap
+                # with a burst of CAN commands and recorder publications.
+                deadline = time.perf_counter()
+                prev_t0["v"] = 0.0
+                continue
 
             # The episode outcome comes from the VR record button (terminate →
             # save, reset+record → discard) or the panel's Save / Discard
@@ -1540,6 +1580,19 @@ def _run(
                 fut.cancel()
             raise
 
+    def _disable_mantis_grippers() -> None:
+        """Leave the handheld grippers torque-off between collection takes."""
+        if mantis_mode:
+            _run_on_robot_loop(robot.disable_grippers_async())
+
+    def _begin_disable_mantis_grippers() -> Any | None:
+        """Start torque-off without waiting on recorder/camera shutdown."""
+        if not mantis_mode:
+            return None
+        return asyncio.run_coroutine_threadsafe(
+            robot.disable_grippers_async(), robot.event_loop
+        )
+
     def _wrap_up_episode(recording: bool, rerecord: bool) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
@@ -1578,19 +1631,33 @@ def _run(
                 "when ready."
             )
 
-            recording, rerecord, contact, qa = _run_on_robot_loop(_episode_loop())
+            try:
+                recording, rerecord, contact, qa = _run_on_robot_loop(_episode_loop())
+            except BaseException:
+                # A failure after a recording start must not leave the handheld
+                # grippers powered while the rest of collection unwinds.
+                try:
+                    _disable_mantis_grippers()
+                except Exception:
+                    _logger.exception(
+                        "failed to disable Mantis grippers after episode error"
+                    )
+                raise
 
-            # The episode is over the moment the loop breaks: freeze the
-            # recorder's row stream NOW, before the gripper valve close /
-            # return-to-rest below — otherwise the capture thread keeps
-            # pairing the frozen final snapshot with reused/re-muxed camera
-            # frames until save/cancel, and every episode (saved or
-            # discarded) ends with a junk tail of rows that were never
-            # teleoperated.
-            if recording:
-                captured_rows, capture_error = recorder.stop_capture()
-            else:
-                captured_rows, capture_error = 0, None
+            # The episode is over the moment the loop breaks. Start Mantis
+            # torque-off immediately, in parallel with freezing the recorder:
+            # a wedged camera read must never keep the grippers powered while
+            # stop_capture waits. The recorder stop signal is still issued in
+            # this same turn, so at most its already-in-flight row can finish.
+            disable_future = _begin_disable_mantis_grippers()
+            try:
+                if recording:
+                    captured_rows, capture_error = recorder.stop_capture()
+                else:
+                    captured_rows, capture_error = 0, None
+            finally:
+                if disable_future is not None:
+                    disable_future.result()
 
             # Recording done — close the raw branch so the rest-pose/reset and
             # next pre-record phase stay light.

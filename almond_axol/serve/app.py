@@ -116,8 +116,8 @@ class EpisodeRequest(BaseModel):
     takes ``start`` | ``s`` | ``r`` | ``continue``; ``waypoints`` takes
     ``record`` | ``undo`` | ``clear`` | ``grip-left`` | ``grip-right`` |
     ``play`` | ``stop`` | ``quit``. A managed Mantis bridge also accepts
-    ``bridge-toggle`` and ``bridge-reset``. The panel sends back whatever the
-    operation published in ``controls`` plus those bridge actions.
+    ``bridge-reset``. The panel sends back whatever the operation published
+    in ``controls`` plus that bridge action.
     """
 
     command: str

@@ -256,7 +256,7 @@ export function CamerasPanel({
       </div>
 
       <div className="flex flex-col gap-3 border-t border-white/10 pt-4">
-        <Label>{mantisMode ? "Mantis cameras" : "Axol cameras"}</Label>
+        <Label>{mantisMode ? "Mantis cameras" : "Axol Cameras"}</Label>
         {cameraSlots.map((slot) => {
           const serial = serials[slot.key]?.trim() ?? ""
           const kind = kindBySerial.get(serial)

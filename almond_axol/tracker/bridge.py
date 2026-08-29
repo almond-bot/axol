@@ -22,8 +22,10 @@ edge of both locks together and disables on a rising edge of either.
 
 A side whose tracker stops reporting (occlusion, SLAM relocalising)
 holds its last good pose rather than going quiet, so IK never chases a
-glitch and the operator can recover by re-engaging. A stale trigger
-node likewise holds its last grip command, never jumping on a dropout.
+glitch. Managed bridges freeze, wait for both sides to recover, and then
+re-anchor automatically; standalone bridges retain manual engage control.
+A stale trigger node likewise holds its last grip command, never jumping
+on a dropout.
 """
 
 from __future__ import annotations
@@ -181,7 +183,9 @@ class StopEventControls:
     """Headless controls for a bridge managed by another process.
 
     The owning process supplies an event that ends the bridge and an optional
-    queue carrying control-panel toggle/reset requests.
+    queue carrying control-panel reset requests. Managed Mantis operations
+    always track, so engage/disengage commands are deliberately ignored; the
+    stdin-driven standalone bridge remains available for manual testing.
     """
 
     def __init__(self, stop_event: Any, command_queue: Any = None) -> None:
@@ -192,20 +196,17 @@ class StopEventControls:
         pass
 
     def consume(self) -> tuple[bool, bool]:
-        toggle = False
         reset = False
         if self._commands is None:
-            return toggle, reset
+            return False, reset
         while True:
             try:
                 command = self._commands.get_nowait()
             except queue.Empty:
                 break
-            if command == "toggle":
-                toggle = True
-            elif command == "reset":
+            if command == "reset":
                 reset = True
-        return toggle, reset
+        return False, reset
 
 
 class TrackerBridge:
@@ -226,9 +227,11 @@ class TrackerBridge:
             because absolute-mode (Mantis) engagement fits the shared base
             transform from BOTH controller positions, so the placeholder
             pose streamed for an unbound side corrupts the fit.
-        auto_engage: Engage once all bound trackers have produced a live pose.
-            The lock stays asserted until the teleop core acknowledges tracking,
-            so a slow startup cannot miss a short pulse.
+        auto_engage: Engage once all bound trackers have produced a live pose,
+            and re-engage after the teleop core reports a forced disengage. The
+            lock request stays asserted until the core acknowledges tracking,
+            and every release stays low until the core echoes its transaction
+            ID, so slow startup/reset/IK handling cannot miss either edge.
     """
 
     def __init__(
@@ -279,31 +282,52 @@ class TrackerBridge:
 
         self._seq = 0
         self._engaged = False
+        self._auto_engage_enabled = auto_engage
         self._auto_engage_pending = auto_engage
         self._auto_engage_waiting_ack = False
+        self._auto_engage_withdrawn = False
+        self._auto_disengage_pending = False
+        self._auto_disengage_waiting_ack = False
+        self._auto_lock_release_id: int | None = None
+        self._auto_lock_release_seq = 0
         self._lock_pulse = 0
         self._reset_pulse = 0
         self._outcome_pulse = 0
         self._episode_outcome: VREpisodeOutcome | None = None
         self._held: dict[str, TrackerPose] = {}
+        self._fresh: dict[str, bool] = {"left": False, "right": False}
         self._warned_stale: dict[str, bool] = {"left": False, "right": False}
         # The server announces whether this connection belongs to teleop or
         # data collection. TELEOP is the safe default until that message lands.
         self._state = VRState.TELEOP
 
+    def _request_auto_lock_release(self) -> None:
+        """Hold managed lock bits low until the teleop core consumes them."""
+        if self._auto_lock_release_id is None:
+            self._auto_lock_release_seq += 1
+            self._auto_lock_release_id = self._auto_lock_release_seq
+
     # -- Frame composition ---------------------------------------------------
 
-    def _side_pose(self, side: str, now: float) -> tuple[np.ndarray, np.ndarray]:
+    def _side_pose(
+        self, side: str, now: float, *, hold_updates: bool = False
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return the ``(pos, quat)`` to stream for one side.
 
         The last good pose wins over anything stale/untracked; a side with
         no data yet (or no tracker assigned) streams the fixed placeholder.
+        ``hold_updates`` still observes freshness but latches the pre-loss
+        pose until the core confirms it has disengaged; a recovered pose must
+        first appear on the fresh re-engage edge, never under the old base fit.
         """
         key = self._keys[side]
+        self._fresh[side] = False
         if key is not None:
             sample = self._source.poses().get(key)
             if sample is not None and sample.tracking and now - sample.t <= _STALE_S:
-                self._held[side] = sample
+                self._fresh[side] = True
+                if not hold_updates:
+                    self._held[side] = sample
                 if self._warned_stale[side]:
                     self._warned_stale[side] = False
                     _logger.info("%s tracker (%s) is tracking again", side, key)
@@ -351,8 +375,17 @@ class TrackerBridge:
         """Build one VRFrame JSON object from the latest tracker poses."""
         toggle, reset = self._controls.consume()
         if toggle and self._lock_pulse == 0:
+            # A manual control source takes ownership of engage state. Managed
+            # bridges never emit toggles, while this keeps a custom/standalone
+            # auto-engage bridge from immediately undoing its operator's
+            # explicit disengage request.
+            self._auto_engage_enabled = False
             self._auto_engage_pending = False
             self._auto_engage_waiting_ack = False
+            self._auto_engage_withdrawn = False
+            self._auto_disengage_pending = False
+            self._auto_disengage_waiting_ack = False
+            self._auto_lock_release_id = None
             self._engaged = not self._engaged
             self._lock_pulse = _PULSE_FRAMES
             _logger.info(
@@ -364,11 +397,16 @@ class TrackerBridge:
 
         now = time.perf_counter()
         frame: dict = {}
+        hold_pose_updates = self._auto_engage_enabled and (
+            self._auto_engage_withdrawn
+            or self._auto_disengage_pending
+            or self._auto_disengage_waiting_ack
+        )
         for side, ee_key, elbow_key in (
             ("left", "l_ee", "l_elbow"),
             ("right", "r_ee", "r_elbow"),
         ):
-            pos, quat = self._side_pose(side, now)
+            pos, quat = self._side_pose(side, now, hold_updates=hold_pose_updates)
             frame[ee_key] = {
                 "position": {
                     "x": float(pos[0]),
@@ -391,14 +429,66 @@ class TrackerBridge:
             }
 
         required_sides = [side for side, key in self._keys.items() if key is not None]
-        if self._auto_engage_pending and all(
-            side in self._held for side in required_sides
+        all_required_fresh = all(self._fresh[side] for side in required_sides)
+        if self._auto_engage_waiting_ack and not all_required_fresh:
+            # Withdraw an unacknowledged engage request if tracking drops in
+            # the meantime. Keeping the level asserted would let the core
+            # eventually engage against historical held poses.
+            self._auto_engage_waiting_ack = False
+            self._auto_engage_withdrawn = True
+            self._auto_engage_pending = True
+            self._request_auto_lock_release()
+        if (
+            self._auto_engage_enabled
+            and self._engaged
+            and not all_required_fresh
+            and not self._auto_disengage_pending
+            and not self._auto_disengage_waiting_ack
+        ):
+            # Held poses are safe only as a stationary fallback. Toggle the
+            # core out of tracking before a returning tracker can jump under
+            # the old world→base fit; once both sides are fresh, the normal
+            # auto-engage path takes a new alignment snapshot.
+            self._auto_engage_pending = True
+            self._auto_disengage_pending = True
+            _logger.warning(
+                "tracker freshness lost — freezing Mantis until both sides recover"
+            )
+        if (
+            self._auto_disengage_pending
+            and self._engaged
+            and self._auto_lock_release_id is None
+            and not self._auto_engage_waiting_ack
+            and not self._auto_disengage_waiting_ack
+        ):
+            self._auto_disengage_pending = False
+            self._auto_disengage_waiting_ack = True
+        elif self._auto_disengage_pending and not self._engaged:
+            self._auto_disengage_pending = False
+        if (
+            self._auto_engage_enabled
+            and self._auto_engage_pending
+            and not self._engaged
+            and all_required_fresh
+            and not self._auto_disengage_pending
+            and not self._auto_disengage_waiting_ack
+            and self._auto_lock_release_id is None
         ):
             self._auto_engage_pending = False
             self._auto_engage_waiting_ack = True
             _logger.info("trackers live — engaging Mantis tracking automatically")
 
-        lock = self._lock_pulse > 0 or self._auto_engage_waiting_ack
+        lock = (
+            self._lock_pulse > 0
+            or self._auto_engage_waiting_ack
+            or self._auto_disengage_waiting_ack
+        )
+        if self._auto_lock_release_id is not None:
+            # Toggle-mode engagement needs a genuine low→high edge. Keep the
+            # wire low until the core explicitly confirms it consumed this
+            # release; an IK solve can block far longer than a timed pulse.
+            lock = False
+            frame["lock_release_id"] = self._auto_lock_release_id
         if self._lock_pulse > 0:
             self._lock_pulse -= 1
         frame["l_lock"] = lock
@@ -479,6 +569,67 @@ class TrackerBridge:
         frame["t"] = (max(cap_ts) if cap_ts else now) * 1000.0
         return frame
 
+    def _handle_tracking_state(self, engaged: bool) -> None:
+        """Adopt a server tracking acknowledgement for managed auto-engage."""
+        was_engaged = self._engaged
+        self._engaged = engaged
+
+        if not self._auto_engage_enabled:
+            return
+
+        if engaged:
+            if self._auto_disengage_waiting_ack:
+                # A reconnect can seed the current true state while our
+                # disengage toggle is still waiting to be consumed.
+                return
+            if self._auto_engage_waiting_ack:
+                self._auto_engage_waiting_ack = False
+                self._auto_engage_pending = False
+                self._auto_engage_withdrawn = False
+            elif self._auto_engage_withdrawn:
+                # The core consumed an engage just before freshness loss made
+                # us withdraw it. Complete a deliberate off→on cycle even if
+                # the tracker already recovered, so absolute IK re-anchors.
+                self._auto_engage_withdrawn = False
+                self._auto_disengage_pending = True
+                self._auto_engage_pending = True
+            else:
+                # Seed from an already-engaged core (for example after bridge
+                # reconnect). Adopt it instead of toggling it off.
+                self._auto_engage_pending = False
+            self._request_auto_lock_release()
+            return
+
+        if self._auto_engage_waiting_ack and not was_engaged:
+            # The server seeds its existing false state when this WebSocket
+            # connects. It is not an acknowledgement of our newly asserted
+            # engage request, so keep that request high until a true arrives.
+            return
+
+        self._auto_engage_waiting_ack = False
+        self._auto_disengage_waiting_ack = False
+        self._auto_disengage_pending = False
+        self._auto_engage_pending = True
+        if was_engaged:
+            # Whether this was our stale-tracker toggle or an out-of-band
+            # reset/contact stop, make the core prove it consumed a low frame
+            # before the next engage edge is allowed.
+            self._request_auto_lock_release()
+
+    def _handle_lock_release(self, value: object) -> None:
+        """Complete the managed low-level handshake for the matching ID."""
+        try:
+            release_id = int(value)
+        except (TypeError, ValueError):
+            return
+        if release_id != self._auto_lock_release_id:
+            return
+        self._auto_lock_release_id = None
+        if self._auto_engage_withdrawn and not self._engaged:
+            # If the high frame had engaged the core, its ordered tracking=true
+            # broadcast would precede this release acknowledgement.
+            self._auto_engage_withdrawn = False
+
     # -- Streaming -----------------------------------------------------------
 
     async def run(self) -> None:
@@ -499,7 +650,7 @@ class TrackerBridge:
             )
         else:
             print(
-                "Streaming tracker poses (managed by control panel); "
+                "Streaming tracker poses (tracking managed automatically); "
                 "trigger x3 = start/success, trigger x4 = failure."
             )
         while not self._controls.quit.is_set():
@@ -550,8 +701,8 @@ class TrackerBridge:
                     except ValueError:
                         _logger.warning("server sent unknown VR state %r", value)
                 elif msg_type == "tracking":
-                    self._engaged = bool(value)
-                    if self._engaged:
-                        self._auto_engage_waiting_ack = False
+                    self._handle_tracking_state(bool(value))
+                elif msg_type == "lock_release":
+                    self._handle_lock_release(value)
         except Exception:  # noqa: BLE001 - connection teardown ends the drain
             pass

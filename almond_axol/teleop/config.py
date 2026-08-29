@@ -246,11 +246,14 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
 
     Shared by ``collect-data --mantis`` and ``teleop --mantis`` so the two flows
     behave identically: ``absolute_mode`` (the engage squeeze is the start-pose
-    alignment act), and transparent smoothing — the EMA and trapezoid filters
-    exist to protect a physical arm and only add lag between the solution and
-    where the hand actually was, so with no arm to protect the joints should
-    follow the raw IK output. The One Euro cutoff is raised for the same
-    reason: its rest-tremor smoothing costs ~100 ms of lag at slow speeds,
+    alignment act), toggle-style lock semantics, and transparent smoothing —
+    the EMA and trapezoid filters exist to protect a physical arm and only add
+    lag between the solution and where the hand actually was, so with no arm to
+    protect the joints should follow the raw IK output. Managed bridges use an
+    acknowledged low→high edge when automatically freezing or re-engaging, so
+    ``hold_to_engage`` must be disabled; otherwise that required low release
+    would act as a dead-man disengage. The One Euro cutoff is raised for the
+    same reason: its rest-tremor smoothing costs ~100 ms of lag at slow speeds,
     which on the rig is pure pose↔image misalignment (and visible slack in the
     headset's URDF overlay); a higher cutoff keeps the solution pinned to the
     hand at the price of passing through a little tremor.
@@ -267,6 +270,7 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
     would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
     """
     config.absolute_mode = True
+    config.hold_to_engage = False
     config.ik_alpha = 1.0
     config.teleop_max_vel = 1e6
     config.teleop_max_accel = 1e6

@@ -196,7 +196,7 @@ export function SettingsSection({
   // Tab order: attached hardware first (Axol cameras, Mantis, Quest USB), then
   // behaviour categories, the pose editor, and per-op Advanced overrides.
   const tabs: { key: SettingsTab; label: string }[] = [
-    { key: "cameras", label: "Axol cameras" },
+    { key: "cameras", label: "Axol Cameras" },
     { key: "mantis", label: "Mantis" },
     { key: "usb", label: "Quest USB" },
   ]
