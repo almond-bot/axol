@@ -1007,8 +1007,8 @@ class OperationRunner:
             config.left is None or config.right is None
         ) and not config.allow_single_side:
             raise RuntimeError(
-                f"No complete {source} tracker binding is saved; run "
-                f"`axol tracker.identify --backend {backend}` first"
+                f"No complete {source} tracker binding is saved; open Settings → "
+                "Teleop & VR and select Identify trackers first"
             )
         ctx = multiprocessing.get_context("spawn")
         stop_event = ctx.Event()

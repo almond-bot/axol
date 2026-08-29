@@ -599,6 +599,20 @@ export async function sendSessionInput(id: string, line = ""): Promise<{ ok: boo
   )
 }
 
+export type TrackerBackend = "survive" | "ultimate"
+
+export interface TrackerBinding {
+  complete: boolean
+  left: string | null
+  right: string | null
+}
+
+export async function fetchTrackerBindings(): Promise<{
+  bindings: Record<TrackerBackend, TrackerBinding>
+}> {
+  return json(await fetch(apiUrl("/api/tracker/bindings")))
+}
+
 // ---------------------------------------------------------------------------
 // Shared operator settings (serve/settings.py) — persisted on the serve host
 // at ~/.almond/settings.json and folded into every op start server-side.

@@ -14,6 +14,7 @@ up by ``axol tracker.bridge``.
 
 from __future__ import annotations
 
+import sys
 import time
 
 import numpy as np
@@ -38,7 +39,21 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
         help="Tracker backend to use and save (default: the saved config, "
         "else survive).",
     )
+    parser.add_argument(
+        "--web-prompts",
+        action="store_true",
+        help="Emit guided prompt markers for the web control panel.",
+    )
     parser.set_defaults(func=run)
+
+
+def _confirm(instruction: str, web_prompts: bool) -> None:
+    """Wait for a motion-capture step from a terminal or the web UI."""
+    if web_prompts:
+        print(f"[prompt] {instruction}", flush=True)
+        sys.stdin.readline()
+    else:
+        input(f"{instruction} Press Enter to begin ... ")
 
 
 def _motion(source, window_s: float) -> dict[str, float]:
@@ -91,9 +106,10 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
         assigned: dict[str, str] = {}
         for side in ("left", "right"):
             while True:
-                input(
-                    f"[{side.upper()}] Hold every rig still, press Enter, then "
-                    f"shake ONLY the {side} rig for {_CAPTURE_S:.0f}s... "
+                _confirm(
+                    f"Hold every rig still. When ready, move ONLY the {side.upper()} "
+                    f"Mantis for {_CAPTURE_S:.0f} seconds.",
+                    args.web_prompts,
                 )
                 travelled = _motion(source, _CAPTURE_S)
                 candidates = {

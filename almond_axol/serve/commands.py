@@ -555,6 +555,18 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------
+    "tracker.identify": CommandDef(
+        "tracker.identify",
+        "tracker.identify",
+        "Identify Mantis trackers",
+        "Bind the selected Lighthouse or Ultimate trackers to the left and "
+        "right Mantis with a guided motion capture.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_identify"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
     "can.setup": CommandDef(
         "can.setup",
         "can.setup",

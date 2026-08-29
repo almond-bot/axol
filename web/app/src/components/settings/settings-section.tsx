@@ -36,6 +36,7 @@ import { FieldRow, FlatSchemaForm } from "@/components/config-form"
 import { materializeCameraSpec } from "@/lib/camera-spec"
 import { CamerasPanel } from "./cameras-panel"
 import { PosePanel } from "./pose-panel"
+import { TrackerBindingPanel } from "./tracker-binding-panel"
 import { cn } from "@/lib/utils"
 
 export type SettingsTab = string // "cameras" | "usb" | "pose" | "advanced" | a category key
@@ -285,7 +286,18 @@ export function SettingsSection({
                 }
               />
             ) : activeCategory ? (
-              <CategoryPanel category={activeCategory} values={draft.values} onChange={setValue} />
+              <>
+                <CategoryPanel
+                  category={activeCategory}
+                  values={draft.values}
+                  onChange={setValue}
+                />
+                {activeCategory.key === "teleop" && (
+                  <TrackerBindingPanel
+                    source={String(draft.values["teleop.mantis_source"] ?? "lighthouse")}
+                  />
+                )}
+              </>
             ) : (
               <p className="text-sm text-white/40">Loading settings…</p>
             )}

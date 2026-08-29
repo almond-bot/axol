@@ -673,6 +673,27 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(snapshot)
 
+    @app.get("/api/tracker/bindings")
+    async def get_tracker_bindings() -> dict[str, Any]:
+        """Whether each physical Mantis tracker backend has both sides bound."""
+        from ..tracker import load_tracker_config
+
+        config = await asyncio.to_thread(load_tracker_config)
+        bindings: dict[str, dict[str, Any]] = {}
+        for backend in ("survive", "ultimate"):
+            saved = config.bindings.get(backend, {})
+            left = saved.get("left")
+            right = saved.get("right")
+            if backend == config.backend:
+                left = config.left or left
+                right = config.right or right
+            bindings[backend] = {
+                "complete": bool(left and right),
+                "left": left,
+                "right": right,
+            }
+        return {"bindings": bindings}
+
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
     @app.get("/api/datasets")

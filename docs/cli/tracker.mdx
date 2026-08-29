@@ -41,7 +41,7 @@ axol teleop --mantis                # or: axol collect-data --mantis ...
 axol tracker.bridge
 ```
 
-From the control panel, select **Mantis** in the operation card, then pick **Quest**, **Lighthouse**, or **Ultimate** under **Settings → Teleop & VR → Mantis tracking**. Quest connects directly from the headset and starts no bridge. Lighthouse (the default) and Ultimate restore their own saved device bindings and start the matching bridge. While a bridge is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
+From the control panel, select **Mantis** in the operation card, then pick **Quest**, **Lighthouse**, or **Ultimate** under **Settings → Teleop & VR → Mantis tracking**. Quest connects directly from the headset and starts no bridge. Lighthouse (the default) and Ultimate show their binding status in the same settings tab; press **Identify trackers** there for a guided left/right motion capture, with no terminal required. Once bound, they restore their own saved device bindings and start the matching bridge. While a bridge is running, **Toggle tracking** replaces Enter and **Reset** replaces `r`; stopping the operation also stops the bridge.
 
 No tracker→gripper calibration is needed. A Vive Tracker 3.0 on the Mantis rig's standard mount uses the rig's **factory tracker→gripper transform** automatically (a design constant, baked into the SDK) so recorded TCP poses are metrically correct out of the box; a per-unit entry in `~/.almond/mantis/tcp_transform.json` overrides it when present. For everything else, the absolute (Mantis) mapping absorbs the rigid mount offset — along with the world yaw/translation — into the engage snapshot, so holding the grippers at the agreed start pose and engaging **is** the alignment act. Alignment quality at engage bounds the episode's absolute accuracy either way.
 
@@ -62,7 +62,7 @@ A side whose tracker loses tracking (occlusion, SLAM relocalising) holds its las
 
 ## `axol tracker.identify`
 
-Discovers the powered-on trackers, then asks you to shake each rig in turn; the device with the most motion is bound to that side. Bindings are retained separately for Lighthouse and Ultimate so the panel can switch between them. Saves `~/.almond/tracker/config.json`:
+The control panel's **Identify trackers** button runs this command on the serve host. For terminal use, it discovers the powered-on trackers, then asks you to move each rig in turn; the device with the most motion is bound to that side. Bindings are retained separately for Lighthouse and Ultimate so the panel can switch between them. Saves `~/.almond/tracker/config.json`:
 
 ```json
 {
