@@ -28,7 +28,7 @@ This command is configured via draccus. The policy side mirrors [`run-policy`](/
 | `--policy_max_vel FLOAT` | Per-joint velocity ceiling (rad/s) for the envelope over the **policy's** arm actions (default: 6.2832 = 2π). Transparent for normal trained motion; it only engages on discontinuities — a policy outlier or a re-plan from a stale observation — so a bad action can't snap the arms. `0` disables it. Teleop actions are already shaped by the teleop smoothing stack |
 | `--policy_max_accel FLOAT` | Per-joint acceleration ceiling (rad/s²) for that policy-action envelope (default: 21.9911 = 7π) |
 | `--device STR` | PyTorch device for the in-process policy inference (default: `cuda`); use `cpu` for CPU inference |
-| `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC. Resuming an existing dataset keeps its original resolution regardless of this flag |
+| `--dataset_resolution {SVGA,HD1080,HD1200}` | Resolution the **dataset** video is recorded at (default: `SVGA` = 960×600) — also the resolution the policy's observations arrive at. Downscaled from the camera capture on the GPU's VIC; the independent full-resolution headset stream is fixed at 30 fps. Resuming an existing dataset keeps its original resolution regardless of this flag |
 | `--vcodec STR` | Video codec recorded for the dataset (default: per-platform — `h264` on Jetson/aarch64, `auto` elsewhere). Same capped-VBR NVENC encode path as [`collect-data`](/cli/collect-data) |
 | `--root PATH` | Local dataset root (default: `$HF_LEROBOT_HOME`) |
 | `--push_to_hub true` | Push the dataset to HuggingFace Hub when done |

@@ -504,7 +504,8 @@ class TeleopCmdConfig:
     track (one decoder session on the headset) and rendered per-lens for
     true stereo. ``--resolution`` picks the capture resolution for all
     cameras (``SVGA`` / ``HD1080`` / ``HD1200``); ``null`` (the default)
-    keeps each camera's SDK default.
+    keeps each camera's SDK default. Headset streaming is fixed at 30 fps,
+    independently of the capture rate used by recording or policy cameras.
 
     ``--camera_eyes`` overrides which eye(s) of a stereo slot are streamed to
     the headset, keyed by slot (``both`` / ``left`` / ``right``) — e.g.

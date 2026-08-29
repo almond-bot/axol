@@ -471,7 +471,7 @@ def _relay_main(
     # Keep the camera objects alive for the relay's lifetime; ``sources`` maps
     # the per-track names the headset sees to a video source per camera/eye.
     # Prefer the GPU-resident gst pipeline; fall back to the SDK grab — a bare
-    # ZedCamera/eye, which WebRTCManager adapts to a frame-driven NVENC source.
+    # ZedCamera/eye, which WebRTCManager samples on its fixed-rate NVENC track.
     owned: list[object] = []
     sources: dict[str, object] = {}
     writers: list[object] = []
@@ -703,7 +703,9 @@ class VideoRelayProcess:
 
         Args:
             cameras: Per-source spec: ``{name: {"serial": int,
-                "resolution": str, "fps": int, "stereo": bool}}``.
+                "resolution": str, "fps": int, "stereo": bool}}``. ``fps``
+                is the physical capture/data rate; headset encoding is fixed
+                independently at 30 fps.
             want_raw: Also publish each camera's raw RGB frames to shared memory
                 for the control process (data collection). Successfully exported
                 sources appear in :attr:`raw_cameras` as

@@ -48,11 +48,13 @@ import av
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import VIDEO_TIME_BASE, convert_timebase
 
+from .constants import HEADSET_STREAM_FPS
+
 _logger = logging.getLogger(__name__)
 
-# The relay tracks pace at the camera rate; declare a nominal fps for the
-# pipeline caps / IDR interval (frames are pushed as they arrive).
-_FPS = 30
+# SDK-backed WebRTC tracks are paced at this fixed rate before reaching the
+# encoder. Camera capture itself may run faster for recording or policy input.
+_FPS = HEADSET_STREAM_FPS
 
 # Once the encoder's stdout has been quiet this long, the buffered tail is
 # the final NAL of the current access unit (the encoder writes a whole AU

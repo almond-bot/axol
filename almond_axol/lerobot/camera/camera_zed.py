@@ -410,6 +410,27 @@ class ZedCamera(Camera):
         return frame, cap_ts, recv_ts
 
     @check_if_not_connected
+    def read_latest_bgra_with_ts(self) -> tuple[NDArray[Any], float, float]:
+        """Return the latest native BGRA frame without consuming a frame event.
+
+        The WebRTC sampler uses this non-blocking view so its fixed-rate reads
+        cannot steal wakeups from recording or policy consumers waiting in
+        :meth:`read_at_or_after`.
+        """
+        if self.thread is None or not self.thread.is_alive():
+            raise RuntimeError(f"{self} read thread is not running.")
+
+        with self.frame_lock:
+            frame = self.latest_bgra
+            cap_ts = self.latest_capture_perf_ts
+            recv_ts = self.latest_receive_perf_ts
+
+        if frame is None or cap_ts is None or recv_ts is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+
+        return frame, cap_ts, recv_ts
+
+    @check_if_not_connected
     def read_at_or_after(
         self,
         target_capture_perf_ts: float,
@@ -846,6 +867,18 @@ class _StereoEyeView:
             raise RuntimeError(f"{self} read thread is not running.")
         with self._buf.lock:
             frame = self._buf.frame
+            cap_ts = self._buf.cap_ts
+            recv_ts = self._buf.recv_ts
+        if frame is None or cap_ts is None or recv_ts is None:
+            raise RuntimeError(f"{self} has not captured any frames yet.")
+        return frame, cap_ts, recv_ts
+
+    def read_latest_bgra_with_ts(self) -> tuple[NDArray[Any], float, float]:
+        """Return this eye's latest BGRA frame without consuming its event."""
+        if not self._running():
+            raise RuntimeError(f"{self} read thread is not running.")
+        with self._buf.lock:
+            frame = self._buf.bgra
             cap_ts = self._buf.cap_ts
             recv_ts = self._buf.recv_ts
         if frame is None or cap_ts is None or recv_ts is None:

@@ -113,10 +113,9 @@ def _register_camera_video(robot: "AxolRobot", teleop: Any) -> None:
     WebRTC track per source (see :func:`almond_axol.video.video._track_for_source`):
     a gst camera/eye already produces GPU-encoded H.264 access units (its
     ``subscribe()`` feeds a pre-encoded track — the same grab/encode serves the
-    dataset), while an SDK camera is adapted to a frame-driven source that
-    encodes each frame as soon as it's captured. Reads only consume the latest
-    frame each camera already keeps, so the dataset capture pipeline is never
-    blocked.
+    dataset), while an SDK camera samples its newest frame on the fixed 30 fps
+    headset clock. These reads are non-consuming, so the independently paced
+    dataset capture pipeline is never blocked.
     """
     if not robot.cameras:
         return
@@ -237,6 +236,8 @@ def _start_video_relay(
         serial = int(camcfg.serial)
         spec: dict[str, Any] = {
             "serial": serial,
+            # Physical capture / dataset rate. The camera pipeline independently
+            # fixes only its encoded headset branch at 30 fps.
             "fps": camcfg.fps or 60,
             "record": wants_record,
             "stream": wants_stream,

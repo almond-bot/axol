@@ -131,7 +131,14 @@ def _start_video_relay(cfg: TeleopCmdConfig, stereo_set: set[int]) -> Any | None
     resolution = cfg.resolution or "HD1200"
     specs: dict[str, dict[str, Any]] = {}
     for name, serial in cfg.cameras.items():
-        spec: dict[str, Any] = {"serial": serial, "resolution": resolution, "fps": 60}
+        spec: dict[str, Any] = {
+            "serial": serial,
+            "resolution": resolution,
+            # Keep capture at the broadly-supported hardware rate. The encoded
+            # WebRTC branch is independently capped at 30 fps; stereo HD1200
+            # cameras may reject a native 30 fps capture mode.
+            "fps": 60,
+        }
         if int(serial) in stereo_set:
             spec["stereo"] = True
             spec["eyes"], spec["eye_suffix"] = _stream_eyes_for(cfg, name)
@@ -194,12 +201,10 @@ def _connect_zed_cameras(
             width, height = dims
 
     def _connect(name: str, serial: int, **kwargs: Any) -> Any | None:
-        """Open one camera via the SDK, preferring 60 fps capture.
+        """Open one camera through the SDK at its full capture rate.
 
-        At the SDK's default the GMSL cameras capture HD1200 at 30 fps,
-        which adds up to a full 33 ms frame interval of staleness to the
-        headset feed; 60 fps halves that. Cameras that don't support 60 at
-        the requested resolution fall back to their default rate.
+        The WebRTC adapter independently caps delivery at 30 fps, so recording
+        and policy capture rates do not become streaming settings.
         """
         if sdk_exc is not None:
             _logger.warning("teleop: %s camera unavailable (%s)", name, sdk_exc)
@@ -215,7 +220,7 @@ def _connect_zed_cameras(
                 cam.connect(warmup=False)
                 return cam
             except RuntimeError as exc:
-                # Live-parameter mismatch (e.g. 60 fps unsupported) → retry
+                # Live-parameter mismatch (unsupported fps/resolution) → retry
                 # at the camera default.
                 _logger.info("teleop: %s camera rejected %s fps (%s)", name, fps, exc)
             except Exception as exc:  # noqa: BLE001 - camera absent → skip it
@@ -252,8 +257,8 @@ def _register_zed_video(teleop: "VRTeleop", cameras: list[tuple[str, Any]]) -> N
     """Register connected ZED cameras as WebRTC sources for the headset.
 
     The bare ``ZedCamera`` / stereo eyes are registered directly; the in-process
-    aiortc relay adapts each one to a frame-driven source (NVENC encode + aiortc
-    RTP send) — see :func:`almond_axol.video.video._track_for_source`.
+    aiortc relay samples each one on the fixed 30 fps headset clock (NVENC encode
+    + aiortc RTP send) — see :func:`almond_axol.video.video._track_for_source`.
     """
     if not cameras:
         return

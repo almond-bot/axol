@@ -394,6 +394,7 @@ COMMANDS: dict[str, CommandDef] = {
         entrypoint=_collect_dagger_run,
         requires_cameras=True,
         camera_mode="argv",
+        streams_video=True,
         uses_headset=True,
         episode_control=_run_policy_control,
         per_run_fields=("policy_path", "policy_type", "task", "repo_id"),

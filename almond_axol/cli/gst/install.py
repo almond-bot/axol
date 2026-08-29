@@ -42,9 +42,10 @@ _logger = logging.getLogger(__name__)
 _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
 # GStreamer elements gst.install is itself responsible for verifying: the NVENC
-# encode path (nvvidconv / nvv4l2h264enc), which ships with the Jetson L4T BSP.
+# encode path (nvvidconv / nvv4l2h264enc), which ships with the Jetson L4T BSP,
+# plus videorate from plugins-base, used to fix only the headset branch at 30 fps.
 # These gate gst.install's success alongside the gi/appsink import.
-_REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc")
+_REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc", "videorate")
 
 # The patched ZED source element ``axol gst.build-zed`` builds + installs
 # (sensor-accurate PTS). gst.install only *reports* whether it's present — its
@@ -56,6 +57,7 @@ _ZED_SOURCE_MARKER = "zedxonesrc"
 # the build deps PyGObject needs to compile against gobject-introspection.
 _APT_PACKAGES = (
     "gstreamer1.0-tools",
+    "gstreamer1.0-plugins-base",
     "gstreamer1.0-plugins-bad",
     "gir1.2-gstreamer-1.0",
     "gir1.2-gst-plugins-base-1.0",
