@@ -46,6 +46,8 @@ This command is configured via draccus. The robot subsystem is exposed as the ne
 | `--log_level {DEBUG,INFO,WARNING,ERROR}` | Default: `INFO` |
 | `--config_path PATH` | Load a whole-config JSON/YAML file; CLI overrides layer on top. |
 
+Every policy observation is assembled around image exposure time: all cameras must provide a fresh timestamped frame, their median exposure selects the nearest sample from the Rust core's 240 Hz telemetry history, and only then are joint/Cartesian features built. A stale camera, missing state bracket, or excessive timestamp skew stops the rollout instead of silently feeding a train/inference-misaligned observation. The default SDK backend derives exposure time from `TIME_REFERENCE.IMAGE`; the optional GStreamer backend is accepted only when the exact timestamp-patched plugin binary installed by `gst.build-zed` is verified.
+
 ```bash
 axol run-policy --policy_path myorg/pick-place-policy --policy_type act --task "Pick the red cube" \
     --robot_config.cameras "{overhead: {serial: 41234567}, left_arm: {serial: 41234568}, right_arm: {serial: 41234569}}"

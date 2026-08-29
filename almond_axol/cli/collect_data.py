@@ -34,7 +34,7 @@ one of those phases: without it the panel sat on "Saving…" (no buttons) for as
 long as the arms stayed limp, which reads as a stuck save, and a headset-off
 session had no way out of the hold but Stop.
 
-The teleop loop runs at ``--teleop_hz`` and publishes the latest
+The teleop loop runs at ``--teleop_hz`` and publishes a timestamped
 ``(joint_obs, action)`` snapshot every tick. The dataset itself — frame
 capture, row assembly, encoding, ``save_episode`` — is owned by a separate
 recorder (see :mod:`almond_axol.recording.record_proc`): a subprocess when the video
@@ -69,8 +69,8 @@ from ..recording import (
     restore_dataset_ownership,
 )
 from ..robot.control import ContactWatchdog
-from ..teleop_activity import TeleopActivityMarker
 from ..teleop.recorder import resolve_prefix
+from ..teleop_activity import TeleopActivityMarker
 from ..utils import affinity
 from ..utils.jetson_diag import TegraStatsDiag
 from ..utils.proc_diag import SystemDiag
@@ -193,10 +193,11 @@ def _start_video_relay(
 
     The relay subprocess opens the ZED cameras on the GPU-resident gst pipeline,
     streams the headset view over WebRTC (aiortc), **and** publishes each
-    camera's raw RGB frames back to this process through shared memory for the
-    dataset (see :mod:`almond_axol.video.shm_frames`). This keeps the control
-    process off the camera grab/encode/RTP path entirely, so the teleop and IK
-    loops stay as fast as ``axol teleop`` — even while recording.
+    camera's dataset feed through shared memory (PTS-preserving encoded H.264 on
+    the primary path, raw RGB on the fallback; see
+    :mod:`almond_axol.video.shm_frames`). This keeps the control process off the
+    camera grab/encode/RTP path entirely, so the teleop and IK loops stay as fast
+    as ``axol teleop`` — even while recording.
 
     ``dataset_resolution`` is the effective downscale target for the dataset (raw)
     branch — the configured value for a fresh dataset, or the existing dataset's
@@ -236,9 +237,12 @@ def _start_video_relay(
         serial = int(camcfg.serial)
         spec: dict[str, Any] = {
             "serial": serial,
-            # Physical capture / dataset rate. The camera pipeline independently
-            # fixes only its encoded headset branch at 30 fps.
+            # Physical capture and dataset output are independent. The camera
+            # may stay at 60 Hz for low-latency policy/raw access while the
+            # encoded recorder branch decimates to cfg.fps. Headset streaming
+            # is fixed separately at 30 fps.
             "fps": camcfg.fps or 60,
+            "dataset_fps": cfg.fps,
             "record": wants_record,
             "stream": wants_stream,
         }
@@ -701,14 +705,10 @@ def _run(
         relay.shutdown()
         relay = None
 
-    # On the relay's encoded (gstshm-h264) transport the dataset capture loop
-    # is paced by camera frame arrival — exactly one encoded frame per dataset
-    # row — so rows land at the camera rate no matter what fps was requested,
-    # while ``meta/info.json`` is stamped with the requested value. A mismatch
-    # therefore records a dataset whose metadata lies about its timing, and
-    # every consumer (replay-dataset, training) plays it back at the wrong
-    # speed. Fail fast with the rates the relay actually opened the cameras at
-    # (they can fall back, e.g. to 30 fps) instead of recording bad data.
+    # The encoded dataset branch is independently rate-limited to the requested
+    # recording fps. Verify the negotiated metadata anyway: a mismatch would
+    # make the constant-fps MP4 timeline disagree with the dataset metadata and
+    # replay/training would run at the wrong speed.
     if use_relay:
         mismatched = {
             src: int(m["fps"])
@@ -724,11 +724,9 @@ def _run(
             )
             raise ValueError(
                 f"Recording fps is {fps}, but dataset frames are captured at "
-                f"the camera rate ({rates}) — the episode would actually "
-                f"record at the camera rate while claiming {fps} fps, so "
-                f"replay and training would run at the wrong speed. Set the "
-                f"recording fps to the camera rate, or raise the camera fps "
-                f"to {fps}."
+                f"different negotiated rates ({rates}); replay and training "
+                f"would run at the wrong speed. Ensure each camera can capture "
+                f"at least {fps} fps."
             )
 
     # Connect first — cameras auto-detect resolution and FPS on open, which
@@ -879,13 +877,6 @@ def _run(
     diag.start()
     tegra = TegraStatsDiag(_logger)  # no-op off-Tegra
     tegra.start()
-
-    # Keep the relay's raw dataset branch closed until an episode records: the
-    # raw VIC convert + shared-memory copy for every camera is the bulk of the
-    # relay's CPU (~2 cores), and nothing reads raw frames during the pre-record
-    # teleop phase. Closing it there makes that phase as light as `axol teleop`.
-    if relay is not None:
-        relay.set_raw_enabled(False)
 
     episodes_recorded = 0
     episode_idx = recorder.episode_count()
@@ -1078,11 +1069,12 @@ def _run(
             if start_requested and not recording:
                 pending_start = None
                 recording = True
-                # Open the relay's raw branch so the recorder has frames, then
-                # tell the recorder to start an episode.
+                # Arm recorder cutoffs before opening the poised-before-IDR
+                # dataset valves. This preserves the first reopened IDR as row
+                # zero instead of flushing it in a startup race.
+                recorder.start_episode(task)
                 if relay is not None:
                     relay.set_raw_enabled(True)
-                recorder.start_episode(task)
                 control.note_recording()
                 log_say("Recording started.")
 
@@ -1222,13 +1214,19 @@ def _run(
                 fut.cancel()
             raise
 
-    def _wrap_up_episode(recording: bool, rerecord: bool) -> None:
+    def _wrap_up_episode(recording: bool, rerecord: bool, captured_rows: int) -> None:
         """Save or discard the just-ended episode and announce the result."""
         nonlocal episodes_recorded
         if rerecord:
             log_say("Re-recording episode.")
             if recording:
                 recorder.cancel_episode()
+        elif recording and captured_rows == 0:
+            # An operator can end the take before the encoded readers have
+            # produced row zero.  That is a valid empty take, not a session
+            # failure; LeRobot's save_episode intentionally rejects it.
+            log_say("No frames were captured this episode; discarding.")
+            recorder.cancel_episode()
         elif recording:
             log_say("Saving episode…")
             recorder.save_episode()
@@ -1246,6 +1244,12 @@ def _run(
             log_say("Episode ended before recording started, skipping.")
 
     try:
+        # Keep the relay's dataset branch closed until an episode records. This
+        # lives inside the cleanup scope because an acknowledged IDR-alignment
+        # failure is now surfaced synchronously.
+        if relay is not None:
+            relay.set_raw_enabled(False)
+
         while not _stopped():
             episode_idx = recorder.episode_count()
             # Surface the (1-based) episode number in the headset HUD so the
@@ -1260,9 +1264,11 @@ def _run(
 
             recording, rerecord, contact = _run_on_robot_loop(_episode_loop())
 
-            # Recording done — close the raw branch so the rest-pose/reset and
-            # next pre-record phase stay light. (The recorder stops its own
-            # capture loop on save/cancel, below.)
+            # Freeze capture exactly at the operator boundary while the final
+            # state snapshot still brackets every accepted exposure. Only then
+            # wait for the relay's next natural IDR and close its dataset branch;
+            # tail AUs are drained and discarded at the next reader flush.
+            captured_rows = recorder.finish_episode() if recording else 0
             if relay is not None:
                 relay.set_raw_enabled(False)
 
@@ -1285,7 +1291,7 @@ def _run(
                 teleop.send_feedback_state(VRState.DATA_COLLECTION)
                 continue
 
-            if recording and not rerecord:
+            if recording and not rerecord and captured_rows > 0:
                 # Mirror the headset's SAVING state in the panel for the whole
                 # rest-pose + save stretch (recording controls are blocked).
                 control.note_saving()
@@ -1303,7 +1309,7 @@ def _run(
                 _return_home_loop(), robot.event_loop
             )
             try:
-                _wrap_up_episode(recording, rerecord)
+                _wrap_up_episode(recording, rerecord, captured_rows)
                 home_future.result()
             except BaseException:
                 # Ctrl+C or a failed save: unwind the guarded return so it

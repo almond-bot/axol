@@ -90,10 +90,13 @@ from ..lerobot.robot.config_axol import AxolRobotConfig
 from ..lerobot.rollout import (
     IKResetController,
     PolicyActionLimiter,
-    latest_observation,
 )
 from ..lerobot.teleop.config_vr import AxolVRTeleopConfig
-from ..recording import DatasetRecorderProcess, default_vcodec
+from ..recording import (
+    DatasetRecorderProcess,
+    RecorderDatasetSaveError,
+    default_vcodec,
+)
 from .collect_data import (
     _existing_dataset_resolution,
     _start_video_relay,
@@ -252,8 +255,8 @@ class DaggerPolicy(Protocol):
 
     def act(self, observation: dict[str, Any]) -> dict[str, float] | None:
         """Return the next action for ``observation`` (joint state + one
-        frame per camera, from :func:`latest_observation`), or ``None`` to
-        skip the tick (e.g. an unusable observation)."""
+        frame per camera, synchronized at sensor exposure), or ``None`` to skip
+        the tick (e.g. an unusable observation)."""
         ...
 
     def close(self) -> None:
@@ -412,8 +415,8 @@ class _DaggerControlLoop(threading.Thread):
     intervention state machine from the teleop's engage state + freeze latch,
     then commands the robot from whichever source the state selects:
 
-    - POLICY: observation (:func:`latest_observation`) → ``policy.act`` →
-      action dict, through the velocity envelope.
+    - POLICY: sensor-exposure-aligned observation → ``policy.act`` → action
+      dict, through the velocity envelope.
     - TELEOP: ``teleop.get_action()`` (the smoothed IK output, seeded at the
       robot's pose on takeover).
     - FROZEN: re-send the last commanded action so the robot holds pose and
@@ -421,7 +424,9 @@ class _DaggerControlLoop(threading.Thread):
 
     Every tick publishes the ``(joint_obs, action)`` snapshot to the recorder
     subprocess (a small shared-memory write), which pairs it with the relay's
-    camera frames on its own 60 fps clock. The TELEOP state publishes with
+    camera frames on its configured recording clock. Policy snapshots carry the
+    median exposure timestamp of the images that produced the action; TELEOP
+    snapshots carry their live control-tick time. The TELEOP state publishes with
     ``intervention=True``, which is how the recorder tags the dataset's
     per-frame ``intervention`` feature (LeRobot's native DAgger annotation).
     The frozen gap is gated in the recorder
@@ -469,30 +474,35 @@ class _DaggerControlLoop(threading.Thread):
         self.intervention_spans: list[tuple[float, float]] = []
         self.open_span_start: float | None = None
 
-    def _policy_tick(self, t0: float) -> dict[str, float] | None:
+    def _policy_tick(self) -> dict[str, float] | None:
         """One policy inference tick; returns the sent action or ``None``.
 
         ``None`` means the tick was skipped (observation/camera hiccup, or
         the backend declined the observation) — skip-and-retry.
         """
         try:
-            obs = latest_observation(self.robot)
+            obs, observation_ts = self.robot.get_observation_with_capture_timestamp()
         except Exception as exc:  # noqa: BLE001
             _logger.warning("Observation failed (%s); skipping tick.", exc)
             return None
 
         action_dict = self.policy.act(obs)
-        if action_dict is None:
+        if action_dict is None or self.shutdown_event.is_set():
             return None
 
         if self.limiter is not None:
             action_dict = self.limiter.apply(action_dict)
 
         performed = self.robot.send_action(action_dict)
-        # obs carries the joint keys the snapshot needs (camera frames in the
-        # same dict are simply ignored by the snapshot writer's key list).
+        # obs carries the historical joints selected at observation_ts (camera
+        # arrays are ignored by the snapshot writer's fixed key list). Date the
+        # inferred action at that same sensor-exposure instant: the outer tick's
+        # t0 may precede the frames by a full camera period, while send time also
+        # includes inference latency.
         self.recorder.publish(
-            obs, performed if performed is not None else action_dict, t0
+            obs,
+            performed if performed is not None else action_dict,
+            observation_ts,
         )
         return action_dict
 
@@ -573,9 +583,15 @@ class _DaggerControlLoop(threading.Thread):
                 # the policy/frozen states, teleop_hz while engaged.
                 period = teleop_period if self.state == _STATE_TELEOP else policy_period
 
+                # Shutdown can arrive while observation, policy reset, or a
+                # recorder gate call is blocking. Re-check immediately before
+                # any motor command so teardown cannot release one late action.
+                if self.shutdown_event.is_set():
+                    return
+
                 # --- command the robot from the selected source
                 if self.state == _STATE_POLICY:
-                    sent = self._policy_tick(t0)
+                    sent = self._policy_tick()
                     if sent is None:
                         time.sleep(period)
                         continue
@@ -583,6 +599,8 @@ class _DaggerControlLoop(threading.Thread):
                 elif self.state == _STATE_TELEOP:
                     joint_obs = self.robot.get_joint_observation()
                     action = self.teleop.get_action()
+                    if self.shutdown_event.is_set():
+                        return
                     performed = self.robot.send_action(action)
                     # intervention=True: the recorder tags the rows this
                     # snapshot pairs with as human-driven (the dataset's
@@ -596,6 +614,8 @@ class _DaggerControlLoop(threading.Thread):
                     last_action = action
                 else:  # FROZEN — hold pose, keep the command cadence alive.
                     if last_action is not None:
+                        if self.shutdown_event.is_set():
+                            return
                         self.robot.send_action(last_action)
                         # Keep the recorder's snapshot current with the live
                         # command: capture is gated in the recorder, but a row
@@ -1097,10 +1117,11 @@ def _run(
             # history / hidden state from the previous episode).
             policy.reset()
             policy.set_instruction(task)
-            # Open the relay's raw branch (it feeds both the policy's
-            # observations and the recorder) and start the episode.
-            relay.set_raw_enabled(True)
+            # Arm the recorder before opening the relay branch. Today DAgger
+            # forces raw pyshm, but this ordering also preserves row-zero IDR
+            # semantics if it later adopts the encoded transport.
             recorder.start_episode(task)
+            relay.set_raw_enabled(True)
 
             control_thread = _DaggerControlLoop(
                 robot=robot,
@@ -1178,11 +1199,33 @@ def _run(
             control_thread.join(timeout=5.0)
             teleop.set_intervention_allowed(False)
             teleop.force_disengage()
-            # Freeze the recorder's capture at a known row count: stops rows
-            # accruing while we home (idempotent if the episode ended
-            # frozen). Then close the relay's raw branch until the next
-            # episode.
-            final_rows = recorder.pause_episode()
+            if control_thread.is_alive():
+                # A policy call wedged past shutdown can otherwise wake later
+                # and issue one more command while the supervisor homes/saves.
+                # Disconnect first, then discard capture; never race a second
+                # controller against this still-live thread.
+                try:
+                    robot.disconnect()
+                except Exception:  # noqa: BLE001 - preserve the safety failure
+                    _logger.exception("robot disconnect failed after control timeout")
+                try:
+                    recorder.finish_episode()
+                    recorder.cancel_episode()
+                except Exception:  # noqa: BLE001 - outer cleanup gets another try
+                    _logger.exception("episode discard failed after control timeout")
+                try:
+                    relay.set_raw_enabled(False)
+                except Exception:  # noqa: BLE001 - relay shutdown follows
+                    _logger.exception("relay gate failed after control timeout")
+                raise RuntimeError(
+                    "DAgger control thread did not stop within 5s; robot was "
+                    "disconnected and the episode discarded"
+                )
+            # Freeze and join capture at an exact row count before closing the
+            # relay. A mere pause acknowledgement can leave one raw camera read
+            # in flight; closing its valve then turns a normal episode end into
+            # a capture timeout.
+            final_rows = recorder.finish_episode()
             relay.set_raw_enabled(False)
             # Close a span still open when the loop exited (the episode ended
             # mid-intervention) at the final row count — exact, since capture
@@ -1234,6 +1277,10 @@ def _run(
             log_say("Saving episode…")
             try:
                 recorder.save_episode()
+            except RecorderDatasetSaveError:
+                # Writer indices/parquet rows may already have changed. A
+                # retry in this process could compound the damage.
+                raise
             except RuntimeError as exc:
                 # e.g. the recorder refused a video/row-misaligned episode
                 # (encoder frame drops). Discarded — keep the session up.
@@ -1261,10 +1308,16 @@ def _run(
             pass
 
         log_say("Stopping.")
-        try:
-            policy.close()
-        except Exception:  # noqa: BLE001
-            pass
+        if control_thread is None or not control_thread.is_alive():
+            try:
+                policy.close()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            _logger.error(
+                "skipping policy.close because the wedged control thread is "
+                "still executing inside the policy backend"
+            )
         try:
             robot.disconnect()
         except Exception:  # noqa: BLE001

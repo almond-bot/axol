@@ -16,6 +16,7 @@ from .ownership import restore_dataset_ownership
 from .record_proc import (
     DatasetRecorderProcess,
     InProcessRecorder,
+    RecorderDatasetSaveError,
     default_vcodec,
     make_episode_durable,
 )
@@ -23,6 +24,7 @@ from .record_proc import (
 __all__ = [
     "DatasetRecorderProcess",
     "InProcessRecorder",
+    "RecorderDatasetSaveError",
     "default_vcodec",
     "make_episode_durable",
     "restore_dataset_ownership",

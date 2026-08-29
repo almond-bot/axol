@@ -70,6 +70,11 @@ _EE_AXES = ("x", "y", "z", "rx", "ry", "rz")
 _LEFT_EE_KEYS = [f"left_ee.{a}" for a in _EE_AXES]
 _RIGHT_EE_KEYS = [f"right_ee.{a}" for a in _EE_AXES]
 
+# Policy observations should normally select a state within half a 240 Hz
+# telemetry interval. Leave bounded scheduling headroom while rejecting a
+# broken clock/history instead of silently pairing a stale state.
+_POLICY_STATE_ALIGNMENT_LIMIT_S = 0.020
+
 
 class AxolRobot(Robot):
     """LeRobot Robot wrapping the Axol dual-arm hardware.
@@ -172,8 +177,10 @@ class AxolRobot(Robot):
         cams = self.config.observation_cameras().values()
         needs_mono = any(eye is None for _, eye in cams)
         needs_stereo = any(eye is not None for _, eye in cams)
-        available = (not needs_mono or zed_gst_available()) and (
-            not needs_stereo or zed_stereo_gst_available()
+        available = (
+            not needs_mono or zed_gst_available(require_sensor_timestamps=True)
+        ) and (
+            not needs_stereo or zed_stereo_gst_available(require_sensor_timestamps=True)
         )
         if backend == "gst" and not available:
             _logger.warning(
@@ -496,8 +503,21 @@ class AxolRobot(Robot):
         assert self._axol.left is not None
         assert self._axol.right is not None
 
-        left_pos = self._axol.left.positions
-        right_pos = self._axol.right.positions
+        return self._joint_state_from_arrays(
+            self._axol.left.positions,
+            self._axol.right.positions,
+            self._axol.left.torques if self.config.observe_torques else None,
+            self._axol.right.torques if self.config.observe_torques else None,
+        )
+
+    def _joint_state_from_arrays(
+        self,
+        left_pos: np.ndarray,
+        right_pos: np.ndarray,
+        left_trq: np.ndarray | None = None,
+        right_trq: np.ndarray | None = None,
+    ) -> RobotObservation:
+        """Build joint/Cartesian features from one coherent state snapshot."""
 
         obs: RobotObservation = {}
         if self.config.observe_cartesian:
@@ -509,8 +529,8 @@ class AxolRobot(Robot):
                 obs[key] = float(right_pos[i])
 
         if self.config.observe_torques:
-            left_trq = self._axol.left.torques
-            right_trq = self._axol.right.torques
+            if left_trq is None or right_trq is None:
+                raise RuntimeError("timestamped telemetry snapshot has no torques")
             for i, key in enumerate(self._left_trq_keys):
                 obs[key] = float(left_trq[i])
             for i, key in enumerate(self._right_trq_keys):
@@ -530,39 +550,93 @@ class AxolRobot(Robot):
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-        """Return cached joint state and timestamp-aligned camera frames.
+        """Return camera frames paired to nearest timestamped robot state.
 
         Cameras are sampled with :meth:`ZedCamera.read_at_or_after` against a
-        shared ``time.perf_counter()`` target so every frame in the
-        observation shares the same capture instant — matching the alignment
-        guarantee that ``collect-data`` writes into the training dataset. If a
-        camera fails to produce a qualifying frame within ``timeout_ms``, we
-        fall back to ``read_latest()`` so a single stale camera doesn't stall
-        inference.
+        shared ``time.perf_counter()`` target. Their median sensor-exposure time
+        selects the nearest entry from the Rust core's 240 Hz feedback history,
+        matching collection's exposure-driven association. A missing/stale
+        camera or unbracketed state aborts the observation; policy inference
+        must never continue on a silently mismatched image/state pair.
         """
+        observation, _capture_ts = self._get_synchronized_observation()
+        return observation
+
+    @check_if_not_connected
+    def get_observation_with_capture_timestamp(
+        self,
+    ) -> tuple[RobotObservation, float]:
+        """Return a synchronized observation and its canonical capture time.
+
+        The timestamp is the median sensor-exposure time of the returned camera
+        frames, on the system-wide ``perf_counter`` clock. This atomic API is
+        used by DAgger so the recorder dates the inferred action at the same
+        instant as the images and historical joints supplied to the policy.
+        """
+        return self._get_synchronized_observation()
+
+    def _get_synchronized_observation(self) -> tuple[RobotObservation, float]:
+        """Build one synchronized observation and return its exposure time."""
         target_ts = time.perf_counter()
-
-        obs = self._joint_state()
-
+        if not self.cameras:
+            return self._joint_state(), target_ts
+        frames: dict[str, np.ndarray] = {}
+        capture_ts: list[float] = []
         for cam_key, cam in self.cameras.items():
             cam_fps = getattr(cam, "fps", None) or 30
             timeout_ms = int(2 * 1000.0 / cam_fps + 200)
             try:
-                frame, _cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
+                frame, cap_ts, _recv_ts = cam.read_at_or_after(  # type: ignore[attr-defined]
                     target_ts, timeout_ms=timeout_ms
                 )
             except (TimeoutError, RuntimeError) as exc:
-                _logger.debug(
-                    "get_observation: %s read_at_or_after(%.6f) failed (%s); "
-                    "falling back to read_latest().",
-                    cam_key,
-                    target_ts,
-                    exc,
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced no fresh frame: {exc}"
+                ) from exc
+            if not np.isfinite(cap_ts):
+                raise RuntimeError(
+                    f"policy camera {cam_key!r} produced an invalid capture timestamp"
                 )
-                frame = cam.read_latest()
-            obs[cam_key] = frame
+            frames[cam_key] = frame
+            capture_ts.append(cap_ts)
 
-        return obs
+        row_capture_ts = float(np.median(capture_ts))
+        camera_skew = max(capture_ts) - min(capture_ts)
+        slowest_fps = min(
+            float(getattr(cam, "fps", None) or 30) for cam in self.cameras.values()
+        )
+        camera_limit = max(0.010, 1.5 / slowest_fps)
+        if camera_skew > camera_limit:
+            raise RuntimeError(
+                "policy camera exposures are not synchronized "
+                f"(spread {camera_skew * 1e3:.1f}ms, limit "
+                f"{camera_limit * 1e3:.1f}ms)"
+            )
+
+        assert self._axol is not None
+        state = self._axol.state_nearest(row_capture_ts)
+        if state is None:
+            raise RuntimeError(
+                "no retained robot telemetry brackets policy camera exposure "
+                f"{row_capture_ts:.6f}"
+            )
+        left_pos, right_pos, left_trq, right_trq, state_ts = state
+        state_skew = abs(state_ts - row_capture_ts)
+        if state_skew > _POLICY_STATE_ALIGNMENT_LIMIT_S:
+            raise RuntimeError(
+                "nearest robot telemetry is too far from policy camera exposure "
+                f"({state_skew * 1e3:.1f}ms, limit "
+                f"{_POLICY_STATE_ALIGNMENT_LIMIT_S * 1e3:.1f}ms)"
+            )
+        obs = self._joint_state_from_arrays(
+            left_pos,
+            right_pos,
+            left_trq if self.config.observe_torques else None,
+            right_trq if self.config.observe_torques else None,
+        )
+        obs.update(frames)
+
+        return obs, row_capture_ts
 
     def _ensure_ik(self) -> KinematicsSolver:
         """Lazily build the IK solver used to resolve Cartesian action targets.

@@ -87,6 +87,121 @@ def _desired_stamp() -> str:
     return f"{_PINNED_REF}\n{patch_sha}\n"
 
 
+def _plugin_filename(name: str) -> Path | None:
+    """Return the plugin binary selected by ``gst-inspect`` for an element."""
+    inspect = shutil.which("gst-inspect-1.0")
+    if inspect is None:
+        return None
+    try:
+        result = subprocess.run(
+            [inspect, name], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.strip().split(None, 1)
+        if len(fields) == 2 and fields[0] == "Filename":
+            try:
+                return Path(fields[1]).resolve(strict=True)
+            except OSError:
+                return None
+    return None
+
+
+def _plugin_stamp_line(
+    element: str, plugin_path: str | Path | None = None
+) -> str | None:
+    """Element, resolved plugin path, and content digest for one source."""
+    path = _plugin_filename(element) if plugin_path is None else Path(plugin_path)
+    if path is None:
+        return None
+    try:
+        path = path.resolve(strict=True)
+        binary_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return f"{element}\t{path}\t{binary_sha}\n"
+
+
+def _installed_manifest_paths(src: Path) -> set[Path]:
+    """Resolved files installed by the just-completed CMake build."""
+    try:
+        entries = (src / "build" / "install_manifest.txt").read_text().splitlines()
+    except OSError:
+        return set()
+    paths: set[Path] = set()
+    for entry in entries:
+        try:
+            path = Path(entry.strip()).resolve(strict=True)
+        except OSError:
+            continue
+        if path.is_file():
+            paths.add(path)
+    return paths
+
+
+def _installed_stamp(src: Path) -> str | None:
+    """Provenance plus identities trusted from this build's install manifest.
+
+    ``gst-inspect`` tells us which binary runtime will load, but is not itself a
+    trust source: ``GST_PLUGIN_PATH`` could make it resolve a stock plugin. Only
+    bless a resolved binary when CMake's just-written install manifest proves
+    that this patched build installed that exact file.
+    """
+    installed_paths = _installed_manifest_paths(src)
+    if not installed_paths:
+        _logger.warning("zed-gstreamer install manifest is missing or empty")
+        return None
+    lines: list[str | None] = []
+    for element in ("zedsrc", "zedxonesrc"):
+        path = _plugin_filename(element)
+        if path is None or path not in installed_paths:
+            _logger.warning(
+                "%s resolves to %s, which is not an artifact in %s; refusing "
+                "to bless a possibly stock plugin",
+                element,
+                path,
+                src / "build" / "install_manifest.txt",
+            )
+            return None
+        lines.append(_plugin_stamp_line(element, path))
+    if any(line is None for line in lines):
+        return None
+    return _desired_stamp() + "".join(line for line in lines if line is not None)
+
+
+def sensor_timestamp_patch_installed(
+    element: str, plugin_path: str | Path | None = None
+) -> bool:
+    """Whether runtime resolves the exact binary installed by the patched build.
+
+    The GStreamer registry alone cannot distinguish the stock Stereolabs
+    plugin (host-receive PTS) from Axol's patched build (sensor-exposure PTS).
+    The build stamp records both source/patch provenance and a SHA-256 of the
+    resolved installed ``.so``. Re-hash the binary selected by this runtime so
+    a later stock upgrade or higher-priority ``GST_PLUGIN_PATH`` cannot leave a
+    stale source-tree stamp falsely authorizing exact synchronization.
+    """
+    candidates = {
+        _src_dir() / ".axol-build-stamp",
+        Path("/opt/almond/zed-gstreamer/.axol-build-stamp"),
+        Path.home() / ".almond/zed-gstreamer/.axol-build-stamp",
+    }
+    identity = _plugin_stamp_line(element, plugin_path)
+    if identity is None:
+        return False
+    for stamp in candidates:
+        try:
+            recorded = stamp.read_text()
+            if recorded.startswith(_desired_stamp()) and identity in recorded:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 1800) -> bool:
     """Run a command, logging on failure; returns True on exit code 0."""
     try:
@@ -199,12 +314,9 @@ def run(_args: object = None) -> None:
 
     src = _src_dir()
     stamp_file = src / ".axol-build-stamp"
-    desired = _desired_stamp()
-
-    already = (
-        stamp_file.exists()
-        and stamp_file.read_text() == desired
-        and _element_installed("zedxonesrc")
+    already = all(
+        sensor_timestamp_patch_installed(element)
+        for element in ("zedsrc", "zedxonesrc")
     )
     if already:
         print("Patched zed-gstreamer plugins already installed (pinned ref + patch).")
@@ -232,14 +344,30 @@ def run(_args: object = None) -> None:
         )
         return
 
-    if _element_installed("zedxonesrc"):
+    if all(_element_installed(name) for name in ("zedsrc", "zedxonesrc")):
+        desired = _installed_stamp(src)
         try:
+            if desired is None:
+                raise OSError("could not verify installed plugin artifacts")
             stamp_file.write_text(desired)
-        except OSError:
-            pass
-        print("Patched zed-gstreamer plugins installed (sensor-accurate timestamps).")
+        except OSError as exc:
+            _logger.warning(
+                "could not record the installed zed-gstreamer binary digest; "
+                "collection/policy will use the SDK path until gst.build-zed "
+                "succeeds: %s",
+                exc,
+            )
+            print(
+                "WARNING: plugins were installed, but their patched binary "
+                "identity could not be verified. Check GST_PLUGIN_PATH; "
+                "collection/policy will use the ZED SDK fallback."
+            )
+        else:
+            print(
+                "Patched zed-gstreamer plugins installed (sensor-accurate timestamps)."
+            )
     else:
         print(
-            "WARNING: zedxonesrc is still not visible to gst-inspect after "
+            "WARNING: zedsrc/zedxonesrc are still not visible to gst-inspect after "
             "install; check the GStreamer plugin path."
         )

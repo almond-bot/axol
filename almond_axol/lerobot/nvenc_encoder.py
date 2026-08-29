@@ -275,17 +275,37 @@ class _CameraNvencEncoder:
 
     def finish(self) -> tuple[Path, dict | None]:
         """Signal end of episode, wait for the mp4 to finalize, return stats."""
-        self._queue.put(None)
+        # Never block forever putting the sentinel behind a full queue whose
+        # writer died on an encode/pipe error. A healthy writer gets a generous
+        # window to drain; its own error is surfaced as soon as it exits.
+        enqueue_deadline = time.perf_counter() + 30.0
+        while True:
+            if not self._thread.is_alive():
+                detail = self._error or "writer thread exited unexpectedly"
+                raise RuntimeError(
+                    f"NVENC encoder for {self.video_path.name} failed: {detail}"
+                )
+            try:
+                self._queue.put(None, timeout=0.1)
+                break
+            except queue.Full:
+                if time.perf_counter() >= enqueue_deadline:
+                    self._kill()
+                    raise RuntimeError(
+                        f"NVENC encoder for {self.video_path.name} did not drain "
+                        "its input queue within 30s"
+                    )
         self._thread.join(timeout=120)
         if self._thread.is_alive():
-            _logger.error(
-                "NVENC encoder for %s did not finish in time", self.video_path.name
+            self._kill()
+            raise RuntimeError(
+                f"NVENC encoder for {self.video_path.name} did not finish in time"
             )
-            return self.video_path, None
         if self._error is not None:
             raise RuntimeError(
                 f"NVENC encoder for {self.video_path.name} failed: {self._error}"
             )
+        self._validate_finalized_file()
         # Stats were accumulated inline during the episode, so finishing is just
         # the mp4 finalize (moov flush) above — no re-decode of the whole file.
         # Require >=2 samples, matching LeRobot's streaming encoder.
@@ -296,8 +316,43 @@ class _CameraNvencEncoder:
         )
         return self.video_path, stats
 
+    def _validate_finalized_file(self) -> None:
+        """Require one muxed packet for every raw frame written to gst."""
+        import av
+
+        with av.open(str(self.video_path)) as container:
+            streams = [stream for stream in container.streams if stream.type == "video"]
+            if len(streams) != 1:
+                raise RuntimeError(
+                    f"{self.video_path.name} contains {len(streams)} video streams; "
+                    "expected exactly one"
+                )
+            stream = streams[0]
+            advertised = int(stream.frames or 0)
+            packets = sum(
+                1
+                for packet in container.demux(stream)
+                if packet.pts is not None and packet.dts is not None
+            )
+        if packets != self._frame_count or (
+            advertised and advertised != self._frame_count
+        ):
+            raise RuntimeError(
+                f"{self.video_path.name} finalized with {packets} packets "
+                f"({advertised} advertised) after writing {self._frame_count} raw "
+                "frames; refusing to commit mismatched video/state rows"
+            )
+
     def cancel(self) -> None:
-        self._queue.put(None)
+        # Cancellation may discard queued raw frames. Evict until the sentinel
+        # fits so a dead/full writer can never wedge episode teardown.
+        while True:
+            try:
+                self._queue.put_nowait(None)
+                break
+            except queue.Full:
+                with contextlib.suppress(queue.Empty):
+                    self._queue.get_nowait()
         self._thread.join(timeout=5)
         self._kill()
 
@@ -484,6 +539,7 @@ class NvencStreamingEncoder:
         self.fps = fps
         self.queue_maxsize = queue_maxsize
         self._cams: dict[str, _CameraNvencEncoder] = {}
+        self._prepared_results: dict[str, tuple[Path, dict | None]] | None = None
         self._episode_active = False
         self._closed = False
 
@@ -497,16 +553,26 @@ class NvencStreamingEncoder:
         # Axol declares no depth features, so it is always empty here.
         if depth_video_keys:
             raise ValueError("NvencStreamingEncoder does not support depth features")
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         temp_dir = Path(temp_dir)
-        self._cams = {}
-        for video_key in video_keys:
-            ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
-            video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
-            self._cams[video_key] = _CameraNvencEncoder(
-                video_path, self.fps, self.queue_maxsize
-            )
+        new_cams: dict[str, _CameraNvencEncoder] = {}
+        created_dirs: list[Path] = []
+        try:
+            for video_key in video_keys:
+                ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
+                created_dirs.append(ep_dir)
+                video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
+                new_cams[video_key] = _CameraNvencEncoder(
+                    video_path, self.fps, self.queue_maxsize
+                )
+        except Exception:
+            for cam in new_cams.values():
+                cam.cancel()
+            for path in created_dirs:
+                shutil.rmtree(str(path), ignore_errors=True)
+            raise
+        self._cams = new_cams
         self._episode_active = True
 
     def feed_frame(self, video_key: str, image: "NDArray") -> None:
@@ -514,7 +580,7 @@ class NvencStreamingEncoder:
             raise RuntimeError("No active episode. Call start_episode() first.")
         self._cams[video_key].feed(image)
 
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+    def _finalize_active_episode(self) -> dict[str, tuple[Path, dict | None]]:
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
         results: dict[str, tuple[Path, dict | None]] = {}
@@ -540,20 +606,35 @@ class NvencStreamingEncoder:
         self._episode_active = False
         return results
 
-    def cancel_episode(self) -> None:
-        if not self._episode_active:
+    def prepare_finish_episode(self) -> None:
+        """Finalize/count-check video before LeRobot commits parquet rows."""
+        if self._prepared_results is not None or not self._episode_active:
             return
-        for cam in self._cams.values():
-            cam.cancel()
-            video_path = cam.video_path
-            if video_path.exists() or video_path.parent.exists():
-                shutil.rmtree(str(video_path.parent), ignore_errors=True)
+        self._prepared_results = self._finalize_active_episode()
+
+    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        if self._prepared_results is not None:
+            results, self._prepared_results = self._prepared_results, None
+            return results
+        return self._finalize_active_episode()
+
+    def cancel_episode(self) -> None:
+        if self._episode_active:
+            for cam in self._cams.values():
+                cam.cancel()
+                video_path = cam.video_path
+                if video_path.exists() or video_path.parent.exists():
+                    shutil.rmtree(str(video_path.parent), ignore_errors=True)
+        if self._prepared_results is not None:
+            for path, _stats in self._prepared_results.values():
+                shutil.rmtree(str(path.parent), ignore_errors=True)
         self._cams = {}
+        self._prepared_results = None
         self._episode_active = False
 
     def close(self) -> None:
         if self._closed:
             return
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         self._closed = True

@@ -45,14 +45,17 @@ replanned reset all run against the core.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import math
+import threading
 import time
+from collections import deque
 
 import numpy as np
 
 from ..constants import ARM_JOINTS
-from ..motor import ControlMode, Joint
+from ..motor import ControlMode, Joint, MotorError
 from ..motor.bus import CanBus
 from ..motor.motor import _JOINT_CONFIG
 from ..robot.axol import Axol, AxolArm
@@ -111,7 +114,8 @@ class RtAxol:
         self._rec = None
         self._record_prefix: str | None = None
         if record:
-            from ..teleop.recorder import make as make_recorder, resolve_prefix
+            from ..teleop.recorder import make as make_recorder
+            from ..teleop.recorder import resolve_prefix
 
             self._record_prefix = resolve_prefix(record)
             self._rec = make_recorder(self._record_prefix, "meas", {"qm": 16, "tq": 16})
@@ -121,6 +125,16 @@ class RtAxol:
         self._record_sides: set[int] = set()
         self._record_side_ts: dict[int, float] = {}
         self._recording_engaged = False
+        # A short, timestamped 240 Hz state history for policy observations.
+        # Camera exposure timestamps use perf_counter; feedback packets carry
+        # reconstructed wall-clock receive timestamps, converted at publication
+        # with the same per-sample wall→perf mapping as the ZED SDK path.
+        self._state_history: deque[
+            tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        ] = deque(maxlen=512)
+        self._state_cond = threading.Condition()
+        self._state_sides: set[int] = set()
+        self._state_side_ts: dict[int, float] = {}
 
     @property
     def left(self) -> AxolArm | None:
@@ -367,6 +381,41 @@ class RtAxol:
                 if self._rec is not None and self._recording_engaged:
                     self._record_qm[side * 8 + i] = pos
                     self._record_tq[side * 8 + i] = tau
+            self._state_sides.add(side)
+            if slots:
+                self._state_side_ts[side] = max(value[3] for value in slots.values())
+            if self._state_sides >= expected_sides:
+                try:
+                    left = arms[0]
+                    right = arms[1]
+                    wall_ts = sum(self._state_side_ts[s] for s in expected_sides) / len(
+                        expected_sides
+                    )
+                    recv_wall = time.time()
+                    recv_perf = time.perf_counter()
+                    perf_ts = recv_perf - (recv_wall - wall_ts)
+                    snapshot = (
+                        perf_ts,
+                        left.positions.copy(),
+                        right.positions.copy(),
+                        left.torques.copy(),
+                        right.torques.copy(),
+                    )
+                except (KeyError, MotorError, RuntimeError, TypeError, ValueError):
+                    # Early enable packets can arrive before all cached fields
+                    # and calibration offsets exist; the next complete pair
+                    # will publish once the robot is ready.
+                    snapshot = None
+                if snapshot is not None:
+                    with self._state_cond:
+                        if (
+                            not self._state_history
+                            or snapshot[0] > self._state_history[-1][0]
+                        ):
+                            self._state_history.append(snapshot)
+                            self._state_cond.notify_all()
+                self._state_sides.clear()
+                self._state_side_ts.clear()
             if self._rec is not None and self._recording_engaged:
                 self._record_sides.add(side)
                 if slots:
@@ -402,6 +451,56 @@ class RtAxol:
                     self._record_side_ts.clear()
 
         return feed
+
+    def state_nearest(
+        self, target_perf_ts: float, timeout: float = 0.1
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float] | None:
+        """Return the telemetry snapshot nearest a camera exposure timestamp.
+
+        Waits briefly for the upper bracket because a camera frame can become
+        visible just before the next 240 Hz feedback packet reaches Python.
+        Targets older than retained history fail rather than clamping to stale
+        state. Returned arrays are independent copies of the retained sample.
+        """
+        deadline = time.perf_counter() + timeout
+        with self._state_cond:
+            while True:
+                if self._state_history:
+                    oldest_ts = self._state_history[0][0]
+                    newest_ts = self._state_history[-1][0]
+                    if target_perf_ts < oldest_ts:
+                        return None
+                    if target_perf_ts <= newest_ts:
+                        history = list(self._state_history)
+                        timestamps = [entry[0] for entry in history]
+                        upper = bisect.bisect_left(timestamps, target_perf_ts)
+                        if upper == 0:
+                            chosen = history[0]
+                        elif upper == len(history):
+                            chosen = history[-1]
+                        else:
+                            before = history[upper - 1]
+                            after = history[upper]
+                            # Exact ties choose the later sample, matching the
+                            # collection snapshot ring.
+                            chosen = (
+                                after
+                                if after[0] - target_perf_ts
+                                <= target_perf_ts - before[0]
+                                else before
+                            )
+                        ts, left_pos, right_pos, left_trq, right_trq = chosen
+                        return (
+                            left_pos.copy(),
+                            right_pos.copy(),
+                            left_trq.copy(),
+                            right_trq.copy(),
+                            ts,
+                        )
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return None
+                self._state_cond.wait(remaining)
 
     @property
     def records_measurements_at_control_rate(self) -> bool:

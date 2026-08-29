@@ -4,7 +4,8 @@ axol gst.install
 Install the host-side GStreamer support the unified ZED camera pipeline needs
 (``teleop --cameras`` / ``collect-data``): the GStreamer introspection typelibs
 and **PyGObject**, so the in-process pipeline (:mod:`almond_axol.video.gst_zed`)
-can pull encoded + raw frames from an ``appsink``. The NVENC encoder
+can pull headset access units from ``appsink`` and carry dataset access units
+with their sensor PTS through GDP/shared memory. The NVENC encoder
 (``nvv4l2h264enc`` / ``nvvidconv``) ships with the Jetson L4T BSP, and the
 patched zed-gstreamer source elements (``zedxonesrc`` / ``zedsrc``) are built
 separately by ``axol gst.build-zed`` — this command only verifies those are
@@ -15,8 +16,9 @@ gobject-introspection and loads the system typelibs — so it can't be a normal
 dependency. This command apt-installs the system packages and then builds
 PyGObject into the interpreter running the CLI (the uv tool environment),
 mirroring ``axol zed.install``. PyGObject is only used here to read GStreamer
-``appsink`` buffers (frames + PTS); WebRTC transport stays on aiortc, so this
-does not reintroduce the ``webrtcbin``/libnice ICE path.
+``appsink`` buffers and manage the native GDP/shared-memory transport; WebRTC
+transport stays on aiortc, so this does not reintroduce the
+``webrtcbin``/libnice ICE path.
 
 The hosted installer (``web/app/public/install``) runs it once; it is not run
 at teleop/serve startup. Best-effort: a no-op on machines without
@@ -43,9 +45,17 @@ _PYGOBJECT_SPEC = "pygobject>=3.50,<3.52"
 
 # GStreamer elements gst.install is itself responsible for verifying: the NVENC
 # encode path (nvvidconv / nvv4l2h264enc), which ships with the Jetson L4T BSP,
-# plus videorate from plugins-base, used to fix only the headset branch at 30 fps.
+# plus videorate (plugins-base) and GDP payloading (plugins-bad).
+# ``gdppay``/``gdpdepay`` preserve sensor-exposure PTS across the dataset
+# recorder's shm boundary.
 # These gate gst.install's success alongside the gi/appsink import.
-_REQUIRED_ELEMENTS = ("nvvidconv", "nvv4l2h264enc", "videorate")
+_REQUIRED_ELEMENTS = (
+    "nvvidconv",
+    "nvv4l2h264enc",
+    "videorate",
+    "gdppay",
+    "gdpdepay",
+)
 
 # The patched ZED source element ``axol gst.build-zed`` builds + installs
 # (sensor-accurate PTS). gst.install only *reports* whether it's present — its
@@ -194,7 +204,7 @@ def run(_args: object = None) -> None:
     ``axol gst.build-zed``; this command only verifies those are present.
     """
     if _gst_ok():
-        print("GStreamer appsink + NVENC stack already available.")
+        print("GStreamer appsink + GDP + NVENC stack already available.")
         _note_zed_sources()
         return
 
@@ -204,12 +214,13 @@ def run(_args: object = None) -> None:
     _pip_install_pygobject()
 
     if _gst_ok():
-        print("GStreamer appsink + NVENC stack installed.")
+        print("GStreamer appsink + GDP + NVENC stack installed.")
         _note_zed_sources()
     else:
         print(
-            "WARNING: the GStreamer appsink + NVENC stack is still unavailable. "
-            "Ensure PyGObject and the Jetson NVENC elements (nvvidconv / "
+            "WARNING: the GStreamer appsink + GDP + NVENC stack is still "
+            "unavailable. Ensure PyGObject, the GDP plugins (gdppay / "
+            "gdpdepay), and the Jetson NVENC elements (nvvidconv / "
             "nvv4l2h264enc) are installed. Camera video will fall back to the "
             "ZED SDK path (higher latency) until then.",
             file=sys.stderr,

@@ -25,23 +25,22 @@ Alignment contract
 LeRobot decodes dataset video **by timestamp** with a razor-thin tolerance
 (``tolerance_s`` defaults to ``1e-4`` s), and ``add_frame`` stamps row *i* at
 ``timestamp = i / fps``. So the mp4 must be perfectly constant-fps: frame *i* at
-exactly ``i / fps``, with at least as many frames as dataset rows. Shared memory
-does not carry buffer PTS across the ``shmsink``/``shmsrc`` boundary, so this
-encoder assigns the PTS itself: the *k*-th access unit fed for a camera is muxed
-at ``pts = k / fps`` (``dts`` and ``duration`` to match). The caller
-(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) guarantees
-exactly one ``feed_frame`` per camera per dataset row (re-feeding the previous
-AU on a per-camera stall), so frame-count == row-count by construction. The mp4
-this muxer writes carries small per-frame PTS rounding (its timescale cannot
-represent ``1/fps`` exactly); the concat step re-stamps every frame onto an
-exact constant-fps grid so LeRobot's razor-thin per-row timestamp lookup holds
-(see :func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
+exactly ``i / fps``, with exactly as many frames as dataset rows. GDP preserves
+the physical capture PTS across ``shmsink``/``shmsrc`` for state association;
+this muxer independently assigns the dataset timeline: the *k*-th access unit is
+muxed at ``pts = k / fps`` (``dts`` and ``duration`` match). The caller
+(:func:`~almond_axol.recording.record_proc.run_encoded_capture_loop`) requires
+one fresh AU per camera per row and aborts on a stall—predictive AUs are never
+replayed—so frame-count == row-count by construction. The concat step reasserts
+that exact grid across episodes (see
+:func:`~almond_axol.recording.record_proc._concatenate_video_files_rebased`).
 
 Because the frames arrive pre-encoded, the first muxed AU of an episode must be
-an IDR or the mp4 is undecodable from frame 0; the relay forces a keyframe when
-it opens the dataset branch (see :meth:`ZedGstCamera.set_raw_enabled`) and the
-:class:`~almond_axol.video.shm_frames.EncodedAuReader` drops any leading
-non-IDR AUs, so the first fed AU is always a keyframe.
+an IDR or the mp4 is undecodable from frame 0. Between episodes the relay closes
+each dataset branch immediately before its next natural IDR, keeping encoder
+GOP phases aligned. On reopen,
+:class:`~almond_axol.video.shm_frames.EncodedAuReader` verifies that first AU is
+an actual type-5 IDR.
 
 Image stats
 -----------
@@ -202,15 +201,31 @@ class _StatsWorker:
 
     def result(self) -> dict | None:
         """Stop the worker, wait for the drain, and return the stats (or None)."""
-        self._queue.put(None)
+        self._request_stop()
         self._thread.join(timeout=_STATS_JOIN_TIMEOUT_S)
         if self._thread.is_alive() or self._failed or self._decoded == 0:
             return None
         return self._stats.get_statistics()
 
     def cancel(self) -> None:
-        self._queue.put(None)
+        self._request_stop()
         self._thread.join(timeout=1.0)
+
+    def _request_stop(self) -> None:
+        """Insert the sentinel without ever blocking behind sampled frames."""
+        while True:
+            try:
+                self._queue.put_nowait(None)
+                return
+            except queue.Full:
+                # These are optional normalization-stat samples, not dataset
+                # video. Evicting one is harmless and guarantees cancel/save
+                # cannot hang before its bounded worker join even if decode is
+                # wedged with a full queue.
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
 
 
 def hw_mux_encoder_available() -> bool:
@@ -248,16 +263,28 @@ class _CameraH264Muxer:
         self._mux_timescale = fps * 1000
         self._count = 0
         self._error: str | None = None
-        self._last_au: bytes | None = None
 
-        # Live per-keyframe stats decode (see _StatsWorker); the post-finalize
-        # file decode (_compute_stats_from_file) remains as the fallback.
+        # Live per-keyframe stats decode (see _StatsWorker); create it only after
+        # the mux pipeline is successfully built so constructor failure cannot
+        # leak a decoder thread.
         self._want_stats = want_stats
-        self._stats_worker = _StatsWorker(video_path.name) if want_stats else None
+        self._stats_worker: _StatsWorker | None = None
 
-        video_path.parent.mkdir(parents=True, exist_ok=True)
-        self._pipeline, self._src = self._build()
-        self._pipeline.set_state(self._gst.State.PLAYING)
+        self._pipeline = None
+        self._src = None
+        try:
+            video_path.parent.mkdir(parents=True, exist_ok=True)
+            self._pipeline, self._src = self._build()
+            result = self._pipeline.set_state(self._gst.State.PLAYING)
+            if result == self._gst.StateChangeReturn.FAILURE:
+                raise RuntimeError(f"could not start H264 muxer for {video_path.name}")
+            if want_stats:
+                self._stats_worker = _StatsWorker(video_path.name)
+        except Exception:
+            if self._pipeline is not None:
+                self._pipeline.set_state(self._gst.State.NULL)
+                self._pipeline = None
+            raise
         _logger.info(
             "H264 mux pipeline started: %s @ %dfps (stats=%s)",
             video_path.name,
@@ -310,28 +337,16 @@ class _CameraH264Muxer:
                 f"frame {self._count} — pipeline is flushing/errored, aborting "
                 "the episode"
             )
-        self._last_au = au
         self._count += 1
         if self._stats_worker is not None and _au_is_idr(au):
             self._stats_worker.feed(au)
-
-    def feed_repeat(self) -> None:
-        """Re-mux the previous AU (a duplicate frame) to keep counts aligned.
-
-        The frame-driven capture loop calls this when a camera has no fresh AU
-        for a row, so every camera stays at the same frame index as the dataset
-        rows (the encoded analog of the raw path's "reuse last frame"). A repeated
-        AU decodes to the same image, so the mp4 stays valid.
-        """
-        if self._last_au is not None:
-            self.feed(self._last_au)
 
     def _compute_stats_from_file(self) -> dict | None:
         """Decode the finalized mp4's keyframes for image-normalization stats.
 
         Runs once per episode after the file is written (recording paused between
         episodes), so it never competes with the live capture loop. Keyframes
-        only (``skip_frame=NONKEY``): the relay forces an IDR every ~0.25 s, so
+        only (``skip_frame=NONKEY``): the relay emits an IDR every ~0.25 s, so
         this still samples ~4 frames/s while the decoder skips every P-frame —
         the bulk of a full decode's cost. All sampled frames are folded in one
         batched ``RunningQuantileStats.update`` (as stock LeRobot's
@@ -389,6 +404,37 @@ class _CameraH264Muxer:
         stats.update(np.concatenate(batches, axis=0))
         return stats.get_statistics()
 
+    def _validate_finalized_file(self) -> None:
+        """Require one muxed packet for every AU accepted by ``appsrc``.
+
+        This runs during ``prepare_finish_episode``, before LeRobot commits
+        parquet rows.  EOS alone only proves that mp4mux wrote a footer; a
+        short sample table would still make every later row/video timestamp
+        association dishonest.
+        """
+        import av
+
+        with av.open(str(self.video_path)) as container:
+            streams = [stream for stream in container.streams if stream.type == "video"]
+            if len(streams) != 1:
+                raise RuntimeError(
+                    f"{self.video_path.name} contains {len(streams)} video streams; "
+                    "expected exactly one"
+                )
+            stream = streams[0]
+            advertised = int(stream.frames or 0)
+            packets = sum(
+                1
+                for packet in container.demux(stream)
+                if packet.pts is not None and packet.dts is not None
+            )
+        if packets != self._count or (advertised and advertised != self._count):
+            raise RuntimeError(
+                f"{self.video_path.name} finalized with {packets} packets "
+                f"({advertised} advertised) after accepting {self._count} access "
+                "units; refusing to commit mismatched video/state rows"
+            )
+
     def finish(self) -> tuple[Path, dict | None]:
         """EOS the pipeline (flush the moov), then return the path + stats.
 
@@ -415,6 +461,12 @@ class _CameraH264Muxer:
                 f"H264 muxer for {self.video_path.name} failed to finalize: "
                 f"{self._error}"
             )
+        try:
+            self._validate_finalized_file()
+        except Exception:
+            if self._stats_worker is not None:
+                self._stats_worker.cancel()
+            raise
         t_eos = time.perf_counter()
         stats = None
         if self._stats_worker is not None:
@@ -489,6 +541,7 @@ class H264MuxStreamingEncoder:
         self.fps = fps
         self._want_stats = want_stats
         self._cams: dict[str, _CameraH264Muxer] = {}
+        self._prepared_results: dict[str, tuple[Path, dict | None]] | None = None
         self._episode_active = False
         self._closed = False
 
@@ -502,16 +555,26 @@ class H264MuxStreamingEncoder:
         # Axol declares no depth features, so it is always empty here.
         if depth_video_keys:
             raise ValueError("H264MuxStreamingEncoder does not support depth features")
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         temp_dir = Path(temp_dir)
-        self._cams = {}
-        for video_key in video_keys:
-            ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
-            video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
-            self._cams[video_key] = _CameraH264Muxer(
-                video_path, self.fps, self._want_stats
-            )
+        new_cams: dict[str, _CameraH264Muxer] = {}
+        created_dirs: list[Path] = []
+        try:
+            for video_key in video_keys:
+                ep_dir = Path(tempfile.mkdtemp(dir=temp_dir))
+                created_dirs.append(ep_dir)
+                video_path = ep_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
+                new_cams[video_key] = _CameraH264Muxer(
+                    video_path, self.fps, self._want_stats
+                )
+        except Exception:
+            for cam in new_cams.values():
+                cam.cancel()
+            for path in created_dirs:
+                shutil.rmtree(str(path), ignore_errors=True)
+            raise
+        self._cams = new_cams
         self._episode_active = True
 
     def feed_frame(self, video_key: str, au: bytes) -> None:
@@ -519,22 +582,8 @@ class H264MuxStreamingEncoder:
             raise RuntimeError("No active episode. Call start_episode() first.")
         self._cams[video_key].feed(au)
 
-    def feed_repeat(self, video_key: str) -> None:
-        """Re-mux ``video_key``'s previous AU (per-camera stall; keep counts aligned)."""
-        if self._episode_active and video_key in self._cams:
-            self._cams[video_key].feed_repeat()
-
-    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
-        """Finalize every camera's mp4; raises if any muxer failed to finalize.
-
-        Cameras finalize in parallel (one thread each): the EOS flush waits on
-        gst's own threads and the stats decode releases the GIL inside
-        PyAV/numpy, so the wall time is one camera's finalize instead of the
-        sum over cameras — this is the bulk of ``save_episode`` latency.
-
-        A raise leaves ``_episode_active`` set; the next ``start_episode``
-        cancels (and cleans up) the half-finished episode first.
-        """
+    def _finalize_active_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        """Finalize active muxers, leaving no fallible video work pending."""
         if not self._episode_active:
             raise RuntimeError("No active episode to finish.")
         with concurrent.futures.ThreadPoolExecutor(
@@ -549,19 +598,50 @@ class H264MuxStreamingEncoder:
         self._episode_active = False
         return results
 
-    def cancel_episode(self) -> None:
-        if not self._episode_active:
+    def prepare_finish_episode(self) -> None:
+        """Finalize video before LeRobot commits this episode's parquet rows.
+
+        LeRobot 0.6 writes row data before calling ``finish_episode``. Caching
+        the finalized mux results at the operator boundary makes its later call
+        infallible with respect to EOS/muxing, avoiding orphan parquet rows when
+        a camera pipeline cannot finalize.
+        """
+        if self._prepared_results is not None or not self._episode_active:
             return
-        for cam in self._cams.values():
-            cam.cancel()
-            if cam.video_path.parent.exists():
-                shutil.rmtree(str(cam.video_path.parent), ignore_errors=True)
+        self._prepared_results = self._finalize_active_episode()
+
+    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        """Finalize every camera's mp4; raises if any muxer failed to finalize.
+
+        Cameras finalize in parallel (one thread each): the EOS flush waits on
+        gst's own threads and the stats decode releases the GIL inside
+        PyAV/numpy, so the wall time is one camera's finalize instead of the
+        sum over cameras — this is the bulk of ``save_episode`` latency.
+
+        A raise leaves ``_episode_active`` set; the next ``start_episode``
+        cancels (and cleans up) the half-finished episode first.
+        """
+        if self._prepared_results is not None:
+            results, self._prepared_results = self._prepared_results, None
+            return results
+        return self._finalize_active_episode()
+
+    def cancel_episode(self) -> None:
+        if self._episode_active:
+            for cam in self._cams.values():
+                cam.cancel()
+                if cam.video_path.parent.exists():
+                    shutil.rmtree(str(cam.video_path.parent), ignore_errors=True)
+        if self._prepared_results is not None:
+            for path, _stats in self._prepared_results.values():
+                shutil.rmtree(str(path.parent), ignore_errors=True)
         self._cams = {}
+        self._prepared_results = None
         self._episode_active = False
 
     def close(self) -> None:
         if self._closed:
             return
-        if self._episode_active:
+        if self._episode_active or self._prepared_results is not None:
             self.cancel_episode()
         self._closed = True

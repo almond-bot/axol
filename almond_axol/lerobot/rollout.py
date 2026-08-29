@@ -14,9 +14,8 @@ the same episode plumbing without duplicating it:
 - :class:`PolicyActionLimiter` — per-joint velocity/acceleration envelope
   over policy actions, for control loops that command a policy's raw
   output directly (``collect-dagger``).
-- :func:`latest_observation` — joint state + each camera's newest frame
-  without the capture-instant alignment wait, for inference ticks that
-  want the freshest frame rather than a timestamp-aligned one.
+- :func:`latest_observation` — compatibility wrapper for the robot's
+  capture-instant-aligned observation API.
 - :func:`stdin_watcher` — ``s`` / ``r`` / ``q`` keystroke watcher with
   no-block ``select`` polling.
 
@@ -545,30 +544,13 @@ class PolicyActionLimiter:
 
 
 def latest_observation(robot: "AxolRobot") -> dict[str, Any]:
-    """Joint state + each camera's newest frame, without waiting for one.
+    """Return the robot's capture-instant-aligned policy observation.
 
-    Used by inference ticks (``collect-dagger`` and downstream policy CLIs):
-    ``AxolRobot.get_observation`` aligns cameras with ``read_at_or_after(now)``,
-    which *waits* for a frame captured after now, serialized across all the
-    cameras (~up to a frame period each) — a hard ceiling far below fps on the
-    loop calling it. Inference wants the freshest frame it can get;
-    capture-instant alignment only matters for the dataset, which the recorder
-    subprocess handles on its own clock. When the cameras are a video relay's
-    shared-memory readers (pyshm), a read is just a block copy.
-
-    Raises RuntimeError listing the cameras that had no readable frame.
+    Kept as a compatibility helper for downstream policy CLIs. Callers that
+    also need to label an action with the observation's canonical exposure time
+    should use ``AxolRobot.get_observation_with_capture_timestamp`` instead.
     """
-    obs = robot.get_joint_observation()
-    missing: list[str] = []
-    for cam_name, cam in robot.cameras.items():
-        try:
-            obs[cam_name] = cam.read_latest()
-        except Exception as exc:  # noqa: BLE001
-            _logger.debug("Camera %s read_latest failed (%s).", cam_name, exc)
-            missing.append(cam_name)
-    if missing:
-        raise RuntimeError(f"no readable frame from cameras {missing}")
-    return obs
+    return robot.get_observation()
 
 
 def stdin_watcher(
