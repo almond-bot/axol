@@ -12,13 +12,13 @@ configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
 the analog trigger position drives ``l_grip``/``r_grip`` proportionally
 (fully squeezed = closed, released = open). Rapid full squeeze/release
 sequences also control data collection: three presses starts a take when idle
-or ends one successfully; four presses ends one as a failure. Engage/reset come
-from :class:`StdinControls` (the trigger frame carries no buttons —
-session controls arrive with a later PCB revision): Enter toggles
-tracking engage, ``r`` triggers a reset. The toggle is realised as a
-short pulse of both lock bits — the shared teleop core enables on a
-rising edge of both locks together and disables on a rising edge of
-either, so one pulse toggles either way.
+or ends one successfully; four presses ends one as a failure. Managed plain
+teleop/data-collection bridges engage automatically once both trackers are
+live. Other flows use :class:`StdinControls` (the trigger frame carries no
+buttons — session controls arrive with a later PCB revision): Enter toggles
+tracking engage, ``r`` triggers a reset. A manual toggle is realised as a
+short pulse of both lock bits — the shared teleop core enables on a rising
+edge of both locks together and disables on a rising edge of either.
 
 A side whose tracker stops reporting (occlusion, SLAM relocalising)
 holds its last good pose rather than going quiet, so IK never chases a
@@ -217,6 +217,9 @@ class TrackerBridge:
             because absolute-mode (Mantis) engagement fits the shared base
             transform from BOTH controller positions, so the placeholder
             pose streamed for an unbound side corrupts the fit.
+        auto_engage: Engage once all bound trackers have produced a live pose.
+            The lock stays asserted until the teleop core acknowledges tracking,
+            so a slow startup cannot miss a short pulse.
     """
 
     def __init__(
@@ -232,6 +235,7 @@ class TrackerBridge:
         left_trigger: TriggerReader | None = None,
         right_trigger: TriggerReader | None = None,
         allow_single_side: bool = False,
+        auto_engage: bool = False,
     ) -> None:
         if left is None and right is None:
             raise ValueError(
@@ -266,6 +270,8 @@ class TrackerBridge:
 
         self._seq = 0
         self._engaged = False
+        self._auto_engage_pending = auto_engage
+        self._auto_engage_waiting_ack = False
         self._lock_pulse = 0
         self._reset_pulse = 0
         self._outcome_pulse = 0
@@ -336,6 +342,8 @@ class TrackerBridge:
         """Build one VRFrame JSON object from the latest tracker poses."""
         toggle, reset = self._controls.consume()
         if toggle and self._lock_pulse == 0:
+            self._auto_engage_pending = False
+            self._auto_engage_waiting_ack = False
             self._engaged = not self._engaged
             self._lock_pulse = _PULSE_FRAMES
             _logger.info(
@@ -373,7 +381,15 @@ class TrackerBridge:
                 "z": float(pos[2]),
             }
 
-        lock = self._lock_pulse > 0
+        required_sides = [side for side, key in self._keys.items() if key is not None]
+        if self._auto_engage_pending and all(
+            side in self._held for side in required_sides
+        ):
+            self._auto_engage_pending = False
+            self._auto_engage_waiting_ack = True
+            _logger.info("trackers live — engaging Mantis tracking automatically")
+
+        lock = self._lock_pulse > 0 or self._auto_engage_waiting_ack
         if self._lock_pulse > 0:
             self._lock_pulse -= 1
         frame["l_lock"] = lock
@@ -516,5 +532,9 @@ class TrackerBridge:
                         self._state = VRState(value)
                     except ValueError:
                         _logger.warning("server sent unknown VR state %r", value)
+                elif msg_type == "tracking":
+                    self._engaged = bool(value)
+                    if self._engaged:
+                        self._auto_engage_waiting_ack = False
         except Exception:  # noqa: BLE001 - connection teardown ends the drain
             pass

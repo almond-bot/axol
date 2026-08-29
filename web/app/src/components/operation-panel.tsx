@@ -190,7 +190,7 @@ export function OperationPanel({
                   onClick={() => onEpisode("bridge-toggle")}
                   disabled={busy}
                 >
-                  Toggle tracking
+                  Pause / resume tracking
                 </Button>
                 <Button variant="outline" onClick={() => onEpisode("bridge-reset")} disabled={busy}>
                   <RotateCcw /> Reset

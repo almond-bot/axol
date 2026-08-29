@@ -135,6 +135,7 @@ def run_configured_bridge(
     hz: float = 120.0,
     controls: Any = None,
     on_ready: Callable[[], None] | None = None,
+    auto_engage: bool = False,
 ) -> None:
     """Run one configured bridge, optionally under headless lifecycle controls.
 
@@ -186,6 +187,7 @@ def run_configured_bridge(
             left_trigger=triggers.get("left"),
             right_trigger=triggers.get("right"),
             allow_single_side=config.allow_single_side,
+            auto_engage=auto_engage,
         )
         if on_ready is not None:
             on_ready()

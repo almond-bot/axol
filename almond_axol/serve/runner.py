@@ -108,7 +108,12 @@ _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
 
 
 def _managed_tracker_bridge_main(
-    config: Any, stop_event: Any, command_queue: Any, ready_conn: Any, port: int
+    config: Any,
+    stop_event: Any,
+    command_queue: Any,
+    ready_conn: Any,
+    port: int,
+    auto_engage: bool,
 ) -> None:
     """Spawn-process entry point for a control-panel-owned tracker bridge."""
     logging.basicConfig(level=logging.INFO, force=True)
@@ -129,6 +134,7 @@ def _managed_tracker_bridge_main(
             port=port,
             controls=StopEventControls(stop_event, command_queue),
             on_ready=ready,
+            auto_engage=auto_engage,
         )
     except BaseException as exc:
         if not ready_sent:
@@ -990,7 +996,7 @@ class OperationRunner:
             server = getattr(teleop, "vr_server_config", None)
         return int(getattr(server, "port", 8000))
 
-    def _start_tracker_bridge(self, session: Session, cfg: Any) -> None:
+    def _start_tracker_bridge(self, session: Session, cfg: Any, op_id: str) -> None:
         """Start the selected tracker bridge and wait for initialization."""
         from ..tracker import load_tracker_config
         from ..tracker.config import select_tracker_backend
@@ -1022,6 +1028,7 @@ class OperationRunner:
                 command_queue,
                 child_conn,
                 self._bridge_port(cfg),
+                op_id in {"teleop", "collect-data"},
             ),
             name="tracker-bridge",
             daemon=True,
@@ -1098,7 +1105,7 @@ class OperationRunner:
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
-                    self._start_tracker_bridge(session, cfg)
+                    self._start_tracker_bridge(session, cfg, op_id)
                 task = loop.create_task(_wrap())
                 self._async_task = task
                 loop.run_until_complete(task)
@@ -1138,7 +1145,7 @@ class OperationRunner:
         with _Capture(session, log_level):
             try:
                 if manage_bridge:
-                    self._start_tracker_bridge(session, cfg)
+                    self._start_tracker_bridge(session, cfg, op_id)
                 core = cmd.load_entrypoint()
                 control_cls = cmd.load_episode_control()
                 if control_cls is None:
