@@ -610,7 +610,7 @@ export interface TrackerBinding {
 export async function fetchTrackerBindings(): Promise<{
   bindings: Record<TrackerBackend, TrackerBinding>
 }> {
-  return json(await fetch(apiUrl("/api/tracker/bindings")))
+  return json(await fetch(apiUrl("/api/tracker/bindings"), { cache: "no-store" }))
 }
 
 // ---------------------------------------------------------------------------

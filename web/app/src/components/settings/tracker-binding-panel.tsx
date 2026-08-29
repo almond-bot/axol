@@ -65,7 +65,10 @@ export function TrackerBindingPanel({ source }: { source: string }) {
       .find(
         (line) => line.trim() && !line.startsWith("[serve]") && !line.startsWith("[prompt] ")
       ) ?? null
-  const current = status ?? session
+  // useSessionLogs resets asynchronously when a new session is selected, so it
+  // can retain the previous session's terminal status for one render.  Never
+  // let that stale status complete the new identify run before it has started.
+  const current = status?.id === session?.id ? status : session
   const running = current?.status === "starting" || current?.status === "running"
   const terminal = current?.status === "exited" || current?.status === "error"
 
