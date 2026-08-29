@@ -21,6 +21,8 @@ _logger = logging.getLogger(__name__)
 
 _REPO_URL = "https://github.com/collabora/libsurvive.git"
 _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
+# Bump this whenever build options change so existing installations are rebuilt.
+_BUILD_REVISION = "libusb-v1"
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
 
@@ -129,7 +131,12 @@ def _build_and_install(src: Path) -> bool:
             "-DCMAKE_BUILD_TYPE=Release",
             "-DCMAKE_INSTALL_PREFIX=/usr/local",
             "-DBUILD_APPLICATIONS=ON",
-            "-DUSE_HIDAPI=ON",
+            # libsurvive's HIDAPI path creates a placeholder tracker object for
+            # every Watchman dongle immediately. Its pairing loop only sends a
+            # pairing request to dongles without such an object, making
+            # `survive-cli --pair-device 1` ineffective. The native Linux
+            # libusb path supports both normal tracking and dongle pairing.
+            "-DUSE_HIDAPI=OFF",
             "-DDOWNLOAD_EIGEN=OFF",
             "-DUSE_EIGEN=ON",
             "-DUSE_OPENBLAS=OFF",
@@ -180,7 +187,12 @@ def ensure_installed() -> bool:
     """Install libsurvive when needed; return whether a usable backend exists."""
     src = _src_dir()
     stamp = src / _STAMP
-    if is_available() and stamp.exists() and stamp.read_text().strip() == _PINNED_REF:
+    expected_stamp = f"{_PINNED_REF}\n{_BUILD_REVISION}"
+    if (
+        is_available()
+        and stamp.exists()
+        and stamp.read_text().strip() == expected_stamp
+    ):
         print("Lighthouse tracking support is already installed.", flush=True)
         return True
 
@@ -199,7 +211,7 @@ def ensure_installed() -> bool:
     if not is_available():
         _logger.warning("survive-cli is not available after installation")
         return False
-    stamp.write_text(f"{_PINNED_REF}\n")
+    stamp.write_text(f"{expected_stamp}\n")
     print("Lighthouse tracking support installed.", flush=True)
     return True
 
