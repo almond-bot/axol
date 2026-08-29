@@ -23,7 +23,7 @@ from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, URDF_PATH
 from ..utils import adb, ports
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.sudo import prime_sudo
-from .commands import COMMANDS, command_specs, operation_ids
+from .commands import COMMANDS, command_specs, flag_enabled, operation_ids
 from .manager import Session, SessionManager
 from .robot_link import RobotLink, scoped_motor_faults
 from .runner import OperationRunner
@@ -790,11 +790,23 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             # the arm. A sim run never touches the motors, and a robot-free run
             # (teleop's cart_only) never touches the *arms*, so both stay allowed.
             cmd = COMMANDS[req.op]
-            is_sim = cmd.sim_flag is not None and bool(req.args.get(cmd.sim_flag))
-            robot_free = is_sim or any(
-                bool(req.args.get(flag)) for flag in cmd.robot_free_flags
+            requested_mantis = flag_enabled(req.args.get("mantis"))
+            if requested_mantis and not cmd.supports_mantis:
+                return JSONResponse(
+                    {
+                        "error": f"{req.op} does not support Mantis; "
+                        "use teleop or collect-data"
+                    },
+                    status_code=400,
+                )
+            mantis_mode = cmd.supports_mantis and requested_mantis
+            is_sim = cmd.sim_flag is not None and flag_enabled(
+                req.args.get(cmd.sim_flag)
             )
-            hardware_profile = "mantis" if bool(req.args.get("mantis")) else "axol"
+            robot_free = is_sim or any(
+                flag_enabled(req.args.get(flag)) for flag in cmd.robot_free_flags
+            )
+            hardware_profile = "mantis" if mantis_mode else "axol"
             link_matches_run = robot.profile() == hardware_profile
             if (not robot_free or hardware_profile == "mantis") and link_matches_run:
                 fault_response = await _motor_fault_response()

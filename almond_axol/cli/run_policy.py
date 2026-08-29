@@ -1611,6 +1611,11 @@ def _run(
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
     """Drive the full run-policy session: spawn the policy server, connect the robot, and run episodes."""
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        raise ValueError("run-policy does not support Mantis hardware")
+
     import multiprocessing as mp
     import shutil
     from pathlib import Path

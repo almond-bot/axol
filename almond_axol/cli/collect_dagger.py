@@ -719,6 +719,11 @@ def _run(
     stop_event: "threading.Event | None" = None,
     control: "_StdinPolicyControl | _QueuePolicyControl | None" = None,
 ) -> None:
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        raise ValueError("collect-dagger does not support Mantis hardware")
+
     import os
     import shutil
     import socket

@@ -94,6 +94,7 @@ export function OperationPanel({
   // Per-run inputs: every required field plus the op's curated run-identity
   // fields (repo id, task, policy path, episode, …) — required ones first.
   const runFields = useMemo(() => (spec ? perRunFields(spec, meta) : []), [spec, meta])
+  const mantisMode = meta.supportsMantis && Boolean(settings.mantis)
   // Gravity-comp's joint subset gets a proper picker instead of a text field.
   const jointField = runFields.find((f) => f.key === "free_joints")
   const textFields = useMemo(() => runFields.filter((f) => f.key !== "free_joints"), [runFields])
@@ -136,7 +137,7 @@ export function OperationPanel({
   // arm-connection and motor-fault gates don't apply.
   const robotFree = isRobotFreeRun(meta, settings)
   const robotOk = robot?.state === "connected"
-  const camCount = cameraCount(cameras, Boolean(settings.mantis))
+  const camCount = cameraCount(cameras, mantisMode)
 
   const blockers: string[] = []
   if (meta.requiresRobot && !robotFree && !robotOk) blockers.push("Connect Axol")
@@ -183,7 +184,7 @@ export function OperationPanel({
             <p className="mt-2 max-w-prose text-sm text-white/55">{meta.description}</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            {live && Boolean(settings.mantis) && mantisSource !== "quest" && (
+            {live && mantisMode && mantisSource !== "quest" && (
               <>
                 <Button
                   variant="outline"

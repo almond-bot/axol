@@ -437,7 +437,8 @@ export default function ControlPanel() {
 
   // -- per-operation settings --
   const settings = useMemo(() => settingsByOp[opId] ?? loadOpSettings(opId), [settingsByOp, opId])
-  const desiredHardwareProfile: HardwareProfile = settings.mantis ? "mantis" : "axol"
+  const mantisMode = meta.supportsMantis && Boolean(settings.mantis)
+  const desiredHardwareProfile: HardwareProfile = mantisMode ? "mantis" : "axol"
 
   const updateSettings = useCallback((op: OperationId, next: Record<string, FormValue>) => {
     setSettingsByOp((prev) => ({ ...prev, [op]: next }))
@@ -697,7 +698,7 @@ export default function ControlPanel() {
       // gated on them. Teleop streams whatever cameras are configured but must
       // never be blocked by camera detection, and sim never touches hardware.
       const isSimSelected = isSimRun(meta, settings)
-      const mantisSelected = Boolean(settings.mantis)
+      const mantisSelected = mantisMode
       if (meta.requiresCameras && !isSimSelected) {
         // Reuse the detection we already ran (on connect / when the Cameras
         // dialog closed) instead of spawning a fresh enumeration on every start
@@ -853,7 +854,7 @@ export default function ControlPanel() {
               snapshot={settingsSnap}
               supportError={settingsError}
               cameras={cameras}
-              mantisMode={Boolean(settings.mantis)}
+              mantisMode={mantisMode}
               onSave={handleSettingsSave}
               devices={cameraDevices}
               detecting={cameraDetecting}
@@ -887,7 +888,7 @@ export default function ControlPanel() {
           onChange={setSetting}
           onReset={resetSetting}
           onResetAll={resetAll}
-          onOpenSettings={() => openSettings(settings.mantis ? "mantis" : "robot")}
+          onOpenSettings={() => openSettings(mantisMode ? "mantis" : "robot")}
           cameras={cameras}
           robot={robot}
           live={selectedLive}

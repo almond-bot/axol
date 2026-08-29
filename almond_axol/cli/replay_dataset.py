@@ -135,6 +135,11 @@ def main(argv: list[str]) -> None:
 
 def _run(cfg: ReplayDatasetConfig, stop_event: "threading.Event | None" = None) -> None:
     """Load the episode, return to rest, replay its actions, then return to rest."""
+    from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+    if isinstance(cfg.robot_config, MantisRobotConfig):
+        raise ValueError("replay-dataset does not support Mantis hardware")
+
     from pathlib import Path
 
     import numpy as np

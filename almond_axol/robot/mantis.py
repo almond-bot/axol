@@ -240,3 +240,7 @@ class Mantis(RobotBase):
 
     def reset_command_state(self) -> None:
         """No command history to clear — the arms are virtual."""
+
+    def torque_residuals(self) -> tuple[None, None]:
+        """Return no arm contact signal; Mantis has only virtual arm joints."""
+        return None, None

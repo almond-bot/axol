@@ -42,6 +42,7 @@ import threading
 from typing import Any
 
 from ..zed import stereo_serials
+from .commands import flag_enabled
 from .manager import Session
 
 _logger = logging.getLogger(__name__)
@@ -477,9 +478,14 @@ class OperationRunner:
                 if cameras is None:
                     cameras = self._settings.cameras()
 
-            cameras = self._camera_spec_for_profile(
-                cameras, mantis=bool(args.get("mantis"))
-            )
+            requested_mantis = flag_enabled(args.get("mantis"))
+            if requested_mantis and not cmd.supports_mantis:
+                raise ValueError(
+                    f"{op_id} does not support Mantis; use teleop or collect-data"
+                )
+            mantis_mode = cmd.supports_mantis and requested_mantis
+
+            cameras = self._camera_spec_for_profile(cameras, mantis=mantis_mode)
 
             # Fold the camera spec into the argv-style args for the ops whose
             # camera serials are required draccus inputs.
@@ -489,6 +495,15 @@ class OperationRunner:
                 )
 
             cfg = self._build_config(op_id, args)
+            robot_config = getattr(cfg, "robot_config", None)
+            if not cmd.supports_mantis and robot_config is not None:
+                from ..lerobot.robot.config_mantis import MantisRobotConfig
+
+                if isinstance(robot_config, MantisRobotConfig):
+                    raise ValueError(
+                        f"{op_id} does not support Mantis hardware; "
+                        "use teleop or collect-data"
+                    )
         except Exception as exc:  # noqa: BLE001 - surface config errors to UI
             session.status = "error"
             session.error = f"{type(exc).__name__}: {exc}"
@@ -511,14 +526,14 @@ class OperationRunner:
                     "continuing without cameras"
                 )
 
-        is_sim = cmd.sim_flag is not None and bool(args.get(cmd.sim_flag))
+        is_sim = cmd.sim_flag is not None and flag_enabled(args.get(cmd.sim_flag))
         # A robot-free run (sim, or e.g. teleop's cart_only) never touches the
         # arms, so the persistent robot link stays connected and its motor
         # telemetry keeps streaming while the op runs.
         robot_free = is_sim or any(
-            bool(args.get(flag)) for flag in cmd.robot_free_flags
+            flag_enabled(args.get(flag)) for flag in cmd.robot_free_flags
         )
-        hardware_profile = "mantis" if bool(args.get("mantis")) else "axol"
+        hardware_profile = "mantis" if mantis_mode else "axol"
         link_matches_run = (
             self._robot_link is not None
             and self._robot_link.profile() == hardware_profile
@@ -547,7 +562,7 @@ class OperationRunner:
         else:
             target = self._run_thread
         mantis_source = str(args.get("mantis_source", "lighthouse"))
-        manage_bridge = bool(args.get("mantis")) and mantis_source != "quest"
+        manage_bridge = mantis_mode and mantis_source != "quest"
         run_args = (session, op_id, cfg, log_level, needs_robot, manage_bridge)
         self._thread = threading.Thread(
             target=target, args=run_args, name=f"axol-op-{op_id}", daemon=True

@@ -78,6 +78,7 @@ class CommandDef:
         streams_video: bool = False,
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
+        supports_mantis: bool = False,
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
@@ -129,6 +130,10 @@ class CommandDef:
         # (teleop's cart_only): the run skips the robot link and the
         # motor-fault gate but still drives real, non-arm hardware.
         self.robot_free_flags = robot_free_flags
+        # Mantis is a runtime hardware mode only for plain teleop and data
+        # collection. Policy/DAgger may consume datasets produced by Mantis,
+        # but they always drive Axol hardware.
+        self.supports_mantis = supports_mantis
         # Driven from the VR headset, so the panel tells the operator to point
         # the headset at this machine once the op is running.
         self.uses_headset = uses_headset
@@ -317,6 +322,7 @@ COMMANDS: dict[str, CommandDef] = {
         # mantis drives the handheld rig's own CAN buses (can_mantis_l/r), so
         # like cart_only it never touches the arms or their motor faults.
         robot_free_flags=("cart_only", "mantis"),
+        supports_mantis=True,
         uses_headset=True,
         per_run_fields=("sim", "mantis", "cart_only"),
     ),
@@ -372,6 +378,7 @@ COMMANDS: dict[str, CommandDef] = {
         # mantis records with the handheld rig (its own CAN buses) — the Axol
         # arms and their motor-fault gate are not involved.
         robot_free_flags=("mantis",),
+        supports_mantis=True,
         # Panel-driven episodes (headset-off collection): the dashboard can
         # start recording and save or discard an episode, and mirrors the
         # headset HUD (phase, episode number, saved count).
@@ -655,6 +662,7 @@ def command_specs() -> list[dict[str, Any]]:
             "episodeControl": cmd.has_episode_control,
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
+            "supportsMantis": cmd.supports_mantis,
             "usesHeadset": cmd.uses_headset,
         }
         try:
@@ -672,7 +680,8 @@ def command_specs() -> list[dict[str, Any]]:
     return specs
 
 
-def _truthy(value: Any) -> bool:
+def flag_enabled(value: Any) -> bool:
+    """Interpret a submitted boolean without treating the string ``false`` as true."""
     return value is True or (isinstance(value, str) and value.strip().lower() == "true")
 
 
@@ -712,10 +721,10 @@ def build_argv(command_id: str, args: dict[str, Any]) -> list[str]:
             continue
         kind = spec["t"]
         if kind == "flag":
-            if _truthy(raw):
+            if flag_enabled(raw):
                 options.append(spec["flag"])
         elif kind == "flag_off":
-            if not _truthy(raw):
+            if not flag_enabled(raw):
                 options.append(spec["flag"])
         elif kind == "choice":
             flag = spec["map"].get(str(raw).strip())

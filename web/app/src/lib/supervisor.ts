@@ -55,6 +55,8 @@ export interface CommandSpec {
   simFlag?: string | null
   /** Arg names that skip the arm-robot gates without being sim (cart_only). */
   robotFreeFlags?: string[]
+  /** Whether this operation can run against the Mantis hardware profile. */
+  supportsMantis?: boolean
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
 }
@@ -852,6 +854,8 @@ export interface OperationMeta {
   /** Args that skip the arm-robot gates without being sim (teleop's cart_only:
    * real hardware, but the arms and their CAN bus are never touched). */
   robotFreeFlags: string[]
+  /** Runtime supports the Mantis hardware profile. */
+  supportsMantis: boolean
   /** Shows the episode start / save / discard controls while running. */
   episodeControl: boolean
   /** Shows the "point the headset at this machine" hint while running. */
@@ -874,6 +878,7 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: true,
     simFlag: "sim",
     robotFreeFlags: ["mantis"],
+    supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
   },
@@ -887,6 +892,7 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
   },
@@ -901,6 +907,7 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: ["mantis"],
+    supportsMantis: true,
     // Panel-driven episodes are newer than the registry, so a host old enough
     // to need this table can't serve them — the controls would sit on
     // "Preparing" forever. Its collect-data does run the VR server with the
@@ -918,6 +925,7 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
   },
@@ -932,6 +940,7 @@ export const OPERATIONS: OperationMeta[] = [
     simCapable: false,
     simFlag: null,
     robotFreeFlags: [],
+    supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
   },
@@ -959,6 +968,8 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
+    supportsMantis:
+      s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
   }))
