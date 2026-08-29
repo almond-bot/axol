@@ -216,6 +216,10 @@ def test_runner_camera_helpers_and_attach(monkeypatch) -> None:
     ) == (False, None)
 
     monkeypatch.setattr(runner, "stereo_serials", lambda: {12})
+    # Resolution validation lives behind the optional ``lerobot`` extra. This
+    # test covers the runner's mapping behavior, so keep that package boundary
+    # mocked just like the physical camera enumeration above.
+    monkeypatch.setattr(operation, "_resolution", lambda *args, **kwargs: "SVGA")
     session = Session("teleop", {})
     cfg = SimpleNamespace(cameras={}, camera_eyes={}, resolution=None)
     cameras = {
