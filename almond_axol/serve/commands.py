@@ -555,6 +555,17 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
     ),
     # -- Setup --------------------------------------------------------------
+    "tracker.pair": CommandDef(
+        "tracker.pair",
+        "tracker.pair",
+        "Pair Lighthouse tracker",
+        "Pair a Vive Tracker with an HTC Watchman dongle without SteamVR.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_pair"),
+        requires_hardware=True,
+        uses_can_bus=False,
+    ),
     "tracker.identify": CommandDef(
         "tracker.identify",
         "tracker.identify",

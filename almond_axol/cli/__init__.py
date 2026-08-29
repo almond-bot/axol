@@ -14,6 +14,7 @@ from . import (
     tracker_bridge,
     tracker_identify,
     tracker_install,
+    tracker_pair,
 )
 from .can import driver as can_driver
 from .can import enable as can_enable
@@ -120,6 +121,7 @@ def main() -> None:
     tracker_bridge.add_parser(subparsers)
     tracker_identify.add_parser(subparsers)
     tracker_install.add_parser(subparsers)
+    tracker_pair.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     set_can_id.add_parser(subparsers)

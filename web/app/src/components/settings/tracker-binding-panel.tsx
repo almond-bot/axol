@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Check, Loader2, RadioTower, Square } from "lucide-react"
+import { Bluetooth, Check, Loader2, RadioTower, Square } from "lucide-react"
 import {
   fetchSessions,
   fetchTrackerBindings,
@@ -39,7 +39,7 @@ export function TrackerBindingPanel({ source }: { source: string }) {
       .then((sessions) => {
         const active = sessions.find(
           (candidate) =>
-            candidate.command === "tracker.identify" &&
+            (candidate.command === "tracker.identify" || candidate.command === "tracker.pair") &&
             (candidate.status === "starting" || candidate.status === "running")
         )
         if (active) setSession(active)
@@ -72,13 +72,20 @@ export function TrackerBindingPanel({ source }: { source: string }) {
   useEffect(() => {
     if (!terminal || !session || completionRef.current === session.id) return
     completionRef.current = session.id
-    fetchTrackerBindings()
-      .then(({ bindings: found }) => setBindings(found))
-      .catch(() => {})
+    const paired = session.command === "tracker.pair"
+    if (!paired) {
+      fetchTrackerBindings()
+        .then(({ bindings: found }) => setBindings(found))
+        .catch(() => {})
+    }
     if (current?.status === "exited" && (current.exitCode ?? 0) === 0) {
-      toast.success("Mantis tracker binding saved.")
+      toast.success(paired ? "Lighthouse tracker paired." : "Mantis tracker binding saved.")
     } else {
-      toast.error("Tracker identification failed. See the status below.")
+      toast.error(
+        paired
+          ? "Tracker pairing failed. See the status below."
+          : "Tracker identification failed. See the status below."
+      )
     }
   }, [terminal, session, current, toast])
 
@@ -95,6 +102,21 @@ export function TrackerBindingPanel({ source }: { source: string }) {
 
   const binding = bindings[backend]
   const label = backend === "survive" ? "Lighthouse" : "Ultimate"
+  const pairing = session?.command === "tracker.pair"
+
+  async function pair() {
+    setBusy(true)
+    setDismissed(null)
+    completionRef.current = null
+    try {
+      const { session: started } = await startDiagnosticsRun("tracker.pair", {})
+      setSession(started)
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      setBusy(false)
+    }
+  }
 
   async function identify() {
     setBusy(true)
@@ -151,21 +173,24 @@ export function TrackerBindingPanel({ source }: { source: string }) {
           {binding?.complete ? "Left + right bound" : "Not configured"}
         </span>
         {!running && (
-          <Button
-            className="ml-auto"
-            variant="outline"
-            size="sm"
-            onClick={identify}
-            disabled={busy}
-          >
-            {busy ? <Loader2 className="animate-spin" /> : <RadioTower />}
-            {binding?.complete ? "Identify again" : "Identify trackers"}
-          </Button>
+          <div className="ml-auto flex flex-wrap gap-2">
+            {backend === "survive" && (
+              <Button variant="outline" size="sm" onClick={pair} disabled={busy}>
+                {busy ? <Loader2 className="animate-spin" /> : <Bluetooth />}
+                Pair tracker
+              </Button>
+            )}
+            <Button variant="outline" size="sm" onClick={identify} disabled={busy}>
+              {busy ? <Loader2 className="animate-spin" /> : <RadioTower />}
+              {binding?.complete ? "Identify again" : "Identify trackers"}
+            </Button>
+          </div>
         )}
       </div>
       <p className="max-w-prose text-xs leading-relaxed text-white/40">
-        The tracker serials do not indicate which Mantis they are mounted to. This guided check
-        watches which tracker moves for each side and saves the mapping on this host.
+        {backend === "survive"
+          ? "Pair each tracker with its Watchman dongle first, then identify which Mantis it is mounted to. Both steps run on this host without SteamVR."
+          : "The tracker serials do not indicate which Mantis they are mounted to. This guided check watches which tracker moves for each side and saves the mapping on this host."}
       </p>
       {binding?.complete && !running && !terminal && (
         <p className="font-mono text-[11px] text-white/35">
@@ -174,7 +199,7 @@ export function TrackerBindingPanel({ source }: { source: string }) {
       )}
       {running && (
         <div className="flex flex-col gap-2 rounded-md border border-white/10 bg-black/20 p-3">
-          {pendingPrompt ? (
+          {pendingPrompt && !pairing ? (
             <>
               <p className="text-sm text-amber-100/85">{pendingPrompt}</p>
               <Button size="sm" className="self-start" onClick={capture}>
@@ -188,7 +213,7 @@ export function TrackerBindingPanel({ source }: { source: string }) {
           ) : (
             <p className="flex items-center gap-2 text-sm text-white/60">
               <Loader2 className="size-4 animate-spin" />
-              {activeLine ?? "Waiting for trackers…"}
+              {activeLine ?? (pairing ? "Starting dongle pairing…" : "Waiting for trackers…")}
             </p>
           )}
           <Button variant="ghost" size="sm" className="self-start" onClick={stop} disabled={busy}>
@@ -205,8 +230,12 @@ export function TrackerBindingPanel({ source }: { source: string }) {
           }
         >
           {current?.status === "exited" && (current.exitCode ?? 0) === 0
-            ? "Binding saved. Mantis teleop can start now."
-            : (activeLine ?? current?.error ?? "Tracker identification failed.")}
+            ? pairing
+              ? "Tracker paired. Pair the other tracker if needed, then identify trackers."
+              : "Binding saved. Mantis teleop can start now."
+            : (activeLine ??
+              current?.error ??
+              (pairing ? "Tracker pairing failed." : "Tracker identification failed."))}
         </p>
       )}
     </div>

@@ -89,6 +89,7 @@ const STATE_BADGE: Record<
 // adoption effect) so its Stop button shows on any browser, not just the tab
 // that started it.
 const PAGE_COMMAND_IDS = [
+  "tracker.pair",
   "tracker.identify",
   "can.setup",
   "can.enable",
