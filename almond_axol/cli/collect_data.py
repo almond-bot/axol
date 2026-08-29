@@ -1588,7 +1588,9 @@ def _run(
             # discarded) ends with a junk tail of rows that were never
             # teleoperated.
             if recording:
-                recorder.stop_capture()
+                captured_rows, capture_error = recorder.stop_capture()
+            else:
+                captured_rows, capture_error = 0, None
 
             # Recording done — close the raw branch so the rest-pose/reset and
             # next pre-record phase stay light.
@@ -1614,22 +1616,49 @@ def _run(
                 teleop.send_feedback_state(VRState.DATA_COLLECTION)
                 continue
 
+            # LeRobot refuses ``save_episode`` when the capture thread did not
+            # manage to append even one row. This can happen when an episode is
+            # ended immediately after it starts (before the first camera tick)
+            # or when capture fails at startup. Treat it as a recoverable bad
+            # take: clear the empty buffer and leave the session ready to try
+            # the same episode again instead of tearing down robot control.
+            if recording and not rerecord:
+                if capture_error is not None:
+                    log_say(
+                        "Episode capture failed — discarding and re-recording. "
+                        + capture_error
+                    )
+                    rerecord = True
+                elif captured_rows == 0:
+                    log_say(
+                        "Episode captured no dataset rows — it ended before the "
+                        "first camera frame arrived. Discarding and re-recording."
+                    )
+                    rerecord = True
+
             # Episode QA: always log the one-line verdict; a bad episode is
             # refused at save and downgraded to discard + re-record unless
             # the gate is disabled (cfg.qa_gate — escape hatch).
             if recording:
                 qa_ok, qa_reasons = evaluate_episode_qa(qa)
                 _logger.info(
-                    "episode QA: frames=%d stale=%d (%.1f%%) disengaged=%d "
-                    "(%.1f%%) reengaged=%s max_pose_lag=%.0fms -> %s",
+                    "episode QA: control_frames=%d captured_rows=%d stale=%d "
+                    "(%.1f%%) disengaged=%d (%.1f%%) reengaged=%s "
+                    "max_pose_lag=%.0fms capture_error=%s -> %s",
                     qa.total_frames,
+                    captured_rows,
                     qa.stale_frames,
                     100 * qa.stale_fraction,
                     qa.disengaged_frames,
                     100 * qa.disengaged_fraction,
                     qa.reengaged_while_recording,
                     1e3 * qa.max_pose_lag_s,
-                    "OK" if qa_ok else "BAD",
+                    capture_error or "none",
+                    (
+                        "OK"
+                        if qa_ok and captured_rows > 0 and capture_error is None
+                        else "BAD"
+                    ),
                 )
                 if not qa_ok and not rerecord:
                     if cfg.qa_gate:

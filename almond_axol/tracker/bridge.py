@@ -110,6 +110,15 @@ class TriggerGestureRecognizer:
             return outcome
         return None
 
+    def cancel_sequence(self) -> None:
+        """Forget pending presses while preserving the current press latch.
+
+        Preserving ``_pressed`` matters when a four-press gesture resolves on
+        the press edge: the held fourth squeeze must not become the first
+        press of a new gesture on the next sample.
+        """
+        self._clear_sequence()
+
     def _clear_sequence(self) -> None:
         self._presses = 0
         self._last_press_at = None
@@ -420,6 +429,14 @@ class TrackerBridge:
             if VREpisodeOutcome.SUCCESS in outcomes
             else None
         )
+        if gesture is not None:
+            # The operator commonly squeezes both Mantis triggers together.
+            # Their CAN samples can cross the 0.6 s resolution deadline one
+            # frame apart: without consuming both pending sequences, the
+            # first triple starts an episode and the other immediately ends
+            # it. Treat contemporaneous two-handed presses as one gesture.
+            for recognizer in self._gesture.values():
+                recognizer.cancel_sequence()
         episode_outcome: VREpisodeOutcome | None = None
         if gesture == VREpisodeOutcome.SUCCESS:
             if self._state == VRState.DATA_COLLECTION:

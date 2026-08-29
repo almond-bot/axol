@@ -1683,7 +1683,7 @@ class InProcessRecorder:
             self._thread.join()
             self._thread = None
 
-    def stop_capture(self) -> None:
+    def stop_capture(self) -> tuple[int, str | None]:
         """Stop the capture thread WITHOUT saving or clearing the buffer.
 
         Call the moment an episode terminates — before any post-episode robot
@@ -1691,9 +1691,12 @@ class InProcessRecorder:
         can't keep appending rows that pair a frozen snapshot with
         reused/stale camera frames (the "junk tail" every episode would
         otherwise carry). ``save_episode`` / ``cancel_episode`` remain valid
-        afterwards and operate on the buffer as frozen here. Idempotent.
+        afterwards and operate on the buffer as frozen here. Returns the exact
+        number of buffered rows and any fatal capture error so callers can
+        reject a bad take before asking LeRobot to save it. Idempotent.
         """
         self._stop_capture()
+        return self._frames["n"], self._capture_error["v"]
 
     def save_episode(self) -> None:
         from ..lerobot.nvenc_encoder import dropped_frames
@@ -1936,7 +1939,7 @@ def _recorder_main(
                 # can run post-episode robot motion (valve close, rest move)
                 # without junk rows being appended, then decide save/cancel.
                 stop_capture()
-                conn.send(("capture_stopped", frame_counter["n"]))
+                conn.send(("capture_stopped", frame_counter["n"], capture_error["v"]))
             elif kind == "save_episode":
                 stop_capture()
                 from ..lerobot.nvenc_encoder import dropped_frames
@@ -2115,7 +2118,7 @@ class DatasetRecorderProcess:
         """Rows captured in the current episode (dataset time = n / fps)."""
         return self._episode_gate("frame_count", "frame_count")
 
-    def stop_capture(self) -> None:
+    def stop_capture(self) -> tuple[int, str | None]:
         """Stop the capture thread WITHOUT saving or clearing the buffer.
 
         Call the moment an episode terminates — before any post-episode robot
@@ -2123,7 +2126,10 @@ class DatasetRecorderProcess:
         capture thread can't keep appending rows that pair a frozen snapshot
         with reused/re-muxed camera frames (the "junk tail"). The buffered
         rows and any pending capture error survive; ``save_episode`` /
-        ``cancel_episode`` remain valid afterwards. Idempotent.
+        ``cancel_episode`` remain valid afterwards. Returns the exact buffered
+        row count and any fatal capture error reported after the capture thread
+        stops, so callers can reject a bad take before asking LeRobot to save
+        it. Idempotent.
 
         Uses the save timeout rather than the lightweight command timeout:
         the reply waits for the capture thread to join, which can take up to
@@ -2136,6 +2142,7 @@ class DatasetRecorderProcess:
             msg = self._conn.recv()
         if msg[0] != "capture_stopped":
             raise RuntimeError(f"recorder stop_capture failed: {msg!r}")
+        return int(msg[1]), msg[2]
 
     def save_episode(self) -> None:
         with self._lock:
