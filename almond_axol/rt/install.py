@@ -9,10 +9,10 @@ Build and install the ``axol-rt`` realtime core binary (see
 
 Three concerns, each idempotent and self-gating:
 
-* **Toolchain** — if ``cargo`` is missing (PATH or ``~/.cargo/bin``), install
-  a minimal stable Rust toolchain via rustup (no sudo; lands in
-  ``~/.cargo``). Needs a C linker (``cc``) for the final link — present on
-  any Jetson with build-essential.
+* **Toolchain** — if no working ``cargo`` is available (PATH or
+  ``~/.cargo/bin``), install a minimal stable Rust toolchain via rustup (no
+  sudo; lands in ``~/.cargo``). Needs a C linker (``cc``) for the final link
+  — present on any Jetson with build-essential.
 * **Sources** — a dev checkout builds in-repo (``rust/axol-rt`` next to this
   package). Tool installs have no sources on disk, so the crate is fetched
   into ``~/.almond/axol-rt-src`` at the exact ref matching the installed
@@ -49,7 +49,8 @@ _INSTALL_DIR = Path.home() / ".local" / "bin"
 _STAMP = _SRC_CACHE / ".installed-ref"
 
 # A cold rustup install + first build both finish well inside this on a
-# Jetson; a hung network fetch should not wedge provision forever.
+# Jetson; a hung tool or network fetch should not wedge provision forever.
+_CARGO_PROBE_TIMEOUT = 10.0
 _RUSTUP_TIMEOUT = 600.0
 _BUILD_TIMEOUT = 900.0
 _FETCH_TIMEOUT = 120.0
@@ -66,13 +67,35 @@ def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     ).set_defaults(func=run)
 
 
+def _cargo_works(cargo: str) -> bool:
+    """Whether a candidate can select a toolchain and run Cargo."""
+    try:
+        proc = subprocess.run(
+            [cargo, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_CARGO_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
 def _find_cargo() -> str | None:
-    """``cargo`` on PATH, or rustup's default location."""
-    on_path = shutil.which("cargo")
-    if on_path:
-        return on_path
+    """A working home-local Cargo, or a working ``cargo`` on PATH."""
     default = Path.home() / ".cargo" / "bin" / "cargo"
-    return str(default) if default.exists() else None
+    # An elevated caller can retain /home/<user>/.cargo/bin on PATH while
+    # changing HOME to /root. That rustup shim exists but cannot select a
+    # toolchain from /root/.rustup, so existence alone is not enough.
+    candidates = [str(default), shutil.which("cargo")]
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None or candidate in seen:
+            continue
+        seen.add(candidate)
+        if _cargo_works(candidate):
+            return candidate
+    return None
 
 
 def _ensure_toolchain() -> str:
@@ -92,7 +115,7 @@ def _ensure_toolchain() -> str:
     )
     cargo = _find_cargo()
     if cargo is None:
-        raise RuntimeError("rustup finished but cargo did not appear")
+        raise RuntimeError("rustup finished but no working cargo appeared")
     return cargo
 
 
