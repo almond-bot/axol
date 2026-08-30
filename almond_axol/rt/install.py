@@ -20,14 +20,15 @@ Three concerns, each idempotent and self-gating:
   ``v<version>`` release tag for PyPI installs.
 * **Binary** — dev checkouts leave it in ``target/release/`` (where
   :func:`almond_axol.rt.link.find_binary` already looks, and where a manual
-  ``cargo build`` stays authoritative). Tool installs copy it to
-  ``~/.local/bin/axol-rt`` — on PATH after the dev-checkout probe — and
-  stamp the built ref so a re-run of ``axol provision`` at the same version
-  skips the build.
+  ``cargo build`` stays authoritative). Tool installs copy it into
+  ``UV_TOOL_BIN_DIR`` when set, or ``~/.local/bin`` otherwise, and stamp the
+  built ref per destination so a re-run of ``axol provision`` at the same
+  version skips the build.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +46,11 @@ _PACKAGE = "almond-axol"
 _REPO_URL = "https://github.com/almond-bot/axol"
 
 _SRC_CACHE = Path.home() / ".almond" / "axol-rt-src"
-_INSTALL_DIR = Path.home() / ".local" / "bin"
+# Keep the legacy stamp for the default destination so existing provision
+# wrappers can still verify it. Non-default destinations receive their own
+# stamp below, so switching UV_TOOL_BIN_DIR can never bless a stale binary
+# left elsewhere.
+_DEFAULT_INSTALL_DIR = Path.home() / ".local" / "bin"
 _STAMP = _SRC_CACHE / ".installed-ref"
 
 # A cold rustup install + first build both finish well inside this on a
@@ -54,6 +59,22 @@ _CARGO_PROBE_TIMEOUT = 10.0
 _RUSTUP_TIMEOUT = 600.0
 _BUILD_TIMEOUT = 900.0
 _FETCH_TIMEOUT = 120.0
+
+
+def _install_dir() -> Path:
+    """Destination shared with uv's tool launchers, or the user-local default."""
+    configured = os.environ.get("UV_TOOL_BIN_DIR")
+    if configured:
+        return Path(configured)
+    return _DEFAULT_INSTALL_DIR
+
+
+def _stamp_for(dest: Path) -> Path:
+    """Ref stamp bound to ``dest`` (legacy name for the default destination)."""
+    if dest.parent == _DEFAULT_INSTALL_DIR:
+        return _STAMP
+    digest = hashlib.sha256(os.fsencode(str(dest.absolute()))).hexdigest()[:16]
+    return _SRC_CACHE / f".installed-ref-{digest}"
 
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
@@ -204,14 +225,16 @@ def _build(crate: Path, cargo: str) -> Path:
     return binary
 
 
-def _install(binary: Path, ref: str) -> Path:
+def _install(binary: Path, ref: str, dest: Path) -> Path:
     """Copy the binary onto PATH (atomic replace) and stamp the ref."""
-    _INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-    dest = _INSTALL_DIR / "axol-rt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(".tmp")
     shutil.copy2(binary, tmp)
+    tmp.chmod(0o755)
     tmp.replace(dest)
-    _STAMP.write_text(ref + "\n")
+    stamp = _stamp_for(dest)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(ref + "\n")
     return dest
 
 
@@ -264,17 +287,22 @@ def run(_args: object = None) -> None:
 
     source = _source_ref()
     if source is None:
-        print("Cannot resolve the axol-rt source ref for this install; skipping.")
-        return
+        raise RuntimeError("cannot resolve the axol-rt source ref for this install")
     url, ref = source
-    dest = _INSTALL_DIR / "axol-rt"
-    if dest.exists() and _STAMP.exists() and _STAMP.read_text().strip() == ref:
+    dest = _install_dir() / "axol-rt"
+    stamp = _stamp_for(dest)
+    if (
+        dest.is_file()
+        and os.access(dest, os.X_OK)
+        and stamp.exists()
+        and stamp.read_text().strip() == ref
+    ):
         _grant_realtime(dest)
         print(f"axol-rt already installed at {dest} (ref {ref}).")
         return
     cargo = _ensure_toolchain()
     print(f"Fetching axol-rt sources ({url} @ {ref}) ...")
     binary = _build(_fetch_crate(url, ref), cargo)
-    dest = _install(binary, ref)
+    dest = _install(binary, ref, dest)
     _grant_realtime(dest)
     print(f"axol-rt installed: {dest} (ref {ref})")

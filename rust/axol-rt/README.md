@@ -205,8 +205,9 @@ instead of allowing stale motion frames to replay after an e-stop.
 
 `axol provision` (or `axol rt.install` standalone) builds and installs the
 binary automatically — rustup toolchain included, and on uv-tool installs
-(no repo checkout) it fetches these sources at the installed package's
-exact ref. Manual path:
+(no repo checkout) it fetches these sources at the installed package's exact
+ref. The binary goes into `UV_TOOL_BIN_DIR` when set (the hosted installer
+uses `/usr/local/bin`) or `~/.local/bin` otherwise. Manual path:
 
 ```sh
 cargo build --release           # needs no cross-compile: built on the Jetson

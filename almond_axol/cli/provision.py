@@ -26,10 +26,11 @@ The single idempotent provisioning path for the pieces ``uv tool install`` /
 
 Both the hosted installer (``web/app/public/install``) and the ``axol serve``
 self-updater (:mod:`almond_axol.serve.update`) run *this* command, so the set
-of steps lives in exactly one place and can't drift between them. Every step is
-idempotent and best-effort (each self-gates on the ZED SDK / apt / NVENC and
-no-ops when unavailable), so ``axol provision`` is safe to run on any host and
-re-run anytime.
+of steps lives in exactly one place and can't drift between them. Plain
+``axol provision`` keeps every step idempotent and best-effort (each self-gates
+on the ZED SDK / apt / NVENC), so it is safe to run on any host. The hosted
+installer and post-upgrade path add ``--require-rt``: optional hardware remains
+best-effort, but a failed required control-core install makes the command fail.
 
 It does NOT pin Jetson clocks — that's ``axol jetson.setup``, a per-boot runtime
 tweak owned by the systemd ``ExecStartPre``, not an install step.
@@ -58,24 +59,33 @@ _ZED_SDK = Path("/usr/local/zed")
 
 def add_parser(subparsers) -> None:  # type: ignore[type-arg]
     """Register the ``provision`` subcommand."""
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         "provision",
         help=(
             "Install/refresh the non-PyPI + system pieces "
-            "(pyzed, GStreamer/PyGObject, patched zed-gstreamer plugins)."
+            "(cameras, adb, board access, and the axol-rt control core)."
         ),
-    ).set_defaults(func=run)
+    )
+    parser.add_argument(
+        "--require-rt",
+        action="store_true",
+        help="exit non-zero if the required axol-rt core cannot be installed",
+    )
+    parser.set_defaults(func=run)
 
 
-def _step(label: str, fn: Callable[[], object]) -> None:
-    """Run one provisioning step; log and continue on failure (best-effort)."""
+def _step(label: str, fn: Callable[[], object]) -> bool:
+    """Run one step and report success, logging failures without stopping."""
     try:
         fn()
     except SystemExit as exc:  # a step (e.g. zed.install) may hard-exit on failure
         if exc.code not in (0, None):
             _logger.warning("provision: %s failed (exit %s)", label, exc.code)
+            return False
     except Exception as exc:  # noqa: BLE001 - never let one step abort the rest
         _logger.warning("provision: %s failed: %s", label, exc)
+        return False
+    return True
 
 
 def run(_args: object = None) -> None:
@@ -107,4 +117,6 @@ def run(_args: object = None) -> None:
     # then build from the in-repo crate (dev checkout) or from the sources
     # at the installed package's exact ref (tool installs). Self-gates on
     # network/toolchain availability like every other step.
-    _step("axol-rt realtime core (rt.install)", rt_install.run)
+    rt_ok = _step("axol-rt realtime core (rt.install)", rt_install.run)
+    if getattr(_args, "require_rt", False) and not rt_ok:
+        raise SystemExit(1)
