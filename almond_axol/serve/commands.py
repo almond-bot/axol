@@ -8,12 +8,13 @@ whose imports fail (missing ``lerobot``, ZED SDK, mujoco, …) are simply marked
 unavailable so the rest of the catalog still loads.
 
 Only commands some UI surface actually launches belong here: the control
-panel's five operations, and the diagnostics dashboard's tests, CAN bring-up
-buttons, and motor calibration tools. Everything else — install-time commands
-(``gst.*``, ``jetson.setup``, ``can.driver``), the tuning suite (``tune.*``),
-one-off checks (``motor.info`` / ``motor.health``, whose read set the
-dashboard's motor tiles show live), the remote ``inference-server``, and
-``serve`` itself — stays CLI-only.
+panel's five operations, Mantis tracker-runtime setup, and the diagnostics
+dashboard's tests, CAN bring-up buttons, and motor calibration tools.
+Everything else — broad install-time commands (``gst.*``, ``jetson.setup``,
+``can.driver``), the tuning suite (``tune.*``), one-off checks
+(``motor.info`` / ``motor.health``, whose read set the dashboard's motor tiles
+show live), the remote ``inference-server``, and ``serve`` itself — stays
+CLI-only.
 
 ``motor.restore-config`` is also CLI-only: it consumes a snapshot file, and a
 browser form can only name a path on the serve host, so the dashboard offers
@@ -79,6 +80,7 @@ class CommandDef:
         sim_flag: str | None = None,
         robot_free_flags: tuple[str, ...] = (),
         supports_mantis: bool = False,
+        hardware_profiles: tuple[str, ...] = ("axol", "mantis"),
         uses_headset: bool = False,
         episode_control: Callable[[], Callable[..., Any]] | None = None,
         per_run_fields: tuple[str, ...] = (),
@@ -134,6 +136,9 @@ class CommandDef:
         # collection. Policy/DAgger may consume datasets produced by Mantis,
         # but they always drive Axol hardware.
         self.supports_mantis = supports_mantis
+        # Diagnostics can be constrained to the connected hardware profile;
+        # operations use their own config-driven Axol/Mantis selection.
+        self.hardware_profiles = hardware_profiles
         # Driven from the VR headset, so the panel tells the operator to point
         # the headset at this machine once the op is running.
         self.uses_headset = uses_headset
@@ -468,6 +473,19 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_can_bus=False,
     ),
+    "diag.mantis-trigger": CommandDef(
+        "diag.mantis-trigger",
+        "diag.mantis-trigger",
+        "Mantis trigger check",
+        "Drive each Mantis gripper proportionally from its matching trigger; "
+        "no cameras or pose trackers required.",
+        "Diagnostics",
+        "argparse",
+        _argparse_loader("..diagnostics.mantis.trigger"),
+        requires_hardware=True,
+        drives_motors=True,
+        hardware_profiles=("mantis",),
+    ),
     # The lift commands run on the chest CAN bus, not the arm hub, but they
     # still take the single bus-owner slot (uses_can_bus default) so physical
     # motion is never launched concurrently with teleop or another
@@ -579,6 +597,40 @@ COMMANDS: dict[str, CommandDef] = {
         requires_hardware=True,
         uses_can_bus=False,
     ),
+    "tracker.install": CommandDef(
+        "tracker.install",
+        "tracker.install",
+        "Install Lighthouse support",
+        "Build and install the pinned libsurvive runtime and Vive USB permissions.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_install"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
+    "tracker.ultimate.install": CommandDef(
+        "tracker.ultimate.install",
+        "tracker.ultimate.install",
+        "Install Ultimate support",
+        "Install the pinned pyvut runtime, native HID libraries, and USB permissions.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_ultimate"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
+    "tracker.ultimate.check": CommandDef(
+        "tracker.ultimate.check",
+        "tracker.ultimate.check",
+        "Check Ultimate setup",
+        "Check the Ultimate runtime, dongle, permissions, Wi-Fi, and bindings "
+        "without opening the dongle or changing pairing state.",
+        "Setup",
+        "argparse",
+        _argparse_loader("..cli.tracker_ultimate"),
+        requires_hardware=False,
+        uses_can_bus=False,
+    ),
     "can.setup": CommandDef(
         "can.setup",
         "can.setup",
@@ -663,7 +715,9 @@ def command_specs() -> list[dict[str, Any]]:
             "simFlag": cmd.sim_flag,
             "robotFreeFlags": list(cmd.robot_free_flags),
             "supportsMantis": cmd.supports_mantis,
+            "hardwareProfiles": list(cmd.hardware_profiles),
             "usesHeadset": cmd.uses_headset,
+            "streamsVideo": cmd.streams_video,
         }
         try:
             schema = get_schema(cmd.id)

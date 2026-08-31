@@ -671,12 +671,24 @@ class AxolVRTeleop(Teleoperator):
 
         ``time.perf_counter`` seconds of the last IK reply whose TCP differed
         from the previous one (see :attr:`VRTeleopCore.last_tcp_change_ts`).
-        A tracker dropout / IK stall keeps replying with an identical pose,
-        so Mantis data collection compares this against "now" to count stale
-        frames — frozen poses recorded under fresh row timestamps. ``None``
-        before the first absolute-mode solve.
+        This is diagnostic only: a live operator may deliberately hold a
+        perfectly still pose, so data-quality checks use the capture heartbeat
+        from :meth:`pose_capture_ts` rather than treating unchanged TCP values
+        as stale. ``None`` before the first absolute-mode solve.
         """
         return self._core.last_tcp_change_ts
+
+    def tracking_sides(self) -> dict[str, bool]:
+        """Whether each controller/tracker contributed a currently live pose."""
+        return dict(self._core.last_tracking)
+
+    def trigger_sides(self) -> dict[str, bool]:
+        """Whether each managed Mantis trigger has a fresh CAN heartbeat.
+
+        Quest and legacy senders default both sides to live because their grip
+        input is part of the controller frame rather than a separate CAN node.
+        """
+        return dict(self._core.last_trigger_live)
 
     def is_engaged(self) -> bool:
         """Whether teleop tracking is currently engaged (both grips squeezed).

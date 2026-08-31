@@ -29,10 +29,17 @@ import shutil
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 
 import numpy as np
 
-from .base import TrackerPose, TrackerSource, zup_to_yup_pos, zup_to_yup_quat
+from .base import (
+    TrackerPose,
+    TrackerSource,
+    TrackerSourceError,
+    zup_to_yup_pos,
+    zup_to_yup_quat,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -68,11 +75,15 @@ class SurviveSource(TrackerSource):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._proc: subprocess.Popen | None = None
+        self._failure: TrackerSourceError | None = None
 
     # -- Lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
         self._stop.clear()
+        with self._lock:
+            self._failure = None
+            self._poses.clear()
         try:
             import pysurvive  # noqa: F401
 
@@ -88,7 +99,12 @@ class SurviveSource(TrackerSource):
                 ) from None
             target = self._run_cli
             _logger.info("survive backend: using survive-cli subprocess")
-        self._thread = threading.Thread(target=target, daemon=True, name="survive")
+        self._thread = threading.Thread(
+            target=self._run_worker,
+            args=(target,),
+            daemon=True,
+            name="survive",
+        )
         self._thread.start()
 
     def stop(self) -> None:
@@ -106,9 +122,33 @@ class SurviveSource(TrackerSource):
 
     def poses(self) -> dict[str, TrackerPose]:
         with self._lock:
+            if self._failure is not None:
+                raise self._failure
             return dict(self._poses)
 
     # -- Internal ---------------------------------------------------------------
+
+    def _run_worker(self, target: Callable[[], None]) -> None:
+        """Run one libsurvive transport and retain any terminal failure."""
+        try:
+            target()
+        except BaseException as exc:  # noqa: BLE001 - relay thread failures
+            if self._stop.is_set():
+                return
+            failure = (
+                exc
+                if isinstance(exc, TrackerSourceError)
+                else TrackerSourceError(
+                    f"libsurvive reader failed ({type(exc).__name__}: {exc})"
+                )
+            )
+        else:
+            if self._stop.is_set():
+                return
+            failure = TrackerSourceError("libsurvive reader stopped unexpectedly")
+        with self._lock:
+            self._failure = failure
+        _logger.error("%s", failure)
 
     def _publish(self, key: str, pos_zup: np.ndarray, quat_wxyz: np.ndarray) -> None:
         pos, quat = _convert(pos_zup, quat_wxyz)
@@ -137,6 +177,8 @@ class SurviveSource(TrackerSource):
             pos = np.asarray(pose.Pos, dtype=np.float64)
             rot = np.asarray(pose.Rot, dtype=np.float64)  # (w, x, y, z)
             self._publish(str(name), pos, rot)
+        if not self._stop.is_set():
+            raise TrackerSourceError("pysurvive stopped running unexpectedly")
 
     def _run_cli(self) -> None:
         """Parse POSE lines from a ``survive-cli --record-stdout`` stream."""
@@ -180,4 +222,4 @@ class SurviveSource(TrackerSource):
             )
         code = self._proc.poll() if self._proc is not None else None
         if not self._stop.is_set():
-            _logger.error("survive-cli exited unexpectedly (code %s)", code)
+            raise TrackerSourceError(f"survive-cli exited unexpectedly (code {code})")

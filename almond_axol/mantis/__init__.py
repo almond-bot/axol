@@ -22,6 +22,7 @@ from .calibration import (
     DESIGN_TCP_TRANSFORMS,
     MANTIS_TCP_TRANSFORM_FILE,
     load_tcp_transforms,
+    validate_tcp_transform,
 )
 from .relative import quat_xyzw_to_matrix, quat_xyzw_to_rotvec
 
@@ -29,6 +30,7 @@ __all__ = [
     "DESIGN_TCP_TRANSFORMS",
     "MANTIS_TCP_TRANSFORM_FILE",
     "load_tcp_transforms",
+    "validate_tcp_transform",
     "quat_xyzw_to_matrix",
     "quat_xyzw_to_rotvec",
 ]

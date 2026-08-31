@@ -11,8 +11,7 @@ Backends:
   - ``survive``   — Vive Tracker 3.0 via libsurvive (lighthouse tracking).
   - ``ultimate``  — Vive Ultimate Tracker via the wireless dongle (pyvut).
   - ``synthetic`` — generated motion for end-to-end tests without hardware.
-  - ``static``    — fixed poses, for gripper-only Mantis teleop with no
-    tracker hardware at all (the trigger node is the only live input).
+  - ``static``    — fixed poses for standalone bridge/protocol diagnostics.
 """
 
 from . import static, synthetic

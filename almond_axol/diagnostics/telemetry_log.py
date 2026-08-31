@@ -27,11 +27,12 @@ from typing import TYPE_CHECKING, TextIO
 
 from ..constants import Joint
 from ..motor import MotorError
+from ..utils.paths import almond_path
 
 if TYPE_CHECKING:
     from ..robot.axol import Axol, AxolArm
 
-CAPTURE_DIR = Path.home() / ".almond" / "diagnostics" / "captures"
+CAPTURE_DIR = almond_path("diagnostics", "captures")
 
 _DEFAULT_HZ = 5.0
 

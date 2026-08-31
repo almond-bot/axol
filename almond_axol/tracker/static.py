@@ -1,21 +1,16 @@
-"""Fixed-pose tracker source for gripper-only Mantis teleop.
+"""Fixed-pose tracker source for standalone bridge diagnostics.
 
 Reports two devices (``static-left`` / ``static-right``) parked at a
 constant chest-height pose, so ``axol tracker.bridge`` can run with **no
-tracker hardware at all**: the arms hold still and the only thing that
-moves is the gripper, driven by the rig's CAN trigger node. That is the
-whole rig minus the trackers, which is exactly what you want when
-bringing up or debugging a Mantis gripper::
+tracker hardware at all** against a generic VR server::
 
-    axol teleop --mantis                     # one terminal
-    axol tracker.bridge --backend static  # another; Enter to engage
+    axol teleop --sim                         # one terminal
+    axol tracker.bridge --backend static      # another; Enter to engage
 
-The Mantis's seven arm joints per side are virtual (there is no arm), so a
-frozen arm pose costs nothing physically. Unlike the ``synthetic``
-backend — which orbits the devices through small circles to exercise the
-whole bridge → IK → sim pipeline — nothing here ever moves, so a
-squeeze of the trigger is the only thing that can change the commanded
-state.
+Managed Mantis sessions deliberately do not offer this backend: they own a
+Quest, Lighthouse, or Ultimate source for their whole lifecycle. Unlike the
+``synthetic`` backend — which orbits the devices through small circles to
+exercise the bridge → IK → sim pipeline — this source never moves.
 
 The poses match the placeholder the bridge streams for an unbound side,
 and are restamped on every read so the bridge's staleness watchdog stays

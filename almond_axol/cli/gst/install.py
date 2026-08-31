@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 
+from ...utils.jetson import _is_jetson
 from ...utils.sudo import prime_sudo
 
 _logger = logging.getLogger(__name__)
@@ -191,6 +192,13 @@ def run(_args: object = None) -> None:
     the ``zedxonesrc`` / ``zedsrc`` source elements come from
     ``axol gst.build-zed``; this command only verifies those are present.
     """
+    if not _is_jetson():
+        print(
+            "Not an NVIDIA Jetson (L4T); skipping the Jetson-only GStreamer "
+            "NVENC stack. Camera capture will use the ZED SDK fallback on "
+            "this host."
+        )
+        return
     if _gst_ok():
         print("GStreamer appsink + NVENC stack already available.")
         _note_zed_sources()

@@ -54,6 +54,40 @@ command -v curl >/dev/null 2>&1 || die "curl is required."
 # install from the GitHub URL.
 command -v git >/dev/null 2>&1 || die "git is required."
 
+# Resolve the login that owns this robot's operator state once and reuse it for
+# Quest USB access, datasets, and ALMOND_HOME. SUDO_USER is the person who
+# launched the installer; a direct root invocation retains the historical
+# first-/home-user fallback.
+OPERATOR_USER="${SUDO_USER:-}"
+if [ -z "${OPERATOR_USER}" ] || [ "${OPERATOR_USER}" = "root" ]; then
+    OPERATOR_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
+fi
+OPERATOR_HOME=""
+OPERATOR_GROUP=""
+if [ -n "${OPERATOR_USER}" ] && [ "${OPERATOR_USER}" != "root" ]; then
+    OPERATOR_HOME="$(getent passwd "${OPERATOR_USER}" | cut -d: -f6)"
+    OPERATOR_GROUP="$(id -gn "${OPERATOR_USER}" 2>/dev/null || true)"
+    case "${OPERATOR_HOME}" in
+        /*) ;;
+        *) OPERATOR_HOME="" ;;
+    esac
+fi
+
+# systemd parses Environment= with its own quoting rules, not shell quoting.
+# Escape quoting plus systemd's ``%`` specifier marker, and reject line breaks
+# so a passwd entry can never inject another directive.
+systemd_environment_line() {
+    local name="$1"
+    local value="$2"
+    case "${value}" in
+        *$'\n'*|*$'\r'*) die "Cannot write a multiline ${name} value to systemd." ;;
+    esac
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//%/%%}"
+    printf 'Environment="%s=%s"' "${name}" "${value}"
+}
+
 # -- uv -----------------------------------------------------------------------
 
 if ! command -v uv >/dev/null 2>&1; then
@@ -124,12 +158,9 @@ rm -f "${PROVISION_LOG}"
 # `dialout` group -- the one operators already have for CAN/serial access, so
 # interactive `adb` works without a re-login. Make sure the operator is in it
 # (provision does this too, but be explicit here where the account is known):
-# SUDO_USER is whoever launched the installer (we re-exec under sudo above);
-# fall back to the first /home owner when run directly as root.
-QUEST_USER="${SUDO_USER:-}"
-if [ -z "${QUEST_USER}" ] || [ "${QUEST_USER}" = "root" ]; then
-    QUEST_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
-fi
+# OPERATOR_USER is whoever launched the installer (or the direct-root
+# fallback resolved above).
+QUEST_USER="${OPERATOR_USER}"
 if [ -n "${QUEST_USER}" ] && [ "${QUEST_USER}" != "root" ]; then
     usermod -aG dialout "${QUEST_USER}" 2>/dev/null \
         && say "Added ${QUEST_USER} to 'dialout' for Quest-over-USB adb access." \
@@ -149,17 +180,12 @@ axol jetson.setup || say "WARNING: jetson.setup failed (non-Jetson, or needs roo
 
 # The service runs as root, so without help LeRobot would write collected
 # datasets to /root/.cache/huggingface/lerobot. Point HF_LEROBOT_HOME at the
-# installing user's home instead so datasets live in their account. SUDO_USER
-# is set because we re-exec under sudo above; fall back to the owner of the
-# first /home/* directory when the installer is run directly as root.
-DATASET_USER="${SUDO_USER:-}"
-if [ -z "${DATASET_USER}" ] || [ "${DATASET_USER}" = "root" ]; then
-    DATASET_USER="$(ls -ld /home/*/ 2>/dev/null | awk 'NR==1 {print $3}')"
-fi
+# installing user's home instead so datasets live in their account.
+DATASET_USER="${OPERATOR_USER}"
 LEROBOT_HOME_ENV=""
-if [ -n "${DATASET_USER}" ]; then
-    DATASET_HOME="$(getent passwd "${DATASET_USER}" | cut -d: -f6)"
-    if [ -n "${DATASET_HOME}" ] && [ -d "${DATASET_HOME}" ]; then
+if [ -n "${DATASET_USER}" ] && [ -n "${OPERATOR_HOME}" ]; then
+    DATASET_HOME="${OPERATOR_HOME}"
+    if [ -d "${DATASET_HOME}" ]; then
         LEROBOT_HOME="${DATASET_HOME}/.cache/huggingface/lerobot"
         say "Datasets will be stored under ${LEROBOT_HOME} (user: ${DATASET_USER})."
         mkdir -p "${LEROBOT_HOME}"
@@ -169,11 +195,86 @@ if [ -n "${DATASET_USER}" ]; then
             "${DATASET_HOME}/.cache" \
             "${DATASET_HOME}/.cache/huggingface" \
             "${LEROBOT_HOME}" 2>/dev/null || true
-        LEROBOT_HOME_ENV="Environment=HF_LEROBOT_HOME=${LEROBOT_HOME}"
+        LEROBOT_HOME_ENV="$(systemd_environment_line HF_LEROBOT_HOME "${LEROBOT_HOME}")"
     fi
 fi
 if [ -z "${LEROBOT_HOME_ENV}" ]; then
     say "WARNING: could not resolve a non-root user home; datasets default to root's cache."
+fi
+
+# -- Shared operator state ----------------------------------------------------
+
+# CLI commands historically use the operator's ~/.almond, while the hosted
+# service used /root/.almond. Point both at the existing operator tree. On an
+# upgrade, copy only missing state from the old root tree; an operator's
+# existing file always wins and the legacy copy remains as a backup.
+ALMOND_HOME_ENV_LINE=""
+SERVICE_GROUP_LINE=""
+if [ -n "${OPERATOR_HOME}" ] && [ -n "${OPERATOR_GROUP}" ] && [ -d "${OPERATOR_HOME}" ]; then
+    ALMOND_STATE_HOME="${OPERATOR_HOME}/.almond"
+    mkdir -p "${ALMOND_STATE_HOME}"
+
+    LEGACY_STATE_HOME="/root/.almond"
+    if [ "${ALMOND_STATE_HOME}" != "${LEGACY_STATE_HOME}" ] && [ -d "${LEGACY_STATE_HOME}" ]; then
+        PRE_MANTIS_STATE_DIR="u""mi"
+        for item in \
+            settings.json tracker/config.json tracker/ultimate_wifi.json \
+            mantis/tcp_transform.json \
+            "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" \
+            gripper_calibration.json can/startup.sh can/startup_mantis.sh \
+            can/rp1-usb-quirk.sh waypoints.json; do
+            legacy_item="${LEGACY_STATE_HOME}/${item}"
+            operator_item="${ALMOND_STATE_HOME}/${item}"
+            if { [ -e "${legacy_item}" ] || [ -L "${legacy_item}" ]; } \
+                && [ ! -e "${operator_item}" ] && [ ! -L "${operator_item}" ]; then
+                mkdir -p "$(dirname "${operator_item}")"
+                cp -a -- "${legacy_item}" "${operator_item}"
+                if [ "${item}" = "${PRE_MANTIS_STATE_DIR}/tcp_transform.json" ]; then
+                    say "Migrated operator state: legacy Mantis calibration"
+                else
+                    say "Migrated operator state: ${item}"
+                fi
+            fi
+        done
+
+        # Keep a certificate and its private key as a pair; mixing halves from
+        # two homes creates a TLS configuration that looks complete but cannot
+        # start. If the operator has either half, normal cert setup regenerates
+        # the pair when needed instead of merging it here.
+        legacy_cert_dir="${LEGACY_STATE_HOME}/vr/certs"
+        operator_cert_dir="${ALMOND_STATE_HOME}/vr/certs"
+        if [ -f "${legacy_cert_dir}/cert.pem" ] && [ ! -L "${legacy_cert_dir}/cert.pem" ] \
+            && [ -f "${legacy_cert_dir}/key.pem" ] && [ ! -L "${legacy_cert_dir}/key.pem" ] \
+            && [ ! -e "${operator_cert_dir}/cert.pem" ] \
+            && [ ! -L "${operator_cert_dir}/cert.pem" ] \
+            && [ ! -e "${operator_cert_dir}/key.pem" ] \
+            && [ ! -L "${operator_cert_dir}/key.pem" ]; then
+            mkdir -p "${operator_cert_dir}"
+            cp -a -- "${legacy_cert_dir}/cert.pem" "${legacy_cert_dir}/key.pem" \
+                "${operator_cert_dir}/"
+            say "Migrated operator state: Quest/control-panel TLS certificate"
+        fi
+
+        # Diagnostics are append-only history. Preserve the legacy tree only
+        # when the operator does not already have one; never merge run IDs.
+        if [ -d "${LEGACY_STATE_HOME}/diagnostics" ] \
+            && [ ! -e "${ALMOND_STATE_HOME}/diagnostics" ]; then
+            cp -a -- "${LEGACY_STATE_HOME}/diagnostics" \
+                "${ALMOND_STATE_HOME}/diagnostics"
+            say "Migrated operator state: diagnostics"
+        fi
+    fi
+
+    # The service remains uid 0 for hardware setup, but runs with the
+    # operator's primary group and a group-writable umask. State first created
+    # by the service can therefore still be updated by the interactive CLI.
+    chown -R "${OPERATOR_USER}:${OPERATOR_GROUP}" "${ALMOND_STATE_HOME}"
+    chmod 2775 "${ALMOND_STATE_HOME}"
+    ALMOND_HOME_ENV_LINE="$(systemd_environment_line ALMOND_HOME "${ALMOND_STATE_HOME}")"
+    SERVICE_GROUP_LINE="Group=${OPERATOR_GROUP}"
+    say "Shared operator state: ${ALMOND_STATE_HOME} (user: ${OPERATOR_USER})."
+else
+    say "WARNING: could not resolve a non-root operator home; service state defaults to /root/.almond."
 fi
 
 # -- systemd service ----------------------------------------------------------
@@ -186,6 +287,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Keep root privileges for hardware setup while making newly-created operator
+# state writable by the login account selected above.
+${SERVICE_GROUP_LINE}
+UMask=0002
 # Re-pin the Jetson clocks at every boot (they reset on reboot). The leading
 # '-' makes a failure non-fatal, so serve still starts on non-Jetson hosts.
 ExecStartPre=-${BIN_DIR}/axol jetson.setup
@@ -202,6 +307,9 @@ TimeoutStopSec=240
 # Include the sbin dirs: CAN bring-up shells out to modinfo/modprobe/ip/etc.
 Environment=PATH=${BIN_DIR}:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
+# Share settings, tracker bindings, Mantis calibration, CAN state, and Quest
+# certificates with the interactive CLI. Empty only when no operator resolved.
+${ALMOND_HOME_ENV_LINE}
 # Store collected datasets under the installing user's home (see above) rather
 # than root's cache. Empty when no non-root user home was resolved.
 ${LEROBOT_HOME_ENV}

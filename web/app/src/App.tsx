@@ -1176,11 +1176,12 @@ export default function App() {
   // ?autoconnect=1 connects without a click — the headset browser is launched
   // at this URL over adb, so the only remaining human steps are wearing the
   // headset and the browser-mandated trigger pull to enter AR.
-  const bootParams = useRef(
-    typeof window === "undefined" ? null : new URLSearchParams(window.location.search)
+  const bootParams = useMemo(
+    () => (typeof window === "undefined" ? null : new URLSearchParams(window.location.search)),
+    []
   )
   const [hostname, setHostname] = useState(
-    () => bootParams.current?.get("host") ?? localStorage.getItem("wsHostname") ?? ""
+    () => bootParams?.get("host") ?? localStorage.getItem("wsHostname") ?? ""
   )
   const [usbPoses, setUsbPoses] = useState(() => localStorage.getItem("usbPoses") === "1")
   const [vrState, setVrState] = useState<AxolState>(AxolState.Teleop)
@@ -1194,17 +1195,18 @@ export default function App() {
   // Current 1-based episode number during data collection (null until the
   // server announces one; stays null in plain teleop).
   const [episode, setEpisode] = useState<number | null>(null)
+  const [xrError, setXrError] = useState<string | null>(null)
   const { status, connect, disconnect, wsRef } = useAxolVRClient(hostname)
 
   // Fire the autoconnect once the client is idle with a host set.
   const autoConnectedRef = useRef(false)
   useEffect(() => {
-    if (!bootParams.current?.get("autoconnect")) return
+    if (!bootParams?.get("autoconnect")) return
     if (autoConnectedRef.current || !hostname) return
     if (status !== AxolConnectionStatus.Idle) return
     autoConnectedRef.current = true
     connect()
-  }, [hostname, status, connect])
+  }, [bootParams, hostname, status, connect])
   // Controller poses can ride a wired USB `adb reverse` tunnel (localhost) to
   // avoid WiFi latency; camera video keeps using the LAN host above. The pose
   // socket comes up once the main connection is open and the operator opts in.
@@ -1248,8 +1250,21 @@ export default function App() {
   }, [status, wsRef])
 
   const handleConnect = () => {
+    setXrError(null)
     localStorage.setItem("wsHostname", hostname)
     connect()
+  }
+
+  const handleEnterVr = async () => {
+    setXrError(null)
+    try {
+      await store.enterAR()
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      setXrError(
+        detail || "The browser refused to enter WebXR. Check headset permissions and try again."
+      )
+    }
   }
 
   const handleUsbToggle = (next: boolean) => {
@@ -1277,10 +1292,15 @@ export default function App() {
 
             {status === AxolConnectionStatus.Open ? (
               <div className="flex flex-col gap-2">
-                <Button size="lg" className="w-full" onClick={() => store.enterAR()}>
+                <Button size="lg" className="w-full" onClick={handleEnterVr}>
                   <Headset />
                   Enter VR
                 </Button>
+                {xrError && (
+                  <p className="rounded-md border border-red-400/20 bg-red-400/[0.06] p-2 text-xs leading-relaxed text-red-200/80">
+                    Could not enter VR: {xrError}
+                  </p>
+                )}
                 <Button variant="ghost" className="w-full" onClick={disconnect}>
                   Disconnect
                 </Button>

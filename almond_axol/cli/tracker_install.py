@@ -8,6 +8,7 @@ idempotent: an already-installed pinned build is a fast no-op.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -25,6 +26,8 @@ _PINNED_REF = "f1e6eddb669320f2a30760f4b42936bdb4306da0"
 _BUILD_REVISION = "libusb-v1"
 _UDEV_RULE = Path("useful_files/81-vive.rules")
 _STAMP = ".axol-build-stamp"
+_MACHINE_STAMP = Path("/var/lib/almond/libsurvive-build-stamp")
+_INSTALLED_UDEV_RULE = Path("/etc/udev/rules.d/81-vive.rules")
 
 _APT_BUILD_DEPS = (
     "build-essential",
@@ -168,7 +171,7 @@ def _install_udev_rule(src: Path) -> bool:
                 "-m",
                 "0644",
                 str(rule),
-                "/etc/udev/rules.d/81-vive.rules",
+                str(_INSTALLED_UDEV_RULE),
             ]
         ).returncode
         != 0
@@ -183,18 +186,132 @@ def _install_udev_rule(src: Path) -> bool:
     return True
 
 
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _install_machine_stamp(src: Path) -> bool:
+    """Publish one root-readable proof shared by serve and operator CLIs."""
+    rule = src / _UDEV_RULE
+    try:
+        digest = _file_digest(rule)
+        local_stamp = src / _STAMP
+        local_stamp.write_text(f"{_PINNED_REF}\n{_BUILD_REVISION}\n")
+        manifest = src / ".axol-machine-install-manifest"
+        manifest.write_text(f"{_PINNED_REF}\n{_BUILD_REVISION}\n{digest}\n")
+    except OSError as exc:
+        _logger.warning("could not prepare libsurvive install manifest: %s", exc)
+        return False
+    result = run_root(
+        ["install", "-D", "-m", "0644", str(manifest), str(_MACHINE_STAMP)]
+    )
+    return result.returncode == 0
+
+
+def lighthouse_readiness(
+    *,
+    src: Path | None = None,
+    installed_udev_rule: Path = _INSTALLED_UDEV_RULE,
+    manifest_path: Path | None = None,
+) -> dict[str, object]:
+    """Inspect the supported Lighthouse runtime without opening USB devices.
+
+    Merely finding a ``survive-cli`` executable is not enough: Axol relies on
+    the pinned libusb build (the HIDAPI build cannot pair Watchman dongles) and
+    on its matching udev rule.  The installer-owned stamp records both the
+    upstream commit and Axol's build recipe revision.
+    """
+    source = src if src is not None else _src_dir()
+    source_rule = source / _UDEV_RULE
+    expected_stamp = f"{_PINNED_REF}\n{_BUILD_REVISION}"
+
+    # An explicit source without a manifest is the hermetic/test form: verify
+    # that source's local two-line stamp and rule. Normal callers use the
+    # canonical machine manifest, so root serve, provisioning, and an operator
+    # CLI all inspect the same installation regardless of their build cache.
+    source_scoped = src is not None and manifest_path is None
+    stamp_path = source / _STAMP if source_scoped else (manifest_path or _MACHINE_STAMP)
+
+    try:
+        actual_stamp = stamp_path.read_text().strip()
+    except OSError:
+        actual_stamp = ""
+    actual_stamp_lines = actual_stamp.splitlines()
+    stamp_valid = actual_stamp_lines[:2] == expected_stamp.splitlines()
+
+    try:
+        if source_scoped:
+            rule_valid = (
+                source_rule.is_file()
+                and installed_udev_rule.is_file()
+                and source_rule.read_bytes() == installed_udev_rule.read_bytes()
+            )
+        else:
+            recorded_digest = (
+                actual_stamp_lines[2] if len(actual_stamp_lines) > 2 else ""
+            )
+            rule_valid = bool(
+                recorded_digest
+                and installed_udev_rule.is_file()
+                and _file_digest(installed_udev_rule) == recorded_digest
+            )
+    except OSError:
+        rule_valid = False
+
+    available = is_available()
+    pairing_cli = shutil.which("survive-cli") is not None
+    issues: list[str] = []
+    if not available:
+        issues.append("survive-cli/pysurvive is unavailable")
+    if not pairing_cli:
+        issues.append("survive-cli is unavailable, so Watchman pairing cannot run")
+    if not stamp_valid:
+        issues.append("the pinned libsurvive build stamp is missing or stale")
+    if not rule_valid:
+        issues.append("the pinned Vive USB udev rule is missing or stale")
+    return {
+        "installed": available and pairing_cli and stamp_valid and rule_valid,
+        "available": available,
+        "pairingCli": pairing_cli,
+        "pinnedBuild": stamp_valid,
+        "udevReady": rule_valid,
+        "pinnedRef": _PINNED_REF,
+        "buildRevision": _BUILD_REVISION,
+        "installedRef": actual_stamp_lines[0] if actual_stamp_lines else None,
+        "installedBuildRevision": (
+            actual_stamp_lines[1] if len(actual_stamp_lines) > 1 else None
+        ),
+        "stampPath": str(stamp_path),
+        "udevRulePath": str(installed_udev_rule),
+        "issues": issues,
+    }
+
+
 def ensure_installed() -> bool:
     """Install libsurvive when needed; return whether a usable backend exists."""
     src = _src_dir()
-    stamp = src / _STAMP
-    expected_stamp = f"{_PINNED_REF}\n{_BUILD_REVISION}"
-    if (
-        is_available()
-        and stamp.exists()
-        and stamp.read_text().strip() == expected_stamp
-    ):
+    readiness = lighthouse_readiness()
+    if readiness["installed"]:
         print("Lighthouse tracking support is already installed.", flush=True)
         return True
+
+    # One-time upgrade from the former UID-scoped proof. Official root
+    # provisioning used /opt while an operator CLI used ~/.almond, so neither
+    # could trust the other's stamp. If this caller's old source and installed
+    # rule still match exactly, publish the canonical manifest without a rebuild.
+    legacy = lighthouse_readiness(src=src)
+    if legacy["installed"]:
+        print("Publishing the machine-wide Lighthouse install manifest…", flush=True)
+        if _install_machine_stamp(src) and lighthouse_readiness()["installed"]:
+            print("Lighthouse tracking support installed.", flush=True)
+            return True
+
+    # A removed/drifted permissions rule does not require a native rebuild.
+    if readiness["available"] and readiness["pinnedBuild"]:
+        print("Installing Vive USB permissions…", flush=True)
+        if _install_udev_rule(src) and lighthouse_readiness()["installed"]:
+            print("Lighthouse tracking support installed.", flush=True)
+            return True
 
     print("Installing Lighthouse tracking build dependencies…", flush=True)
     if not _install_build_deps():
@@ -208,10 +325,15 @@ def ensure_installed() -> bool:
     print("Installing Vive USB permissions…", flush=True)
     if not _install_udev_rule(src):
         return False
-    if not is_available():
-        _logger.warning("survive-cli is not available after installation")
+    if not _install_machine_stamp(src):
         return False
-    stamp.write_text(f"{expected_stamp}\n")
+    final = lighthouse_readiness()
+    if not final["installed"]:
+        _logger.warning(
+            "Lighthouse installation did not pass final readiness: %s",
+            "; ".join(str(issue) for issue in final["issues"]),
+        )
+        return False
     print("Lighthouse tracking support installed.", flush=True)
     return True
 

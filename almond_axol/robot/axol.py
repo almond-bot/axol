@@ -11,7 +11,6 @@ import json
 import logging
 import math
 import time
-from pathlib import Path
 
 import numpy as np
 
@@ -25,6 +24,7 @@ from ..motor import (
     MotorGains,
     MotorStatus,
 )
+from ..utils.paths import almond_path
 from .base import RobotBase
 from .config import AxolConfig
 from .control import Differentiator, compute_friction
@@ -65,7 +65,7 @@ _GRIPPER_CALIB_KD = 1.0
 # ``_calibrate_gripper()``. It is persisted here so a reconnecting
 # ``enable()`` can restore it without re-running the sweep (which physically
 # forces the jaw open, dropping anything a holding gripper grips).
-_GRIPPER_CALIB_PATH = Path.home() / ".almond" / "gripper_calibration.json"
+_GRIPPER_CALIB_PATH = almond_path("gripper_calibration.json")
 
 # Tolerance (rad) around the calibrated travel range when validating a
 # persisted calibration against the gripper's current position on restore.

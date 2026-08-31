@@ -67,6 +67,9 @@ export function AxolVRClient({
 
   const stateRef = useRef<AxolState>(AxolState.Teleop)
   const seqRef = useRef(0)
+  const poseSourceIdRef = useRef(
+    `webxr-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`
+  )
   const prevXRef = useRef(false)
   const prevYRef = useRef(false)
   const prevARef = useRef(false)
@@ -372,13 +375,15 @@ export function AxolVRClient({
       return { x: p.x, y: p.y, z: p.z }
     }
 
-    // Keep the teleop endpoint explicit: this is WebXR's virtual aim/pointer
-    // pose, not gripSpace. TODO(mantis-calibration): empirically measure the
-    // standard Quest cradle's target-ray→gripper-TCP transform with the URDF
-    // overlay and promote it to the design constant; targetRaySpace has no
-    // dimensioned physical shell datum to recover in CAD.
-    const l_hand = getPose(leftSource?.targetRaySpace)
-    const r_hand = getPose(rightSource?.targetRaySpace)
+    // A controller-mounted Mantis needs the physical grip datum, not WebXR's
+    // runtime-defined aim ray (which vendors may move between firmware
+    // releases). Older runtimes may omit gripSpace, so retain targetRaySpace
+    // only as a compatibility fallback and surface that distinction during
+    // calibration/setup.
+    const l_pose_space = leftSource?.gripSpace ? "grip" : "target-ray"
+    const r_pose_space = rightSource?.gripSpace ? "grip" : "target-ray"
+    const l_hand = getPose(leftSource?.gripSpace ?? leftSource?.targetRaySpace)
+    const r_hand = getPose(rightSource?.gripSpace ?? rightSource?.targetRaySpace)
 
     if (!l_hand || !r_hand) {
       // Lost controller tracking — can't ship a pose frame; leave XR anyway.
@@ -389,13 +394,13 @@ export function AxolVRClient({
     const r_ee = r_hand.pose
 
     const body = (frame as XRFrame & { body?: XRBody }).body
-    const l_elbow = getPosition(body?.get(L_ELBOW_JOINT))
-    const r_elbow = getPosition(body?.get(R_ELBOW_JOINT))
-
-    if (!l_elbow || !r_elbow) {
-      if (yEdge) onExit?.()
-      return
-    }
+    // Body tracking is optional on Quest and absolute Mantis mapping ignores
+    // elbow hints. Keep controller tracking usable without it; relative Axol
+    // teleop's default elbow weight is also zero, while operators who opt into
+    // elbow weighting still get a stable (if neutral) controller-position
+    // fallback instead of the entire pose stream silently stopping.
+    const l_elbow = getPosition(body?.get(L_ELBOW_JOINT)) ?? l_ee.position
+    const r_elbow = getPosition(body?.get(R_ELBOW_JOINT)) ?? r_ee.position
 
     const l_grip = 1 - (leftSource?.gamepad?.buttons[0]?.value ?? 0)
     const r_grip = 1 - (rightSource?.gamepad?.buttons[0]?.value ?? 0)
@@ -435,6 +440,18 @@ export function AxolVRClient({
       l_stick_click,
       r_stick_click,
       seq: ++seqRef.current,
+      // One logical identity across USB, WebRTC, and network WebSocket. The
+      // server de-dupes the shared sequence globally and can keep this Quest
+      // view-only when a Lighthouse/Ultimate bridge owns Mantis poses.
+      pose_source_id: poseSourceIdRef.current,
+      pose_source_kind: "webxr",
+      // Mount calibration is datum-specific. The host validates both the
+      // WebXR controller generation and grip-vs-aim space before accepting a
+      // production Quest pose.
+      l_pose_profile: leftSource?.profiles?.[0] ?? null,
+      r_pose_profile: rightSource?.profiles?.[0] ?? null,
+      l_pose_space,
+      r_pose_space,
       // Capture timestamp (ms). The server's pose interpolator uses this to
       // reconstruct the true motion cadence when frames arrive batched over a
       // jittery/relayed link, so teleop stays smooth instead of stuttering.

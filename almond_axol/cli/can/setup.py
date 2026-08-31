@@ -62,11 +62,13 @@ from ...constants import (
     CAN_BRINGUP_SCRIPT,
     CAN_CHEST,
     CAN_LEFT,
-    CAN_RIGHT,
     CAN_MANTIS_LEFT,
     CAN_MANTIS_RIGHT,
+    CAN_RIGHT,
     Joint,
 )
+from ...tracker.trigger import TRIGGER_CAN_ID, decode_trigger_payload
+from ...utils.paths import adopt_state_file
 from ...utils.sudo import run_root
 from . import driver
 
@@ -353,12 +355,17 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     """Automatically assign attached dual-channel hubs to Axol/Mantis.
 
     Every attached hub is probed, including hubs already pinned by udev rules.
-    A positive device response overrides a stale pin; a silent configured hub
-    keeps its old role. New silent hardware is presented for manual assignment.
-    Returns ``(axol_serial, mantis_serial)``.
+    A positive device response overrides a stale pin. If a configured hub is
+    still silent after bounded RX recovery, the normal interactive flow offers
+    Axol/Mantis assignment with Enter preserving its previous role. New silent
+    hardware is likewise presented. Returns ``(axol_serial, mantis_serial)``.
     """
     print(f"Scanning for dual-channel CAN adapters ({_VID}:{_PID})...")
     attached = set(_detect_serials())
+    # Role-specific scans deliberately exclude other CAN topologies. Keep the
+    # full set too so a serial that now enumerates as (say) a wheel adapter is
+    # not retained as an allegedly unplugged Axol hub as well.
+    all_attached = set(_scan_adapters()) | attached
     configured_axol = _configured_serial(_AXOL_PROFILE)
     configured_mantis = _configured_serial(_MANTIS_PROFILE)
 
@@ -368,18 +375,7 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     roles: dict[str, str | None] = {}
     for serial in sorted(attached):
         print(f"  {serial}: probing Mantis trigger / Axol shoulder...")
-        roles[serial] = _identify_dual_adapter(serial)
-
-    if (
-        configured_axol is not None
-        and configured_axol == configured_mantis
-        and roles.get(configured_axol) is None
-    ):
-        _die(
-            f"Adapter {configured_axol} is pinned as both Axol and Mantis, "
-            "and no device answered to resolve the conflict. Power the hardware "
-            "or remove the conflicting CAN udev rule, then re-run setup."
-        )
+        roles[serial] = _identify_dual_adapter(serial, reset=True)
 
     def detected_for(role: str, configured: str | None) -> str | None:
         matches = sorted(serial for serial, found in roles.items() if found == role)
@@ -399,33 +395,6 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     axol = detected_for("axol", configured_axol)
     mantis = detected_for("mantis", configured_mantis)
 
-    # Preserve an old assignment only when its attached hardware was silent
-    # (power may be off), or when no possible replacement is attached at all.
-    for role, configured in (
-        ("axol", configured_axol),
-        ("mantis", configured_mantis),
-    ):
-        current = axol if role == "axol" else mantis
-        other = mantis if role == "axol" else axol
-        keep = (
-            current is None
-            and configured is not None
-            and configured != other
-            and (
-                not attached
-                or (configured in attached and roles.get(configured) is None)
-            )
-        )
-        if keep:
-            if role == "axol":
-                axol = configured
-            else:
-                mantis = configured
-            print(
-                f"  {role.capitalize()}: no device answered; keeping configured "
-                f"adapter (serial {configured})."
-            )
-
     unidentified = [
         serial
         for serial, role in sorted(roles.items())
@@ -433,20 +402,67 @@ def _find_dual_serials() -> tuple[str | None, str | None]:
     ]
     for serial in unidentified:
         print(f"  {serial}: no identifying device answered.")
-        choice = (
-            input(
+        previous_roles = [
+            role
+            for role, configured in (
+                ("axol", configured_axol),
+                ("mantis", configured_mantis),
+            )
+            if serial == configured
+        ]
+        if len(previous_roles) == 1:
+            previous = previous_roles[0]
+            prompt = (
+                f"    Assign it to the [a]xol arm hub or [m]antis rig "
+                f"([Enter] keeps {previous}): "
+            )
+        elif len(previous_roles) > 1:
+            previous = None
+            prompt = (
+                "    It is currently assigned to both products. Assign it to "
+                "the [a]xol arm hub or [m]antis rig (blank skips): "
+            )
+        else:
+            previous = None
+            prompt = (
                 "    Assign it to the [a]xol arm hub, [m]antis rig, "
                 "or leave blank to skip: "
             )
-            .strip()
-            .lower()
-        )
+        choice = input(prompt).strip().lower()
+        if not choice and previous is not None:
+            choice = previous[0]
         if choice == "a" and axol is None:
             axol = serial
         elif choice == "m" and mantis is None:
             mantis = serial
         elif choice in ("a", "m"):
             print("    That role is already assigned — skipping.")
+
+    # If no positive probe or explicit operator choice replaced an unplugged
+    # configured role, keep its pin. In particular, leaving a different silent
+    # adapter blank means "skip this adapter", not "forget the hub that is
+    # temporarily unplugged". Otherwise a configured wheel/chest bus later in
+    # run() would cause _apply_setup() to rewrite the rules without that hub.
+    for role, configured in (
+        ("axol", configured_axol),
+        ("mantis", configured_mantis),
+    ):
+        current = axol if role == "axol" else mantis
+        other = mantis if role == "axol" else axol
+        if (
+            current is None
+            and configured is not None
+            and configured not in all_attached
+            and configured != other
+        ):
+            if role == "axol":
+                axol = configured
+            else:
+                mantis = configured
+            print(
+                f"  {role.capitalize()}: adapter {configured} is not attached; "
+                "keeping its configured assignment."
+            )
     return axol, mantis
 
 
@@ -475,13 +491,25 @@ _PROBE_WINDOW_S = 0.4
 
 # Dual-channel hub identity probes. The Mantis trigger is the strongest
 # discriminator because it does not exist on an Axol arm. Its firmware emits
-# ``<fH`` (normalised position + 12-bit raw ADC) at 100 Hz on 0x009. The arm
-# fallback asks its MyActuator shoulder-1 (ID 0x01) for status frame 1.
-_MANTIS_TRIGGER_ID = 0x009
-_MANTIS_TRIGGER_DLC = 6
+# a ``<fH`` core (normalised position + 12-bit raw ADC), optionally followed
+# by one opaque byte, at 100 Hz on 0x009. The arm fallback asks its
+# MyActuator shoulder-1 (ID 0x01) for status frame 1.
 _AXOL_SHOULDER_REQ_ID = 0x141
 _AXOL_SHOULDER_RESP_ID = 0x241
 _MYACTUATOR_STATUS1 = 0x9A
+
+# Linux ORs these flags into ``can_frame.can_id``. Identity probes only accept
+# standard 11-bit data frames: masking first would let an extended, RTR, or
+# error frame whose low bits happen to match a device ID create a false role.
+_CAN_FRAME_TYPE_FLAGS = 0xE0000000
+_CAN_SFF_MASK = 0x7FF
+
+
+def _standard_data_can_id(raw_can_id: int) -> int | None:
+    """Return an 11-bit data-frame ID, rejecting EFF/RTR/error frames."""
+    if raw_can_id & _CAN_FRAME_TYPE_FLAGS:
+        return None
+    return raw_can_id & _CAN_SFF_MASK
 
 
 def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa: ANN001
@@ -513,8 +541,9 @@ def _probe(iface: str, frames: list[tuple[int, bytes]], match) -> bool:  # noqa:
                     frame = s.recv(16)
                 except (TimeoutError, OSError):
                     break
-                can_id, dlc = struct.unpack("<IB3x", frame[:8])
-                if match(can_id & 0x7FF, frame[8 : 8 + dlc]):
+                raw_can_id, dlc = struct.unpack("<IB3x", frame[:8])
+                can_id = _standard_data_can_id(raw_can_id)
+                if can_id is not None and match(can_id, frame[8 : 8 + dlc]):
                     return True
     finally:
         s.close()
@@ -575,14 +604,14 @@ def _probe_mantis_trigger(iface: str) -> bool:
     """True when a valid Mantis trigger broadcast is observed on ``iface``."""
 
     def is_trigger(can_id: int, data: bytes) -> bool:
-        if can_id != _MANTIS_TRIGGER_ID or len(data) != _MANTIS_TRIGGER_DLC:
+        if can_id != TRIGGER_CAN_ID:
             return False
-        try:
-            position, raw = struct.unpack("<fH", data)
-        except struct.error:
+        decoded = decode_trigger_payload(data)
+        if decoded is None:
             return False
-        # The range checks reject NaN too. Validate the otherwise-unused ADC
-        # field so unrelated traffic sharing 0x009 cannot identify a hub.
+        position, raw = decoded
+        # Validate the otherwise-unused ADC field too so unrelated traffic
+        # sharing 0x009 cannot identify a hub.
         return 0.0 <= position <= 1.0 and raw <= 0x0FFF
 
     # No request is necessary: the trigger publishes continuously at 100 Hz.
@@ -622,33 +651,56 @@ def _ifaces_for_serial(serial: str) -> list[str]:
     return [name for _, name in sorted(found)]
 
 
-def _identify_dual_adapter(serial: str) -> str | None:
+def _identify_dual_adapter(serial: str, *, reset: bool = False) -> str | None:
     """Probe a dual-channel hub: ``"axol"``, ``"mantis"``, or ``None``.
 
     Both products use identical USB hardware, so identity comes from the CAN
     devices behind it. Silence leaves the decision to the operator instead of
-    turning an unpowered Mantis into an arm hub (or vice versa).
+    turning an unpowered Mantis into an arm hub (or vice versa). Explicit
+    ``can.setup`` passes ``reset=True`` so every attached supported hub is
+    pair-reset before identification; runtime callers can retain a healthy
+    first pass while still receiving bounded recovery when it is silent.
     """
     ifaces = _ifaces_for_serial(serial)
     if len(ifaces) < 2:
         return None
     try:
-        bring_up_interfaces(ifaces)
+        # An UP gs_usb interface can still be TX-only with wedged RX. Preserve
+        # a healthy first pass, but if either half is down recover the adapter
+        # pair together before probing. Pair-wide ordering matters for this
+        # dual-channel firmware: both channels go down before either comes up.
+        bring_up_interfaces(
+            ifaces,
+            force_cycle=reset or not all(iface_up(iface) for iface in ifaces),
+        )
     except RuntimeError:
         return None
 
-    mantis = any(_probe_mantis_trigger(iface) for iface in ifaces)
-    axol = any(_probe_axol_shoulder(iface) for iface in ifaces)
-    if mantis and axol:
-        print(
-            f"  WARNING: both a Mantis trigger and an Axol shoulder answered "
-            f"behind {serial}; refusing to guess."
-        )
-        return None
-    if mantis:
-        return "mantis"
-    if axol:
-        return "axol"
+    # Initial probe plus two bounded pair recoveries. A powered Mantis/Axol
+    # therefore corrects a stale udev role during ordinary ``can.setup``;
+    # genuinely unpowered identical USB hardware still falls back to the
+    # operator instead of being guessed.
+    for attempt in range(3):
+        mantis = any(_probe_mantis_trigger(iface) for iface in ifaces)
+        axol = any(_probe_axol_shoulder(iface) for iface in ifaces)
+        if mantis and axol:
+            print(
+                f"  WARNING: both a Mantis trigger and an Axol shoulder answered "
+                f"behind {serial}; refusing to guess."
+            )
+            return None
+        if mantis:
+            return "mantis"
+        if axol:
+            return "axol"
+        if attempt < 2:
+            print(
+                "    No identity response; recovering both CAN channels and retrying..."
+            )
+            try:
+                bring_up_interfaces(ifaces, force_cycle=True)
+            except RuntimeError:
+                return None
     return None
 
 
@@ -665,43 +717,60 @@ def _iface_for_serial(serial: str) -> str | None:
     return None
 
 
-def _identify_adapter(serial: str) -> str | None:
+def _identify_adapter(
+    serial: str, *, reset: bool = False, recover_silence: bool = True
+) -> str | None:
     """Probe a single-channel adapter's bus: ``"wheels"``, ``"chest"``, or None.
 
-    Brings the interface up first (root); a bus where nothing answers —
-    devices unpowered, or unrelated hardware — stays None and is left to the
-    operator.
+    Explicit ``can.setup`` passes ``reset=True`` for a previously identified
+    wheel/cart or chest/lift adapter. Unknown generic gs_usb devices get a
+    non-disruptive first probe with ``recover_silence=False``; a positive match
+    is reset later during final setup, while an unrelated device is not flapped.
     """
     iface = _iface_for_serial(serial)
     if iface is None:
         return None
+    was_up = iface_up(iface)
     try:
-        bring_up_interfaces([iface])
+        bring_up_interfaces([iface], force_cycle=reset or not was_up)
     except RuntimeError:
         return None
-    # Silence any jelly_legs board before the wheel probe: the board starts
-    # its 50 ms broadcast after the first frame it sees (the wheel probe's
-    # own Damiao reads would wake it), and that stream starves the CANable's
-    # TX path — on a combined bus the wheel probe would then go deaf and the
-    # bus would be misclassified as chest-only. Harmless where no board is
-    # listening; a frame queued on a dead bus is dropped by the bring-up flap.
-    _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
-    time.sleep(0.05)
-    wheels = _probe_wheels(iface)
-    chest = _probe_chest(iface)
-    if chest and wheels:
-        # The pre-split combined cart bus (jelly_legs next to the wheels).
-        print(
-            f"  WARNING: both the wheel motors and the jelly_legs board "
-            f"answer on {iface} — treating it as the wheel bus. Point the "
-            f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
-            f"the lift onto its own chest bus."
-        )
-        return "wheels"
-    if chest:
-        return "chest"
-    if wheels:
-        return "wheels"
+
+    attempts = 3 if recover_silence else 1
+    for attempt in range(attempts):
+        # Silence any jelly_legs board before the wheel probe: the board starts
+        # its 50 ms broadcast after the first frame it sees (the wheel probe's
+        # own Damiao reads would wake it), and that stream starves the CANable's
+        # TX path — on a combined bus the wheel probe would then go deaf and the
+        # bus would be misclassified as chest-only. Harmless where no board is
+        # listening; a frame queued on a dead bus is dropped by the reset.
+        _send_once(iface, _JELLY_CMD_ID, _JELLY_SET_RATE_OFF)
+        time.sleep(0.05)
+        wheels = _probe_wheels(iface)
+        chest = _probe_chest(iface)
+        if chest and wheels:
+            # The pre-split combined cart bus (jelly_legs next to the wheels).
+            print(
+                f"  WARNING: both the wheel motors and the jelly_legs board "
+                f"answer on {iface} — treating it as the wheel bus. Point the "
+                f"lift at it explicitly (cart.lift_channel={_CAN_B}) or move "
+                f"the lift onto its own chest bus."
+            )
+            return "wheels"
+        if chest:
+            return "chest"
+        if wheels:
+            return "wheels"
+        if attempt < attempts - 1:
+            print(f"    No wheel/cart response on {iface}; resetting and retrying...")
+            try:
+                bring_up_interfaces([iface], force_cycle=True)
+            except RuntimeError:
+                return None
+    if not recover_silence and not was_up:
+        # Probing needed the unknown interface UP, but silence means it may be
+        # unrelated to Axol. Restore the administrative state we found.
+        run_root(["ip", "link", "set", iface, "down"], check=False)
     return None
 
 
@@ -759,13 +828,75 @@ def _reload_udev() -> None:
     print("  Done.")
 
 
+def _interface_rename_plan(
+    records: list[tuple[str, str, int]],
+    target: dict[tuple[str, int], str],
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Return collision-free ``(temporary, final)`` interface rename stages.
+
+    ``records`` contains ``(current_name, USB serial, dev_id)``. Every source
+    that needs a new final name is first moved to a short temporary name. Any
+    *other* interface currently occupying one of those final names is staged
+    too, which is what lets two attached hubs recover when their stale
+    Axol/Mantis assignments are exactly swapped.
+
+    The second stage includes only interfaces claimed by ``target``. An
+    unclaimed stale occupant remains under its temporary name until a later
+    profile pass gives it the right final name (or until it is replugged).
+    """
+    by_name = {name: (serial, dev_id) for name, serial, dev_id in records}
+    final_by_source = {
+        name: target[(serial, dev_id)]
+        for name, serial, dev_id in records
+        if (serial, dev_id) in target and target[(serial, dev_id)] != name
+    }
+    if not final_by_source:
+        return [], []
+
+    participants = set(final_by_source)
+    participants.update(
+        final
+        for final in final_by_source.values()
+        if final in by_name and final not in final_by_source
+    )
+
+    # Linux IFNAMSIZ leaves 15 visible characters. Keep the generated names
+    # well below that and avoid every live/final name so a partial run remains
+    # diagnosable and the second profile pass can still discover ``can*``.
+    used = set(by_name) | set(target.values())
+    temporary_by_source: dict[str, str] = {}
+    next_index = 0
+    for source in sorted(participants):
+        while True:
+            temporary = f"can_tmp{next_index}"
+            next_index += 1
+            if temporary not in used:
+                break
+        temporary_by_source[source] = temporary
+        used.add(temporary)
+
+    temporary_stage = [
+        (source, temporary_by_source[source]) for source in sorted(participants)
+    ]
+    final_stage = [
+        (temporary_by_source[source], final)
+        for source, final in sorted(final_by_source.items())
+    ]
+    return temporary_stage, final_stage
+
+
 def _rename_interfaces(
     hub_serial: str | None,
     wheels_serial: str | None = None,
     chest_serial: str | None = None,
     profile: _Profile = _AXOL_PROFILE,
 ) -> None:
-    """Rename existing canX interfaces to their target names without replug."""
+    """Rename existing CAN interfaces to their target names without replug.
+
+    All participants are staged through temporary names first. Direct renames
+    cannot recover a swapped Axol/Mantis pin because each desired final name is
+    still occupied by the other hub.
+    """
     print("Renaming CAN interfaces (requires sudo)...")
     # (adapter serial, channel dev_id) -> persistent name. The wheel/chest
     # adapters are single-channel, so their only interface is dev_id 0.
@@ -778,6 +909,7 @@ def _rename_interfaces(
     if chest_serial:
         target[(chest_serial, 0)] = _CAN_C
 
+    records: list[tuple[str, str, int]] = []
     for iface_path in Path("/sys/class/net").glob("can*"):
         iface = iface_path.name
         info = subprocess.run(
@@ -792,13 +924,22 @@ def _rename_interfaces(
         except ValueError:
             continue
 
-        new_name = target.get((iface_serial, dev_id))
-        if new_name is None or iface == new_name:
-            continue
+        records.append((iface, iface_serial, dev_id))
 
-        print(f"  {iface} -> {new_name}")
-        run_root(["ip", "link", "set", iface, "down"], check=True)
-        run_root(["ip", "link", "set", iface, "name", new_name], check=True)
+    temporary_stage, final_stage = _interface_rename_plan(records, target)
+    final_by_temporary = dict(final_stage)
+    for source, temporary in temporary_stage:
+        final = final_by_temporary.get(temporary)
+        if final is None:
+            print(f"  {source} -> {temporary} (clearing a stale occupied name)")
+        else:
+            print(f"  {source} -> {final}")
+        run_root(["ip", "link", "set", source, "down"], check=True)
+
+    for source, temporary in temporary_stage:
+        run_root(["ip", "link", "set", source, "name", temporary], check=True)
+    for temporary, final in final_stage:
+        run_root(["ip", "link", "set", temporary, "name", final], check=True)
 
     print("  Done.")
 
@@ -873,6 +1014,7 @@ def _write_cron_script(profile: _Profile = _AXOL_PROFILE) -> None:
         )
     profile.cron_script.write_text(script)
     profile.cron_script.chmod(0o755)
+    adopt_state_file(profile.cron_script)
     print("  Done.")
 
 
@@ -996,6 +1138,7 @@ def _setup_rp1_usb_quirk() -> None:
     )
     _RP1_QUIRK_SCRIPT.write_text(script)
     _RP1_QUIRK_SCRIPT.chmod(0o755)
+    adopt_state_file(_RP1_QUIRK_SCRIPT)
     unit = (
         f"# Installed by `axol can.setup` on Raspberry Pi 5 hosts.\n"
         f"[Unit]\n"
@@ -1065,11 +1208,13 @@ def rx_alive(profile: _Profile = _AXOL_PROFILE) -> bool:
 
 
 def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
-    """Run the bring-up script, then verify RX and re-flap once if it's dead.
+    """Run the bring-up script, then verify RX and recover its hub pair.
 
     Every down/up cycle of the adapter's channels toggles it between a healthy
     state and the TX-only wedge described in :func:`rx_alive_per_arm`, so a
-    bring-up that lands in the wedge is recovered by exactly one more cycle.
+    bring-up that lands in the wedge is recovered by another pair cycle. The
+    full startup script runs once so the Axol wheel/cart and chest/lift buses
+    are reset once too; hub RX retries never re-flap those healthy single buses.
     A robot with its motors powered off is indistinguishable from the wedge,
     hence the bounded retries and the warning instead of an error. Results are
     reported per side: one answering side proves the adapter is healthy (no
@@ -1088,8 +1233,10 @@ def bring_up_can(profile: _Profile = _AXOL_PROFILE) -> None:
         run_root(["bash", str(profile.cron_script)], check=True)
         print(f"  Done — {profile.label} not attached, its interfaces skipped.")
         return
+    run_root(["bash", str(profile.cron_script)], check=True)
     for attempt in range(3):
-        run_root(["bash", str(profile.cron_script)], check=True)
+        if attempt:
+            bring_up_interfaces([profile.left, profile.right], force_cycle=True)
         left, right = rx_alive_per_arm(profile)
         if left and right:
             print(f"  Done — motors responding on both {noun}s.")
@@ -1124,20 +1271,28 @@ def iface_up(channel: str) -> bool:
     return bool(flags & 0x1)
 
 
-def bring_up_interfaces(channels: list[str]) -> None:
+def bring_up_interfaces(channels: list[str], *, force_cycle: bool = False) -> None:
     """Configure and bring up arbitrary SocketCAN interfaces.
 
     The non-Axol-hub counterpart of :func:`bring_up_can`, for setups running
-    on some other CAN adapter: no startup script, no udev naming, no RX-wedge
-    cycling — just per-interface bitrate / txqueuelen / up. Interfaces already
-    up are left untouched; a missing one raises ``RuntimeError`` naming it so
-    callers (CLI, control panel) can surface which channel to fix.
+    on some other CAN adapter: no startup script or udev naming, just
+    per-interface bitrate / txqueuelen / up. Interfaces already up are left
+    untouched unless ``force_cycle`` requests paired recovery. A missing one
+    raises ``RuntimeError`` naming it so callers can surface which channel to
+    fix.
     """
     missing = [ch for ch in channels if not (Path("/sys/class/net") / ch).exists()]
     if missing:
         raise RuntimeError(f"CAN interface not found: {', '.join(missing)}")
+    if force_cycle:
+        reset_label = "paired CAN recovery" if len(channels) > 1 else "CAN recovery"
+        for channel in channels:
+            print(f"  {channel}: cycling down for {reset_label}...")
+            run_root(["ip", "link", "set", channel, "down"], check=True)
+
+    pending = channels if force_cycle else [ch for ch in channels if not iface_up(ch)]
     for channel in channels:
-        if iface_up(channel):
+        if channel not in pending:
             print(f"  {channel}: already up.")
             continue
         print(f"  {channel}: bringing up at {_BITRATE} bit/s (requires sudo)...")
@@ -1149,6 +1304,9 @@ def bring_up_interfaces(channels: list[str]) -> None:
             ["ip", "link", "set", channel, "txqueuelen", str(_TXQUEUELEN)],
             check=True,
         )
+    # Configure the full reset group before raising any channel. For a dual
+    # hub this avoids the half-up transition that can wedge gs_usb RX.
+    for channel in pending:
         run_root(["ip", "link", "set", channel, "up"], check=True)
     print("  Done.")
 
@@ -1235,8 +1393,8 @@ def ensure_setup(
 def ensure_mantis_setup() -> None:
     """Configure a detected Mantis hub non-interactively for the web panel.
 
-    A previously pinned serial wins. Otherwise every unattached dual-channel
-    hub is probed and exactly one Mantis response must be found; silent or
+    Every attached dual-channel hub is probed, including a serial previously
+    pinned as Axol. Exactly one Mantis response must be found; silent or
     ambiguous adapters are left for interactive :func:`run` instead of being
     guessed. This is the Mantis counterpart to :func:`ensure_setup` used by
     the idle diagnostics link.
@@ -1245,97 +1403,166 @@ def ensure_mantis_setup() -> None:
     if installed:
         time.sleep(2.0)
 
-    serial = _configured_serial(_MANTIS_PROFILE)
-    if serial is None:
-        axol_serial = _configured_serial(_AXOL_PROFILE)
-        matches = [
-            candidate
-            for candidate in _detect_serials()
-            if candidate != axol_serial
-            and _identify_dual_adapter(candidate) == "mantis"
-        ]
-        if len(matches) != 1:
-            if not matches:
-                raise RuntimeError(
-                    "Mantis not detected — power the grippers and triggers, "
-                    "then run `axol can.setup`"
-                )
+    configured_mantis = _configured_serial(_MANTIS_PROFILE)
+    configured_axol = _configured_serial(_AXOL_PROFILE)
+    matches = [
+        candidate
+        for candidate in _detect_serials()
+        if _identify_dual_adapter(candidate) == "mantis"
+    ]
+    if len(matches) != 1:
+        if not matches:
             raise RuntimeError(
-                "Multiple Mantis hubs detected — run `axol can.setup` to assign them"
+                "Mantis not detected — power the grippers and triggers, "
+                "then run `axol can.setup`"
             )
-        serial = matches[0]
+        raise RuntimeError(
+            "Multiple Mantis hubs detected — run `axol can.setup` to assign them"
+        )
+    serial = configured_mantis if configured_mantis in matches else matches[0]
+
+    if serial == configured_axol:
+        # A live trigger response proved that the old Axol pin is stale. Clear
+        # only that dual-hub match while preserving any wheel/chest rules; the
+        # Mantis setup below performs the shared udev reload and live rename.
+        _write_udev_rules(
+            None,
+            _configured_named_serial(_CAN_B),
+            _configured_named_serial(_CAN_C),
+        )
     _configure_mantis(serial)
 
 
-def _find_single_serials(hub_serial: str | None) -> tuple[str | None, str | None]:
+def _find_single_serials(
+    hub_serial: str | None, mantis_serial: str | None = None
+) -> tuple[str | None, str | None]:
     """Interactively assign single-channel adapters to the wheel/chest buses.
 
-    Previously pinned adapters are kept without prompting. Every other
-    attached single-channel adapter is identified by probing its bus (see
-    :func:`_identify_adapter`); one where nothing answers — devices
-    unpowered, or unrelated hardware — is offered to the operator instead of
-    guessed at. Serials the Mantis rig's rules already claim are excluded
-    outright (a belt-and-braces guard; the rig's board is dual-channel, so it
-    should never appear here).
+    Every attached candidate is probed. Previously pinned wheel/cart and
+    chest/lift buses are reset first so stale assignments correct themselves;
+    an unknown generic gs_usb adapter is probed without flapping it and gets
+    reset in final setup only after a positive match or operator assignment.
+    One where nothing answers is offered to the operator with Enter preserving
+    its old role. Unplugged configured adapters keep their pins. Serials
+    claimed by a dual hub are excluded outright.
 
     Returns ``(wheels_serial, chest_serial)``, either of which may be None.
     """
-    wheels = _configured_named_serial(_CAN_B)
-    chest = _configured_named_serial(_CAN_C)
-    if wheels:
-        print(f"Cart wheel bus: keeping configured adapter (serial {wheels}).")
-    if chest:
-        print(f"Chest bus: keeping configured adapter (serial {chest}).")
-
-    exclude = {s for s in (hub_serial, wheels, chest) if s}
+    configured_wheels = _configured_named_serial(_CAN_B)
+    configured_chest = _configured_named_serial(_CAN_C)
+    selected_dual = {serial for serial in (hub_serial, mantis_serial) if serial}
+    exclude = set(selected_dual)
     exclude |= _mantis_claimed_serials()
-    candidates = _detect_single_serials(exclude)
-    if not candidates:
-        return wheels, chest
+    attached = set(_detect_single_serials(exclude))
+    all_attached = set(_scan_adapters()) | attached
 
-    print(
-        f"Identifying {len(candidates)} single-channel CAN adapter(s) by "
-        f"probing (wheel motors / jelly_legs board must be powered)..."
-    )
-    unidentified: list[str] = []
-    for serial in candidates:
-        role = _identify_adapter(serial)
-        if role == "wheels" and wheels is None:
-            wheels = serial
-            print(f"  {serial}: Damiao wheel motors answered -> {_CAN_B}")
-        elif role == "chest" and chest is None:
-            chest = serial
-            print(f"  {serial}: jelly_legs board answered -> {_CAN_C}")
-        elif role is not None:
-            print(
-                f"  {serial}: identified as the {role} bus, but that bus is "
-                f"already pinned to another adapter — skipping."
-            )
-        else:
-            unidentified.append(serial)
+    if attached:
+        print(
+            f"Identifying {len(attached)} single-channel CAN "
+            "adapter(s) (wheel motors / cart lift must be powered)..."
+        )
+    roles: dict[str, str | None] = {}
+    for serial in sorted(attached):
+        print(f"  {serial}: probing wheel drive / cart lift controller...")
+        known = serial in (configured_wheels, configured_chest)
+        roles[serial] = (
+            _identify_adapter(serial, reset=True)
+            if known
+            else _identify_adapter(serial, recover_silence=False)
+        )
 
+    def detected_for(role: str, configured: str | None) -> str | None:
+        matches = sorted(serial for serial, found in roles.items() if found == role)
+        if not matches:
+            return None
+        selected = configured if configured in matches else matches[0]
+        label = "Damiao wheel motors" if role == "wheels" else "cart lift controller"
+        target = _CAN_B if role == "wheels" else _CAN_C
+        print(f"  {selected}: {label} answered -> {target}")
+        for serial in matches:
+            if serial != selected:
+                print(
+                    f"  {serial}: also identified as {role}, but that role is "
+                    "already assigned — skipping."
+                )
+        return selected
+
+    wheels = detected_for("wheels", configured_wheels)
+    chest = detected_for("chest", configured_chest)
+
+    unidentified = [
+        serial
+        for serial, role in sorted(roles.items())
+        if role is None and serial not in (wheels, chest)
+    ]
     for serial in unidentified:
         print(f"  {serial}: nothing answered on this adapter's bus.")
-        choice = (
-            input(
-                f"    Assign it to the [w]heel bus ({_CAN_B}), the [c]hest "
-                f"bus ({_CAN_C}), or leave blank to skip: "
+        previous_roles = [
+            role
+            for role, configured in (
+                ("wheels", configured_wheels),
+                ("chest", configured_chest),
             )
-            .strip()
-            .lower()
-        )
+            if serial == configured
+        ]
+        if len(previous_roles) == 1:
+            previous = previous_roles[0]
+            prompt = (
+                f"    Assign it to the [w]heel/cart bus or [c]hest/lift bus "
+                f"([Enter] keeps {previous}): "
+            )
+        elif len(previous_roles) > 1:
+            previous = None
+            prompt = (
+                "    It is currently assigned to both buses. Assign it to the "
+                "[w]heel/cart bus or [c]hest/lift bus (blank skips): "
+            )
+        else:
+            previous = None
+            prompt = (
+                f"    Assign it to the [w]heel/cart bus ({_CAN_B}), the "
+                f"[c]hest/lift bus ({_CAN_C}), or leave blank to skip: "
+            )
+        choice = input(prompt).strip().lower()
+        if not choice and previous is not None:
+            choice = previous[0]
         if choice == "w" and wheels is None:
             wheels = serial
         elif choice == "c" and chest is None:
             chest = serial
         elif choice in ("w", "c"):
             print("    That bus is already assigned — skipping.")
+
+    for role, configured in (
+        ("wheels", configured_wheels),
+        ("chest", configured_chest),
+    ):
+        current = wheels if role == "wheels" else chest
+        other = chest if role == "wheels" else wheels
+        if (
+            current is None
+            and configured is not None
+            and configured not in all_attached
+            and configured != other
+            and configured not in selected_dual
+        ):
+            if role == "wheels":
+                wheels = configured
+            else:
+                chest = configured
+            print(
+                f"  {role.capitalize()}: adapter {configured} is not attached; "
+                "keeping its configured assignment."
+            )
     return wheels, chest
 
 
 def run(args: object = None) -> None:
     """Configure persistent CAN interfaces and a @reboot bring-up entry."""
-    installed = driver.ensure_driver()
+    try:
+        installed = driver.ensure_driver()
+    except RuntimeError as exc:
+        _die(str(exc))
     if installed:
         # The freshly-loaded driver may claim adapters the old one ignored
         # (CANable 2.0); give their interfaces a moment to appear.
@@ -1344,12 +1571,26 @@ def run(args: object = None) -> None:
     configured_axol = _configured_serial(_AXOL_PROFILE)
     configured_mantis = _configured_serial(_MANTIS_PROFILE)
     hub_serial, mantis_serial = _find_dual_serials()
-    wheels_serial, chest_serial = _find_single_serials(hub_serial)
+    wheels_serial, chest_serial = _find_single_serials(hub_serial, mantis_serial)
     if not (hub_serial or mantis_serial or wheels_serial or chest_serial):
         _die(
             "No CAN adapters found or configured. Connect the Axol/Mantis hub, "
             "wheel-bus, or chest adapter and re-run."
         )
+    assignments = {
+        "Axol": hub_serial,
+        "Mantis": mantis_serial,
+        "wheels": wheels_serial,
+        "chest/lift": chest_serial,
+    }
+    for serial in {value for value in assignments.values() if value is not None}:
+        claimed = [name for name, value in assignments.items() if value == serial]
+        if len(claimed) > 1:
+            _die(
+                f"Adapter {serial} resolved to multiple CAN roles "
+                f"({', '.join(claimed)}). Power the attached hardware and "
+                "re-run `axol can.setup` to resolve it before rules are written."
+            )
     axol_reclassified = configured_axol is not None and configured_axol == mantis_serial
     mantis_reclassified = (
         configured_mantis is not None and configured_mantis == hub_serial

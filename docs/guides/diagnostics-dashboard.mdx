@@ -27,7 +27,7 @@ Telemetry is sampled by the idle robot link, which is the single owner of the CA
 
 ## Diagnostics
 
-Each diagnostic — [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable), and the [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable) camera-cable check — is a card: click it, set parameters in the dialog, and hit Run. Axol ROM tests expose a joint picker; Mantis ROM tests automatically run the gripper-only path. The card shows the running state, elapsed time, and latest output; completion lands as a notification and the full log is kept below. CAN-owning tests pause idle telemetry for their duration.
+Each diagnostic — [`diag.rom-enable`](https://docs.almond.bot/cli/diag-rom-enable), [`diag.rom-disable`](https://docs.almond.bot/cli/diag-rom-disable), the [`diag.mantis-trigger`](https://docs.almond.bot/cli/diag-mantis-trigger) trigger/gripper check, and the [`diag.zed-cable`](https://docs.almond.bot/cli/diag-zed-cable) camera-cable check — is a card: click it, set parameters in the dialog, and hit Run. Axol ROM tests expose a joint picker; Mantis ROM tests automatically run the gripper-only path, and the trigger check appears only for a connected Mantis profile. The card shows the running state, elapsed time, and latest output; completion lands as a notification and the full log is kept below. CAN-owning tests pause idle telemetry for their duration.
 
 On robots fitted with the powered cart's telescoping lift, the lift's [`lift.home`](https://docs.almond.bot/cli/lift-home) calibration and [`lift.goto`](https://docs.almond.bot/cli/lift-goto) install-height move appear here as cards as well.
 

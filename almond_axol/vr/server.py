@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
@@ -58,11 +59,92 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
-# Sequence-dedup stream key for pose frames arriving over the WebRTC control
-# data channel. The ControlChannelManager callback carries no client identity,
-# so all control-channel traffic shares one dedup stream — fine in practice,
-# since at most one headset drives teleop over the control channel at a time.
-_CONTROL_STREAM = "control"
+_quest_datum_lock = threading.Lock()
+_last_quest_datum: dict[str, Any] | None = None
+_QUEST_DATUM_FRESH_S = 5.0
+
+
+def get_last_quest_pose_datum() -> dict[str, Any] | None:
+    """Current controller datum reported by a connected WebXR client.
+
+    ``live`` becomes false when frames stop even if a dead socket has not yet
+    timed out. Internal source ownership fields never leave this process.
+    """
+    with _quest_datum_lock:
+        if _last_quest_datum is None:
+            return None
+        result = {
+            key: value
+            for key, value in _last_quest_datum.items()
+            if not key.startswith("_")
+        }
+        age = max(0.0, time.monotonic() - _last_quest_datum["_observedMono"])
+        result["ageSeconds"] = round(age, 3)
+        result["live"] = age <= _QUEST_DATUM_FRESH_S
+        return result
+
+
+def _remember_quest_pose_datum(
+    frame: VRFrame, *, server_token: int, source_id: str
+) -> None:
+    """Expose the live Quest datum to setup UI without persisting user data."""
+    global _last_quest_datum
+    left = {"profile": frame.l_pose_profile, "poseSpace": frame.l_pose_space}
+    right = {"profile": frame.r_pose_profile, "poseSpace": frame.r_pose_space}
+    if not any((*left.values(), *right.values())):
+        return
+    common_key = None
+    if left["profile"] and left == right and left["poseSpace"] == "grip":
+        common_key = f"quest:{left['profile']}:{left['poseSpace']}"
+    value = {
+        "left": left,
+        "right": right,
+        "commonKey": common_key,
+        "observedAt": time.time(),
+        "_observedMono": time.monotonic(),
+        "_serverToken": server_token,
+        "_sourceId": source_id,
+    }
+    with _quest_datum_lock:
+        changed = (
+            _last_quest_datum is None
+            or _last_quest_datum.get("left") != left
+            or _last_quest_datum.get("right") != right
+            or _last_quest_datum.get("_serverToken") != server_token
+            or _last_quest_datum.get("_sourceId") != source_id
+        )
+        _last_quest_datum = value
+    if changed:
+        if common_key is not None:
+            _logger.info("Quest controller calibration datum: %s", common_key)
+        elif left == right and left["poseSpace"] == "target-ray":
+            _logger.error(
+                "Quest controllers only exposed target-ray poses for %s; "
+                "Mantis calibration and collection require gripSpace",
+                left["profile"],
+            )
+        else:
+            _logger.warning(
+                "Quest controllers reported different or incomplete pose datums: "
+                "left=%s/%s right=%s/%s",
+                left["profile"],
+                left["poseSpace"],
+                right["profile"],
+                right["poseSpace"],
+            )
+
+
+def _clear_quest_pose_datum(*, server_token: int, source_id: str | None = None) -> None:
+    """Forget a datum once its WebXR source or owning server has stopped."""
+    global _last_quest_datum
+    with _quest_datum_lock:
+        if _last_quest_datum is None:
+            return
+        if _last_quest_datum.get("_serverToken") != server_token:
+            return
+        if source_id is not None and _last_quest_datum.get("_sourceId") != source_id:
+            return
+        _last_quest_datum = None
 
 
 class VRServer:
@@ -83,9 +165,27 @@ class VRServer:
             config: Port, TLS certificate, and private-key paths.
         """
         self._port = config.port
+        self._quest_datum_token = id(self)
         self._on_frame: Callable[[VRFrame], None] | None = None
         self._certfile = config.certfile or CERTFILE
         self._keyfile = config.keyfile or KEYFILE
+        if config.pose_source_kind not in (None, "webxr", "tracker"):
+            raise ValueError(
+                "pose_source_kind must be None, 'webxr', or 'tracker'; got "
+                f"{config.pose_source_kind!r}"
+            )
+        expected_source_id = config.expected_pose_source_id
+        if expected_source_id is not None and (
+            not isinstance(expected_source_id, str)
+            or not expected_source_id.strip()
+            or len(expected_source_id) > 128
+        ):
+            raise ValueError(
+                "expected_pose_source_id must be a non-empty string of at most "
+                "128 characters"
+            )
+        self._expected_pose_source_kind = config.pose_source_kind
+        self._expected_pose_source_id = expected_source_id
 
         # Operating mode announced to each headset on connect ("teleop" or
         # "data_collection"). The web UI uses it to lock its HUD to a single
@@ -116,18 +216,22 @@ class VRServer:
         self._hud: dict[str, Any] | None = None
         self._hud_client: int | None = None
 
-        # Per-stream sequence dedup: each sender's ``seq`` counter is its own
-        # monotonic stream, so the highest seq processed so far is tracked per
-        # connection (keyed by the websocket's id, or ``_CONTROL_STREAM`` for
-        # the WebRTC pose data channel) and a frame with seq <= that stream's
-        # high-water mark — a duplicate or an out-of-order straggler within
-        # that stream — is dropped. Keeping the marks per stream (not global)
-        # lets independent senders with unrelated counters coexist, e.g. the
-        # tracker bridge plus a Quest/web client monitoring the session; with
-        # a single global mark they mutually silence each other. A stream's
-        # entry is removed when its connection closes, so a reconnecting
-        # sender whose counter restarts low isn't locked out.
-        self._last_seq: dict[Any, int] = {}
+        # Sequence high-water marks are keyed by a *logical producer*, not a
+        # transport. Quest sends one id/sequence over USB, WebRTC, and network
+        # WebSocket, so the first copy wins globally and a delayed standby copy
+        # cannot rewind state or inflate the jitter buffer. A producer also
+        # owns the pose stream exclusively: other clients still receive video,
+        # HUD, and URDF broadcasts but their VRFrames are ignored.
+        self._last_seq: dict[str, int] = {}
+        self._pose_owner: str | None = None
+        self._pose_owner_kind: str | None = None
+        self._source_kind: dict[str, str] = {}
+        self._source_clients: dict[str, set[int]] = {}
+        self._client_sources: dict[int, set[str]] = {}
+        # Once a tracker bridge has claimed an unrestricted server, never fail
+        # over to a still-connected Quest viewer if that bridge disappears.
+        # Managed Mantis servers start latched through pose_source_kind.
+        self._tracker_source_latched = config.pose_source_kind == "tracker"
 
         # Whether camera video is expected to become available this session.
         # Camera bring-up (relay subprocess, ZED open, NVENC init) can take
@@ -172,15 +276,6 @@ class VRServer:
         )
         self._client_count: int = 0
         self._active_clients: set[WebSocket] = set()
-        # Monotonic time of the last valid pose frame per client (socket or
-        # its control data channel) — i.e. the operator's connections, as
-        # opposed to view-only ones like the control panel's camera mirror.
-        # When the last pose-sending client disconnects, the buffered pose
-        # state (latest frame, seq high-water mark, interpolator) is dropped
-        # so a relaunched headset — whose seq counter restarts at 1 — isn't
-        # gated against the old session's high-water mark while a view-only
-        # client keeps the connection count above zero.
-        self._pose_last: dict[int, float] = {}
         self._server_task: asyncio.Task[None] | None = None
         self._uvicorn_server: uvicorn.Server | None = None
         self._listen_socket: socket.socket | None = None
@@ -424,6 +519,7 @@ class VRServer:
 
     async def disable(self) -> None:
         """Gracefully shut down the WSS server."""
+        _clear_quest_pose_datum(server_token=self._quest_datum_token)
         if self._webrtc is not None:
             await self._webrtc.close_all()
         await self._control.close_all()
@@ -462,7 +558,11 @@ class VRServer:
         self._video_offering.clear()
         self._control_offering.clear()
         self._signaling_tasks.clear()
-        self._pose_last.clear()
+        self._pose_owner = None
+        self._pose_owner_kind = None
+        self._source_kind.clear()
+        self._source_clients.clear()
+        self._client_sources.clear()
         self._loop = None
         # Fresh session next enable(): don't gate a reloaded headset's restarted
         # seq counter against a stale high-water mark.
@@ -500,20 +600,105 @@ class VRServer:
             await self._handle_signaling(websocket, client_id, obj)
             return
 
-        if self._ingest_frame_obj(obj, client_id):
-            self._pose_last[client_id] = time.monotonic()
+        self._ingest_frame_obj(obj, client_id, client_id)
 
-    def _ingest_frame_obj(self, obj: Any, stream: Any) -> bool:
+    def _reset_pose_buffer(self) -> None:
+        """Drop pose/interpolation state when ownership changes or disappears."""
+        self._latest_frame = None
+        self._interp.reset()
+
+    def _register_pose_source(
+        self, frame: VRFrame, stream: Any, client_id: int
+    ) -> tuple[str, str]:
+        """Resolve and remember a frame's logical producer and kind."""
+        raw_id = frame.pose_source_id
+        source_id = (
+            raw_id
+            if isinstance(raw_id, str) and raw_id.strip() and len(raw_id) <= 128
+            else f"legacy:{client_id}"
+        )
+        raw_kind = frame.pose_source_kind
+        source_kind = raw_kind if raw_kind in ("webxr", "tracker") else "legacy"
+        previous_kind = self._source_kind.setdefault(source_id, source_kind)
+        if previous_kind != source_kind:
+            # A logical id cannot change privilege/kind mid-session.
+            source_kind = previous_kind
+        self._source_clients.setdefault(source_id, set()).add(client_id)
+        self._client_sources.setdefault(client_id, set()).add(source_id)
+        return source_id, source_kind
+
+    def _pose_source_allowed(self, source_id: str, source_kind: str) -> bool:
+        """Claim or validate exclusive ownership for one logical producer."""
+        if (
+            self._expected_pose_source_id is not None
+            and source_id != self._expected_pose_source_id
+        ):
+            return False
+        expected = self._expected_pose_source_kind
+        if expected == "tracker" and source_kind != "tracker":
+            return False
+        if expected == "webxr" and source_kind not in ("webxr", "legacy"):
+            return False
+
+        if self._pose_owner == source_id:
+            return True
+        if self._pose_owner is None:
+            if self._tracker_source_latched and source_kind != "tracker":
+                return False
+            self._pose_owner = source_id
+            self._pose_owner_kind = source_kind
+            if source_kind == "tracker":
+                self._tracker_source_latched = True
+            self._reset_pose_buffer()
+            _logger.info("pose source %s claimed control (%s)", source_id, source_kind)
+            return True
+
+        # On an unrestricted compatibility server, a tracker bridge may take
+        # priority over a WebXR client. Managed Mantis avoids this transition
+        # entirely by declaring the expected kind before the server starts.
+        if source_kind == "tracker" and self._pose_owner_kind != "tracker":
+            _logger.warning(
+                "tracker pose source %s superseded %s; resetting pose buffer",
+                source_id,
+                self._pose_owner,
+            )
+            self._pose_owner = source_id
+            self._pose_owner_kind = source_kind
+            self._tracker_source_latched = True
+            self._reset_pose_buffer()
+            return True
+        return False
+
+    def _drop_pose_client(self, client_id: int) -> None:
+        """Release a client's logical-source memberships on disconnect."""
+        for source_id in self._client_sources.pop(client_id, set()):
+            clients = self._source_clients.get(source_id)
+            if clients is None:
+                continue
+            clients.discard(client_id)
+            if clients:
+                continue
+            self._source_clients.pop(source_id, None)
+            self._source_kind.pop(source_id, None)
+            self._last_seq.pop(source_id, None)
+            _clear_quest_pose_datum(
+                server_token=self._quest_datum_token, source_id=source_id
+            )
+            if self._pose_owner == source_id:
+                self._pose_owner = None
+                self._pose_owner_kind = None
+                self._reset_pose_buffer()
+                _logger.info("pose source %s released control", source_id)
+
+    def _ingest_frame_obj(self, obj: Any, stream: Any, client_id: int) -> bool:
         """Validate a decoded pose object and publish it to the consumer.
 
-        ``stream`` identifies the connection the frame arrived on (the
-        websocket's ``client_id``, or ``_CONTROL_STREAM`` for the pose data
-        channel); sequence dedup is scoped to it.
+        ``stream`` identifies the physical transport for diagnostics and
+        legacy compatibility. Sequence de-duplication and ownership are scoped
+        to ``frame.pose_source_id`` across every transport.
 
-        Returns True when the object was a valid pose frame — including one
-        dropped by the seq dedup below, so a transport that only ever loses
-        the arrival race (e.g. the network standby while USB wins) still
-        counts as a pose sender.
+        Returns True when the object belongs to the active producer (including
+        a duplicate copy); False for invalid or view-only-source frames.
         """
         try:
             frame = VRFrame.model_validate(obj)
@@ -521,21 +706,28 @@ class VRServer:
             _logger.warning("invalid frame: %s", exc)
             return False
 
-        # Each sender stamps ``seq`` monotonically within its own connection,
-        # so process each seq once *per stream*: a copy with seq <= the
-        # stream's high-water mark is a duplicate or an out-of-order straggler
-        # (e.g. batched network arrivals delivered late) and is dropped, which
-        # keeps ``on_frame`` (the reset/recording state-edge latches) firing
-        # exactly once per frame and stops a resumed stream rewinding to a
-        # stale pose. Dedup is per stream, not global, so independent
-        # concurrent senders (the tracker bridge plus a monitoring web client)
-        # never silence each other. Frames without a seq skip dedup.
+        source_id, source_kind = self._register_pose_source(frame, stream, client_id)
+        # A Quest remains a useful video/URDF viewer during a managed
+        # Lighthouse/Ultimate run. Its pose frames stay view-only, but its
+        # controller datum is still setup information worth surfacing.
+        if source_kind == "webxr":
+            _remember_quest_pose_datum(
+                frame,
+                server_token=self._quest_datum_token,
+                source_id=source_id,
+            )
+        if not self._pose_source_allowed(source_id, source_kind):
+            return False
+
+        # A copy with seq <= this logical producer's high-water mark is a
+        # duplicate or delayed straggler, even when it arrived over a different
+        # transport. Frames without seq retain legacy latest-wins behavior.
         seq = frame.seq
         if seq is not None:
-            last = self._last_seq.get(stream)
+            last = self._last_seq.get(source_id)
             if last is not None and seq <= last:
                 return True
-            self._last_seq[stream] = seq
+            self._last_seq[source_id] = seq
 
         self._latest_frame = frame
         self._interp.push(frame)
@@ -558,8 +750,7 @@ class VRServer:
             return
         if isinstance(obj, dict) and "type" in obj:
             return
-        if self._ingest_frame_obj(obj, _CONTROL_STREAM):
-            self._pose_last[client_id] = time.monotonic()
+        self._ingest_frame_obj(obj, f"control:{client_id}", client_id)
 
     async def _handle_signaling(
         self, websocket: WebSocket, client_id: int, obj: dict[str, Any]
@@ -805,33 +996,17 @@ class VRServer:
                 if server._webrtc is not None:
                     await server._webrtc.close(client_id)
                 await server._control.close(client_id)
-                # Forget this connection's seq high-water mark so a reconnecting
-                # sender (whose counter restarts low) isn't dropped as stale.
-                server._last_seq.pop(client_id, None)
-                # A pose-sending client (the operator) disconnected. When the
-                # last one goes, drop the buffered pose state *now* rather
-                # than when every client disconnects — a view-only client
-                # (the control panel's camera mirror) can stay connected
-                # across the operator's app relaunches, and a relaunched
-                # headset restarts its seq counter at 1, so a kept high-water
-                # mark would silently drop every frame it sends (no poses, no
-                # engage) until the panel also left.
-                if (
-                    server._pose_last.pop(client_id, None) is not None
-                    and not server._pose_last
-                ):
-                    server._latest_frame = None
-                    server._last_seq.clear()
-                    server._interp.reset()
-                # Last operator gone: drop buffered pose state so a fresh
-                # session's capture timestamps aren't blended with this one's
-                # stale frames (which would drive IK with incoherent poses
-                # until the playout buffer drains), and clear any remaining
-                # seq marks (the control-channel stream has no disconnect
-                # callback of its own).
+                # A logical producer may span this socket plus a second USB
+                # socket. Release ownership only after its final transport
+                # disconnects; view-only clients never keep pose state alive.
+                server._drop_pose_client(client_id)
                 if server._client_count == 0:
-                    server._latest_frame = None
+                    server._pose_owner = None
+                    server._pose_owner_kind = None
                     server._last_seq.clear()
-                    server._interp.reset()
+                    server._source_kind.clear()
+                    server._source_clients.clear()
+                    server._client_sources.clear()
+                    server._reset_pose_buffer()
 
         return app

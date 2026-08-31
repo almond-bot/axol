@@ -1,19 +1,22 @@
 """
 axol mantis.session
 
-Zero-touch Mantis data-collection session for a dedicated Jetson.
+Quest browser/bootstrap helper for a dedicated Mantis host.
 
-Runs the whole rig stack unattended: starts ``axol serve`` (control panel +
-web app) and ``axol teleop --mantis`` as supervised children, then watches USB
-for a Quest headset. When one appears it sets up ``adb reverse`` tunnels for
+Ensures ``axol serve`` is available and watches USB for a Quest headset. When
+one appears it sets up ``adb reverse`` tunnels for
 the VR (8000) and serve (8001) ports and launches the headset browser at the
 locally-served VR page with auto-connect query params — the only human steps
 left are putting the headset on and pulling the trigger once to enter AR
 (a browser-enforced user gesture; it cannot be scripted).
 
-``axol mantis.session --install`` writes and enables a systemd service so the
-session starts on every boot, turning the machine into a dedicated
-Mantis Jetson. First-time note: the headset browser must accept the self-signed
+It deliberately does **not** pre-launch teleop: doing so monopolizes the VR
+port and prevents the control panel from starting data collection. Select the
+Quest source and launch teleop/collection from the panel after the browser
+opens.
+
+``axol mantis.session --install`` writes and enables a systemd helper on boot.
+First-time note: the headset browser must accept the self-signed
 certificates once (the page opens automatically; approve the interstitials);
 after that, sessions are hands-free.
 """
@@ -21,6 +24,7 @@ after that, sessions are hands-free.
 from __future__ import annotations
 
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -69,11 +73,16 @@ def _quest_serial(adb: str) -> str | None:
 def _bootstrap_headset(adb: str, serial: str) -> bool:
     """Reverse the ports and open the VR page in the headset browser."""
     for port in (_VR_PORT, _SERVE_PORT):
-        subprocess.run(
+        reverse = subprocess.run(
             [adb, "-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"],
             capture_output=True,
+            text=True,
             timeout=10,
         )
+        if reverse.returncode != 0:
+            detail = (reverse.stderr or reverse.stdout).strip()
+            print(f"headset {serial}: adb reverse for port {port} failed: {detail}")
+            return False
     r = subprocess.run(
         [
             adb,
@@ -104,8 +113,17 @@ def _spawn(name: str, args: list[str]) -> subprocess.Popen:
     return subprocess.Popen(args)
 
 
+def _serve_is_up() -> bool:
+    """Whether a local control-panel server already owns its HTTPS port."""
+    try:
+        with socket.create_connection(("127.0.0.1", _SERVE_PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 def _session() -> None:
-    """Supervise serve + teleop --mantis and bootstrap any Quest that appears."""
+    """Keep the control panel available and bootstrap any Quest that appears."""
     axol = shutil.which("axol") or sys.argv[0]
     adb = _adb()
     if adb is None:
@@ -114,23 +132,14 @@ def _session() -> None:
             "(install android-tools-adb)."
         )
 
-    procs = {
-        "serve": _spawn("serve", [axol, "serve"]),
-        "teleop": _spawn("teleop --mantis", [axol, "teleop", "--mantis"]),
-    }
+    serve = None if _serve_is_up() else _spawn("serve", [axol, "serve"])
     bootstrapped: set[str] = set()
     try:
         while True:
-            for name, proc in list(procs.items()):
-                if proc.poll() is not None:
-                    print(f"{name} exited ({proc.returncode}); restarting in 5s")
-                    time.sleep(5)
-                    args = (
-                        [axol, "serve"]
-                        if name == "serve"
-                        else [axol, "teleop", "--mantis"]
-                    )
-                    procs[name] = _spawn(name, args)
+            if serve is not None and serve.poll() is not None:
+                print(f"serve exited ({serve.returncode}); restarting in 5s")
+                time.sleep(5)
+                serve = _spawn("serve", [axol, "serve"])
             if adb is not None:
                 serial = _quest_serial(adb)
                 if serial and serial not in bootstrapped:
@@ -141,13 +150,12 @@ def _session() -> None:
                     bootstrapped.clear()
             time.sleep(3)
     finally:
-        for proc in procs.values():
-            proc.terminate()
-        for proc in procs.values():
+        if serve is not None:
+            serve.terminate()
             try:
-                proc.wait(timeout=10)
+                serve.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                serve.kill()
 
 
 def _install() -> None:
@@ -158,8 +166,8 @@ def _install() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     user = subprocess.run(["whoami"], capture_output=True, text=True).stdout.strip()
     unit = f"""[Unit]
-Description=Almond Mantis session (serve + teleop --mantis + Quest bootstrap)
-After=network-online.target
+Description=Almond Mantis Quest USB/browser bootstrap
+After=network-online.target axol.service
 
 [Service]
 Type=simple
@@ -183,7 +191,7 @@ WantedBy=multi-user.target
     run_root(["tee", str(_SERVICE_PATH)], input_text=unit, check=True)
     run_root(["systemctl", "daemon-reload"], check=True)
     run_root(["systemctl", "enable", "--now", "axol-mantis.service"], check=True)
-    print("Done — this machine now runs the Mantis session on boot.")
+    print("Done — this machine now bootstraps an attached Quest on boot.")
     print("  status : systemctl status axol-mantis")
     print("  logs   : journalctl -fu axol-mantis")
     print("  remove : sudo systemctl disable --now axol-mantis")

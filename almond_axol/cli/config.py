@@ -262,7 +262,7 @@ class _OverlayArgumentParser(draccus.argparsing.ArgumentParser):  # type: ignore
             file_args = {}
 
         deflat_d = utils.deflatten(parsed_arg_values, sep=".")
-        # Precedence (later wins): defaults -> --config_path file -> CLI.
+        # Precedence (later wins): defaults/host fallback -> config file -> CLI.
         deflat_d = mergedeep.merge({}, self._overlay, file_args, deflat_d)
         return decoding.decode(self.config_class, deflat_d)
 
@@ -420,18 +420,27 @@ def _condense_help(ap: argparse.ArgumentParser) -> None:
         )
 
 
-def parse(config_class: type[T], argv: list[str]) -> T:
+def parse(
+    config_class: type[T],
+    argv: list[str],
+    *,
+    fallback_overlay: dict[str, Any] | None = None,
+) -> T:
     """Parse ``argv`` into ``config_class`` with full-default overlay.
 
     draccus auto-adds ``--config_path PATH`` for a whole-config JSON/YAML
     file; every nested field is also overridable via ``--dotted.path
     VALUE``. Unspecified fields fall back to the dataclass defaults.
+    ``fallback_overlay`` adds host-persisted defaults above the dataclass but
+    below both config files and explicit flags.
 
     Deeply-nested per-joint gains and draccus's per-dataclass config-file
     includes are hidden from ``--help`` (but remain fully overridable) so
     the listing stays scannable; an epilog points at the full reference.
     """
-    overlay = _default_overlay(config_class)
+    overlay = mergedeep.merge(
+        {}, _default_overlay(config_class), fallback_overlay or {}
+    )
     parser = _OverlayArgumentParser(config_class=config_class, overlay=overlay)
     _condense_help(parser.parser)
     try:
@@ -530,15 +539,16 @@ class TeleopCmdConfig:
     sim: bool = False
     # Mantis bench mode: drive the two handheld grippers on can_mantis_l/r
     # while the arms exist only as the VR client's URDF overlay — absolute
-    # pose mapping is forced on. The control panel uses mantis_source to either
-    # wait for Quest WebXR or start the selected tracker bridge. Direct CLI use
-    # still supplies its own VR client.
+    # pose mapping is forced on. mantis_source either waits for Quest WebXR or
+    # starts the selected tracker bridge; direct CLI and control-panel runs use
+    # the same managed behavior.
     # No robot, no cameras, no recording. Mutually exclusive with --sim.
     mantis: bool = False
     mantis_source: MantisSource = "lighthouse"
-    """Pose source for Mantis mode. Quest connects through the WebXR client;
-    Lighthouse and Ultimate start the corresponding tracker bridge when the
-    operation is launched from the control panel."""
+    """Pose source for Mantis mode. Direct Mantis runs inherit the host's
+    Settings → Mantis choice when saved; otherwise Lighthouse is the default.
+    A config file or explicit CLI value wins. Quest connects through WebXR;
+    Lighthouse and Ultimate start the corresponding local tracker bridge."""
     cart_only: bool = False
     """Drive only the powered cart from the headset thumbsticks. The arms and
     their CAN channels are left untouched (no Axol hub needed); the cart is

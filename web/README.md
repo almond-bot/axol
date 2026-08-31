@@ -33,7 +33,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 
 | Export | Description |
 |---|---|
-| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over the main WebSocket, mirroring each frame onto a dedicated USB pose socket when one is supplied so the server can prefer the wired link and fall back to WiFi |
+| `AxolVRClient` | R3F component — reads XR input sources each frame and streams pose data over the main WebSocket, mirroring each frame onto a dedicated USB pose socket when supplied. Both copies share one producer id/sequence, so the first arrival wins and the other is discarded |
 | `useAxolVRClient` | Hook — manages WebSocket lifecycle (connect, disconnect, auto-retry) |
 | `useAxolPoseSocket` | Hook — maintains a dedicated pose WebSocket to `wss://localhost:<port>` (the Quest-over-USB `adb reverse` tunnel) so controller poses avoid WiFi latency; returns `{ poseWsRef, status }` |
 | `useAxolVideo` | Hook — negotiates a WebRTC connection over the same WebSocket and returns the camera video tracks streamed by the server (overhead / wrist cams), labelled by camera name |
@@ -51,7 +51,7 @@ React components and hooks for connecting to the Almond Axol SDK WebSocket serve
 | Prop | Type | Description |
 |---|---|---|
 | `wsRef` | `RefObject<WebSocket \| null>` | WebSocket ref from `useAxolVRClient` |
-| `poseWsRef` | `RefObject<WebSocket \| null>` (optional) | Dedicated pose WebSocket from `useAxolPoseSocket` (Quest-over-USB). When supplied and open, each frame is sent over **both** this and `wsRef`; the server prefers the low-latency USB stream and uses the network frames only while USB is quiet, so a USB drop fails over to WiFi with no reconnect |
+| `poseWsRef` | `RefObject<WebSocket \| null>` (optional) | Dedicated pose WebSocket from `useAxolPoseSocket` (Quest-over-USB). When open, each frame is sent over **both** transports with one producer id/sequence; the server accepts whichever copy arrives first, so USB normally wins on latency and WiFi takes over immediately if it stops |
 | `onStateChange` | `(state: AxolState) => void` | Fires when the controller state machine transitions |
 | `onPendingRecording` | `(pendingAt: number \| null) => void` | Fires with a timestamp when a 3-second recording countdown begins; `null` when cancelled or resolved |
 | `onPendingConfirm` | `(action: ConfirmAction \| null) => void` | Fires with `"save"` / `"discard"` when the stop-recording confirmation popup is armed, and `null` when it's confirmed or cancelled |
@@ -76,10 +76,11 @@ useAxolPoseSocket(enabled: boolean, port = 8000)
 When `enabled`, maintains `wss://localhost:<port>` — the Quest-over-USB
 `adb reverse` tunnel — with auto-retry, and closes when disabled. Pass
 `poseWsRef` to `AxolVRClient` and each frame is mirrored over both the USB cable
-and the network socket; the server prefers the cable (avoiding WiFi power-save
-buffering) and falls back to the network frames whenever USB goes quiet, so a
-cable drop fails over to WiFi with no reconnect. Camera video keeps using the
-LAN connection. See **Quest over USB** in the repo README for the operator flow.
+and network socket. Both copies carry the same stable `pose_source_id` and
+`seq`; the server accepts the first arrival and globally discards the duplicate,
+so USB normally wins on latency and WiFi takes over with no reconnect if the
+cable drops. Camera video keeps using the LAN connection. See **Quest over USB**
+in the repo README for the operator flow.
 
 **Frame data (`AxolPoseData`)**
 
@@ -97,6 +98,10 @@ Each frame sends a JSON message over the WebSocket:
   r_grip:  number    // right grip
   l_tracked: boolean // false when the left controller is only inertially tracked (WebXR emulatedPosition — occluded/out of view); the server holds the last clean pose. Omit to default true
   r_tracked: boolean // right controller optical-tracking state; see l_tracked
+  l_pose_profile: string | null // first WebXR input profile; Quest mount calibration is scoped to this controller generation
+  r_pose_profile: string | null
+  l_pose_space: "grip" | "target-ray" // production Mantis requires the calibrated gripSpace datum
+  r_pose_space: "grip" | "target-ray"
   reset:   boolean   // true on the frame X (reset) or Y (exit) was pressed — Y piggy-backs a reset so the arms return to rest before the session ends
   state:   "teleop" | "data_collection" | "recording"  // client-driven; "saving" is server-pushed via feedback message
   l_stick_x: number  // left thumbstick x, [-1, 1], right = +1 — powered-cart strafe (ignored without a cart)
@@ -104,9 +109,13 @@ Each frame sends a JSON message over the WebSocket:
   r_stick_x: number  // right thumbstick x, [-1, 1], right = +1 — powered-cart rotation
   l_stick_click: boolean  // left thumbstick pressed in — lift down while held
   r_stick_click: boolean  // right thumbstick pressed in — lift up while held
-  seq:     number    // monotonic frame counter; the same frame is sent over both USB and WiFi with one seq, and the server processes each seq once (from whichever link delivers it first)
+  pose_source_id: string       // stable logical Quest id shared by USB, WebRTC, network, and reconnects
+  pose_source_kind: "webxr"    // managed server source policy; Lighthouse/Ultimate bridges use "tracker"
+  seq:     number    // monotonic within pose_source_id; the server accepts the first transport copy exactly once
 }
 ```
+
+The server admits only one logical pose producer. A managed Quest Mantis run accepts `webxr`; a managed Lighthouse/Ultimate run accepts `tracker`. Other connected clients still receive camera, HUD, and URDF messages, but their pose frames are view-only and cannot blend with or replace the selected source.
 
 ## Controller bindings
 
@@ -236,7 +245,7 @@ On connect the server announces its operating mode — `{ "type": "mode", "value
 
 The server also pushes `{ "type": "tracking", "value": true|false }` whenever the engage toggle changes; the headset uses it to only allow repositioning the camera screens while the robot isn't being controlled.
 
-In absolute (Mantis) mode the server additionally streams `{ "type": "urdf_state", "base": { "pos": [x,y,z], "quat": [x,y,z,w] } | null, "joints": { "<urdf joint>": rad, ... }, "engaged": bool }` at ~30 Hz. `base` is the robot base transform solved at engage (null before the first engage) in the same reference space as the controller poses; the app renders the robot URDF there (`RobotModel` in the app), fetching the model from the server's `https://<host>:8000/urdf/` static mount.
+In absolute (Mantis) mode the server additionally streams `{ "type": "urdf_state", "base": { "pos": [x,y,z], "quat": [x,y,z,w] } | null, "joints": { "<urdf joint>": rad, ... }, "engaged": bool, "viewer_world_aligned": bool }` at ~30 Hz. `base` is the robot base transform solved at engage (null before the first engage) in the active pose producer's reference space; the app renders the robot URDF there (`RobotModel` in the app), fetching the model from the server's `https://<host>:8000/urdf/` static mount. A Quest connected during managed Lighthouse/Ultimate is view-only and has an unrelated local-floor origin/yaw, so these sources send `viewer_world_aligned: false` and the client hides the misleading spatial overlay unless an operator explicitly asserts an out-of-band world registration.
 
 The server additionally **relays a HUD message between clients**: the headset publishes its transient HUD state — the armed save/discard confirmation popup and the record-start countdown — as `{ "type": "hud", "value": { "confirm": "save" | "discard" | null, "countdownRemainingMs": number | null } }`, and the server stores it and forwards it to every *other* connected client (re-sent to late joiners), clearing it with a null broadcast when the publisher disconnects. The control panel subscribes to this on its camera-feed socket to mirror the in-headset popups, so a session can be watched from the dashboard with the headset off.
 

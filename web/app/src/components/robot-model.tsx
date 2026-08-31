@@ -50,7 +50,8 @@ const _targetQuat = new THREE.Quaternion()
  * (`https://host:8000/urdf/`) and renders it in the passthrough scene at the
  * base transform the server calibrated at engage, with arm joints and gripper
  * fingers driven by the live `urdf_state` stream (`useAxolUrdfState`). Hidden
- * until the first engage (the server sends `base: null` before calibration).
+ * until the first engage (the server sends `base: null` before calibration),
+ * and while an external tracker world has not been registered to the viewer.
  *
  * This is the hardware↔URDF alignment check: at engage the virtual grippers
  * should coincide with the physical devices, and stay on them as you move —
@@ -133,7 +134,7 @@ export function RobotModel({
     const group = groupRef.current
     if (!group) return
     const state = urdfStateRef.current
-    if (!robot || !state?.base) {
+    if (!robot || !state?.base || !state.viewerWorldAligned) {
       group.visible = false
       trackingRef.current = false
       return

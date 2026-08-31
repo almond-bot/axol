@@ -5,9 +5,6 @@ import importlib
 import sys
 
 from ..utils.dotenv import load_local_env
-from . import migrate_dataset as migrate_dataset_cmd
-from . import provision as provision_cmd
-from . import serve as serve_cmd
 from . import (
     mantis_latency,
     mantis_session,
@@ -15,7 +12,11 @@ from . import (
     tracker_identify,
     tracker_install,
     tracker_pair,
+    tracker_ultimate,
 )
+from . import migrate_dataset as migrate_dataset_cmd
+from . import provision as provision_cmd
+from . import serve as serve_cmd
 from .can import driver as can_driver
 from .can import enable as can_enable
 from .can import setup as can_setup
@@ -58,6 +59,10 @@ _DIAG_COMMANDS: dict[str, tuple[str, str]] = {
     "diag.zed-cable": (
         "almond_axol.diagnostics.zed.cable",
         "Verify a ZED camera cable by validating captured frames.",
+    ),
+    "diag.mantis-trigger": (
+        "almond_axol.diagnostics.mantis.trigger",
+        "Drive the Mantis grippers from their triggers without tracking or cameras.",
     ),
 }
 
@@ -122,6 +127,7 @@ def main() -> None:
     tracker_identify.add_parser(subparsers)
     tracker_install.add_parser(subparsers)
     tracker_pair.add_parser(subparsers)
+    tracker_ultimate.add_parser(subparsers)
     lift_home.add_parser(subparsers)
     lift_goto.add_parser(subparsers)
     set_can_id.add_parser(subparsers)

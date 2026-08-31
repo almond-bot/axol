@@ -20,9 +20,9 @@ controls are blocked until save_episode() completes.
 
 At save time each episode passes a data-quality gate (see
 :func:`evaluate_episode_qa`): episodes with a mid-recording re-engage, too
-many frozen-TCP frames, or too many disengaged frames are discarded and
-re-recorded instead of silently saved (``--qa_gate false`` disables the
-refusal; the QA summary is always logged).
+many frozen-TCP/disengaged/untracked frames, or a stale Mantis trigger
+heartbeat are discarded and re-recorded instead of silently saved
+(``--qa_gate false`` disables the refusal; the QA summary is always logged).
 
 After an episode ends the arms return to rest automatically, but *guarded*:
 a torque-residual watchdog compares measured torque against the gravity
@@ -116,7 +116,7 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
     """
     from dataclasses import fields
 
-    from ..constants import CAN_LEFT, CAN_RIGHT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
     if isinstance(cfg.robot_config, AxolRobotConfig) and not isinstance(
@@ -161,8 +161,160 @@ def _apply_mantis_profile(cfg: "CollectDataConfig") -> None:
                 "ik_alpha=1.0, and transparent trapezoid limits on the "
                 "teleop config."
             )
-        apply_mantis_teleop_profile(tc)
+        apply_mantis_teleop_profile(
+            tc,
+            tracker_source=cfg.mantis_source,
+        )
+        cfg.teleop_config.vr_server_config.pose_source_kind = (
+            "webxr" if cfg.mantis_source == "quest" else "tracker"
+        )
         apply_mantis_kinematics_profile(cfg.teleop_config.kinematics_config)
+
+
+def _prepare_mantis_collection(cfg: "CollectDataConfig") -> None:
+    """Apply Mantis defaults and fail deterministic calibration preflight."""
+    _apply_mantis_profile(cfg)
+    _validate_mantis_calibration(cfg)
+
+
+def _validate_mantis_calibration(cfg: "CollectDataConfig") -> None:
+    """Reject transforms whose tracker identity/datum is not production-safe."""
+    from ..mantis.calibration import (
+        MANTIS_TCP_TRANSFORM_FILE,
+        design_transform_for,
+        load_tcp_transforms,
+        parse_quest_tracker_key,
+        tracker_key_for_side,
+        validate_tcp_transform,
+    )
+
+    vrt = cfg.teleop_config.vr_teleop_config
+    # Do not trust presence alone here: this is the last deterministic gate
+    # before hardware and recording start, and callers/tests may invoke it
+    # without first applying the normal Mantis profile. In particular,
+    # explicit Advanced/CLI values never pass through the JSON file loader.
+    for side in ("left", "right"):
+        attr = f"tcp_transform_{side}"
+        transform = getattr(vrt, attr)
+        if transform is None:
+            continue
+        try:
+            setattr(vrt, attr, validate_tcp_transform(transform))
+        except ValueError as exc:
+            raise ValueError(
+                f"Mantis {side} tracker→gripper TCP transform is invalid: {exc}"
+            ) from exc
+
+    # The bring-up escape hatch permits *missing* transforms, not malformed
+    # transforms that could crash the worker or create invalid rotations.
+    if cfg.mantis_allow_uncalibrated:
+        return
+
+    def quest_error() -> ValueError:
+        return ValueError(
+            "Mantis Quest production collection requires measured left and "
+            "right transforms under one profile-scoped "
+            "`quest:<WebXR-profile>:grip` key. Bare `quest`, target-ray, "
+            "missing, or conflicting datum metadata is unsafe because the "
+            "controller-local frame differs. Add the constants to "
+            f"{MANTIS_TCP_TRANSFORM_FILE}; the live WebXR profile is "
+            "reported by the updated Quest client. Use "
+            "--mantis_allow_uncalibrated true only for a bring-up capture "
+            "that will not be used for training."
+        )
+
+    if cfg.mantis_source == "quest":
+        datum = parse_quest_tracker_key(vrt.tracker_key or "")
+        datum_ready = (
+            datum is not None
+            and datum[1] == "grip"
+            and vrt.quest_controller_profile == datum[0]
+            and vrt.quest_pose_space == datum[1]
+        )
+        if not datum_ready:
+            raise quest_error()
+
+    # A valid seven-float value is not sufficient provenance for production:
+    # an Advanced/CLI value can survive a source or tracker swap. Re-resolve
+    # the authoritative measured/factory value for each active tracker and
+    # require the final value sent to IK to match it. This also keeps the
+    # server's readiness gate and the last CLI preflight equivalent.
+    saved = load_tcp_transforms()
+    missing: list[tuple[str, str]] = []
+    mismatched: list[tuple[str, str]] = []
+    for side in ("left", "right"):
+        if cfg.mantis_source == "quest":
+            key = vrt.tracker_key or "quest"
+        else:
+            # Hardware trackers are independently bound. Do not reuse the
+            # singular config.tracker_key override for both sides here; doing
+            # so would let one device identity authorize the other rig.
+            key, _ = tracker_key_for_side(side, source=cfg.mantis_source)
+
+        entries = saved.get(side, {})
+        # Saved hardware measurements must name the bound device. A bare
+        # family key has unknown provenance; only a factory design constant is
+        # allowed to cover a whole hardware family.
+        device_scoped = cfg.mantis_source == "quest" or bool(key.partition(":")[2])
+        authoritative = entries.get(key) if device_scoped else None
+        if authoritative is None:
+            authoritative = design_transform_for(side, key)
+        if authoritative is None:
+            missing.append((side, key))
+            continue
+        authoritative = validate_tcp_transform(authoritative)
+        actual = getattr(vrt, f"tcp_transform_{side}")
+        if actual is None:
+            missing.append((side, key))
+            continue
+        position_matches = all(
+            math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+            for a, b in zip(actual[:3], authoritative[:3], strict=True)
+        )
+        # Unit quaternions q and -q encode the same rotation.
+        quat_dot = sum(
+            a * b for a, b in zip(actual[3:], authoritative[3:], strict=True)
+        )
+        orientation_matches = math.isclose(
+            abs(quat_dot), 1.0, rel_tol=1e-9, abs_tol=1e-9
+        )
+        if not position_matches or not orientation_matches:
+            mismatched.append((side, key))
+
+    if cfg.mantis_source == "quest" and (missing or mismatched):
+        raise quest_error()
+    if missing:
+        details = ", ".join(f"{side} ({key})" for side, key in missing)
+        raise ValueError(
+            f"Mantis {cfg.mantis_source} collection has no verified "
+            f"tracker→gripper TCP transform for {details}. Add measured "
+            "constants keyed to each bound tracker in "
+            f"{MANTIS_TCP_TRANSFORM_FILE}, or use "
+            "--mantis_allow_uncalibrated true only for a calibration/bring-up "
+            "capture that will not be used for training."
+        )
+    if mismatched:
+        details = ", ".join(f"{side} ({key})" for side, key in mismatched)
+        raise ValueError(
+            "Mantis production collection refused an unproven transform "
+            f"override for {details}. Remove the stale Advanced/CLI value or "
+            "make it exactly match the active tracker entry in "
+            f"{MANTIS_TCP_TRANSFORM_FILE}."
+        )
+
+
+def _prepare_recording_cameras(cfg: "CollectDataConfig") -> None:
+    """Prune placeholders and require a real dataset camera, without I/O."""
+    if not isinstance(cfg.robot_config, AxolRobotConfig):
+        return
+    cfg.robot_config.select_assigned_cameras(minimum=1)
+    if not cfg.robot_config.observation_cameras():
+        raise ValueError(
+            "collect-data has no camera with recording enabled — every "
+            "assigned camera is set to stream-only (or recording is turned "
+            "off). Enable recording for at least one camera in the Cameras "
+            "dialog (or set its record_resolution / eyes)."
+        )
 
 
 def _default_robot_config() -> AxolRobotConfig:
@@ -410,9 +562,14 @@ class CollectDataConfig:
     # Cartesian EE-pose dataset schema. The Axol arms are not involved.
     mantis: bool = False
     mantis_source: MantisSource = "lighthouse"
-    """Pose source for Mantis mode. Quest connects through the WebXR client;
-    Lighthouse and Ultimate start the corresponding tracker bridge when the
-    operation is launched from the control panel."""
+    """Pose source for Mantis mode. Direct Mantis runs inherit the host's
+    Settings → Mantis choice when saved; otherwise Lighthouse is the default.
+    A config file or explicit CLI value wins. Quest connects through WebXR;
+    Lighthouse and Ultimate start the corresponding local tracker bridge."""
+    mantis_allow_uncalibrated: bool = False
+    """Allow a Mantis dataset when either tracker→TCP transform is missing.
+    Intended only for bring-up/calibration captures: the resulting Cartesian
+    TCP rows are mount-dependent and must not be mixed into training data."""
     # Mantis only: zero-phase low-pass cutoff (Hz) applied to the recorded EE
     # pose track at episode save, removing broadband tracker noise without lag
     # (intentional hand motion lives below ~10 Hz). 0 disables. Ignored for
@@ -443,7 +600,8 @@ class CollectDataConfig:
     root: str | None = None
     push_to_hub: bool = False
     # Refuse to save episodes the quality gate marks corrupt — a mid-recording
-    # re-engage (frame shift), > 5% frozen-TCP frames, or > 1% disengaged
+    # re-engage (frame shift), over five percent frozen-TCP frames, or over one
+    # percent disengaged
     # frames (see evaluate_episode_qa): the episode is discarded and
     # re-recorded with a loud spoken/logged explanation. Set false as an
     # escape hatch (debugging the gate, or deliberately recording unusual
@@ -460,16 +618,17 @@ class CollectDataConfig:
 # Episode quality gate
 # ----------------------------------------------------------------------
 
-# A tracked TCP that hasn't taken a new value for longer than this while
-# recording counts as a "stale frame": the tracker / IK stream is frozen but
-# rows keep landing with fresh timestamps, so training would see a hand that
-# holds perfectly still and then teleports.
-_QA_STALE_TCP_S = 0.25
+# Maximum age of the capture represented by the current Mantis action. The
+# timestamp advances on equal-valued live poses without an unnecessary IK
+# solve, but stops on a transport or changing-pose IK stall. Pose *stillness*
+# is valid data and must never be mistaken for a stale source.
+_QA_STALE_POSE_S = 0.25
 # Verdict thresholds, as fractions of recorded control ticks (ticks ≈ dataset
 # rows — the loop publishes one snapshot per tick). Exceeding either marks the
 # episode bad; a mid-recording re-engage is always fatal (frame shift).
 _QA_MAX_STALE_FRACTION = 0.05
 _QA_MAX_DISENGAGED_FRACTION = 0.01
+_QA_MAX_UNTRACKED_FRACTION = 0.01
 
 
 @dataclass
@@ -484,13 +643,23 @@ class EpisodeQAStats:
 
     # Control ticks recorded (denominator for the fractions below).
     total_frames: int = 0
-    # Ticks where the tracked TCP hadn't changed for > _QA_STALE_TCP_S:
-    # tracker dropout, IK stall, or a frozen pose stream. Only counted once a
-    # TCP has been seen at all (pre-first-solve rows fall back to FK).
+    # Ticks where the pose behind the latest action was older than
+    # _QA_STALE_POSE_S: tracker transport or IK output stalled. A live hand
+    # holding perfectly still continues to advance its equal-pose heartbeat.
     stale_frames: int = 0
     # Ticks recorded while teleop tracking was disengaged: the recorded pose
     # holds still while the operator's hands actually move.
     disengaged_frames: int = 0
+    # Ticks where either side was held because its optical/SLAM tracking was
+    # invalid. Counting sides explicitly catches the old failure mode where
+    # one frozen hand passed the combined TCP-motion heuristic while the other
+    # hand kept moving.
+    untracked_frames: int = 0
+    # Ticks where either managed Mantis trigger lacked its 100 Hz CAN
+    # heartbeat. The bridge already waits 250 ms before declaring the input
+    # stale, so even one such tick represents a meaningful grip-input dropout
+    # and makes the recorded command stream untrustworthy.
+    trigger_loss_frames: int = 0
     # Tracking re-engaged (False -> True) while recording. The engage squeeze
     # re-fits the world->base transform, silently shifting the frame of every
     # later row — the episode mixes two incompatible coordinate frames and is
@@ -510,6 +679,11 @@ class EpisodeQAStats:
         """Disengaged ticks as a fraction of recorded ticks (0.0 when empty)."""
         return self.disengaged_frames / self.total_frames if self.total_frames else 0.0
 
+    @property
+    def untracked_fraction(self) -> float:
+        """Invalid-per-side ticks as a fraction of recorded ticks."""
+        return self.untracked_frames / self.total_frames if self.total_frames else 0.0
+
 
 def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
     """Quality verdict for a recorded episode: ``(ok, reasons)``.
@@ -520,6 +694,8 @@ def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
       of every later row — always fatal), or
     - stale-frame fraction above :data:`_QA_MAX_STALE_FRACTION` (5%), or
     - disengaged-frame fraction above :data:`_QA_MAX_DISENGAGED_FRACTION` (1%).
+    - any managed-trigger liveness loss (the bridge only marks this after the
+      CAN heartbeat has already been stale for its dropout threshold).
 
     ``reasons`` lists the human-readable failures (empty when ``ok``). A pure
     function of the counters so the verdict logic is unit-testable without
@@ -535,15 +711,25 @@ def evaluate_episode_qa(stats: EpisodeQAStats) -> tuple[bool, list[str]]:
         )
     if stats.stale_fraction > _QA_MAX_STALE_FRACTION:
         reasons.append(
-            f"{100 * stats.stale_fraction:.1f}% of frames recorded a frozen "
-            f"TCP pose (limit {100 * _QA_MAX_STALE_FRACTION:.0f}%; tracker "
-            "dropout or IK stall)"
+            f"{100 * stats.stale_fraction:.1f}% of frames had a stale pose "
+            f"heartbeat (limit {100 * _QA_MAX_STALE_FRACTION:.0f}%; tracker "
+            "transport or IK stall)"
         )
     if stats.disengaged_fraction > _QA_MAX_DISENGAGED_FRACTION:
         reasons.append(
             f"{100 * stats.disengaged_fraction:.1f}% of frames were recorded "
             f"while tracking was disengaged (limit "
             f"{100 * _QA_MAX_DISENGAGED_FRACTION:.0f}%)"
+        )
+    if stats.untracked_fraction > _QA_MAX_UNTRACKED_FRACTION:
+        reasons.append(
+            f"{100 * stats.untracked_fraction:.1f}% of frames had a lost "
+            f"left or right tracker (limit {100 * _QA_MAX_UNTRACKED_FRACTION:.0f}%)"
+        )
+    if stats.trigger_loss_frames:
+        reasons.append(
+            f"{stats.trigger_loss_frames} frames had a stale left or right "
+            "Mantis trigger heartbeat; grip commands were held during the dropout"
         )
     return (not reasons, reasons)
 
@@ -588,7 +774,7 @@ class _NullCollectControl:
     def poll_command(self) -> str | None:
         return None
 
-    def note_ready(self, episode: int) -> None:
+    def note_ready(self, episode: int, message: str | None = None) -> None:
         pass
 
     def note_countdown(self, deadline: float) -> None:
@@ -685,13 +871,14 @@ class _QueueCollectControl:
             if phase != "countdown":
                 self._countdown_deadline = None
 
-    def note_ready(self, episode: int) -> None:
+    def note_ready(self, episode: int, message: str | None = None) -> None:
         with self._lock:
             self._episode = episode
         self._set(
             "ready",
-            f"Episode {episode}: press record on the VR controller, or start "
-            "recording here.",
+            message
+            or f"Episode {episode}: press record on the VR controller, or "
+            "start recording here.",
         )
 
     def note_countdown(self, deadline: float) -> None:
@@ -727,6 +914,17 @@ Control = _NullCollectControl | _QueueCollectControl
 def main(argv: list[str]) -> None:
     """Parse the CLI config and run a data-collection session."""
     cfg = parse(CollectDataConfig, argv)
+    if cfg.mantis:
+        from .mantis_bridge import (
+            add_quest_key_to_direct_fallback,
+            load_direct_mantis_fallback,
+        )
+
+        fallback, quest_key = load_direct_mantis_fallback(collection=True)
+        cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
+        if cfg.mantis_source == "quest" and quest_key is not None:
+            add_quest_key_to_direct_fallback(fallback, quest_key, collection=True)
+            cfg = parse(CollectDataConfig, argv, fallback_overlay=fallback)
     # force=True: importing lerobot (at module load) installs a root handler
     # and leaves the root level at WARNING, which would otherwise make this a
     # no-op and silently drop every log_say() status line.
@@ -736,7 +934,27 @@ def main(argv: list[str]) -> None:
     # by the host installer + its boot service, not here — see
     # `axol jetson.setup` / `axol gst.install`. This entry point just runs.
 
-    _run(cfg)
+    if cfg.mantis:
+        # Deterministic source/transform errors must be raised before opening
+        # a dongle, starting libsurvive, or waiting for live tracker inputs.
+        _prepare_mantis_collection(cfg)
+        _prepare_recording_cameras(cfg)
+        from .mantis_bridge import managed_mantis_bridge, set_managed_pose_source_id
+
+        pose_source_id = (
+            set_managed_pose_source_id(cfg) if cfg.mantis_source != "quest" else None
+        )
+
+        with managed_mantis_bridge(
+            cfg.mantis_source,
+            left_channel=cfg.robot_config.left_channel,
+            right_channel=cfg.robot_config.right_channel,
+            port=cfg.teleop_config.vr_server_config.port,
+            pose_source_id=pose_source_id,
+        ):
+            _run(cfg)
+    else:
+        _run(cfg)
 
 
 def _run(
@@ -769,7 +987,14 @@ def _run(
     from ..vr.models import VRState
 
     if cfg.mantis:
-        _apply_mantis_profile(cfg)
+        # Serve calls _run directly, while the plain CLI calls this a second
+        # time after its pre-bridge check. The preparation is idempotent.
+        _prepare_mantis_collection(cfg)
+
+    # This is pure config validation/pruning. Direct Mantis CLI runs also call
+    # it before entering their managed bridge so a missing/all-stream-only
+    # camera setup cannot open trackers and wait for triggers before failing.
+    _prepare_recording_cameras(cfg)
 
     # Default keeps the CLI path unchanged: episode decisions come from the VR
     # controller only. The web panel injects a _QueueCollectControl so the
@@ -800,22 +1025,13 @@ def _run(
         _orig_affinity = None
     affinity.pin_realtime()
 
-    # Finalize the camera set before the relay/robot open the cameras: prune the
-    # unassigned placeholder slots (at least one must be set) and flag any
-    # physically-stereo ZED X so the relay and the in-process fallback both open
-    # it on the stereo grab path. Shared with run-policy via
-    # ``prepare_capture_cameras`` so the two commands set cameras up identically.
+    # Flag physically-stereo ZED X before the relay/robot opens the cameras so
+    # the relay and in-process fallback both use the stereo grab path. The pure
+    # assigned/recording validation above already pruned placeholder slots.
     if isinstance(cfg.robot_config, AxolRobotConfig):
         from ..zed import stereo_serials
 
-        cfg.robot_config.prepare_capture_cameras(stereo_serials(), minimum=1)
-        if not cfg.robot_config.observation_cameras():
-            raise ValueError(
-                "collect-data has no camera with recording enabled — every "
-                "assigned camera is set to stream-only (or recording is turned "
-                "off). Enable recording for at least one camera in the Cameras "
-                "dialog (or set its record_resolution / eyes)."
-            )
+        cfg.robot_config.apply_detected_stereo(stereo_serials())
 
     from ..lerobot.robot.config_mantis import MantisRobotConfig
 
@@ -883,13 +1099,19 @@ def _run(
             )
         dataset_resolution = existing
 
+    from ..utils.network import local_ip
+
     hostname = socket.gethostname()
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as _s:
-        _s.connect(("8.8.8.8", 80))
-        local_ip = _s.getsockname()[0]
-    print("Connect the VR app (https://axol.almond.bot) to this machine:")
+    host_ip = local_ip()
+    if cfg.mantis and cfg.mantis_source != "quest":
+        print(
+            "Optional camera/episode UI (tracking comes from the local "
+            f"{cfg.mantis_source} bridge):"
+        )
+    else:
+        print("Connect the VR app (https://axol.almond.bot) to this machine:")
     print(f"  Hostname : {hostname}.local")
-    print(f"  IP       : {local_ip}")
+    print(f"  IP       : {host_ip}")
 
     if rerun_ip:
         init_rerun(session_name="axol_record", ip=rerun_ip, port=rerun_port)
@@ -1185,6 +1407,31 @@ def _run(
         max_slip["v"] = 0.0
         last_rate_log = t0
 
+    def _note_ready(episode: int) -> str:
+        """Announce the episode using controls that exist for this source."""
+        panel = isinstance(control, _QueueCollectControl)
+        if mantis_mode and cfg.mantis_source != "quest":
+            message = (
+                f"Episode {episode}: Mantis is ready. Keep both trackers live; "
+                "at the start pose release then squeeze both triggers together "
+                "to align, then rapidly squeeze either trigger three times to "
+                "start" + (" (or select Start recording here)." if panel else ".")
+            )
+        elif mantis_mode:
+            message = (
+                f"Episode {episode}: Mantis is ready. Hold both Quest controllers "
+                "at the start pose and press both grip buttons to align; press A "
+                "in Quest to start"
+                + (" (or select Start recording here)." if panel else ".")
+            )
+        else:
+            message = (
+                f"Episode {episode}: robot is at rest pose. Press record on the "
+                "VR controller" + (" or select Start recording here." if panel else ".")
+            )
+        control.note_ready(episode, message)
+        return message
+
     # The hot control loop runs *on the robot's event loop* (see
     # AxolRobot.event_loop) so motion_control is awaited inline — cooperatively
     # interleaved with CAN telemetry on one thread, exactly like `axol teleop`.
@@ -1227,6 +1474,33 @@ def _run(
             nonlocal recording, stats, recording_started_at, capture_checked
             nonlocal was_engaged
             if mantis_mode:
+                tracking = teleop.tracking_sides()
+                if not all(tracking.values()):
+                    missing = ", ".join(
+                        side for side, live in tracking.items() if not live
+                    )
+                    log_say(
+                        "Cannot start recording: live tracking is missing for "
+                        f"{missing}. Restore visibility/SLAM tracking and try again."
+                    )
+                    return False
+                triggers = teleop.trigger_sides()
+                if not all(triggers.values()):
+                    missing = ", ".join(
+                        side for side, live in triggers.items() if not live
+                    )
+                    log_say(
+                        "Cannot start recording: the Mantis trigger heartbeat is "
+                        f"missing for {missing}. Restore the CAN connection, "
+                        "release both triggers, re-align, and try again."
+                    )
+                    return False
+                if not teleop.is_engaged():
+                    log_say(
+                        "Cannot start recording: Mantis is not aligned and engaged. "
+                        "Hold both rigs at the start pose and engage, then try again."
+                    )
+                    return False
                 log_say("Preparing Mantis grippers.")
                 enable_task = asyncio.create_task(robot.enable_grippers_async())
                 while not enable_task.done() and not _stopped():
@@ -1244,6 +1518,35 @@ def _run(
                         await robot.disable_grippers_async()
                     return False
                 await enable_task
+                # The hard-stop calibration above can take seconds. Inputs
+                # that were valid before it began may have dropped and forced
+                # a disengage meanwhile; never open the recorder on that stale
+                # preflight result.
+                tracking = teleop.tracking_sides()
+                triggers = teleop.trigger_sides()
+                engaged = teleop.is_engaged()
+                if (
+                    not all(tracking.values())
+                    or not all(triggers.values())
+                    or not engaged
+                ):
+                    failures: list[str] = []
+                    if not all(tracking.values()):
+                        failures.append("tracker visibility/SLAM tracking changed")
+                    if not all(triggers.values()):
+                        failures.append("a trigger CAN heartbeat dropped")
+                    if not engaged:
+                        failures.append("Mantis disengaged")
+                    await robot.disable_grippers_async()
+                    _note_ready(episode_idx + 1)
+                    log_say(
+                        "Cannot start recording: "
+                        + "; ".join(failures)
+                        + " while the grippers were preparing. Restore both "
+                        "inputs, release both triggers, re-align, squeeze "
+                        "together, and try again."
+                    )
+                    return False
             if _stopped():
                 if mantis_mode:
                     await robot.disable_grippers_async()
@@ -1290,7 +1593,7 @@ def _run(
                 # "contact" phase, and nothing else re-announces this phase
                 # until the next episode — the outer loop only runs
                 # note_ready before the episode starts.
-                control.note_ready(episode_idx + 1)
+                _note_ready(episode_idx + 1)
                 deadline = time.perf_counter()
                 prev_t0["v"] = 0.0
                 continue
@@ -1340,6 +1643,7 @@ def _run(
             # exposure timestamps.
             row_ts = t0
             act_ds = robot.action_to_dataset(act_processed)
+            pose_ts: float | None = None
             if mantis_mode:
                 pose_ts = teleop.pose_capture_ts()
                 if pose_ts is not None:
@@ -1385,8 +1689,11 @@ def _run(
                 elif not was_engaged:
                     stats.reengaged_while_recording = True
                 was_engaged = engaged
-                change_ts = teleop.tcp_last_change_ts()
-                if change_ts is not None and t0 - change_ts > _QA_STALE_TCP_S:
+                if not all(teleop.tracking_sides().values()):
+                    stats.untracked_frames += 1
+                if not all(teleop.trigger_sides().values()):
+                    stats.trigger_loss_frames += 1
+                if pose_ts is None or t0 - pose_ts > _QA_STALE_POSE_S:
                     stats.stale_frames += 1
 
             # Capture-health ack: recorder.start_episode has no feedback, so
@@ -1431,7 +1738,7 @@ def _run(
                     )
                 else:
                     pending_start = None
-                    control.note_ready(episode_idx + 1)
+                    _note_ready(episode_idx + 1)
                     log_say("Recording start cancelled.")
             start_requested = events.get("start_recording") or (
                 pending_start is not None and time.perf_counter() >= pending_start
@@ -1624,12 +1931,7 @@ def _run(
             # gets the same readout (plus the Start button) through the
             # control's snapshot.
             teleop.send_feedback_episode(episode_idx + 1)
-            control.note_ready(episode_idx + 1)
-            log_say(
-                f"Episode {episode_idx + 1}: robot is at rest pose. Press "
-                "record on the VR controller (or Start in the control panel) "
-                "when ready."
-            )
+            log_say(_note_ready(episode_idx + 1))
 
             try:
                 recording, rerecord, contact, qa = _run_on_robot_loop(_episode_loop())
@@ -1710,7 +2012,8 @@ def _run(
                 qa_ok, qa_reasons = evaluate_episode_qa(qa)
                 _logger.info(
                     "episode QA: control_frames=%d captured_rows=%d stale=%d "
-                    "(%.1f%%) disengaged=%d (%.1f%%) reengaged=%s "
+                    "(%.1f%%) disengaged=%d (%.1f%%) untracked=%d (%.1f%%) "
+                    "trigger_loss=%d reengaged=%s "
                     "max_pose_lag=%.0fms capture_error=%s -> %s",
                     qa.total_frames,
                     captured_rows,
@@ -1718,6 +2021,9 @@ def _run(
                     100 * qa.stale_fraction,
                     qa.disengaged_frames,
                     100 * qa.disengaged_fraction,
+                    qa.untracked_frames,
+                    100 * qa.untracked_fraction,
+                    qa.trigger_loss_frames,
                     qa.reengaged_while_recording,
                     1e3 * qa.max_pose_lag_s,
                     capture_error or "none",

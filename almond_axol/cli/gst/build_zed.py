@@ -37,6 +37,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from ...utils.jetson import _is_jetson
 from ...utils.sudo import prime_sudo, run_root
 
 _logger = logging.getLogger(__name__)
@@ -52,9 +53,11 @@ _PATCH = Path(__file__).parent / "patches" / "zed-gstreamer-sensor-timestamp.pat
 _ZED_SDK = Path("/usr/local/zed")
 
 # apt build deps. OpenCV / RTSP server are optional (their plugins are skipped
-# at configure time); GStreamer + GLib dev packages are what the zedxonesrc /
-# zedsrc targets actually need. NVENC + the Jetson multimedia headers ship with
-# the L4T BSP.
+# at configure time). The ZED SDK's own zed-config.cmake unconditionally calls
+# ``find_package(BLAS REQUIRED)`` and links the unversioned libusb library, so
+# their *development* packages are required even when the corresponding runtime
+# libraries already happen to be installed. NVENC + the Jetson multimedia
+# headers ship with the L4T BSP.
 _APT_BUILD_DEPS = (
     "build-essential",
     "cmake",
@@ -63,6 +66,8 @@ _APT_BUILD_DEPS = (
     "libglib2.0-dev",
     "libgstreamer1.0-dev",
     "libgstreamer-plugins-base1.0-dev",
+    "libblas-dev",
+    "libusb-1.0-0-dev",
 )
 
 
@@ -118,19 +123,38 @@ def _element_installed(name: str) -> bool:
     return _run([inspect, name], timeout=60)
 
 
-def _apt_install_build_deps() -> None:
+def _apt_install_build_deps() -> bool:
+    """Install Debian build prerequisites, returning whether setup may proceed.
+
+    On non-Debian hosts there is no package manager to drive, so let CMake
+    inspect whatever the operator installed manually. When apt is available,
+    however, don't continue into an opaque configure failure after escalation
+    or package installation failed.
+    """
     if shutil.which("apt-get") is None:
         _logger.info("apt-get not found; assuming build deps are present")
-        return
+        return True
     if not prime_sudo():
         _logger.warning(
             "zed-gstreamer build deps need root; run as root or: "
             "sudo apt-get install -y %s",
             " ".join(_APT_BUILD_DEPS),
         )
-        return
-    run_root(["apt-get", "update"])
-    run_root(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
+        return False
+    # An update failure need not block an install from an already-populated apt
+    # cache. The install result itself is authoritative.
+    update = run_root(["apt-get", "update"])
+    if update.returncode != 0:
+        _logger.warning("apt-get update failed; trying the existing package cache")
+    installed = run_root(["apt-get", "install", "-y", *_APT_BUILD_DEPS])
+    if installed.returncode != 0:
+        _logger.warning(
+            "could not install zed-gstreamer build dependencies; run: "
+            "sudo apt-get install -y %s",
+            " ".join(_APT_BUILD_DEPS),
+        )
+        return False
+    return True
 
 
 def _sync_source(src: Path) -> bool:
@@ -175,13 +199,15 @@ def _build_and_install(src: Path) -> bool:
         return False
     build = src / "build"
     build.mkdir(parents=True, exist_ok=True)
-    jobs = str(min(4, (os.cpu_count() or 2)))
     configured = _run(
         [cmake, "-DCMAKE_BUILD_TYPE=Release", "-S", str(src), "-B", str(build)]
     )
     if not configured:
         return False
-    if not _run([cmake, "--build", str(build), "-j", jobs]):
+    # Upstream explicitly documents that this project does not support a
+    # parallel build. Keep one job even on large Jetsons to avoid intermittent
+    # generated-target races.
+    if not _run([cmake, "--build", str(build), "-j", "1"]):
         return False
     # Install writes into the system GStreamer plugin dir (root-owned).
     return run_root([cmake, "--install", str(build)]).returncode == 0
@@ -189,6 +215,13 @@ def _build_and_install(src: Path) -> bool:
 
 def run(_args: object = None) -> None:
     """Build + install the patched zed-gstreamer plugins (idempotent)."""
+    if not _is_jetson():
+        print(
+            "Not an NVIDIA Jetson (L4T); skipping the Jetson-only "
+            "zed-gstreamer GPU path. Camera capture will use the ZED SDK "
+            "fallback on this host."
+        )
+        return
     if not _ZED_SDK.exists():
         print(
             "No ZED SDK at /usr/local/zed; skipping zed-gstreamer build "
@@ -211,7 +244,13 @@ def run(_args: object = None) -> None:
         return
 
     print("Installing zed-gstreamer build dependencies (apt)...")
-    _apt_install_build_deps()
+    if not _apt_install_build_deps():
+        print(
+            "WARNING: could not install zed-gstreamer build dependencies. "
+            "Install the packages listed above and re-run "
+            "'axol gst.build-zed'."
+        )
+        return
 
     print(f"Fetching zed-gstreamer @ {_PINNED_REF[:12]} into {src}...")
     if not _sync_source(src):

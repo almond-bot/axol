@@ -1,27 +1,32 @@
-"""The Mantis rig's tracker→TCP transforms: factory design constants + overrides.
+"""The Mantis rig's tracker→TCP transforms: verified constants + overrides.
 
-The rig's tracker mounts are a fixed design, so the rigid tracker→gripper
-transform is a **design constant** per tracker family, shipped in
-:data:`DESIGN_TCP_TRANSFORMS` and applied out of the box. A per-unit override
+The rig's tracker mounts are a fixed design, so a bench-verified rigid
+tracker→gripper transform can be shipped per tracker family in
+:data:`DESIGN_TCP_TRANSFORMS` and applied out of the box. CAD-derived values
+that have not been checked against the live tracker datum remain in
+:data:`CANDIDATE_TCP_TRANSFORMS`; they are never applied automatically or
+accepted for production collection. A per-unit override
 file at ``~/.almond/mantis/tcp_transform.json`` takes precedence when present
 (hand-measured refinements, non-standard mounts); its shape is one SE(3)
 transform per rig side *and tracker identity*::
 
     {
       "left": {
-        "quest":        {"pos": [x, y, z], "quat": [qx, qy, qz, qw]},
+        "quest:meta-quest-touch-plus:grip":
+                        {"pos": [x, y, z], "quat": [qx, qy, qz, qw]},
         "survive:T20":  {"pos": [...], "quat": [...]}
       },
       "right": { ... }
     }
 
-The tracker key is the tracking backend name plus the device identifier when
-one exists (``"quest"`` for the headset path, ``"survive:<codename>"`` /
-``"ultimate:<mac>"`` for the Vive backends, see :func:`tracker_key_for_side`);
-design defaults are keyed by the backend family alone. Keying by tracker
-matters because each tracker type has both a different physical mount on the
-rig *and* a different device-local frame — a transform for one tracker type
-is silently wrong for another.
+The tracker key is the tracking backend plus its exact device-local datum:
+``"quest:<WebXR-profile>:grip"`` for the headset path, or
+``"survive:<codename>"`` / ``"ultimate:<mac>"`` for Vive backends (see
+:func:`tracker_key_for_side`). Hardware design defaults are keyed by backend
+family; Quest defaults must remain profile/pose-space scoped. Keying matters
+because each tracker type can have both a different physical mount and a
+different device-local frame — a transform for one is silently wrong for
+another.
 
 The transform is ``T^tracker_gripper``: the gripper (TCP) frame expressed in
 the tracker's local frame, exactly the ``(p_off, R_off)`` shape the absolute-
@@ -40,20 +45,23 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+from numbers import Real
 from pathlib import Path
+
+from ..utils.paths import almond_path
 
 _logger = logging.getLogger(__name__)
 
-MANTIS_TCP_TRANSFORM_FILE = Path.home() / ".almond" / "mantis" / "tcp_transform.json"
-_PRE_MANTIS_TCP_TRANSFORM_FILE = (
-    Path.home() / ".almond" / ("u" + "mi") / "tcp_transform.json"
-)
+MANTIS_TCP_TRANSFORM_FILE = almond_path("mantis", "tcp_transform.json")
+_PRE_MANTIS_TCP_TRANSFORM_FILE = almond_path("u" + "mi", "tcp_transform.json")
 
 # Pseudo tracker key under which entries from the legacy (per-side only) file
 # format surface on load. Never produced by a fresh calibration.
 LEGACY_TRACKER_KEY = "legacy"
+QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 
-# Factory (CAD-derived) tracker→gripper transforms for the Mantis rig's
+# Bench-verified factory tracker→gripper transforms for the Mantis rig's
 # standard tracker mounts, keyed by tracker backend family — the part of a
 # tracker key before the ":" (``"survive:T20"`` → ``"survive"``). These are
 # design constants of the rig, identical for every unit up to manufacturing
@@ -76,15 +84,14 @@ LEGACY_TRACKER_KEY = "legacy"
 # axes to gripper axes, straight from the mount CAD.
 #
 # TODO(mantis-calibration): Measure the Quest 3 cradle transform empirically.
-# The headset client deliberately streams WebXR ``targetRaySpace`` (the
-# runtime-defined aim/pointer pose), NOT ``gripSpace``. Its origin is therefore
-# a virtual point near the controller's top/front rather than a dimensioned
-# shell datum, and Meta may move it across firmware. Cradle CAD alone cannot
-# supply this transform: seat the controller, run the absolute-mode URDF
+# The headset client streams WebXR ``gripSpace`` (with ``targetRaySpace`` only
+# as a compatibility fallback on runtimes that omit gripSpace). Cradle CAD may
+# therefore supply a starting physical transform, but the WebXR grip datum is
+# still not a dimensioned shell origin. Seat the controller, run the URDF
 # overlay, iterate the per-unit ``quest`` pos/quat entry until the physical and
 # rendered gripper TCPs coincide, then promote the result here. Until then the
-# engage snapshot absorbs the whole offset (recorded TCP poses are
-# mount-dependent; a loud warning is logged at session start).
+# engage snapshot aligns only the starting pose; later recorded TCP poses stay
+# mount-dependent, so production collection rejects the missing transform.
 #
 # TODO(mantis-calibration): Derive the Vive Ultimate Tracker transform from
 # the mount CAD. Use the centre of the tracker's bottom mounting surface on
@@ -94,28 +101,122 @@ LEGACY_TRACKER_KEY = "legacy"
 # quaternion order and up-axis settings on the bench (see docs/cli/tracker.mdx),
 # then confirm the finished overlay before shipping the constant. Same fallback
 # as Quest until it ships.
-DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
+CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
         "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
     },
 }
 
+# Only values promoted after a live URDF-overlay bench check belong here.
+# Collection treats absence from this mapping as uncalibrated even when a CAD
+# candidate exists above.
+DESIGN_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {}
+
+
+def validate_tcp_transform(transform: object) -> list[float]:
+    """Return one safe tracker→TCP transform as seven floats.
+
+    ``transform`` must be ``[x, y, z, qx, qy, qz, qw]`` with exactly seven
+    finite numeric entries. As with the calibration-file loader's historical
+    behavior, a finite non-zero quaternion is normalized before use. A zero
+    (or numerically degenerate) quaternion is rejected rather than becoming an
+    invalid rotation matrix in the teleop worker.
+
+    Raises:
+        ValueError: If the shape, values, or quaternion are unsafe.
+    """
+    if not isinstance(transform, (list, tuple)) or len(transform) != 7:
+        raise ValueError("must contain exactly 7 values [x, y, z, qx, qy, qz, qw]")
+
+    values: list[float] = []
+    for index, value in enumerate(transform):
+        # bool is an int subclass, but accepting it in a spatial transform is
+        # almost certainly a malformed JSON/YAML or Advanced-field value.
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"value at index {index} must be numeric")
+        try:
+            converted = float(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"value at index {index} must be a finite float") from exc
+        if not math.isfinite(converted):
+            raise ValueError(f"value at index {index} must be finite")
+        values.append(converted)
+
+    quat_norm = math.hypot(*values[3:])
+    if not math.isfinite(quat_norm) or quat_norm <= 1e-12:
+        raise ValueError("quaternion must have a finite, non-zero norm")
+    values[3:] = [value / quat_norm for value in values[3:]]
+    return values
+
 
 def design_transform_for(side: str, tracker_key: str) -> list[float] | None:
-    """The rig's factory transform for ``side``, or ``None`` for the family.
+    """The rig's bench-verified transform for ``side``, or ``None``.
 
     ``tracker_key`` is matched by backend family only (device identity does
     not change the design constant — every Tracker 3.0 sits on the same
     mount). Returns ``[x, y, z, qx, qy, qz, qw]`` like a calibration entry.
     """
     family = tracker_key.split(":", 1)[0]
-    return DESIGN_TCP_TRANSFORMS.get(family, {}).get(side)
+    # Quest controller frames are profile- and pose-space-specific. A future
+    # verified constant must therefore use the full
+    # ``quest:<profile>:<space>`` key; never fan a bare family value across
+    # controller generations. Hardware trackers have a stable backend-local
+    # datum, so their family default remains appropriate.
+    lookup = tracker_key if family == "quest" else family
+    if family == "quest" and parse_quest_tracker_key(tracker_key) is None:
+        return None
+    return DESIGN_TCP_TRANSFORMS.get(lookup, {}).get(side)
+
+
+def candidate_transform_for(side: str, tracker_key: str) -> list[float] | None:
+    """Return an unverified CAD candidate, never a production transform."""
+    family = tracker_key.split(":", 1)[0]
+    lookup = tracker_key if family == "quest" else family
+    if family == "quest" and parse_quest_tracker_key(tracker_key) is None:
+        return None
+    return CANDIDATE_TCP_TRANSFORMS.get(lookup, {}).get(side)
+
+
+def parse_quest_tracker_key(tracker_key: str) -> tuple[str, str] | None:
+    """Parse ``quest:<WebXR profile>:<pose space>`` into its live datum.
+
+    A bare ``quest`` key predates controller-profile reporting and is
+    intentionally not accepted here: a Touch controller generation and
+    WebXR's grip/aim spaces do not share an interchangeable local frame.
+    """
+    if not tracker_key.startswith("quest:"):
+        return None
+    profile_and_space = tracker_key[len("quest:") :]
+    profile, separator, pose_space = profile_and_space.rpartition(":")
+    if not separator or not profile or pose_space not in QUEST_POSE_SPACES:
+        return None
+    return profile, pose_space
+
+
+def select_quest_transform_key(
+    transforms: dict[str, dict[str, list[float]]],
+) -> str | None:
+    """Select the sole profile-scoped Quest key calibrated on both sides.
+
+    Multiple common profiles are deliberately ambiguous; callers need an
+    explicit ``tracker_key`` in that case instead of guessing which connected
+    controller generation the operation will report.
+    """
+    common = set(transforms.get("left", {})) & set(transforms.get("right", {}))
+    common.update(
+        key
+        for key, sides in DESIGN_TCP_TRANSFORMS.items()
+        if "left" in sides and "right" in sides
+    )
+    scoped = sorted(key for key in common if parse_quest_tracker_key(key) is not None)
+    return scoped[0] if len(scoped) == 1 else None
 
 
 def tracker_key_for_side(
     side: str,
     override: str | None = None,
+    source: str | None = None,
     config_path: Path | None = None,
 ) -> tuple[str, str]:
     """Identity key of the tracker presumed active on ``side``.
@@ -127,15 +228,17 @@ def tracker_key_for_side(
     ``axol tracker.identify``) — e.g. ``"survive:T20"`` or
     ``"ultimate:<mac>"``.
 
-    The frame source is not observable here (a Quest headset and an ``axol
-    tracker.bridge`` connect to the VR server identically), so this is a
-    presumption: a tracker config file on disk means the Vive path is in use,
-    no file means Quest. ``override`` short-circuits it for operators who
-    know better.
+    ``source`` is the selected Mantis source (``quest``, ``lighthouse``, or
+    ``ultimate``). Passing it is strongly preferred: a Quest headset and an
+    ``axol tracker.bridge`` look identical to the VR server, and the tracker
+    config may contain bindings for more than one backend. The historical
+    file-existence inference remains only for callers that do not know the
+    active source. ``override`` always takes precedence.
 
     Args:
         side: ``"left"`` or ``"right"`` (the two rigs bind different devices).
         override: Explicit key to use instead of deriving one, or ``None``.
+        source: Selected Mantis source, or ``None`` for legacy inference.
         config_path: Tracker config file to read (default: the real one);
             for tests.
 
@@ -148,15 +251,31 @@ def tracker_key_for_side(
     from ..tracker.config import TRACKER_CONFIG_FILE, load_tracker_config
 
     path = TRACKER_CONFIG_FILE if config_path is None else config_path
+    if source == "quest":
+        return "quest", "Quest WebXR source explicitly selected"
+    backend = {"lighthouse": "survive", "ultimate": "ultimate"}.get(source or "")
+    if source is not None and backend is None:
+        raise ValueError(
+            f"tracker source must be quest, lighthouse, or ultimate; got {source!r}"
+        )
     if not path.exists():
+        if backend is not None:
+            return backend, f"{source} source selected; no saved device binding"
         return (
             "quest",
             f"no tracker backend configured ({path} missing) — "
             "assuming the Quest headset path",
         )
     config = load_tracker_config(path)
-    device = config.left if side == "left" else config.right
-    key = f"{config.backend}:{device}" if device else config.backend
+    selected_backend = backend or config.backend
+    binding = config.bindings.get(selected_backend, {})
+    if selected_backend == config.backend:
+        device = binding.get(side) or (config.left if side == "left" else config.right)
+    else:
+        device = binding.get(side)
+    key = f"{selected_backend}:{device}" if device else selected_backend
+    if source is not None:
+        return key, f"{source} source explicitly selected; binding loaded from {path}"
     return key, f"'{config.backend}' backend configured in {path}"
 
 
@@ -175,7 +294,8 @@ def load_tcp_transforms(
     per-tracker keying, so which tracker they were measured with is unknown.
 
     Returns an empty dict when no calibration exists or the file is invalid
-    (callers fall back to the engage-snapshot absorption).
+    (teleop may use its explicitly warned, start-pose-only fallback; production
+    collection rejects a missing transform).
     """
     if (
         path == MANTIS_TCP_TRANSFORM_FILE
@@ -228,11 +348,14 @@ def _flatten_entry(entry: object) -> list[float] | None:
         return None
     pos = entry.get("pos")
     quat = entry.get("quat")
-    if (
+    if not (
         isinstance(pos, list)
         and len(pos) == 3
         and isinstance(quat, list)
         and len(quat) == 4
     ):
-        return [float(v) for v in (*pos, *quat)]
-    return None
+        return None
+    try:
+        return validate_tcp_transform([*pos, *quat])
+    except ValueError:
+        return None

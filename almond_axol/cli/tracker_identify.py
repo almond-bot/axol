@@ -19,8 +19,12 @@ import time
 
 import numpy as np
 
+from ..tracker.base import TRACKER_POSE_MAX_AGE_S
+
 _DISCOVER_TIMEOUT_S = 30.0
 _CAPTURE_S = 3.0
+_FRESH_S = TRACKER_POSE_MAX_AGE_S
+_MAX_CAPTURE_ATTEMPTS = 5
 # A tracker must move at least this much path length (m) during the shake
 # window to count — anything less is sensor noise on a resting device.
 _MIN_MOTION_M = 0.10
@@ -57,12 +61,15 @@ def _confirm(instruction: str, web_prompts: bool) -> None:
 
 
 def _motion(source, window_s: float) -> dict[str, float]:
-    """Per-device position path length (m) accumulated over ``window_s``."""
+    """Fresh, fully-tracked position path length per device over a window."""
     last: dict[str, np.ndarray] = {}
     travelled: dict[str, float] = {}
     deadline = time.perf_counter() + window_s
     while time.perf_counter() < deadline:
         for key, sample in source.poses().items():
+            if not sample.tracking or time.perf_counter() - sample.t > _FRESH_S:
+                last.pop(key, None)
+                continue
             prev = last.get(key)
             if prev is not None:
                 travelled[key] = travelled.get(key, 0.0) + float(
@@ -76,11 +83,26 @@ def _motion(source, window_s: float) -> dict[str, float]:
 def run(args) -> None:  # type: ignore[no-untyped-def]
     """Discover trackers, capture per-side motion, save the binding."""
     from ..tracker import create_source, load_tracker_config
-    from ..tracker.config import save_tracker_config
+    from ..tracker.config import save_tracker_config, select_tracker_backend
 
     config = load_tracker_config()
     if args.backend is not None:
-        config.backend = args.backend
+        select_tracker_backend(config, args.backend)
+
+    runtime_source = {
+        "survive": "lighthouse",
+        "ultimate": "ultimate",
+    }.get(config.backend)
+    if runtime_source is not None:
+        # Identify persists device ownership, so it must use the same pinned
+        # runtime and host-access policy as the managed operation that will
+        # consume that binding.  Synthetic remains available for tests.
+        from .mantis_bridge import require_mantis_tracker_readiness
+
+        try:
+            require_mantis_tracker_readiness(runtime_source)
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from None
 
     source = create_source(config)
     print(f"Starting the {config.backend} backend...")
@@ -90,22 +112,36 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
             "Waiting for trackers to report (power them on and move them a little)..."
         )
         deadline = time.perf_counter() + _DISCOVER_TIMEOUT_S
-        while not source.poses():
+        live: list[str] = []
+        while len(live) < 2:
+            now = time.perf_counter()
+            live = sorted(
+                key
+                for key, sample in source.poses().items()
+                if sample.tracking and now - sample.t <= _FRESH_S
+            )
             if time.perf_counter() >= deadline:
+                source_hint = (
+                    "check power, pairing, and base-station visibility"
+                    if config.backend == "survive"
+                    else "check power, dongle permissions, and that both trackers "
+                    "have localized in the Windows-created SLAM map"
+                    if config.backend == "ultimate"
+                    else "check the tracker source"
+                )
                 raise SystemExit(
-                    "No trackers reported within "
-                    f"{_DISCOVER_TIMEOUT_S:.0f}s — check power, pairing, and "
-                    "(for Tracker 3.0) base-station visibility."
+                    "Two fresh, fully tracked devices did not report within "
+                    f"{_DISCOVER_TIMEOUT_S:.0f}s (live: "
+                    f"{', '.join(live) or 'none'}) — {source_hint}."
                 )
             time.sleep(0.2)
         # Give stragglers a moment to appear too.
         time.sleep(2.0)
-        keys = sorted(source.poses())
-        print(f"Discovered: {', '.join(keys)}\n")
+        print(f"Discovered and tracking: {', '.join(live)}\n")
 
         assigned: dict[str, str] = {}
         for side in ("left", "right"):
-            while True:
+            for attempt in range(1, _MAX_CAPTURE_ATTEMPTS + 1):
                 _confirm(
                     f"Hold every rig still. When ready, move ONLY the {side.upper()} "
                     f"Mantis for {_CAPTURE_S:.0f} seconds.",
@@ -118,7 +154,10 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                     if v >= _MIN_MOTION_M and k not in assigned.values()
                 }
                 if not candidates:
-                    print("  no tracker moved enough — try again, shake harder.")
+                    print(
+                        "  no unassigned, fully tracked device moved enough — "
+                        "restore tracking and try again."
+                    )
                     continue
                 key = max(candidates, key=candidates.get)  # type: ignore[arg-type]
                 others = sorted(
@@ -133,6 +172,11 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 print(f"  {side} = {key} ({candidates[key]:.2f} m of motion)")
                 assigned[side] = key
                 break
+            else:
+                raise SystemExit(
+                    f"Could not identify the {side} tracker after "
+                    f"{_MAX_CAPTURE_ATTEMPTS} attempts. No binding was changed."
+                )
 
         config.left = assigned["left"]
         config.right = assigned["right"]

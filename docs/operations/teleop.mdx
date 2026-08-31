@@ -1,15 +1,15 @@
 ---
 title: "Teleoperation"
-description: "Drive Axol live from a VR headset — from the web control panel or the CLI, on real hardware or in sim."
+description: "Drive Axol or validate a Mantis rig from Quest, Lighthouse, or Ultimate tracking."
 ---
 
-Teleoperation drives the robot live from a Meta Quest headset: the headset streams your hand and elbow pose to the SDK, which solves IK and commands the arms. You can run it two ways — from the **web control panel** (browser) or the **CLI** (`axol teleop`) — and against either the **real robot** or the **software simulator** (no hardware needed; the sim just swaps the motors for a browser visualizer).
+Teleoperation drives Axol live from a Meta Quest headset. It also has a **Mantis** hardware profile for bringing up the two handheld grippers and validating absolute Cartesian capture from Quest, VIVE Tracker 3.0 (Lighthouse), or VIVE Ultimate trackers. You can run either flow from the **web control panel** or the **CLI** (`axol teleop`).
 
 ## Before you start
 
 - **Axol installed** — the [one-command install](/installation) on the robot machine, or a [development install](/advanced/development-install) for sim.
-- **CAN up and motors verified** (real robot only). The control panel does this for you on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once, then check a motor with [`axol motor.info`](/cli/motor-info).
-- **A Meta Quest** on the same network, with the [TLS certificate authorized](#authorize-the-tls-certificate) once.
+- **CAN up and motors verified** (real Axol or Mantis only). The control panel does this on connect; on the CLI run [`axol can.setup`](/cli/can-setup) once. A Mantis hub should appear as two distinct Mantis interfaces, normally `can_mantis_l/r`.
+- **Your pose source ready.** Normal Axol and Quest Mantis use a Meta Quest with the [TLS certificate authorized](#authorize-the-tls-certificate). Lighthouse and Ultimate use the tracker setup below; a Quest is optional as a view-only passthrough display.
 
 <Note>
   No CAN setup or motor check is needed in **sim** — there's no hardware to talk to.
@@ -31,7 +31,7 @@ The easiest way is from the app itself: when you press **Connect** and the certi
       </Step>
 
       <Step title="(Optional) assign cameras">
-        To see the robot's camera feeds in the headset, open the **Cameras** settings tab and assign the ZED cameras to their slots. Skip this for camera-free teleop. See [Cameras](/guides/control-panel#cameras).
+        To see the robot's camera feeds in the headset, open **Axol Cameras** and assign the ZED cameras to their overhead / left arm / right arm slots. Skip this for camera-free teleop. See [Cameras](/guides/control-panel#cameras).
       </Step>
 
       <Step title="Select Teleoperation and Start">
@@ -73,7 +73,59 @@ The easiest way is from the app itself: when you press **Connect** and the certi
   </Tab>
 </Tabs>
 
-## Controller layout
+## Mantis teleop: end-to-end
+
+Mantis teleop enables only the two physical grippers; the Axol arms are an IK-driven URDF overlay. Use it to prove the exact source, side mapping, mount transform, and loss/recovery behavior that collection will use.
+
+<Steps>
+  <Step title="Connect the Mantis hardware and map its sides">
+    In the panel, enable **Mantis** in the Teleoperation card and connect the **Mantis** tile. Open **Settings → Mantis**. Confirm the left and right CAN fields are non-empty and different; if squeezing the physical left rig moves the reported right input, swap those two interface values and reconnect. Each side's trigger reader follows the same mapping.
+
+    Before setting up cameras or trackers, run `axol diag.mantis-trigger` to prove that each physical trigger proportionally drives its matching gripper. This check needs only CAN and safely stops both grippers on **Ctrl-C** or a lost trigger stream; see the [`diag.mantis-trigger` reference](/cli/diag-mantis-trigger).
+
+    Camera layouts are separate: **Settings → Axol Cameras** holds overhead / left arm / right arm, while **Settings → Mantis** contains the two-camera **Left Mantis / Right Mantis** layout. Save after changing the source, channels, or cameras.
+  </Step>
+
+  <Step title="Prepare and select one pose source">
+    <Tabs>
+      <Tab title="Quest">
+        Select **Quest** and save. Start the run, open [axol.almond.bot](https://axol.almond.bot) in the headset, connect to the host, authorize its certificate if prompted, and enter VR. WebXR handedness identifies left/right automatically; do not run tracker pairing or Identify. During the live run, Settings → Mantis shows both reported profile/space values and a copyable common key. Use it as **Quest calibration key**, then enter both measured mounts in the per-side transform editor under that identical `quest:&lt;reported-profile&gt;:grip` key. See [Meta Quest setup and the schema](/cli/tracker#meta-quest-setup).
+      </Tab>
+
+      <Tab title="Lighthouse">
+        Select **Lighthouse** and save. `axol provision` normally installs the runtime; if readiness is red, use **Install Lighthouse support** in this tab (the CLI equivalent is `axol tracker.install`). Power the base stations, pair each VIVE Tracker 3.0 with its Watchman dongle, then use **Pair tracker** and **Identify trackers** here. Move only the requested rig during each Identify capture. Both sides must be bound, visible, and reporting fresh poses before the run becomes ready. The bundled transform is currently a CAD candidate, not a production-verified constant; enter the measured values in the transform editor shown under `survive:&lt;left-codename&gt;` / `survive:&lt;right-codename&gt;`, then complete acceptance below.
+      </Tab>
+
+      <Tab title="Ultimate">
+        Select **Ultimate** and save. First pair both VIVE Ultimate trackers to the dongle and create/refine their shared tracking map in VIVE Hub on **Windows**; HTC's Windows-only service and the physical room scan cannot be automated by the Jetson panel. Back in Settings → Mantis, use **Install Ultimate support**, save the protected configuration/fallback in the **Private shared-map AP** editor (not the Windows or robot LAN), then physically connect the dongle and power both trackers. In USB-dongle mode the tracker firmware supplies the active host AP credentials; the setup page explains how the saved fallback is used. Use **Identify trackers**, moving only the requested rig, enter the measured mounts under the displayed `ultimate:&lt;left-mac&gt;` / `ultimate:&lt;right-mac&gt;` keys, and choose **Run readiness check**. The [VIVE Ultimate setup](/cli/tracker#vive-ultimate-tracker-setup-dongle--pyvut) includes the equivalent CLI route and file schemas.
+      </Tab>
+    </Tabs>
+  </Step>
+
+  <Step title="Start, align, and test recovery">
+    For Quest, hold the rigs at the agreed start pose, release both controller grip buttons, then press both grips together to align/engage. For managed Lighthouse/Ultimate, wait for **both tracker poses and both trigger heartbeats**, hold the rigs at the start pose, fully release both rig triggers, then squeeze both together once. The alignment squeeze is consumed and does not count toward an episode gesture.
+
+    If either pose source drops, both sides freeze. Recovery is deliberately inert: restore both sides, return to the alignment pose, release both controls, then press/squeeze both together again. Reset returns to rest and requires the same fresh gesture. It never re-anchors and moves automatically.
+  </Step>
+
+  <Step title="Accept the live source before collection">
+    Verify physical left/right, scale, every translation axis, wrist rotation, and tracker→TCP alignment. Deliberately occlude or de-localize each side and repeat the recovery test. `--sim --teleop.absolute_mode true` is only a generic mapping demo; physical acceptance must use `--mantis` and the selected live source.
+
+    With Lighthouse/Ultimate, a Quest may connect as a **view-only** passthrough/video/HUD client. Its controller frames are ignored and never blend with or replace the managed tracker bridge. Because the SDK does not yet provide a Quest↔tracker world-registration procedure, it hides the spatial URDF overlay by default for these sources. Only explicitly assert an out-of-band world registration after the Quest local-floor origin/yaw has been registered to the tracker installation's physical frame.
+  </Step>
+</Steps>
+
+The direct CLI owns the selected tracker bridge too:
+
+```bash
+axol teleop --mantis --mantis_source quest
+axol teleop --mantis --mantis_source lighthouse
+axol teleop --mantis --mantis_source ultimate
+```
+
+Do not launch a second `tracker.bridge` beside these commands. See the [Mantis tracker guide](/cli/tracker) for setup, binding files, calibration schema, and standalone diagnostic backends.
+
+## Quest controller layout
 
 <img src="/assets/quest.png" alt="Quest controller diagram" />
 

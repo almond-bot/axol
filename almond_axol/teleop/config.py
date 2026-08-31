@@ -150,9 +150,11 @@ class VRTeleopConfig:
             Engaging is therefore the alignment act: the operator holds both
             grippers at the agreed start pose (matching the robot's rest
             pose relative to the task scene) and squeezes both grips. The
-            offset between each controller and its gripper TCP (mount
-            geometry, URDF frame conventions) is absorbed by the same
-            engage snapshot. Elbow hints are ignored in this mode — human
+            offset between each controller and its gripper TCP is applied from
+            ``tcp_transform_left/right`` when known. Without that transform,
+            the engage snapshot aligns the starting pose only; later poses are
+            mount-dependent and unsuitable for production collection. Elbow
+            hints are ignored in this mode — human
             elbow positions say nothing about the robot's preferred null-space
             posture. ``position_multiplier`` / ``rotation_multiplier`` do not
             apply (the mapping is 1:1 by construction). Defaults to ``False``.
@@ -169,19 +171,34 @@ class VRTeleopConfig:
             per-unit override from ``~/.almond/mantis/tcp_transform.json``.
             When set, ``absolute_mode`` maps each tracked pose through it —
             recorded TCP poses become mount-independent and wrist rotations
-            stop smearing into position error — instead of absorbing the
-            whole controller→gripper offset into the engage snapshot. ``None``
-            falls back to the engage-snapshot absorption.
+            stop smearing into position error. ``None`` falls back to a
+            start-pose-only engage alignment, which is useful for bring-up but
+            not production Cartesian data.
         tcp_transform_right: Same for the right rig.
-        tracker_key: Identity key of the active tracker (e.g. ``"quest"``,
-            ``"survive:T20"``, ``"ultimate:<mac>"``) used to select the
-            matching per-tracker entry from the saved calibration file when
+        tracker_key: Identity key of the active tracker (e.g.
+            ``"quest:meta-quest-touch-plus:grip"``, ``"survive:T20"``, or
+            ``"ultimate:<mac>"``) used to select the matching per-tracker
+            entry from the saved calibration file when
             ``tcp_transform_left`` / ``tcp_transform_right`` are unset.
-            ``None`` (default) derives the key from the saved tracker config
-            (``~/.almond/tracker/config.json`` present → its backend/devices;
-            absent → ``"quest"``). Set it explicitly when that presumption is
-            wrong, e.g. teleoperating with the Quest on a machine that also
-            has a Vive backend configured.
+            ``None`` (default) uses the operation's explicit Mantis source when
+            available; legacy callers infer it from the saved tracker config
+            (file present → its backend/devices, absent → ``"quest"``).
+        quest_controller_profile: Expected WebXR controller profile for a
+            calibrated Quest rig (for example ``"oculus-touch-v3"``). A
+            profile-scoped transform key of the form
+            ``quest:<profile>:<space>`` fills this automatically. Absolute
+            tracking fails closed when a connected controller reports a
+            different profile or omits profile metadata.
+        quest_pose_space: Expected WebXR controller pose datum: ``"grip"``
+            for production Mantis capture, or ``"target-ray"`` only for
+            uncalibrated compatibility bring-up. Filled from a profile-scoped
+            Quest transform key alongside ``quest_controller_profile``.
+        urdf_viewer_world_aligned: Whether the active pose producer's world is
+            registered to the viewer headset's local-floor world. ``None``
+            chooses True for Quest and False for Lighthouse/Ultimate. External
+            tracker sessions keep the Quest video/HUD viewer useful but hide
+            the spatial URDF overlay unless an operator explicitly asserts an
+            out-of-band world registration.
     """
 
     rest_pose_left: np.ndarray = field(
@@ -239,9 +256,14 @@ class VRTeleopConfig:
     tcp_transform_left: list[float] | None = None
     tcp_transform_right: list[float] | None = None
     tracker_key: str | None = None
+    quest_controller_profile: str | None = None
+    quest_pose_space: str | None = None
+    urdf_viewer_world_aligned: bool | None = None
 
 
-def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
+def apply_mantis_teleop_profile(
+    config: VRTeleopConfig, *, tracker_source: str | None = None
+) -> None:
     """Force the Mantis mapping/faithfulness profile in place.
 
     Shared by ``collect-data --mantis`` and ``teleop --mantis`` so the two flows
@@ -261,12 +283,14 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
     Also resolves the tracker→gripper transform per side into
     ``tcp_transform_left`` / ``tcp_transform_right``, first match wins:
     explicitly set config values; the override-file entry for the active
-    tracker (``config.tracker_key``, or derived — see
+    tracker (``config.tracker_key``, or derived from ``tracker_source`` — see
     :func:`almond_axol.mantis.calibration.tracker_key_for_side`); the rig's
     factory design transform for the tracker family
     (:data:`~almond_axol.mantis.calibration.DESIGN_TCP_TRANSFORMS` — a design
-    constant, so it applies out of the box); a legacy unkeyed override
-    entry. A tracker with none of these is warned about loudly: the session
+    constant, so it applies out of the box). A legacy unkeyed override is
+    considered only when no active source is declared; a Mantis run never
+    applies a transform measured with an unknown tracker. A tracker with none
+    of these is warned about loudly: the session
     would otherwise silently record uncalibrated (engage-snapshot) TCP poses.
     """
     config.absolute_mode = True
@@ -276,6 +300,32 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
     config.teleop_max_accel = 1e6
     config.engage_max_vel = 1e6
     config.pose_min_cutoff = 5.0
+    if config.urdf_viewer_world_aligned is None:
+        config.urdf_viewer_world_aligned = tracker_source not in (
+            "lighthouse",
+            "ultimate",
+        )
+
+    if tracker_source == "quest" and config.tracker_key is not None:
+        from ..mantis.calibration import parse_quest_tracker_key
+
+        quest_datum = parse_quest_tracker_key(config.tracker_key)
+        if quest_datum is not None:
+            profile, pose_space = quest_datum
+            if config.quest_controller_profile not in (None, profile):
+                raise ValueError(
+                    "Quest tracker_key profile conflicts with "
+                    f"quest_controller_profile: {profile!r} != "
+                    f"{config.quest_controller_profile!r}"
+                )
+            if config.quest_pose_space not in (None, pose_space):
+                raise ValueError(
+                    "Quest tracker_key pose space conflicts with "
+                    f"quest_pose_space: {pose_space!r} != "
+                    f"{config.quest_pose_space!r}"
+                )
+            config.quest_controller_profile = profile
+            config.quest_pose_space = pose_space
 
     if config.tcp_transform_left is None or config.tcp_transform_right is None:
         from ..mantis.calibration import (
@@ -283,18 +333,52 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
             MANTIS_TCP_TRANSFORM_FILE,
             design_transform_for,
             load_tcp_transforms,
+            parse_quest_tracker_key,
+            select_quest_transform_key,
             tracker_key_for_side,
         )
 
         saved = load_tcp_transforms()
+        if tracker_source == "quest" and config.tracker_key is None:
+            config.tracker_key = select_quest_transform_key(saved)
+            if config.tracker_key is not None:
+                _logger.info(
+                    "Mantis Quest: selected the sole profile-scoped transform %r.",
+                    config.tracker_key,
+                )
+        if tracker_source == "quest" and config.tracker_key is not None:
+            quest_datum = parse_quest_tracker_key(config.tracker_key)
+            if quest_datum is not None:
+                profile, pose_space = quest_datum
+                if config.quest_controller_profile not in (None, profile):
+                    raise ValueError(
+                        "Quest transform profile conflicts with "
+                        f"quest_controller_profile: {profile!r} != "
+                        f"{config.quest_controller_profile!r}"
+                    )
+                if config.quest_pose_space not in (None, pose_space):
+                    raise ValueError(
+                        "Quest transform pose space conflicts with "
+                        f"quest_pose_space: {pose_space!r} != "
+                        f"{config.quest_pose_space!r}"
+                    )
+                config.quest_controller_profile = profile
+                config.quest_pose_space = pose_space
         for side in ("left", "right"):
             attr = f"tcp_transform_{side}"
             if getattr(config, attr) is not None:
                 continue
-            key, reason = tracker_key_for_side(side, override=config.tracker_key)
+            key, reason = tracker_key_for_side(
+                side,
+                override=config.tracker_key,
+                source=tracker_source,
+            )
             entries = saved.get(side, {})
             design = design_transform_for(side, key)
-            if key in entries:
+            scoped_quest_key = parse_quest_tracker_key(key)
+            if key in entries and not (
+                tracker_source == "quest" and scoped_quest_key is None
+            ):
                 setattr(config, attr, entries[key])
                 _logger.info(
                     "Mantis %s: loaded tracker→gripper calibration for tracker %r (%s).",
@@ -313,7 +397,7 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
                     reason,
                     MANTIS_TCP_TRANSFORM_FILE,
                 )
-            elif LEGACY_TRACKER_KEY in entries:
+            elif tracker_source is None and LEGACY_TRACKER_KEY in entries:
                 setattr(config, attr, entries[LEGACY_TRACKER_KEY])
                 _logger.warning(
                     "Mantis %s: no transform for the active tracker %r (%s) — "
@@ -326,6 +410,15 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
                     MANTIS_TCP_TRANSFORM_FILE,
                 )
             else:
+                from ..mantis.calibration import candidate_transform_for
+
+                candidate_note = (
+                    " A CAD candidate exists, but it is intentionally not "
+                    "applied until the live tracker datum and orientation are "
+                    "bench-verified."
+                    if candidate_transform_for(side, key) is not None
+                    else ""
+                )
                 _logger.warning(
                     "Mantis %s: NO tracker→gripper transform for the active "
                     "tracker %r (%s) — no factory design constant covers this "
@@ -334,9 +427,29 @@ def apply_mantis_teleop_profile(config: VRTeleopConfig) -> None:
                     "engage snapshot, so recorded TCP poses will be "
                     "mount-dependent and wrist rotations will smear into "
                     "position error. Add a measured transform to the file "
-                    "before collecting data.",
+                    "before collecting data.%s",
                     side,
                     key,
                     reason,
                     MANTIS_TCP_TRANSFORM_FILE,
+                    candidate_note,
                 )
+
+    # Saved transforms were validated while loading, but explicit dotted CLI
+    # / control-panel Advanced values bypass the file loader. Validate the
+    # final value from every source before the IK worker can slice it into a
+    # position and quaternion. Normalizing here also gives explicit values
+    # the same behavior as saved calibration entries.
+    from ..mantis.calibration import validate_tcp_transform
+
+    for side in ("left", "right"):
+        attr = f"tcp_transform_{side}"
+        transform = getattr(config, attr)
+        if transform is None:
+            continue
+        try:
+            setattr(config, attr, validate_tcp_transform(transform))
+        except ValueError as exc:
+            raise ValueError(
+                f"Mantis {side} tracker→gripper TCP transform is invalid: {exc}"
+            ) from exc

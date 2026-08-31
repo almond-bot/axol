@@ -873,7 +873,7 @@ static struct gs_can *gs_make_candev(unsigned int channel,
 	netdev->netdev_ops = &gs_usb_netdev_ops;
 
 	netdev->flags |= IFF_ECHO; /* we support full roundtrip echo */
-	netdev->dev_id = channel;  /* backport of upstream 04c9b00ba835
+	netdev->dev_id = channel;  /* backport of upstream acff76fa45b4
 				    * ("can: gs_usb: gs_make_candev(): set
 				    * netdev->dev_id") so userspace can tell
 				    * the two channels apart */
@@ -1104,4 +1104,5 @@ MODULE_DESCRIPTION(
 "Socket CAN device driver for Geschwister Schneider Technologie-, "
 "Entwicklungs- und Vertriebs UG. USB2.0 to CAN interfaces\n"
 "and bytewerk.org candleLight USB CAN interfaces.");
+MODULE_VERSION("almond-5.15.148-hub2");
 MODULE_LICENSE("GPL v2");

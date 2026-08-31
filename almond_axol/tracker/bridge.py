@@ -12,9 +12,10 @@ configured per side (see :class:`~almond_axol.tracker.trigger.TriggerReader`):
 the analog trigger position drives ``l_grip``/``r_grip`` proportionally
 (fully squeezed = closed, released = open). Rapid full squeeze/release
 sequences also control data collection: three presses starts a take when idle
-or ends one successfully; four presses ends one as a failure. Managed plain
-teleop/data-collection bridges engage automatically once both trackers are
-live. Other flows use :class:`StdinControls` (the trigger frame carries no
+or ends one successfully; four presses ends one as a failure. A managed
+plain-teleop/data-collection bridge waits for both trackers and triggers,
+then requires both triggers released and squeezed together to align and
+engage. Other flows use :class:`StdinControls` (the trigger frame carries no
 buttons — session controls arrive with a later PCB revision): Enter toggles
 tracking engage, ``r`` triggers a reset. A manual toggle is realised as a
 short pulse of both lock bits — the shared teleop core enables on a rising
@@ -22,10 +23,13 @@ edge of both locks together and disables on a rising edge of either.
 
 A side whose tracker stops reporting (occlusion, SLAM relocalising)
 holds its last good pose rather than going quiet, so IK never chases a
-glitch. Managed bridges freeze, wait for both sides to recover, and then
-re-anchor automatically; standalone bridges retain manual engage control.
+glitch. Managed bridges freeze and wait for both sides to recover; the
+operator must then release and squeeze both triggers together to re-anchor.
+Standalone bridges retain manual engage control.
 A stale trigger node likewise holds its last grip command, never jumping
-on a dropout.
+on a dropout. Managed bridges treat trigger freshness as a safety input:
+either trigger dropping out disengages tracking and recovery requires a new
+two-trigger release→squeeze at the alignment pose.
 """
 
 from __future__ import annotations
@@ -38,19 +42,28 @@ import ssl
 import sys
 import threading
 import time
+import uuid
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import numpy as np
 
 from ..utils.ports import VR_PORT
 from ..vr.models import VREpisodeOutcome, VRState
-from .base import TrackerPose, TrackerSource
+from .base import (
+    TRACKER_PAIR_MAX_SKEW_S,
+    TRACKER_POSE_MAX_AGE_S,
+    TrackerPose,
+    TrackerSource,
+    TrackerSourceError,
+)
 from .trigger import TriggerReader
 
 _logger = logging.getLogger(__name__)
 
-# A pose older than this is stale: hold the last streamed pose and warn.
-_STALE_S = 0.5
+# Keep direct ``q`` shutdown inside the managed context's five-second join
+# budget even if a local server is stuck mid-handshake or close handshake.
+_SOCKET_LIFECYCLE_TIMEOUT_S = 2.0
 # Lock/reset pulses span this many frames so the server-side edge
 # detection can't miss them across interpolation or a dropped frame.
 _PULSE_FRAMES = 10
@@ -69,6 +82,10 @@ _DEFAULT_POSE = {
     "left": (np.array([0.2, 1.0, -0.4]), np.array([0.0, 0.0, 0.0, 1.0])),
     "right": (np.array([-0.2, 1.0, -0.4]), np.array([0.0, 0.0, 0.0, 1.0])),
 }
+
+
+class TrackerBridgeError(RuntimeError):
+    """A non-network bridge failure that cannot be fixed by reconnecting."""
 
 
 class TriggerGestureRecognizer:
@@ -209,6 +226,74 @@ class StopEventControls:
         return False, reset
 
 
+class ManagedStdinControls:
+    """Reset/quit controls for a direct managed Mantis operation.
+
+    Unlike :class:`StdinControls`, Enter never toggles engagement: the managed
+    release→squeeze safety handshake owns that state.  ``q`` sets the bridge's
+    shared stop event and asks the context manager to interrupt the owning
+    teleop/collection loop, while EOF is ignored so redirected stdin does not
+    unexpectedly stop a robot operation.
+    """
+
+    def __init__(
+        self,
+        stop_event: Any,
+        on_quit: Callable[[], None],
+        *,
+        input_stream: Any = None,
+        activation_event: Any = None,
+    ) -> None:
+        self.quit = stop_event
+        self._on_quit = on_quit
+        self._input_stream = sys.stdin if input_stream is None else input_stream
+        self._activation_event = activation_event
+        self._reset_requests = 0
+        self._lock = threading.Lock()
+        self._started = False
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            daemon=True,
+            name="mantis-stdin",
+        )
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        if self._activation_event is not None:
+            while not self.quit.is_set():
+                if self._activation_event.wait(0.1):
+                    break
+            if self.quit.is_set():
+                return
+        for line in self._input_stream:
+            if self.quit.is_set():
+                return
+            command = line.strip().lower()
+            if command == "r":
+                with self._lock:
+                    self._reset_requests += 1
+            elif command == "q":
+                self.quit.set()
+                try:
+                    self._on_quit()
+                except Exception:  # noqa: BLE001 - stdin thread must stay contained
+                    _logger.exception("managed Mantis quit callback failed")
+                return
+
+    def consume(self) -> tuple[bool, bool]:
+        """Return a reset request; managed stdin never toggles engagement."""
+        with self._lock:
+            reset = self._reset_requests > 0
+            self._reset_requests = 0
+        return False, reset
+
+
 class TrackerBridge:
     """Composes and streams VRFrames from a :class:`TrackerSource`.
 
@@ -232,6 +317,14 @@ class TrackerBridge:
             lock request stays asserted until the core acknowledges tracking,
             and every release stays low until the core echoes its transaction
             ID, so slow startup/reset/IK handling cannot miss either edge.
+        confirm_auto_engage: When ``auto_engage`` is enabled and both trigger
+            readers exist, require a deliberate release then simultaneous
+            squeeze before each engage/re-engage. This makes the operator hold
+            both rigs at the intended rest/alignment pose before the absolute
+            world→base transform is fitted.
+        pose_source_id: Logical producer ID placed on every frame. Managed
+            operations supply the server's one-run token; standalone bridges
+            generate their own stable ID.
     """
 
     def __init__(
@@ -248,10 +341,17 @@ class TrackerBridge:
         right_trigger: TriggerReader | None = None,
         allow_single_side: bool = False,
         auto_engage: bool = False,
+        confirm_auto_engage: bool = False,
+        pose_source_id: str | None = None,
     ) -> None:
         if left is None and right is None:
             raise ValueError(
                 "no tracker is bound to either side — run `axol tracker.identify` first"
+            )
+        if left is not None and left == right:
+            raise ValueError(
+                f"left and right are both bound to {left!r}. Bind two distinct "
+                "trackers with `axol tracker.identify`."
             )
         if (left is None or right is None) and not allow_single_side:
             bound = "left" if right is None else "right"
@@ -274,6 +374,13 @@ class TrackerBridge:
         # Last grip streamed per side; held across trigger dropouts so a stale
         # node never commands a jump. Open until the first frame arrives.
         self._grip_held = {"left": 1.0, "right": 1.0}
+        # A missing reader is "live" for standalone/legacy bridges where the
+        # input is intentionally optional. Managed Mantis bridges require two
+        # readers at construction and update both values from CAN freshness.
+        self._trigger_fresh: dict[str, bool] = {
+            "left": left_trigger is None,
+            "right": right_trigger is None,
+        }
         self._warned_trigger: dict[str, bool] = {"left": False, "right": False}
         self._gesture = {
             "left": TriggerGestureRecognizer(),
@@ -281,9 +388,31 @@ class TrackerBridge:
         }
 
         self._seq = 0
+        # Stable across WebSocket reconnects for this bridge instance. The VR
+        # server de-duplicates sequence numbers per logical source and gives a
+        # tracker source exclusive control during managed Mantis runs.
+        if pose_source_id is not None and (
+            not isinstance(pose_source_id, str)
+            or not pose_source_id.strip()
+            or len(pose_source_id) > 128
+        ):
+            raise ValueError(
+                "pose_source_id must be a non-empty string of at most 128 characters"
+            )
+        self._pose_source_id = pose_source_id or f"tracker-{uuid.uuid4()}"
         self._engaged = False
         self._auto_engage_enabled = auto_engage
-        self._auto_engage_pending = auto_engage
+        self._confirm_auto_engage = auto_engage and confirm_auto_engage
+        if self._confirm_auto_engage and (
+            left_trigger is None or right_trigger is None
+        ):
+            raise ValueError(
+                "managed Mantis engagement requires fresh left and right trigger "
+                "inputs; configure both trigger CAN channels"
+            )
+        self._engage_confirmation_needed = self._confirm_auto_engage
+        self._engage_confirmation_armed = False
+        self._auto_engage_pending = auto_engage and not self._confirm_auto_engage
         self._auto_engage_waiting_ack = False
         self._auto_engage_withdrawn = False
         self._auto_disengage_pending = False
@@ -297,6 +426,7 @@ class TrackerBridge:
         self._held: dict[str, TrackerPose] = {}
         self._fresh: dict[str, bool] = {"left": False, "right": False}
         self._warned_stale: dict[str, bool] = {"left": False, "right": False}
+        self._warned_skew: dict[str, bool] = {"left": False, "right": False}
         # The server announces whether this connection belongs to teleop or
         # data collection. TELEOP is the safe default until that message lands.
         self._state = VRState.TELEOP
@@ -307,10 +437,24 @@ class TrackerBridge:
             self._auto_lock_release_seq += 1
             self._auto_lock_release_id = self._auto_lock_release_seq
 
+    def _require_engage_confirmation(self) -> None:
+        """Require a fresh two-trigger release→squeeze before auto-engaging."""
+        if self._confirm_auto_engage:
+            self._engage_confirmation_needed = True
+            self._engage_confirmation_armed = False
+            self._auto_engage_pending = False
+        else:
+            self._auto_engage_pending = True
+
     # -- Frame composition ---------------------------------------------------
 
     def _side_pose(
-        self, side: str, now: float, *, hold_updates: bool = False
+        self,
+        side: str,
+        now: float,
+        poses: dict[str, TrackerPose],
+        *,
+        hold_updates: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return the ``(pos, quat)`` to stream for one side.
 
@@ -323,8 +467,12 @@ class TrackerBridge:
         key = self._keys[side]
         self._fresh[side] = False
         if key is not None:
-            sample = self._source.poses().get(key)
-            if sample is not None and sample.tracking and now - sample.t <= _STALE_S:
+            sample = poses.get(key)
+            if (
+                sample is not None
+                and sample.tracking
+                and now - sample.t <= TRACKER_POSE_MAX_AGE_S
+            ):
                 self._fresh[side] = True
                 if not hold_updates:
                     self._held[side] = sample
@@ -354,9 +502,12 @@ class TrackerBridge:
         """
         reader = self._triggers[side]
         if reader is None:
+            self._trigger_fresh[side] = True
             return 1.0
         grip = reader.grip()
-        if grip is not None and not reader.is_stale():
+        fresh = grip is not None and not reader.is_stale()
+        self._trigger_fresh[side] = fresh
+        if fresh:
             self._grip_held[side] = grip
             if self._warned_trigger[side]:
                 self._warned_trigger[side] = False
@@ -397,6 +548,10 @@ class TrackerBridge:
 
         now = time.perf_counter()
         frame: dict = {}
+        # One atomic-ish backend snapshot per frame. Calling ``poses()`` once
+        # per side lets an intervening callback pair unrelated instants and
+        # hides real left/right skew.
+        poses = self._source.poses()
         hold_pose_updates = self._auto_engage_enabled and (
             self._auto_engage_withdrawn
             or self._auto_disengage_pending
@@ -406,7 +561,9 @@ class TrackerBridge:
             ("left", "l_ee", "l_elbow"),
             ("right", "r_ee", "r_elbow"),
         ):
-            pos, quat = self._side_pose(side, now, hold_updates=hold_pose_updates)
+            pos, quat = self._side_pose(
+                side, now, poses, hold_updates=hold_pose_updates
+            )
             frame[ee_key] = {
                 "position": {
                     "x": float(pos[0]),
@@ -427,21 +584,94 @@ class TrackerBridge:
                 "y": float(pos[1]),
                 "z": float(pos[2]),
             }
+            frame[f"{side[0]}_tracked"] = self._fresh[side]
+
+        left_held = self._held.get("left")
+        right_held = self._held.get("right")
+        if (
+            self._fresh["left"]
+            and self._fresh["right"]
+            and left_held is not None
+            and right_held is not None
+            and abs(left_held.t - right_held.t) > TRACKER_PAIR_MAX_SKEW_S
+        ):
+            older = "left" if left_held.t < right_held.t else "right"
+            self._fresh[older] = False
+            frame[f"{older[0]}_tracked"] = False
+            if not self._warned_skew[older]:
+                self._warned_skew[older] = True
+                _logger.warning(
+                    "%s tracker sample is %.0f ms behind the other side — "
+                    "holding and requiring a fresh Mantis alignment",
+                    older,
+                    abs(left_held.t - right_held.t) * 1000.0,
+                )
+        else:
+            self._warned_skew = {"left": False, "right": False}
 
         required_sides = [side for side, key in self._keys.items() if key is not None]
         all_required_fresh = all(self._fresh[side] for side in required_sides)
-        if self._auto_engage_waiting_ack and not all_required_fresh:
+        grips = {
+            "left": self._side_grip("left"),
+            "right": self._side_grip("right"),
+        }
+        frame["l_grip"] = grips["left"]
+        frame["r_grip"] = grips["right"]
+        frame["l_trigger_live"] = self._trigger_fresh["left"]
+        frame["r_trigger_live"] = self._trigger_fresh["right"]
+        all_required_triggers_fresh = all(
+            self._trigger_fresh[side] for side in ("left", "right")
+        )
+        all_required_inputs_fresh = all_required_fresh and (
+            all_required_triggers_fresh or not self._confirm_auto_engage
+        )
+
+        # A partial gesture cannot straddle a CAN dropout. In particular, a
+        # held stale grip must never resolve a triple press and start/finish a
+        # recording after its trigger node has stopped reporting.
+        for side, recognizer in self._gesture.items():
+            if self._triggers[side] is not None and not self._trigger_fresh[side]:
+                recognizer.cancel_sequence()
+
+        confirmation_press = False
+        if not all_required_inputs_fresh and self._engage_confirmation_needed:
+            # A release observed before a tracker or trigger dropout cannot
+            # authorize a later engage. Recovery starts a new cycle.
+            self._engage_confirmation_armed = False
+        if (
+            self._auto_engage_enabled
+            and self._engage_confirmation_needed
+            and not self._engaged
+            and all_required_inputs_fresh
+        ):
+            if all(value >= _GESTURE_RELEASE_GRIP for value in grips.values()):
+                self._engage_confirmation_armed = True
+            elif self._engage_confirmation_armed and all(
+                value <= _GESTURE_PRESS_GRIP for value in grips.values()
+            ):
+                self._engage_confirmation_needed = False
+                self._engage_confirmation_armed = False
+                self._auto_engage_pending = True
+                confirmation_press = True
+                for side, recognizer in self._gesture.items():
+                    # Consume the alignment squeeze in each recognizer so a
+                    # still-held trigger cannot become press #1 of the episode
+                    # triple-click gesture on the next frame.
+                    recognizer.update(grips[side], now)
+                    recognizer.cancel_sequence()
+                _logger.info("alignment confirmed with both triggers — engaging Mantis")
+        if self._auto_engage_waiting_ack and not all_required_inputs_fresh:
             # Withdraw an unacknowledged engage request if tracking drops in
             # the meantime. Keeping the level asserted would let the core
             # eventually engage against historical held poses.
             self._auto_engage_waiting_ack = False
             self._auto_engage_withdrawn = True
-            self._auto_engage_pending = True
+            self._require_engage_confirmation()
             self._request_auto_lock_release()
         if (
             self._auto_engage_enabled
             and self._engaged
-            and not all_required_fresh
+            and not all_required_inputs_fresh
             and not self._auto_disengage_pending
             and not self._auto_disengage_waiting_ack
         ):
@@ -449,10 +679,11 @@ class TrackerBridge:
             # core out of tracking before a returning tracker can jump under
             # the old world→base fit; once both sides are fresh, the normal
             # auto-engage path takes a new alignment snapshot.
-            self._auto_engage_pending = True
+            self._require_engage_confirmation()
             self._auto_disengage_pending = True
             _logger.warning(
-                "tracker freshness lost — freezing Mantis until both sides recover"
+                "tracker or trigger freshness lost — freezing Mantis until "
+                "both sides recover"
             )
         if (
             self._auto_disengage_pending
@@ -469,14 +700,14 @@ class TrackerBridge:
             self._auto_engage_enabled
             and self._auto_engage_pending
             and not self._engaged
-            and all_required_fresh
+            and all_required_inputs_fresh
             and not self._auto_disengage_pending
             and not self._auto_disengage_waiting_ack
             and self._auto_lock_release_id is None
         ):
             self._auto_engage_pending = False
             self._auto_engage_waiting_ack = True
-            _logger.info("trackers live — engaging Mantis tracking automatically")
+            _logger.info("trackers live and aligned — engaging Mantis tracking")
 
         lock = (
             self._lock_pulse > 0
@@ -498,20 +729,18 @@ class TrackerBridge:
         if self._reset_pulse > 0:
             self._reset_pulse -= 1
 
-        grips = {
-            "left": self._side_grip("left"),
-            "right": self._side_grip("right"),
-        }
-        frame["l_grip"] = grips["left"]
-        frame["r_grip"] = grips["right"]
-
         # A gesture may be issued on either side. Failure wins if two sides
         # happen to complete different gestures on the same frame.
-        outcomes = [
-            self._gesture[side].update(grips[side], now)
-            for side in ("left", "right")
-            if self._triggers[side] is not None
-        ]
+        outcomes = (
+            []
+            if confirmation_press
+            or (self._confirm_auto_engage and not all_required_inputs_fresh)
+            else [
+                self._gesture[side].update(grips[side], now)
+                for side in ("left", "right")
+                if self._triggers[side] is not None and self._trigger_fresh[side]
+            ]
+        )
         gesture = (
             VREpisodeOutcome.FAILURE
             if VREpisodeOutcome.FAILURE in outcomes
@@ -558,15 +787,25 @@ class TrackerBridge:
 
         self._seq += 1
         frame["seq"] = self._seq
+        frame["pose_source_id"] = self._pose_source_id
+        frame["pose_source_kind"] = "tracker"
         # Stamp with the tracker sample's *capture* time (monotonic ms, like
         # performance.now()), not compose time: the server's interpolator
         # reconstructs this instant as ``t_host``, and Mantis recording aligns
         # dataset rows and camera exposures on it — stamping compose time
         # would fold the tracker→bridge latency into every recorded pose.
-        # With two trackers the freshest capture stands in for both (the
-        # sides sample within a driver poll of each other).
-        cap_ts = [p.t for p in self._held.values()]
-        frame["t"] = (max(cap_ts) if cap_ts else now) * 1000.0
+        # A valid two-hand frame is no newer than its oldest contributing
+        # sample. Invalid/stale frames use compose time so the tracking-loss
+        # control edge is delivered monotonically; their false tracked flag
+        # prevents QA or IK from treating that timestamp as a live pose.
+        required_held = [
+            self._held[side]
+            for side in required_sides
+            if side in self._held and self._fresh[side]
+        ]
+        all_required_held_fresh = len(required_held) == len(required_sides)
+        capture_t = min(p.t for p in required_held) if all_required_held_fresh else now
+        frame["t"] = capture_t * 1000.0
         return frame
 
     def _handle_tracking_state(self, engaged: bool) -> None:
@@ -592,7 +831,7 @@ class TrackerBridge:
                 # the tracker already recovered, so absolute IK re-anchors.
                 self._auto_engage_withdrawn = False
                 self._auto_disengage_pending = True
-                self._auto_engage_pending = True
+                self._require_engage_confirmation()
             else:
                 # Seed from an already-engaged core (for example after bridge
                 # reconnect). Adopt it instead of toggling it off.
@@ -609,7 +848,7 @@ class TrackerBridge:
         self._auto_engage_waiting_ack = False
         self._auto_disengage_waiting_ack = False
         self._auto_disengage_pending = False
-        self._auto_engage_pending = True
+        self._require_engage_confirmation()
         if was_engaged:
             # Whether this was our stale-tracker toggle or an out-of-band
             # reset/contact stop, make the core prove it consumed a low frame
@@ -648,21 +887,53 @@ class TrackerBridge:
                 "r = reset, q = quit; trigger x3 = start/success, "
                 "trigger x4 = failure."
             )
-        else:
+        elif isinstance(self._controls, ManagedStdinControls):
             print(
-                "Streaming tracker poses (tracking managed automatically); "
-                "trigger x3 = start/success, trigger x4 = failure."
+                "Streaming managed Mantis tracker poses. Controls: r = reset, "
+                "q = stop; engagement uses the two-trigger alignment handshake; "
+                "trigger x3 = start/success, x4 = failure."
             )
+        else:
+            if self._confirm_auto_engage:
+                print(
+                    "Streaming tracker poses. Hold both rigs at the alignment "
+                    "pose, release both triggers, then squeeze both together "
+                    "to engage; trigger x3 = start/success, x4 = failure."
+                )
+            else:
+                print(
+                    "Streaming tracker poses (tracking managed automatically); "
+                    "trigger x3 = start/success, trigger x4 = failure."
+                )
         while not self._controls.quit.is_set():
             try:
-                async with websockets.connect(uri, ssl=ssl_ctx, max_queue=4) as ws:
+                async with websockets.connect(
+                    uri,
+                    ssl=ssl_ctx,
+                    max_queue=4,
+                    open_timeout=_SOCKET_LIFECYCLE_TIMEOUT_S,
+                    close_timeout=_SOCKET_LIFECYCLE_TIMEOUT_S,
+                ) as ws:
                     _logger.info("connected to %s", uri)
                     await self._stream(ws)
             except asyncio.CancelledError:
                 raise
+            except (TrackerSourceError, TrackerBridgeError):
+                raise
             except Exception as exc:  # noqa: BLE001 - reconnect on any drop
                 if self._controls.quit.is_set():
                     break
+                # A socket failure and a backend failure can race. Probe the
+                # source before entering the reconnect delay so a dead reader
+                # cannot leave its owning operation alive indefinitely.
+                try:
+                    self._source.poses()
+                except TrackerSourceError:
+                    raise
+                except Exception as source_exc:  # noqa: BLE001 - backend API varies
+                    raise TrackerBridgeError(
+                        "tracker backend health check failed"
+                    ) from source_exc
                 _logger.warning("connection to %s lost (%s); retrying in 2s", uri, exc)
                 await asyncio.sleep(2.0)
 
@@ -674,7 +945,15 @@ class TrackerBridge:
         try:
             while not self._controls.quit.is_set():
                 deadline += interval
-                await ws.send(json.dumps(self.compose_frame()))
+                try:
+                    payload = json.dumps(self.compose_frame())
+                except TrackerSourceError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - composition is fatal
+                    raise TrackerBridgeError(
+                        f"could not compose tracker frame ({type(exc).__name__}: {exc})"
+                    ) from exc
+                await ws.send(payload)
                 await asyncio.sleep(max(0.0, deadline - time.perf_counter()))
         finally:
             drain.cancel()

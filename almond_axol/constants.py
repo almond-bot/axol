@@ -3,6 +3,8 @@
 from enum import Enum
 from pathlib import Path
 
+from .utils.paths import almond_path
+
 
 class Joint(Enum):
     """All motor joints on one arm, in control order.
@@ -39,7 +41,7 @@ CAN_CHEST = "can_alm_axol_c"
 # it flaps both arm-hub channels *together* (flapping one at a time can wedge
 # the adapter's RX path). The CAN bus layer reuses it to purge stale TX frames
 # after an e-stop (see almond_axol/motor/bus.py).
-CAN_BRINGUP_SCRIPT: Path = Path.home() / ".almond" / "can" / "startup.sh"
+CAN_BRINGUP_SCRIPT: Path = almond_path("can", "startup.sh")
 
 # Mantis handheld data-collection rig: one dual-channel adapter, each channel
 # wired to a single Damiao gripper (CAN ID 0x08, same as Joint.GRIPPER).

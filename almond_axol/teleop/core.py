@@ -119,6 +119,18 @@ class VRTeleopCore:
         # control-loop tick that consumed it. ``None`` until the first solve
         # (or when the transport doesn't provide capture times).
         self.last_pose_host_ts: float | None = None
+        # Per-side validity carried by WebXR/managed tracker frames. Dataset
+        # collection uses it to refuse a take when one hand is being held from
+        # stale tracking while the other still moves.
+        self.last_tracking: dict[str, bool] = {"left": False, "right": False}
+        # Per-side Mantis trigger-node liveness. Quest/legacy VRFrame senders
+        # inherit True defaults; a managed tracker bridge explicitly marks a
+        # side False once its 100 Hz CAN heartbeat becomes stale.
+        self.last_trigger_live: dict[str, bool] = {"left": False, "right": False}
+        # Rate-limit a calibrated Quest datum mismatch while still surfacing
+        # exactly what the headset reported. The actual safety action is to
+        # turn that side's tracked flag false before the absolute-mode gate.
+        self._quest_datum_warning: tuple[object, ...] | None = None
         # Absolute (Mantis) mode: the engage-calibrated base transform in VR world
         # coords ({"pos": [x,y,z], "quat": [x,y,z,w]}), as reported by the IK
         # worker. ``None`` before the first engage / outside absolute mode.
@@ -184,6 +196,13 @@ class VRTeleopCore:
         # always deliberate; cleared once engaged, so an operator who froze
         # both arms mid-task can resume either with a single click.
         self._require_both_engage: bool = True
+        # Absolute tracker poses can snap when optical tracking returns. A
+        # lost side therefore freezes both arms and blocks re-engagement until
+        # the core itself has consumed a fully released frame followed by a
+        # fresh two-grip squeeze. Keeping this gate in the core also protects
+        # Quest/WebXR senders, not just the managed Lighthouse/Ultimate bridge.
+        self._tracking_reengage_blocked: bool = False
+        self._tracking_release_seen: bool = False
         self._at_rest: bool = True
         self._engage_time: float | None = None
 
@@ -398,6 +417,13 @@ class VRTeleopCore:
         self._prev_r_lock = False
         self._require_both_engage = True
         self._engage_time = None
+        if self.config.absolute_mode:
+            # A forced stop invalidates the absolute world→base anchor. This
+            # covers explicit bad-tracking frames as well as a total WebXR
+            # stream gap (where no frame exists to carry l/r_tracked=False),
+            # resets, and contact stops.
+            self._tracking_reengage_blocked = True
+            self._tracking_release_seen = False
         if log_message is not None and was_enabled:
             self._logger.info(log_message)
         self._broadcast(False)
@@ -501,6 +527,88 @@ class VRTeleopCore:
             self.l_grip = frame.l_grip
         if self.right_enabled:
             self.r_grip = frame.r_grip
+
+    def _accept_tracking_frame(self, frame: object) -> bool:
+        """Gate absolute-mode frames across an optical tracking dropout.
+
+        Returning ``False`` holds the last target and deliberately skips the
+        engage update. Once both tracked flags recover, both lock inputs must
+        be observed low before a later two-lock press can re-anchor absolute
+        IK. The low frame is accepted so the managed bridge's lock-release
+        acknowledgement still completes.
+        """
+        if not self.config.absolute_mode:
+            return True
+
+        tracking_ok = bool(frame.l_tracked) and bool(frame.r_tracked)
+        if not tracking_ok:
+            if not self._tracking_reengage_blocked:
+                self._disengage_all("Teleop disabled (tracker visibility lost)")
+            self._tracking_release_seen = False
+            return False
+
+        if not self._tracking_reengage_blocked:
+            return True
+
+        l_lock = bool(frame.l_lock)
+        r_lock = bool(frame.r_lock)
+        if not self._tracking_release_seen:
+            if l_lock or r_lock:
+                return False
+            self._tracking_release_seen = True
+            return True
+
+        if l_lock and r_lock:
+            self._tracking_reengage_blocked = False
+            self._tracking_release_seen = False
+        return True
+
+    def _validated_tracking_flags(self, frame: object) -> dict[str, bool]:
+        """Combine optical tracking with calibrated Quest datum identity.
+
+        WebXR ``gripSpace`` and ``targetRaySpace`` have different origins, and
+        Touch controller profiles can change the device-local grip frame. A
+        transform calibrated for one pair must never be applied to another.
+        Uncalibrated bring-up has no expected profile and retains the normal
+        optical flags.
+        """
+        flags = {
+            "left": bool(frame.l_tracked),
+            "right": bool(frame.r_tracked),
+        }
+        expected_profile = self.config.quest_controller_profile
+        if not self.config.absolute_mode or expected_profile is None:
+            self._quest_datum_warning = None
+            return flags
+
+        expected_space = self.config.quest_pose_space or "grip"
+        observed: list[object] = []
+        for side in ("left", "right"):
+            prefix = side[0]
+            profile = getattr(frame, f"{prefix}_pose_profile", None)
+            pose_space = getattr(frame, f"{prefix}_pose_space", None)
+            observed.extend((side, profile, pose_space))
+            if profile != expected_profile or pose_space != expected_space:
+                flags[side] = False
+
+        warning = (expected_profile, expected_space, *observed)
+        if not all(flags.values()) and warning != self._quest_datum_warning:
+            self._logger.error(
+                "Quest controller datum mismatch: calibrated for profile %r "
+                "using %s space, received left=(%r, %r), right=(%r, %r). "
+                "Mantis tracking is held; use gripSpace controllers matching "
+                "the saved calibration.",
+                expected_profile,
+                expected_space,
+                getattr(frame, "l_pose_profile", None),
+                getattr(frame, "l_pose_space", None),
+                getattr(frame, "r_pose_profile", None),
+                getattr(frame, "r_pose_space", None),
+            )
+        elif all(flags.values()) and self._quest_datum_warning is not None:
+            self._logger.info("Quest controllers now match the calibrated datum")
+        self._quest_datum_warning = None if all(flags.values()) else warning
+        return flags
 
     def set_target(self, q_raw: object) -> None:
         """Publish a fresh raw IK solution (consumed by compute_output).
@@ -995,11 +1103,44 @@ class VRTeleopCore:
                 self._logger.exception("VR frame sampling failed; keeping last target")
                 self._pace(t0, ik_interval)
                 continue
-            if frame is None or frame is last_frame:
+            if frame is None:
+                self._maybe_disengage_stale(conn, last_frame, process_alive)
+                time.sleep(0.001)
+                continue
+            if frame is last_frame:
+                # PoseInterpolator deliberately preserves object identity when
+                # the rendered pose is numerically unchanged, but advances
+                # t_host as equal-valued raw samples arrive. The action is
+                # still current without another IK solve, so carry that live
+                # capture heartbeat into Mantis dataset timestamps/QA.
+                pose_ts = getattr(frame, "t_host", None)
+                if pose_ts is not None:
+                    self.last_pose_host_ts = pose_ts
                 self._maybe_disengage_stale(conn, last_frame, process_alive)
                 time.sleep(0.001)
                 continue
             last_frame = frame
+            self.last_tracking = self._validated_tracking_flags(frame)
+            if self.last_tracking != {
+                "left": bool(frame.l_tracked),
+                "right": bool(frame.r_tracked),
+            }:
+                # Feed the combined optical+datum validity through the same
+                # forced-disengage/release→squeeze gate as a camera occlusion.
+                frame = frame.model_copy(
+                    update={
+                        "l_tracked": self.last_tracking["left"],
+                        "r_tracked": self.last_tracking["right"],
+                    }
+                )
+            self.last_trigger_live = {
+                "left": bool(getattr(frame, "l_trigger_live", True)),
+                "right": bool(getattr(frame, "r_trigger_live", True)),
+            }
+
+            if not self._accept_tracking_frame(frame):
+                self._pace(t0, ik_interval)
+                continue
 
             try:
                 self.update_engage(frame)
@@ -1104,6 +1245,13 @@ class VRTeleopCore:
                 "base": self.abs_base,
                 "joints": joints,
                 "engaged": self.teleop_enabled,
+                # Lighthouse/Ultimate coordinates are unrelated to a
+                # view-only Quest's local-floor origin/yaw unless the two
+                # installations were explicitly co-registered. Never render
+                # a plausible-looking but spatially false calibration overlay.
+                "viewer_world_aligned": (
+                    self.config.urdf_viewer_world_aligned is not False
+                ),
             }
         )
 

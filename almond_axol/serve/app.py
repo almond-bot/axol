@@ -14,13 +14,14 @@ import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
-from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, URDF_PATH
+from ..constants import URDF_PATH
 from ..utils import adb, ports
+from ..utils.can_channels import require_mantis_channels
 from ..utils.certs import ACCEPT_PAGE_HTML
 from ..utils.sudo import prime_sudo
 from .commands import COMMANDS, command_specs, flag_enabled, operation_ids
@@ -83,9 +84,9 @@ class RobotConnectRequest(BaseModel):
     ``channelsSet`` distinguishes "connect with the stored/default interfaces"
     (an empty body) from an explicit selection. A ``None`` channel disables
     that arm, so a single non-Axol-hub adapter can drive one arm only. The
-    Axol selections are persisted to the shared operation settings. Mantis
-    selections affect only the idle diagnostics link, so inspecting the rig
-    cannot overwrite the robot's channels.
+    Axol and Mantis selections are persisted independently. Selecting or
+    swapping the rig's hub channels therefore cannot overwrite the robot's
+    channels, and the next Mantis teleop/collection run uses the same map.
     """
 
     leftChannel: str | None = None
@@ -149,16 +150,32 @@ _VR_PORT = ports.VR_PORT  # VR teleop WebSocket server (shared with the adb tunn
 
 def _lan_ip() -> str:
     """Best-effort LAN IP of this machine (the one a headset/peer can reach)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-        except OSError:
-            return "127.0.0.1"
+    from ..utils.network import local_ip
+
+    return local_ip()
 
 
 # ARPHRD_CAN in /sys/class/net/<iface>/type — identifies CAN interfaces.
 _ARPHRD_CAN = "280"
+
+
+def _mantis_channel_mismatch_message(
+    active: tuple[str | None, str | None],
+    expected: tuple[str, str],
+) -> str | None:
+    """Actionable preflight error when an open link uses an older rig map."""
+    if active == expected:
+        return None
+    formatted = ", ".join(
+        f"{side}={channel or 'disabled'}"
+        for side, channel in zip(("left", "right"), expected, strict=True)
+    )
+    return (
+        "The saved Mantis CAN mapping changed after this link connected "
+        f"({formatted}). Disconnect and reconnect Mantis, then start again. "
+        "If the physical sides are reversed, swap the two channels in "
+        "Settings → Mantis first."
+    )
 
 
 def _list_can_interfaces() -> list[dict[str, Any]]:
@@ -233,6 +250,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     # ZED devices are exclusive. Hold this across preview capture and operation
     # startup so both paths make their idle check while owning one reservation.
     camera_reservation = asyncio.Lock()
+    # Operations and spawned setup/diagnostic commands share hardware (CAN,
+    # cameras, and tracker dongles).  Their check-and-start sequences must be
+    # atomic in both directions: without this lock, a tracker Identify could
+    # pass its idle check while a Mantis operation was still starting (or vice
+    # versa), leaving two readers fighting over the same device.
+    session_launch_reservation = asyncio.Lock()
+    # A CAN-owning subprocess becomes terminal just before its watcher has
+    # reopened the idle RobotLink.  Keep that small cleanup window reserved so
+    # a new operation cannot start against a link that is still being restored.
+    diagnostic_cleanup_pending: set[str] = set()
+
+    def _diagnostic_session_active() -> bool:
+        return bool(diagnostic_cleanup_pending) or any(
+            session["status"] in ("starting", "running", "stopping")
+            for session in manager.list()
+        )
 
     def _is_idle() -> bool:
         """Safe to restart: no operation running.
@@ -243,7 +276,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         """
         if runner.is_running():
             return False
-        return not any(s["status"] in ("starting", "running") for s in manager.list())
+        return not _diagnostic_session_active()
 
     # Surfaces "update available" (a newer release tag, found via read-only
     # `git ls-remote --tags`) to the control panel via /api/update/status and
@@ -393,13 +426,21 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
     ) -> dict[str, Any] | JSONResponse:
         """Connect the robot link, optionally onto explicit CAN interfaces.
 
-        Axol channel selections are persisted to the shared operation settings.
-        Mantis selection points the idle telemetry link at the rig without
-        changing the Axol channels stored for robot operations.
+        Axol and Mantis channel selections are persisted independently and
+        reused by operations for that hardware profile.
         """
         profile = req.profile if req is not None else "axol"
         if req is not None and req.channelsSet:
-            if not req.leftChannel and not req.rightChannel:
+            channels: tuple[str | None, str | None] = (
+                req.leftChannel,
+                req.rightChannel,
+            )
+            if profile == "mantis":
+                try:
+                    channels = require_mantis_channels(channels)
+                except ValueError as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
+            elif not req.leftChannel and not req.rightChannel:
                 return JSONResponse(
                     {"error": "select a CAN interface for at least one side"},
                     status_code=400,
@@ -412,13 +453,22 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             if profile == "axol":
                 settings.update(
                     values={
-                        "robot.left_channel": req.leftChannel or "null",
-                        "robot.right_channel": req.rightChannel or "null",
+                        "robot.left_channel": channels[0] or "null",
+                        "robot.right_channel": channels[1] or "null",
                     }
                 )
-            channels = (req.leftChannel, req.rightChannel)
+            else:
+                settings.update(
+                    values={
+                        "mantis.left_channel": channels[0],
+                        "mantis.right_channel": channels[1],
+                    }
+                )
         elif profile == "mantis":
-            channels = (CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT)
+            try:
+                channels = require_mantis_channels(settings.mantis_can_channels())
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
         else:
             channels = settings.can_channels()
         if channels != robot.channels() or profile != robot.profile():
@@ -497,7 +547,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         finally:
             manager.unsubscribe(session, queue)
             if uses_can_bus:
-                await asyncio.to_thread(robot.reacquire)
+                # The process status is already terminal here, so retain the
+                # shared reservation explicitly until the idle link owns CAN
+                # again.  The launch lock makes the pending-check and discard
+                # atomic with both launch endpoints.
+                async with session_launch_reservation:
+                    try:
+                        await asyncio.to_thread(robot.reacquire)
+                    finally:
+                        diagnostic_cleanup_pending.discard(session.id)
         if meta is not None:
             await asyncio.to_thread(
                 runs.finalize,
@@ -507,52 +565,84 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 list(session.log),
             )
 
+    async def _launch_subprocess_command(
+        command_id: str,
+        args: dict[str, Any],
+        *,
+        stdin_pipe: bool,
+    ) -> tuple[Any, Session, bool] | JSONResponse:
+        """Atomically reserve shared hardware and spawn one catalog command."""
+        command = COMMANDS.get(command_id)
+        if command is None:
+            return JSONResponse(
+                {"error": f"unknown command: {command_id}"}, status_code=400
+            )
+
+        async with session_launch_reservation:
+            if runner.is_running():
+                return JSONResponse(
+                    {"error": "an operation is running — stop it first"},
+                    status_code=409,
+                )
+            if _diagnostic_session_active():
+                return JSONResponse(
+                    {"error": "another session is running — stop it first"},
+                    status_code=409,
+                )
+            profile = robot.profile()
+            if profile not in command.hardware_profiles:
+                allowed = " or ".join(command.hardware_profiles)
+                return JSONResponse(
+                    {
+                        "error": f"{command.label} requires the {allowed} "
+                        f"hardware profile; the connected profile is {profile}"
+                    },
+                    status_code=409,
+                )
+            if command.drives_motors:
+                fault_response = await _motor_fault_response(scope_args=args)
+                if fault_response is not None:
+                    return fault_response
+
+            # A camera-only diagnostic (ZED cable check) doesn't touch the CAN
+            # bus, so leave the idle motor telemetry streaming while it runs.
+            uses_can_bus = command.uses_can_bus
+            if uses_can_bus:
+                await asyncio.to_thread(robot.release)
+            try:
+                session = await manager.start(command_id, args, stdin_pipe=stdin_pipe)
+            except Exception:
+                if uses_can_bus:
+                    await asyncio.to_thread(robot.reacquire)
+                raise
+
+            if uses_can_bus:
+                if session.status == "error":
+                    await asyncio.to_thread(robot.reacquire)
+                else:
+                    diagnostic_cleanup_pending.add(session.id)
+            return command, session, uses_can_bus
+
     @app.post("/api/diagnostics/run")
     async def diagnostics_run(req: DiagnosticsRunRequest) -> JSONResponse:
         # Diagnostics commands open the CAN bus (or reconfigure its interfaces)
         # themselves, so the launch does the same single-owner dance as the
         # in-process operations: refuse while something else owns the bus, and
         # hand the idle link's buses over for the duration of the run.
-        command = COMMANDS.get(req.command)
-        if command is None:
-            return JSONResponse(
-                {"error": f"unknown command: {req.command}"}, status_code=400
-            )
-        if runner.is_running():
-            return JSONResponse(
-                {"error": "an operation is running — stop it first"}, status_code=409
-            )
-        if any(s["status"] in ("starting", "running") for s in manager.list()):
-            return JSONResponse(
-                {"error": "another session is running — stop it first"},
-                status_code=409,
-            )
-        if command.drives_motors:
-            fault_response = await _motor_fault_response(scope_args=req.args)
-            if fault_response is not None:
-                return fault_response
-
-        # A camera-only diagnostic (ZED cable check) doesn't touch the CAN bus,
-        # so leave the idle motor telemetry streaming while it runs.
-        uses_can_bus = command.uses_can_bus
-        if uses_can_bus:
-            await asyncio.to_thread(robot.release)
-        try:
-            # A writable stdin lets the UI answer the diagnostic's hands-on
-            # prompts (the "Continue" button) via /input below.
-            session = await manager.start(req.command, req.args, stdin_pipe=True)
-        except Exception:
-            if uses_can_bus:
-                await asyncio.to_thread(robot.reacquire)
-            raise
+        # A writable stdin lets the UI answer the diagnostic's hands-on prompts
+        # (the "Continue" button) via /input below.
+        launched = await _launch_subprocess_command(
+            req.command, req.args, stdin_pipe=True
+        )
+        if isinstance(launched, JSONResponse):
+            return launched
+        command, session, uses_can_bus = launched
         # Only the Diagnostics tests are recorded in the run history; the
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
         # the bus handover + prompt plumbing but leave no record behind.
         record = command.category == "Diagnostics"
         meta = runs.begin(session.id, req.command, req.args) if record else None
         if session.status == "error":
-            if uses_can_bus:
-                await asyncio.to_thread(robot.reacquire)
             if meta is not None:
                 await asyncio.to_thread(
                     runs.finalize,
@@ -669,30 +759,249 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 else ...,
                 advanced=req.advanced,
             )
-        except KeyError as exc:
+        except (KeyError, ValueError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(snapshot)
 
+    def quest_calibration_key() -> object:
+        snapshot = settings.snapshot()
+        values = snapshot.get("values")
+        return (
+            values.get("mantis.quest_tracker_key") if isinstance(values, dict) else None
+        )
+
+    async def redacted_json_body(
+        request: Request,
+    ) -> tuple[dict[str, Any] | None, JSONResponse | None]:
+        """Parse a JSON object without echoing a possibly secret request body."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - parser detail may contain body data
+            return None, JSONResponse(
+                {"error": "request body must be valid JSON"}, status_code=400
+            )
+        if not isinstance(body, dict):
+            return None, JSONResponse(
+                {"error": "request body must be a JSON object"}, status_code=400
+            )
+        return body, None
+
+    # -- tracker setup files -------------------------------------------------
+
+    @app.get("/api/tracker/ultimate/wifi")
+    async def get_ultimate_wifi() -> dict[str, Any]:
+        """Non-secret Ultimate shared-map Wi-Fi configuration status."""
+        from .tracker_setup import ultimate_wifi_snapshot
+
+        return await asyncio.to_thread(ultimate_wifi_snapshot)
+
+    @app.put("/api/tracker/ultimate/wifi", response_model=None)
+    async def put_ultimate_wifi(request: Request) -> JSONResponse:
+        """Save shared-map Wi-Fi values without ever returning the password."""
+        from .tracker_setup import TrackerSetupError, save_ultimate_wifi
+
+        body, error = await redacted_json_body(request)
+        if error is not None:
+            return error
+        try:
+            result = await asyncio.to_thread(save_ultimate_wifi, body)
+        except TrackerSetupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not write the Ultimate Wi-Fi configuration"},
+                status_code=400,
+            )
+        return JSONResponse(result)
+
+    @app.get("/api/tracker/calibration/{source}", response_model=None)
+    async def get_tracker_calibration(source: str) -> JSONResponse:
+        """Measured TCP calibration for the exact active tracker identities."""
+        from .tracker_setup import TrackerSetupError, calibration_snapshot
+
+        try:
+            result = await asyncio.to_thread(
+                calibration_snapshot, source, quest_calibration_key()
+            )
+        except TrackerSetupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not inspect the tracker calibration"},
+                status_code=400,
+            )
+        return JSONResponse(result)
+
+    @app.put("/api/tracker/calibration/{source}", response_model=None)
+    async def put_tracker_calibration(source: str, request: Request) -> JSONResponse:
+        """Merge measured TCP calibration for one or both Mantis sides."""
+        from .tracker_setup import TrackerSetupError, save_calibration
+
+        body, error = await redacted_json_body(request)
+        if error is not None:
+            return error
+        try:
+            result = await asyncio.to_thread(
+                save_calibration, source, body, quest_calibration_key()
+            )
+        except TrackerSetupError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        except OSError:
+            return JSONResponse(
+                {"error": "could not write the tracker calibration"},
+                status_code=400,
+            )
+        return JSONResponse(result)
+
     @app.get("/api/tracker/bindings")
     async def get_tracker_bindings() -> dict[str, Any]:
-        """Whether each physical Mantis tracker backend has both sides bound."""
-        from ..tracker import load_tracker_config
+        """Saved bindings plus non-invasive setup readiness for each source."""
 
-        config = await asyncio.to_thread(load_tracker_config)
-        bindings: dict[str, dict[str, Any]] = {}
-        for backend in ("survive", "ultimate"):
-            saved = config.bindings.get(backend, {})
-            left = saved.get("left")
-            right = saved.get("right")
-            if backend == config.backend:
-                left = config.left or left
-                right = config.right or right
-            bindings[backend] = {
-                "complete": bool(left and right),
-                "left": left,
-                "right": right,
+        def inspect() -> dict[str, Any]:
+            from ..cli.tracker_install import lighthouse_readiness
+            from ..cli.tracker_ultimate import (
+                is_ultimate_tracker_key,
+                ultimate_runtime_readiness,
+            )
+            from ..mantis.calibration import (
+                DESIGN_TCP_TRANSFORMS,
+                candidate_transform_for,
+                design_transform_for,
+                load_tcp_transforms,
+                parse_quest_tracker_key,
+                select_quest_transform_key,
+            )
+            from ..tracker import load_tracker_config
+            from ..vr.server import get_last_quest_pose_datum
+
+            config = load_tracker_config()
+            saved_transforms = load_tcp_transforms()
+            bindings: dict[str, dict[str, Any]] = {}
+            source_status: dict[str, dict[str, Any]] = {}
+
+            def transform_status(
+                family: str, devices: dict[str, Any]
+            ) -> dict[str, str]:
+                result: dict[str, str] = {}
+                for side in ("left", "right"):
+                    device = devices.get(side)
+                    key = f"{family}:{device}" if device else family
+                    if key in saved_transforms.get(side, {}):
+                        result[side] = "measured"
+                    elif design_transform_for(side, key) is not None:
+                        result[side] = "factory"
+                    elif candidate_transform_for(side, key) is not None:
+                        result[side] = "candidate"
+                    else:
+                        result[side] = "missing"
+                return result
+
+            resolved: dict[str, dict[str, Any]] = {}
+            for backend in ("survive", "ultimate"):
+                saved = config.bindings.get(backend, {})
+                left = saved.get("left")
+                right = saved.get("right")
+                if backend == config.backend:
+                    left = config.left or left
+                    right = config.right or right
+                resolved[backend] = {"left": left, "right": right}
+                bindings[backend] = {
+                    "complete": bool(
+                        left
+                        and right
+                        and left != right
+                        and (
+                            backend != "ultimate"
+                            or (
+                                is_ultimate_tracker_key(left)
+                                and is_ultimate_tracker_key(right)
+                            )
+                        )
+                    ),
+                    "left": left,
+                    "right": right,
+                }
+
+            common_quest_keys = {
+                key
+                for key in set(saved_transforms.get("left", {}))
+                & set(saved_transforms.get("right", {}))
+                if parse_quest_tracker_key(key) is not None
             }
-        return {"bindings": bindings}
+            common_quest_keys.update(
+                key
+                for key, sides in DESIGN_TCP_TRANSFORMS.items()
+                if "left" in sides
+                and "right" in sides
+                and parse_quest_tracker_key(key) is not None
+            )
+            configured_quest_key = settings.snapshot()["values"].get(
+                "mantis.quest_tracker_key"
+            )
+            if configured_quest_key is not None:
+                configured_quest_key = str(configured_quest_key).strip() or None
+            quest_key = configured_quest_key or select_quest_transform_key(
+                saved_transforms
+            )
+            quest_datum = (
+                parse_quest_tracker_key(quest_key) if quest_key is not None else None
+            )
+            quest_transforms = {
+                side: (
+                    "measured"
+                    if quest_key is not None
+                    and quest_key in saved_transforms.get(side, {})
+                    else "factory"
+                    if quest_key is not None
+                    and design_transform_for(side, quest_key) is not None
+                    else "candidate"
+                    if quest_key is not None
+                    and candidate_transform_for(side, quest_key) is not None
+                    else "missing"
+                )
+                for side in ("left", "right")
+            }
+            source_status["quest"] = {
+                "binding": "automatic-handedness",
+                "installed": True,
+                "transforms": quest_transforms,
+                "calibrationKey": quest_key,
+                "controllerProfile": quest_datum[0] if quest_datum else None,
+                "poseSpace": quest_datum[1] if quest_datum else None,
+                "availableCalibrationKeys": sorted(common_quest_keys),
+                "datumStatus": (
+                    "configured"
+                    if quest_datum is not None
+                    else "invalid"
+                    if configured_quest_key is not None
+                    else "ambiguous"
+                    if len(common_quest_keys) > 1
+                    else "missing"
+                ),
+                "liveDatum": get_last_quest_pose_datum(),
+            }
+            lighthouse = lighthouse_readiness()
+            source_status["lighthouse"] = {
+                **lighthouse,
+                "binding": bindings["survive"],
+                "transforms": transform_status("survive", resolved["survive"]),
+            }
+            ultimate = ultimate_runtime_readiness()
+            source_status["ultimate"] = {
+                **ultimate,
+                "binding": bindings["ultimate"],
+                "transforms": transform_status("ultimate", resolved["ultimate"]),
+                "quatOrder": config.ultimate_quat_order,
+                "upAxis": config.ultimate_up_axis,
+            }
+            left_channel, right_channel = settings.mantis_can_channels()
+            return {
+                "bindings": bindings,
+                "sources": source_status,
+                "channels": {"left": left_channel, "right": right_channel},
+            }
+
+        return await asyncio.to_thread(inspect)
 
     # -- datasets on disk (the operation panels' shared repo-id picker) --------
 
@@ -784,7 +1093,15 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             return JSONResponse(
                 {"error": f"unknown operation: {req.op}"}, status_code=400
             )
-        async with camera_reservation:
+        async with camera_reservation, session_launch_reservation:
+            if _diagnostic_session_active():
+                return JSONResponse(
+                    {
+                        "error": "a setup or diagnostics session is running — "
+                        "stop it first"
+                    },
+                    status_code=409,
+                )
             # A faulted motor (over-temp, stall, encoder error, unreachable, …)
             # must block every hardware operation — driving through a fault risks
             # the arm. A sim run never touches the motors, and a robot-free run
@@ -808,6 +1125,62 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
             )
             hardware_profile = "mantis" if mantis_mode else "axol"
             link_matches_run = robot.profile() == hardware_profile
+            if mantis_mode:
+                try:
+                    expected_channels = require_mantis_channels(
+                        settings.effective_mantis_can_channels(req.op, req.args)
+                    )
+                except ValueError as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
+                interfaces = {
+                    item["name"]: bool(item["up"]) for item in _list_can_interfaces()
+                }
+                missing_interfaces = [
+                    channel
+                    for channel in expected_channels
+                    if channel not in interfaces
+                ]
+                if missing_interfaces:
+                    return JSONResponse(
+                        {
+                            "error": "Configured Mantis CAN interface not present: "
+                            + ", ".join(missing_interfaces)
+                            + ". Plug in the hub (or run `axol can.setup`), then "
+                            "reconnect Mantis before starting."
+                        },
+                        status_code=409,
+                    )
+                down_interfaces = [
+                    channel for channel in expected_channels if not interfaces[channel]
+                ]
+                if down_interfaces:
+                    return JSONResponse(
+                        {
+                            "error": "Configured Mantis CAN interface is down: "
+                            + ", ".join(down_interfaces)
+                            + ". Reconnect Mantis to bring both channels up before "
+                            "starting."
+                        },
+                        status_code=409,
+                    )
+                link = robot.status()
+                if not link_matches_run or not link["connected"]:
+                    return JSONResponse(
+                        {
+                            "error": "Connect the Mantis CAN link before starting. "
+                            "If left/right are reversed, swap the Mantis channels "
+                            "in Settings → Mantis and reconnect."
+                        },
+                        status_code=409,
+                    )
+                channel_error = _mantis_channel_mismatch_message(
+                    robot.channels(), expected_channels
+                )
+                if channel_error is not None:
+                    return JSONResponse(
+                        {"error": channel_error},
+                        status_code=409,
+                    )
             if (not robot_free or hardware_profile == "mantis") and link_matches_run:
                 fault_response = await _motor_fault_response()
                 if fault_response is not None:
@@ -851,12 +1224,17 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
 
     @app.post("/api/run")
     async def run(req: RunRequest) -> JSONResponse:
-        try:
-            session = await manager.start(req.command, req.args)
-        except KeyError:
-            return JSONResponse(
-                {"error": f"unknown command: {req.command}"}, status_code=400
-            )
+        # Legacy/plain command launch shares exactly the same reservation as
+        # the diagnostics dashboard; otherwise it would be an API-level bypass
+        # around the operation/diagnostic single-owner guarantee.
+        launched = await _launch_subprocess_command(
+            req.command, req.args, stdin_pipe=False
+        )
+        if isinstance(launched, JSONResponse):
+            return launched
+        _command, session, uses_can_bus = launched
+        if session.status != "error":
+            asyncio.create_task(_watch_diagnostics_run(None, session, uses_can_bus))
         return JSONResponse(session.to_dict())
 
     @app.post("/api/sessions/{session_id}/stop")

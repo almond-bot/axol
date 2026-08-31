@@ -46,6 +46,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from ..utils.paths import almond_path
+
 _logger = logging.getLogger(__name__)
 
 # Fast-sample cadence (position / velocity / torque, all motors).
@@ -53,7 +55,7 @@ SAMPLE_HZ = 10.0
 # Ring buffer length: 10 minutes at SAMPLE_HZ.
 _BUFFER_FRAMES = int(SAMPLE_HZ * 600)
 
-RUNS_DIR = Path.home() / ".almond" / "diagnostics" / "runs"
+RUNS_DIR = almond_path("diagnostics", "runs")
 
 # Marker a bus-owning diagnostic script prints to hand over its own capture.
 _CSV_MARKER = re.compile(r"\[telemetry\] csv=(\S+)")

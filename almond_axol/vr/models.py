@@ -105,6 +105,24 @@ class VRFrame(BaseModel):
             when the pose stream is the ground truth (Mantis recording): it names
             when the hand actually was at this pose, not when the frame was
             played out. ``None`` until the interpolator has seen the frame.
+        pose_source_id: Logical producer identity shared by every transport
+            carrying this frame. Quest sends the same id over USB, WebRTC,
+            and network WebSocket so sequence de-duplication is global to the
+            headset rather than per socket. Tracker bridges use one id across
+            reconnects. Optional for compatibility with older clients.
+        pose_source_kind: ``"webxr"`` for Quest or ``"tracker"`` for a local
+            Lighthouse/Ultimate bridge. A managed Mantis server admits only
+            its configured kind, allowing a Quest to display video/URDF state
+            without its controller frames taking control.
+        l_pose_profile: First (most preferred) WebXR input profile reported by
+            the left Quest controller, such as ``"oculus-touch-v3"``. Used
+            with ``l_pose_space`` to ensure a calibrated mount transform is
+            never applied to another controller generation or local datum.
+        r_pose_profile: Same for the right Quest controller.
+        l_pose_space: ``"grip"`` when ``l_ee`` came from WebXR ``gripSpace``;
+            ``"target-ray"`` only for compatibility runtimes lacking it.
+            Production Quest collection requires the calibrated grip datum.
+        r_pose_space: Same for the right Quest controller.
         l_tracked: True while the left controller's position is optically
             tracked. ``False`` means the headset lost sight of the controller
             (occlusion, edge of camera FOV, very fast motion) and the reported
@@ -114,6 +132,12 @@ class VRFrame(BaseModel):
             clean pose instead. Defaults to True so older web builds (which
             omit the field) keep the previous always-trusted behaviour.
         r_tracked: Same as ``l_tracked`` for the right controller.
+        l_trigger_live: True while the left Mantis trigger node is delivering
+            fresh CAN frames. Managed tracker bridges set this False after a
+            meaningful input dropout while holding the last safe grip command.
+            Defaults to True for Quest and older clients that do not use a
+            separate CAN trigger.
+        r_trigger_live: Same as ``l_trigger_live`` for the right trigger.
         l_stick_x: Left thumbstick x, [-1, 1], right = +1. With ``l_stick_y``
             it drives the powered cart's translation when one is configured
             (see :class:`almond_axol.robot.cart.Cart`). Neutral defaults keep
@@ -141,8 +165,16 @@ class VRFrame(BaseModel):
     t: float | None = None
     seq: int | None = None
     t_host: float | None = None
+    pose_source_id: str | None = None
+    pose_source_kind: str | None = None
+    l_pose_profile: str | None = None
+    r_pose_profile: str | None = None
+    l_pose_space: str | None = None
+    r_pose_space: str | None = None
     l_tracked: bool = True
     r_tracked: bool = True
+    l_trigger_live: bool = True
+    r_trigger_live: bool = True
     l_stick_x: float = 0.0
     l_stick_y: float = 0.0
     r_stick_x: float = 0.0

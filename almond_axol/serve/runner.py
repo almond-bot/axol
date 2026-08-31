@@ -71,10 +71,11 @@ _FORCE_GRACE_S = 5.0
 _RECORDER_PROC_NAME = "dataset-recorder"
 _FINALIZE_GRACE_S = 200.0
 
-# A managed Mantis bridge reports ready after its tracker backend and trigger
-# readers open. It does not wait for the operation's VR server: its WebSocket
-# loop reconnects until that server begins listening.
-_BRIDGE_READY_TIMEOUT_S = 30.0
+# A managed Mantis bridge reports ready after both trackers and configured
+# trigger nodes have produced fresh, usable data. It does not wait for the
+# operation's VR server: its WebSocket loop reconnects until that server begins
+# listening.
+_BRIDGE_READY_TIMEOUT_S = 35.0
 _BRIDGE_STOP_TIMEOUT_S = 4.0
 
 # Loggers whose records we never forward to the UI: webserver lifecycle,
@@ -108,6 +109,28 @@ _UVICORN_LINE = re.compile(r"^(INFO|WARNING|ERROR|DEBUG|CRITICAL|TRACE):\s{2,}")
 _CAMERA_SLOTS = ("overhead", "left_arm", "right_arm")
 
 
+def _managed_mantis_run_channels(cfg: Any) -> tuple[str, str]:
+    """Resolve and validate the gripper channels a parsed Mantis run opens."""
+    from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+    from ..utils.can_channels import require_mantis_channels
+
+    robot_config = getattr(cfg, "robot_config", None)
+    left = getattr(robot_config, "left_channel", getattr(cfg, "left_channel", None))
+    right = getattr(robot_config, "right_channel", getattr(cfg, "right_channel", None))
+    if left == CAN_LEFT:
+        left = CAN_MANTIS_LEFT
+    if right == CAN_RIGHT:
+        right = CAN_MANTIS_RIGHT
+    return require_mantis_channels((left, right))
+
+
+def _bind_managed_mantis_trigger_channels(config: Any, cfg: Any) -> None:
+    """Make bridge trigger readers follow this run's gripper channel map."""
+    left, right = _managed_mantis_run_channels(cfg)
+    config.trigger_can_left = left
+    config.trigger_can_right = right
+
+
 def _managed_tracker_bridge_main(
     config: Any,
     stop_event: Any,
@@ -115,6 +138,7 @@ def _managed_tracker_bridge_main(
     ready_conn: Any,
     port: int,
     auto_engage: bool,
+    pose_source_id: str,
 ) -> None:
     """Spawn-process entry point for a control-panel-owned tracker bridge."""
     logging.basicConfig(level=logging.INFO, force=True)
@@ -136,6 +160,8 @@ def _managed_tracker_bridge_main(
             controls=StopEventControls(stop_event, command_queue),
             on_ready=ready,
             auto_engage=auto_engage,
+            require_live_inputs=True,
+            pose_source_id=pose_source_id,
         )
     except BaseException as exc:
         if not ready_sent:
@@ -405,6 +431,7 @@ class OperationRunner:
         self._bridge_process: multiprocessing.Process | None = None
         self._bridge_stop_event: Any = None
         self._bridge_commands: Any = None
+        self._bridge_monitor: threading.Thread | None = None
         # asyncio op plumbing (set while an async op runs).
         self._async_loop: asyncio.AbstractEventLoop | None = None
         self._async_task: asyncio.Task[Any] | None = None
@@ -434,8 +461,18 @@ class OperationRunner:
     def is_running(self) -> bool:
         # "stopping" still counts as running: the op owns the CAN bus until its
         # worker thread unwinds, so a new op must not start until it's gone.
+        # An exception records the terminal error before the worker finishes
+        # stopping its managed tracker bridge and reacquiring the idle robot
+        # link.  Keep reporting busy while that worker is alive so another
+        # launch cannot overlap that cleanup window.
         s = self._session
-        return s is not None and s.status in ("starting", "running", "stopping")
+        active_status = s is not None and s.status in (
+            "starting",
+            "running",
+            "stopping",
+        )
+        worker_alive = self._thread is not None and self._thread.is_alive()
+        return active_status or worker_alive
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -494,7 +531,44 @@ class OperationRunner:
                     args, cameras, streams_video=cmd.streams_video
                 )
 
+            # Expose the immutable, fully merged run selection to every UI
+            # client. In particular, changing the saved Mantis source while a
+            # run is live must not relabel its hints/reset controls.
+            session.args = dict(args)
+
             cfg = self._build_config(op_id, args)
+            if cmd.requires_cameras and not self._has_recording_camera(cfg):
+                raise ValueError(
+                    f"{op_id} requires at least one assigned camera with "
+                    "recording enabled. Choose a recording resolution and "
+                    "enable Record for that camera in Settings."
+                )
+            if mantis_mode:
+                if op_id == "collect-data":
+                    from ..cli.collect_data import _prepare_mantis_collection
+
+                    # Fail missing/ambiguous tracker→TCP calibration before
+                    # releasing CAN or opening the managed tracker backend.
+                    _prepare_mantis_collection(cfg)
+                elif op_id == "teleop":
+                    from ..cli.teleop import _prepare_mantis_teleop
+
+                    # Resolve source identity, transform validation, and
+                    # viewer-world policy before a tracker process or CAN
+                    # owner starts. The operation repeats this idempotently.
+                    _prepare_mantis_teleop(cfg)
+                from ..cli.mantis_bridge import (
+                    require_mantis_tracker_readiness,
+                    set_managed_pose_source_id,
+                )
+
+                # Quest is checked live by the WebXR handshake. External
+                # sources must pass the same supported-runtime/access gate as
+                # direct CLI commands before releasing CAN or opening hardware.
+                require_mantis_tracker_readiness(str(cfg.mantis_source))
+                _managed_mantis_run_channels(cfg)
+                if str(cfg.mantis_source) != "quest":
+                    set_managed_pose_source_id(cfg)
             robot_config = getattr(cfg, "robot_config", None)
             if not cmd.supports_mantis and robot_config is not None:
                 from ..lerobot.robot.config_mantis import MantisRobotConfig
@@ -771,10 +845,20 @@ class OperationRunner:
         own two-camera map so changing gripper cameras does not overwrite the
         Axol rig. Older saved specs fall back to the Axol left/right entries.
         """
-        if not mantis or not cameras:
+        if not cameras:
             return cameras
 
         selected = dict(cameras)
+        # Migrate the pre-branch camera shape in memory. Before Stream and
+        # Record became independent, an assigned camera was always recorded;
+        # preserve that contract for stored specs and older REST clients.
+        selected.setdefault("stream_resolution", selected.get("resolution") or "SVGA")
+        selected.setdefault("record_resolution", "SVGA")
+        selected.setdefault("stream", {})
+        selected.setdefault("record", {})
+        if not mantis:
+            return selected
+
         axol_serials = cameras.get("serials") or {}
         raw_mantis = cameras.get("mantis_serials")
         mantis_serials = raw_mantis if isinstance(raw_mantis, dict) else {}
@@ -803,6 +887,19 @@ class OperationRunner:
             if serial > 0:
                 serials[slot] = serial
         return serials
+
+    @staticmethod
+    def _has_recording_camera(cfg: Any) -> bool:
+        """Whether the parsed operation config has a real recorded camera."""
+        robot_config = getattr(cfg, "robot_config", None)
+        cameras = getattr(robot_config, "cameras", None)
+        if not isinstance(cameras, dict):
+            return False
+        return any(
+            int(getattr(camera, "serial", 0) or 0) > 0
+            and bool(getattr(camera, "record", True))
+            for camera in cameras.values()
+        )
 
     @staticmethod
     def _resolution(
@@ -1027,6 +1124,21 @@ class OperationRunner:
                 f"Mantis source {source!r} does not use a tracker bridge"
             )
         select_tracker_backend(config, backend)
+        server = getattr(cfg, "vr_server", None)
+        if server is None:
+            teleop = getattr(cfg, "teleop_config", None)
+            server = getattr(teleop, "vr_server_config", None)
+        pose_source_id = getattr(server, "expected_pose_source_id", None)
+        if not pose_source_id:
+            raise RuntimeError(
+                "managed Mantis operation is missing its exact pose-source token"
+            )
+        # A managed Mantis run has one authoritative channel map: the channels
+        # its grippers open.  tracker.bridge may have custom trigger overrides
+        # for standalone diagnostics, but carrying those into an operation
+        # could leave its controls attached to the old logical side after a hub
+        # swap, so managed trigger readers always follow the run config.
+        _bind_managed_mantis_trigger_channels(config, cfg)
         if (
             config.left is None or config.right is None
         ) and not config.allow_single_side:
@@ -1047,6 +1159,7 @@ class OperationRunner:
                 child_conn,
                 self._bridge_port(cfg),
                 op_id in {"teleop", "collect-data"},
+                pose_source_id,
             ),
             name="tracker-bridge",
             daemon=True,
@@ -1075,6 +1188,44 @@ class OperationRunner:
             f"[serve] Mantis tracker bridge ready (pid {process.pid}, "
             f"backend {config.backend})"
         )
+        monitor = threading.Thread(
+            target=self._monitor_tracker_bridge,
+            args=(session, process, stop_event),
+            name="tracker-bridge-monitor",
+            daemon=True,
+        )
+        with self._lock:
+            self._bridge_monitor = monitor
+        monitor.start()
+
+    def _monitor_tracker_bridge(
+        self, session: Session, process: multiprocessing.Process, stop_event: Any
+    ) -> None:
+        """Turn an unexpected post-readiness bridge exit into an op failure."""
+        process.join()
+        with self._lock:
+            expected = (
+                stop_event.is_set()
+                or self._bridge_process is not process
+                or self._session is not session
+            )
+        if expected:
+            return
+        detail = (
+            f"exit code {process.exitcode}"
+            if process.exitcode is not None
+            else "unknown exit status"
+        )
+        message = f"Mantis tracker bridge exited unexpectedly ({detail})"
+        session.emit(f"[serve] error: {message}")
+        self._mark_terminal(session, "error", error=message)
+        self._stop_event.set()
+        loop, task = self._async_loop, self._async_task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
 
     def _stop_tracker_bridge(self, session: Session) -> None:
         """Stop and reap the bridge child owned by the current operation."""
@@ -1082,9 +1233,11 @@ class OperationRunner:
             process = self._bridge_process
             stop_event = self._bridge_stop_event
             command_queue = self._bridge_commands
+            monitor = self._bridge_monitor
             self._bridge_process = None
             self._bridge_stop_event = None
             self._bridge_commands = None
+            self._bridge_monitor = None
         if process is None:
             return
         if stop_event is not None:
@@ -1097,6 +1250,8 @@ class OperationRunner:
         if command_queue is not None:
             command_queue.close()
             command_queue.join_thread()
+        if monitor is not None and monitor is not threading.current_thread():
+            monitor.join(timeout=1.0)
         session.emit("[serve] Mantis tracker bridge stopped")
 
     # -- async ops (teleop / gravity-comp) ----------------------------------

@@ -57,8 +57,12 @@ export interface CommandSpec {
   robotFreeFlags?: string[]
   /** Whether this operation can run against the Mantis hardware profile. */
   supportsMantis?: boolean
+  /** Connected hardware profiles on which this command may be launched. */
+  hardwareProfiles?: HardwareProfile[]
   /** Driven from the VR headset, so the panel shows the connect hint. */
   usesHeadset?: boolean
+  /** Honors the camera spec's headset-stream branch during this operation. */
+  streamsVideo?: boolean
 }
 
 /** Catalog category display order (matches serve/commands.py CATEGORY_ORDER). */
@@ -609,10 +613,175 @@ export interface TrackerBinding {
   right: string | null
 }
 
-export async function fetchTrackerBindings(): Promise<{
+export type TrackerTransformStatus = "measured" | "factory" | "candidate" | "missing"
+
+export interface TrackerTransformReadiness {
+  left: TrackerTransformStatus
+  right: TrackerTransformStatus
+}
+
+export interface QuestTrackerReadiness {
+  binding: "automatic-handedness"
+  installed: boolean
+  transforms: TrackerTransformReadiness
+  calibrationKey: string | null
+  controllerProfile: string | null
+  poseSpace: "grip" | "target-ray" | null
+  availableCalibrationKeys: string[]
+  datumStatus: "configured" | "ambiguous" | "invalid" | "missing"
+  liveDatum?: {
+    left: { profile: string | null; poseSpace: "grip" | "target-ray" | null }
+    right: { profile: string | null; poseSpace: "grip" | "target-ray" | null }
+    commonKey: string | null
+    observedAt: number
+    ageSeconds: number
+    live: boolean
+  } | null
+}
+
+export interface LighthouseTrackerReadiness {
+  binding: TrackerBinding
+  installed: boolean
+  available: boolean
+  pairingCli: boolean
+  pinnedBuild: boolean
+  udevReady: boolean
+  pinnedRef: string
+  buildRevision: string
+  installedRef: string | null
+  installedBuildRevision: string | null
+  issues: string[]
+  transforms: TrackerTransformReadiness
+}
+
+export interface UltimateTrackerReadiness {
+  binding: TrackerBinding
+  installed: boolean
+  nativeDependencies: boolean
+  pythonHid: boolean
+  apiCompatible: boolean
+  pinnedPyvut: boolean
+  pinnedRef: string
+  logSuppression: boolean
+  udevReady: boolean
+  operatorAccess: boolean
+  dongleConnected: boolean
+  endpointStatus: "accessible" | "permission-denied" | "missing" | "unavailable"
+  wifiConfig: "valid" | "missing" | "invalid" | "permissions-warning"
+  quatOrder: "xyzw" | "wxyz"
+  upAxis: "y" | "z"
+  issues: string[]
+  transforms: TrackerTransformReadiness
+}
+
+export interface TrackerSourceReadiness {
+  quest: QuestTrackerReadiness
+  lighthouse: LighthouseTrackerReadiness
+  ultimate: UltimateTrackerReadiness
+}
+
+export interface TrackerBindingsSnapshot {
   bindings: Record<TrackerBackend, TrackerBinding>
-}> {
+  /** Non-invasive setup checks; absent on older serve hosts. */
+  sources?: TrackerSourceReadiness
+  /** Resolved trigger/gripper channels; absent on older serve hosts. */
+  channels?: RobotChannels
+}
+
+export async function fetchTrackerBindings(): Promise<TrackerBindingsSnapshot> {
   return json(await fetch(apiUrl("/api/tracker/bindings"), { cache: "no-store" }))
+}
+
+export type MantisTrackerSource = "quest" | "lighthouse" | "ultimate"
+
+export interface UltimateWifiConfig {
+  /** Host path is informational only; credential values never include the password. */
+  path: string
+  configured: boolean
+  status: "valid" | "missing" | "invalid" | "permissions-warning"
+  error: string | null
+  ssid: string
+  country: string
+  freq: number
+  passwordSet: boolean
+}
+
+export interface UltimateWifiUpdate {
+  ssid: string
+  country: string
+  freq: number
+  /** Omit to preserve the existing password. The host never returns it. */
+  pass?: string
+}
+
+export async function fetchUltimateWifiConfig(): Promise<UltimateWifiConfig> {
+  return json(
+    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
+      cache: "no-store",
+    })
+  )
+}
+
+export async function saveUltimateWifiConfig(
+  update: UltimateWifiUpdate
+): Promise<UltimateWifiConfig> {
+  return json(
+    await fetch(apiUrl("/api/tracker/ultimate/wifi"), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    })
+  )
+}
+
+export type TrackerCalibrationStatus = TrackerTransformStatus | "unbound"
+
+export interface TrackerCalibrationSide {
+  key: string | null
+  status: TrackerCalibrationStatus
+  /** Only measured overrides are returned; factory/candidate values stay null. */
+  pos: [number, number, number] | null
+  quat: [number, number, number, number] | null
+}
+
+export interface TrackerCalibrationSnapshot {
+  path: string
+  source: MantisTrackerSource
+  keys: { left: string | null; right: string | null }
+  left: TrackerCalibrationSide
+  right: TrackerCalibrationSide
+}
+
+export interface TrackerCalibrationValue {
+  /** Echoed active key; the host rejects the write if identification changed. */
+  key: string
+  pos: [number, number, number]
+  quat: [number, number, number, number]
+}
+
+export type TrackerCalibrationUpdate = Partial<Record<"left" | "right", TrackerCalibrationValue>>
+
+export async function fetchTrackerCalibration(
+  source: MantisTrackerSource
+): Promise<TrackerCalibrationSnapshot> {
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}`), {
+      cache: "no-store",
+    })
+  )
+}
+
+export async function saveTrackerCalibration(
+  source: MantisTrackerSource,
+  update: TrackerCalibrationUpdate
+): Promise<TrackerCalibrationSnapshot> {
+  return json(
+    await fetch(apiUrl(`/api/tracker/calibration/${source}`), {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    })
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -728,11 +897,44 @@ export function cameraCount(spec: CameraSpec, mantis?: boolean): number {
   return new Set(values.map((s) => s?.trim()).filter(Boolean)).size
 }
 
-/** Non-empty, trimmed serials assigned across the camera slots. */
-export function configuredSerials(spec: CameraSpec, mantis = false): string[] {
-  return Object.values(cameraSerials(spec, mantis))
-    .map((s) => s?.trim() ?? "")
+function branchResolutionEnabled(spec: CameraSpec, branch: "stream" | "record"): boolean {
+  const value =
+    branch === "stream"
+      ? (spec.stream_resolution ?? spec.resolution ?? "SVGA")
+      : (spec.record_resolution ?? "SVGA")
+  return value.trim() !== "" && value.toLowerCase() !== RESOLUTION_OFF
+}
+
+function cameraBranchEnabled(
+  spec: CameraSpec,
+  slot: CameraSlot,
+  branch: "stream" | "record"
+): boolean {
+  if (!branchResolutionEnabled(spec, branch)) return false
+  const raw: unknown = spec[branch]?.[slot]
+  return raw !== false && raw !== null && raw !== "off" && raw !== ""
+}
+
+/** Assigned serials that an operation will actually open. */
+export function participatingCameraSerials(
+  spec: CameraSpec,
+  mantis = false,
+  branches: { stream: boolean; record: boolean } = { stream: true, record: true }
+): string[] {
+  const values = Object.entries(cameraSerials(spec, mantis))
+    .filter(
+      ([slot]) =>
+        (branches.stream && cameraBranchEnabled(spec, slot as CameraSlot, "stream")) ||
+        (branches.record && cameraBranchEnabled(spec, slot as CameraSlot, "record"))
+    )
+    .map(([, serial]) => serial?.trim() ?? "")
     .filter(Boolean)
+  return [...new Set(values)]
+}
+
+/** Number of distinct assigned cameras included in the dataset branch. */
+export function recordingCameraCount(spec: CameraSpec, mantis = false): number {
+  return participatingCameraSerials(spec, mantis, { stream: false, record: true }).length
 }
 
 /**
@@ -743,10 +945,11 @@ export function configuredSerials(spec: CameraSpec, mantis = false): string[] {
 export function missingCameraSerials(
   spec: CameraSpec,
   detected: CameraDevice[],
-  mantis = false
+  mantis = false,
+  branches: { stream: boolean; record: boolean } = { stream: true, record: true }
 ): string[] {
   const present = new Set(detected.map((d) => String(d.serial)))
-  return configuredSerials(spec, mantis).filter((s) => !present.has(s))
+  return participatingCameraSerials(spec, mantis, branches).filter((s) => !present.has(s))
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1063,8 @@ export interface OperationMeta {
   episodeControl: boolean
   /** Shows the "point the headset at this machine" hint while running. */
   usesHeadset: boolean
+  /** Honors cameras selected for headset streaming, in addition to recording. */
+  streamsVideo: boolean
 }
 
 /**
@@ -881,6 +1086,7 @@ export const OPERATIONS: OperationMeta[] = [
     supportsMantis: true,
     episodeControl: false,
     usesHeadset: true,
+    streamsVideo: true,
   },
   {
     id: "gravity-comp",
@@ -895,6 +1101,7 @@ export const OPERATIONS: OperationMeta[] = [
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
+    streamsVideo: false,
   },
   {
     id: "collect-data",
@@ -914,6 +1121,7 @@ export const OPERATIONS: OperationMeta[] = [
     // camera tracks, so the feeds are safe to offer.
     episodeControl: false,
     usesHeadset: true,
+    streamsVideo: true,
   },
   {
     id: "replay-dataset",
@@ -928,6 +1136,7 @@ export const OPERATIONS: OperationMeta[] = [
     supportsMantis: false,
     episodeControl: false,
     usesHeadset: false,
+    streamsVideo: false,
   },
   {
     id: "run-policy",
@@ -943,6 +1152,7 @@ export const OPERATIONS: OperationMeta[] = [
     supportsMantis: false,
     episodeControl: true,
     usesHeadset: false,
+    streamsVideo: false,
   },
 ]
 
@@ -968,10 +1178,10 @@ export function operationsFromCommands(specs: CommandSpec[]): OperationMeta[] {
     simCapable: s.simCapable,
     simFlag: s.simFlag ?? null,
     robotFreeFlags: s.robotFreeFlags ?? [],
-    supportsMantis:
-      s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
+    supportsMantis: s.supportsMantis ?? Boolean(s.perRunFields?.includes("mantis")),
     episodeControl: Boolean(s.episodeControl),
     usesHeadset: Boolean(s.usesHeadset),
+    streamsVideo: Boolean(s.streamsVideo),
   }))
 }
 
@@ -1053,13 +1263,14 @@ export function useSessionLogs(sessionId: string | null): {
   lines: string[]
   status: SessionInfo | null
 } {
-  const [lines, setLines] = useState<string[]>([])
-  const [status, setStatus] = useState<SessionInfo | null>(null)
+  const [logState, setLogState] = useState<{
+    sessionId: string | null
+    lines: string[]
+    status: SessionInfo | null
+  }>({ sessionId: null, lines: [], status: null })
   const wsRef = useRef<WebSocket | null>(null)
 
   useEffect(() => {
-    setLines([])
-    setStatus(null)
     if (!sessionId) return
 
     const ws = new WebSocket(wsUrl(sessionId))
@@ -1067,16 +1278,22 @@ export function useSessionLogs(sessionId: string | null): {
 
     ws.onmessage = (event) => {
       const msg: LogMessage = JSON.parse(event.data)
-      if (msg.type === "log" && msg.line !== undefined) {
-        setLines((prev) => {
-          const base = prev.length >= MAX_LINES ? prev.slice(-MAX_LINES + 1) : prev
-          return [...base, msg.line as string]
-        })
-      } else if (msg.type === "status" && msg.session) {
-        setStatus(msg.session)
-      } else if (msg.type === "error" && msg.message) {
-        setLines((prev) => [...prev, `[error] ${msg.message}`])
-      }
+      setLogState((previous) => {
+        const current =
+          previous.sessionId === sessionId ? previous : { sessionId, lines: [], status: null }
+        if (msg.type === "log" && msg.line !== undefined) {
+          const base =
+            current.lines.length >= MAX_LINES ? current.lines.slice(-MAX_LINES + 1) : current.lines
+          return { ...current, lines: [...base, msg.line] }
+        }
+        if (msg.type === "status" && msg.session) {
+          return { ...current, status: msg.session }
+        }
+        if (msg.type === "error" && msg.message) {
+          return { ...current, lines: [...current.lines, `[error] ${msg.message}`] }
+        }
+        return current
+      })
     }
 
     return () => {
@@ -1086,5 +1303,7 @@ export function useSessionLogs(sessionId: string | null): {
     }
   }, [sessionId])
 
-  return { lines, status }
+  return logState.sessionId === sessionId
+    ? { lines: logState.lines, status: logState.status }
+    : { lines: [], status: null }
 }

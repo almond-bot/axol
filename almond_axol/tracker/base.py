@@ -4,9 +4,10 @@ Every backend reports poses in the **WebXR world convention** the teleop
 stack assumes (see ``_VR_UP`` in :mod:`almond_axol.teleop.worker`): a
 right-handed, gravity-aligned frame with **+y up**, positions in metres,
 orientations as unit ``(x, y, z, w)`` quaternions. The absolute (Mantis) IK
-mode absorbs any world yaw/translation and the rigid tracker→gripper
-mount at engage time, so gravity alignment and scale are the only things
-a backend must get right.
+mode solves world yaw/translation at engage time. Production Cartesian data
+also needs the source-specific rigid tracker→gripper transform; without one,
+the single engage pose can align the rigs but cannot make later wrist motion
+mount-independent.
 
 Backends whose native world frame is z-up (libsurvive, and the Ultimate
 tracker's SLAM frame) convert through :func:`zup_to_yup_pos` /
@@ -20,11 +21,29 @@ from dataclasses import dataclass
 
 import numpy as np
 
+# A managed two-hand tracker frame is usable only while both host-capture
+# timestamps are recent and describe effectively the same instant.  Keep the
+# limits beside the TrackerPose contract so startup checks, identification,
+# and the streaming bridge cannot silently disagree about what "live" means.
+TRACKER_POSE_MAX_AGE_S = 0.15
+TRACKER_PAIR_MAX_SKEW_S = 0.05
+
 # Basis change from a right-handed z-up world to the WebXR y-up world:
 # x' = x, y' = z, z' = -y (a -90 deg rotation about x). As a quaternion
 # (x, y, z, w) it conjugates orientations: q_yup = Q_C * q_zup * Q_C^-1.
 _SQRT_HALF = float(np.sqrt(0.5))
 _Q_ZUP_TO_YUP = np.array([-_SQRT_HALF, 0.0, 0.0, _SQRT_HALF])
+
+
+class TrackerSourceError(RuntimeError):
+    """A tracker backend has stopped and cannot recover in-place.
+
+    Socket loss between :class:`TrackerBridge` and the local VR server is
+    recoverable, but a dead hardware reader is not.  Backends raise this
+    distinct error from :meth:`TrackerSource.poses` so the bridge can stop the
+    owning Mantis operation instead of misclassifying it as a WebSocket drop
+    and retrying forever.
+    """
 
 
 def quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:

@@ -9,10 +9,12 @@ from __future__ import annotations
 import os
 import subprocess
 
+from .paths import adopt_state_file, almond_path
+
 # Shared cert location. Kept under ``vr/`` even though ``axol serve`` now uses it
 # too: renaming would force every existing install to regenerate (and re-accept)
 # its certificate, so the legacy path stays for backward compatibility.
-CERT_DIR = os.path.join(os.path.expanduser("~"), ".almond", "vr", "certs")
+CERT_DIR = str(almond_path("vr", "certs"))
 CERTFILE = os.path.join(CERT_DIR, "cert.pem")
 KEYFILE = os.path.join(CERT_DIR, "key.pem")
 
@@ -77,3 +79,7 @@ def create_self_signed_cert(certfile: str, keyfile: str) -> None:
         check=True,
         capture_output=True,
     )
+
+    # Custom paths outside ALMOND_HOME are deliberately left alone.
+    adopt_state_file(certfile)
+    adopt_state_file(keyfile)

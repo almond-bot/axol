@@ -8,6 +8,7 @@ import {
   fetchInfo,
   fetchOpStatus,
   fetchRobotStatus,
+  fetchSessions,
   fetchSettings,
   fetchUpdateStatus,
   fetchUsbStatus,
@@ -134,6 +135,9 @@ export default function ControlPanel() {
 
   const [robot, setRobot] = useState<RobotStatus | null>(null)
   const [robotBusy, setRobotBusy] = useState(false)
+  // Bumped when the persisted Mantis left/right mapping changes. It wakes the
+  // idle-link effect even though the selected hardware profile did not change.
+  const [mantisChannelRevision, setMantisChannelRevision] = useState(0)
   const [usb, setUsb] = useState<UsbStatus | null>(null)
   const [usbBusy, setUsbBusy] = useState(false)
   const [cameras, setCameras] = useState<CameraSpec>(() => loadCameras())
@@ -157,6 +161,10 @@ export default function ControlPanel() {
   const [settingsByOp, setSettingsByOp] = useState<OpSettings>({})
 
   const [session, setSession] = useState<SessionInfo | null>(null)
+  // Generic setup/diagnostic owner (Pair, Identify, installers, etc.). The
+  // server serializes it against operations; mirror that owner in the UI so
+  // opposite actions disable instead of optimistically ending in HTTP 409.
+  const [activeCommandSession, setActiveCommandSession] = useState<SessionInfo | null>(null)
   // run-policy episode phase/count, from the server so the episode controls are
   // correct on any computer (not just the tab that started the run).
   const [policy, setPolicy] = useState<PolicyState | null>(null)
@@ -307,6 +315,39 @@ export default function ControlPanel() {
     }
   }, [conn.state])
 
+  useEffect(() => {
+    if (conn.state !== "ok") {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setActiveCommandSession(null)
+      return
+    }
+    let active = true
+    const operationIds = new Set([
+      ...OPERATIONS.map((operation) => operation.id),
+      ...commands.filter((command) => command.isOperation).map((command) => command.id),
+    ])
+    const poll = () => {
+      fetchSessions()
+        .then((sessions) => {
+          if (!active) return
+          setActiveCommandSession(
+            sessions.find(
+              (candidate) =>
+                !operationIds.has(candidate.command) &&
+                (candidate.status === "starting" || candidate.status === "running")
+            ) ?? null
+          )
+        })
+        .catch(() => {})
+    }
+    poll()
+    const timer = window.setInterval(poll, 1500)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [conn.state, commands])
+
   // Poll the update indicator slowly while online (its server-side `ls-remote`
   // is debounced, so a tight interval would buy nothing). Paused while an
   // update is in flight — handleUpdate drives its own faster restart-watch poll.
@@ -341,12 +382,29 @@ export default function ControlPanel() {
   // Last automatically selected idle telemetry profile. Keeping this latched
   // means a manual disconnect is not immediately undone.
   const autoRobotRef = useRef<HardwareProfile | null>(null)
+  // A settings save can happen while an operation owns the link. Defer the
+  // reconnect until it becomes idle instead of letting the old-bus link look
+  // ready for the next Mantis run.
+  const reconnectMantisRef = useRef(false)
 
   // Auto-establish the Quest-over-USB tunnel as soon as an authorized headset
   // appears. The latch clears once the tunnel is up (so a later drop retries
   // once) or when the headset goes away, while preventing a per-poll retry loop
   // if `adb reverse` can't establish it.
   const autoUsbRef = useRef(false)
+  const usbConnectClick = useCallback(async () => {
+    setUsbBusy(true)
+    try {
+      // Runs `adb reverse`; the first touch also pops the USB-debugging
+      // authorization prompt on the headset.
+      setUsb(await usbConnect())
+    } catch (e) {
+      toast.error(String(e))
+    } finally {
+      setUsbBusy(false)
+    }
+  }, [toast])
+
   useEffect(() => {
     if (conn.state !== "ok") {
       // Clear the latch on disconnect so a reconnect gets a fresh auto-connect
@@ -365,8 +423,7 @@ export default function ControlPanel() {
     if (autoUsbRef.current || usbBusy) return
     autoUsbRef.current = true
     usbConnectClick()
-    // usbConnectClick is stable (only uses state setters / fetch).
-  }, [conn.state, usb, usbBusy])
+  }, [conn.state, usb, usbBusy, usbConnectClick])
 
   function hostDisconnectClick() {
     // Purely client-side: drop this browser's view of the host without
@@ -403,6 +460,9 @@ export default function ControlPanel() {
   // Persist a settings-dialog save: cameras also mirror to localStorage (the
   // fallback for old hosts / offline), everything else goes to the serve host.
   async function handleSettingsSave(patch: SettingsPatch) {
+    const mantisChannelsChanged = ["mantis.left_channel", "mantis.right_channel"].some((key) =>
+      Object.prototype.hasOwnProperty.call(patch.values ?? {}, key)
+    )
     if (patch.cameras) {
       setCameras(patch.cameras)
       persistLocalCameras(patch.cameras)
@@ -418,6 +478,18 @@ export default function ControlPanel() {
       advancedSchema: prev?.advancedSchema ?? snap.advancedSchema,
     }))
     if (snap.cameras) setCameras(snap.cameras)
+    if (mantisChannelsChanged) {
+      reconnectMantisRef.current = true
+      autoRobotRef.current = null
+      setMantisChannelRevision((revision) => revision + 1)
+      if (desiredHardwareProfile !== "mantis") {
+        toast.info("Mantis CAN mapping saved. It will apply the next time Mantis connects.")
+      } else if (isLive || robot?.state === "busy") {
+        toast.info("Mantis CAN mapping saved. The link will reconnect when this run stops.")
+      } else {
+        toast.info("Mantis CAN mapping saved. Reconnecting the Mantis link now…")
+      }
+    }
   }
 
   // The operations this host offers, and the selected one resolved against
@@ -464,7 +536,11 @@ export default function ControlPanel() {
     async (profile: HardwareProfile) => {
       setRobotBusy(true)
       try {
-        setRobot(await robotConnect(undefined, profile))
+        const status = await robotConnect(undefined, profile)
+        setRobot(status)
+        if (!status.connected) {
+          throw new Error(status.error ?? `Could not connect the ${profile} CAN link`)
+        }
       } catch (e) {
         toast.error(String(e))
       } finally {
@@ -485,20 +561,6 @@ export default function ControlPanel() {
       toast.error(String(e))
     } finally {
       setRobotBusy(false)
-    }
-  }
-
-  // -- quest over usb (adb reverse pose tunnel) --
-  async function usbConnectClick() {
-    setUsbBusy(true)
-    try {
-      // Runs `adb reverse`; the first touch also pops the USB-debugging
-      // authorization prompt on the headset.
-      setUsb(await usbConnect())
-    } catch (e) {
-      toast.error(String(e))
-    } finally {
-      setUsbBusy(false)
     }
   }
 
@@ -562,22 +624,33 @@ export default function ControlPanel() {
       autoRobotRef.current = null
       return
     }
-    if (isLive || !robot || robotBusy) return
-    if (autoRobotRef.current === desiredHardwareProfile) return
+    if (isLive || !robot || robotBusy || robot.state === "busy") return
     const activeProfile = robot.profile ?? "axol"
+    const mappingReconnect = reconnectMantisRef.current && desiredHardwareProfile === "mantis"
+    if (autoRobotRef.current === desiredHardwareProfile && !mappingReconnect) return
     if (
       activeProfile !== desiredHardwareProfile ||
       robot.state === "disconnected" ||
-      robot.state === "error"
+      robot.state === "error" ||
+      mappingReconnect
     ) {
       const timer = window.setTimeout(() => {
         autoRobotRef.current = desiredHardwareProfile
+        if (mappingReconnect) reconnectMantisRef.current = false
         robotConnectClick(desiredHardwareProfile)
       }, 0)
       return () => window.clearTimeout(timer)
     }
     autoRobotRef.current = desiredHardwareProfile
-  }, [conn.state, desiredHardwareProfile, isLive, robot, robotBusy, robotConnectClick])
+  }, [
+    conn.state,
+    desiredHardwareProfile,
+    isLive,
+    mantisChannelRevision,
+    robot,
+    robotBusy,
+    robotConnectClick,
+  ])
 
   // While an op is live (including the "stopping" window), poll the server's
   // authoritative op status so the panel reliably catches the transition to
@@ -719,7 +792,10 @@ export default function ControlPanel() {
           toast.error(`Can't verify cameras: ${detErr}`)
           return
         }
-        const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected)
+        const missing = missingCameraSerials(cameras, devices ?? [], mantisSelected, {
+          stream: meta.streamsVideo,
+          record: true,
+        })
         if (missing.length > 0) {
           toast.error(
             `Camera ${missing.length > 1 ? "serials" : "serial"} not detected: ${missing.join(
@@ -734,7 +810,14 @@ export default function ControlPanel() {
       // advanced overrides) are folded in server-side, and stale keys from the
       // old per-op localStorage must not shadow them.
       const runKeys = new Set(spec ? perRunFields(spec, meta).map((f) => f.key) : [])
-      const args = Object.fromEntries(Object.entries(settings).filter(([k]) => runKeys.has(k)))
+      const args: Record<string, FormValue> = Object.fromEntries(
+        Object.entries(settings).filter(([k]) => runKeys.has(k))
+      )
+      // Snapshot the shared source into the session request. New hosts also
+      // return their fully merged args, but this keeps live hints/reset
+      // controls tied to the actual run even against an older serve host if
+      // the operator edits the saved source mid-run.
+      if (mantisSelected) args.mantis_source = mantisSource
       // Send the camera spec whenever any serial is assigned — collect-data /
       // run-policy need at least one, while teleop streams whichever are set to
       // the headset (and runs fine with none in sim). Newer hosts also hold the
@@ -862,6 +945,15 @@ export default function ControlPanel() {
               usb={usb}
               usbBusy={usbBusy}
               onUsbConnect={() => usbConnectClick()}
+              actionBlocker={
+                isLive
+                  ? `${runningOp ?? "An operation"} is running`
+                  : activeCommandSession
+                    ? `${activeCommandSession.command} is running`
+                    : null
+              }
+              activeCommandSession={activeCommandSession}
+              onCommandSessionChange={setActiveCommandSession}
             />
           </div>
         )}
@@ -899,6 +991,13 @@ export default function ControlPanel() {
           viewerPort={viewerPort}
           vrPort={hostInfo?.vrPort ?? 8000}
           startPhase={startPhase}
+          hostBlocker={
+            activeCommandSession
+              ? `${activeCommandSession.command} setup/diagnostic is running`
+              : isLive && !selectedLive
+                ? `${runningOp ?? "Another operation"} is running`
+                : null
+          }
           policy={selectedLive ? policy : null}
           onStart={handleStart}
           onStop={handleStop}

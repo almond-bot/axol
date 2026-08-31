@@ -36,9 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from ..utils.can_channels import require_mantis_channels
+from ..utils.paths import almond_path
+
 _logger = logging.getLogger(__name__)
 
-SETTINGS_PATH = Path.home() / ".almond" / "settings.json"
+SETTINGS_PATH = almond_path("settings.json")
 
 # The built-in operations, whose dotted config paths the tables below spell
 # out. A registered operation joins the same tables through its
@@ -102,6 +105,27 @@ def _settings_op(op_id: str) -> str:
 
     cmd = COMMANDS.get(op_id)
     return cmd.settings_like if cmd is not None and cmd.settings_like else op_id
+
+
+def _mantis_channels_from_values(
+    values: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    """Resolve stored Mantis channel values, including reset/default semantics."""
+    from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+
+    def norm(key: str, default: str) -> str | None:
+        value = values.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        if not text:
+            return default
+        return None if text.lower() in ("null", "none") else text
+
+    return (
+        norm("mantis.left_channel", CAN_MANTIS_LEFT),
+        norm("mantis.right_channel", CAN_MANTIS_RIGHT),
+    )
 
 
 def _lerobot_dataset_root() -> str:
@@ -386,6 +410,47 @@ SETTINGS: tuple[SettingCategory, ...] = (
                     "teleop": ("mantis_source",),
                     "collect-data": ("mantis_source",),
                 },
+            ),
+            SettingDef(
+                key="mantis.quest_tracker_key",
+                label="Quest calibration key",
+                type="text",
+                help=(
+                    "Exact controller-local datum used by both saved mount "
+                    "transforms: quest:<WebXR-profile>:grip. Start a Quest "
+                    "bring-up run and paste the live key shown below. This "
+                    "setting is applied only when Mantis tracking is Quest."
+                ),
+                targets={
+                    "teleop": ("teleop.tracker_key",),
+                    "collect-data": (f"{_VRT}.tracker_key",),
+                },
+            ),
+            SettingDef(
+                key="mantis.left_channel",
+                label="Left Mantis CAN channel",
+                type="text",
+                help=(
+                    "SocketCAN interface connected to the left handheld rig. "
+                    "Use this to swap hub channels without moving cables. "
+                    "The trigger reader follows the same interface."
+                ),
+                # Applied conditionally by SettingsStore.merged_args only when
+                # that run has Mantis enabled; Axol runs retain robot.*.
+                targets={},
+                effective_default="can_mantis_l",
+            ),
+            SettingDef(
+                key="mantis.right_channel",
+                label="Right Mantis CAN channel",
+                type="text",
+                help=(
+                    "SocketCAN interface connected to the right handheld rig. "
+                    "Use this to swap hub channels without moving cables. "
+                    "The trigger reader follows the same interface."
+                ),
+                targets={},
+                effective_default="can_mantis_r",
             ),
             SettingDef(
                 key="teleop.frequency",
@@ -1049,10 +1114,18 @@ class SettingsStore:
         try:
             raw = json.loads(self._path.read_text())
             if isinstance(raw, dict):
+                values = dict(raw.get("values") or {})
+                advanced = dict(raw.get("advanced") or {})
+                # tracker_key used to be buried in Advanced. Adopt it into
+                # the source-specific Mantis control so there is one visible
+                # value and readiness evaluates exactly what a run will use.
+                legacy_key = advanced.pop("vr_teleop.tracker_key", None)
+                if legacy_key is not None:
+                    values.setdefault("mantis.quest_tracker_key", legacy_key)
                 return {
-                    "values": dict(raw.get("values") or {}),
+                    "values": values,
                     "cameras": raw.get("cameras"),
-                    "advanced": dict(raw.get("advanced") or {}),
+                    "advanced": advanced,
                 }
         except FileNotFoundError:
             pass
@@ -1089,6 +1162,14 @@ class SettingsStore:
         key (reset to default). ``cameras`` replaces the whole camera spec
         (``None`` clears it).
         """
+        if advanced is not None and "vr_teleop.tracker_key" in advanced:
+            # Accept an imported pre-migration settings file, but immediately
+            # move its hidden Advanced value into the visible Quest control.
+            legacy_key = advanced.get("vr_teleop.tracker_key")
+            advanced = dict(advanced)
+            advanced.pop("vr_teleop.tracker_key", None)
+            values = dict(values or {})
+            values.setdefault("mantis.quest_tracker_key", legacy_key)
         if values is not None:
             unknown = [k for k in values if k not in _SETTINGS_BY_KEY]
             if unknown:
@@ -1098,6 +1179,36 @@ class SettingsStore:
             if bad:
                 raise KeyError(f"unknown advanced settings: {', '.join(sorted(bad))}")
         with self._lock:
+            if (
+                values is not None
+                and {
+                    "mantis.left_channel",
+                    "mantis.right_channel",
+                }
+                & values.keys()
+            ):
+                for key in (
+                    "mantis.left_channel",
+                    "mantis.right_channel",
+                ):
+                    if (
+                        key in values
+                        and values[key] is not None
+                        and not str(values[key]).strip()
+                    ):
+                        side = key.removeprefix("mantis.").removesuffix("_channel")
+                        raise ValueError(
+                            f"Mantis {side} CAN channel is empty; use null to "
+                            "reset it to the default"
+                        )
+                proposed = dict(self._data["values"])
+                for key, value in values.items():
+                    if value is None:
+                        proposed.pop(key, None)
+                    else:
+                        proposed[key] = value
+                left, right = _mantis_channels_from_values(proposed)
+                require_mantis_channels((left, right))
             if values is not None:
                 for k, v in values.items():
                     if v is None:
@@ -1146,6 +1257,49 @@ class SettingsStore:
 
         return norm(left, CAN_LEFT), norm(right, CAN_RIGHT)
 
+    def mantis_can_channels(self) -> tuple[str | None, str | None]:
+        """The handheld rig's persisted (left, right) SocketCAN mapping."""
+        with self._lock:
+            values = dict(self._data["values"])
+        return _mantis_channels_from_values(values)
+
+    def effective_mantis_can_channels(
+        self, op_id: str, args: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Resolve the exact Mantis channels an operation request will open.
+
+        This mirrors :meth:`merged_args` plus the command-level Mantis profile:
+        stored rig channels are folded below request overrides, and untouched
+        Axol defaults are translated to the Mantis hub names.  The serve API
+        uses this result to ensure its already-open diagnostics link represents
+        the same buses the impending operation will borrow.
+        """
+        from ..constants import CAN_LEFT, CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT, CAN_RIGHT
+
+        merged = self.merged_args(op_id, args)
+        target_op = _settings_op(op_id)
+        if target_op == "teleop":
+            left = merged.get("left_channel", CAN_LEFT)
+            right = merged.get("right_channel", CAN_RIGHT)
+        elif target_op == "collect-data":
+            left = merged.get(f"{_ROBOT}.left_channel", CAN_LEFT)
+            right = merged.get(f"{_ROBOT}.right_channel", CAN_RIGHT)
+        else:
+            return self.mantis_can_channels()
+
+        def resolve(value: Any, arm_default: str, rig_default: str) -> str | None:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text or text == arm_default:
+                return rig_default
+            return None if text.lower() in ("null", "none") else text
+
+        return (
+            resolve(left, CAN_LEFT, CAN_MANTIS_LEFT),
+            resolve(right, CAN_RIGHT, CAN_MANTIS_RIGHT),
+        )
+
     def has_gripper(self) -> bool:
         """Whether this robot is the gripper-equipped SKU (default ``True``).
 
@@ -1190,5 +1344,35 @@ class SettingsStore:
             prefix = section.targets.get(target_op)
             if prefix:
                 merged[f"{prefix}.{subpath}"] = value
+
+        # The Mantis and Axol channel maps are deliberately independent. The
+        # curated target table cannot express a conditional target, so fold
+        # the rig map in only for a Mantis run and still leave request args as
+        # the final override below.
+        raw_mantis = args.get("mantis")
+        mantis = (
+            raw_mantis.strip().lower() in ("1", "true", "yes", "on")
+            if isinstance(raw_mantis, str)
+            else bool(raw_mantis)
+        )
+        if mantis:
+            left, right = self.mantis_can_channels()
+            if target_op == "teleop":
+                merged["left_channel"] = left
+                merged["right_channel"] = right
+            elif target_op == "collect-data":
+                merged[f"{_ROBOT}.left_channel"] = left
+                merged[f"{_ROBOT}.right_channel"] = right
+        # The curated Quest datum is intentionally source-scoped. Without
+        # this removal, switching the UI to Lighthouse/Ultimate would keep a
+        # Quest key as an explicit override and prevent those tracker-specific
+        # transforms from resolving. Request args below may still make an
+        # intentional one-run override.
+        source = args.get("mantis_source", merged.get("mantis_source"))
+        if not mantis or source != "quest":
+            if target_op == "teleop":
+                merged.pop("teleop.tracker_key", None)
+            elif target_op == "collect-data":
+                merged.pop(f"{_VRT}.tracker_key", None)
         merged.update(args)
         return merged

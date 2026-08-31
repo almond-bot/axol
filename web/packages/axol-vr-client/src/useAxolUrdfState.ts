@@ -21,6 +21,8 @@ export interface AxolUrdfState {
   base: AxolUrdfBase | null
   joints: Record<string, number>
   engaged: boolean
+  /** False when the producer and viewer use unregistered tracking worlds. */
+  viewerWorldAligned: boolean
 }
 
 /**
@@ -51,12 +53,16 @@ export function useAxolUrdfState(
       stateRef.current = null
       ws?.addEventListener("message", (event: MessageEvent) => {
         try {
-          const msg = JSON.parse(event.data as string) as { type?: string } & Partial<AxolUrdfState>
+          const msg = JSON.parse(event.data as string) as {
+            type?: string
+            viewer_world_aligned?: boolean
+          } & Partial<AxolUrdfState>
           if (msg.type === "urdf_state") {
             stateRef.current = {
               base: msg.base ?? null,
               joints: msg.joints ?? {},
               engaged: !!msg.engaged,
+              viewerWorldAligned: msg.viewer_world_aligned !== false,
             }
           }
         } catch {

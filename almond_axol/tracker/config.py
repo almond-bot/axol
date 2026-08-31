@@ -13,8 +13,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ..constants import CAN_MANTIS_LEFT, CAN_MANTIS_RIGHT
+from ..utils.paths import almond_path
 
-TRACKER_CONFIG_FILE = Path.home() / ".almond" / "tracker" / "config.json"
+TRACKER_CONFIG_FILE = almond_path("tracker", "config.json")
 
 
 @dataclass
@@ -34,6 +35,7 @@ class TrackerConfig:
             ``right`` remain the active backend's binding for compatibility.
         ultimate_quat_order: Component order of the quaternion in the
             Ultimate dongle's pose reports (``"xyzw"`` or ``"wxyz"``).
+            The pinned pyvut runtime reports ``"wxyz"``.
             Verify at bring-up: hold a tracker still and level; the
             streamed orientation must be near-identity after conversion.
         ultimate_up_axis: Up axis of the Ultimate tracker's SLAM world
@@ -57,7 +59,7 @@ class TrackerConfig:
     left: str | None = None
     right: str | None = None
     bindings: dict[str, dict[str, str | None]] = field(default_factory=dict)
-    ultimate_quat_order: str = "xyzw"
+    ultimate_quat_order: str = "wxyz"
     ultimate_up_axis: str = "z"
     trigger_can_left: str | None = CAN_MANTIS_LEFT
     trigger_can_right: str | None = CAN_MANTIS_RIGHT
@@ -69,6 +71,8 @@ def load_tracker_config(path: Path = TRACKER_CONFIG_FILE) -> TrackerConfig:
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
+        return TrackerConfig()
+    if not isinstance(data, dict):
         return TrackerConfig()
     old_stem = "u" + "mi"
     old_channels = {
@@ -119,6 +123,15 @@ def save_tracker_config(
 def select_tracker_backend(config: TrackerConfig, backend: str) -> None:
     """Activate ``backend`` and restore its saved left/right binding."""
     if backend == config.backend:
+        # A hand-edited or early multi-backend config may hold the binding only
+        # in ``bindings``. Treat that as authoritative when the compatibility
+        # top-level fields are absent instead of reporting a false incomplete
+        # setup for the already-active backend.
+        binding = config.bindings.get(backend, {})
+        if config.left is None:
+            config.left = binding.get("left")
+        if config.right is None:
+            config.right = binding.get("right")
         return
     binding = config.bindings.get(backend, {})
     config.backend = backend

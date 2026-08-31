@@ -21,6 +21,7 @@ import {
   type SettingsField,
   type SettingsPatch,
   type SettingsSnapshot,
+  type SessionInfo,
   type SettingValue,
   type UsbStatus,
 } from "@/lib/supervisor"
@@ -71,6 +72,9 @@ export function SettingsSection({
   usb,
   usbBusy,
   onUsbConnect,
+  actionBlocker,
+  activeCommandSession,
+  onCommandSessionChange,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -91,6 +95,11 @@ export function SettingsSection({
   usb: UsbStatus | null
   usbBusy: boolean
   onUsbConnect: () => void
+  /** Current host owner that prevents launching another setup action. */
+  actionBlocker: string | null
+  /** Active generic setup/diagnostic session, if any. */
+  activeCommandSession: SessionInfo | null
+  onCommandSessionChange: (session: SessionInfo | null) => void
 }) {
   const toast = useToast()
   const [draft, setDraft] = useState<Draft | null>(null)
@@ -209,9 +218,24 @@ export function SettingsSection({
   const activeCategory = schema.find((c) => c.key === tab)
   const poseFields =
     schema.find((c) => c.key === "teleop")?.settings.filter((s) => s.ui.widget === "pose") ?? []
-  const mantisSourceField = schema
-    .find((c) => c.key === "teleop")
-    ?.settings.find((s) => s.key === "teleop.mantis_source")
+  const teleopCategory = schema.find((c) => c.key === "teleop")
+  const mantisSourceField = teleopCategory?.settings.find((s) => s.key === "teleop.mantis_source")
+  const questTrackerKeyField = teleopCategory?.settings.find(
+    (s) => s.key === "mantis.quest_tracker_key"
+  )
+  const mantisChannelFields =
+    teleopCategory?.settings.filter(
+      (s) => s.key === "mantis.left_channel" || s.key === "mantis.right_channel"
+    ) ?? []
+  const defaultMantisSource = String(mantisSourceField?.default ?? "lighthouse")
+  const draftMantisSource = String(draft?.values["teleop.mantis_source"] ?? defaultMantisSource)
+  const storedMantisSource = String(snapshot?.values["teleop.mantis_source"] ?? defaultMantisSource)
+  const mantisSourceSaved = draftMantisSource === storedMantisSource
+  const draftQuestTrackerKey = String(draft?.values["mantis.quest_tracker_key"] ?? "")
+  const storedQuestTrackerKey = String(snapshot?.values["mantis.quest_tracker_key"] ?? "")
+  const mantisCalibrationContextSaved =
+    mantisSourceSaved &&
+    (draftMantisSource !== "quest" || draftQuestTrackerKey === storedQuestTrackerKey)
 
   return (
     <Card className="gap-0 p-0">
@@ -277,9 +301,45 @@ export function SettingsSection({
                     onChange={setValue}
                   />
                 )}
+                {draftMantisSource === "quest" && questTrackerKeyField && (
+                  <SettingRow
+                    field={questTrackerKeyField}
+                    value={draft.values[questTrackerKeyField.key]}
+                    onChange={setValue}
+                  />
+                )}
                 <TrackerBindingPanel
-                  source={String(draft.values["teleop.mantis_source"] ?? "lighthouse")}
+                  source={draftMantisSource}
+                  sourceSaved={mantisSourceSaved}
+                  calibrationContextSaved={mantisCalibrationContextSaved}
+                  onQuestKeySelect={(key) => setValue("mantis.quest_tracker_key", key)}
+                  blockedReason={actionBlocker}
+                  hostSession={activeCommandSession}
+                  onHostSessionChange={onCommandSessionChange}
                 />
+                {mantisChannelFields.length > 0 && (
+                  <div className="flex flex-col gap-4 border-t border-white/10 pt-5">
+                    <div className="flex flex-col gap-1.5">
+                      <Label>Logical left/right CAN mapping</Label>
+                      <p className="max-w-prose text-xs leading-relaxed text-white/40">
+                        Defaults are <span className="font-mono">can_mantis_l</span> and{" "}
+                        <span className="font-mono">can_mantis_r</span>. Swap the two interface
+                        values to swap logical left and right without moving cables; each
+                        side&apos;s trigger reader follows the same channel.
+                      </p>
+                    </div>
+                    <div className="grid gap-x-8 gap-y-5 sm:grid-cols-2">
+                      {mantisChannelFields.map((field) => (
+                        <SettingRow
+                          key={field.key}
+                          field={field}
+                          value={draft.values[field.key]}
+                          onChange={setValue}
+                        />
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <div className="border-t border-white/10 pt-5">
                   <CamerasPanel
                     spec={draft.cameras}
@@ -316,7 +376,16 @@ export function SettingsSection({
                 category={activeCategory}
                 values={draft.values}
                 onChange={setValue}
-                excludeKeys={activeCategory.key === "teleop" ? ["teleop.mantis_source"] : []}
+                excludeKeys={
+                  activeCategory.key === "teleop"
+                    ? [
+                        "teleop.mantis_source",
+                        "mantis.quest_tracker_key",
+                        "mantis.left_channel",
+                        "mantis.right_channel",
+                      ]
+                    : []
+                }
               />
             ) : (
               <p className="text-sm text-white/40">Loading settings…</p>

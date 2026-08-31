@@ -44,10 +44,20 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
     if args.timeout <= 0:
         raise SystemExit("--timeout must be greater than zero")
 
+    # The mere presence of survive-cli does not prove it is Axol's pinned
+    # libusb build: the HIDAPI build can track but cannot pair Watchman
+    # dongles.  Match the runtime gate used by the setup UI and operations.
+    from .mantis_bridge import require_mantis_tracker_readiness
+
+    try:
+        require_mantis_tracker_readiness("lighthouse")
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
+
     executable = shutil.which("survive-cli")
     if executable is None:
         raise SystemExit(
-            "Lighthouse tracking support is not installed; run `axol provision`."
+            "Lighthouse tracking support is not installed; run `axol tracker.install`."
         )
 
     print(
@@ -116,7 +126,7 @@ def run(args) -> None:  # type: ignore[no-untyped-def]
                 and time.monotonic() - started >= _PAIRING_START_TIMEOUT_S
             ):
                 raise SystemExit(
-                    "The dongle did not enter pairing mode. Run `axol provision` "
+                    "The dongle did not enter pairing mode. Run `axol tracker.install` "
                     "to install the libusb build, reconnect the dongle, and try again."
                 )
 

@@ -423,8 +423,13 @@ export default function Diagnostics() {
   const busyElsewhere = linkState === "busy" && activeRun == null
 
   const diagCommands = useMemo(
-    () => commands.filter((c) => c.category === "Diagnostics"),
-    [commands]
+    () =>
+      commands.filter(
+        (c) =>
+          c.category === "Diagnostics" &&
+          (!c.hardwareProfiles || c.hardwareProfiles.includes(robot?.profile ?? "axol"))
+      ),
+    [commands, robot?.profile]
   )
   const canCommand = (id: string) => commands.find((c) => c.id === id) ?? null
 
@@ -620,8 +625,8 @@ export default function Diagnostics() {
         {robot && robot.state === "disconnected" && (
           <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-white/[0.02] p-3">
             <p className="text-sm text-white/60">
-              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected —
-              connect to start streaming motor telemetry.
+              The {robot.profile === "mantis" ? "Mantis" : "robot"} link is disconnected — connect
+              to start streaming motor telemetry.
             </p>
             <div className="ml-auto flex items-center gap-2">
               <Button
@@ -634,7 +639,8 @@ export default function Diagnostics() {
                 <Cable /> CAN adapter…
               </Button>
               <Button size="sm" onClick={connectRobot} disabled={robotBusy}>
-                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect {robot.profile === "mantis" ? "Mantis" : "robot"}
+                {robotBusy ? <Loader2 className="animate-spin" /> : null} Connect{" "}
+                {robot.profile === "mantis" ? "Mantis" : "robot"}
               </Button>
             </div>
           </div>

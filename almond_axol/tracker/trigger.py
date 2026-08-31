@@ -22,9 +22,11 @@ circuits-py repo, protocol table in the adjacent README):
 
   - Classic CAN 2.0 data frame, **standard 11-bit arbitration ID
     0x009** (0x008 is reserved for the gripper motor itself, whose
-    feedback answers on motor ID + 0x10), DLC 6, published at 100 Hz
-    whenever the device is powered.
-  - Payload layout, **little-endian** (``struct.unpack("<fH", data)``):
+    feedback answers on motor ID + 0x10), DLC 6 or 7, published at
+    100 Hz whenever the device is powered. Both variants use the same
+    six-byte core payload; the optional seventh opaque byte is ignored.
+  - Core payload layout, **little-endian**
+    (``struct.unpack("<fH", data[:6])``):
 
     =======  ===========================================================
     byte(s)  content
@@ -77,8 +79,10 @@ TRIGGER_RATE_HZ = 100.0
 # stale: hold the last grip command rather than jumping to a default.
 STALE_AFTER_S = 0.25
 
-# Payload size (float32 trigger state + uint16 raw switch level).
-_FRAME_LEN = 6
+# Payload size (float32 trigger state + uint16 raw switch level), plus an
+# optional one-byte opaque extension. Both variants exist on physical rigs.
+_CORE_FRAME_LEN = 6
+_FRAME_LENGTHS = frozenset({_CORE_FRAME_LEN, _CORE_FRAME_LEN + 1})
 _FRAME_FMT = "<fH"
 
 
@@ -98,8 +102,23 @@ class TriggerFrame:
     raw: int
 
 
+def decode_trigger_payload(data: bytes) -> tuple[float, int] | None:
+    """Decode the finite wire values from a 6- or 7-byte trigger payload.
+
+    The optional seventh opaque byte is deliberately ignored: the
+    position/raw core is unchanged. Values are not clamped here so identity
+    probes can strictly validate the wire range.
+    """
+    if len(data) not in _FRAME_LENGTHS:
+        return None
+    trigger, raw = struct.unpack(_FRAME_FMT, data[:_CORE_FRAME_LEN])
+    if not math.isfinite(trigger):
+        return None
+    return trigger, raw
+
+
 def parse_trigger_frame(data: bytes) -> TriggerFrame | None:
-    """Decode one 6-byte trigger-node payload, or ``None`` if malformed.
+    """Decode a supported trigger-node payload, or ``None`` if malformed.
 
     Pure function of the payload bytes (no CAN dependency) so it is unit
     testable and doubles as the reference decoder for the firmware
@@ -108,11 +127,10 @@ def parse_trigger_frame(data: bytes) -> TriggerFrame | None:
     keeps a corrupted frame from ever commanding the gripper past its
     travel.
     """
-    if len(data) != _FRAME_LEN:
+    decoded = decode_trigger_payload(data)
+    if decoded is None:
         return None
-    trigger, raw = struct.unpack(_FRAME_FMT, data)
-    if not math.isfinite(trigger):
-        return None
+    trigger, raw = decoded
     return TriggerFrame(position=min(max(trigger, 0.0), 1.0), raw=raw)
 
 
