@@ -516,8 +516,13 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
                 {"error": "another session is running — stop it first"},
                 status_code=409,
             )
+        # Diagnostics are subprocess-backed rather than OperationRunner-backed,
+        # so fold their declared shared settings here. Per-run dialog values
+        # still win. This notably carries robot.has_gripper into lift-cycle's
+        # --no-gripper flag before either fault scoping or argv construction.
+        launch_args = settings.merged_args(req.command, req.args)
         if command.drives_motors:
-            fault_response = await _motor_fault_response(scope_args=req.args)
+            fault_response = await _motor_fault_response(scope_args=launch_args)
             if fault_response is not None:
                 return fault_response
 
@@ -529,7 +534,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         try:
             # A writable stdin lets the UI answer the diagnostic's hands-on
             # prompts (the "Continue" button) via /input below.
-            session = await manager.start(req.command, req.args, stdin_pipe=True)
+            session = await manager.start(req.command, launch_args, stdin_pipe=True)
         except Exception:
             if uses_can_bus:
                 await asyncio.to_thread(robot.reacquire)
@@ -538,7 +543,7 @@ def create_app(static_dir: Path | None = None) -> FastAPI:
         # ad-hoc launches (CAN bring-up, motor calibration tools) still get
         # the bus handover + prompt plumbing but leave no record behind.
         record = command.category == "Diagnostics"
-        meta = runs.begin(session.id, req.command, req.args) if record else None
+        meta = runs.begin(session.id, req.command, launch_args) if record else None
         if session.status == "error":
             if uses_can_bus:
                 await asyncio.to_thread(robot.reacquire)

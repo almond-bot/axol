@@ -1,0 +1,33 @@
+---
+title: "diag.lift-cycle"
+description: "Raise the arms for clearance, then cycle the telescoping lift down and up."
+---
+
+Exercises the powered cart's telescoping lift with the robot mounted. Before the lift moves, the command enables the selected arms and smoothly moves their S1 joints to the mirrored 90° clearance pose. It then runs the requested number of complete **down, then up** cycles. After a successful run verifies the lift is fully up and stopped, it smoothly returns S1 to 0° rest while holding every other joint at its measured starting position, verifies both the arm pose and lift state, then disables the selected arm motors and confirms none still reports holding. This is not a full-arm rest-pose replay.
+
+```bash
+axol diag.lift-cycle --cycles 3
+axol diag.lift-cycle --cycles 5 --lift-channel can0
+axol diag.lift-cycle --cycles 2 --speed 300
+axol diag.lift-cycle --cycles 1 --no-right --left-channel can0
+```
+
+In a terminal, omit `--cycles` and the command prompts for a positive number of cycles. Pass `--cycles` directly for unattended use; the diagnostics dashboard exposes it as a required field. `--speed` sets the lift controller's maximum speed in encoder counts/s; use `0` for full configured speed or a value from 250 to 65535. Lower caps are rejected to preserve margin across calibrated lift ranges before the firmware's 60-second safety timeout. `--lift-channel` selects the lift controller's SocketCAN interface (default: `can_alm_axol_c`); pass another interface only for a custom mapping. There is no automatic fallback to the wheel bus (`can_alm_axol_b`).
+
+The wheel motors and `can_alm_axol_b` do not need to be connected. With the defaults, this command opens only the selected arm buses and the lift/base interface `can_alm_axol_c`.
+
+`--left-channel` and `--right-channel` select the arm buses. Use `--no-left` or `--no-right` when only one arm is installed or connected; at least one arm is required so the mounted robot can be moved to the clearance pose. Pass `--no-gripper` on a gripperless robot so the nonexistent gripper motors are never contacted. The diagnostics dashboard inherits this from the shared **Grippers fitted** setting.
+
+<Note>
+  The lift must already be homed. Run [`axol lift.home`](/cli/lift-home) first; both commands default to the named lift interface `can_alm_axol_c`.
+</Note>
+
+<Note>
+  Flash the current Jelly Legs v0.8 firmware before cycling. The command checks v0.8's position-save state as soon as the first move begins and stops if an older image is running. It continuously verifies S1 clearance and the other held arm joints while the lift moves. During the final S1 return, it also requires fresh status showing the lift remains homed, idle, and fully up. Any failed check stops the sequence.
+</Note>
+
+<Warning>
+  Clear people and objects from the arms, lift columns, and cart before starting. The diagnostic drives both the selected arm motors and the lift through their physical range. Ctrl-C (or **Stop** in the diagnostics dashboard) attempts an immediate lift STOP. On any failure, the arms remain enabled at their last commanded pose; inspect the lift and arm state before moving them again.
+</Warning>
+
+The command is also available from the control panel's [diagnostics dashboard](/guides/diagnostics-dashboard) under **Diagnostics → Lift cycle**.
