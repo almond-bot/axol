@@ -338,16 +338,17 @@ export default function Diagnostics() {
     }
   }, [activeRun, toast])
 
+  const activeProfile = robot?.profile ?? "axol"
   const connectRobot = useCallback(async () => {
     setRobotBusy(true)
     try {
-      setRobot(await robotConnect(undefined, robot?.profile ?? "axol"))
+      setRobot(await robotConnect(undefined, activeProfile))
     } catch (e) {
       toast.error(String(e))
     } finally {
       setRobotBusy(false)
     }
-  }, [toast, robot?.profile])
+  }, [toast, activeProfile])
 
   // Manual CAN interface selection — the fallback when the Axol hub adapter
   // (and its auto-named interfaces) can't be found. The server persists the
