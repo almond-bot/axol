@@ -95,20 +95,21 @@ QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 #
 # ultimate (Vive Ultimate Tracker, standard mount): a mechanical comparison
 # reported 2026-08-31 places its device origin 11 mm higher than the Tracker 3.0
-# origin along the tracker→TCP tuple's local z axis. Measuring the same TCP
-# from that higher origin changes the Tracker 3.0 candidate's z offset from
-# -92 mm to -103 mm. The mount orientation and other translation axes are
-# shared. pyvut is reverse-engineered, so its
-# quaternion order/up-axis and the completed overlay still need a bench check
-# before this candidate can become a design constant.
+# origin along native physical z (vertical). The bridge relabels native z-up as
+# WebXR y-up, and the Tracker 3.0 candidate represents the TCP's 35.5 mm
+# downward separation as +0.0355 local y. Measuring the same TCP from an origin
+# 11 mm higher therefore changes that stored offset to +0.0465 m; the -92 mm
+# forward offset and mount orientation are shared. Because pyvut is
+# reverse-engineered, its quaternion order/up-axis and the completed overlay
+# still need a bench check before this candidate can become a design constant.
 CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
         "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
     },
     "ultimate": {
-        "left": [0.0, 0.0355, -0.103, 0.7071068, 0.0, 0.0, 0.7071068],
-        "right": [0.0, 0.0355, -0.103, 0.7071068, 0.0, 0.0, 0.7071068],
+        "left": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
+        "right": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
     },
 }
 

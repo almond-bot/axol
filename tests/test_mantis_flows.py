@@ -514,7 +514,7 @@ class MantisFlowTest(unittest.TestCase):
         self.assertIsNone(config.tcp_transform_right)
 
     def test_ultimate_candidate_accounts_for_higher_tracking_origin(self) -> None:
-        expected = [0.0, 0.0355, -0.103, 0.7071068, 0.0, 0.0, 0.7071068]
+        expected = [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068]
         self.assertEqual(
             candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
             expected,
