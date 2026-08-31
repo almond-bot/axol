@@ -93,18 +93,23 @@ QUEST_POSE_SPACES = frozenset({"grip", "target-ray"})
 # engage snapshot aligns only the starting pose; later recorded TCP poses stay
 # mount-dependent, so production collection rejects the missing transform.
 #
-# TODO(mantis-calibration): Complete the Vive Ultimate Tracker transform. A
-# mechanical comparison reported 2026-08-31 places its origin 11 mm higher than
-# the Tracker 3.0 origin along physical vertical (+z in the native tracking
-# world). That one world-frame datum does not establish the full tracker-local
-# SE(3) transform: the Ultimate device axes/orientation, lateral and forward
-# offsets, pyvut quaternion convention, and the existing Tracker 3.0 candidate's
-# unresolved datum/sign still need a CAD/bench check. Do not turn the 11 mm into
-# a stored y-up offset by itself.
+# ultimate (Vive Ultimate Tracker, standard mount): starts from the Tracker 3.0
+# candidate above. Reported reference-origin coordinates in their shared CAD
+# frame are respectively [47, 0, 35] mm and [47, 0, 46] mm. The common 47/0
+# coordinates cancel and establish an 11 mm vertical delta. Applying that delta
+# to the existing V3 candidate's independently derived 35.5 mm bridge-local
+# vertical component gives 46.5 mm; the -92 mm forward offset and mount rotation
+# are inherited. pyvut's axes/quaternion and the physical overlay still require
+# bench verification, so this remains a candidate and must not be promoted to
+# DESIGN_TCP_TRANSFORMS yet.
 CANDIDATE_TCP_TRANSFORMS: dict[str, dict[str, list[float]]] = {
     "survive": {
         "left": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
         "right": [0.0, 0.0355, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
+    },
+    "ultimate": {
+        "left": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
+        "right": [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068],
     },
 }
 
