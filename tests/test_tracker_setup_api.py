@@ -196,7 +196,7 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                     },
                 )
                 for side in ("left", "right"):
-                    self.assertEqual(ultimate[side]["status"], "candidate")
+                    self.assertEqual(ultimate[side]["status"], "missing")
                     self.assertIsNone(ultimate[side]["pos"])
                     self.assertIsNone(ultimate[side]["quat"])
 

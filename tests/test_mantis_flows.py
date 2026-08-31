@@ -505,31 +505,12 @@ class MantisFlowTest(unittest.TestCase):
     def test_pending_cad_transform_does_not_authorize_collection(self) -> None:
         self.assertIsNotNone(candidate_transform_for("left", "survive:T20"))
         self.assertIsNone(design_transform_for("left", "survive:T20"))
+        self.assertIsNone(candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"))
         config = VRTeleopConfig(tracker_key="survive:T20")
         with mock.patch(
             "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
         ):
             apply_mantis_teleop_profile(config, tracker_source="lighthouse")
-        self.assertIsNone(config.tcp_transform_left)
-        self.assertIsNone(config.tcp_transform_right)
-
-    def test_ultimate_candidate_accounts_for_higher_tracking_origin(self) -> None:
-        expected = [0.0, 0.0465, -0.092, 0.7071068, 0.0, 0.0, 0.7071068]
-        self.assertEqual(
-            candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
-            expected,
-        )
-        self.assertEqual(
-            candidate_transform_for("right", "ultimate:11:22:33:44:55:66"),
-            expected,
-        )
-        self.assertIsNone(design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"))
-
-        config = VRTeleopConfig(tracker_key="ultimate:aa:bb:cc:dd:ee:ff")
-        with mock.patch(
-            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
-        ):
-            apply_mantis_teleop_profile(config, tracker_source="ultimate")
         self.assertIsNone(config.tcp_transform_left)
         self.assertIsNone(config.tcp_transform_right)
 
