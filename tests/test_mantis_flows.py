@@ -513,6 +513,26 @@ class MantisFlowTest(unittest.TestCase):
         self.assertIsNone(config.tcp_transform_left)
         self.assertIsNone(config.tcp_transform_right)
 
+    def test_ultimate_candidate_accounts_for_higher_tracking_origin(self) -> None:
+        expected = [0.0, 0.0355, -0.103, 0.7071068, 0.0, 0.0, 0.7071068]
+        self.assertEqual(
+            candidate_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"),
+            expected,
+        )
+        self.assertEqual(
+            candidate_transform_for("right", "ultimate:11:22:33:44:55:66"),
+            expected,
+        )
+        self.assertIsNone(design_transform_for("left", "ultimate:aa:bb:cc:dd:ee:ff"))
+
+        config = VRTeleopConfig(tracker_key="ultimate:aa:bb:cc:dd:ee:ff")
+        with mock.patch(
+            "almond_axol.mantis.calibration.load_tcp_transforms", return_value={}
+        ):
+            apply_mantis_teleop_profile(config, tracker_source="ultimate")
+        self.assertIsNone(config.tcp_transform_left)
+        self.assertIsNone(config.tcp_transform_right)
+
     def test_active_source_never_uses_unknown_legacy_transform(self) -> None:
         identity = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
         saved = {

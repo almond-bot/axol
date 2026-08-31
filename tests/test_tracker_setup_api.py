@@ -195,6 +195,10 @@ class TrackerSetupPersistenceTest(unittest.TestCase):
                         "right": "ultimate:1:2:3:4:5:6",
                     },
                 )
+                for side in ("left", "right"):
+                    self.assertEqual(ultimate[side]["status"], "candidate")
+                    self.assertIsNone(ultimate[side]["pos"])
+                    self.assertIsNone(ultimate[side]["quat"])
 
                 with self.assertRaisesRegex(
                     tracker_setup.TrackerSetupError, "quest_tracker_key"
